@@ -9,12 +9,8 @@ export function transpileToC(code: string): string {
     ts.ScriptKind.TS
   );
 
-  return `
-#define console.log(message) printf(message)
-
-#include <stdio.h>
+  return `#include <stdio.h>
 #include <string.h>
-
 
 int main() {
     ${visit(sourceFile)}

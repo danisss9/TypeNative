@@ -4,9 +4,9 @@ Build native applications using Typescript.
 
 ## Get Started
 
-- Write a file `test.ts` with content `console.log('Hello World!'); getchar()` or any other message.
-- Run `npx typenative --target test.ts`
-- Run the executable in `dist/native.exe` and see your message 
+- Write a file `test.ts` with content `console.log('Hello World!');` or any other message
+- Run `npx typenative --source test.ts`
+- Run `dist/native.exe` in terminal and see your message 
 
 ## Todo 
 

@@ -1,12 +1,8 @@
 import ts from 'typescript';
 export function transpileToC(code) {
     const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
-    return `
-#define console.log(message) printf(message)
-
-#include <stdio.h>
+    return `#include <stdio.h>
 #include <string.h>
-
 
 int main() {
     ${visit(sourceFile)}

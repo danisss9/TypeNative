@@ -1,8 +1,12 @@
+#!/usr/bin/env node
 import inquirer from 'inquirer';
 import shell from 'shelljs';
 import fs from 'fs-extra';
 import path from 'path';
 import { transpileToC } from './transpiler.js';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 (async function main() {
     const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
     const targetIndex = process.argv.findIndex((a) => a === '--source');
@@ -33,7 +37,7 @@ import { transpileToC } from './transpiler.js';
     const cCode = transpileToC(tsCode);
     await fs.ensureDir('dist');
     await fs.writeFile('dist/code.c', cCode, { encoding: 'utf-8' });
-    shell.exec(`${path.resolve()}\\tcc\\tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${scriptMode ? '-run' : ''}`);
+    shell.exec(`${__dirname}/tcc/tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${scriptMode ? '-run' : ''}`);
     if (answers.output) {
         await fs.copy('dist/native.exe', answers.output, { overwrite: true });
     }

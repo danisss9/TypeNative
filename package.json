@@ -1,19 +1,18 @@
 {
   "name": "typenative",
-  "version": "0.0.1",
-  "description": "",
-  "main": "bin/index.js",
+  "version": "0.0.8",
+  "description": "Build native applications using Typescript.",
+  "type": "module",
   "bin": {
     "typenative": "bin/index.js"
   },
-  "type": "module",
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "start": "node ./bin/index",
+    "start:compiler": "node ./bin/index",
     "start:script": "node ./bin/index --script",
     "test": "node ./bin/index --source test/test.ts --script",
-    "publish": "npm publish"
+    "release": "npm publish"
   },
   "repository": {
     "type": "git",

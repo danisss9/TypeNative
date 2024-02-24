@@ -1,8 +1,14 @@
+#!/usr/bin/env node
+
 import inquirer from 'inquirer';
 import shell from 'shelljs';
 import fs from 'fs-extra';
 import path from 'path';
 import { transpileToC } from './transpiler.js';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 (async function main() {
   const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
@@ -41,7 +47,7 @@ import { transpileToC } from './transpiler.js';
   await fs.writeFile('dist/code.c', cCode, { encoding: 'utf-8' });
 
   shell.exec(
-    `${path.resolve()}\\tcc\\tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${
+    `${__dirname}/tcc/tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${
       scriptMode ? '-run' : ''
     }`
   );
