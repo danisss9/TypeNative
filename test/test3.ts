@@ -1,17 +1,13 @@
-let arr: number[] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
+let n: number = 50;
 
-//arr.push(1);
+let a: number = 0;
+let b: number = 1;
+let c: number = n;
 
-for (let i = 0; i < arr.length; i++) {
-  arr[i] = arr[i] + i;
+for (let i = 2; i <= n; i++) {
+  c = a + b;
+  a = b;
+  b = c;
 }
 
-for (let i = 0; i < arr.length; i++) {
-  console.log(arr[i]);
-}
-
-/*  clock_t start_time = clock();
-
-  // code or function to benchmark
-
-  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; */
+console.log(c);

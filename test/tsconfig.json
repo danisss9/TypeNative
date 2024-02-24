@@ -3,7 +3,7 @@
     "compilerOptions": {
       "target": "es2020",    
       "lib": [], 
-      "types": [],
+      "types": ["../types/typenative.d.ts"],
       "rootDir": "",
       "strict": true,         
       "noImplicitAny": true,

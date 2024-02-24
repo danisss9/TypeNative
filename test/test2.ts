@@ -1,23 +1,11 @@
-/// <reference no-default-lib="true"/>
+const s1: string = '123';
+const s2: string = '456';
+console.log(s1 + s2);
 
-require('time');
+const n1: number = 10;
+const n2: number = 20;
+console.log(n1 + n2 - n1);
 
-let n: number = 50;
-
-let a: number = 0;
-let b: number = 1;
-let c: number = n;
-
-for (let i = 2; i <= n; i++) {
-  c = a + b;
-  a = b;
-  b = c;
-}
-
-console.log(c);
-
-/*  clock_t start_time = clock();
-
-  // code or function to benchmark
-
-  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; */
+const bool1: boolean = true;
+const bool2: boolean = false;
+console.log((bool1 && bool1) || bool2);
