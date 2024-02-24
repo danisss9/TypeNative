@@ -41,13 +41,13 @@ import { transpileToC } from './transpiler.js';
   await fs.writeFile('dist/code.c', cCode, { encoding: 'utf-8' });
 
   shell.exec(
-    `${path.resolve()}\\tcc\\tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/code.exe ${
+    `${path.resolve()}\\tcc\\tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${
       scriptMode ? '-run' : ''
     }`
   );
 
   if (answers.output) {
-    await fs.copy('dist/code.exe', answers.output, { overwrite: true });
+    await fs.copy('dist/native.exe', answers.output, { overwrite: true });
   }
 
   if (!scriptMode) {

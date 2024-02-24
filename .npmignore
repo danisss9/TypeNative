@@ -1,0 +1,10 @@
+.vscode
+dist
+node_modules
+src
+tcc
+test
+TypeScript
+.gitignore
+.prettierrc.json
+tsconfig.json

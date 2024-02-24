@@ -12,7 +12,8 @@
     "watch": "tsc --watch",
     "start": "node ./bin/index",
     "start:script": "node ./bin/index --script",
-    "test": "node ./bin/index --source test/test.ts --script"
+    "test": "node ./bin/index --source test/test.ts --script",
+    "publish": "npm publish"
   },
   "repository": {
     "type": "git",

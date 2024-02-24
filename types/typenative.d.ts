@@ -15,3 +15,5 @@ interface Console {
   log(...data: any[]): void;
 }
 declare var console: Console;
+
+declare var getchar: () => void;
