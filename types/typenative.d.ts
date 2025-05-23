@@ -6,7 +6,7 @@ interface Array<T> {
   /**
    * Returns a string representation of an array.
    */
-  toString(): string;
+  push(element: T): void;
 
   [n: number]: T;
 }
@@ -15,5 +15,3 @@ interface Console {
   log(...data: any[]): void;
 }
 declare var console: Console;
-
-declare var getchar: () => void;

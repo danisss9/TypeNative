@@ -1,6 +1,6 @@
 {
   "name": "typenative",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Build native applications using Typescript.",
   "type": "module",
   "bin": {
@@ -12,6 +12,9 @@
     "start:compiler": "node ./bin/index",
     "start:script": "node ./bin/index --script",
     "test": "node ./bin/index --source test/test.ts --script",
+    "test2": "node ./bin/index --source test/test2.ts --script",
+    "test3": "node ./bin/index --source test/test3.ts --script",
+    "test4": "node ./bin/index --source test/test4.ts --script",
     "release": "npm publish"
   },
   "repository": {
@@ -26,14 +29,14 @@
   "homepage": "https://github.com/danisss9/typenative#readme",
   "devDependencies": {
     "@types/fs-extra": "^11.0.4",
-    "@types/inquirer": "^9.0.7",
-    "@types/node": "^20.11.20",
-    "@types/shelljs": "^0.8.15"
+    "@types/inquirer": "^9.0.8",
+    "@types/node": "^22.15.21",
+    "@types/shelljs": "^0.8.16"
   },
   "dependencies": {
-    "fs-extra": "^11.2.0",
-    "inquirer": "^9.2.15",
-    "shelljs": "^0.8.5",
-    "typescript": "^5.3.3"
+    "fs-extra": "^11.3.0",
+    "inquirer": "^12.6.1",
+    "shelljs": "^0.10.0",
+    "typescript": "^5.8.3"
   }
 }

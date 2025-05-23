@@ -4,7 +4,7 @@ import inquirer from 'inquirer';
 import shell from 'shelljs';
 import fs from 'fs-extra';
 import path from 'path';
-import { transpileToC } from './transpiler.js';
+import { transpileToNative } from './transpiler.js';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -41,22 +41,23 @@ const __dirname = path.dirname(__filename);
     ? answers.tsCode
     : await fs.readFile(target ?? answers.path, { encoding: 'utf-8' });
 
-  const cCode = transpileToC(tsCode);
+  const nativeCode = transpileToNative(tsCode);
 
   await fs.ensureDir('dist');
-  await fs.writeFile('dist/code.c', cCode, { encoding: 'utf-8' });
+  await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
 
-  shell.exec(
-    `${__dirname}/tcc/tcc.exe -g ${path.resolve()}/dist/code.c -o ${path.resolve()}/dist/native.exe ${
-      scriptMode ? '-run' : ''
-    }`
-  );
+  shell.exec('go build -o dist/native.exe dist/code.go');
+  // await fs.remove('dist/code.go');
 
   if (answers.output) {
     await fs.copy('dist/native.exe', answers.output, { overwrite: true });
+    await fs.remove('dist/native.exe');
   }
 
-  if (!scriptMode) {
+  if (scriptMode) {
+    shell.exec(path.join('dist', 'native.exe'));
+    await fs.remove('dist/native.exe');
+  } else {
     console.log('DONE');
   }
 })();

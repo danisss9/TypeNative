@@ -2,7 +2,7 @@ import ts from 'typescript';
 
 let TypeCheker: ts.TypeChecker;
 
-export function transpileToC(code: string): string {
+export function transpileToNative(code: string): string {
   const sourceFile = ts.createSourceFile(
     'main.ts',
     code,
@@ -13,16 +13,16 @@ export function transpileToC(code: string): string {
 
   TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
 
-  return `#include <stdio.h>
-#include <string.h>
+  return `package main
 
-int main() {
-    ${visit(sourceFile)}return 0;
-}
-    `;
+import "fmt"
+
+func main() {
+    ${visit(sourceFile)}
+}`;
 }
 
-export function visit(node: ts.Node): string {
+export function visit(node: ts.Node, inline = false): string {
   let code: string = '';
 
   if (ts.isIdentifier(node)) {
@@ -30,29 +30,43 @@ export function visit(node: ts.Node): string {
   } else if (ts.isStringLiteral(node)) {
     return `"${node.text}"`;
   } else if (ts.isNumericLiteral(node)) {
-    return `${node.text}`;
+    return `float64(${node.text})`;
   } else if (ts.isToken(node) && node.kind === ts.SyntaxKind.TrueKeyword) {
-    return `1`;
+    return `true`;
   } else if (ts.isToken(node) && node.kind === ts.SyntaxKind.FalseKeyword) {
-    return `0`;
+    return `false`;
+  } else if (ts.isBlock(node)) {
+    return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}}\n\t`;
   } else if (ts.isPropertyAccessExpression(node)) {
     return `${visit(node.expression)}.${visit(node.name)}`;
   } else if (ts.isVariableDeclaration(node)) {
-    const type = getCType(node.type!);
-    const initializer = node.initializer ? ` = ${visit(node.initializer)}` : '';
-    return `${type.typeStr} ${visit(node.name)}${type.arrayStr}${initializer}`;
+    const type = getType(node.type!);
+    const initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
+    return `${type === ':' ? '' : 'var'} ${visit(node.name)} ${type}${
+      type === ':' ? '' : ' '
+    }${initializer}`;
   } else if (ts.isCallExpression(node)) {
     const expr = visit(node.expression);
-    const leftSide = expr === 'console.log' ? 'printf' : expr;
-    return `${leftSide}(${node.arguments.map((a) => visit(a)).join(',')})`;
+    return `${getFunction(expr)}(${node.arguments.map((a) => visit(a)).join(',')})`;
+  } else if (ts.isPrefixUnaryExpression(node)) {
+    return `${getOperatorText(node.operator)}${visit(node.operand)}`;
+  } else if (ts.isPostfixUnaryExpression(node)) {
+    return `${visit(node.operand, true)}${getOperatorText(node.operator)}`;
   } else if (ts.isBinaryExpression(node)) {
     return `${visit(node.left)} ${node.operatorToken.getText()} ${visit(node.right)}`;
   } else if (ts.isParenthesizedExpression(node)) {
     return `(${visit(node.expression)})`;
   } else if (ts.isVariableDeclarationList(node)) {
-    return node.declarations.map((n) => visit(n)).join(';\n\t') + ';\n\t';
+    return (
+      node.declarations.map((n) => visit(n)).join(inline ? ';' : ';\n\t') + (inline ? ';' : ';\n\t')
+    );
   } else if (ts.isExpressionStatement(node)) {
-    return visit(node.expression) + ';\n\t';
+    return visit(node.expression) + (inline ? ';' : ';\n\t');
+  } else if (ts.isForStatement(node)) {
+    return `for${visit(node.initializer!, true)} ${visit(node.condition!, true)}; ${visit(
+      node.incrementor!,
+      true
+    )}${visit(node.statement)}`;
   }
 
   console.log(ts.SyntaxKind[node.kind], node.getText());
@@ -64,17 +78,42 @@ export function visit(node: ts.Node): string {
   return code;
 }
 
-function getCType(typeNode: ts.TypeNode): { typeStr: string; arrayStr: string } {
+function getType(typeNode: ts.TypeNode): string {
   const type = TypeCheker.getTypeFromTypeNode(typeNode);
   const typeName = TypeCheker.typeToString(type);
   switch (typeName) {
-    case 'string':
-      return { typeStr: 'char', arrayStr: '[]' };
     case 'number':
-      return { typeStr: 'double', arrayStr: '' };
+      return 'float64';
     case 'boolean':
-      return { typeStr: 'int', arrayStr: '' };
+      return 'bool';
+    case 'any':
+      return ':';
     default:
-      return { typeStr: typeName, arrayStr: '' };
+      return typeName;
+  }
+}
+function getFunction(expr: string): string {
+  switch (expr) {
+    case 'console.log':
+      return 'fmt.Println';
+    default:
+      return expr;
+  }
+}
+
+function getOperatorText(operator: ts.PrefixUnaryOperator | ts.PostfixUnaryExpression): string {
+  switch (operator) {
+    case ts.SyntaxKind.PlusToken:
+      return '+';
+    case ts.SyntaxKind.MinusToken:
+      return '-';
+    case ts.SyntaxKind.TildeToken:
+      return '~';
+    case ts.SyntaxKind.ExclamationToken:
+      return '!';
+    case ts.SyntaxKind.PlusPlusToken:
+      return '++';
+    case ts.SyntaxKind.MinusMinusToken:
+      return '--';
   }
 }
