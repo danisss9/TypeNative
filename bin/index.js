@@ -37,7 +37,9 @@ const __dirname = path.dirname(__filename);
     const nativeCode = transpileToNative(tsCode);
     await fs.ensureDir('dist');
     await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
-    await execa('go build -o dist/native.exe dist/code.go');
+    await execa('go build -o dist/native.exe dist/code.go', {
+        stdio: 'inherit'
+    });
     // await fs.remove('dist/code.go');
     if (answers.output) {
         await fs.copy('dist/native.exe', answers.output, { overwrite: true });

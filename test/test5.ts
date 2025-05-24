@@ -23,6 +23,7 @@ switch (number) {
   case 2:
     console.log('Answer is 2');
     break;
+  case 3:
   default:
     console.log('Answer is something else: ', number);
     break;

@@ -88,11 +88,29 @@ export function visit(node, inline = false, extraBlockContent = '') {
         return `for ${visit(node.statement, false, condition)}`;
     }
     else if (ts.isIfStatement(node)) {
-        const condition = `if ${visit(node.expression, true)} ${visit(node.thenStatement, true)}`;
+        const condition = `if ${visit(node.expression, true)} ${visit(node.thenStatement, !!node.elseStatement)}`;
         if (node.elseStatement) {
             return `${condition} else ${visit(node.elseStatement)}`;
         }
         return condition;
+    }
+    else if (ts.isSwitchStatement(node)) {
+        return `switch ${visit(node.expression)} ${visit(node.caseBlock)}`;
+    }
+    else if (ts.isCaseBlock(node)) {
+        return `{\n\t\t${node.clauses.map((c) => visit(c)).join('\n\t\t')}\n\t}`;
+    }
+    else if (ts.isCaseClause(node)) {
+        const isFallThrough = !node.statements.some((c) => ts.isBreakStatement(c));
+        return `case ${visit(node.expression, true)}: \n\t\t\t${node.statements
+            .map((s) => visit(s))
+            .join('')}${isFallThrough ? 'fallthrough\n\t' : ''}`;
+    }
+    else if (ts.isDefaultClause(node)) {
+        return `default: \n\t\t\t${node.statements.map((s) => visit(s)).join('')}`;
+    }
+    else if (ts.isBreakStatement(node)) {
+        return '';
     }
     const syntaxKind = ts.SyntaxKind[node.kind];
     if (!['SourceFile', 'FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
