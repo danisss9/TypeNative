@@ -33,18 +33,24 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | Increment/Decrement | ✅ | `++`, `--` |
 | **Control Flow** |  |  |
 | For loops | ✅ | Standard `for` loops |
+| For...of loops | ✅ | Iteration over arrays |
+| While loops | ✅ | Transpiled to Go's `for` loops |
+| Do...while loops | ✅ | Implemented with conditional break |
+| If/Else statements | ✅ | Fully supported |
+| Switch statements | ✅ | Case and default statements |
 | **Data Structures** |  |  |
 | Arrays | ✅ | Basic array operations |
+| Array methods | ✅ | `push` supported |
 | **Functions** |  |  |
 | console.log | ✅ | Mapped to `fmt.Println` |
+| console.time/timeEnd | ✅ | Performance measurement |
+| Math.random | ✅ | Mapped to Go's `rand.Float64()` |
+| Math.floor | ✅ | Mapped to Go's `math.Floor()` |
 | **Unsupported Features** |  |  |
 | Classes | ❌ | Not implemented |
 | Interfaces | ❌ | Not implemented |
 | Functions | ❌ | Custom function definitions not supported |
 | Arrow Functions | ❌ | Not implemented |
-| If/Else statements | ❌ | Not implemented |
-| While/Do loops | ❌ | Not implemented |
-| Switch statements | ❌ | Not implemented |
 | Async/Await | ❌ | Not implemented |
 | Modules/Imports | ❌ | Not implemented |
 | Generics | ❌ | Not implemented |

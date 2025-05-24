@@ -1,6 +1,6 @@
 {
   "name": "typenative",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "Build native applications using Typescript.",
   "type": "module",
   "bin": {
@@ -14,7 +14,10 @@
     "test": "node ./bin/index --source test/test.ts --script",
     "test2": "node ./bin/index --source test/test2.ts --script",
     "test3": "node ./bin/index --source test/test3.ts --script",
+    "test3_node": "tsc test/test3.ts && node test/test3.js && rimraf test/test3.js",
     "test4": "node ./bin/index --source test/test4.ts --script",
+    "test5": "node ./bin/index --source test/test5.ts --script",
+    "test6": "node ./bin/index --source test/test6.ts --script",
     "release": "npm publish"
   },
   "repository": {
@@ -31,7 +34,7 @@
     "@types/fs-extra": "^11.0.4",
     "@types/inquirer": "^9.0.8",
     "@types/node": "^22.15.21",
-    "@types/shelljs": "^0.8.16"
+    "rimraf": "^6.0.1"
   },
   "dependencies": {
     "fs-extra": "^11.3.0",

@@ -1,4 +1,7 @@
-let n: number = 50;
+// Fibonacci sequence calculation using a loop
+let n: number = 1000;
+
+console.time('Fibonacci calculation');
 
 let a: number = 0;
 let b: number = 1;
@@ -11,3 +14,4 @@ for (let i = 2; i <= n; i++) {
 }
 
 console.log(c);
+console.timeEnd('Fibonacci calculation');

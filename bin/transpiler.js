@@ -1,17 +1,20 @@
 import ts from 'typescript';
 let TypeCheker;
+let importedPackages = new Set();
 export function transpileToNative(code) {
     const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
     TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
+    importedPackages.clear();
+    const transpiledCode = visit(sourceFile);
     return `package main
 
-import "fmt"
+${[...importedPackages].map((pkg) => `import "${pkg}"`).join('\n')}
 
 func main() {
-    ${visit(sourceFile)}
+    ${transpiledCode.trim()}
 }`;
 }
-export function visit(node, inline = false) {
+export function visit(node, inline = false, extraBlockContent = '') {
     let code = '';
     if (ts.isIdentifier(node)) {
         return node.text;
@@ -28,20 +31,30 @@ export function visit(node, inline = false) {
     else if (ts.isToken(node) && node.kind === ts.SyntaxKind.FalseKeyword) {
         return `false`;
     }
+    else if (ts.isArrayLiteralExpression(node)) {
+        const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type, true) : '';
+        return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
+    }
     else if (ts.isBlock(node)) {
-        return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}}\n\t`;
+        return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}${extraBlockContent}}${inline ? '' : '\n\t'}`;
+    }
+    else if (ts.isElementAccessExpression(node)) {
+        return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
     }
     else if (ts.isPropertyAccessExpression(node)) {
-        return `${visit(node.expression)}.${visit(node.name)}`;
+        const leftSide = visit(node.expression);
+        const rightSide = visit(node.name);
+        return getAcessString(leftSide, rightSide);
     }
     else if (ts.isVariableDeclaration(node)) {
         const type = getType(node.type);
         const initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
-        return `${type === ':' ? '' : 'var'} ${visit(node.name)} ${type}${type === ':' ? '' : ' '}${initializer}`;
+        return `${type === ':' ? '' : 'var '}${visit(node.name)} ${type}${type === ':' ? '' : ' '}${initializer}`;
     }
     else if (ts.isCallExpression(node)) {
-        const expr = visit(node.expression);
-        return `${getFunction(expr)}(${node.arguments.map((a) => visit(a)).join(',')})`;
+        const caller = visit(node.expression);
+        const args = node.arguments.map((a) => visit(a));
+        return getCallString(caller, args);
     }
     else if (ts.isPrefixUnaryExpression(node)) {
         return `${getOperatorText(node.operator)}${visit(node.operand)}`;
@@ -56,24 +69,53 @@ export function visit(node, inline = false) {
         return `(${visit(node.expression)})`;
     }
     else if (ts.isVariableDeclarationList(node)) {
-        return (node.declarations.map((n) => visit(n)).join(inline ? ';' : ';\n\t') + (inline ? ';' : ';\n\t'));
+        return (node.declarations.map((n) => visit(n)).join(inline ? ';' : ';\n\t') + (inline ? '' : ';\n\t'));
     }
     else if (ts.isExpressionStatement(node)) {
-        return visit(node.expression) + (inline ? ';' : ';\n\t');
+        return visit(node.expression) + (inline ? '' : ';\n\t');
     }
     else if (ts.isForStatement(node)) {
-        return `for${visit(node.initializer, true)} ${visit(node.condition, true)}; ${visit(node.incrementor, true)}${visit(node.statement)}`;
+        return `for ${visit(node.initializer, true)}; ${visit(node.condition, true)}; ${visit(node.incrementor, true)}${visit(node.statement)}`;
     }
-    console.log(ts.SyntaxKind[node.kind], node.getText());
+    else if (ts.isForOfStatement(node)) {
+        return `for _,${visit(node.initializer, true)}= range ${visit(node.expression, true)}${visit(node.statement)}`;
+    }
+    else if (ts.isWhileStatement(node)) {
+        return `for ${visit(node.expression, true)}${visit(node.statement)}`;
+    }
+    else if (ts.isDoStatement(node)) {
+        const condition = `\tif !(${visit(node.expression, true)}) {\n\t\t\tbreak \n\t\t}\n\t`;
+        return `for ${visit(node.statement, false, condition)}`;
+    }
+    else if (ts.isIfStatement(node)) {
+        const condition = `if ${visit(node.expression, true)} ${visit(node.thenStatement, true)}`;
+        if (node.elseStatement) {
+            return `${condition} else ${visit(node.elseStatement)}`;
+        }
+        return condition;
+    }
+    const syntaxKind = ts.SyntaxKind[node.kind];
+    if (!['SourceFile', 'FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
+        console.log(ts.SyntaxKind[node.kind], node.getText());
+    }
     ts.forEachChild(node, (subNode) => {
         code += visit(subNode);
         return null;
     });
     return code;
 }
-function getType(typeNode) {
+function getType(typeNode, getArrayType = false) {
     const type = TypeCheker.getTypeFromTypeNode(typeNode);
-    const typeName = TypeCheker.typeToString(type);
+    let typeName = TypeCheker.typeToString(type);
+    const isArray = typeNode?.kind & ts.SyntaxKind.ArrayType;
+    if (isArray) {
+        if (getArrayType) {
+            typeName = typeName.replace('[]', '');
+        }
+        else {
+            return ':';
+        }
+    }
     switch (typeName) {
         case 'number':
             return 'float64';
@@ -85,13 +127,39 @@ function getType(typeNode) {
             return typeName;
     }
 }
-function getFunction(expr) {
-    switch (expr) {
-        case 'console.log':
-            return 'fmt.Println';
-        default:
-            return expr;
+function getAcessString(leftSide, rightSide) {
+    if (rightSide === 'length') {
+        return 'float64(len(arr))';
     }
+    return `${leftSide}.${rightSide}`;
+}
+function getCallString(caller, args) {
+    if (caller === 'console.log') {
+        importedPackages.add('fmt');
+        return `fmt.Println(${args.join(', ')})`;
+    }
+    else if (caller === 'console.time') {
+        importedPackages.add('time');
+        return `${getTimerName(args[0])} := time.Now()`;
+    }
+    else if (caller === 'console.timeEnd') {
+        importedPackages.add('time');
+        importedPackages.add('fmt');
+        return `fmt.Println("Elapsed time:", time.Since(${getTimerName(args[0])}))`;
+    }
+    else if (caller === 'Math.random') {
+        importedPackages.add('math/rand');
+        return 'rand.Float64()';
+    }
+    else if (caller === 'Math.floor') {
+        importedPackages.add('math');
+        return `math.Floor(${args.join(', ')})`;
+    }
+    else if (caller.endsWith('.push')) {
+        const arrayName = caller.substring(0, caller.length - '.push'.length);
+        return `${arrayName} = append(${arrayName},${args.join(', ')})`;
+    }
+    return `${caller}(${args.join(', ')})`;
 }
 function getOperatorText(operator) {
     switch (operator) {
@@ -107,5 +175,11 @@ function getOperatorText(operator) {
             return '++';
         case ts.SyntaxKind.MinusMinusToken:
             return '--';
+        default:
+            console.error('Did not find operator', operator);
+            return '';
     }
+}
+function getTimerName(name) {
+    return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
 }
