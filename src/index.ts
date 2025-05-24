@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import inquirer from 'inquirer';
-import shell from 'shelljs';
 import fs from 'fs-extra';
 import path from 'path';
+import { execa } from 'execa';
 import { transpileToNative } from './transpiler.js';
 import { fileURLToPath } from 'url';
 
@@ -46,7 +46,9 @@ const __dirname = path.dirname(__filename);
   await fs.ensureDir('dist');
   await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
 
-  shell.exec('go build -o dist/native.exe dist/code.go');
+  await execa('go build -o dist/native.exe dist/code.go', {
+    stdio: 'inherit'
+  });
   // await fs.remove('dist/code.go');
 
   if (answers.output) {
@@ -55,7 +57,9 @@ const __dirname = path.dirname(__filename);
   }
 
   if (scriptMode) {
-    shell.exec(path.join('dist', 'native.exe'));
+    await execa('dist/native.exe', {
+      stdio: 'inherit'
+    });
     await fs.remove('dist/native.exe');
   } else {
     console.log('DONE');

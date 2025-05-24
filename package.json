@@ -37,9 +37,9 @@
     "rimraf": "^6.0.1"
   },
   "dependencies": {
+    "execa": "^9.5.3",
     "fs-extra": "^11.3.0",
     "inquirer": "^12.6.1",
-    "shelljs": "^0.10.0",
     "typescript": "^5.8.3"
   }
 }
