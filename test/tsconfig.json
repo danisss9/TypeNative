@@ -4,7 +4,7 @@
       "target": "es2020",    
       "lib": [], 
       "types": ["../types/typenative.d.ts"],
-      "rootDir": "",
+      "rootDir": ".",
       "strict": true,         
       "noImplicitAny": true,
     }

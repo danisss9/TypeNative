@@ -4,13 +4,20 @@ Build native applications using Typescript.
 
 ## PreRequisites
 
-- Go 1.21 or newer.
+- [Nodejs v20](https://nodejs.org/en) or newer.
+- [Go 1.21](https://go.dev/doc/install) or newer.
 
 ## Get Started
 
 - Write a file `test.ts` with content `console.log('Hello World!');` or any other message
 - Run `npx typenative --source test.ts --script`
 - See your message in the terminal
+
+## Create a TypeNative Project
+
+- Run `npx typenative --new`
+- Give your project a name
+- Start writing code
 
 ## Typescript Syntax Support
 
@@ -42,6 +49,8 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | Arrays | ✅ | Basic array operations |
 | Array methods | ✅ | `push` supported |
 | **Functions** |  |  |
+| Function declarations | ✅ | Transpiled to Go functions |
+| Arrow Functions | ✅ | Transpiled to anonymous functions |
 | console.log | ✅ | Mapped to `fmt.Println` |
 | console.time/timeEnd | ✅ | Performance measurement |
 | Math.random | ✅ | Mapped to Go's `rand.Float64()` |
@@ -49,8 +58,6 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | **Unsupported Features** |  |  |
 | Classes | ❌ | Not implemented |
 | Interfaces | ❌ | Not implemented |
-| Functions | ❌ | Custom function definitions not supported |
-| Arrow Functions | ❌ | Not implemented |
 | Async/Await | ❌ | Not implemented |
 | Modules/Imports | ❌ | Not implemented |
 | Generics | ❌ | Not implemented |
