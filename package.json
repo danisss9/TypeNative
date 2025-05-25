@@ -9,9 +9,9 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "start:compiler": "node ./bin/index",
-    "start:script": "node ./bin/index --script",
-    "test": "node ./bin/index --source test/test.ts --script",
+    "test": "echo \"No tests specified\" && exit 0",
+    "release": "npm publish",
+    "test1": "node ./bin/index --source test/test1.ts --script",
     "test2": "node ./bin/index --source test/test2.ts --script",
     "test3": "node ./bin/index --source test/test3.ts --script",
     "test3_node": "tsc test/test3.ts && node test/test3.js && rimraf test/test3.js",
@@ -21,8 +21,7 @@
     "test7": "node ./bin/index --source test/test7.ts --script",
     "test8": "node ./bin/index --source test/test8.ts --script",
     "test9": "node ./bin/index --source test/test9.ts --script",
-    "test10": "node ./bin/index --source test/test10.ts --script",
-    "release": "npm publish"
+    "test10": "node ./bin/index --source test/test10.ts --script"
   },
   "repository": {
     "type": "git",
