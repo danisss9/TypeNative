@@ -1,22 +1,33 @@
 import ts from 'typescript';
 let TypeCheker;
-let importedPackages = new Set();
+const importedPackages = new Set();
+let outsideNodes = [];
 export function transpileToNative(code) {
     const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
     TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
     importedPackages.clear();
-    const transpiledCode = visit(sourceFile);
+    outsideNodes = [];
+    const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
+    const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
     return `package main
 
 ${[...importedPackages].map((pkg) => `import "${pkg}"`).join('\n')}
 
 func main() {
     ${transpiledCode.trim()}
-}`;
 }
-export function visit(node, inline = false, extraBlockContent = '') {
+ 
+${transpiledCodeOutside.trim()}`;
+}
+export function visit(node, options = {}) {
     let code = '';
-    if (ts.isIdentifier(node)) {
+    if (ts.isSourceFile(node)) {
+        return node.statements
+            .map((n) => visit(n, { addFunctionOutside: true }))
+            .filter((n) => !!n)
+            .join(options.inline ? '' : '\n\t');
+    }
+    else if (ts.isIdentifier(node)) {
         return node.text;
     }
     else if (ts.isStringLiteral(node)) {
@@ -36,7 +47,7 @@ export function visit(node, inline = false, extraBlockContent = '') {
         return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
     }
     else if (ts.isBlock(node)) {
-        return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}${extraBlockContent}}${inline ? '' : '\n\t'}`;
+        return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
     }
     else if (ts.isElementAccessExpression(node)) {
         return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
@@ -60,7 +71,7 @@ export function visit(node, inline = false, extraBlockContent = '') {
         return `${getOperatorText(node.operator)}${visit(node.operand)}`;
     }
     else if (ts.isPostfixUnaryExpression(node)) {
-        return `${visit(node.operand, true)}${getOperatorText(node.operator)}`;
+        return `${visit(node.operand, { inline: true })}${getOperatorText(node.operator)}`;
     }
     else if (ts.isBinaryExpression(node)) {
         return `${visit(node.left)} ${node.operatorToken.getText()} ${visit(node.right)}`;
@@ -69,26 +80,35 @@ export function visit(node, inline = false, extraBlockContent = '') {
         return `(${visit(node.expression)})`;
     }
     else if (ts.isVariableDeclarationList(node)) {
-        return (node.declarations.map((n) => visit(n)).join(inline ? ';' : ';\n\t') + (inline ? '' : ';\n\t'));
+        return (node.declarations.map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
+            (options.inline ? '' : ';\n\t'));
     }
     else if (ts.isExpressionStatement(node)) {
-        return visit(node.expression) + (inline ? '' : ';\n\t');
+        return visit(node.expression) + (options.inline ? '' : ';\n\t');
     }
     else if (ts.isForStatement(node)) {
-        return `for ${visit(node.initializer, true)}; ${visit(node.condition, true)}; ${visit(node.incrementor, true)}${visit(node.statement)}`;
+        return `for ${visit(node.initializer, { inline: true })}; ${visit(node.condition, {
+            inline: true
+        })}; ${visit(node.incrementor, { inline: true })}${visit(node.statement)}`;
     }
     else if (ts.isForOfStatement(node)) {
-        return `for _,${visit(node.initializer, true)}= range ${visit(node.expression, true)}${visit(node.statement)}`;
+        return `for _,${visit(node.initializer, { inline: true })}= range ${visit(node.expression, {
+            inline: true
+        })}${visit(node.statement)}`;
     }
     else if (ts.isWhileStatement(node)) {
-        return `for ${visit(node.expression, true)}${visit(node.statement)}`;
+        return `for ${visit(node.expression, { inline: true })}${visit(node.statement)}`;
     }
     else if (ts.isDoStatement(node)) {
-        const condition = `\tif !(${visit(node.expression, true)}) {\n\t\t\tbreak \n\t\t}\n\t`;
-        return `for ${visit(node.statement, false, condition)}`;
+        const condition = `\tif !(${visit(node.expression, {
+            inline: true
+        })}) {\n\t\t\tbreak \n\t\t}\n\t`;
+        return `for ${visit(node.statement, { inline: true, extraBlockContent: condition })}`;
     }
     else if (ts.isIfStatement(node)) {
-        const condition = `if ${visit(node.expression, true)} ${visit(node.thenStatement, !!node.elseStatement)}`;
+        const condition = `if ${visit(node.expression, { inline: true })} ${visit(node.thenStatement, {
+            inline: !!node.elseStatement
+        })}`;
         if (node.elseStatement) {
             return `${condition} else ${visit(node.elseStatement)}`;
         }
@@ -102,30 +122,58 @@ export function visit(node, inline = false, extraBlockContent = '') {
     }
     else if (ts.isCaseClause(node)) {
         const isFallThrough = !node.statements.some((c) => ts.isBreakStatement(c));
-        return `case ${visit(node.expression, true)}: \n\t\t\t${node.statements
+        return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${node.statements
+            .filter((n) => !ts.isBreakStatement(n))
             .map((s) => visit(s))
             .join('')}${isFallThrough ? 'fallthrough\n\t' : ''}`;
     }
     else if (ts.isDefaultClause(node)) {
-        return `default: \n\t\t\t${node.statements.map((s) => visit(s)).join('')}`;
+        return `default: \n\t\t\t${node.statements
+            .filter((n) => !ts.isBreakStatement(n))
+            .map((s) => visit(s))
+            .join('')}`;
     }
     else if (ts.isBreakStatement(node)) {
-        return '';
+        return 'break';
+    }
+    else if (ts.isReturnStatement(node)) {
+        return (`return ${node.expression ? visit(node.expression) : ''}` + (options.inline ? '' : ';\n\t'));
+    }
+    else if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) {
+        if (options.addFunctionOutside) {
+            outsideNodes.push(node);
+            return '';
+        }
+        const name = visit(node.name, { inline: true });
+        const parameters = node.parameters
+            .map((p) => `${visit(p.name)} ${getType(p.type)}`)
+            .join(', ');
+        const returnType = node.type ? ` ${getType(node.type)}` : '';
+        if (options.isOutside) {
+            return `func ${name}(${parameters})${returnType} ${visit(node.body)}`;
+        }
+        return `${name} := func(${parameters})${returnType} ${visit(node.body)}`;
+    }
+    else if (ts.isArrowFunction(node)) {
+        const parameters = node.parameters
+            .map((p) => `${visit(p.name)} ${getType(p.type)}`)
+            .join(', ');
+        const returnType = node.type ? ` ${getType(node.type)}` : '';
+        return `func(${parameters})${returnType} ${visit(node.body)}`;
     }
     const syntaxKind = ts.SyntaxKind[node.kind];
-    if (!['SourceFile', 'FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
+    if (!['FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
         console.log(ts.SyntaxKind[node.kind], node.getText());
     }
     ts.forEachChild(node, (subNode) => {
         code += visit(subNode);
-        return null;
     });
     return code;
 }
 function getType(typeNode, getArrayType = false) {
     const type = TypeCheker.getTypeFromTypeNode(typeNode);
     let typeName = TypeCheker.typeToString(type);
-    const isArray = typeNode?.kind & ts.SyntaxKind.ArrayType;
+    const isArray = typeName.includes('[]');
     if (isArray) {
         if (getArrayType) {
             typeName = typeName.replace('[]', '');
@@ -141,6 +189,8 @@ function getType(typeNode, getArrayType = false) {
             return 'bool';
         case 'any':
             return ':';
+        case 'void':
+            return '';
         default:
             return typeName;
     }
