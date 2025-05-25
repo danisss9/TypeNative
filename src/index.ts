@@ -125,7 +125,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${projectName}.exe`
     },
     devDependencies: {
-      typenative: '^0.0.13'
+      typenative: '^0.0.14'
     }
   };
   return JSON.stringify(pckg, null, 2);
