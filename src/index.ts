@@ -125,7 +125,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${projectName}.exe`
     },
     devDependencies: {
-      typenative: '^0.12.0'
+      typenative: '^0.0.13'
     }
   };
   return JSON.stringify(pckg, null, 2);
@@ -133,11 +133,11 @@ function getPackageJson(projectName: string): string {
 
 function getTsConfig(): string {
   const tsConfig = {
-    include: ['*.ts'],
+    include: ['**/*.ts'],
     compilerOptions: {
       target: 'es2020',
       lib: [],
-      types: ['./node_modules/types/typenative.d.ts'],
+      types: ['./node_modules/typenative/types/typenative.d.ts'],
       rootDir: '.',
       strict: true,
       noImplicitAny: true
@@ -161,13 +161,13 @@ This project was created using TypeNative, a tool to transpile TypeScript code t
 
 ## How to Run
 
-1. Install dependencies: \`npm install\`
-2. Build the project: \`npm run build\`
-3. Run the executable: \`./dist/native.exe\`
-
-## How to Use
-
 You can write your TypeScript code in the \`main.ts\` file. The code will be transpiled to Go and compiled into a native executable.
 You can also run the code directly in script mode using \`npm run execute\`.
+
+## How to Build
+
+1. Install dependencies: \`npm install\` (if not done already)
+2. Build the project: \`npm run build\`
+3. Run the executable: \`./bin/${projectName}.exe\`
 `;
 }
