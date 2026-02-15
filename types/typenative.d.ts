@@ -52,3 +52,15 @@ interface Math {
   floor(x: number): number;
 }
 declare var Math: Math;
+
+interface Promise<T> {
+  then(callback: (value: T) => void): void;
+}
+
+interface PromiseConstructor {
+  new <T>(executor: (resolve: (value: T) => void) => void): Promise<T>;
+}
+
+declare var Promise: PromiseConstructor;
+
+declare function setTimeout(callback: () => void, ms: number): void;

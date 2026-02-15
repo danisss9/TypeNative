@@ -3,12 +3,14 @@ let TypeCheker;
 const importedPackages = new Set();
 let outsideNodes = [];
 const classNames = new Set();
+let promiseResolveName = '';
 export function transpileToNative(code) {
     const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
     TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
     importedPackages.clear();
     outsideNodes = [];
     classNames.clear();
+    promiseResolveName = '';
     const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
     const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
     return `package main
@@ -65,6 +67,14 @@ export function visit(node, options = {}) {
         return `${type === ':' ? '' : 'var '}${visit(node.name)} ${type}${type === ':' ? '' : ' '}${initializer}`;
     }
     else if (ts.isCallExpression(node)) {
+        // Handle setTimeout specially to get raw delay value
+        if (ts.isIdentifier(node.expression) && node.expression.text === 'setTimeout') {
+            importedPackages.add('time');
+            const callback = visit(node.arguments[0]);
+            const delayNode = node.arguments[1];
+            const delay = ts.isNumericLiteral(delayNode) ? delayNode.text : visit(delayNode);
+            return `time.AfterFunc(${delay} * time.Millisecond, ${callback.trimEnd()})`;
+        }
         const caller = visit(node.expression);
         const args = node.arguments.map((a) => visit(a));
         return getCallString(caller, args);
@@ -85,6 +95,9 @@ export function visit(node, options = {}) {
     }
     else if (ts.isParenthesizedExpression(node)) {
         return `(${visit(node.expression)})`;
+    }
+    else if (ts.isAwaitExpression(node)) {
+        return `<-${visit(node.expression)}`;
     }
     else if (ts.isVariableDeclarationList(node)) {
         return (node.declarations.map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
@@ -144,6 +157,12 @@ export function visit(node, options = {}) {
         return 'break';
     }
     else if (ts.isReturnStatement(node)) {
+        // Handle return new Promise(...)
+        if (node.expression && ts.isNewExpression(node.expression) &&
+            ts.isIdentifier(node.expression.expression) &&
+            node.expression.expression.text === 'Promise') {
+            return visitPromiseReturn(node.expression, options);
+        }
         return (`return ${node.expression ? visit(node.expression) : ''}` + (options.inline ? '' : ';\n\t'));
     }
     else if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) {
@@ -230,9 +249,7 @@ export function visit(node, options = {}) {
         let result = `type ${name} struct {\n${fields.join('\n')}\n}\n\n`;
         const ctor = node.members.find((m) => ts.isConstructorDeclaration(m));
         if (ctor) {
-            const params = ctor.parameters
-                .map((p) => `${visit(p.name)} ${getType(p.type)}`)
-                .join(', ');
+            const params = ctor.parameters.map((p) => `${visit(p.name)} ${getType(p.type)}`).join(', ');
             const bodyStatements = ctor.body?.statements
                 .filter((s) => {
                 if (ts.isExpressionStatement(s) && ts.isCallExpression(s.expression)) {
@@ -261,6 +278,9 @@ export function visit(node, options = {}) {
     }
     else if (ts.isNewExpression(node)) {
         const className = visit(node.expression);
+        if (className === 'Promise') {
+            return visitNewPromise(node);
+        }
         const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
         return `New${className}(${args.join(', ')})`;
     }
@@ -305,6 +325,9 @@ function getType(typeNode, getArrayType = false) {
         return ':';
     if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
+        if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
+            return `chan ${getType(typeNode.typeArguments[0])}`;
+        }
         if (classNames.has(name)) {
             return `*${name}`;
         }
@@ -341,6 +364,9 @@ function getAcessString(leftSide, rightSide) {
     return `${leftSide}.${rightSide}`;
 }
 function getCallString(caller, args) {
+    if (promiseResolveName && caller === promiseResolveName) {
+        return `ch <- ${args[0]}`;
+    }
     if (caller === 'console.log') {
         importedPackages.add('fmt');
         return `fmt.Println(${args.join(', ')})`;
@@ -389,4 +415,47 @@ function getOperatorText(operator) {
 }
 function getTimerName(name) {
     return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
+}
+function getPromiseChannelType(node) {
+    let parent = node.parent;
+    while (parent) {
+        if (ts.isFunctionDeclaration(parent) || ts.isMethodDeclaration(parent) || ts.isFunctionExpression(parent)) {
+            if (parent.type && ts.isTypeReferenceNode(parent.type) && ts.isIdentifier(parent.type.typeName)) {
+                if (parent.type.typeName.text === 'Promise' && parent.type.typeArguments && parent.type.typeArguments.length > 0) {
+                    return getType(parent.type.typeArguments[0]);
+                }
+            }
+            break;
+        }
+        parent = parent.parent;
+    }
+    return 'interface{}';
+}
+function visitPromiseReturn(node, options) {
+    const callback = node.arguments?.[0];
+    if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
+        return `return ${visit(node)}` + (options.inline ? '' : ';\n\t');
+    }
+    const channelType = getPromiseChannelType(node);
+    const resolveParam = callback.parameters[0];
+    const resolveName = resolveParam ? visit(resolveParam.name) : '';
+    const prevResolveName = promiseResolveName;
+    promiseResolveName = resolveName;
+    const body = ts.isBlock(callback.body) ? visit(callback.body) : `{ ${visit(callback.body)} }`;
+    promiseResolveName = prevResolveName;
+    return `ch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch` + (options.inline ? '' : ';\n\t');
+}
+function visitNewPromise(node) {
+    const callback = node.arguments?.[0];
+    if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
+        return 'NewPromise()';
+    }
+    const channelType = getPromiseChannelType(node);
+    const resolveParam = callback.parameters[0];
+    const resolveName = resolveParam ? visit(resolveParam.name) : '';
+    const prevResolveName = promiseResolveName;
+    promiseResolveName = resolveName;
+    const body = ts.isBlock(callback.body) ? visit(callback.body) : `{ ${visit(callback.body)} }`;
+    promiseResolveName = prevResolveName;
+    return `func() chan ${channelType} {\n\t\tch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch;\n\t}()`;
 }
