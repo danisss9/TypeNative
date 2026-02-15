@@ -14,4 +14,6 @@ for (let i = 2; i <= n; i++) {
 }
 
 console.log(c);
+assert(c > 0, 'Fibonacci result should be positive');
+assert(a > 0, 'Fibonacci a should be positive');
 console.timeEnd('Fibonacci calculation');

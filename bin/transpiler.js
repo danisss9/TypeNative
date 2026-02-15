@@ -158,7 +158,8 @@ export function visit(node, options = {}) {
     }
     else if (ts.isReturnStatement(node)) {
         // Handle return new Promise(...)
-        if (node.expression && ts.isNewExpression(node.expression) &&
+        if (node.expression &&
+            ts.isNewExpression(node.expression) &&
             ts.isIdentifier(node.expression.expression) &&
             node.expression.expression.text === 'Promise') {
             return visitPromiseReturn(node.expression, options);
@@ -367,6 +368,10 @@ function getCallString(caller, args) {
     if (promiseResolveName && caller === promiseResolveName) {
         return `ch <- ${args[0]}`;
     }
+    if (caller === 'assert') {
+        const message = args.length > 1 ? args[1] : '"Assertion failed"';
+        return `if !(${args[0]}) {\n\t\tpanic(${message})\n\t}`;
+    }
     if (caller === 'console.log') {
         importedPackages.add('fmt');
         return `fmt.Println(${args.join(', ')})`;
@@ -419,9 +424,15 @@ function getTimerName(name) {
 function getPromiseChannelType(node) {
     let parent = node.parent;
     while (parent) {
-        if (ts.isFunctionDeclaration(parent) || ts.isMethodDeclaration(parent) || ts.isFunctionExpression(parent)) {
-            if (parent.type && ts.isTypeReferenceNode(parent.type) && ts.isIdentifier(parent.type.typeName)) {
-                if (parent.type.typeName.text === 'Promise' && parent.type.typeArguments && parent.type.typeArguments.length > 0) {
+        if (ts.isFunctionDeclaration(parent) ||
+            ts.isMethodDeclaration(parent) ||
+            ts.isFunctionExpression(parent)) {
+            if (parent.type &&
+                ts.isTypeReferenceNode(parent.type) &&
+                ts.isIdentifier(parent.type.typeName)) {
+                if (parent.type.typeName.text === 'Promise' &&
+                    parent.type.typeArguments &&
+                    parent.type.typeArguments.length > 0) {
                     return getType(parent.type.typeArguments[0]);
                 }
             }
@@ -443,7 +454,8 @@ function visitPromiseReturn(node, options) {
     promiseResolveName = resolveName;
     const body = ts.isBlock(callback.body) ? visit(callback.body) : `{ ${visit(callback.body)} }`;
     promiseResolveName = prevResolveName;
-    return `ch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch` + (options.inline ? '' : ';\n\t');
+    return (`ch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch` +
+        (options.inline ? '' : ';\n\t'));
 }
 function visitNewPromise(node) {
     const callback = node.arguments?.[0];

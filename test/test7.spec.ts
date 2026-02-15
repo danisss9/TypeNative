@@ -32,7 +32,11 @@ class Complex extends Basic implements IComplex {
 
 const simpleObj = new Basic();
 console.log('Should print true:', simpleObj.isBasic());
+assert(simpleObj.isBasic() === true, 'Basic.isBasic() should return true');
 const obj = new Complex('Test');
 console.log('Should print false:', obj.isBasic());
+assert(obj.isBasic() === false, 'Complex.isBasic() should return false');
 console.log('Should print true:', obj.isComplex('Test'));
+assert(obj.isComplex('Test') === true, 'Complex.isComplex(Test) should return true');
 console.log('Should print false:', obj.isComplex('Not Test'));
+assert(obj.isComplex('Not Test') === false, 'Complex.isComplex(Not Test) should return false');

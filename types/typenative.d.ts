@@ -64,3 +64,5 @@ interface PromiseConstructor {
 declare var Promise: PromiseConstructor;
 
 declare function setTimeout(callback: () => void, ms: number): void;
+
+declare function assert(condition: boolean, message?: string): void;

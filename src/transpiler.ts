@@ -387,6 +387,10 @@ function getCallString(caller: string, args: string[]): string {
   if (promiseResolveName && caller === promiseResolveName) {
     return `ch <- ${args[0]}`;
   }
+  if (caller === 'assert') {
+    const message = args.length > 1 ? args[1] : '"Assertion failed"';
+    return `if !(${args[0]}) {\n\t\tpanic(${message})\n\t}`;
+  }
   if (caller === 'console.log') {
     importedPackages.add('fmt');
     return `fmt.Println(${args.join(', ')})`;

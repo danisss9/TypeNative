@@ -10,6 +10,7 @@ async function asyncFunc(): Promise<string> {
 async function run() {
   const result = await asyncFunc();
   console.log(result);
+  assert(result === 'Async Result', 'Async result should be Async Result');
 }
 
 run();

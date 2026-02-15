@@ -1,5 +1,6 @@
 // If and Switch statements
 const condition: boolean = true;
+assert(condition === true, 'Condition should be true');
 if (condition) {
   console.log('This is a if statement');
 } else if (!condition) {
@@ -9,6 +10,8 @@ if (condition) {
 }
 
 const number: number = Math.floor(Math.random() * 5);
+assert(number >= 0, 'Random number should be >= 0');
+assert(number < 5, 'Random number should be < 5');
 if (number > 5) {
   console.log('This should not be printed');
 }
