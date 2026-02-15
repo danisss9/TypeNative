@@ -1,10 +1,19 @@
 import ts from 'typescript';
+import { customAlphabet } from 'nanoid';
+
+const goSafeId = customAlphabet(
+  'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+  8
+);
 
 let TypeCheker: ts.TypeChecker;
 const importedPackages = new Set<string>();
 let outsideNodes: ts.Node[] = [];
 const classNames = new Set<string>();
 let promiseResolveName: string = '';
+const dangerousNames = new Set(['main']);
+const renamedFunctions = new Map<string, string>();
+const variableTypes = new Map<string, string>();
 
 export function transpileToNative(code: string): string {
   const sourceFile = ts.createSourceFile(
@@ -20,6 +29,8 @@ export function transpileToNative(code: string): string {
   outsideNodes = [];
   classNames.clear();
   promiseResolveName = '';
+  renamedFunctions.clear();
+  variableTypes.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -43,7 +54,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       .filter((n) => !!n)
       .join(options.inline ? '' : '\n\t');
   } else if (ts.isIdentifier(node)) {
-    return node.text;
+    if (node.text === 'undefined') return 'nil';
+    return getSafeName(node.text);
   } else if (ts.isStringLiteral(node)) {
     return `"${node.text}"`;
   } else if (ts.isNumericLiteral(node)) {
@@ -52,6 +64,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `true`;
   } else if (ts.isToken(node) && node.kind === ts.SyntaxKind.FalseKeyword) {
     return `false`;
+  } else if (ts.isToken(node) && node.kind === ts.SyntaxKind.NullKeyword) {
+    return `nil`;
   } else if (ts.isArrayLiteralExpression(node)) {
     const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type!, true) : '';
     return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
@@ -64,10 +78,37 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isPropertyAccessExpression(node)) {
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
-    return getAcessString(leftSide, rightSide);
+    const objectType = resolveExpressionType(node.expression);
+    return getAcessString(leftSide, rightSide, objectType);
   } else if (ts.isVariableDeclaration(node)) {
     const type = getType(node.type!);
-    const initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
+    // Track variable type for type-aware method dispatch
+    if (ts.isIdentifier(node.name)) {
+      const cat = node.type ? getTypeCategory(node.type) : undefined;
+      if (cat) {
+        variableTypes.set(node.name.text, cat);
+      } else if (
+        node.initializer &&
+        ts.isNewExpression(node.initializer) &&
+        ts.isIdentifier(node.initializer.expression)
+      ) {
+        if (classNames.has(node.initializer.expression.text)) {
+          variableTypes.set(node.name.text, 'class');
+        }
+      }
+    }
+    let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
+    // Wrap non-nil values assigned to nullable primitive pointer types
+    // Only wrap for primitive pointers (*string, *float64, *bool), not class pointers
+    if (
+      node.initializer &&
+      type.startsWith('*') &&
+      !isNilLiteral(node.initializer) &&
+      ['*string', '*float64', '*bool'].includes(type)
+    ) {
+      const value = visit(node.initializer);
+      initializer = `= func() ${type} { v := ${value}; return &v }()`;
+    }
     return `${type === ':' ? '' : 'var '}${visit(node.name)} ${type}${
       type === ':' ? '' : ' '
     }${initializer}`;
@@ -81,9 +122,15 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       return `time.AfterFunc(${delay} * time.Millisecond, ${callback.trimEnd()})`;
     }
     const caller = visit(node.expression);
+    const safeCaller = getSafeName(caller);
     const typeArgs = getTypeArguments(node.typeArguments);
     const args = node.arguments.map((a) => visit(a));
-    return getCallString(caller, args, typeArgs);
+    // Resolve object type for type-aware method dispatch
+    let objectType: string | undefined;
+    if (ts.isPropertyAccessExpression(node.expression)) {
+      objectType = resolveExpressionType(node.expression.expression);
+    }
+    return getCallString(safeCaller, args, typeArgs, objectType);
   } else if (ts.isPrefixUnaryExpression(node)) {
     return `${getOperatorText(node.operator)}${visit(node.operand)}`;
   } else if (ts.isPostfixUnaryExpression(node)) {
@@ -164,6 +211,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     }
 
     const name = visit(node.name!, { inline: true });
+    const safeName = getSafeName(name);
     const typeParams = getTypeParameters(node.typeParameters);
     const parameters = node.parameters
       .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
@@ -171,10 +219,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const returnType = node.type ? ` ${getType(node.type)}` : '';
 
     if (options.isOutside) {
-      return `func ${name}${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
+      return `func ${safeName}${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
     }
 
-    return `${name} := func${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
+    return `${safeName} := func${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
   } else if (ts.isArrowFunction(node)) {
     const parameters = node.parameters
       .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
@@ -245,7 +293,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     for (const member of node.members) {
       if (ts.isPropertyDeclaration(member)) {
         const fieldName = visit(member.name);
-        const fieldType = member.type ? getType(member.type) : 'interface{}';
+        let fieldType: string;
+        if (member.type && ts.isArrayTypeNode(member.type)) {
+          fieldType = `[]${getType(member.type, true)}`;
+        } else {
+          fieldType = member.type ? getType(member.type) : 'interface{}';
+        }
         fields.push(`\t${fieldName} ${fieldType}`);
       }
     }
@@ -293,7 +346,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     }
     const typeArgs = getTypeArguments(node.typeArguments);
     const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
-    return `New${className}${typeArgs}(${args.join(', ')})`;  
+    return `New${className}${typeArgs}(${args.join(', ')})`;
   } else if (ts.isObjectLiteralExpression(node)) {
     let typeName = '';
     if (ts.isVariableDeclaration(node.parent) && node.parent.type) {
@@ -313,6 +366,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `${typeName}{${properties}}`;
   } else if (ts.isPropertyAssignment(node)) {
     return `${visit(node.name)}: ${visit(node.initializer)}`;
+  } else if (ts.isNonNullExpression(node)) {
+    return visit(node.expression);
   }
 
   const syntaxKind = ts.SyntaxKind[node.kind];
@@ -344,6 +399,26 @@ function getTypeText(typeNode: ts.TypeNode): string {
 
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   if (!typeNode) return ':';
+  // Handle union types (e.g. string | null, number | undefined)
+  if (ts.isUnionTypeNode(typeNode)) {
+    const nonNullTypes = typeNode.types.filter(
+      (t) =>
+        t.kind !== ts.SyntaxKind.NullKeyword &&
+        t.kind !== ts.SyntaxKind.UndefinedKeyword &&
+        !(ts.isLiteralTypeNode(t) && t.literal.kind === ts.SyntaxKind.NullKeyword)
+    );
+    if (nonNullTypes.length === 1 && nonNullTypes.length < typeNode.types.length) {
+      // This is a nullable type T | null or T | undefined
+      const innerType = getType(nonNullTypes[0]);
+      if (['float64', 'string', 'bool'].includes(innerType)) {
+        return `*${innerType}`;
+      }
+      // Pointer/interface types already support nil
+      return innerType;
+    }
+    // Non-nullable union or multi-type union → interface{}
+    return 'interface{}';
+  }
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
     if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
@@ -382,43 +457,247 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   }
 }
 
-function getAcessString(leftSide: string, rightSide: string): string {
-  if (rightSide === 'length') {
-    return 'float64(len(arr))';
+function getTypeCategory(typeNode: ts.TypeNode | undefined): string | undefined {
+  if (!typeNode) return undefined;
+  if (ts.isArrayTypeNode(typeNode)) return 'array';
+  if (typeNode.kind === ts.SyntaxKind.StringKeyword) return 'string';
+  if (typeNode.kind === ts.SyntaxKind.NumberKeyword) return 'number';
+  if (typeNode.kind === ts.SyntaxKind.BooleanKeyword) return 'boolean';
+  if (ts.isUnionTypeNode(typeNode)) {
+    const nonNullTypes = typeNode.types.filter(
+      (t) =>
+        t.kind !== ts.SyntaxKind.NullKeyword &&
+        t.kind !== ts.SyntaxKind.UndefinedKeyword &&
+        !(ts.isLiteralTypeNode(t) && t.literal.kind === ts.SyntaxKind.NullKeyword)
+    );
+    if (nonNullTypes.length === 1) return getTypeCategory(nonNullTypes[0]);
+  }
+  if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
+    const name = typeNode.typeName.text;
+    if (classNames.has(name)) return 'class';
+    return name;
+  }
+  return undefined;
+}
+
+function resolveExpressionType(expr: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expr)) {
+    return variableTypes.get(expr.text);
+  }
+  if (expr.kind === ts.SyntaxKind.ThisKeyword) {
+    return 'class';
+  }
+  return undefined;
+}
+
+function isNilLiteral(node: ts.Expression): boolean {
+  if (node.kind === ts.SyntaxKind.NullKeyword) return true;
+  if (ts.isIdentifier(node) && node.text === 'undefined') return true;
+  return false;
+}
+
+function getAcessString(leftSide: string, rightSide: string, objectType?: string): string {
+  if (rightSide === 'length' && objectType !== 'class') {
+    return `float64(len(${leftSide}))`;
   }
 
   return `${leftSide}.${rightSide}`;
 }
 
-function getCallString(caller: string, args: string[], typeArgs: string = ''): string {
-  if (promiseResolveName && caller === promiseResolveName) {
-    return `ch <- ${args[0]}`;
-  }
-  if (caller === 'assert') {
+type CallHandler = (caller: string, args: string[], typeArgs: string) => string;
+
+const callHandlers: Record<string, CallHandler> = {
+  assert: (_caller, args) => {
     const message = args.length > 1 ? args[1] : '"Assertion failed"';
     return `if !(${args[0]}) {\n\t\tpanic(${message})\n\t}`;
-  }
-  if (caller === 'console.log') {
+  },
+  'console.log': (_caller, args) => {
     importedPackages.add('fmt');
     return `fmt.Println(${args.join(', ')})`;
-  } else if (caller === 'console.time') {
+  },
+  'console.time': (_caller, args) => {
     importedPackages.add('time');
     return `${getTimerName(args[0])} := time.Now()`;
-  } else if (caller === 'console.timeEnd') {
+  },
+  'console.timeEnd': (_caller, args) => {
     importedPackages.add('time');
     importedPackages.add('fmt');
     return `fmt.Println("Elapsed time:", time.Since(${getTimerName(args[0])}))`;
-  } else if (caller === 'Math.random') {
+  },
+  'Math.random': () => {
     importedPackages.add('math/rand');
     return 'rand.Float64()';
-  } else if (caller === 'Math.floor') {
+  },
+  'Math.floor': (_caller, args) => {
     importedPackages.add('math');
-    return `math.Floor(${args.join(', ')})`;
-  } else if (caller.endsWith('.push')) {
-    const arrayName = caller.substring(0, caller.length - '.push'.length);
-    return `${arrayName} = append(${arrayName},${args.join(', ')})`;
+    return `math.Floor(${args[0]})`;
+  },
+  'Math.ceil': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Ceil(${args[0]})`;
+  },
+  'Math.round': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Round(${args[0]})`;
+  },
+  'Math.abs': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Abs(${args[0]})`;
+  },
+  'Math.max': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Max(${args[0]}, ${args[1]})`;
+  },
+  'Math.min': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Min(${args[0]}, ${args[1]})`;
+  },
+  'Math.sqrt': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Sqrt(${args[0]})`;
+  },
+  'Math.pow': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Pow(${args[0]}, ${args[1]})`;
+  },
+  parseInt: (_caller, args) => {
+    importedPackages.add('strconv');
+    return `func() float64 { v, _ := strconv.Atoi(${args[0]}); return float64(v) }()`;
+  },
+  parseFloat: (_caller, args) => {
+    importedPackages.add('strconv');
+    return `func() float64 { v, _ := strconv.ParseFloat(${args[0]}, 64); return v }()`;
   }
+};
 
+type MethodHandler = (obj: string, args: string[]) => string;
+
+const stringMethodHandlers: Record<string, MethodHandler> = {
+  split: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.Split(${obj}, ${args[0]})`;
+  },
+  trim: (obj) => {
+    importedPackages.add('strings');
+    return `strings.TrimSpace(${obj})`;
+  },
+  trimStart: (obj) => {
+    importedPackages.add('strings');
+    return `strings.TrimLeft(${obj}, " \\t\\n\\r")`;
+  },
+  trimEnd: (obj) => {
+    importedPackages.add('strings');
+    return `strings.TrimRight(${obj}, " \\t\\n\\r")`;
+  },
+  toUpperCase: (obj) => {
+    importedPackages.add('strings');
+    return `strings.ToUpper(${obj})`;
+  },
+  toLowerCase: (obj) => {
+    importedPackages.add('strings');
+    return `strings.ToLower(${obj})`;
+  },
+  indexOf: (obj, args) => {
+    importedPackages.add('strings');
+    return `float64(strings.Index(${obj}, ${args[0]}))`;
+  },
+  includes: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.Contains(${obj}, ${args[0]})`;
+  },
+  startsWith: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.HasPrefix(${obj}, ${args[0]})`;
+  },
+  endsWith: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.HasSuffix(${obj}, ${args[0]})`;
+  },
+  replace: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.Replace(${obj}, ${args[0]}, ${args[1]}, 1)`;
+  },
+  replaceAll: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.ReplaceAll(${obj}, ${args[0]}, ${args[1]})`;
+  },
+  repeat: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.Repeat(${obj}, int(${args[0]}))`;
+  },
+  charAt: (obj, args) => `string(${obj}[int(${args[0]})])`,
+  substring: (obj, args) => {
+    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
+    return `${obj}[int(${args[0]}):]`;
+  },
+  slice: (obj, args) => {
+    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
+    return `${obj}[int(${args[0]}):]`;
+  },
+  concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
+  toString: (obj: string) => {
+    importedPackages.add('fmt');
+    return `fmt.Sprintf("%v", ${obj})`;
+  }
+};
+
+const arrayMethodHandlers: Record<string, MethodHandler> = {
+  push: (obj, args) => `${obj} = append(${obj}, ${args.join(', ')})`,
+  join: (obj, args) => {
+    importedPackages.add('strings');
+    return `strings.Join(${obj}, ${args[0] ?? '""'})`;
+  },
+  slice: (obj, args) => {
+    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
+    return `${obj}[int(${args[0]}):]`;
+  },
+  toString: (obj: string) => {
+    importedPackages.add('fmt');
+    return `fmt.Sprintf("%v", ${obj})`;
+  }
+};
+
+function getDynamicCallHandler(caller: string, objectType?: string): CallHandler | null {
+  if (promiseResolveName && caller === promiseResolveName) {
+    return (_caller, args) => `ch <- ${args[0]}`;
+  }
+  const dotIndex = caller.lastIndexOf('.');
+  if (dotIndex !== -1) {
+    const methodName = caller.substring(dotIndex + 1);
+
+    // Class instances use their own methods — never intercept
+    if (objectType === 'class') return null;
+
+    let handler: MethodHandler | undefined;
+    if (objectType === 'string') {
+      handler = stringMethodHandlers[methodName];
+    } else if (objectType === 'array') {
+      handler = arrayMethodHandlers[methodName];
+    } else {
+      // Unknown type: try both maps for backward compatibility
+      handler = stringMethodHandlers[methodName] ?? arrayMethodHandlers[methodName];
+    }
+
+    if (handler) {
+      return (c, args) => {
+        const obj = c.substring(0, dotIndex);
+        return handler!(obj, args);
+      };
+    }
+  }
+  return null;
+}
+
+function getCallString(
+  caller: string,
+  args: string[],
+  typeArgs: string = '',
+  objectType?: string
+): string {
+  const handler = callHandlers[caller] ?? getDynamicCallHandler(caller, objectType);
+  if (handler) {
+    return handler(caller, args, typeArgs);
+  }
   return `${caller}${typeArgs}(${args.join(', ')})`;
 }
 
@@ -470,6 +749,17 @@ function getTypeArguments(typeArguments: readonly ts.TypeNode[] | undefined): st
   if (!typeArguments || typeArguments.length === 0) return '';
   const args = typeArguments.map((ta) => getType(ta));
   return `[${args.join(', ')}]`;
+}
+
+function getSafeName(name: string): string {
+  if (!dangerousNames.has(name)) {
+    return name;
+  }
+
+  if (!renamedFunctions.has(name)) {
+    renamedFunctions.set(name, `${name}_${goSafeId()}`);
+  }
+  return renamedFunctions.get(name)!;
 }
 
 function getPromiseChannelType(node: ts.NewExpression): string {

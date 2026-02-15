@@ -22,7 +22,10 @@
     "test8": "node ./bin/index --source test/test8.spec.ts --script",
     "test9": "node ./bin/index --source test/test9.spec.ts --script",
     "test10": "node ./bin/index --source test/test10.spec.ts --script",
-    "test11": "node ./bin/index --source test/test11.spec.ts --script"
+    "test11": "node ./bin/index --source test/test11.spec.ts --script",
+    "test12": "node ./bin/index --source test/test12.spec.ts --script",
+    "test13": "node ./bin/index --source test/test13.spec.ts --script",
+    "test14": "node ./bin/index --source test/test14.spec.ts --script"
   },
   "repository": {
     "type": "git",
@@ -44,6 +47,7 @@
     "execa": "^9.5.3",
     "fs-extra": "^11.3.0",
     "inquirer": "^12.6.1",
+    "nanoid": "^5.1.6",
     "typescript": "^5.8.3"
   }
 }

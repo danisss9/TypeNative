@@ -33,11 +33,73 @@ interface Array<T> extends IterableIterator<T> {
    */
   length: number;
   /**
-   * Returns a string representation of an array.
+   * Appends new elements to the end of an array.
    */
   push(element: T): void;
+  /**
+   * Adds all the elements of an array into a string, separated by the specified separator string.
+   */
+  join(separator?: string): string;
+  /**
+   * Returns a copy of a section of an array.
+   */
+  slice(start?: number, end?: number): T[];
+  /**
+   * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
+   */
+  indexOf(searchElement: T): number;
+  /**
+   * Determines whether an array includes a certain element.
+   */
+  includes(searchElement: T): boolean;
+  /**
+   * Returns a string representation of an array.
+   */
+  toString(): string;
 
   [n: number]: T;
+}
+
+interface String {
+  /** Returns the length of the string. */
+  length: number;
+  /** Returns the character at the specified index. */
+  charAt(pos: number): string;
+  /** Returns the position of the first occurrence of a substring. */
+  indexOf(searchString: string): number;
+  /** Determines whether a string contains the specified substring. */
+  includes(searchString: string): boolean;
+  /** Determines whether a string begins with the specified characters. */
+  startsWith(searchString: string): boolean;
+  /** Determines whether a string ends with the specified characters. */
+  endsWith(searchString: string): boolean;
+  /** Splits a string into substrings using the specified separator. */
+  split(separator: string): string[];
+  /** Removes whitespace from both ends of a string. */
+  trim(): string;
+  /** Removes whitespace from the beginning of a string. */
+  trimStart(): string;
+  /** Removes whitespace from the end of a string. */
+  trimEnd(): string;
+  /** Converts all characters to uppercase. */
+  toUpperCase(): string;
+  /** Converts all characters to lowercase. */
+  toLowerCase(): string;
+  /** Replaces the first occurrence of a substring. */
+  replace(searchValue: string, replaceValue: string): string;
+  /** Replaces all occurrences of a substring. */
+  replaceAll(searchValue: string, replaceValue: string): string;
+  /** Returns a section of a string. */
+  substring(start: number, end?: number): string;
+  /** Returns a section of a string. */
+  slice(start: number, end?: number): string;
+  /** Returns a string repeated the specified number of times. */
+  repeat(count: number): string;
+  /** Concatenates strings. */
+  concat(...strings: string[]): string;
+  /** Returns a string representation. */
+  toString(): string;
+  [index: number]: string;
 }
 
 interface Console {
@@ -50,8 +112,18 @@ declare var console: Console;
 interface Math {
   random(): number;
   floor(x: number): number;
+  ceil(x: number): number;
+  round(x: number): number;
+  abs(x: number): number;
+  max(a: number, b: number): number;
+  min(a: number, b: number): number;
+  sqrt(x: number): number;
+  pow(base: number, exponent: number): number;
 }
 declare var Math: Math;
+
+declare function parseInt(s: string): number;
+declare function parseFloat(s: string): number;
 
 interface Promise<T> {
   then(callback: (value: T) => void): void;
