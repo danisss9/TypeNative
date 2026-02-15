@@ -102,8 +102,7 @@ export function visit(node, options = {}) {
                     variableTypes.set(node.name.text, 'class');
                 }
             }
-            else if (node.initializer &&
-                ts.isRegularExpressionLiteral(node.initializer)) {
+            else if (node.initializer && ts.isRegularExpressionLiteral(node.initializer)) {
                 variableTypes.set(node.name.text, 'RegExp');
             }
         }
@@ -698,7 +697,10 @@ function getDynamicCallHandler(caller, objectType) {
         }
         else {
             // Unknown type: try both maps for backward compatibility
-            handler = stringMethodHandlers[methodName] ?? arrayMethodHandlers[methodName] ?? regexpMethodHandlers[methodName];
+            handler =
+                stringMethodHandlers[methodName] ??
+                    arrayMethodHandlers[methodName] ??
+                    regexpMethodHandlers[methodName];
         }
         if (handler) {
             return (c, args) => {

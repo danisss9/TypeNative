@@ -5,6 +5,13 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.16] - 2025-02-15
+
+### Added
+
+- RegExp support: regex literals (`/pattern/flags`), `new RegExp()`, `test()`, and `exec()` mapped to Go's `regexp` package
+- Universal `toString()` support for numbers, booleans, arrays, and objects
+
 ## [0.0.15] - 2025-02-15
 
 ### Added
@@ -26,8 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Type-aware method dispatch to prevent class methods from being intercepted as built-in string/array methods
 - Safe name collision avoidance for Go reserved identifiers
 - Automatic Go import management for `fmt`, `math`, `math/rand`, `strings`, `strconv`, `time`
-- RegExp support: regex literals (`/pattern/flags`), `new RegExp()`, `test()`, and `exec()` mapped to Go's `regexp` package
-- Universal `toString()` support for numbers, booleans, arrays, and objects
 
 ## [0.0.14] - 2025-05-25
 
