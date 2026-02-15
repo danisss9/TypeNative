@@ -31,13 +31,16 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | string | ✅ | |
 | null | ✅ |  |
 | any | ✅ | Used for type inference |
+| Nullable types | ✅ | `T \| null` / `T \| undefined` transpiled to Go pointer types |
 | **Variables** |  |  |
 | Variable declarations | ✅ | `let` and `const` |
+| Object literals | ✅ | Transpiled to Go struct literals |
 | **Operators** |  |  |
 | Arithmetic operators | ✅ | `+`, `-`, etc. |
-| Comparison operators | ✅ | `==`, `!=`, etc. |
+| Comparison operators | ✅ | `==`, `!=`, `===`, `!==`, etc. |
 | Logical operators | ✅ | `&&`, `\|\|` |
 | Increment/Decrement | ✅ | `++`, `--` |
+| Non-null assertion (`!`) | ✅ | Stripped during transpilation |
 | **Control Flow** |  |  |
 | For loops | ✅ | Standard `for` loops |
 | For...of loops | ✅ | Iteration over arrays |
@@ -47,19 +50,39 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | Switch statements | ✅ | Case and default statements |
 | **Data Structures** |  |  |
 | Arrays | ✅ | Basic array operations |
-| Array methods | ✅ | `push` supported |
+| Array methods | ✅ | `push`, `join`, `slice`, `toString` |
 | **Functions** |  |  |
 | Function declarations | ✅ | Transpiled to Go functions |
-| Arrow Functions | ✅ | Transpiled to anonymous functions |
+| Arrow functions | ✅ | Transpiled to anonymous functions |
+| **Classes & Interfaces** |  |  |
+| Classes | ✅ | Transpiled to Go structs with constructor and receiver methods |
+| Class inheritance | ✅ | `extends` via embedded structs, `super()` supported |
+| Interfaces | ✅ | Transpiled to Go interfaces, supports `extends` |
+| Generics | ✅ | Type parameters on functions and classes via Go generics |
+| **Async** |  |  |
+| Async/Await | ✅ | `async` functions return Go channels, `await` reads from channels |
+| Promises | ✅ | `new Promise` transpiled to channel + goroutine pattern |
+| setTimeout | ✅ | Mapped to Go's `time.AfterFunc` |
+| **Built-in Functions** |  |  |
 | console.log | ✅ | Mapped to `fmt.Println` |
-| console.time/timeEnd | ✅ | Performance measurement |
-| Math.random | ✅ | Mapped to Go's `rand.Float64()` |
-| Math.floor | ✅ | Mapped to Go's `math.Floor()` |
+| console.time/timeEnd | ✅ | Performance measurement via `time.Now` / `time.Since` |
+| assert | ✅ | Transpiled to `panic` on failure |
+| parseInt / parseFloat | ✅ | Mapped to Go's `strconv` package |
+| **Math Methods** |  |  |
+| Math.random | ✅ | Mapped to `rand.Float64()` |
+| Math.floor / ceil / round | ✅ | Mapped to `math.Floor`, `math.Ceil`, `math.Round` |
+| Math.abs / sqrt / pow | ✅ | Mapped to corresponding `math` functions |
+| Math.min / max | ✅ | Mapped to `math.Min`, `math.Max` |
+| **String Methods** |  |  |
+| toUpperCase / toLowerCase | ✅ | Via `strings` package |
+| trim / trimStart / trimEnd | ✅ | Via `strings` package |
+| split / includes / indexOf | ✅ | Via `strings` package |
+| startsWith / endsWith | ✅ | Via `strings` package |
+| replace / replaceAll | ✅ | Via `strings` package |
+| charAt / substring / slice | ✅ | Direct Go string indexing/slicing |
+| concat / repeat / toString | ✅ | String concatenation and `strings.Repeat` |
 | **Unsupported Features** |  |  |
-| Classes | ❌ | Not implemented |
-| Interfaces | ❌ | Not implemented |
-| Async/Await | ❌ | Not implemented |
-| Modules/Imports | ❌ | Not implemented |
-| Generics | ❌ | Not implemented |
+| Modules/Imports | ❌ | Not yet implemented |
+| Try/Catch | ❌ | Not yet implemented |
 
 TypeNative is currently in early development and new features are being added regularly.
