@@ -1,3 +1,40 @@
+interface Boolean {}
+
+interface CallableFunction extends Function {}
+
+interface Function {
+  /*   apply(thisArg: any, argArray?: any): any;
+  call(thisArg: any, ...argArray: any[]): any;
+  bind(thisArg: any, ...argArray: any[]): any; */
+}
+
+interface IArguments {
+  [index: number]: any;
+  length: number;
+}
+
+interface NewableFunction extends Function {}
+
+interface Number {
+  toString(): string;
+}
+
+interface Object {
+  constructor: Function;
+  toString(): string;
+}
+
+interface RegExp {
+  test(string: string): boolean;
+  exec(string: string): string[] | null;
+}
+
+interface RegExpConstructor {
+  new (pattern: string, flags?: string): RegExp;
+}
+
+declare var RegExp: RegExpConstructor;
+
 interface SymbolConstructor {
   readonly iterator: unique symbol;
 }

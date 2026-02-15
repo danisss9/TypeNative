@@ -58,6 +58,16 @@ export function visit(node, options = {}) {
     else if (ts.isToken(node) && node.kind === ts.SyntaxKind.NullKeyword) {
         return `nil`;
     }
+    else if (ts.isRegularExpressionLiteral(node)) {
+        importedPackages.add('regexp');
+        const text = node.text; // e.g. /pattern/flags
+        const lastSlash = text.lastIndexOf('/');
+        const pattern = text.substring(1, lastSlash);
+        const flags = text.substring(lastSlash + 1);
+        const goFlags = jsRegexFlagsToGo(flags);
+        const escaped = pattern.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return `regexp.MustCompile("${goFlags}${escaped}")`;
+    }
     else if (ts.isArrayLiteralExpression(node)) {
         const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type, true) : '';
         return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
@@ -85,9 +95,16 @@ export function visit(node, options = {}) {
             else if (node.initializer &&
                 ts.isNewExpression(node.initializer) &&
                 ts.isIdentifier(node.initializer.expression)) {
-                if (classNames.has(node.initializer.expression.text)) {
+                if (node.initializer.expression.text === 'RegExp') {
+                    variableTypes.set(node.name.text, 'RegExp');
+                }
+                else if (classNames.has(node.initializer.expression.text)) {
                     variableTypes.set(node.name.text, 'class');
                 }
+            }
+            else if (node.initializer &&
+                ts.isRegularExpressionLiteral(node.initializer)) {
+                variableTypes.set(node.name.text, 'RegExp');
             }
         }
         let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
@@ -336,6 +353,19 @@ export function visit(node, options = {}) {
         if (className === 'Promise') {
             return visitNewPromise(node);
         }
+        if (className === 'RegExp') {
+            importedPackages.add('regexp');
+            const nodeArgs = node.arguments ?? [];
+            if (nodeArgs.length >= 2 && ts.isStringLiteral(nodeArgs[1])) {
+                const pattern = visit(nodeArgs[0]);
+                const flags = jsRegexFlagsToGo(nodeArgs[1].text);
+                return `regexp.MustCompile("${flags}" + ${pattern})`;
+            }
+            if (nodeArgs.length >= 1) {
+                return `regexp.MustCompile(${visit(nodeArgs[0])})`;
+            }
+            return `regexp.MustCompile("")`;
+        }
         const typeArgs = getTypeArguments(node.typeArguments);
         const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
         return `New${className}${typeArgs}(${args.join(', ')})`;
@@ -403,6 +433,9 @@ function getType(typeNode, getArrayType = false) {
         const name = typeNode.typeName.text;
         if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
             return `chan ${getType(typeNode.typeArguments[0])}`;
+        }
+        if (name === 'RegExp') {
+            return '*regexp.Regexp';
         }
         const typeArgs = getTypeArguments(typeNode.typeArguments);
         if (classNames.has(name)) {
@@ -615,6 +648,10 @@ const stringMethodHandlers = {
         return `fmt.Sprintf("%v", ${obj})`;
     }
 };
+const regexpMethodHandlers = {
+    test: (obj, args) => `${obj}.MatchString(${args[0]})`,
+    exec: (obj, args) => `${obj}.FindStringSubmatch(${args[0]})`
+};
 const arrayMethodHandlers = {
     push: (obj, args) => `${obj} = append(${obj}, ${args.join(', ')})`,
     join: (obj, args) => {
@@ -638,6 +675,14 @@ function getDynamicCallHandler(caller, objectType) {
     const dotIndex = caller.lastIndexOf('.');
     if (dotIndex !== -1) {
         const methodName = caller.substring(dotIndex + 1);
+        // toString() is universal — works for any type including numbers and objects
+        if (methodName === 'toString') {
+            return (c) => {
+                const obj = c.substring(0, dotIndex);
+                importedPackages.add('fmt');
+                return `fmt.Sprintf("%v", ${obj})`;
+            };
+        }
         // Class instances use their own methods — never intercept
         if (objectType === 'class')
             return null;
@@ -648,9 +693,12 @@ function getDynamicCallHandler(caller, objectType) {
         else if (objectType === 'array') {
             handler = arrayMethodHandlers[methodName];
         }
+        else if (objectType === 'RegExp') {
+            handler = regexpMethodHandlers[methodName];
+        }
         else {
             // Unknown type: try both maps for backward compatibility
-            handler = stringMethodHandlers[methodName] ?? arrayMethodHandlers[methodName];
+            handler = stringMethodHandlers[methodName] ?? arrayMethodHandlers[methodName] ?? regexpMethodHandlers[methodName];
         }
         if (handler) {
             return (c, args) => {
@@ -689,6 +737,16 @@ function getOperatorText(operator) {
 }
 function getTimerName(name) {
     return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
+}
+function jsRegexFlagsToGo(flags) {
+    let goFlags = '';
+    if (flags.includes('i'))
+        goFlags += 'i';
+    if (flags.includes('m'))
+        goFlags += 'm';
+    if (flags.includes('s'))
+        goFlags += 's';
+    return goFlags ? `(?${goFlags})` : '';
 }
 function getTypeParameters(typeParameters) {
     if (!typeParameters || typeParameters.length === 0)

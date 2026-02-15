@@ -81,6 +81,13 @@ TypeNative currently supports a subset of TypeScript syntax elements that are tr
 | replace / replaceAll        |    ✅     | Via `strings` package                                             |
 | charAt / substring / slice  |    ✅     | Direct Go string indexing/slicing                                 |
 | concat / repeat / toString  |    ✅     | String concatenation and `strings.Repeat`                         |
+| **Number / Object Methods** |           |                                                                   |
+| toString                    |    ✅     | Universal `toString()` via `fmt.Sprintf` for any type             |
+| **RegExp**                  |           |                                                                   |
+| Regex literals              |    ✅     | `/pattern/flags` transpiled to `regexp.MustCompile`               |
+| new RegExp()                |    ✅     | Constructor with optional flags                                   |
+| test()                      |    ✅     | Mapped to `regexp.MatchString`                                    |
+| exec()                      |    ✅     | Mapped to `regexp.FindStringSubmatch`                             |
 | **Unsupported Features**    |           |                                                                   |
 | Modules/Imports             |    ❌     | `import` / `export` declarations                                  |
 | Try/Catch                   |    ❌     | Error handling                                                    |
