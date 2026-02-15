@@ -21,7 +21,18 @@ class Complex extends Basic implements IComplex {
     this.name = name;
   }
 
+  override isBasic(): boolean {
+    return false;
+  }
+
   isComplex(p: string): boolean {
     return p === this.name;
   }
 }
+
+const simpleObj = new Basic();
+console.log('Should print true:', simpleObj.isBasic());
+const obj = new Complex('Test');
+console.log('Should print false:', obj.isBasic());
+console.log('Should print true:', obj.isComplex('Test'));
+console.log('Should print false:', obj.isComplex('Not Test'));

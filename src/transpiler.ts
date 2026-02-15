@@ -3,6 +3,7 @@ import ts from 'typescript';
 let TypeCheker: ts.TypeChecker;
 const importedPackages = new Set<string>();
 let outsideNodes: ts.Node[] = [];
+const classNames = new Set<string>();
 
 export function transpileToNative(code: string): string {
   const sourceFile = ts.createSourceFile(
@@ -16,6 +17,7 @@ export function transpileToNative(code: string): string {
   TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
   importedPackages.clear();
   outsideNodes = [];
+  classNames.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -76,7 +78,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isPostfixUnaryExpression(node)) {
     return `${visit(node.operand, { inline: true })}${getOperatorText(node.operator)}`;
   } else if (ts.isBinaryExpression(node)) {
-    return `${visit(node.left)} ${node.operatorToken.getText()} ${visit(node.right)}`;
+    let op = node.operatorToken.getText();
+    if (op === '===') op = '==';
+    if (op === '!==') op = '!=';
+    return `${visit(node.left)} ${op} ${visit(node.right)}`;
   } else if (ts.isParenthesizedExpression(node)) {
     return `(${visit(node.expression)})`;
   } else if (ts.isVariableDeclarationList(node)) {
@@ -153,6 +158,131 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       .join(', ');
     const returnType = node.type ? ` ${getType(node.type)}` : '';
     return `func(${parameters})${returnType} ${visit(node.body!)}`;
+  } else if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    return 'self';
+  } else if (ts.isInterfaceDeclaration(node)) {
+    if (options.addFunctionOutside) {
+      outsideNodes.push(node);
+      return '';
+    }
+
+    const name = visit(node.name);
+
+    const extendedInterfaces: string[] = [];
+    if (node.heritageClauses) {
+      for (const clause of node.heritageClauses) {
+        if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+          for (const type of clause.types) {
+            extendedInterfaces.push(visit(type.expression));
+          }
+        }
+      }
+    }
+
+    const methods: string[] = [];
+    for (const member of node.members) {
+      if (ts.isMethodSignature(member)) {
+        const methodName = visit(member.name);
+        const params = member.parameters
+          .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
+          .join(', ');
+        const returnType = member.type ? ` ${getType(member.type)}` : '';
+        methods.push(`\t${methodName}(${params})${returnType}`);
+      }
+    }
+
+    const members = [...extendedInterfaces.map((e) => `\t${e}`), ...methods];
+
+    return `type ${name} interface {\n${members.join('\n')}\n}`;
+  } else if (ts.isClassDeclaration(node)) {
+    if (options.addFunctionOutside) {
+      outsideNodes.push(node);
+      classNames.add(visit(node.name!));
+      return '';
+    }
+
+    const name = visit(node.name!);
+
+    let parentClass: string | null = null;
+    if (node.heritageClauses) {
+      for (const clause of node.heritageClauses) {
+        if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+          parentClass = visit(clause.types[0].expression);
+        }
+      }
+    }
+
+    const fields: string[] = [];
+    if (parentClass) {
+      fields.push(`\t${parentClass}`);
+    }
+    for (const member of node.members) {
+      if (ts.isPropertyDeclaration(member)) {
+        const fieldName = visit(member.name);
+        const fieldType = member.type ? getType(member.type) : 'interface{}';
+        fields.push(`\t${fieldName} ${fieldType}`);
+      }
+    }
+
+    let result = `type ${name} struct {\n${fields.join('\n')}\n}\n\n`;
+
+    const ctor = node.members.find((m) => ts.isConstructorDeclaration(m)) as
+      | ts.ConstructorDeclaration
+      | undefined;
+    if (ctor) {
+      const params = ctor.parameters.map((p) => `${visit(p.name)} ${getType(p.type!)}`).join(', ');
+
+      const bodyStatements =
+        ctor.body?.statements
+          .filter((s) => {
+            if (ts.isExpressionStatement(s) && ts.isCallExpression(s.expression)) {
+              return s.expression.expression.kind !== ts.SyntaxKind.SuperKeyword;
+            }
+            return true;
+          })
+          .map((s) => visit(s))
+          .join('\t') ?? '';
+
+      result += `func New${name}(${params}) *${name} {\n\t\tself := &${name}{}\n\t\t${bodyStatements}return self;\n\t}\n\n`;
+    } else {
+      result += `func New${name}() *${name} {\n\t\treturn &${name}{}\n\t}\n\n`;
+    }
+
+    for (const member of node.members) {
+      if (ts.isMethodDeclaration(member)) {
+        const methodName = visit(member.name);
+        const params = member.parameters
+          .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
+          .join(', ');
+        const returnType = member.type ? ` ${getType(member.type)}` : '';
+        result += `func (self *${name}) ${methodName}(${params})${returnType} ${visit(member.body!)}\n\n`;
+      }
+    }
+
+    return result.trim();
+  } else if (ts.isNewExpression(node)) {
+    const className = visit(node.expression);
+    const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
+    return `New${className}(${args.join(', ')})`;
+  } else if (ts.isObjectLiteralExpression(node)) {
+    let typeName = '';
+    if (ts.isVariableDeclaration(node.parent) && node.parent.type) {
+      typeName = getTypeText(node.parent.type);
+    }
+
+    const properties = node.properties
+      .map((p) => {
+        if (ts.isPropertyAssignment(p)) {
+          return `${visit(p.name)}: ${visit(p.initializer)}`;
+        }
+        return '';
+      })
+      .filter((p) => p)
+      .join(', ');
+
+    return `${typeName}{${properties}}`;
+  } else if (ts.isPropertyAssignment(node)) {
+    return `${visit(node.name)}: ${visit(node.initializer)}`;
   }
 
   const syntaxKind = ts.SyntaxKind[node.kind];
@@ -174,7 +304,24 @@ export type VisitNodeOptions = {
   isOutside?: boolean;
 };
 
+function getTypeText(typeNode: ts.TypeNode): string {
+  if (!typeNode) return ':';
+  if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
+    return typeNode.typeName.text;
+  }
+  return getType(typeNode);
+}
+
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
+  if (!typeNode) return ':';
+  if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
+    const name = typeNode.typeName.text;
+    if (classNames.has(name)) {
+      return `*${name}`;
+    }
+    return name;
+  }
+
   const type = TypeCheker.getTypeFromTypeNode(typeNode);
   let typeName = TypeCheker.typeToString(type);
   const isArray = typeName.includes('[]');
