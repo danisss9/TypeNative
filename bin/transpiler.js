@@ -76,8 +76,9 @@ export function visit(node, options = {}) {
             return `time.AfterFunc(${delay} * time.Millisecond, ${callback.trimEnd()})`;
         }
         const caller = visit(node.expression);
+        const typeArgs = getTypeArguments(node.typeArguments);
         const args = node.arguments.map((a) => visit(a));
-        return getCallString(caller, args);
+        return getCallString(caller, args, typeArgs);
     }
     else if (ts.isPrefixUnaryExpression(node)) {
         return `${getOperatorText(node.operator)}${visit(node.operand)}`;
@@ -172,14 +173,15 @@ export function visit(node, options = {}) {
             return '';
         }
         const name = visit(node.name, { inline: true });
+        const typeParams = getTypeParameters(node.typeParameters);
         const parameters = node.parameters
             .map((p) => `${visit(p.name)} ${getType(p.type)}`)
             .join(', ');
         const returnType = node.type ? ` ${getType(node.type)}` : '';
         if (options.isOutside) {
-            return `func ${name}(${parameters})${returnType} ${visit(node.body)}`;
+            return `func ${name}${typeParams}(${parameters})${returnType} ${visit(node.body)}`;
         }
-        return `${name} := func(${parameters})${returnType} ${visit(node.body)}`;
+        return `${name} := func${typeParams}(${parameters})${returnType} ${visit(node.body)}`;
     }
     else if (ts.isArrowFunction(node)) {
         const parameters = node.parameters
@@ -197,6 +199,7 @@ export function visit(node, options = {}) {
             return '';
         }
         const name = visit(node.name);
+        const typeParams = getTypeParameters(node.typeParameters);
         const extendedInterfaces = [];
         if (node.heritageClauses) {
             for (const clause of node.heritageClauses) {
@@ -219,7 +222,7 @@ export function visit(node, options = {}) {
             }
         }
         const members = [...extendedInterfaces.map((e) => `\t${e}`), ...methods];
-        return `type ${name} interface {\n${members.join('\n')}\n}`;
+        return `type ${name}${typeParams} interface {\n${members.join('\n')}\n}`;
     }
     else if (ts.isClassDeclaration(node)) {
         if (options.addFunctionOutside) {
@@ -228,6 +231,8 @@ export function visit(node, options = {}) {
             return '';
         }
         const name = visit(node.name);
+        const typeParams = getTypeParameters(node.typeParameters);
+        const typeParamNames = getTypeParameterNames(node.typeParameters);
         let parentClass = null;
         if (node.heritageClauses) {
             for (const clause of node.heritageClauses) {
@@ -247,7 +252,7 @@ export function visit(node, options = {}) {
                 fields.push(`\t${fieldName} ${fieldType}`);
             }
         }
-        let result = `type ${name} struct {\n${fields.join('\n')}\n}\n\n`;
+        let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\n`;
         const ctor = node.members.find((m) => ts.isConstructorDeclaration(m));
         if (ctor) {
             const params = ctor.parameters.map((p) => `${visit(p.name)} ${getType(p.type)}`).join(', ');
@@ -260,10 +265,10 @@ export function visit(node, options = {}) {
             })
                 .map((s) => visit(s))
                 .join('\t') ?? '';
-            result += `func New${name}(${params}) *${name} {\n\t\tself := &${name}{}\n\t\t${bodyStatements}return self;\n\t}\n\n`;
+            result += `func New${name}${typeParams}(${params}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${bodyStatements}return self;\n\t}\n\n`;
         }
         else {
-            result += `func New${name}() *${name} {\n\t\treturn &${name}{}\n\t}\n\n`;
+            result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\treturn &${name}${typeParamNames}{}\n\t}\n\n`;
         }
         for (const member of node.members) {
             if (ts.isMethodDeclaration(member)) {
@@ -272,7 +277,7 @@ export function visit(node, options = {}) {
                     .map((p) => `${visit(p.name)} ${getType(p.type)}`)
                     .join(', ');
                 const returnType = member.type ? ` ${getType(member.type)}` : '';
-                result += `func (self *${name}) ${methodName}(${params})${returnType} ${visit(member.body)}\n\n`;
+                result += `func (self *${name}${typeParamNames}) ${methodName}(${params})${returnType} ${visit(member.body)}\n\n`;
             }
         }
         return result.trim();
@@ -282,8 +287,9 @@ export function visit(node, options = {}) {
         if (className === 'Promise') {
             return visitNewPromise(node);
         }
+        const typeArgs = getTypeArguments(node.typeArguments);
         const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
-        return `New${className}(${args.join(', ')})`;
+        return `New${className}${typeArgs}(${args.join(', ')})`;
     }
     else if (ts.isObjectLiteralExpression(node)) {
         let typeName = '';
@@ -329,10 +335,11 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
             return `chan ${getType(typeNode.typeArguments[0])}`;
         }
+        const typeArgs = getTypeArguments(typeNode.typeArguments);
         if (classNames.has(name)) {
-            return `*${name}`;
+            return `*${name}${typeArgs}`;
         }
-        return name;
+        return `${name}${typeArgs}`;
     }
     const type = TypeCheker.getTypeFromTypeNode(typeNode);
     let typeName = TypeCheker.typeToString(type);
@@ -364,7 +371,7 @@ function getAcessString(leftSide, rightSide) {
     }
     return `${leftSide}.${rightSide}`;
 }
-function getCallString(caller, args) {
+function getCallString(caller, args, typeArgs = '') {
     if (promiseResolveName && caller === promiseResolveName) {
         return `ch <- ${args[0]}`;
     }
@@ -397,7 +404,7 @@ function getCallString(caller, args) {
         const arrayName = caller.substring(0, caller.length - '.push'.length);
         return `${arrayName} = append(${arrayName},${args.join(', ')})`;
     }
-    return `${caller}(${args.join(', ')})`;
+    return `${caller}${typeArgs}(${args.join(', ')})`;
 }
 function getOperatorText(operator) {
     switch (operator) {
@@ -420,6 +427,28 @@ function getOperatorText(operator) {
 }
 function getTimerName(name) {
     return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
+}
+function getTypeParameters(typeParameters) {
+    if (!typeParameters || typeParameters.length === 0)
+        return '';
+    const params = typeParameters.map((tp) => {
+        const name = visit(tp.name);
+        const constraint = tp.constraint ? getType(tp.constraint) : 'any';
+        return `${name} ${constraint}`;
+    });
+    return `[${params.join(', ')}]`;
+}
+function getTypeParameterNames(typeParameters) {
+    if (!typeParameters || typeParameters.length === 0)
+        return '';
+    const names = typeParameters.map((tp) => visit(tp.name));
+    return `[${names.join(', ')}]`;
+}
+function getTypeArguments(typeArguments) {
+    if (!typeArguments || typeArguments.length === 0)
+        return '';
+    const args = typeArguments.map((ta) => getType(ta));
+    return `[${args.join(', ')}]`;
 }
 function getPromiseChannelType(node) {
     let parent = node.parent;
