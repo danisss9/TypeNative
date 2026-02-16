@@ -14,6 +14,11 @@ let promiseResolveName: string = '';
 const dangerousNames = new Set(['main']);
 const renamedFunctions = new Map<string, string>();
 const variableTypes = new Map<string, string>();
+const variableGoTypes = new Map<string, string>();
+const variableClassNames = new Map<string, string>();
+const classPropertyTypes = new Map<string, Map<string, string>>();
+const classMethodReturnTypes = new Map<string, Map<string, string>>();
+const typeAliases = new Map<string, ts.TypeNode>();
 
 export function transpileToNative(code: string): string {
   const sourceFile = ts.createSourceFile(
@@ -31,6 +36,11 @@ export function transpileToNative(code: string): string {
   promiseResolveName = '';
   renamedFunctions.clear();
   variableTypes.clear();
+  variableGoTypes.clear();
+  variableClassNames.clear();
+  classPropertyTypes.clear();
+  classMethodReturnTypes.clear();
+  typeAliases.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -58,6 +68,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return getSafeName(node.text);
   } else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
+  } else if (ts.isAsExpression(node)) {
+    return visit(node.expression);
+  } else if (ts.isTypeAssertionExpression(node)) {
+    return visit(node.expression);
   } else if (ts.isTemplateExpression(node)) {
     return visitTemplateExpression(node);
   } else if (ts.isNumericLiteral(node)) {
@@ -85,8 +99,14 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       options.extraBlockContent ?? ''
     }}${options.inline ? '' : '\n\t'}`;
   } else if (ts.isElementAccessExpression(node)) {
+    if (hasQuestionDot(node)) {
+      return visitOptionalElementAccess(node);
+    }
     return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
   } else if (ts.isPropertyAccessExpression(node)) {
+    if (hasQuestionDot(node)) {
+      return visitOptionalPropertyAccess(node);
+    }
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
     const objectType = resolveExpressionType(node.expression);
@@ -95,9 +115,18 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const type = getType(node.type!);
     // Track variable type for type-aware method dispatch
     if (ts.isIdentifier(node.name)) {
+      if (node.type) {
+        variableGoTypes.set(node.name.text, getType(node.type));
+      }
       const cat = node.type ? getTypeCategory(node.type) : undefined;
       if (cat) {
         variableTypes.set(node.name.text, cat);
+        if (cat === 'class' && node.type) {
+          const className = getClassNameFromTypeNode(node.type);
+          if (className) {
+            variableClassNames.set(node.name.text, className);
+          }
+        }
       } else if (
         node.initializer &&
         ts.isNewExpression(node.initializer) &&
@@ -107,9 +136,17 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
           variableTypes.set(node.name.text, 'RegExp');
         } else if (classNames.has(node.initializer.expression.text)) {
           variableTypes.set(node.name.text, 'class');
+          variableClassNames.set(node.name.text, node.initializer.expression.text);
         }
       } else if (node.initializer && ts.isRegularExpressionLiteral(node.initializer)) {
         variableTypes.set(node.name.text, 'RegExp');
+      }
+
+      if (!variableGoTypes.has(node.name.text) && node.initializer) {
+        const inferredType = inferExpressionType(node.initializer);
+        if (inferredType) {
+          variableGoTypes.set(node.name.text, inferredType);
+        }
       }
     }
     let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
@@ -128,6 +165,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       type === ':' ? '' : ' '
     }${initializer}`;
   } else if (ts.isCallExpression(node)) {
+    if (
+      hasQuestionDot(node) ||
+      (ts.isPropertyAccessExpression(node.expression) && hasQuestionDot(node.expression))
+    ) {
+      return visitOptionalCall(node);
+    }
     // Handle setTimeout specially to get raw delay value
     if (ts.isIdentifier(node.expression) && node.expression.text === 'setTimeout') {
       importedPackages.add('time');
@@ -150,7 +193,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `${getOperatorText(node.operator)}${visit(node.operand)}`;
   } else if (ts.isPostfixUnaryExpression(node)) {
     return `${visit(node.operand, { inline: true })}${getOperatorText(node.operator)}`;
+  } else if (ts.isConditionalExpression(node)) {
+    return visitConditionalExpression(node);
   } else if (ts.isBinaryExpression(node)) {
+    if (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+      return visitNullishCoalescingExpression(node);
+    }
     let op = node.operatorToken.getText();
     if (op === '===') op = '==';
     if (op === '!==') op = '!=';
@@ -246,6 +294,9 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `func(${parameters})${returnType} ${visit(node.body!)}`;
   } else if (node.kind === ts.SyntaxKind.ThisKeyword) {
     return 'self';
+  } else if (ts.isTypeAliasDeclaration(node)) {
+    typeAliases.set(node.name.text, node.type);
+    return '';
   } else if (ts.isInterfaceDeclaration(node)) {
     if (options.addFunctionOutside) {
       outsideNodes.push(node);
@@ -284,7 +335,21 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isClassDeclaration(node)) {
     if (options.addFunctionOutside) {
       outsideNodes.push(node);
-      classNames.add(visit(node.name!));
+      const className = visit(node.name!);
+      classNames.add(className);
+
+      const properties = new Map<string, string>();
+      const methods = new Map<string, string>();
+      for (const member of node.members) {
+        if (ts.isPropertyDeclaration(member) && ts.isIdentifier(member.name)) {
+          properties.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+        }
+        if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name)) {
+          methods.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+        }
+      }
+      classPropertyTypes.set(className, properties);
+      classMethodReturnTypes.set(className, methods);
       return '';
     }
 
@@ -452,6 +517,264 @@ function visitTemplateExpression(node: ts.TemplateExpression): string {
   return parts.join(' + ');
 }
 
+function hasQuestionDot(node: ts.Node): boolean {
+  return (
+    'questionDotToken' in node &&
+    !!(node as { questionDotToken?: ts.Token<ts.SyntaxKind.QuestionDotToken> }).questionDotToken
+  );
+}
+
+function getTempName(prefix: string): string {
+  return `__${prefix}_${goSafeId()}__`;
+}
+
+function inferExpectedTypeFromContext(node: ts.Node): string | undefined {
+  const parent = node.parent;
+  if (ts.isVariableDeclaration(parent) && parent.initializer === node && parent.type) {
+    return getType(parent.type);
+  }
+  if (ts.isReturnStatement(parent)) {
+    let scope: ts.Node | undefined = parent.parent;
+    while (scope) {
+      if (
+        ts.isFunctionDeclaration(scope) ||
+        ts.isMethodDeclaration(scope) ||
+        ts.isFunctionExpression(scope) ||
+        ts.isArrowFunction(scope)
+      ) {
+        if (scope.type) return getType(scope.type);
+        break;
+      }
+      scope = scope.parent;
+    }
+  }
+  return undefined;
+}
+
+function inferExpressionType(expr: ts.Expression): string | undefined {
+  if (ts.isParenthesizedExpression(expr)) return inferExpressionType(expr.expression);
+  if (ts.isNonNullExpression(expr)) return inferExpressionType(expr.expression);
+  if (ts.isAsExpression(expr)) return getType(expr.type);
+  if (ts.isTypeAssertionExpression(expr)) return getType(expr.type);
+  if (
+    ts.isStringLiteral(expr) ||
+    ts.isNoSubstitutionTemplateLiteral(expr) ||
+    ts.isTemplateExpression(expr)
+  ) {
+    return 'string';
+  }
+  if (ts.isNumericLiteral(expr)) return 'float64';
+  if (expr.kind === ts.SyntaxKind.TrueKeyword || expr.kind === ts.SyntaxKind.FalseKeyword)
+    return 'bool';
+  if (expr.kind === ts.SyntaxKind.NullKeyword) return 'nil';
+  if (ts.isIdentifier(expr)) return variableGoTypes.get(expr.text);
+
+  if (ts.isPropertyAccessExpression(expr)) {
+    const leftType = inferExpressionType(expr.expression);
+    if (expr.name.text === 'length') return 'float64';
+
+    if (hasQuestionDot(expr)) {
+      if (leftType && leftType.startsWith('*')) {
+        const className = leftType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+        const memberType = classPropertyTypes.get(className)?.get(expr.name.text) ?? 'interface{}';
+        return makeNullableType(memberType);
+      }
+      return 'interface{}';
+    }
+
+    if (leftType && leftType.startsWith('*')) {
+      const className = leftType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+      const memberType = classPropertyTypes.get(className)?.get(expr.name.text);
+      if (memberType) return memberType;
+    }
+    if (ts.isIdentifier(expr.expression)) {
+      const className = variableClassNames.get(expr.expression.text);
+      const memberType = className
+        ? classPropertyTypes.get(className)?.get(expr.name.text)
+        : undefined;
+      if (memberType) return memberType;
+    }
+  }
+
+  if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression)) {
+    const methodName = expr.expression.name.text;
+
+    const ownerType = inferExpressionType(expr.expression.expression);
+    if (ownerType && ownerType.startsWith('*')) {
+      const className = ownerType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+      const returnType = classMethodReturnTypes.get(className)?.get(methodName);
+      if (returnType) {
+        if (hasQuestionDot(expr) || hasQuestionDot(expr.expression)) {
+          return makeNullableType(returnType);
+        }
+        return returnType;
+      }
+    }
+
+    if (ts.isIdentifier(expr.expression.expression)) {
+      const className = variableClassNames.get(expr.expression.expression.text);
+      const returnType = className
+        ? classMethodReturnTypes.get(className)?.get(methodName)
+        : undefined;
+      if (returnType) {
+        if (hasQuestionDot(expr) || hasQuestionDot(expr.expression)) {
+          return makeNullableType(returnType);
+        }
+        return returnType;
+      }
+    }
+  }
+
+  if (ts.isConditionalExpression(expr)) {
+    const whenTrueType = inferExpressionType(expr.whenTrue);
+    const whenFalseType = inferExpressionType(expr.whenFalse);
+    if (whenTrueType && whenTrueType === whenFalseType) return whenTrueType;
+    return whenTrueType ?? whenFalseType;
+  }
+
+  if (
+    ts.isBinaryExpression(expr) &&
+    expr.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+  ) {
+    const leftType = inferExpressionType(expr.left);
+    const rightType = inferExpressionType(expr.right);
+    if (leftType && leftType.startsWith('*') && rightType === leftType.slice(1)) {
+      return rightType;
+    }
+    return rightType ?? leftType;
+  }
+
+  return undefined;
+}
+
+function makeNullableType(typeName: string): string {
+  if (!typeName || typeName === 'interface{}' || typeName.startsWith('*'))
+    return typeName || 'interface{}';
+  if (['string', 'float64', 'bool'].includes(typeName)) return `*${typeName}`;
+  return typeName;
+}
+
+function visitConditionalExpression(node: ts.ConditionalExpression): string {
+  const whenTrue = visit(node.whenTrue);
+  const whenFalse = visit(node.whenFalse);
+  const resultType =
+    inferExpectedTypeFromContext(node) ||
+    (() => {
+      const whenTrueType = inferExpressionType(node.whenTrue);
+      const whenFalseType = inferExpressionType(node.whenFalse);
+      if (whenTrueType && whenTrueType === whenFalseType) return whenTrueType;
+      return whenTrueType ?? whenFalseType ?? 'interface{}';
+    })();
+
+  return `func() ${resultType} { if ${visit(node.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
+}
+
+function visitNullishCoalescingExpression(node: ts.BinaryExpression): string {
+  const leftType = inferExpressionType(node.left);
+  const rightType = inferExpressionType(node.right);
+
+  if (leftType && leftType.startsWith('*')) {
+    const leftValueType = leftType.slice(1);
+    const expectedType = inferExpectedTypeFromContext(node);
+    const resultType =
+      expectedType || (rightType === leftValueType ? leftValueType : (rightType ?? leftType));
+    const tmp = getTempName('nullish');
+    const leftExpr = visit(node.left);
+    const rightExpr = visit(node.right);
+    const returnLeft = resultType === leftValueType ? `*${tmp}` : tmp;
+    return `func() ${resultType} { ${tmp} := ${leftExpr}; if ${tmp} == nil { return ${rightExpr} }; return ${returnLeft} }()`;
+  }
+
+  return visit(node.left);
+}
+
+function visitOptionalPropertyAccess(node: ts.PropertyAccessExpression): string {
+  const baseExpr = visit(node.expression);
+  const baseType = inferExpressionType(node.expression);
+  if (!baseType || !baseType.startsWith('*')) {
+    const objectType = resolveExpressionType(node.expression);
+    return getAcessString(baseExpr, visit(node.name), objectType);
+  }
+
+  const className = baseType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+  const propertyType = classPropertyTypes.get(className)?.get(node.name.text) ?? 'interface{}';
+  const nullableType = makeNullableType(propertyType);
+  const tmp = getTempName('opt');
+  const propertyAccess = `${tmp}.${visit(node.name)}`;
+
+  if (nullableType.startsWith('*') && nullableType.slice(1) === propertyType) {
+    const valueTemp = getTempName('optv');
+    return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; ${valueTemp} := ${propertyAccess}; return &${valueTemp} }()`;
+  }
+
+  return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${propertyAccess} }()`;
+}
+
+function visitOptionalElementAccess(node: ts.ElementAccessExpression): string {
+  const baseExpr = visit(node.expression);
+  const baseType = inferExpressionType(node.expression);
+  if (!baseType || !baseType.startsWith('*')) {
+    return `${baseExpr}[int(${visit(node.argumentExpression)})]`;
+  }
+
+  const valueType = inferExpectedTypeFromContext(node) ?? 'interface{}';
+  const nullableType = makeNullableType(valueType);
+  const tmp = getTempName('opte');
+  const elementExpr = `${tmp}[int(${visit(node.argumentExpression)})]`;
+
+  if (nullableType.startsWith('*') && nullableType.slice(1) === valueType) {
+    const valueTemp = getTempName('optev');
+    return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; ${valueTemp} := ${elementExpr}; return &${valueTemp} }()`;
+  }
+
+  return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${elementExpr} }()`;
+}
+
+function visitOptionalCall(node: ts.CallExpression): string {
+  if (!ts.isPropertyAccessExpression(node.expression)) {
+    return `${visit(node.expression)}(${node.arguments.map((a) => visit(a)).join(', ')})`;
+  }
+
+  const baseNode = node.expression.expression;
+  const methodName = node.expression.name.text;
+  const baseExpr = visit(baseNode);
+  const baseType = inferExpressionType(baseNode);
+  const args = node.arguments.map((a) => visit(a)).join(', ');
+
+  if (!baseType || !baseType.startsWith('*')) {
+    return `${baseExpr}.${methodName}(${args})`;
+  }
+
+  const className = baseType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+  const returnType = classMethodReturnTypes.get(className)?.get(methodName) ?? 'interface{}';
+  const nullableType = makeNullableType(returnType);
+  const tmp = getTempName('optc');
+  const callExpr = `${tmp}.${methodName}(${args})`;
+
+  if (nullableType.startsWith('*') && nullableType.slice(1) === returnType) {
+    const valueTemp = getTempName('optcv');
+    return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; ${valueTemp} := ${callExpr}; return &${valueTemp} }()`;
+  }
+
+  return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${callExpr} }()`;
+}
+
+function getAliasType(name: string, seen = new Set<string>()): ts.TypeNode | undefined {
+  const aliasType = typeAliases.get(name);
+  if (!aliasType) return undefined;
+
+  if (seen.has(name)) return undefined;
+  if (ts.isTypeReferenceNode(aliasType) && ts.isIdentifier(aliasType.typeName)) {
+    const nestedName = aliasType.typeName.text;
+    if (typeAliases.has(nestedName)) {
+      seen.add(name);
+      return getAliasType(nestedName, seen) ?? aliasType;
+    }
+  }
+
+  return aliasType;
+}
+
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   if (!typeNode) return ':';
   // Handle union types (e.g. string | null, number | undefined)
@@ -476,6 +799,10 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   }
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
+    const aliasType = getAliasType(name);
+    if (aliasType) {
+      return getType(aliasType, getArrayType);
+    }
     if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
       return `chan ${getType(typeNode.typeArguments[0])}`;
     }
@@ -534,6 +861,24 @@ function getTypeCategory(typeNode: ts.TypeNode | undefined): string | undefined 
     const name = typeNode.typeName.text;
     if (classNames.has(name)) return 'class';
     return name;
+  }
+  return undefined;
+}
+
+function getClassNameFromTypeNode(typeNode: ts.TypeNode): string | undefined {
+  if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
+    return classNames.has(typeNode.typeName.text) ? typeNode.typeName.text : undefined;
+  }
+  if (ts.isUnionTypeNode(typeNode)) {
+    const nonNullTypes = typeNode.types.filter(
+      (t) =>
+        t.kind !== ts.SyntaxKind.NullKeyword &&
+        t.kind !== ts.SyntaxKind.UndefinedKeyword &&
+        !(ts.isLiteralTypeNode(t) && t.literal.kind === ts.SyntaxKind.NullKeyword)
+    );
+    if (nonNullTypes.length === 1) {
+      return getClassNameFromTypeNode(nonNullTypes[0]);
+    }
   }
   return undefined;
 }

@@ -27,7 +27,8 @@
     "test13": "node ./bin/index --source test/test13.spec.ts --script",
     "test14": "node ./bin/index --source test/test14.spec.ts --script",
     "test15": "node ./bin/index --source test/test15.spec.ts --script",
-    "test16": "node ./bin/index --source test/test16.spec.ts --script"
+    "test16": "node ./bin/index --source test/test16.spec.ts --script",
+    "test17": "node ./bin/index --source test/test17.spec.ts --script"
   },
   "repository": {
     "type": "git",

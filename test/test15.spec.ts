@@ -1,5 +1,4 @@
 // Template Literals
-
 const name: string = 'world';
 const str1: string = `hello ${name}`;
 console.log(str1);
