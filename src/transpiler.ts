@@ -56,8 +56,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isIdentifier(node)) {
     if (node.text === 'undefined') return 'nil';
     return getSafeName(node.text);
-  } else if (ts.isStringLiteral(node)) {
-    return `"${node.text}"`;
+  } else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return toGoStringLiteral(node.text);
+  } else if (ts.isTemplateExpression(node)) {
+    return visitTemplateExpression(node);
   } else if (ts.isNumericLiteral(node)) {
     return `float64(${node.text})`;
   } else if (ts.isToken(node) && node.kind === ts.SyntaxKind.TrueKeyword) {
@@ -421,6 +423,33 @@ function getTypeText(typeNode: ts.TypeNode): string {
     return typeNode.typeName.text;
   }
   return getType(typeNode);
+}
+
+function toGoStringLiteral(value: string): string {
+  return JSON.stringify(value);
+}
+
+function visitTemplateExpression(node: ts.TemplateExpression): string {
+  const parts: string[] = [];
+
+  if (node.head.text.length > 0) {
+    parts.push(toGoStringLiteral(node.head.text));
+  }
+
+  for (const span of node.templateSpans) {
+    importedPackages.add('fmt');
+    parts.push(`fmt.Sprintf("%v", ${visit(span.expression)})`);
+
+    if (span.literal.text.length > 0) {
+      parts.push(toGoStringLiteral(span.literal.text));
+    }
+  }
+
+  if (parts.length === 0) {
+    return '""';
+  }
+
+  return parts.join(' + ');
 }
 
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
