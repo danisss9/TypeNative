@@ -82,6 +82,22 @@ interface Array<T> extends IterableIterator<T> {
    */
   slice(start?: number, end?: number): T[];
   /**
+   * Calls a defined callback function on each element of an array, and returns an array that contains the results.
+   */
+  map<U>(callback: (value: T, index?: number, array?: T[]) => U): U[];
+  /**
+   * Returns the elements of an array that meet the condition specified in a callback function.
+   */
+  filter(callback: (value: T, index?: number, array?: T[]) => boolean): T[];
+  /**
+   * Determines whether the specified callback function returns true for any element of an array.
+   */
+  some(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  /**
+   * Returns the value of the first element in the array where callback is true, and undefined otherwise.
+   */
+  find(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
+  /**
    * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
    */
   indexOf(searchElement: T): number;

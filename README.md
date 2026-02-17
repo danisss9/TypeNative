@@ -60,10 +60,12 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **Data Structures & Array Methods**
 
-| Feature       | Supported | Notes                   |
-| ------------- | :-------: | ----------------------- |
-| Arrays        |    ✅     | Basic array operations  |
-| Array methods |    ✅     | `push`, `join`, `slice` |
+| Feature                    | Supported | Notes                                                            |
+| -------------------------- | :-------: | ---------------------------------------------------------------- |
+| Arrays                     |    ✅     | Basic array operations                                           |
+| Array methods              |    ✅     | `push`, `join`, `slice`                                          |
+| Higher-order array methods |    ✅     | `.map()`, `.filter()`, `.some()`, `.find()`                      |
+| Method chaining            |    ✅     | Chaining array methods such as `.map(...).filter(...).join(...)` |
 
 **Functions**
 
@@ -140,12 +142,11 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **Unsupported / Roadmap**
 
-| Feature                     | Supported | Notes                                                  |
-| --------------------------- | :-------: | ------------------------------------------------------ |
-| Modules/Imports             |    ❌     | `import` / `export` declarations                       |
-| Try/Catch                   |    ❌     | Error handling                                         |
-| Map / Set                   |    ❌     | Built-in collection types and their methods            |
-| Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()`, `.join()` |
-| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables       |
+| Feature                     | Supported | Notes                                            |
+| --------------------------- | :-------: | ------------------------------------------------ |
+| Modules/Imports             |    ❌     | `import` / `export` declarations                 |
+| Try/Catch                   |    ❌     | Error handling                                   |
+| Map / Set                   |    ❌     | Built-in collection types and their methods      |
+| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables |
 
 TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.

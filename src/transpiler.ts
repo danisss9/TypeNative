@@ -188,6 +188,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       const delay = ts.isNumericLiteral(delayNode) ? delayNode.text : visit(delayNode);
       return `time.AfterFunc(${delay} * time.Millisecond, ${callback.trimEnd()})`;
     }
+    const arrayHigherOrderCall = visitArrayHigherOrderCall(node);
+    if (arrayHigherOrderCall) {
+      return arrayHigherOrderCall;
+    }
     const caller = visit(node.expression);
     const safeCaller = getSafeName(caller);
     const typeArgs = getTypeArguments(node.typeArguments);
@@ -620,6 +624,11 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
     return 'bool';
   if (expr.kind === ts.SyntaxKind.NullKeyword) return 'nil';
   if (ts.isIdentifier(expr)) return variableGoTypes.get(expr.text);
+  if (ts.isArrayLiteralExpression(expr)) {
+    if (expr.elements.length === 0) return '[]interface{}';
+    const firstElementType = inferExpressionType(expr.elements[0] as ts.Expression) ?? 'interface{}';
+    return `[]${firstElementType}`;
+  }
 
   if (ts.isPropertyAccessExpression(expr)) {
     if (ts.isIdentifier(expr.expression) && enumNames.has(expr.expression.text)) {
@@ -658,8 +667,22 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
 
   if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression)) {
     const methodName = expr.expression.name.text;
-
     const ownerType = inferExpressionType(expr.expression.expression);
+    if (isArrayLikeGoType(ownerType)) {
+      const elementType = getArrayElementTypeFromGoType(ownerType!);
+      if (methodName === 'map') {
+        const callback = expr.arguments[0];
+        const mappedType = callback
+          ? inferArrayCallbackReturnType(callback, elementType, elementType)
+          : elementType;
+        return `[]${mappedType}`;
+      }
+      if (methodName === 'filter') return `[]${elementType}`;
+      if (methodName === 'some') return 'bool';
+      if (methodName === 'find') return elementType;
+      if (methodName === 'join') return 'string';
+    }
+
     if (ownerType && ownerType.startsWith('*')) {
       const className = ownerType.replace(/^\*/, '').replace(/\[.*\]$/, '');
       const returnType = classMethodReturnTypes.get(className)?.get(methodName);
@@ -819,6 +842,162 @@ function visitOptionalCall(node: ts.CallExpression): string {
   return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${callExpr} }()`;
 }
 
+function isArrayLikeGoType(goType: string | undefined): boolean {
+  return !!goType && goType.startsWith('[]');
+}
+
+function getArrayElementTypeFromGoType(goType: string): string {
+  if (!goType.startsWith('[]')) return 'interface{}';
+  const elementType = goType.slice(2);
+  return elementType || 'interface{}';
+}
+
+function inferArrayCallbackReturnType(
+  callback: ts.Expression,
+  elementType: string,
+  fallbackType: string
+): string {
+  if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
+    if (callback.type) {
+      const explicitType = getType(callback.type);
+      return explicitType || fallbackType;
+    }
+    if (ts.isBlock(callback.body)) {
+      return fallbackType;
+    }
+    const inferred = inferExpressionType(callback.body);
+    return inferred ?? fallbackType;
+  }
+
+  if (ts.isIdentifier(callback)) {
+    const knownType = variableGoTypes.get(callback.text);
+    if (knownType) return knownType;
+  }
+
+  return fallbackType;
+}
+
+type ArrayCallbackInfo = {
+  fnExpr: string;
+  paramCount: number;
+  returnType: string;
+};
+
+function buildArrayCallbackInfo(
+  callback: ts.Expression,
+  elementType: string,
+  forcedReturnType?: string
+): ArrayCallbackInfo {
+  if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
+    const paramCount = callback.parameters.length;
+    const callbackReturnType =
+      forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, 'interface{}');
+
+    const params: string[] = [];
+    if (paramCount > 0) {
+      params.push(`${visit(callback.parameters[0].name)} ${elementType}`);
+    }
+    if (paramCount > 1) {
+      params.push(`${visit(callback.parameters[1].name)} float64`);
+    }
+    if (paramCount > 2) {
+      params.push(`${visit(callback.parameters[2].name)} []${elementType}`);
+    }
+
+    const body = ts.isBlock(callback.body)
+      ? visit(callback.body)
+      : `{\n\t\treturn ${visit(callback.body)};\n\t}`;
+
+    return {
+      fnExpr: `func(${params.join(', ')}) ${callbackReturnType} ${body}`,
+      paramCount,
+      returnType: callbackReturnType
+    };
+  }
+
+  return {
+    fnExpr: visit(callback),
+    paramCount: 1,
+    returnType: forcedReturnType ?? 'interface{}'
+  };
+}
+
+function buildArrayCallbackInvocation(
+  callbackInfo: ArrayCallbackInfo,
+  itemVar: string,
+  indexVar: string,
+  arrayVar: string
+): string {
+  const args: string[] = [];
+  if (callbackInfo.paramCount > 0) args.push(itemVar);
+  if (callbackInfo.paramCount > 1) args.push(`float64(${indexVar})`);
+  if (callbackInfo.paramCount > 2) args.push(arrayVar);
+  return `(${callbackInfo.fnExpr})(${args.join(', ')})`;
+}
+
+function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined {
+  if (!ts.isPropertyAccessExpression(node.expression)) return undefined;
+
+  const methodName = node.expression.name.text;
+  if (!['map', 'filter', 'some', 'find', 'join'].includes(methodName)) {
+    return undefined;
+  }
+
+  const arrayExprNode = node.expression.expression;
+  const arrayExpr = visit(arrayExprNode);
+  const ownerType = inferExpressionType(arrayExprNode);
+  const elementType = isArrayLikeGoType(ownerType)
+    ? getArrayElementTypeFromGoType(ownerType!)
+    : 'interface{}';
+
+  if (methodName === 'join') {
+    importedPackages.add('strings');
+    importedPackages.add('fmt');
+    const separator = node.arguments[0] ? visit(node.arguments[0]) : '""';
+    const arrVar = getTempName('arrjoin');
+    const partsVar = getTempName('parts');
+    return `func() string { ${arrVar} := ${arrayExpr}; ${partsVar} := make([]string, len(${arrVar})); for i, v := range ${arrVar} { ${partsVar}[i] = fmt.Sprintf("%v", v) }; return strings.Join(${partsVar}, ${separator}) }()`;
+  }
+
+  const callback = node.arguments[0];
+  if (!callback) {
+    return undefined;
+  }
+
+  const arrVar = getTempName('arrhof');
+  const idxVar = getTempName('i');
+  const itemVar = getTempName('item');
+
+  if (methodName === 'map') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, elementType);
+    const mappedType = callbackInfo.returnType || 'interface{}';
+    const resultVar = getTempName('mapres');
+    const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() []${mappedType} { ${arrVar} := ${arrayExpr}; ${resultVar} := make([]${mappedType}, 0, len(${arrVar})); for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { ${resultVar} = append(${resultVar}, ${callbackCall}) }; return ${resultVar} }()`;
+  }
+
+  if (methodName === 'filter') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
+    const resultVar = getTempName('filterres');
+    const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() []${elementType} { ${arrVar} := ${arrayExpr}; ${resultVar} := make([]${elementType}, 0, len(${arrVar})); for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { ${resultVar} = append(${resultVar}, ${itemVar}) } }; return ${resultVar} }()`;
+  }
+
+  if (methodName === 'some') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
+    const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() bool { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { return true } }; return false }()`;
+  }
+
+  const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
+  const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+  const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+  return `func() ${elementType} { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { return ${itemVar} } }; var __zero ${elementType}; return __zero }()`;
+}
+
 function getAliasType(name: string, seen = new Set<string>()): ts.TypeNode | undefined {
   const aliasType = typeAliases.get(name);
   if (!aliasType) return undefined;
@@ -926,6 +1105,10 @@ function visitEnumDeclaration(node: ts.EnumDeclaration): string {
 
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   if (!typeNode) return ':';
+  if (ts.isArrayTypeNode(typeNode)) {
+    const elementType = getType(typeNode.elementType);
+    return getArrayType ? elementType : `[]${elementType}`;
+  }
   // Handle union types (e.g. string | null, number | undefined)
   if (ts.isUnionTypeNode(typeNode)) {
     const nonNullTypes = typeNode.types.filter(
