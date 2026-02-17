@@ -1,6 +1,6 @@
 {
   "name": "typenative",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "description": "Build native applications using Typescript.",
   "type": "module",
   "bin": {

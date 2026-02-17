@@ -5,6 +5,17 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.17] - 2026-02-16
+
+### Added
+
+- Support for ternary expressions (`condition ? a : b`)
+- Support for optional chaining (`obj?.prop`, `arr?.[i]`)
+- Support for nullish coalescing (`??` operator)
+- Support for type aliases (`type X = ...`)
+- Support for type assertions (`expr as Type`)
+- Support for optional properties (`prop?: Type` in interfaces/types)
+
 ## [0.0.16] - 2025-02-15
 
 ### Added

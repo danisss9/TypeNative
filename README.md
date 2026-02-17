@@ -11,99 +11,142 @@ Build native applications using Typescript.
 
 - Write a file `test.ts` with content `console.log('Hello World!');` or any other message
 - Run `npx typenative --source test.ts --script`
-- See your message in the terminal
-
-## Create a TypeNative Project
-
-- Run `npx typenative --new`
-- Give your project a name
-- Start writing code
 
 ## Typescript Syntax Support
 
-TypeNative currently supports a subset of TypeScript syntax elements that are transpiled to Go code:
+TypeNative currently supports a focused subset of TypeScript syntax elements that are transpiled to Go code. The support is grouped by topic for easier scanning.
 
-| Feature                     | Supported | Notes                                                             |
-| --------------------------- | :-------: | ----------------------------------------------------------------- |
-| **Basic Types**             |           |                                                                   |
-| number                      |    ✅     | Transpiled to `float64`                                           |
-| boolean                     |    ✅     | Transpiled to `bool`                                              |
-| string                      |    ✅     |                                                                   |
-| null                        |    ✅     |                                                                   |
-| any                         |    ✅     | Used for type inference                                           |
-| Nullable types              |    ✅     | `T \| null` / `T \| undefined` transpiled to Go pointer types     |
-| **Variables**               |           |                                                                   |
-| Variable declarations       |    ✅     | `let` and `const`                                                 |
-| Object literals             |    ✅     | Transpiled to Go struct literals                                  |
-| **Operators**               |           |                                                                   |
-| Arithmetic operators        |    ✅     | `+`, `-`, etc.                                                    |
-| Comparison operators        |    ✅     | `==`, `!=`, `===`, `!==`, etc.                                    |
-| Logical operators           |    ✅     | `&&`, `\|\|`                                                      |
-| Increment/Decrement         |    ✅     | `++`, `--`                                                        |
-| Non-null assertion (`!`)    |    ✅     | Stripped during transpilation                                     |
-| **Control Flow**            |           |                                                                   |
-| For loops                   |    ✅     | Standard `for` loops                                              |
-| For...of loops              |    ✅     | Iteration over arrays                                             |
-| While loops                 |    ✅     | Transpiled to Go's `for` loops                                    |
-| Do...while loops            |    ✅     | Implemented with conditional break                                |
-| If/Else statements          |    ✅     | Fully supported                                                   |
-| Switch statements           |    ✅     | Case and default statements                                       |
-| **Data Structures**         |           |                                                                   |
-| Arrays                      |    ✅     | Basic array operations                                            |
-| Array methods               |    ✅     | `push`, `join`, `slice`, `toString`                               |
-| **Functions**               |           |                                                                   |
-| Function declarations       |    ✅     | Transpiled to Go functions                                        |
-| Arrow functions             |    ✅     | Transpiled to anonymous functions                                 |
-| **Classes & Interfaces**    |           |                                                                   |
-| Classes                     |    ✅     | Transpiled to Go structs with constructor and receiver methods    |
-| Class inheritance           |    ✅     | `extends` via embedded structs, `super()` supported               |
-| Interfaces                  |    ✅     | Transpiled to Go interfaces, supports `extends`                   |
-| Generics                    |    ✅     | Type parameters on functions and classes via Go generics          |
-| **Async**                   |           |                                                                   |
-| Async/Await                 |    ✅     | `async` functions return Go channels, `await` reads from channels |
-| Promises                    |    ✅     | `new Promise` transpiled to channel + goroutine pattern           |
-| setTimeout                  |    ✅     | Mapped to Go's `time.AfterFunc`                                   |
-| **Built-in Functions**      |           |                                                                   |
-| console.log                 |    ✅     | Mapped to `fmt.Println`                                           |
-| console.time/timeEnd        |    ✅     | Performance measurement via `time.Now` / `time.Since`             |
-| assert                      |    ✅     | Transpiled to `panic` on failure                                  |
-| parseInt / parseFloat       |    ✅     | Mapped to Go's `strconv` package                                  |
-| **Math Methods**            |           |                                                                   |
-| Math.random                 |    ✅     | Mapped to `rand.Float64()`                                        |
-| Math.floor / ceil / round   |    ✅     | Mapped to `math.Floor`, `math.Ceil`, `math.Round`                 |
-| Math.abs / sqrt / pow       |    ✅     | Mapped to corresponding `math` functions                          |
-| Math.min / max              |    ✅     | Mapped to `math.Min`, `math.Max`                                  |
-| **String Methods**          |           |                                                                   |
-| toUpperCase / toLowerCase   |    ✅     | Via `strings` package                                             |
-| trim / trimStart / trimEnd  |    ✅     | Via `strings` package                                             |
-| split / includes / indexOf  |    ✅     | Via `strings` package                                             |
-| startsWith / endsWith       |    ✅     | Via `strings` package                                             |
-| replace / replaceAll        |    ✅     | Via `strings` package                                             |
-| charAt / substring / slice  |    ✅     | Direct Go string indexing/slicing                                 |
-| concat / repeat / toString  |    ✅     | String concatenation and `strings.Repeat`                         |
-| **Number / Object Methods** |           |                                                                   |
-| toString                    |    ✅     | Universal `toString()` via `fmt.Sprintf` for any type             |
-| **RegExp**                  |           |                                                                   |
-| Regex literals              |    ✅     | `/pattern/flags` transpiled to `regexp.MustCompile`               |
-| new RegExp()                |    ✅     | Constructor with optional flags                                   |
-| test()                      |    ✅     | Mapped to `regexp.MatchString`                                    |
-| exec()                      |    ✅     | Mapped to `regexp.FindStringSubmatch`                             |
-| **Unsupported Features**    |           |                                                                   |
-| Modules/Imports             |    ❌     | `import` / `export` declarations                                  |
-| Try/Catch                   |    ❌     | Error handling                                                    |
-| Template literals           |    ❌     | Backtick strings with `${expr}` interpolation                     |
-| Ternary expressions         |    ❌     | `condition ? a : b`                                               |
-| Optional chaining           |    ❌     | `obj?.prop`, `arr?.[i]`                                           |
-| Nullish coalescing          |    ❌     | `??` operator                                                     |
-| Spread operator             |    ❌     | `[...iterable]`, `{...obj}`                                       |
-| Type aliases                |    ❌     | `type X = ...`                                                    |
-| Type assertions             |    ❌     | `expr as Type`                                                    |
-| Optional properties         |    ❌     | `prop?: Type` in interfaces/types                                 |
-| Default parameter values    |    ❌     | `function(x = defaultValue)`                                      |
-| Map / Set                   |    ❌     | Built-in collection types and their methods                       |
-| Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()` with callbacks        |
-| Method chaining             |    ❌     | `arr.map(...).filter(...).join(...)`                              |
-| Enums                       |    ❌     | `enum` declarations and member access                             |
-| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables                  |
+**Basic Types**
+
+| Feature        | Supported | Notes                                                         |
+| -------------- | :-------: | ------------------------------------------------------------- |
+| number         |    ✅     | Transpiled to `float64`                                       |
+| boolean        |    ✅     | Transpiled to `bool`                                          |
+| string         |    ✅     |                                                               |
+| null           |    ✅     |                                                               |
+| any            |    ✅     | Used for type inference                                       |
+| Nullable types |    ✅     | `T \| null` / `T \| undefined` transpiled to Go pointer types |
+
+**Variables & Objects**
+
+| Feature               | Supported | Notes                            |
+| --------------------- | :-------: | -------------------------------- |
+| Variable declarations |    ✅     | `let` and `const`                |
+| Object literals       |    ✅     | Transpiled to Go struct literals |
+
+**Operators**
+
+| Feature                  | Supported | Notes                          |
+| ------------------------ | :-------: | ------------------------------ |
+| Arithmetic operators     |    ✅     | `+`, `-`, etc.                 |
+| Comparison operators     |    ✅     | `==`, `!=`, `===`, `!==`, etc. |
+| Logical operators        |    ✅     | `&&`, `\|\|`                   |
+| Increment/Decrement      |    ✅     | `++`, `--`                     |
+| Non-null assertion (`!`) |    ✅     | Stripped during transpilation  |
+| Ternary expressions      |    ✅     | `condition ? a : b`            |
+| Nullish coalescing       |    ✅     | `??` operator                  |
+| Optional chaining        |    ✅     | `obj?.prop`, `arr?.[i]`        |
+
+**Control Flow**
+
+| Feature            | Supported | Notes                              |
+| ------------------ | :-------: | ---------------------------------- |
+| If/Else statements |    ✅     | Fully supported                    |
+| Switch statements  |    ✅     | Case and default statements        |
+| For loops          |    ✅     | Standard `for` loops               |
+| For...of loops     |    ✅     | Iteration over arrays              |
+| While loops        |    ✅     | Transpiled to Go's `for` loops     |
+| Do...while loops   |    ✅     | Implemented with conditional break |
+
+**Data Structures & Array Methods**
+
+| Feature       | Supported | Notes                   |
+| ------------- | :-------: | ----------------------- |
+| Arrays        |    ✅     | Basic array operations  |
+| Array methods |    ✅     | `push`, `join`, `slice` |
+
+**Functions**
+
+| Feature                      | Supported | Notes                             |
+| ---------------------------- | :-------: | --------------------------------- |
+| Function declarations        |    ✅     | Transpiled to Go functions        |
+| Arrow functions              |    ✅     | Transpiled to anonymous functions |
+| Generics (functions/classes) |    ✅     | Type parameters via Go generics   |
+
+**Classes & Interfaces**
+
+| Feature             | Supported | Notes                                                          |
+| ------------------- | :-------: | -------------------------------------------------------------- |
+| Classes             |    ✅     | Transpiled to Go structs with constructor and receiver methods |
+| Class inheritance   |    ✅     | `extends` via embedded structs, `super()` supported            |
+| Interfaces          |    ✅     | Transpiled to Go interfaces, supports `extends`                |
+| Optional properties |    ✅     | `prop?: Type` in interfaces/types                              |
+
+**Async & Timing**
+
+| Feature     | Supported | Notes                                                             |
+| ----------- | :-------: | ----------------------------------------------------------------- |
+| Async/Await |    ✅     | `async` functions return Go channels, `await` reads from channels |
+| Promises    |    ✅     | `new Promise` transpiled to channel + goroutine pattern           |
+| setTimeout  |    ✅     | Mapped to Go's `time.AfterFunc`                                   |
+
+**Built-in Functions & Utilities**
+
+| Feature               | Supported | Notes                                                 |
+| --------------------- | :-------: | ----------------------------------------------------- |
+| console.log           |    ✅     | Mapped to `fmt.Println`                               |
+| console.time/timeEnd  |    ✅     | Performance measurement via `time.Now` / `time.Since` |
+| assert                |    ✅     | Transpiled to `panic` on failure                      |
+| parseInt / parseFloat |    ✅     | Mapped to Go's `strconv` package                      |
+
+**Math Methods**
+
+| Feature                   | Supported | Notes                                             |
+| ------------------------- | :-------: | ------------------------------------------------- |
+| Math.random               |    ✅     | Mapped to `rand.Float64()`                        |
+| Math.floor / ceil / round |    ✅     | Mapped to `math.Floor`, `math.Ceil`, `math.Round` |
+| Math.abs / sqrt / pow     |    ✅     | Mapped to corresponding `math` functions          |
+| Math.min / max            |    ✅     | Mapped to `math.Min`, `math.Max`                  |
+
+**String Methods**
+
+| Feature                    | Supported | Notes                                     |
+| -------------------------- | :-------: | ----------------------------------------- |
+| toUpperCase / toLowerCase  |    ✅     | Via `strings` package                     |
+| trim / trimStart / trimEnd |    ✅     | Via `strings` package                     |
+| split / includes / indexOf |    ✅     | Via `strings` package                     |
+| startsWith / endsWith      |    ✅     | Via `strings` package                     |
+| replace / replaceAll       |    ✅     | Via `strings` package                     |
+| charAt / substring / slice |    ✅     | Direct Go string indexing/slicing         |
+| concat / repeat            |    ✅     | String concatenation and `strings.Repeat` |
+
+**Number / Object Methods**
+
+| Feature  | Supported | Notes                                                 |
+| -------- | :-------: | ----------------------------------------------------- |
+| toString |    ✅     | Universal `toString()` via `fmt.Sprintf` for any type |
+
+**RegExp**
+
+| Feature        | Supported | Notes                                               |
+| -------------- | :-------: | --------------------------------------------------- |
+| Regex literals |    ✅     | `/pattern/flags` transpiled to `regexp.MustCompile` |
+| new RegExp()   |    ✅     | Constructor with optional flags                     |
+| test()         |    ✅     | Mapped to `regexp.MatchString`                      |
+| exec()         |    ✅     | Mapped to `regexp.FindStringSubmatch`               |
+
+**Unsupported / Roadmap**
+
+| Feature                     | Supported | Notes                                                      |
+| --------------------------- | :-------: | ---------------------------------------------------------- |
+| Modules/Imports             |    ❌     | `import` / `export` declarations                           |
+| Try/Catch                   |    ❌     | Error handling                                             |
+| Template literals           |    ❌     | Backtick strings with `${expr}` interpolation              |
+| Default parameter values    |    ❌     | `function(x = defaultValue)`                               |
+| Map / Set                   |    ❌     | Built-in collection types and their methods                |
+| Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()` with callbacks |
+| Method chaining             |    ❌     | `arr.map(...).filter(...).join(...)`                       |
+| Enums                       |    ❌     | `enum` declarations and member access                      |
+| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables           |
 
 TypeNative is currently in early development and new features are being added regularly.

@@ -13,6 +13,7 @@ const variableGoTypes = new Map();
 const variableClassNames = new Map();
 const classPropertyTypes = new Map();
 const classMethodReturnTypes = new Map();
+const interfacePropertyTypes = new Map();
 const typeAliases = new Map();
 export function transpileToNative(code) {
     const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
@@ -27,6 +28,7 @@ export function transpileToNative(code) {
     variableClassNames.clear();
     classPropertyTypes.clear();
     classMethodReturnTypes.clear();
+    interfacePropertyTypes.clear();
     typeAliases.clear();
     const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
     const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
@@ -310,6 +312,15 @@ export function visit(node, options = {}) {
     else if (ts.isInterfaceDeclaration(node)) {
         if (options.addFunctionOutside) {
             outsideNodes.push(node);
+            const properties = new Map();
+            for (const member of node.members) {
+                if (ts.isPropertySignature(member) && ts.isIdentifier(member.name)) {
+                    properties.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
+                }
+            }
+            if (properties.size > 0) {
+                interfacePropertyTypes.set(visit(node.name), properties);
+            }
             return '';
         }
         const name = visit(node.name);
@@ -325,6 +336,7 @@ export function visit(node, options = {}) {
             }
         }
         const methods = [];
+        const properties = [];
         for (const member of node.members) {
             if (ts.isMethodSignature(member)) {
                 const methodName = visit(member.name);
@@ -334,6 +346,13 @@ export function visit(node, options = {}) {
                 const returnType = member.type ? ` ${getType(member.type)}` : '';
                 methods.push(`\t${methodName}(${params})${returnType}`);
             }
+            else if (ts.isPropertySignature(member) && ts.isIdentifier(member.name)) {
+                properties.push(`\t${member.name.text} ${getOptionalNodeType(member.type, !!member.questionToken)}`);
+            }
+        }
+        if (properties.length > 0 && methods.length === 0) {
+            const fields = [...extendedInterfaces.map((e) => `\t${e}`), ...properties];
+            return `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}`;
         }
         const members = [...extendedInterfaces.map((e) => `\t${e}`), ...methods];
         return `type ${name}${typeParams} interface {\n${members.join('\n')}\n}`;
@@ -347,7 +366,7 @@ export function visit(node, options = {}) {
             const methods = new Map();
             for (const member of node.members) {
                 if (ts.isPropertyDeclaration(member) && ts.isIdentifier(member.name)) {
-                    properties.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+                    properties.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
                 }
                 if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name)) {
                     methods.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
@@ -380,7 +399,7 @@ export function visit(node, options = {}) {
                     fieldType = `[]${getType(member.type, true)}`;
                 }
                 else {
-                    fieldType = member.type ? getType(member.type) : 'interface{}';
+                    fieldType = getOptionalNodeType(member.type, !!member.questionToken);
                 }
                 fields.push(`\t${fieldName} ${fieldType}`);
             }
@@ -550,19 +569,20 @@ function inferExpressionType(expr) {
         const leftType = inferExpressionType(expr.expression);
         if (expr.name.text === 'length')
             return 'float64';
+        const resolvedLeftType = leftType?.replace(/^\*/, '').replace(/\[.*\]$/, '');
+        const resolvedPropertyType = resolvedLeftType
+            ? classPropertyTypes.get(resolvedLeftType)?.get(expr.name.text) ??
+                interfacePropertyTypes.get(resolvedLeftType)?.get(expr.name.text)
+            : undefined;
         if (hasQuestionDot(expr)) {
             if (leftType && leftType.startsWith('*')) {
-                const className = leftType.replace(/^\*/, '').replace(/\[.*\]$/, '');
-                const memberType = classPropertyTypes.get(className)?.get(expr.name.text) ?? 'interface{}';
+                const memberType = resolvedPropertyType ?? 'interface{}';
                 return makeNullableType(memberType);
             }
             return 'interface{}';
         }
-        if (leftType && leftType.startsWith('*')) {
-            const className = leftType.replace(/^\*/, '').replace(/\[.*\]$/, '');
-            const memberType = classPropertyTypes.get(className)?.get(expr.name.text);
-            if (memberType)
-                return memberType;
+        if (resolvedPropertyType) {
+            return resolvedPropertyType;
         }
         if (ts.isIdentifier(expr.expression)) {
             const className = variableClassNames.get(expr.expression.text);
@@ -723,6 +743,16 @@ function getAliasType(name, seen = new Set()) {
         }
     }
     return aliasType;
+}
+function getOptionalNodeType(typeNode, isOptional) {
+    const baseType = typeNode ? getType(typeNode) : 'interface{}';
+    if (!isOptional)
+        return baseType;
+    if (baseType === 'interface{}' || baseType.startsWith('*'))
+        return baseType;
+    if (['string', 'float64', 'bool'].includes(baseType))
+        return `*${baseType}`;
+    return baseType;
 }
 function getType(typeNode, getArrayType = false) {
     if (!typeNode)
