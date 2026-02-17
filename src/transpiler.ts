@@ -97,9 +97,9 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type!, true) : '';
     return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
   } else if (ts.isBlock(node)) {
-    return `{\n\t\t${node.statements.map((n) => visit(n)).join('\t')}${
-      options.extraBlockContent ?? ''
-    }}${options.inline ? '' : '\n\t'}`;
+    return `{\n\t\t${options.prefixBlockContent ?? ''}${node.statements
+      .map((n) => visit(n))
+      .join('\t')}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
   } else if (ts.isElementAccessExpression(node)) {
     if (hasQuestionDot(node)) {
       return visitOptionalElementAccess(node);
@@ -278,22 +278,27 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const name = visit(node.name!, { inline: true });
     const safeName = getSafeName(name);
     const typeParams = getTypeParameters(node.typeParameters);
-    const parameters = node.parameters
-      .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
-      .join(', ');
+    const parameterInfo = getFunctionParametersInfo(node.parameters);
     const returnType = node.type ? ` ${getType(node.type)}` : '';
 
     if (options.isOutside) {
-      return `func ${safeName}${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
+      return `func ${safeName}${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body!, {
+        prefixBlockContent: parameterInfo.prefixBlockContent
+      })}`;
     }
 
-    return `${safeName} := func${typeParams}(${parameters})${returnType} ${visit(node.body!)}`;
+    return `${safeName} := func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body!, {
+      prefixBlockContent: parameterInfo.prefixBlockContent
+    })}`;
   } else if (ts.isArrowFunction(node)) {
-    const parameters = node.parameters
-      .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
-      .join(', ');
+    const parameterInfo = getFunctionParametersInfo(node.parameters);
     const returnType = node.type ? ` ${getType(node.type)}` : '';
-    return `func(${parameters})${returnType} ${visit(node.body!)}`;
+    if (parameterInfo.prefixBlockContent && !ts.isBlock(node.body)) {
+      return `func(${parameterInfo.signature})${returnType} {\n\t\t${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
+    }
+    return `func(${parameterInfo.signature})${returnType} ${visit(node.body!, {
+      prefixBlockContent: parameterInfo.prefixBlockContent
+    })}`;
   } else if (node.kind === ts.SyntaxKind.ThisKeyword) {
     return 'self';
   } else if (ts.isTypeAliasDeclaration(node)) {
@@ -417,7 +422,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       | ts.ConstructorDeclaration
       | undefined;
     if (ctor) {
-      const params = ctor.parameters.map((p) => `${visit(p.name)} ${getType(p.type!)}`).join(', ');
+      const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters);
 
       const bodyStatements =
         ctor.body?.statements
@@ -430,7 +435,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
           .map((s) => visit(s))
           .join('\t') ?? '';
 
-      result += `func New${name}${typeParams}(${params}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${bodyStatements}return self;\n\t}\n\n`;
+      result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${bodyStatements}return self;\n\t}\n\n`;
     } else {
       result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\treturn &${name}${typeParamNames}{}\n\t}\n\n`;
     }
@@ -438,11 +443,11 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     for (const member of node.members) {
       if (ts.isMethodDeclaration(member)) {
         const methodName = visit(member.name);
-        const params = member.parameters
-          .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
-          .join(', ');
+        const methodParameterInfo = getFunctionParametersInfo(member.parameters);
         const returnType = member.type ? ` ${getType(member.type)}` : '';
-        result += `func (self *${name}${typeParamNames}) ${methodName}(${params})${returnType} ${visit(member.body!)}\n\n`;
+        result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body!, {
+          prefixBlockContent: methodParameterInfo.prefixBlockContent
+        })}\n\n`;
       }
     }
 
@@ -506,6 +511,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 export type VisitNodeOptions = {
   inline?: boolean;
   extraBlockContent?: string;
+  prefixBlockContent?: string;
   addFunctionOutside?: boolean;
   isOutside?: boolean;
 };
@@ -1219,6 +1225,79 @@ function getTypeArguments(typeArguments: readonly ts.TypeNode[] | undefined): st
   if (!typeArguments || typeArguments.length === 0) return '';
   const args = typeArguments.map((ta) => getType(ta));
   return `[${args.join(', ')}]`;
+}
+
+type FunctionParametersInfo = {
+  signature: string;
+  prefixBlockContent: string;
+};
+
+function getParameterGoType(param: ts.ParameterDeclaration): string {
+  if (param.type) {
+    const explicitType = getType(param.type);
+    return explicitType === ':' ? 'interface{}' : explicitType;
+  }
+
+  if (param.initializer) {
+    const inferredType = inferExpressionType(param.initializer);
+    if (inferredType && inferredType !== 'nil' && inferredType !== ':') {
+      return inferredType;
+    }
+  }
+
+  return 'interface{}';
+}
+
+function getFunctionParametersInfo(
+  parameters: ts.NodeArray<ts.ParameterDeclaration>
+): FunctionParametersInfo {
+  if (parameters.length === 0) {
+    return { signature: '', prefixBlockContent: '' };
+  }
+
+  const firstDefaultIndex = parameters.findIndex((p) => !!p.initializer);
+  if (firstDefaultIndex === -1) {
+    return {
+      signature: parameters.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`).join(', '),
+      prefixBlockContent: ''
+    };
+  }
+
+  const hasRequiredAfterDefault = parameters
+    .slice(firstDefaultIndex)
+    .some((p) => !p.initializer);
+
+  if (hasRequiredAfterDefault) {
+    return {
+      signature: parameters.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`).join(', '),
+      prefixBlockContent: ''
+    };
+  }
+
+  const requiredParams = parameters.slice(0, firstDefaultIndex);
+  const defaultedParams = parameters.slice(firstDefaultIndex);
+
+  const signatureParts = requiredParams.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`);
+  signatureParts.push('__defaultArgs ...interface{}');
+
+  const prefixBlockContent = defaultedParams
+    .map((param, index) => {
+      const paramName = visit(param.name);
+      const paramType = getParameterGoType(param);
+      const defaultValue = visit(param.initializer!);
+
+      if (paramType === 'interface{}') {
+        return `var ${paramName} interface{}\n\t\tif len(__defaultArgs) > ${index} {\n\t\t\t${paramName} = __defaultArgs[${index}]\n\t\t} else {\n\t\t\t${paramName} = ${defaultValue}\n\t\t}\n\t\t`;
+      }
+
+      return `var ${paramName} ${paramType}\n\t\tif len(__defaultArgs) > ${index} {\n\t\t\t${paramName} = __defaultArgs[${index}].(${paramType})\n\t\t} else {\n\t\t\t${paramName} = ${defaultValue}\n\t\t}\n\t\t`;
+    })
+    .join('');
+
+  return {
+    signature: signatureParts.join(', '),
+    prefixBlockContent
+  };
 }
 
 function getSafeName(name: string): string {

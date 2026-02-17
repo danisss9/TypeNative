@@ -72,6 +72,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Function declarations        |    ✅     | Transpiled to Go functions        |
 | Arrow functions              |    ✅     | Transpiled to anonymous functions |
 | Generics (functions/classes) |    ✅     | Type parameters via Go generics   |
+| Default parameter values     |    ✅     | `function(x = defaultValue)`      |
 
 **Classes & Interfaces**
 
@@ -110,15 +111,16 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **String Methods**
 
-| Feature                    | Supported | Notes                                     |
-| -------------------------- | :-------: | ----------------------------------------- |
-| toUpperCase / toLowerCase  |    ✅     | Via `strings` package                     |
-| trim / trimStart / trimEnd |    ✅     | Via `strings` package                     |
-| split / includes / indexOf |    ✅     | Via `strings` package                     |
-| startsWith / endsWith      |    ✅     | Via `strings` package                     |
-| replace / replaceAll       |    ✅     | Via `strings` package                     |
-| charAt / substring / slice |    ✅     | Direct Go string indexing/slicing         |
-| concat / repeat            |    ✅     | String concatenation and `strings.Repeat` |
+| Feature                    | Supported | Notes                                         |
+| -------------------------- | :-------: | --------------------------------------------- |
+| Template literals          |    ✅     | Backtick strings with `${expr}` interpolation |
+| toUpperCase / toLowerCase  |    ✅     | Via `strings` package                         |
+| trim / trimStart / trimEnd |    ✅     | Via `strings` package                         |
+| split / includes / indexOf |    ✅     | Via `strings` package                         |
+| startsWith / endsWith      |    ✅     | Via `strings` package                         |
+| replace / replaceAll       |    ✅     | Via `strings` package                         |
+| charAt / substring / slice |    ✅     | Direct Go string indexing/slicing             |
+| concat / repeat            |    ✅     | String concatenation and `strings.Repeat`     |
 
 **Number / Object Methods**
 
@@ -137,16 +139,13 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **Unsupported / Roadmap**
 
-| Feature                     | Supported | Notes                                                      |
-| --------------------------- | :-------: | ---------------------------------------------------------- |
-| Modules/Imports             |    ❌     | `import` / `export` declarations                           |
-| Try/Catch                   |    ❌     | Error handling                                             |
-| Template literals           |    ❌     | Backtick strings with `${expr}` interpolation              |
-| Default parameter values    |    ❌     | `function(x = defaultValue)`                               |
-| Map / Set                   |    ❌     | Built-in collection types and their methods                |
-| Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()` with callbacks |
-| Method chaining             |    ❌     | `arr.map(...).filter(...).join(...)`                       |
-| Enums                       |    ❌     | `enum` declarations and member access                      |
-| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables           |
+| Feature                     | Supported | Notes                                                  |
+| --------------------------- | :-------: | ------------------------------------------------------ |
+| Modules/Imports             |    ❌     | `import` / `export` declarations                       |
+| Try/Catch                   |    ❌     | Error handling                                         |
+| Map / Set                   |    ❌     | Built-in collection types and their methods            |
+| Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()`, `.join()` |
+| Enums                       |    ❌     | `enum` declarations and member access                  |
+| Closures over mutable state |    ❌     | Functions capturing and mutating outer variables       |
 
-TypeNative is currently in early development and new features are being added regularly.
+TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.

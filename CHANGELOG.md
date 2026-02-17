@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for type aliases (`type X = ...`)
 - Support for type assertions (`expr as Type`)
 - Support for optional properties (`prop?: Type` in interfaces/types)
+- Support for default parameter values (e.g. `function(x = defaultValue)`)
 
 ## [0.0.16] - 2025-02-15
 
