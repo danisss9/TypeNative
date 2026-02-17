@@ -82,6 +82,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Class inheritance   |    ✅     | `extends` via embedded structs, `super()` supported            |
 | Interfaces          |    ✅     | Transpiled to Go interfaces, supports `extends`                |
 | Optional properties |    ✅     | `prop?: Type` in interfaces/types                              |
+| Enums               |    ✅     | `enum` declarations and member access                          |
 
 **Async & Timing**
 
@@ -145,7 +146,6 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Try/Catch                   |    ❌     | Error handling                                         |
 | Map / Set                   |    ❌     | Built-in collection types and their methods            |
 | Higher-order array methods  |    ❌     | `.map()`, `.filter()`, `.some()`, `.find()`, `.join()` |
-| Enums                       |    ❌     | `enum` declarations and member access                  |
 | Closures over mutable state |    ❌     | Functions capturing and mutating outer variables       |
 
 TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.

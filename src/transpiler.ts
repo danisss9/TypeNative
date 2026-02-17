@@ -20,6 +20,8 @@ const classPropertyTypes = new Map<string, Map<string, string>>();
 const classMethodReturnTypes = new Map<string, Map<string, string>>();
 const interfacePropertyTypes = new Map<string, Map<string, string>>();
 const typeAliases = new Map<string, ts.TypeNode>();
+const enumNames = new Set<string>();
+const enumBaseTypes = new Map<string, 'string' | 'float64'>();
 
 export function transpileToNative(code: string): string {
   const sourceFile = ts.createSourceFile(
@@ -43,6 +45,8 @@ export function transpileToNative(code: string): string {
   classMethodReturnTypes.clear();
   interfacePropertyTypes.clear();
   typeAliases.clear();
+  enumNames.clear();
+  enumBaseTypes.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -108,6 +112,9 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isPropertyAccessExpression(node)) {
     if (hasQuestionDot(node)) {
       return visitOptionalPropertyAccess(node);
+    }
+    if (ts.isIdentifier(node.expression) && enumNames.has(node.expression.text)) {
+      return `${getSafeName(node.expression.text)}_${getEnumMemberName(node.name)}`;
     }
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
@@ -301,6 +308,17 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     })}`;
   } else if (node.kind === ts.SyntaxKind.ThisKeyword) {
     return 'self';
+  } else if (ts.isEnumDeclaration(node)) {
+    const enumName = node.name.text;
+    enumNames.add(enumName);
+    enumBaseTypes.set(enumName, getEnumBaseType(node));
+
+    if (options.addFunctionOutside) {
+      outsideNodes.push(node);
+      return '';
+    }
+
+    return visitEnumDeclaration(node);
   } else if (ts.isTypeAliasDeclaration(node)) {
     typeAliases.set(node.name.text, node.type);
     return '';
@@ -604,6 +622,10 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
   if (ts.isIdentifier(expr)) return variableGoTypes.get(expr.text);
 
   if (ts.isPropertyAccessExpression(expr)) {
+    if (ts.isIdentifier(expr.expression) && enumNames.has(expr.expression.text)) {
+      const enumType = getSafeName(expr.expression.text);
+      return enumType;
+    }
     const leftType = inferExpressionType(expr.expression);
     if (expr.name.text === 'length') return 'float64';
 
@@ -821,6 +843,87 @@ function getOptionalNodeType(typeNode: ts.TypeNode | undefined, isOptional: bool
   return baseType;
 }
 
+function getEnumMemberName(name: ts.PropertyName): string {
+  if (ts.isIdentifier(name)) {
+    return getSafeName(name.text);
+  }
+
+  if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+    const sanitized = name.text.replace(/[^a-zA-Z0-9_]/g, '_');
+    return sanitized.length > 0 ? sanitized : 'Member';
+  }
+
+  return 'Member';
+}
+
+function getEnumBaseType(node: ts.EnumDeclaration): 'string' | 'float64' {
+  for (const member of node.members) {
+    const initializer = member.initializer;
+    if (!initializer) continue;
+    if (ts.isStringLiteral(initializer) || ts.isNoSubstitutionTemplateLiteral(initializer)) {
+      return 'string';
+    }
+  }
+  return 'float64';
+}
+
+function readNumericEnumInitializer(initializer: ts.Expression): number | undefined {
+  if (ts.isNumericLiteral(initializer)) {
+    return Number(initializer.text);
+  }
+
+  if (
+    ts.isPrefixUnaryExpression(initializer) &&
+    initializer.operator === ts.SyntaxKind.MinusToken &&
+    ts.isNumericLiteral(initializer.operand)
+  ) {
+    return -Number(initializer.operand.text);
+  }
+
+  return undefined;
+}
+
+function visitEnumDeclaration(node: ts.EnumDeclaration): string {
+  const enumName = getSafeName(node.name.text);
+  const baseType = enumBaseTypes.get(node.name.text) ?? getEnumBaseType(node);
+
+  let nextNumericValue = 0;
+  let canAutoIncrement = true;
+  const members: string[] = [];
+
+  for (const member of node.members) {
+    const memberName = getEnumMemberName(member.name);
+    const symbolName = `${enumName}_${memberName}`;
+
+    let valueExpr: string;
+    if (member.initializer) {
+      if (baseType === 'float64') {
+        const numericValue = readNumericEnumInitializer(member.initializer);
+        if (numericValue !== undefined) {
+          valueExpr = `${numericValue}`;
+          nextNumericValue = numericValue + 1;
+          canAutoIncrement = true;
+        } else {
+          valueExpr = `float64(${visit(member.initializer)})`;
+          canAutoIncrement = false;
+        }
+      } else {
+        valueExpr = visit(member.initializer);
+      }
+    } else if (baseType === 'float64') {
+      const currentValue = canAutoIncrement ? nextNumericValue : 0;
+      valueExpr = `${currentValue}`;
+      nextNumericValue = currentValue + 1;
+    } else {
+      valueExpr = toGoStringLiteral(memberName);
+    }
+
+    members.push(`\t${symbolName} ${enumName} = ${enumName}(${valueExpr})`);
+  }
+
+  return `type ${enumName} ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
+}
+
 function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   if (!typeNode) return ':';
   // Handle union types (e.g. string | null, number | undefined)
@@ -845,6 +948,9 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   }
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
+    if (enumNames.has(name)) {
+      return getSafeName(name);
+    }
     const aliasType = getAliasType(name);
     if (aliasType) {
       return getType(aliasType, getArrayType);
