@@ -1,36 +1,67 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+# Triggered by tags matching "TypeNative_{version}" (e.g. TypeNative_0.0.18)
+# Runs tests, creates a GitHub release, and publishes to npm.
+#
+# Uses npm Trusted Publishing (OIDC) — no NPM_TOKEN secret required.
+# Setup: npmjs.com → your package → Settings → Trusted Publishing → Add publisher
+#   Owner: danisss9 | Repo: typenative | Workflow: npm-publish-github-packages.yml
 
-name: Node.js Package
+name: Release & Publish
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'TypeNative_*'
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
       - run: npm ci
       - run: npm test
 
-  publish-gpr:
-    needs: build
+  release:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#TypeNative_}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: TypeNative v${{ steps.version.outputs.VERSION }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+
+  publish-npm:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for npm Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://npm.pkg.github.com/
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#TypeNative_}" >> $GITHUB_OUTPUT
+
+      - name: Sync package.json version to tag
+        run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version
+
       - run: npm ci
-      - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
+
+      - run: npm publish --provenance --access public
