@@ -232,9 +232,21 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       inline: true
     })}; ${visit(node.incrementor!, { inline: true })}${visit(node.statement)}`;
   } else if (ts.isForOfStatement(node)) {
-    return `for _,${visit(node.initializer, { inline: true })}= range ${visit(node.expression, {
-      inline: true
-    })}${visit(node.statement)}`;
+    const iterExpr = visit(node.expression, { inline: true });
+    const iterType = inferExpressionType(node.expression);
+    if (iterType && iterType.startsWith('map[')) {
+      const valueType = extractMapValueType(iterType);
+      const isSet = valueType === 'struct{}';
+      const varInfo = getForOfVarNames(node.initializer);
+      if (isSet) {
+        return `for ${varInfo[0]} := range ${iterExpr}${visit(node.statement)}`;
+      } else if (varInfo.length >= 2) {
+        return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}${visit(node.statement)}`;
+      } else {
+        return `for ${varInfo[0]} := range ${iterExpr}${visit(node.statement)}`;
+      }
+    }
+    return `for _,${visit(node.initializer, { inline: true })}= range ${iterExpr}${visit(node.statement)}`;
   } else if (ts.isWhileStatement(node)) {
     return `for ${visit(node.expression, { inline: true })}${visit(node.statement)}`;
   } else if (ts.isDoStatement(node)) {
@@ -492,6 +504,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       }
       return `regexp.MustCompile("")`;
     }
+    if (className === 'Map') {
+      return visitNewMap(node);
+    }
+    if (className === 'Set') {
+      return visitNewSet(node);
+    }
     const typeArgs = getTypeArguments(node.typeArguments);
     const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
     return `New${className}${typeArgs}(${args.join(', ')})`;
@@ -629,6 +647,15 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
     const firstElementType = inferExpressionType(expr.elements[0] as ts.Expression) ?? 'interface{}';
     return `[]${firstElementType}`;
   }
+  if (ts.isNewExpression(expr) && ts.isIdentifier(expr.expression)) {
+    const ctorName = expr.expression.text;
+    if (ctorName === 'Map' && expr.typeArguments && expr.typeArguments.length === 2) {
+      return `map[${getType(expr.typeArguments[0])}]${getType(expr.typeArguments[1])}`;
+    }
+    if (ctorName === 'Set' && expr.typeArguments && expr.typeArguments.length === 1) {
+      return `map[${getType(expr.typeArguments[0])}]struct{}`;
+    }
+  }
 
   if (ts.isPropertyAccessExpression(expr)) {
     if (ts.isIdentifier(expr.expression) && enumNames.has(expr.expression.text)) {
@@ -668,6 +695,12 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
   if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression)) {
     const methodName = expr.expression.name.text;
     const ownerType = inferExpressionType(expr.expression.expression);
+
+    if (ownerType && ownerType.startsWith('map[')) {
+      if (methodName === 'has') return 'bool';
+      if (methodName === 'get') return extractMapValueType(ownerType);
+    }
+
     if (isArrayLikeGoType(ownerType)) {
       const elementType = getArrayElementTypeFromGoType(ownerType!);
       if (methodName === 'map') {
@@ -1144,6 +1177,15 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
     if (name === 'RegExp') {
       return '*regexp.Regexp';
     }
+    if (name === 'Map' && typeNode.typeArguments && typeNode.typeArguments.length === 2) {
+      const keyType = getType(typeNode.typeArguments[0]);
+      const valueType = getType(typeNode.typeArguments[1]);
+      return `map[${keyType}]${valueType}`;
+    }
+    if (name === 'Set' && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
+      const elementType = getType(typeNode.typeArguments[0]);
+      return `map[${elementType}]struct{}`;
+    }
     const typeArgs = getTypeArguments(typeNode.typeArguments);
     if (classNames.has(name)) {
       return `*${name}${typeArgs}`;
@@ -1194,6 +1236,8 @@ function getTypeCategory(typeNode: ts.TypeNode | undefined): string | undefined 
   }
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
+    if (name === 'Map') return 'Map';
+    if (name === 'Set') return 'Set';
     if (classNames.has(name)) return 'class';
     return name;
   }
@@ -1236,6 +1280,9 @@ function isNilLiteral(node: ts.Expression): boolean {
 
 function getAcessString(leftSide: string, rightSide: string, objectType?: string): string {
   if (rightSide === 'length' && objectType !== 'class') {
+    return `float64(len(${leftSide}))`;
+  }
+  if (rightSide === 'size' && (objectType === 'Map' || objectType === 'Set')) {
     return `float64(len(${leftSide}))`;
   }
 
@@ -1400,6 +1447,27 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   }
 };
 
+const mapMethodHandlers: Record<string, MethodHandler> = {
+  set: (obj, args) => `${obj}[${args[0]}] = ${args[1]}`,
+  get: (obj, args) => `${obj}[${args[0]}]`,
+  has: (obj, args) => {
+    const tmp = getTempName('ok');
+    return `func() bool { _, ${tmp} := ${obj}[${args[0]}]; return ${tmp} }()`;
+  },
+  delete: (obj, args) => `delete(${obj}, ${args[0]})`,
+  clear: (obj) => `clear(${obj})`
+};
+
+const setMethodHandlers: Record<string, MethodHandler> = {
+  add: (obj, args) => `${obj}[${args[0]}] = struct{}{}`,
+  has: (obj, args) => {
+    const tmp = getTempName('ok');
+    return `func() bool { _, ${tmp} := ${obj}[${args[0]}]; return ${tmp} }()`;
+  },
+  delete: (obj, args) => `delete(${obj}, ${args[0]})`,
+  clear: (obj) => `clear(${obj})`
+};
+
 function getDynamicCallHandler(caller: string, objectType?: string): CallHandler | null {
   if (promiseResolveName && caller === promiseResolveName) {
     return (_caller, args) => `ch <- ${args[0]}`;
@@ -1427,6 +1495,10 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
       handler = arrayMethodHandlers[methodName];
     } else if (objectType === 'RegExp') {
       handler = regexpMethodHandlers[methodName];
+    } else if (objectType === 'Map') {
+      handler = mapMethodHandlers[methodName];
+    } else if (objectType === 'Set') {
+      handler = setMethodHandlers[methodName];
     } else {
       // Unknown type: try both maps for backward compatibility
       handler =
@@ -1669,4 +1741,72 @@ function visitNewPromise(node: ts.NewExpression): string {
   promiseResolveName = prevResolveName;
 
   return `func() chan ${channelType} {\n\t\tch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch;\n\t}()`;
+}
+
+function extractMapValueType(mapType: string): string {
+  // mapType is "map[K]V" — find the closing bracket of K accounting for nesting
+  if (!mapType.startsWith('map[')) return 'interface{}';
+  let depth = 0;
+  for (let i = 4; i < mapType.length; i++) {
+    if (mapType[i] === '[') depth++;
+    else if (mapType[i] === ']') {
+      if (depth === 0) return mapType.substring(i + 1);
+      depth--;
+    }
+  }
+  return 'interface{}';
+}
+
+function visitNewMap(node: ts.NewExpression): string {
+  let keyType = 'interface{}';
+  let valueType = 'interface{}';
+  if (node.typeArguments && node.typeArguments.length === 2) {
+    keyType = getType(node.typeArguments[0]);
+    valueType = getType(node.typeArguments[1]);
+  }
+  const mapType = `map[${keyType}]${valueType}`;
+  const args = node.arguments;
+  if (!args || args.length === 0 || !ts.isArrayLiteralExpression(args[0])) {
+    return `make(${mapType})`;
+  }
+  const initArg = args[0] as ts.ArrayLiteralExpression;
+  const tmp = getTempName('map');
+  const entries = initArg.elements
+    .filter((el) => ts.isArrayLiteralExpression(el) && el.elements.length >= 2)
+    .map((el) => {
+      const pair = el as ts.ArrayLiteralExpression;
+      return `${tmp}[${visit(pair.elements[0])}] = ${visit(pair.elements[1])}`;
+    })
+    .join('; ');
+  return `func() ${mapType} { ${tmp} := make(${mapType}); ${entries}; return ${tmp} }()`;
+}
+
+function visitNewSet(node: ts.NewExpression): string {
+  let elementType = 'interface{}';
+  if (node.typeArguments && node.typeArguments.length === 1) {
+    elementType = getType(node.typeArguments[0]);
+  }
+  const setType = `map[${elementType}]struct{}`;
+  const args = node.arguments;
+  if (!args || args.length === 0 || !ts.isArrayLiteralExpression(args[0])) {
+    return `make(${setType})`;
+  }
+  const initArg = args[0] as ts.ArrayLiteralExpression;
+  const tmp = getTempName('set');
+  const values = initArg.elements.map((el) => `${tmp}[${visit(el)}] = struct{}{}`).join('; ');
+  return `func() ${setType} { ${tmp} := make(${setType}); ${values}; return ${tmp} }()`;
+}
+
+function getForOfVarNames(initializer: ts.ForInitializer): string[] {
+  if (!ts.isVariableDeclarationList(initializer) || initializer.declarations.length === 0) {
+    return ['_'];
+  }
+  const decl = initializer.declarations[0];
+  if (ts.isArrayBindingPattern(decl.name)) {
+    return decl.name.elements.map((el) => {
+      if (ts.isOmittedExpression(el)) return '_';
+      return visit((el as ts.BindingElement).name);
+    });
+  }
+  return [visit(decl.name)];
 }

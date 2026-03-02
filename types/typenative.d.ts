@@ -191,3 +191,47 @@ declare var Promise: PromiseConstructor;
 declare function setTimeout(callback: () => void, ms: number): void;
 
 declare function assert(condition: boolean, message?: string): void;
+
+interface Map<K, V> {
+  /** The number of key/value pairs in the Map. */
+  readonly size: number;
+  /** Adds or updates a key/value pair. */
+  set(key: K, value: V): this;
+  /** Returns the value for the given key, or undefined if absent. */
+  get(key: K): V | undefined;
+  /** Returns true if the key exists in the Map. */
+  has(key: K): boolean;
+  /** Removes the entry for the given key. Returns true if the entry existed. */
+  delete(key: K): boolean;
+  /** Removes all entries. */
+  clear(): void;
+  [Symbol.iterator](): Iterator<[K, V]>;
+}
+
+interface MapConstructor {
+  new <K, V>(): Map<K, V>;
+  new <K, V>(entries: [K, V][]): Map<K, V>;
+}
+
+declare var Map: MapConstructor;
+
+interface Set<T> {
+  /** The number of values in the Set. */
+  readonly size: number;
+  /** Inserts a value (no-op if already present). Returns the Set. */
+  add(value: T): this;
+  /** Returns true if the value exists in the Set. */
+  has(value: T): boolean;
+  /** Removes the given value. Returns true if the value existed. */
+  delete(value: T): boolean;
+  /** Removes all values. */
+  clear(): void;
+  [Symbol.iterator](): Iterator<T>;
+}
+
+interface SetConstructor {
+  new <T>(): Set<T>;
+  new <T>(values: T[]): Set<T>;
+}
+
+declare var Set: SetConstructor;

@@ -66,6 +66,8 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Array methods              |    ✅     | `push`, `join`, `slice`                                          |
 | Higher-order array methods |    ✅     | `.map()`, `.filter()`, `.some()`, `.find()`                      |
 | Method chaining            |    ✅     | Chaining array methods such as `.map(...).filter(...).join(...)` |
+| Map                        |    ✅     | `Map<K, V>` → Go `map[K]V`; `.set()`, `.get()`, `.has()`, `.delete()`, `.clear()`, `.size` |
+| Set                        |    ✅     | `Set<T>` → Go `map[T]struct{}`; `.add()`, `.has()`, `.delete()`, `.clear()`, `.size` |
 
 **Functions**
 
@@ -146,7 +148,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | --------------------------- | :-------: | ------------------------------------------------ |
 | Modules/Imports             |    ❌     | `import` / `export` declarations                 |
 | Try/Catch                   |    ❌     | Error handling                                   |
-| Map / Set                   |    ❌     | Built-in collection types and their methods      |
+| Map / Set                   |    ✅     | Built-in collection types and their methods      |
 | Closures over mutable state |    ❌     | Functions capturing and mutating outer variables |
 
 TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.
