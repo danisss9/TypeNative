@@ -84,7 +84,7 @@ const __dirname = path.dirname(__filename);
 
     if (answers.installDependencies) {
       console.log('Installing dependencies...');
-      await execa('npm install', { cwd: projectName, stdio: 'inherit' });
+      await execa('npm', ['install'], { cwd: projectName, stdio: 'inherit' });
       console.log('Dependencies installed successfully!');
     }
     return;
@@ -102,7 +102,7 @@ const __dirname = path.dirname(__filename);
   await fs.ensureDir('dist');
   await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
 
-  await execa(`go build -o ${exePath} dist/code.go`, {
+  await execa('go', ['build', '-o', exePath, 'dist/code.go'], {
     stdio: 'inherit'
   });
   // await fs.remove('dist/code.go');
