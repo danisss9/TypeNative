@@ -78,31 +78,34 @@ const __dirname = path.dirname(__filename);
         ? answers.tsCode
         : await fs.readFile(source ?? answers.path, { encoding: 'utf-8' });
     const nativeCode = transpileToNative(tsCode);
+    const exeName = process.platform === 'win32' ? 'native.exe' : 'native';
+    const exePath = `dist/${exeName}`;
     await fs.ensureDir('dist');
     await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
-    await execa('go build -o dist/native.exe dist/code.go', {
+    await execa(`go build -o ${exePath} dist/code.go`, {
         stdio: 'inherit'
     });
     // await fs.remove('dist/code.go');
     if (scriptMode) {
-        await execa('dist/native.exe', {
+        await execa(exePath, {
             stdio: 'inherit'
         });
-        //await fs.remove('dist/native.exe');
+        //await fs.remove(exePath);
     }
     else if (output || answers.output) {
-        await fs.copy('dist/native.exe', output ?? answers.output, { overwrite: true });
-        //await fs.remove('dist/native.exe');
+        await fs.copy(exePath, output ?? answers.output, { overwrite: true });
+        //await fs.remove(exePath);
         console.log(`Created native executable at: ${output ?? answers.output}`);
     }
 })();
 function getPackageJson(projectName) {
+    const exeName = process.platform === 'win32' ? `${projectName}.exe` : projectName;
     const pckg = {
         name: projectName,
         version: '1.0.0',
         scripts: {
             execute: 'npx typenative --source main.ts --script',
-            build: `npx typenative --source main.ts --output bin/${projectName}.exe`
+            build: `npx typenative --source main.ts --output bin/${exeName}`
         },
         devDependencies: {
             typenative: '^0.0.16'
@@ -132,6 +135,7 @@ bin/
 `;
 }
 function getReadMe(projectName) {
+    const exeName = process.platform === 'win32' ? `${projectName}.exe` : projectName;
     return `# ${projectName}
 
 This project was created using TypeNative, a tool to transpile TypeScript code to native Go code.
@@ -145,6 +149,6 @@ You can also run the code directly in script mode using \`npm run execute\`.
 
 1. Install dependencies: \`npm install\` (if not done already)
 2. Build the project: \`npm run build\`
-3. Run the executable: \`./bin/${projectName}.exe\`
+3. Run the executable: \`./bin/${exeName}\`
 `;
 }
