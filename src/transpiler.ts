@@ -279,6 +279,20 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       .join('')}`;
   } else if (ts.isBreakStatement(node)) {
     return 'break';
+  } else if (ts.isThrowStatement(node)) {
+    const expr = node.expression;
+    if (
+      ts.isNewExpression(expr) &&
+      ts.isIdentifier(expr.expression) &&
+      expr.expression.text === 'Error'
+    ) {
+      const args = expr.arguments ?? [];
+      const msg = args.length > 0 ? visit(args[0]) : '""';
+      return `panic(${msg})` + (options.inline ? '' : ';\n\t');
+    }
+    return `panic(${visit(expr)})` + (options.inline ? '' : ';\n\t');
+  } else if (ts.isTryStatement(node)) {
+    return visitTryStatement(node, options);
   } else if (ts.isReturnStatement(node)) {
     // Handle return new Promise(...)
     if (
@@ -1809,4 +1823,29 @@ function getForOfVarNames(initializer: ts.ForInitializer): string[] {
     });
   }
   return [visit(decl.name)];
+}
+
+function visitTryStatement(node: ts.TryStatement, options: VisitNodeOptions): string {
+  const deferreds: string[] = [];
+
+  // Register finally first (LIFO: runs last after catch)
+  if (node.finallyBlock) {
+    const finallyBody = node.finallyBlock.statements.map((s) => visit(s)).join('\t');
+    deferreds.push(`defer func() {\n\t\t\t${finallyBody}\t\t\t}()`);
+  }
+
+  // Register catch second (LIFO: runs first, handles panic via recover)
+  if (node.catchClause) {
+    const varDecl = node.catchClause.variableDeclaration;
+    const catchVar = varDecl ? visit(varDecl.name) : '_r';
+    const catchBody = node.catchClause.block.statements.map((s) => visit(s)).join('\t');
+    deferreds.push(
+      `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := r\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
+    );
+  }
+
+  const tryBody = node.tryBlock.statements.map((s) => visit(s)).join('\t');
+  const body = [...deferreds, tryBody].join('\n\t\t\t');
+
+  return `func() {\n\t\t\t${body}\n\t\t\t}()` + (options.inline ? '' : ';\n\t');
 }

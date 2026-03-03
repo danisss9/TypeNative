@@ -192,6 +192,16 @@ declare function setTimeout(callback: () => void, ms: number): void;
 
 declare function assert(condition: boolean, message?: string): void;
 
+interface Error {
+  message: string;
+}
+
+interface ErrorConstructor {
+  new(message?: string): Error;
+}
+
+declare var Error: ErrorConstructor;
+
 interface Map<K, V> {
   /** The number of key/value pairs in the Map. */
   readonly size: number;
