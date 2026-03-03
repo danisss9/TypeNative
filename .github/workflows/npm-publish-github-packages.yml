@@ -66,6 +66,8 @@ jobs:
       - name: Sync package.json version to tag
         run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version --allow-same-version
 
+      - run: npm install -g npm@latest
+
       - run: npm ci
 
       - run: npm publish --access public
