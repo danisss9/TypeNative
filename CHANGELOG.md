@@ -5,6 +5,20 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.18] - 2026-03-03
+
+### Added
+
+- `Map<K, V>` support: transpiled to Go `map[K]V`; `.set()`, `.get()`, `.has()`, `.delete()`, `.clear()`, `.size` fully supported
+- `Set<T>` support: transpiled to Go `map[T]struct{}`; `.add()`, `.has()`, `.delete()`, `.clear()`, `.size` fully supported
+- Try/Catch/Finally support: `try/catch/finally` transpiled to Go IIFE with `defer`/`recover` pattern
+- `throw new Error("msg")` transpiled to `panic("msg")`; bare `throw expr` transpiled to `panic(expr)`
+- `Error` type added to `typenative.d.ts` for IDE type checking in test files
+- Closures over mutable state: functions can now capture and mutate variables from outer scopes
+- Function type annotations: `() => number`, `(x: number) => string`, etc. transpiled to Go `func(...)` types
+- Return type inference for functions and arrow functions: when no explicit return type annotation is present, the transpiler infers the return type from `return` statements
+- Expression-body arrow functions now correctly wrap the result as `{ return expr; }` in Go
+
 ## [0.0.17] - 2026-02-16
 
 ### Added

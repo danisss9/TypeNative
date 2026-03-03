@@ -324,25 +324,40 @@ export function visit(node, options = {}) {
             outsideNodes.push(node);
             return '';
         }
-        const name = visit(node.name, { inline: true });
-        const safeName = getSafeName(name);
         const typeParams = getTypeParameters(node.typeParameters);
         const parameterInfo = getFunctionParametersInfo(node.parameters);
-        const returnType = node.type ? ` ${getType(node.type)}` : '';
+        if (node.body && ts.isBlock(node.body)) {
+            prescanVariableDeclarations(node.body);
+        }
+        const inferredRetType = inferFunctionBodyReturnType(node);
+        const returnType = inferredRetType ? ` ${inferredRetType}` : '';
         if (options.isOutside) {
+            const name = node.name ? visit(node.name, { inline: true }) : '';
+            const safeName = getSafeName(name);
             return `func ${safeName}${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body, {
                 prefixBlockContent: parameterInfo.prefixBlockContent
             })}`;
         }
+        if (!node.name) {
+            return `func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body, {
+                prefixBlockContent: parameterInfo.prefixBlockContent
+            })}`;
+        }
+        const name = visit(node.name, { inline: true });
+        const safeName = getSafeName(name);
         return `${safeName} := func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body, {
             prefixBlockContent: parameterInfo.prefixBlockContent
         })}`;
     }
     else if (ts.isArrowFunction(node)) {
         const parameterInfo = getFunctionParametersInfo(node.parameters);
-        const returnType = node.type ? ` ${getType(node.type)}` : '';
+        const inferredRetType = inferFunctionBodyReturnType(node);
+        const returnType = inferredRetType ? ` ${inferredRetType}` : '';
         if (parameterInfo.prefixBlockContent && !ts.isBlock(node.body)) {
             return `func(${parameterInfo.signature})${returnType} {\n\t\t${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
+        }
+        if (!ts.isBlock(node.body)) {
+            return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body)}; }`;
         }
         return `func(${parameterInfo.signature})${returnType} ${visit(node.body, {
             prefixBlockContent: parameterInfo.prefixBlockContent
@@ -605,7 +620,52 @@ function inferExpectedTypeFromContext(node) {
     }
     return undefined;
 }
+function prescanVariableDeclarations(block) {
+    for (const stmt of block.statements) {
+        if (ts.isVariableStatement(stmt)) {
+            for (const decl of stmt.declarationList.declarations) {
+                if (ts.isIdentifier(decl.name) && !variableGoTypes.has(decl.name.text)) {
+                    if (decl.type) {
+                        variableGoTypes.set(decl.name.text, getType(decl.type));
+                    }
+                    else if (decl.initializer) {
+                        const inferredType = inferExpressionType(decl.initializer);
+                        if (inferredType)
+                            variableGoTypes.set(decl.name.text, inferredType);
+                    }
+                }
+            }
+        }
+    }
+}
+function inferFunctionBodyReturnType(node) {
+    if (node.type)
+        return getType(node.type);
+    if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) {
+        return inferExpressionType(node.body);
+    }
+    if (node.body && ts.isBlock(node.body)) {
+        for (const stmt of node.body.statements) {
+            if (ts.isReturnStatement(stmt) && stmt.expression) {
+                const exprType = inferExpressionType(stmt.expression);
+                if (exprType)
+                    return exprType;
+            }
+        }
+    }
+    return undefined;
+}
+function inferArrowFunctionGoType(node) {
+    const params = node.parameters
+        .map((p) => (p.type ? getType(p.type) : 'interface{}'))
+        .join(', ');
+    const retType = inferFunctionBodyReturnType(node);
+    return `func(${params})${retType ? ` ${retType}` : ''}`;
+}
 function inferExpressionType(expr) {
+    if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
+        return inferArrowFunctionGoType(expr);
+    }
     if (ts.isParenthesizedExpression(expr))
         return inferExpressionType(expr.expression);
     if (ts.isNonNullExpression(expr))
@@ -1074,6 +1134,13 @@ function getType(typeNode, getArrayType = false) {
         }
         // Non-nullable union or multi-type union → interface{}
         return 'interface{}';
+    }
+    if (ts.isFunctionTypeNode(typeNode)) {
+        const params = typeNode.parameters
+            .map((p) => (p.type ? getType(p.type) : 'interface{}'))
+            .join(', ');
+        const ret = typeNode.type ? ` ${getType(typeNode.type)}` : '';
+        return `func(${params})${ret}`;
     }
     if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;

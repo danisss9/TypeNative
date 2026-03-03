@@ -1,6 +1,6 @@
 {
   "name": "typenative",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "description": "Build native applications using Typescript.",
   "type": "module",
   "bin": {
@@ -31,7 +31,11 @@
     "test17": "node ./bin/index --source test/test17.spec.ts --script",
     "test18": "node ./bin/index --source test/test18.spec.ts --script",
     "test19": "node ./bin/index --source test/test19.spec.ts --script",
-    "test20": "node ./bin/index --source test/Test20.spec.ts --script"
+    "test20": "node ./bin/index --source test/Test20.spec.ts --script",
+    "test21": "node ./bin/index --source test/Test21.spec.ts --script",
+    "test22": "node ./bin/index --source test/Test22.spec.ts --script",
+    "test23": "node ./bin/index --source test/Test23.spec.ts --script",
+    "test24": "node ./bin/index --source test/Test24.spec.ts --script"
   },
   "repository": {
     "type": "git",
