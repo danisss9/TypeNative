@@ -79,7 +79,7 @@ const __dirname = path.dirname(__filename);
         ? answers.tsCode
         : await fs.readFile(sourcePath, { encoding: 'utf-8' });
     const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-    const nativeCode = transpileToNative(tsCode, sourceDir
+    const transpileResult = transpileToNative(tsCode, sourceDir
         ? {
             readFile: (specifier, fromDir) => {
                 const baseDir = fromDir ?? sourceDir;
@@ -100,15 +100,37 @@ const __dirname = path.dirname(__filename);
                     return null;
                 }
                 // npm package — walk up from baseDir looking for node_modules/<name>
-                return resolveNpmPackage(baseDir, specifier);
+                const resolved = resolveNpmPackage(baseDir, specifier);
+                if (!resolved)
+                    return null;
+                let { content, dir } = resolved;
+                // Normalize CommonJS to ES module syntax
+                if (!content.includes('export ') && (content.includes('module.exports') || content.includes('exports.'))) {
+                    content = normalizeCjsContent(content);
+                }
+                // Inject types from a local ambient .d.ts if available
+                const typed = tryInjectDtsTypes(content, specifier, sourceDir);
+                if (typed)
+                    content = typed;
+                return { content, dir };
             }
         }
         : undefined);
     const exeName = process.platform === 'win32' ? 'native.exe' : 'native';
     const exePath = `dist/${exeName}`;
     await fs.ensureDir('dist');
-    await fs.writeFile('dist/code.go', nativeCode, { encoding: 'utf-8' });
-    await execa('go', ['build', '-o', exePath, 'dist/code.go'], {
+    // Clean up stale Go files from previous runs before writing new ones
+    for (const existing of await fs.readdir('dist')) {
+        if (existing.endsWith('.go'))
+            await fs.remove(`dist/${existing}`);
+    }
+    await fs.writeFile('dist/code.go', transpileResult.main, { encoding: 'utf-8' });
+    const goFiles = ['dist/code.go'];
+    for (const [filename, content] of transpileResult.files) {
+        await fs.writeFile(`dist/${filename}`, content, { encoding: 'utf-8' });
+        goFiles.push(`dist/${filename}`);
+    }
+    await execa('go', ['build', '-o', exePath, ...goFiles], {
         stdio: 'inherit'
     });
     // await fs.remove('dist/code.go');
@@ -124,6 +146,51 @@ const __dirname = path.dirname(__filename);
         console.log(`Created native executable at: ${output ?? answers.output}`);
     }
 })();
+function normalizeCjsContent(code) {
+    code = code.replace(/['"]use strict['"];?\n?/g, '');
+    code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
+    return code;
+}
+function tryInjectDtsTypes(jsContent, packageName, searchDir) {
+    if (!searchDir)
+        return null;
+    // Look for *.d.ts files in searchDir that declare the module
+    let dtsBody = null;
+    try {
+        const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        for (const file of fs.readdirSync(searchDir)) {
+            if (!file.endsWith('.d.ts'))
+                continue;
+            const content = fs.readFileSync(path.join(searchDir, file), 'utf-8');
+            const match = content.match(new RegExp(`declare module ['"]${escaped}['"][^{]*\\{([\\s\\S]*?)\\}`));
+            if (match) {
+                dtsBody = match[1];
+                break;
+            }
+        }
+    }
+    catch {
+        return null;
+    }
+    if (!dtsBody)
+        return null;
+    // Extract typed function signatures from the .d.ts module body
+    const signatures = new Map();
+    const sigRegex = /export function (\w+)\(([^)]*)\)\s*:\s*([^\n;]+)/g;
+    let m;
+    while ((m = sigRegex.exec(dtsBody)) !== null) {
+        signatures.set(m[1], { params: m[2].trim(), returnType: m[3].trim() });
+    }
+    if (signatures.size === 0)
+        return null;
+    // Replace untyped signatures in the normalized JS with typed ones from .d.ts
+    return jsContent.replace(/export function (\w+)\s*\(([^)]*)\)/g, (match, name) => {
+        const sig = signatures.get(name);
+        if (!sig)
+            return match;
+        return `export function ${name}(${sig.params}): ${sig.returnType}`;
+    });
+}
 function resolveNpmPackage(fromDir, packageName) {
     // Walk up the directory tree looking for node_modules/<packageName>
     let searchDir = fromDir;
@@ -132,19 +199,23 @@ function resolveNpmPackage(fromDir, packageName) {
         const pkgJsonPath = path.join(pkgDir, 'package.json');
         try {
             const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-            // Build candidate entry points, preferring TypeScript source
-            // Build candidate entry points — only TypeScript source files are valid
-            const candidates = [];
+            // Build candidate entry points: TypeScript preferred, JavaScript as fallback
+            const tsCandidates = [];
+            const jsCandidates = [];
             for (const field of ['source', 'main', 'module']) {
                 const entry = pkgJson[field];
                 if (!entry)
                     continue;
                 if (entry.endsWith('.ts'))
-                    candidates.push(entry);
-                else if (entry.endsWith('.js'))
-                    candidates.push(entry.replace(/\.js$/, '.ts'));
+                    tsCandidates.push(entry);
+                else if (entry.endsWith('.js')) {
+                    tsCandidates.push(entry.replace(/\.js$/, '.ts'));
+                    jsCandidates.push(entry);
+                }
             }
-            candidates.push('index.ts', 'src/index.ts');
+            tsCandidates.push('index.ts', 'src/index.ts');
+            jsCandidates.push('index.js', 'src/index.js');
+            const candidates = [...tsCandidates, ...jsCandidates];
             for (const candidate of candidates) {
                 const fullPath = path.resolve(pkgDir, candidate);
                 try {

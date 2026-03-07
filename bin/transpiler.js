@@ -28,6 +28,8 @@ let fileResolver = null;
 let currentFileDir = null;
 // Tracks already-included files by a stable key to prevent duplicates/cycles
 const includedLocalImports = new Set();
+// Collects Go source files generated from local TS imports (filename → content)
+let localImportFiles = new Map();
 export function transpileToNative(code, options) {
     fileResolver = options?.readFile ?? null;
     currentFileDir = null;
@@ -49,17 +51,19 @@ export function transpileToNative(code, options) {
     enumBaseTypes.clear();
     importAliases.clear();
     includedLocalImports.clear();
+    localImportFiles = new Map();
     const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
     const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
-    return `package main
+    const main = `package main
 
 ${[...importedPackages].map((pkg) => `import "${pkg}"`).join('\n')}
 
 func main() {
     ${transpiledCode.trim()}
 }
- 
+
 ${transpiledCodeOutside.trim()}`;
+    return { main, files: localImportFiles };
 }
 export function visit(node, options = {}) {
     let code = '';
@@ -1737,13 +1741,74 @@ function visitNewSet(node) {
     const values = initArg.elements.map((el) => `${tmp}[${visit(el)}] = struct{}{}`).join('; ');
     return `func() ${setType} { ${tmp} := make(${setType}); ${values}; return ${tmp} }()`;
 }
-function includeLocalImport(code, dir) {
+function specifierToGoFileName(specifier) {
+    const segments = specifier.split(/[/\\]/);
+    let name = segments[segments.length - 1] || segments[segments.length - 2] || 'import';
+    // Strip all extensions (e.g. .spec.ts → '', .ts → '')
+    name = name.replace(/(\.[^.]+)+$/, '');
+    name = name.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!name)
+        name = 'import';
+    // Deduplicate filename if already taken by a different import
+    let candidate = name + '.go';
+    let i = 2;
+    while (localImportFiles.has(candidate)) {
+        candidate = `${name}_${i}.go`;
+        i++;
+    }
+    return candidate;
+}
+function normalizeCjsToEsm(code) {
+    // Remove 'use strict' directive
+    code = code.replace(/['"]use strict['"];?\n?/g, '');
+    // module.exports.X = function(...) { } or exports.X = function(...) { }
+    code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
+    return code;
+}
+function includeLocalImport(code, dir, goFileName) {
     const prevDir = currentFileDir;
     currentFileDir = dir;
-    const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
-    for (const stmt of sf.statements) {
-        visit(stmt, { addFunctionOutside: true });
+    // Normalize CommonJS modules to ES module syntax before parsing
+    if (!code.includes('export ') && (code.includes('module.exports') || code.includes('exports.'))) {
+        code = normalizeCjsToEsm(code);
     }
+    if (!goFileName) {
+        // Inline mode (npm packages): pull declarations into the current transpilation context
+        const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+        for (const stmt of sf.statements) {
+            visit(stmt, { addFunctionOutside: true });
+        }
+        currentFileDir = prevDir;
+        return;
+    }
+    // Separate-file mode (local TS imports): transpile to its own Go file
+    const savedOutsideNodes = outsideNodes;
+    const savedPackages = [...importedPackages];
+    outsideNodes = [];
+    importedPackages.clear();
+    const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+    const inlineLines = [];
+    for (const stmt of sf.statements) {
+        const result = visit(stmt, { addFunctionOutside: true });
+        if (result.trim())
+            inlineLines.push(result);
+    }
+    const fileImports = [...importedPackages].map((pkg) => `import "${pkg}"`).join('\n');
+    const fileOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
+    const fileInline = inlineLines.join('\n');
+    const parts = ['package main'];
+    if (fileImports)
+        parts.push(fileImports);
+    if (fileInline.trim())
+        parts.push(fileInline.trim());
+    if (fileOutside.trim())
+        parts.push(fileOutside.trim());
+    localImportFiles.set(goFileName, parts.join('\n\n'));
+    // Restore main-file state
+    outsideNodes = savedOutsideNodes;
+    importedPackages.clear();
+    for (const p of savedPackages)
+        importedPackages.add(p);
     currentFileDir = prevDir;
 }
 function registerGoPackageAliases(node, goPkg) {
@@ -1847,15 +1912,17 @@ function visitImportDeclaration(node) {
     if (!ts.isStringLiteral(node.moduleSpecifier))
         return '';
     const moduleSpec = node.moduleSpecifier.text;
-    // Relative imports → inline the TS source file's declarations
+    // Relative imports → transpile to a separate Go file
     if (moduleSpec.startsWith('.') || moduleSpec.startsWith('/')) {
         // Key combines current dir + specifier to avoid cross-package collisions
         const key = `${currentFileDir ?? ''}::${moduleSpec}`;
         if (fileResolver && !includedLocalImports.has(key)) {
             includedLocalImports.add(key);
             const resolved = fileResolver(moduleSpec, currentFileDir);
-            if (resolved)
-                includeLocalImport(resolved.content, resolved.dir);
+            if (resolved) {
+                const goFileName = specifierToGoFileName(moduleSpec);
+                includeLocalImport(resolved.content, resolved.dir, goFileName);
+            }
         }
         return '';
     }
@@ -1875,13 +1942,15 @@ function visitImportDeclaration(node) {
         setupNodeModuleImport(node, nodeModule);
         return '';
     }
-    // npm package (bare specifier) → resolve from node_modules and inline
+    // npm package (bare specifier) → transpile to its own Go file
     const npmKey = `npm::${moduleSpec}`;
     if (fileResolver && !includedLocalImports.has(npmKey)) {
         includedLocalImports.add(npmKey);
         const resolved = fileResolver(moduleSpec, currentFileDir);
-        if (resolved)
-            includeLocalImport(resolved.content, resolved.dir);
+        if (resolved) {
+            const goFileName = specifierToGoFileName(moduleSpec);
+            includeLocalImport(resolved.content, resolved.dir, goFileName);
+        }
     }
     return '';
 }

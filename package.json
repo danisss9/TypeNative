@@ -38,6 +38,7 @@
     "test23": "node ./bin/index --source test/Test23.spec.ts --script",
     "test24": "node ./bin/index --source test/Test24.spec.ts --script",
     "test25": "node ./bin/index --source test/Test25.spec.ts --script",
+    "test25_export": "node ./bin/index --source test/Test25-export.spec.ts --script",
     "test26": "node ./bin/index --source test/Test26.spec.ts --script",
     "test27": "node ./bin/index --source test/Test27.spec.ts --script"
   },
