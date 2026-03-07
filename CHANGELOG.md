@@ -5,6 +5,16 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.19] - 2026-03-07
+
+### Added
+
+- Module/import support: `import { x } from './file'` transpiled to Go package imports for local TypeScript files
+- Node.js built-in module imports: `import { join } from 'node:path'` and similar mapped to corresponding Go standard library packages
+- npm package imports: `import { x } from 'pkg'` mapped to Go module imports via `typenative-npm.d.ts` type definitions
+- Go package imports: `import { x } from 'go:package'` to import a Go library package
+- Named exports: `export function` and `export const` declarations now transpiled correctly
+
 ## [0.0.18] - 2026-03-03
 
 ### Added
