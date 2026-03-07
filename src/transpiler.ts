@@ -22,8 +22,31 @@ const interfacePropertyTypes = new Map<string, Map<string, string>>();
 const typeAliases = new Map<string, ts.TypeNode>();
 const enumNames = new Set<string>();
 const enumBaseTypes = new Map<string, 'string' | 'float64'>();
+// Maps local TS name → Go qualified name (e.g. 'Println' → 'fmt.Println', 'myFmt' → 'fmt')
+const importAliases = new Map<string, string>();
+// Callback for resolving import specifiers to source code.
+// specifier: the raw import string (relative path or package name)
+// fromDir: directory of the file containing the import (null = main file's dir)
+// Returns the file content and its directory (for resolving that file's own imports)
+let fileResolver:
+  | ((specifier: string, fromDir: string | null) => { content: string; dir: string } | null)
+  | null = null;
+// Directory of the file currently being processed (null = main entry file)
+let currentFileDir: string | null = null;
+// Tracks already-included files by a stable key to prevent duplicates/cycles
+const includedLocalImports = new Set<string>();
 
-export function transpileToNative(code: string): string {
+export function transpileToNative(
+  code: string,
+  options?: {
+    readFile?: (
+      specifier: string,
+      fromDir: string | null
+    ) => { content: string; dir: string } | null;
+  }
+): string {
+  fileResolver = options?.readFile ?? null;
+  currentFileDir = null;
   const sourceFile = ts.createSourceFile(
     'main.ts',
     code,
@@ -47,6 +70,8 @@ export function transpileToNative(code: string): string {
   typeAliases.clear();
   enumNames.clear();
   enumBaseTypes.clear();
+  importAliases.clear();
+  includedLocalImports.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -71,6 +96,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       .join(options.inline ? '' : '\n\t');
   } else if (ts.isIdentifier(node)) {
     if (node.text === 'undefined') return 'nil';
+    const goAlias = importAliases.get(node.text);
+    if (goAlias) return goAlias;
     return getSafeName(node.text);
   } else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
@@ -324,9 +351,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     if (options.isOutside) {
       const name = node.name ? visit(node.name, { inline: true }) : '';
       const safeName = getSafeName(name);
-      return `func ${safeName}${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body!, {
-        prefixBlockContent: parameterInfo.prefixBlockContent
-      })}`;
+      return `func ${safeName}${typeParams}(${parameterInfo.signature})${returnType} ${visit(
+        node.body!,
+        {
+          prefixBlockContent: parameterInfo.prefixBlockContent
+        }
+      )}`;
     }
 
     if (!node.name) {
@@ -337,9 +367,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 
     const name = visit(node.name, { inline: true });
     const safeName = getSafeName(name);
-    return `${safeName} := func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body!, {
-      prefixBlockContent: parameterInfo.prefixBlockContent
-    })}`;
+    return `${safeName} := func${typeParams}(${parameterInfo.signature})${returnType} ${visit(
+      node.body!,
+      {
+        prefixBlockContent: parameterInfo.prefixBlockContent
+      }
+    )}`;
   } else if (ts.isArrowFunction(node)) {
     const parameterInfo = getFunctionParametersInfo(node.parameters);
     const inferredRetType = inferFunctionBodyReturnType(node);
@@ -510,9 +543,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
         const methodName = visit(member.name);
         const methodParameterInfo = getFunctionParametersInfo(member.parameters);
         const returnType = member.type ? ` ${getType(member.type)}` : '';
-        result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body!, {
-          prefixBlockContent: methodParameterInfo.prefixBlockContent
-        })}\n\n`;
+        result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
+          member.body!,
+          {
+            prefixBlockContent: methodParameterInfo.prefixBlockContent
+          }
+        )}\n\n`;
       }
     }
 
@@ -565,6 +601,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `${visit(node.name)}: ${visit(node.initializer)}`;
   } else if (ts.isNonNullExpression(node)) {
     return visit(node.expression);
+  } else if (ts.isImportDeclaration(node)) {
+    return visitImportDeclaration(node);
+  } else if (ts.isExportDeclaration(node) || ts.isExportAssignment(node)) {
+    return '';
   }
 
   const syntaxKind = ts.SyntaxKind[node.kind];
@@ -692,9 +732,7 @@ function inferFunctionBodyReturnType(
 }
 
 function inferArrowFunctionGoType(node: ts.ArrowFunction | ts.FunctionExpression): string {
-  const params = node.parameters
-    .map((p) => (p.type ? getType(p.type) : 'interface{}'))
-    .join(', ');
+  const params = node.parameters.map((p) => (p.type ? getType(p.type) : 'interface{}')).join(', ');
   const retType = inferFunctionBodyReturnType(node);
   return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
@@ -721,7 +759,8 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
   if (ts.isIdentifier(expr)) return variableGoTypes.get(expr.text);
   if (ts.isArrayLiteralExpression(expr)) {
     if (expr.elements.length === 0) return '[]interface{}';
-    const firstElementType = inferExpressionType(expr.elements[0] as ts.Expression) ?? 'interface{}';
+    const firstElementType =
+      inferExpressionType(expr.elements[0] as ts.Expression) ?? 'interface{}';
     return `[]${firstElementType}`;
   }
   if (ts.isNewExpression(expr) && ts.isIdentifier(expr.expression)) {
@@ -1061,6 +1100,8 @@ function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined 
     : 'interface{}';
 
   if (methodName === 'join') {
+    // Only intercept array.join — if owner type is unknown/not array, fall through to callHandlers
+    if (!isArrayLikeGoType(ownerType)) return undefined;
     importedPackages.add('strings');
     importedPackages.add('fmt');
     const separator = node.arguments[0] ? visit(node.arguments[0]) : '""';
@@ -1708,9 +1749,7 @@ function getFunctionParametersInfo(
     };
   }
 
-  const hasRequiredAfterDefault = parameters
-    .slice(firstDefaultIndex)
-    .some((p) => !p.initializer);
+  const hasRequiredAfterDefault = parameters.slice(firstDefaultIndex).some((p) => !p.initializer);
 
   if (hasRequiredAfterDefault) {
     return {
@@ -1879,6 +1918,167 @@ function visitNewSet(node: ts.NewExpression): string {
   const tmp = getTempName('set');
   const values = initArg.elements.map((el) => `${tmp}[${visit(el)}] = struct{}{}`).join('; ');
   return `func() ${setType} { ${tmp} := make(${setType}); ${values}; return ${tmp} }()`;
+}
+
+function includeLocalImport(code: string, dir: string | null): void {
+  const prevDir = currentFileDir;
+  currentFileDir = dir;
+  const sf = ts.createSourceFile(
+    'imported.ts',
+    code,
+    ts.ScriptTarget.ES2020,
+    true,
+    ts.ScriptKind.TS
+  );
+  for (const stmt of sf.statements) {
+    visit(stmt, { addFunctionOutside: true });
+  }
+  currentFileDir = prevDir;
+}
+
+function registerGoPackageAliases(node: ts.ImportDeclaration, goPkg: string): void {
+  const pkgName = goPkg.split('/').pop()!;
+  if (!node.importClause) return;
+  const clause = node.importClause;
+
+  // Default import: `import fmt from 'go:fmt'` or `import myFmt from 'go:fmt'`
+  if (clause.name && clause.name.text !== pkgName) {
+    importAliases.set(clause.name.text, pkgName);
+  }
+
+  if (clause.namedBindings) {
+    if (ts.isNamespaceImport(clause.namedBindings)) {
+      // `import * as myFmt from 'go:fmt'`
+      const localName = clause.namedBindings.name.text;
+      if (localName !== pkgName) {
+        importAliases.set(localName, pkgName);
+      }
+    } else if (ts.isNamedImports(clause.namedBindings)) {
+      // `import { Println, Sprintf as Spf } from 'go:fmt'`
+      for (const el of clause.namedBindings.elements) {
+        if (el.isTypeOnly) continue;
+        const localName = el.name.text;
+        const importedName = el.propertyName?.text ?? localName;
+        importAliases.set(localName, `${pkgName}.${importedName}`);
+      }
+    }
+  }
+}
+
+function getImportLocalName(node: ts.ImportDeclaration): string | null {
+  const clause = node.importClause;
+  if (!clause) return null;
+  if (clause.name) return clause.name.text;
+  if (clause.namedBindings) {
+    if (ts.isNamespaceImport(clause.namedBindings)) return clause.namedBindings.name.text;
+  }
+  return null;
+}
+
+// Per-module table: maps Node.js function name → Go expression template.
+// For default/namespace imports (e.g. `import path from 'node:path'`), entries are registered
+// as `callHandlers[localName.funcName]`. For named imports (e.g. `import { join } from 'node:path'`),
+// the Go identifier is stored in importAliases so bare calls like `join(...)` resolve correctly.
+const nodeModuleMappings: Record<
+  string,
+  { goPackage: string; functions: Record<string, (args: string[]) => string> }
+> = {
+  path: {
+    goPackage: 'path/filepath',
+    functions: {
+      join: (args) => `filepath.Join(${args.join(', ')})`,
+      dirname: (args) => `filepath.Dir(${args[0]})`,
+      basename: (args) =>
+        args[1]
+          ? `strings.TrimSuffix(filepath.Base(${args[0]}), ${args[1]})`
+          : `filepath.Base(${args[0]})`,
+      extname: (args) => `filepath.Ext(${args[0]})`,
+      resolve: (args) =>
+        `func() string { p, _ := filepath.Abs(filepath.Join(${args.join(', ')})); return p }()`
+    }
+  }
+  // Future node stdlib modules can be added here as additional keys:
+  // fs: { goPackage: 'os', functions: { ... } },
+  // os: { goPackage: 'os', functions: { ... } },
+};
+
+// Mapping from Node.js stdlib module names to Go setup functions.
+// Each entry adds the required Go imports and registers call handlers for the local identifier.
+function setupNodeModuleImport(node: ts.ImportDeclaration, nodeModule: string): void {
+  const mapping = nodeModuleMappings[nodeModule];
+  if (!mapping) return;
+
+  importedPackages.add(mapping.goPackage);
+
+  const clause = node.importClause;
+  if (!clause) return;
+
+  if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+    // Named imports: `import { join, dirname } from 'node:path'`
+    // Map each local name directly to its Go qualified function via importAliases,
+    // so bare calls like `join(...)` resolve to `filepath.Join(...)`.
+    for (const el of clause.namedBindings.elements) {
+      if (el.isTypeOnly) continue;
+      const localName = el.name.text;
+      const importedName = el.propertyName?.text ?? localName;
+      const fn = mapping.functions[importedName];
+      if (fn) {
+        // Register a call handler keyed on the local name
+        callHandlers[localName] = (_caller, args) => fn(args);
+      }
+    }
+  } else {
+    // Default import (`import path from 'node:path'`) or
+    // namespace import (`import * as path from 'node:path'`)
+    const localName = getImportLocalName(node) ?? nodeModule;
+    for (const [funcName, fn] of Object.entries(mapping.functions)) {
+      callHandlers[`${localName}.${funcName}`] = (_caller, args) => fn(args);
+    }
+  }
+}
+
+function visitImportDeclaration(node: ts.ImportDeclaration): string {
+  if (!ts.isStringLiteral(node.moduleSpecifier)) return '';
+  const moduleSpec = node.moduleSpecifier.text;
+
+  // Relative imports → inline the TS source file's declarations
+  if (moduleSpec.startsWith('.') || moduleSpec.startsWith('/')) {
+    // Key combines current dir + specifier to avoid cross-package collisions
+    const key = `${currentFileDir ?? ''}::${moduleSpec}`;
+    if (fileResolver && !includedLocalImports.has(key)) {
+      includedLocalImports.add(key);
+      const resolved = fileResolver(moduleSpec, currentFileDir);
+      if (resolved) includeLocalImport(resolved.content, resolved.dir);
+    }
+    return '';
+  }
+
+  // Type-only imports contribute nothing to runtime
+  if (node.importClause?.isTypeOnly) return '';
+
+  // Go standard library: `import { Println } from 'go:fmt'` → import "fmt"
+  if (moduleSpec.startsWith('go:')) {
+    const goPkg = moduleSpec.slice(3);
+    importedPackages.add(goPkg);
+    registerGoPackageAliases(node, goPkg);
+    return '';
+  }
+
+  // Node.js standard library: `import path from 'node:path'` → mapped Go packages
+  if (moduleSpec.startsWith('node:')) {
+    const nodeModule = moduleSpec.slice(5);
+    setupNodeModuleImport(node, nodeModule);
+    return '';
+  }
+
+  // npm package (bare specifier) → resolve from node_modules and inline
+  const npmKey = `npm::${moduleSpec}`;
+  if (fileResolver && !includedLocalImports.has(npmKey)) {
+    includedLocalImports.add(npmKey);
+    const resolved = fileResolver(moduleSpec, currentFileDir);
+    if (resolved) includeLocalImport(resolved.content, resolved.dir);
+  }
+  return '';
 }
 
 function getForOfVarNames(initializer: ts.ForInitializer): string[] {

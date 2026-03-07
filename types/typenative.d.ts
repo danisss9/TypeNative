@@ -1,3 +1,5 @@
+// Type definitions for TypeNative
+
 interface Boolean {}
 
 interface CallableFunction extends Function {}
@@ -197,7 +199,7 @@ interface Error {
 }
 
 interface ErrorConstructor {
-  new(message?: string): Error;
+  new (message?: string): Error;
 }
 
 declare var Error: ErrorConstructor;

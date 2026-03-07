@@ -3,9 +3,10 @@
     "compilerOptions": {
       "target": "es2020",    
       "lib": [], 
-      "types": ["../types/typenative.d.ts"],
+      "types": ["../types/typenative.d.ts", "../types/typenative-go.d.ts", "../types/typenative-npm.d.ts"],
       "rootDir": ".",
       "strict": true,         
       "noImplicitAny": true,
+      "allowSyntheticDefaultImports": true
     }
 }

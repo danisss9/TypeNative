@@ -2,10 +2,10 @@
 
 import inquirer from 'inquirer';
 import fs from 'fs-extra';
-import path from 'path';
+import path from 'node:path';
 import { execa } from 'execa';
 import { transpileToNative } from './transpiler.js';
-import { fileURLToPath } from 'url';
+import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,11 +90,41 @@ const __dirname = path.dirname(__filename);
     return;
   }
 
+  const sourcePath: string | null = answers.tsCode ? null : (source ?? answers.path ?? null);
   const tsCode: string = answers.tsCode
     ? answers.tsCode
-    : await fs.readFile(source ?? answers.path, { encoding: 'utf-8' });
+    : await fs.readFile(sourcePath!, { encoding: 'utf-8' });
 
-  const nativeCode = transpileToNative(tsCode);
+  const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
+  const nativeCode = transpileToNative(
+    tsCode,
+    sourceDir
+      ? {
+          readFile: (specifier, fromDir) => {
+            const baseDir = fromDir ?? sourceDir;
+
+            // Relative or absolute path → resolve from baseDir
+            if (specifier.startsWith('.') || specifier.startsWith('/')) {
+              for (const candidate of [specifier + '.ts', specifier]) {
+                try {
+                  const fullPath = path.resolve(baseDir, candidate);
+                  return {
+                    content: fs.readFileSync(fullPath, 'utf-8'),
+                    dir: path.dirname(fullPath)
+                  };
+                } catch {
+                  /* not found */
+                }
+              }
+              return null;
+            }
+
+            // npm package — walk up from baseDir looking for node_modules/<name>
+            return resolveNpmPackage(baseDir, specifier);
+          }
+        }
+      : undefined
+  );
 
   const exeName = process.platform === 'win32' ? 'native.exe' : 'native';
   const exePath = `dist/${exeName}`;
@@ -119,6 +149,48 @@ const __dirname = path.dirname(__filename);
   }
 })();
 
+function resolveNpmPackage(
+  fromDir: string,
+  packageName: string
+): { content: string; dir: string } | null {
+  // Walk up the directory tree looking for node_modules/<packageName>
+  let searchDir = fromDir;
+  while (true) {
+    const pkgDir = path.join(searchDir, 'node_modules', packageName);
+    const pkgJsonPath = path.join(pkgDir, 'package.json');
+    try {
+      const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8') as string);
+
+      // Build candidate entry points, preferring TypeScript source
+      // Build candidate entry points — only TypeScript source files are valid
+      const candidates: string[] = [];
+      for (const field of ['source', 'main', 'module']) {
+        const entry: string | undefined = pkgJson[field];
+        if (!entry) continue;
+        if (entry.endsWith('.ts')) candidates.push(entry);
+        else if (entry.endsWith('.js')) candidates.push(entry.replace(/\.js$/, '.ts'));
+      }
+      candidates.push('index.ts', 'src/index.ts');
+
+      for (const candidate of candidates) {
+        const fullPath = path.resolve(pkgDir, candidate);
+        try {
+          return { content: fs.readFileSync(fullPath, 'utf-8') as string, dir: path.dirname(fullPath) };
+        } catch {
+          /* try next candidate */
+        }
+      }
+    } catch {
+      /* no package.json here, keep walking up */
+    }
+
+    const parent = path.dirname(searchDir);
+    if (parent === searchDir) break; // filesystem root
+    searchDir = parent;
+  }
+  return null;
+}
+
 function getPackageJson(projectName: string): string {
   const exeName = process.platform === 'win32' ? `${projectName}.exe` : projectName;
   const pckg = {
@@ -129,7 +201,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${exeName}`
     },
     devDependencies: {
-      typenative: '^0.0.16'
+      typenative: '^0.0.19'
     }
   };
   return JSON.stringify(pckg, null, 2);
@@ -141,10 +213,11 @@ function getTsConfig(): string {
     compilerOptions: {
       target: 'es2020',
       lib: [],
-      types: ['./node_modules/typenative/types/typenative.d.ts'],
+      types: ['typenative', 'typenative/go', 'typenative/npm'],
       rootDir: '.',
       strict: true,
-      noImplicitAny: true
+      noImplicitAny: true,
+      allowSyntheticDefaultImports: true
     }
   };
   return JSON.stringify(tsConfig, null, 2);
