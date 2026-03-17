@@ -100,6 +100,26 @@ interface Array<T> extends IterableIterator<T> {
    */
   find(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
   /**
+   * Returns the index of the first element that satisfies the callback, or -1.
+   */
+  findIndex(callback: (value: T, index?: number, array?: T[]) => boolean): number;
+  /**
+   * Determines whether all elements satisfy the callback.
+   */
+  every(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  /**
+   * Performs the callback for each element.
+   */
+  forEach(callback: (value: T, index?: number, array?: T[]) => void): void;
+  /**
+   * Calls the callback function on each element of the array, accumulating a result.
+   */
+  reduce<U>(
+    callback: (accumulator: U, value: T, index?: number, array?: T[]) => U,
+    initialValue: U
+  ): U;
+  reduce(callback: (accumulator: T, value: T, index?: number, array?: T[]) => T): T;
+  /**
    * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
    */
   indexOf(searchElement: T): number;
@@ -107,6 +127,38 @@ interface Array<T> extends IterableIterator<T> {
    * Determines whether an array includes a certain element.
    */
   includes(searchElement: T): boolean;
+  /**
+   * Removes the last element from an array and returns it.
+   */
+  pop(): T | undefined;
+  /**
+   * Removes the first element from an array and returns it.
+   */
+  shift(): T | undefined;
+  /**
+   * Inserts elements at the beginning of an array.
+   */
+  unshift(...items: T[]): number;
+  /**
+   * Reverses the elements of an array in place.
+   */
+  reverse(): T[];
+  /**
+   * Sorts the elements of an array in place.
+   */
+  sort(compareFn?: (a: T, b: T) => number): T[];
+  /**
+   * Returns a new array formed by applying callback to each element and then flattening.
+   */
+  flat(): T[];
+  /**
+   * Merges two or more arrays.
+   */
+  concat(...items: T[]): T[];
+  /**
+   * Returns the element at the given index (supports negative indices).
+   */
+  at(index: number): T | undefined;
   /**
    * Returns a string representation of an array.
    */
@@ -152,6 +204,18 @@ interface String {
   repeat(count: number): string;
   /** Concatenates strings. */
   concat(...strings: string[]): string;
+  /** Pads the start of a string with another string to a total length. */
+  padStart(targetLength: number, padString?: string): string;
+  /** Pads the end of a string with another string to a total length. */
+  padEnd(targetLength: number, padString?: string): string;
+  /** Matches a string against a regex and returns the matches. */
+  match(regexp: string | RegExp): string[] | null;
+  /** Matches all occurrences of a regex. */
+  matchAll(regexp: string | RegExp): string[][];
+  /** Searches for a match and returns the index. */
+  search(regexp: string | RegExp): number;
+  /** Returns the element at the given index (supports negative indices). */
+  at(index: number): string | undefined;
   /** Returns a string representation. */
   toString(): string;
   [index: number]: string;
@@ -159,6 +223,7 @@ interface String {
 
 interface Console {
   log(...data: any[]): void;
+  error(...data: any[]): void;
   time(label?: string): void;
   timeEnd(label?: string): void;
 }
@@ -174,11 +239,44 @@ interface Math {
   min(a: number, b: number): number;
   sqrt(x: number): number;
   pow(base: number, exponent: number): number;
+  log(x: number): number;
+  log2(x: number): number;
+  log10(x: number): number;
+  sin(x: number): number;
+  cos(x: number): number;
+  tan(x: number): number;
+  trunc(x: number): number;
+  sign(x: number): number;
 }
 declare var Math: Math;
 
-declare function parseInt(s: string): number;
+declare function parseInt(s: string, radix?: number): number;
 declare function parseFloat(s: string): number;
+declare function String(value: any): string;
+declare function Number(value: any): number;
+declare function Boolean(value: any): boolean;
+
+interface JSON {
+  stringify(value: any, replacer?: any, space?: number | string): string;
+  parse(text: string): any;
+}
+declare var JSON: JSON;
+
+interface ObjectConstructor {
+  keys(obj: any): string[];
+  values(obj: any): any[];
+  entries(obj: any): [string, any][];
+}
+declare var Object: ObjectConstructor;
+
+interface Process {
+  argv: string[];
+  platform: string;
+  exit(code?: number): never;
+  cwd(): string;
+  env: { [key: string]: string | undefined };
+}
+declare var process: Process;
 
 interface Promise<T> {
   then(callback: (value: T) => void): void;

@@ -29,10 +29,13 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **Variables & Objects**
 
-| Feature               | Supported | Notes                            |
-| --------------------- | :-------: | -------------------------------- |
-| Variable declarations |    ✅     | `let` and `const`                |
-| Object literals       |    ✅     | Transpiled to Go struct literals |
+| Feature                | Supported | Notes                                           |
+| ---------------------- | :-------: | ----------------------------------------------- |
+| Variable declarations  |    ✅     | `let` and `const`                               |
+| Object literals        |    ✅     | Transpiled to Go struct literals                |
+| Object shorthand       |    ✅     | `{ name }` → `{ name: name }`                  |
+| Array destructuring    |    ✅     | `const [a, b] = arr`                            |
+| Object destructuring   |    ✅     | `const { x, y } = obj`                          |
 
 **Operators**
 
@@ -42,6 +45,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Comparison operators     |    ✅     | `==`, `!=`, `===`, `!==`, etc. |
 | Logical operators        |    ✅     | `&&`, `\|\|`                   |
 | Increment/Decrement      |    ✅     | `++`, `--`                     |
+| Spread operator          |    ✅     | `[...arr]`, `fn(...args)`      |
 | Non-null assertion (`!`) |    ✅     | Stripped during transpilation  |
 | Ternary expressions      |    ✅     | `condition ? a : b`            |
 | Nullish coalescing       |    ✅     | `??` operator                  |
@@ -54,21 +58,22 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | If/Else statements |    ✅     | Fully supported                                        |
 | Switch statements  |    ✅     | Case and default statements                            |
 | For loops          |    ✅     | Standard `for` loops                                   |
-| For...of loops     |    ✅     | Iteration over arrays                                  |
+| For...of loops     |    ✅     | Arrays, Maps, Sets; `Object.entries()` unwrapping      |
+| For...in loops     |    ✅     | Iterates keys via Go `range`                           |
 | While loops        |    ✅     | Transpiled to Go's `for` loops                         |
 | Do...while loops   |    ✅     | Implemented with conditional break                     |
 | Try/Catch/Finally  |    ✅     | `throw` → `panic`; catch/finally via `defer`/`recover` |
 
 **Data Structures & Array Methods**
 
-| Feature                    | Supported | Notes                                                                                      |
-| -------------------------- | :-------: | ------------------------------------------------------------------------------------------ |
-| Arrays                     |    ✅     | Basic array operations                                                                     |
-| Array methods              |    ✅     | `push`, `join`, `slice`                                                                    |
-| Higher-order array methods |    ✅     | `.map()`, `.filter()`, `.some()`, `.find()`                                                |
-| Method chaining            |    ✅     | Chaining array methods such as `.map(...).filter(...).join(...)`                           |
-| Map                        |    ✅     | `Map<K, V>` → Go `map[K]V`; `.set()`, `.get()`, `.has()`, `.delete()`, `.clear()`, `.size` |
-| Set                        |    ✅     | `Set<T>` → Go `map[T]struct{}`; `.add()`, `.has()`, `.delete()`, `.clear()`, `.size`       |
+| Feature                    | Supported | Notes                                                                                         |
+| -------------------------- | :-------: | --------------------------------------------------------------------------------------------- |
+| Arrays                     |    ✅     | Basic array operations                                                                        |
+| Array methods              |    ✅     | `push`, `pop`, `shift`, `unshift`, `join`, `slice`, `concat`, `reverse`, `sort`, `flat`, `at` |
+| Higher-order array methods |    ✅     | `.map()`, `.filter()`, `.some()`, `.find()`, `.findIndex()`, `.every()`, `.forEach()`, `.reduce()` |
+| Method chaining            |    ✅     | e.g. `.map(...).filter(...).join(...)`                                                        |
+| Map                        |    ✅     | `Map<K, V>` → Go `map[K]V`; `.set()`, `.get()`, `.has()`, `.delete()`, `.clear()`, `.size`  |
+| Set                        |    ✅     | `Set<T>` → Go `map[T]struct{}`; `.add()`, `.has()`, `.delete()`, `.clear()`, `.size`         |
 
 **Functions**
 
@@ -76,10 +81,12 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | ---------------------------- | :-------: | ----------------------------------------------------------- |
 | Function declarations        |    ✅     | Transpiled to Go functions                                  |
 | Arrow functions              |    ✅     | Transpiled to anonymous functions                           |
+| IIFEs                        |    ✅     | `(() => { ... })()` and `(function name() { ... })()`       |
 | Closures over mutable state  |    ✅     | Functions capturing and mutating outer variables            |
 | Function types               |    ✅     | `() => number`, `(x: number) => string` as type annotations |
 | Generics (functions/classes) |    ✅     | Type parameters via Go generics                             |
 | Default parameter values     |    ✅     | `function(x = defaultValue)`                                |
+| Rest parameters              |    ✅     | `function(...args: T[])` → Go variadic                      |
 
 **Classes & Interfaces**
 
@@ -87,6 +94,8 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | ------------------- | :-------: | -------------------------------------------------------------- |
 | Classes             |    ✅     | Transpiled to Go structs with constructor and receiver methods |
 | Class inheritance   |    ✅     | `extends` via embedded structs, `super()` supported            |
+| Static members      |    ✅     | `static method()` / `static prop` → package-level declarations |
+| Getters / Setters   |    ✅     | `get prop()` → `Get_prop()`, `set prop(v)` → `Set_prop(v)`    |
 | Interfaces          |    ✅     | Transpiled to Go interfaces, supports `extends`                |
 | Optional properties |    ✅     | `prop?: Type` in interfaces/types                              |
 | Enums               |    ✅     | `enum` declarations and member access                          |
@@ -104,9 +113,16 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Feature               | Supported | Notes                                                 |
 | --------------------- | :-------: | ----------------------------------------------------- |
 | console.log           |    ✅     | Mapped to `fmt.Println`                               |
+| console.error         |    ✅     | Mapped to `fmt.Fprintln(os.Stderr, ...)`              |
 | console.time/timeEnd  |    ✅     | Performance measurement via `time.Now` / `time.Since` |
 | assert                |    ✅     | Transpiled to `panic` on failure                      |
 | parseInt / parseFloat |    ✅     | Mapped to Go's `strconv` package                      |
+| JSON.stringify        |    ✅     | Mapped to `encoding/json` `Marshal` / `MarshalIndent` |
+| JSON.parse            |    ✅     | Mapped to `encoding/json` `Unmarshal`                 |
+| Object.keys/values    |    ✅     | Map key/value iteration helpers                       |
+| process.argv          |    ✅     | Mapped to `os.Args`                                   |
+| process.platform      |    ✅     | Mapped to `runtime.GOOS`                              |
+| process.exit          |    ✅     | Mapped to `os.Exit`                                   |
 
 **Math Methods**
 
@@ -116,6 +132,9 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Math.floor / ceil / round |    ✅     | Mapped to `math.Floor`, `math.Ceil`, `math.Round` |
 | Math.abs / sqrt / pow     |    ✅     | Mapped to corresponding `math` functions          |
 | Math.min / max            |    ✅     | Mapped to `math.Min`, `math.Max`                  |
+| Math.log / log2 / log10   |    ✅     | Mapped to `math.Log`, `math.Log2`, `math.Log10`   |
+| Math.sin / cos / tan      |    ✅     | Mapped to `math.Sin`, `math.Cos`, `math.Tan`      |
+| Math.trunc / sign         |    ✅     | Mapped to `math.Trunc` and inline sign check      |
 
 **String Methods**
 
@@ -129,6 +148,9 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | replace / replaceAll       |    ✅     | Via `strings` package                         |
 | charAt / substring / slice |    ✅     | Direct Go string indexing/slicing             |
 | concat / repeat            |    ✅     | String concatenation and `strings.Repeat`     |
+| padStart / padEnd          |    ✅     | Via `strings.Repeat`                          |
+| match / matchAll / search  |    ✅     | Via `regexp` package                          |
+| at                         |    ✅     | Supports negative indices                     |
 
 **Number / Object Methods**
 
@@ -147,12 +169,15 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 
 **Modules & Imports**
 
-| Feature                  | Supported | Notes                                                        |
-| ------------------------ | :-------: | ------------------------------------------------------------ |
-| Local file imports       |    ✅     | `import { x } from './file'` transpiled to Go package import |
-| Node.js built-in imports |    ✅     | `import { join } from 'node:path'` mapped to Go stdlib       |
-| Go package imports       |    ✅     | `import { x } from 'go:pkg'`                                 |
-| npm package imports      |    ✅     | `import { x } from 'pkg'` mapped to Go module imports        |
-| Named exports            |    ✅     | `export function` / `export const` declarations              |
+| Feature                  | Supported | Notes                                                              |
+| ------------------------ | :-------: | ------------------------------------------------------------------ |
+| Named imports            |    ✅     | `import { x } from './file'`                                       |
+| Default imports          |    ✅     | `import x from 'pkg'` — namespace stripped in output               |
+| Namespace imports        |    ✅     | `import * as x from 'pkg'`                                         |
+| Local file imports       |    ✅     | Relative paths transpiled to a separate Go file                    |
+| Node.js built-in imports |    ✅     | `import { join } from 'node:path'` mapped to Go stdlib             |
+| Go package imports       |    ✅     | `import { x } from 'go:pkg'`                                       |
+| npm package imports      |    ✅     | `import { x } from 'pkg'` mapped to Go module imports              |
+| Named exports            |    ✅     | `export function` / `export const` declarations                    |
 
 TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.

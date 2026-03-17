@@ -1,6 +1,6 @@
 {
   "name": "typenative",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Build native applications using Typescript.",
   "type": "module",
   "bin": {
@@ -40,7 +40,10 @@
     "test25": "node ./bin/index --source test/Test25.spec.ts --script",
     "test25_export": "node ./bin/index --source test/Test25-export.spec.ts --script",
     "test26": "node ./bin/index --source test/Test26.spec.ts --script",
-    "test27": "node ./bin/index --source test/Test27.spec.ts --script"
+    "test27": "node ./bin/index --source test/Test27.spec.ts --script",
+    "test28": "node ./bin/index --source test/test28.spec.ts --script",
+    "test29": "node ./bin/index --source test/test29.spec.ts --script",
+    "test30": "node ./bin/index --source test/test30.spec.ts --script"
   },
   "repository": {
     "type": "git",

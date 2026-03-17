@@ -11,7 +11,16 @@ const importedPackages = new Set<string>();
 let outsideNodes: ts.Node[] = [];
 const classNames = new Set<string>();
 let promiseResolveName: string = '';
-const dangerousNames = new Set(['main']);
+// Go keywords that cannot be used as identifiers
+const dangerousNames = new Set([
+  'main',
+  // Go reserved keywords
+  'break', 'case', 'chan', 'const', 'continue',
+  'default', 'defer', 'else', 'fallthrough', 'for',
+  'func', 'go', 'goto', 'if', 'import',
+  'interface', 'map', 'package', 'range', 'return',
+  'select', 'struct', 'switch', 'type', 'var',
+]);
 const renamedFunctions = new Map<string, string>();
 const variableTypes = new Map<string, string>();
 const variableGoTypes = new Map<string, string>();
@@ -24,6 +33,10 @@ const enumNames = new Set<string>();
 const enumBaseTypes = new Map<string, 'string' | 'float64'>();
 // Maps local TS name → Go qualified name (e.g. 'Println' → 'fmt.Println', 'myFmt' → 'fmt')
 const importAliases = new Map<string, string>();
+// Tracks static methods per class: Set of "ClassName.methodName" strings
+const classStaticMethods = new Set<string>();
+// Tracks static properties per class: Set of "ClassName.propName" strings
+const classStaticProps = new Set<string>();
 // Callback for resolving import specifiers to source code.
 // specifier: the raw import string (relative path or package name)
 // fromDir: directory of the file containing the import (null = main file's dir)
@@ -37,6 +50,9 @@ let currentFileDir: string | null = null;
 const includedLocalImports = new Set<string>();
 // Collects Go source files generated from local TS imports (filename → content)
 let localImportFiles: Map<string, string> = new Map();
+// Default import namespaces from npm/local packages (e.g. `import ts from 'typescript'` → 'ts')
+// Property accesses on these are stripped: ts.createSourceFile → createSourceFile
+const defaultImportNamespaces = new Set<string>();
 
 export type TranspileResult = { main: string; files: Map<string, string> };
 
@@ -77,6 +93,9 @@ export function transpileToNative(
   importAliases.clear();
   includedLocalImports.clear();
   localImportFiles = new Map();
+  defaultImportNamespaces.clear();
+  classStaticMethods.clear();
+  classStaticProps.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -132,6 +151,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `regexp.MustCompile("${goFlags}${escaped}")`;
   } else if (ts.isArrayLiteralExpression(node)) {
     const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type!, true) : '';
+    const hasSpread = node.elements.some((e) => ts.isSpreadElement(e));
+    if (hasSpread) {
+      return visitSpreadArrayLiteral(node, type);
+    }
     return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
   } else if (ts.isBlock(node)) {
     return `{\n\t\t${options.prefixBlockContent ?? ''}${node.statements
@@ -149,11 +172,54 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     if (ts.isIdentifier(node.expression) && enumNames.has(node.expression.text)) {
       return `${getSafeName(node.expression.text)}_${getEnumMemberName(node.name)}`;
     }
+    // Strip default import namespace: `ts.createSourceFile` → `createSourceFile`
+    if (ts.isIdentifier(node.expression) && defaultImportNamespaces.has(node.expression.text)) {
+      return visit(node.name);
+    }
+    // Static member access: `Counter.count` → `Counter_count`
+    if (ts.isIdentifier(node.expression)) {
+      const key = `${node.expression.text}.${node.name.text}`;
+      if (classStaticMethods.has(key) || classStaticProps.has(key)) {
+        return `${node.expression.text}_${node.name.text}`;
+      }
+    }
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
     const objectType = resolveExpressionType(node.expression);
     return getAcessString(leftSide, rightSide, objectType);
   } else if (ts.isVariableDeclaration(node)) {
+    // Object destructuring: const { x, y } = obj
+    if (ts.isObjectBindingPattern(node.name) && node.initializer) {
+      const initExpr = visit(node.initializer);
+      const parts = node.name.elements.map((el) => {
+        const localName = visit(el.name);
+        const propName = el.propertyName ? visit(el.propertyName) : localName;
+        const defaultVal = el.initializer ? visit(el.initializer) : undefined;
+        if (defaultVal) {
+          return `${localName} := func() interface{} { if ${initExpr}.${propName} == nil { return ${defaultVal} }; return ${initExpr}.${propName} }()`;
+        }
+        return `${localName} := ${initExpr}.${propName}`;
+      });
+      return parts.join(';\n\t');
+    }
+    // Array destructuring: const [a, b] = arr
+    if (ts.isArrayBindingPattern(node.name) && node.initializer) {
+      const initExpr = visit(node.initializer);
+      const tmpVar = getTempName('arr');
+      const parts = [`${tmpVar} := ${initExpr}`];
+      node.name.elements.forEach((el, idx) => {
+        if (ts.isOmittedExpression(el)) return;
+        const bindEl = el as ts.BindingElement;
+        const localName = visit(bindEl.name);
+        // Variables starting with _ are intentionally unused — use blank identifier
+        if (localName === '_' || localName.startsWith('_')) {
+          parts.push(`_ = ${tmpVar}[${idx}]`);
+        } else {
+          parts.push(`${localName} := ${tmpVar}[${idx}]`);
+        }
+      });
+      return parts.join(';\n\t');
+    }
     const type = getType(node.type!);
     // Track variable type for type-aware method dispatch
     if (ts.isIdentifier(node.name)) {
@@ -213,6 +279,21 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     ) {
       return visitOptionalCall(node);
     }
+    // IIFE with named function expression: (function name() { ... })()
+    if (
+      ts.isParenthesizedExpression(node.expression) &&
+      ts.isFunctionExpression(node.expression.expression)
+    ) {
+      const fn = node.expression.expression;
+      const parameterInfo = getFunctionParametersInfo(fn.parameters);
+      if (fn.body && ts.isBlock(fn.body)) {
+        prescanVariableDeclarations(fn.body);
+      }
+      const inferredRetType = inferFunctionBodyReturnType(fn);
+      const returnType = inferredRetType ? ` ${inferredRetType}` : '';
+      const args = node.arguments.map((a) => visit(a)).join(', ');
+      return `func(${parameterInfo.signature})${returnType} ${visit(fn.body!, { prefixBlockContent: parameterInfo.prefixBlockContent })}(${args})`;
+    }
     // Handle setTimeout specially to get raw delay value
     if (ts.isIdentifier(node.expression) && node.expression.text === 'setTimeout') {
       importedPackages.add('time');
@@ -228,7 +309,13 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const caller = visit(node.expression);
     const safeCaller = getSafeName(caller);
     const typeArgs = getTypeArguments(node.typeArguments);
-    const args = node.arguments.map((a) => visit(a));
+    // Handle spread arguments: fn(...arr) → fn(arr...)
+    const hasSpreadArg = node.arguments.some((a) => ts.isSpreadElement(a));
+    const args = hasSpreadArg
+      ? node.arguments.map((a) =>
+          ts.isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a)
+        )
+      : node.arguments.map((a) => visit(a));
     // Resolve object type for type-aware method dispatch
     let objectType: string | undefined;
     if (ts.isPropertyAccessExpression(node.expression)) {
@@ -264,9 +351,26 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `for ${visit(node.initializer!, { inline: true })}; ${visit(node.condition!, {
       inline: true
     })}; ${visit(node.incrementor!, { inline: true })}${visit(node.statement)}`;
+  } else if (ts.isForInStatement(node)) {
+    const varName = ts.isVariableDeclarationList(node.initializer)
+      ? visit(node.initializer.declarations[0].name)
+      : visit(node.initializer as ts.Expression);
+    return `for ${varName} := range ${visit(node.expression, { inline: true })}${visit(node.statement)}`;
   } else if (ts.isForOfStatement(node)) {
-    const iterExpr = visit(node.expression, { inline: true });
-    const iterType = inferExpressionType(node.expression);
+    // Unwrap Object.entries(x) → treat x as the iterable
+    let iterNode: ts.Expression = node.expression;
+    if (
+      ts.isCallExpression(iterNode) &&
+      ts.isPropertyAccessExpression(iterNode.expression) &&
+      ts.isIdentifier(iterNode.expression.expression) &&
+      iterNode.expression.expression.text === 'Object' &&
+      iterNode.expression.name.text === 'entries' &&
+      iterNode.arguments.length > 0
+    ) {
+      iterNode = iterNode.arguments[0] as ts.Expression;
+    }
+    const iterExpr = visit(iterNode, { inline: true });
+    const iterType = inferExpressionType(iterNode);
     if (iterType && iterType.startsWith('map[')) {
       const valueType = extractMapValueType(iterType);
       const isSet = valueType === 'struct{}';
@@ -475,14 +579,24 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       const properties = new Map<string, string>();
       const methods = new Map<string, string>();
       for (const member of node.members) {
+        const memberModifiers = (member as ts.HasModifiers).modifiers;
+        const isStatic = memberModifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
         if (ts.isPropertyDeclaration(member) && ts.isIdentifier(member.name)) {
-          properties.set(
-            member.name.text,
-            getOptionalNodeType(member.type, !!member.questionToken)
-          );
+          if (isStatic) {
+            classStaticProps.add(`${className}.${member.name.text}`);
+          } else {
+            properties.set(
+              member.name.text,
+              getOptionalNodeType(member.type, !!member.questionToken)
+            );
+          }
         }
         if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name)) {
-          methods.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+          if (isStatic) {
+            classStaticMethods.add(`${className}.${member.name.text}`);
+          } else {
+            methods.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+          }
         }
       }
       classPropertyTypes.set(className, properties);
@@ -549,12 +663,42 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
         const methodName = visit(member.name);
         const methodParameterInfo = getFunctionParametersInfo(member.parameters);
         const returnType = member.type ? ` ${getType(member.type)}` : '';
-        result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
-          member.body!,
-          {
-            prefixBlockContent: methodParameterInfo.prefixBlockContent
-          }
-        )}\n\n`;
+        const isStatic = member.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
+        if (isStatic) {
+          // Static methods become package-level functions named ClassName_methodName
+          result += `func ${name}_${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
+            member.body!,
+            { prefixBlockContent: methodParameterInfo.prefixBlockContent }
+          )}\n\n`;
+        } else {
+          result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
+            member.body!,
+            { prefixBlockContent: methodParameterInfo.prefixBlockContent }
+          )}\n\n`;
+        }
+      } else if (ts.isGetAccessor(member)) {
+        // Getter: get prop() { ... } → func (self *T) Prop() RetType { ... }
+        const getterName = visit(member.name);
+        const returnType = member.type ? ` ${getType(member.type)}` : ' interface{}';
+        result += `func (self *${name}${typeParamNames}) Get_${getterName}()${returnType} ${visit(member.body!)}\n\n`;
+      } else if (ts.isSetAccessor(member)) {
+        // Setter: set prop(val) { ... } → func (self *T) SetProp(val ValType) { ... }
+        const setterName = visit(member.name);
+        const parameterInfo = getFunctionParametersInfo(member.parameters);
+        result += `func (self *${name}${typeParamNames}) Set_${setterName}(${parameterInfo.signature}) ${visit(member.body!, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
+      }
+    }
+
+    // Static property declarations → package-level vars named ClassName_propName
+    for (const member of node.members) {
+      if (
+        ts.isPropertyDeclaration(member) &&
+        member.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
+      ) {
+        const fieldName = visit(member.name);
+        const fieldType = getOptionalNodeType(member.type, !!member.questionToken);
+        const initializer = member.initializer ? ` = ${visit(member.initializer)}` : '';
+        result += `var ${name}_${fieldName} ${fieldType}${initializer}\n\n`;
       }
     }
 
@@ -597,6 +741,12 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
         if (ts.isPropertyAssignment(p)) {
           return `${visit(p.name)}: ${visit(p.initializer)}`;
         }
+        // Shorthand: { name } → name: name
+        if (ts.isShorthandPropertyAssignment(p)) {
+          const name = visit(p.name);
+          return `${name}: ${name}`;
+        }
+        // Spread: { ...obj } — not easily supported in Go structs, omit
         return '';
       })
       .filter((p) => p)
@@ -615,7 +765,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 
   const syntaxKind = ts.SyntaxKind[node.kind];
   if (!['FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
-    console.log(ts.SyntaxKind[node.kind], node.getText());
+    const snippet = node.getText().substring(0, 60).replace(/\n/g, ' ');
+    console.warn(`[TypeNative] Unsupported syntax: ${syntaxKind} — "${snippet}"`);
   }
 
   ts.forEachChild(node, (subNode) => {
@@ -643,6 +794,37 @@ function getTypeText(typeNode: ts.TypeNode): string {
 
 function toGoStringLiteral(value: string): string {
   return JSON.stringify(value);
+}
+
+function visitSpreadArrayLiteral(node: ts.ArrayLiteralExpression, elemType: string): string {
+  // Build append chain for arrays with spread elements
+  // [...arr1, x, y, ...arr2] → append(append(append([]T{}, arr1...), x, y), arr2...)
+  type Chunk = { isSpread: boolean; items: ts.Expression[] };
+  const chunks: Chunk[] = [];
+
+  for (const el of node.elements) {
+    if (ts.isSpreadElement(el)) {
+      chunks.push({ isSpread: true, items: [el.expression] });
+    } else {
+      const last = chunks[chunks.length - 1];
+      if (last && !last.isSpread) {
+        last.items.push(el);
+      } else {
+        chunks.push({ isSpread: false, items: [el] });
+      }
+    }
+  }
+
+  const baseType = elemType || 'interface{}';
+  let result = `[]${baseType}{}`;
+  for (const chunk of chunks) {
+    if (chunk.isSpread) {
+      result = `append(${result}, ${visit(chunk.items[0])}...)`;
+    } else {
+      result = `append(${result}, ${chunk.items.map((e) => visit(e)).join(', ')})`;
+    }
+  }
+  return result;
 }
 
 function visitTemplateExpression(node: ts.TemplateExpression): string {
@@ -1060,8 +1242,8 @@ function buildArrayCallbackInfo(
     }
 
     const body = ts.isBlock(callback.body)
-      ? visit(callback.body)
-      : `{\n\t\treturn ${visit(callback.body)};\n\t}`;
+      ? visit(callback.body, { inline: true })
+      : `{ return ${visit(callback.body)}; }`;
 
     return {
       fnExpr: `func(${params.join(', ')}) ${callbackReturnType} ${body}`,
@@ -1090,11 +1272,27 @@ function buildArrayCallbackInvocation(
   return `(${callbackInfo.fnExpr})(${args.join(', ')})`;
 }
 
+// Like buildArrayCallbackInvocation but for reduce: (acc, item, idx, arr)
+function buildArrayCallbackInvocationReduce(
+  callbackInfo: ArrayCallbackInfo,
+  accVar: string,
+  itemVar: string,
+  indexVar: string,
+  arrayVar: string
+): string {
+  const args: string[] = [];
+  if (callbackInfo.paramCount > 0) args.push(accVar);
+  if (callbackInfo.paramCount > 1) args.push(itemVar);
+  if (callbackInfo.paramCount > 2) args.push(`float64(${indexVar})`);
+  if (callbackInfo.paramCount > 3) args.push(arrayVar);
+  return `(${callbackInfo.fnExpr})(${args.join(', ')})`;
+}
+
 function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined {
   if (!ts.isPropertyAccessExpression(node.expression)) return undefined;
 
   const methodName = node.expression.name.text;
-  if (!['map', 'filter', 'some', 'find', 'join'].includes(methodName)) {
+  if (!['map', 'filter', 'some', 'find', 'findIndex', 'every', 'forEach', 'reduce', 'join'].includes(methodName)) {
     return undefined;
   }
 
@@ -1149,6 +1347,46 @@ function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined 
     return `func() bool { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { return true } }; return false }()`;
   }
 
+  if (methodName === 'findIndex') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() float64 { ${arrVar} := ${arrayExpr}; for ${idxVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { return float64(${idxVar}) } }; return float64(-1) }()`;
+  }
+
+  if (methodName === 'every') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
+    const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() bool { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if !(${callbackCall}) { return false } }; return true }()`;
+  }
+
+  if (methodName === 'forEach') {
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType, '');
+    const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
+    const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
+    return `func() { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { ${callbackCall} } }()`;
+  }
+
+  if (methodName === 'reduce') {
+    const reduceCallback = node.arguments[0];
+    if (!reduceCallback) return undefined;
+    const initialValue = node.arguments[1] ? visit(node.arguments[1] as ts.Expression) : undefined;
+    const accType = initialValue
+      ? (inferExpressionType(node.arguments[1] as ts.Expression) ?? elementType)
+      : elementType;
+    const accVar = getTempName('acc');
+    // Build a callback that takes (acc, item, idx, arr) — param count determines what gets passed
+    const cbInfo = buildArrayCallbackInfo(reduceCallback, elementType, accType ?? 'interface{}');
+    const cbCall = buildArrayCallbackInvocationReduce(cbInfo, accVar, itemVar, idxVar, arrVar);
+    // Only include the index loop var if the callback uses it (paramCount > 2)
+    const reduceIdxVar = cbInfo.paramCount > 2 ? idxVar : '_';
+    if (initialValue !== undefined) {
+      return `func() ${accType} { ${arrVar} := ${arrayExpr}; ${accVar} := ${initialValue}; for ${reduceIdxVar}, ${itemVar} := range ${arrVar} { ${accVar} = ${cbCall} }; return ${accVar} }()`;
+    }
+    return `func() ${elementType} { ${arrVar} := ${arrayExpr}; ${accVar} := ${arrVar}[0]; for ${reduceIdxVar}, ${itemVar} := range ${arrVar}[1:] { ${accVar} = ${cbCall} }; return ${accVar} }()`;
+  }
+
+  // find
   const callbackInfo = buildArrayCallbackInfo(callback, elementType, 'bool');
   const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
   const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
@@ -1416,6 +1654,21 @@ function getAcessString(leftSide: string, rightSide: string, objectType?: string
   if (rightSide === 'size' && (objectType === 'Map' || objectType === 'Set')) {
     return `float64(len(${leftSide}))`;
   }
+  // process global properties
+  if (leftSide === 'process') {
+    if (rightSide === 'argv') {
+      importedPackages.add('os');
+      return 'os.Args';
+    }
+    if (rightSide === 'platform') {
+      importedPackages.add('runtime');
+      return 'runtime.GOOS';
+    }
+    if (rightSide === 'env') {
+      // process.env.X is handled by nested property access; just return a placeholder object
+      return 'os.Environ()';
+    }
+  }
 
   return `${leftSide}.${rightSide}`;
 }
@@ -1483,7 +1736,84 @@ const callHandlers: Record<string, CallHandler> = {
   parseFloat: (_caller, args) => {
     importedPackages.add('strconv');
     return `func() float64 { v, _ := strconv.ParseFloat(${args[0]}, 64); return v }()`;
-  }
+  },
+  'process.exit': (_caller, args) => {
+    importedPackages.add('os');
+    return `os.Exit(int(${args[0] ?? '0'}))`;
+  },
+  'process.cwd': () => {
+    importedPackages.add('os');
+    return `func() string { __d, _ := os.Getwd(); return __d }()`;
+  },
+  'JSON.stringify': (_caller, args) => {
+    importedPackages.add('encoding/json');
+    if (args.length >= 3) {
+      return `func() string { __b, _ := json.MarshalIndent(${args[0]}, "", "  "); return string(__b) }()`;
+    }
+    return `func() string { __b, _ := json.Marshal(${args[0]}); return string(__b) }()`;
+  },
+  'JSON.parse': (_caller, args) => {
+    importedPackages.add('encoding/json');
+    return `func() interface{} { var __v interface{}; json.Unmarshal([]byte(${args[0]}), &__v); return __v }()`;
+  },
+  'Object.keys': (_caller, args) => {
+    importedPackages.add('maps');
+    return `func() []string { __k := make([]string, 0); for k := range ${args[0]} { __k = append(__k, k) }; return __k }()`;
+  },
+  'Object.values': (_caller, args) => {
+    return `func() []interface{} { __v := make([]interface{}, 0); for _, v := range ${args[0]} { __v = append(__v, v) }; return __v }()`;
+  },
+  'Object.entries': (_caller, args) => {
+    // When used outside for...of, produce a slice of [key, value] pairs — rarely needed
+    return args[0];
+  },
+  'Math.log': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Log(${args[0]})`;
+  },
+  'Math.log2': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Log2(${args[0]})`;
+  },
+  'Math.log10': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Log10(${args[0]})`;
+  },
+  'Math.sin': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Sin(${args[0]})`;
+  },
+  'Math.cos': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Cos(${args[0]})`;
+  },
+  'Math.tan': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Tan(${args[0]})`;
+  },
+  'Math.trunc': (_caller, args) => {
+    importedPackages.add('math');
+    return `math.Trunc(${args[0]})`;
+  },
+  'Math.sign': (_caller, args) => {
+    return `func() float64 { if ${args[0]} > 0 { return 1 }; if ${args[0]} < 0 { return -1 }; return 0 }()`;
+  },
+  'console.error': (_caller, args) => {
+    importedPackages.add('fmt');
+    importedPackages.add('os');
+    return `fmt.Fprintln(os.Stderr, ${args.join(', ')})`;
+  },
+  'String': (_caller, args) => {
+    importedPackages.add('fmt');
+    return `fmt.Sprintf("%v", ${args[0]})`;
+  },
+  'Number': (_caller, args) => {
+    importedPackages.add('strconv');
+    return `func() float64 { v, _ := strconv.ParseFloat(fmt.Sprintf("%v", ${args[0]}), 64); return v }()`;
+  },
+  'Boolean': (_caller, args) => {
+    return `(${args[0]} != nil && ${args[0]} != false && ${args[0]} != 0 && ${args[0]} != "")`;
+  },
 };
 
 type MethodHandler = (obj: string, args: string[]) => string;
@@ -1551,6 +1881,32 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `${obj}[int(${args[0]}):]`;
   },
   concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
+  padStart: (obj, args) => {
+    importedPackages.add('fmt');
+    importedPackages.add('strings');
+    const pad = args[1] ?? '" "';
+    return `func() string { __s := ${obj}; __n := int(${args[0]}) - len(__s); if __n > 0 { __s = strings.Repeat(${pad}, __n)[:__n] + __s }; return __s }()`;
+  },
+  padEnd: (obj, args) => {
+    importedPackages.add('strings');
+    const pad = args[1] ?? '" "';
+    return `func() string { __s := ${obj}; __n := int(${args[0]}) - len(__s); if __n > 0 { __s = __s + strings.Repeat(${pad}, __n)[:__n] }; return __s }()`;
+  },
+  match: (obj, args) => {
+    importedPackages.add('regexp');
+    return `regexp.MustCompile(${args[0]}).FindStringSubmatch(${obj})`;
+  },
+  matchAll: (obj, args) => {
+    importedPackages.add('regexp');
+    return `regexp.MustCompile(${args[0]}).FindAllStringSubmatch(${obj}, -1)`;
+  },
+  search: (obj, args) => {
+    importedPackages.add('regexp');
+    return `float64(regexp.MustCompile(${args[0]}).FindStringIndex(${obj})[0])`;
+  },
+  at: (obj, args) => {
+    return `func() string { __i := int(${args[0]}); if __i < 0 { __i = len(${obj}) + __i }; return string(${obj}[__i]) }()`;
+  },
   toString: (obj: string) => {
     importedPackages.add('fmt');
     return `fmt.Sprintf("%v", ${obj})`;
@@ -1564,6 +1920,13 @@ const regexpMethodHandlers: Record<string, MethodHandler> = {
 
 const arrayMethodHandlers: Record<string, MethodHandler> = {
   push: (obj, args) => `${obj} = append(${obj}, ${args.join(', ')})`,
+  pop: (obj) => {
+    return `func() interface{} { if len(${obj}) == 0 { return nil }; __last := ${obj}[len(${obj})-1]; ${obj} = ${obj}[:len(${obj})-1]; return __last }()`;
+  },
+  shift: (obj) => {
+    return `func() interface{} { if len(${obj}) == 0 { return nil }; __first := ${obj}[0]; ${obj} = ${obj}[1:]; return __first }()`;
+  },
+  unshift: (obj, args) => `${obj} = append([]interface{}{${args.join(', ')}}, ${obj}...)`,
   join: (obj, args) => {
     importedPackages.add('strings');
     return `strings.Join(${obj}, ${args[0] ?? '""'})`;
@@ -1572,10 +1935,30 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
     return `${obj}[int(${args[0]}):]`;
   },
+  reverse: (obj) => {
+    importedPackages.add('slices');
+    return `func() interface{} { slices.Reverse(${obj}); return nil }()`;
+  },
+  sort: (obj) => {
+    importedPackages.add('sort');
+    return `func() interface{} { sort.Slice(${obj}, func(i, j int) bool { return fmt.Sprintf("%v", ${obj}[i]) < fmt.Sprintf("%v", ${obj}[j]) }); return nil }()`;
+  },
+  indexOf: (obj, args) => {
+    return `func() float64 { for __i, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return float64(__i) } }; return float64(-1) }()`;
+  },
+  includes: (obj, args) => {
+    return `func() bool { for _, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return true } }; return false }()`;
+  },
+  concat: (obj, args) => `append(${obj}, ${args.join(', ')}...)`,
+  flat: (obj) => obj,
   toString: (obj: string) => {
     importedPackages.add('fmt');
     return `fmt.Sprintf("%v", ${obj})`;
-  }
+  },
+  // padStart / padEnd for string arrays (rarely used, but added for completeness)
+  at: (obj, args) => {
+    return `func() interface{} { __i := int(${args[0]}); if __i < 0 { __i = len(${obj}) + __i }; if __i < 0 || __i >= len(${obj}) { return nil }; return ${obj}[__i] }()`;
+  },
 };
 
 const mapMethodHandlers: Record<string, MethodHandler> = {
@@ -1725,6 +2108,16 @@ type FunctionParametersInfo = {
 };
 
 function getParameterGoType(param: ts.ParameterDeclaration): string {
+  // Rest parameter: ...args — use variadic syntax
+  if (param.dotDotDotToken) {
+    if (param.type) {
+      let baseType = getType(param.type);
+      // If annotated as T[], the variadic type is T
+      if (baseType.startsWith('[]')) baseType = baseType.slice(2);
+      return `...${baseType}`;
+    }
+    return '...interface{}';
+  }
   if (param.type) {
     const explicitType = getType(param.type);
     return explicitType === ':' ? 'interface{}' : explicitType;
@@ -2149,6 +2542,16 @@ function visitImportDeclaration(node: ts.ImportDeclaration): string {
     if (resolved) {
       const goFileName = specifierToGoFileName(moduleSpec);
       includeLocalImport(resolved.content, resolved.dir, goFileName);
+    }
+  }
+  // Register default/namespace import name as a "stripped" namespace
+  // e.g. `import ts from 'typescript'` → ts.createSourceFile → createSourceFile
+  if (node.importClause) {
+    const clause = node.importClause;
+    if (clause.name) {
+      defaultImportNamespaces.add(clause.name.text);
+    } else if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
+      defaultImportNamespaces.add(clause.namedBindings.name.text);
     }
   }
   return '';

@@ -5,6 +5,33 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.20] - 2026-03-16
+
+### Added
+
+- **Spread in array literals**: `[...arr1, ...arr2]` → `append(append([]T{}, arr1...), arr2...)`
+- **Rest parameters**: `function(...args: T[])` → Go variadic `func(...args T)`
+- **Spread in function calls**: `fn(...args)` → `fn(args...)`
+- **Array destructuring**: `const [a, b] = arr` → Go index assignments
+- **Object shorthand**: `{ name }` → `{ name: name }` in struct literals
+- **Static class members**: `static method()` / `static prop` → `ClassName_method()` / `ClassName_prop` package-level declarations; `ClassName.method()` calls correctly resolve
+- **Getters/Setters**: `get prop()` → `Get_prop()` method, `set prop(v)` → `Set_prop(v)` method
+- **`for...in` loops**: `for (const k in obj)` → `for k := range obj`
+- **`Object.entries()` in `for...of`**: `for (const [k, v] of Object.entries(map))` unwraps to `for k, v := range map`
+- **Named function expression IIFEs**: `(function name() { ... })()` → anonymous `func() { ... }()`
+- **`process` global**: `process.argv` → `os.Args`, `process.platform` → `runtime.GOOS`, `process.exit()` → `os.Exit()`, `process.cwd()` → `os.Getwd()`
+- **`JSON.stringify()` / `JSON.parse()`**: mapped to `encoding/json` `Marshal`/`Unmarshal`
+- **`Object.keys()` / `Object.values()` / `Object.entries()`**: map iteration helpers
+- **Array methods**: `findIndex`, `every`, `forEach`, `reduce`, `pop`, `shift`, `unshift`, `reverse`, `sort`, `concat`, `flat`, `at`
+- **String methods**: `padStart`, `padEnd`, `match`, `matchAll`, `search`, `at`
+- **Math methods**: `log`, `log2`, `log10`, `sin`, `cos`, `tan`, `trunc`, `sign`
+- **`console.error()`**: maps to `fmt.Fprintln(os.Stderr, ...)`
+- **`String()` / `Number()` / `Boolean()`** conversion functions
+- **Go reserved words protection**: `getSafeName()` now covers all Go keywords (`break`, `case`, `chan`, `continue`, `default`, `defer`, `else`, `fallthrough`, `for`, `func`, `go`, `goto`, `if`, `import`, `interface`, `map`, `package`, `range`, `return`, `select`, `struct`, `switch`, `type`, `var`)
+- **Default import namespaces from npm/local packages**: `import ts from 'typescript'` registers `ts` as a stripped namespace so `ts.method()` → `method()`
+- **Better unsupported syntax warnings**: `console.warn` with syntax kind name and source snippet instead of `console.log`
+- **Type definitions (`typenative.d.ts`)**: added `findIndex`, `every`, `forEach`, `reduce`, `pop`, `shift`, `unshift`, `reverse`, `sort`, `flat`, `concat`, `at` to `Array`; `padStart`, `padEnd`, `match`, `matchAll`, `search`, `at` to `String`; added `JSON`, `Object`, `Process`, extended `Math` and `Console`
+
 ## [0.0.19] - 2026-03-07
 
 ### Added
