@@ -5,6 +5,38 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.21] - 2026-09-06
+
+Self-hosting milestone: the compiler no longer depends on `execa`, `fs-extra`, or `nanoid`, and the
+TypeScript parser is decoupled behind an injectable, normalized JSON AST — produced either by the
+`typescript` npm package (dev CLI) or by the new Go-native `tsparser` tool (self-hosted binary).
+Verified: all 33 test specs transpile identically through both parser paths, and the compiler now
+transpiles its own source all the way to `go build`.
+
+### Added
+
+- **`node:fs` mappings**: `readFileSync`, `writeFileSync`, `appendFileSync`, `existsSync`, `mkdirSync`, `readdirSync`, `copyFileSync`, `rmSync` → Go helpers (`TnReadFile`, `TnWriteFile`, …)
+- **`node:url` mappings**: `fileURLToPath`, `pathToFileURL`
+- **`node:os` mappings**: `platform` (returns `win32`/`darwin`/linux like Node), `homedir`, `tmpdir`
+- **`node:child_process` mappings**: sync `exec`/`execSync`/`spawnSync` shaped like Node's `spawnSync` (`{ stdout, stderr, status }`); `{ stdio: 'inherit' }` runs with the parent's stdio (`TnRunInherit`); `{ input }` pipes stdin (`TnExecInput`)
+- **`node:readline` mapping**: synchronous `question(prompt)` for interactive native prompts (`TnQuestion`, single buffered stdin reader)
+- **`process.env.X`** → `TnGetenv("X")`
+- **Go helper registry**: node-stdlib helpers are emitted once into the main output file with correct per-file import scoping (helpers register their Go packages lazily; import lists are computed after function bodies are visited)
+- **`tsparser/` Go tool**: parses TypeScript via `github.com/buke/typescript-go-internal` (native Go port of the TypeScript parser — no embedded JS runtime) and emits a normalized JSON AST with TypeScript-API kind and field names
+- **`src/parse-node.ts`**: Node adapter producing the identical JSON AST from the `typescript` npm package; verified byte-identical against `tsparser` on all test specs and all compiler sources
+- **`src/parse-native.ts`**: self-hosted parser client (spawns the `tsparser` binary, `TYPENATIVE_TSPARSER` env override)
+- **Injectable parser**: `transpileToNative(code, { parse, readFile })` — the transpiler no longer imports `typescript`
+- **Unbraced `if`/`else if`/`else` statements**: single-statement branches now emit valid Go blocks
+- **`%` and `%=` on numbers** → `math.Mod`
+- **`./x.js` → `x.ts` import resolution** for ES-style relative specifiers
+- **Tests 31–32**: node-stdlib end-to-end spec (fs round-trip, os platform, shell exec) and subprocess/control-flow spec
+
+### Changed
+
+- **CLI entry split**: `bin/cli.js` (npm `bin`) keeps inquirer for interactive Node use; the transpilable core lives in `src/index.ts` (`run`/`createProject`), with `src/main.ts` as the self-hosting entry and `src/prompt.ts` (transpilable sync prompts) replacing inquirer in native builds
+- **Transpiler internals**: the `ts` typechecker is replaced by syntactic `typeNodeToText`; node predicates became plain `isX()` kind-string functions; operator tokens map through a kind-name table
+- Dropped runtime dependencies: `execa`, `fs-extra`, `nanoid` (replaced by a local `goSafeId`)
+
 ## [0.0.20] - 2026-03-16
 
 ### Added
