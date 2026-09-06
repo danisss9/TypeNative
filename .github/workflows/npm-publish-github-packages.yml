@@ -1,9 +1,14 @@
 # Triggered by tags matching "TypeNative_{version}" (e.g. TypeNative_0.0.18)
 # Runs tests, creates a GitHub release, and publishes to npm.
 #
-# Requires an NPM_TOKEN secret set in your GitHub repository settings.
-# Setup: npmjs.com → Access Tokens → Generate New Token (Automation)
-#        GitHub repo → Settings → Secrets → Actions → New secret: NPM_TOKEN
+# Uses npm Trusted Publishing (OIDC) — no NPM_TOKEN secret needed.
+# One-time setup on npmjs.com:
+#   typenative package page → Settings → Publishing access → Trusted Publisher → Connect GitHub
+#     - Organization or user: danisss9
+#     - Repository:           typenative
+#     - Workflow filename:    npm-publish-github-packages.yml
+#     - Environment name:     (leave blank)
+# Requires npm >= 11.5.1 (ensured below) and the `id-token: write` permission.
 
 name: Release & Publish
 
@@ -61,6 +66,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org/
 
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1 — ensure we have it
+      - run: npm install -g npm@latest
+
       - name: Extract version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#TypeNative_}" >> $GITHUB_OUTPUT
@@ -70,6 +78,6 @@ jobs:
 
       - run: npm ci
 
+      # Authenticates via OIDC (id-token: write) — no NODE_AUTH_TOKEN needed.
+      # Provenance is included automatically; the flag is kept for explicitness.
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
