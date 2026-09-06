@@ -1,83 +1,51 @@
-#!/usr/bin/env node
-import inquirer from 'inquirer';
-import fs from 'fs-extra';
+// Core compiler logic — kept free of Node-only dependencies (inquirer, execa,
+// fs-extra) so this module transpiles with TypeNative itself.
+// Node-only interactive prompting lives in src/cli.ts; the self-hosted entry
+// point is src/main.ts.
 import path from 'node:path';
-import { execa } from 'execa';
+import * as fs from 'node:fs';
+import { platform } from 'node:os';
+// TypeNative maps node:child_process to a synchronous Go API whose shape differs
+// from Node's; under Node these functions are never called (the CLI wrapper does
+// not reach them), so they're accessed through `any` casts for type-checking.
+import * as childProcess from 'node:child_process';
 import { transpileToNative } from './transpiler.js';
-import { fileURLToPath } from 'node:url';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-(async function main() {
-    const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
-    const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
-    const sourceIndex = process.argv.findIndex((a) => a === '--source');
-    const source = sourceIndex > -1 ? process.argv[sourceIndex + 1] : null;
-    const outputIndex = process.argv.findIndex((a) => a === '--output');
-    const output = outputIndex > -1 ? process.argv[outputIndex + 1] : null;
-    const answers = await inquirer.prompt([
-        {
-            type: 'input',
-            name: 'projectName',
-            message: 'Enter Project Name:',
-            when: newCommand,
-            validate: (input) => input.trim() !== ''
-        },
-        {
-            type: 'confirm',
-            name: 'installDependencies',
-            message: 'Do you want to install dependencies?',
-            when: newCommand
-        },
-        {
-            type: 'input',
-            name: 'path',
-            message: 'Enter Path to typescript main file:',
-            when: !newCommand && !scriptMode && !source,
-            validate: (input) => input.trim() !== ''
-        },
-        {
-            type: 'input',
-            name: 'output',
-            message: 'Enter Output Path:',
-            when: !newCommand && !scriptMode && !output,
-            validate: (input) => input.trim() !== ''
-        },
-        {
-            type: 'editor',
-            name: 'tsCode',
-            message: 'Write your typescript code here:',
-            when: !newCommand && scriptMode && !source,
-            default: `console.log('Hello, World!');`
+// Run a command and capture its output. Uses Node's spawnSync under Node and a
+// Go helper (os/exec) once transpiled — both synchronous, same result shape.
+export function runCommand(name, args) {
+    const result = childProcess.spawnSync(name, args, { encoding: 'utf-8' });
+    return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+}
+// Run a command with the parent's stdio, returns the exit code.
+export function runInherit(name, args = []) {
+    const result = childProcess.spawnSync(name, args, { stdio: 'inherit' });
+    return result.status;
+}
+export function createProject(projectName, installDependencies) {
+    fs.mkdirSync(projectName, { recursive: true });
+    fs.writeFileSync(path.join(projectName, 'main.ts'), `// Write your TypeScript code here\nconsole.log('Hello, World!');\n`);
+    fs.writeFileSync(path.join(projectName, 'tsconfig.json'), getTsConfig());
+    fs.writeFileSync(path.join(projectName, 'package.json'), getPackageJson(projectName));
+    fs.writeFileSync(path.join(projectName, '.gitignore'), getGitIgnore());
+    fs.writeFileSync(path.join(projectName, 'README.md'), getReadMe(projectName));
+    console.log(`Project "${projectName}" created successfully!`);
+    if (installDependencies) {
+        console.log('Installing dependencies...');
+        // npm --prefix avoids needing cwd support in the subprocess binding
+        const result = runCommand('npm', ['install', '--prefix', projectName]);
+        if (result.stdout)
+            console.log(result.stdout.trim());
+        if (result.status !== 0) {
+            if (result.stderr)
+                console.error(result.stderr.trim());
+            process.exit(result.status);
         }
-    ]);
-    if (newCommand) {
-        const projectName = answers.projectName.trim();
-        await fs.ensureDir(projectName);
-        await fs.writeFile(path.join(projectName, 'main.ts'), `// Write your TypeScript code here\nconsole.log('Hello, World!');\n`, { encoding: 'utf-8' });
-        await fs.writeFile(path.join(projectName, 'tsconfig.json'), getTsConfig(), {
-            encoding: 'utf-8'
-        });
-        await fs.writeFile(path.join(projectName, 'package.json'), getPackageJson(projectName), {
-            encoding: 'utf-8'
-        });
-        await fs.writeFile(path.join(projectName, '.gitignore'), getGitIgnore(), {
-            encoding: 'utf-8'
-        });
-        await fs.writeFile(path.join(projectName, 'README.md'), getReadMe(projectName), {
-            encoding: 'utf-8'
-        });
-        console.log(`Project "${projectName}" created successfully!`);
-        if (answers.installDependencies) {
-            console.log('Installing dependencies...');
-            await execa('npm', ['install'], { cwd: projectName, stdio: 'inherit' });
-            console.log('Dependencies installed successfully!');
-        }
-        return;
+        console.log('Dependencies installed successfully!');
     }
-    const sourcePath = answers.tsCode ? null : (source ?? answers.path ?? null);
-    const tsCode = answers.tsCode
-        ? answers.tsCode
-        : await fs.readFile(sourcePath, { encoding: 'utf-8' });
+}
+export function run(opts) {
+    const sourcePath = opts.tsCode ? null : opts.source;
+    const tsCode = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath, 'utf-8');
     const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
     const transpileResult = transpileToNative(tsCode, sourceDir
         ? {
@@ -85,7 +53,11 @@ const __dirname = path.dirname(__filename);
                 const baseDir = fromDir ?? sourceDir;
                 // Relative or absolute path → resolve from baseDir
                 if (specifier.startsWith('.') || specifier.startsWith('/')) {
-                    for (const candidate of [specifier + '.ts', specifier]) {
+                    // ES convention: ./x.js may refer to x.ts
+                    const tsSpecifier = specifier.endsWith('.js')
+                        ? specifier.replace(/\.js$/, '.ts')
+                        : specifier;
+                    for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
                         try {
                             const fullPath = path.resolve(baseDir, candidate);
                             return {
@@ -105,7 +77,8 @@ const __dirname = path.dirname(__filename);
                     return null;
                 let { content, dir } = resolved;
                 // Normalize CommonJS to ES module syntax
-                if (!content.includes('export ') && (content.includes('module.exports') || content.includes('exports.'))) {
+                if (!content.includes('export ') &&
+                    (content.includes('module.exports') || content.includes('exports.'))) {
                     content = normalizeCjsContent(content);
                 }
                 // Inject types from a local ambient .d.ts if available
@@ -116,36 +89,35 @@ const __dirname = path.dirname(__filename);
             }
         }
         : undefined);
-    const exeName = process.platform === 'win32' ? 'native.exe' : 'native';
+    const exeName = platform() === 'win32' ? 'native.exe' : 'native';
     const exePath = `dist/${exeName}`;
-    await fs.ensureDir('dist');
+    fs.mkdirSync('dist', { recursive: true });
     // Clean up stale Go files from previous runs before writing new ones
-    for (const existing of await fs.readdir('dist')) {
+    for (const existing of fs.readdirSync('dist')) {
         if (existing.endsWith('.go'))
-            await fs.remove(`dist/${existing}`);
+            fs.rmSync(`dist/${existing}`);
     }
-    await fs.writeFile('dist/code.go', transpileResult.main, { encoding: 'utf-8' });
+    fs.writeFileSync('dist/code.go', transpileResult.main);
     const goFiles = ['dist/code.go'];
     for (const [filename, content] of transpileResult.files) {
-        await fs.writeFile(`dist/${filename}`, content, { encoding: 'utf-8' });
+        fs.writeFileSync(`dist/${filename}`, content);
         goFiles.push(`dist/${filename}`);
     }
-    await execa('go', ['build', '-o', exePath, ...goFiles], {
-        stdio: 'inherit'
-    });
-    // await fs.remove('dist/code.go');
-    if (scriptMode) {
-        await execa(exePath, {
-            stdio: 'inherit'
-        });
-        //await fs.remove(exePath);
+    const buildResult = runCommand('go', ['build', '-o', exePath, ...goFiles]);
+    if (buildResult.status !== 0) {
+        console.error('go build failed:');
+        if (buildResult.stderr)
+            console.error(buildResult.stderr.trim());
+        process.exit(1);
     }
-    else if (output || answers.output) {
-        await fs.copy(exePath, output ?? answers.output, { overwrite: true });
-        //await fs.remove(exePath);
-        console.log(`Created native executable at: ${output ?? answers.output}`);
+    if (opts.scriptMode) {
+        process.exit(runInherit(exePath));
     }
-})();
+    else if (opts.output) {
+        fs.copyFileSync(exePath, opts.output);
+        console.log(`Created native executable at: ${opts.output}`);
+    }
+}
 function normalizeCjsContent(code) {
     code = code.replace(/['"]use strict['"];?\n?/g, '');
     code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
@@ -237,7 +209,7 @@ function resolveNpmPackage(fromDir, packageName) {
     return null;
 }
 function getPackageJson(projectName) {
-    const exeName = process.platform === 'win32' ? `${projectName}.exe` : projectName;
+    const exeName = platform() === 'win32' ? `${projectName}.exe` : projectName;
     const pckg = {
         name: projectName,
         version: '1.0.0',
@@ -274,7 +246,7 @@ bin/
 `;
 }
 function getReadMe(projectName) {
-    const exeName = process.platform === 'win32' ? `${projectName}.exe` : projectName;
+    const exeName = platform() === 'win32' ? `${projectName}.exe` : projectName;
     return `# ${projectName}
 
 This project was created using TypeNative, a tool to transpile TypeScript code to native Go code.

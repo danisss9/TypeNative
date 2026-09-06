@@ -1,10 +1,16 @@
 import ts from 'typescript';
-import { customAlphabet } from 'nanoid';
 
-const goSafeId = customAlphabet(
-  'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-  8
-);
+// Local replacement for nanoid's customAlphabet — must stay transpilable by
+// TypeNative itself (no dependencies), only using mapped String methods.
+const GO_SAFE_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+function goSafeId(): string {
+  let id = '';
+  for (let i = 0; i < 8; i++) {
+    id += GO_SAFE_ALPHABET.charAt(Math.floor(Math.random() * GO_SAFE_ALPHABET.length));
+  }
+  return id;
+}
 
 let TypeCheker: ts.TypeChecker;
 const importedPackages = new Set<string>();
@@ -53,6 +59,13 @@ let localImportFiles: Map<string, string> = new Map();
 // Default import namespaces from npm/local packages (e.g. `import ts from 'typescript'` → 'ts')
 // Property accesses on these are stripped: ts.createSourceFile → createSourceFile
 const defaultImportNamespaces = new Set<string>();
+// Go helper functions required by the current transpilation (e.g. 'exec', 'readFile').
+// Helper sources are appended to every generated Go file that references them.
+const usedHelpers = new Set<string>();
+// Packages that were imported only because a helper needs them. Tracked so
+// per-file import lists can exclude them (helpers are emitted once, in the
+// main file, which carries these imports instead).
+const helperProvidedPackages = new Set<string>();
 
 export type TranspileResult = { main: string; files: Map<string, string> };
 
@@ -96,6 +109,8 @@ export function transpileToNative(
   defaultImportNamespaces.clear();
   classStaticMethods.clear();
   classStaticProps.clear();
+  usedHelpers.clear();
+  helperProvidedPackages.clear();
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
   const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
 
@@ -107,7 +122,8 @@ func main() {
     ${transpiledCode.trim()}
 }
 
-${transpiledCodeOutside.trim()}`;
+${transpiledCodeOutside.trim()}
+${emitGoHelpers()}`.trimEnd();
   return { main, files: localImportFiles };
 }
 
@@ -335,6 +351,16 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     let op = node.operatorToken.getText();
     if (op === '===') op = '==';
     if (op === '!==') op = '!=';
+    // Go's % is not defined on float64 (TS numbers all map to float64)
+    if (op === '%') {
+      importedPackages.add('math');
+      return `math.Mod(${visit(node.left)}, ${visit(node.right)})`;
+    }
+    if (op === '%=') {
+      importedPackages.add('math');
+      const left = visit(node.left);
+      return `${left} = math.Mod(${left}, ${visit(node.right)})`;
+    }
     return `${visit(node.left)} ${op} ${visit(node.right)}`;
   } else if (ts.isParenthesizedExpression(node)) {
     return `(${visit(node.expression)})`;
@@ -392,11 +418,23 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     })}) {\n\t\t\tbreak \n\t\t}\n\t`;
     return `for ${visit(node.statement, { inline: true, extraBlockContent: condition })}`;
   } else if (ts.isIfStatement(node)) {
-    const condition = `if ${visit(node.expression, { inline: true })} ${visit(node.thenStatement, {
-      inline: !!node.elseStatement
-    })}`;
+    // Go requires the branch body to be a block even for single statements
+    // Go requires a block body; `} else` must stay on the same line, so the
+    // terminating ';' is only added when no else branch follows
+    const thenTerm = node.elseStatement ? '' : ';';
+    const thenCode = ts.isBlock(node.thenStatement)
+      ? visit(node.thenStatement, { inline: !!node.elseStatement })
+      : `{\n${visit(node.thenStatement)}\n}${thenTerm}`;
+    const condition = `if ${visit(node.expression, { inline: true })} ${thenCode}`;
     if (node.elseStatement) {
-      return `${condition} else ${visit(node.elseStatement)}`;
+      if (ts.isBlock(node.elseStatement)) {
+        return `${condition} else ${visit(node.elseStatement)}`;
+      }
+      // else-if chains stay chained; other single statements get a block
+      const elseCode = ts.isIfStatement(node.elseStatement)
+        ? visit(node.elseStatement)
+        : `{\n${visit(node.elseStatement)}\n}`;
+      return `${condition} else ${elseCode}`;
     }
     return condition;
   } else if (ts.isSwitchStatement(node)) {
@@ -2037,7 +2075,10 @@ function getCallString(
   typeArgs: string = '',
   objectType?: string
 ): string {
-  const handler = callHandlers[caller] ?? getDynamicCallHandler(caller, objectType);
+  // Parentheses from casts like `(mod as any).fn(...)` are stripped for lookup
+  const handler =
+    callHandlers[caller] ?? callHandlers[caller.replace(/[()]/g, '')] ??
+    getDynamicCallHandler(caller, objectType);
   if (handler) {
     return handler(caller, args, typeArgs);
   }
@@ -2366,11 +2407,14 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
     return;
   }
 
-  // Separate-file mode (local TS imports): transpile to its own Go file
+  // Separate-file mode (local TS imports): transpile to its own Go file.
+  // Helper functions are NOT emitted per-file: every generated file shares
+  // `package main`, so helpers are emitted once in the main output file.
   const savedOutsideNodes = outsideNodes;
   const savedPackages = [...importedPackages];
   outsideNodes = [];
   importedPackages.clear();
+  helperProvidedPackages.clear();
 
   const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
   const inlineLines: string[] = [];
@@ -2379,9 +2423,22 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
     if (result.trim()) inlineLines.push(result);
   }
 
-  const fileImports = [...importedPackages].map((pkg) => `import "${pkg}"`).join('\n');
   const fileOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
   const fileInline = inlineLines.join('\n');
+  // Computed after all visits: function bodies (outside nodes) register
+  // packages too, and imports must be captured after those visits.
+  // Helper-provided packages are only imported here if the file's own code
+  // references them; the main file (which carries the helper sources)
+  // always imports them.
+  const fileCode = `${fileInline}\n${fileOutside}`;
+  const fileImports = [...importedPackages]
+    .filter((pkg) => {
+      if (!helperProvidedPackages.has(pkg)) return true;
+      const name = pkg.split('/').pop()!;
+      return fileCode.includes(`${name}.`);
+    })
+    .map((pkg) => `import "${pkg}"`)
+    .join('\n');
 
   const parts: string[] = ['package main'];
   if (fileImports) parts.push(fileImports);
@@ -2389,10 +2446,12 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   if (fileOutside.trim()) parts.push(fileOutside.trim());
   localImportFiles.set(goFileName, parts.join('\n\n'));
 
-  // Restore main-file state
+  // Restore main-file state; helper-provided packages carry over so the main
+  // file (which carries the helper sources) imports them.
   outsideNodes = savedOutsideNodes;
   importedPackages.clear();
   for (const p of savedPackages) importedPackages.add(p);
+  for (const p of helperProvidedPackages) importedPackages.add(p);
   currentFileDir = prevDir;
 }
 
@@ -2439,36 +2498,351 @@ function getImportLocalName(node: ts.ImportDeclaration): string | null {
 // For default/namespace imports (e.g. `import path from 'node:path'`), entries are registered
 // as `callHandlers[localName.funcName]`. For named imports (e.g. `import { join } from 'node:path'`),
 // the Go identifier is stored in importAliases so bare calls like `join(...)` resolve correctly.
+// Each emitter registers the Go packages it needs via `needPkg` only when actually used,
+// because Go rejects unused imports.
+function needPkg(pkg: string): void {
+  importedPackages.add(pkg);
+}
+
+// Marks a Go helper as used; also registers the packages the helper needs,
+// since the import list is serialized before helpers are emitted.
+function useHelper(id: string): void {
+  if (usedHelpers.has(id)) return;
+  usedHelpers.add(id);
+  for (const pkg of helperPackages[id] ?? []) {
+    importedPackages.add(pkg);
+    helperProvidedPackages.add(pkg);
+  }
+}
+
 const nodeModuleMappings: Record<
   string,
-  { goPackage: string; functions: Record<string, (args: string[]) => string> }
+  { functions: Record<string, (args: string[]) => string> }
 > = {
   path: {
-    goPackage: 'path/filepath',
     functions: {
-      join: (args) => `filepath.Join(${args.join(', ')})`,
-      dirname: (args) => `filepath.Dir(${args[0]})`,
-      basename: (args) =>
-        args[1]
-          ? `strings.TrimSuffix(filepath.Base(${args[0]}), ${args[1]})`
-          : `filepath.Base(${args[0]})`,
-      extname: (args) => `filepath.Ext(${args[0]})`,
-      resolve: (args) =>
-        `func() string { p, _ := filepath.Abs(filepath.Join(${args.join(', ')})); return p }()`
+      join: (args) => {
+        needPkg('path/filepath');
+        return `filepath.Join(${args.join(', ')})`;
+      },
+      dirname: (args) => {
+        needPkg('path/filepath');
+        return `filepath.Dir(${args[0]})`;
+      },
+      basename: (args) => {
+        needPkg('path/filepath');
+        if (args[1]) {
+          needPkg('strings');
+          return `strings.TrimSuffix(filepath.Base(${args[0]}), ${args[1]})`;
+        }
+        return `filepath.Base(${args[0]})`;
+      },
+      extname: (args) => {
+        needPkg('path/filepath');
+        return `filepath.Ext(${args[0]})`;
+      },
+      resolve: (args) => {
+        needPkg('path/filepath');
+        return `func() string { p, _ := filepath.Abs(filepath.Join(${args.join(
+          ', '
+        )})); return p }()`;
+      }
+    }
+  },
+  fs: {
+    functions: {
+      readFileSync: (args) => {
+        useHelper('readFile');
+        return `TnReadFile(${args[0]})`;
+      },
+      writeFileSync: (args) => {
+        useHelper('writeFile');
+        return `TnWriteFile(${args[0]}, ${args[1]})`;
+      },
+      appendFileSync: (args) => {
+        useHelper('appendFile');
+        return `TnAppendFile(${args[0]}, ${args[1]})`;
+      },
+      existsSync: (args) => {
+        needPkg('os');
+        return `func() bool { _, err := os.Stat(${args[0]}); return !os.IsNotExist(err) }()`;
+      },
+      mkdirSync: (args) => {
+        useHelper('mkdirAll');
+        return `TnMkdirAll(${args[0]})`;
+      },
+      readdirSync: (args) => {
+        useHelper('readDir');
+        return `TnReadDir(${args[0]})`;
+      },
+      copyFileSync: (args) => {
+        useHelper('copyFile');
+        return `TnCopyFile(${args[0]}, ${args[1]})`;
+      },
+      rmSync: (args) => {
+        useHelper('removeAll');
+        return `TnRemoveAll(${args[0]})`;
+      }
+    }
+  },
+  url: {
+    functions: {
+      fileURLToPath: (args) => {
+        useHelper('fileURLToPath');
+        return `TnFileURLToPath(${args[0]})`;
+      },
+      pathToFileURL: (args) => {
+        useHelper('pathToFileURL');
+        return `TnPathToFileURL(${args[0]})`;
+      }
+    }
+  },
+  os: {
+    functions: {
+      platform: () => {
+        useHelper('osPlatform');
+        return 'TnOsPlatform()';
+      },
+      homedir: () => {
+        needPkg('os');
+        return `func() string { h, _ := os.UserHomeDir(); return h }()`;
+      },
+      tmpdir: () => {
+        needPkg('os');
+        return 'os.TempDir()';
+      }
+    }
+  },
+  child_process: {
+    functions: {
+      // exec(command) — run through the shell, returns { stdout, stderr, status }
+      exec: (args) => {
+        useHelper('exec');
+        return `TnExecShell(${args[0]})`;
+      },
+      // execSync(command) — run through the shell, returns stdout (panics on failure)
+      execSync: (args) => {
+        useHelper('exec');
+        useHelper('execSync');
+        return `TnExecShellSync(${args[0]})`;
+      },
+      // spawnSync(file, args, options) — matches Node's sync API.
+      // options with `inherit` → run with the parent's stdio (returns exit code);
+      // otherwise output is captured. Fields match Node: stdout/stderr/status.
+      spawnSync: (args) => {
+        useHelper('exec');
+        useHelper('runInherit');
+        if (args[2]?.includes('inherit')) {
+          return `TnRunInherit(${args[0]})`;
+        }
+        // Untyped array literals visit as `[] {…}` — give them the []string
+        // type the variadic helper needs (`[]string{…}...` is valid Go spread)
+        const arrArg = args[1] ?? '[]string{}';
+        const typedArg = arrArg.startsWith('[]') && !arrArg.startsWith('[]string')
+          ? `[]string ${arrArg.slice(2)}`
+          : arrArg;
+        return `TnExec(${args[0]}, ${typedArg}...)`;
+      }
+    }
+  },
+  readline: {
+    functions: {
+      // question(prompt) — print prompt and read one line from stdin (synchronous)
+      question: (args) => {
+        useHelper('question');
+        return `TnQuestion(${args[0] ?? '""'})`;
+      }
     }
   }
-  // Future node stdlib modules can be added here as additional keys:
-  // fs: { goPackage: 'os', functions: { ... } },
-  // os: { goPackage: 'os', functions: { ... } },
 };
+
+// Go packages required by each helper, registered when the helper is used.
+const helperPackages: Record<string, string[]> = {
+  readFile: ['os'],
+  writeFile: ['os'],
+  appendFile: ['os'],
+  mkdirAll: ['os'],
+  readDir: ['os'],
+  copyFile: ['os', 'io', 'path/filepath'],
+  removeAll: ['os'],
+  fileURLToPath: ['net/url', 'path/filepath', 'strings'],
+  pathToFileURL: ['net/url', 'path/filepath'],
+  osPlatform: ['runtime'],
+  exec: ['os/exec', 'bytes', 'runtime'],
+  execSync: ['os/exec', 'bytes', 'runtime'],
+  runInherit: ['os/exec', 'os'],
+  question: ['bufio', 'fmt', 'os', 'strings']
+};
+
+// Go helper sources emitted (once) into the main output file when used.
+// Field names are intentionally lowercase: every generated file is `package main`,
+// so `result.stdout` in emitted code resolves to the struct field directly.
+const goHelpers: Record<string, string> = {
+  readFile: `func TnReadFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}`,
+  writeFile: `func TnWriteFile(path string, content string) {
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		panic(err)
+	}
+}`,
+  appendFile: `func TnAppendFile(path string, content string) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(content); err != nil {
+		panic(err)
+	}
+}`,
+  mkdirAll: `func TnMkdirAll(path string) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		panic(err)
+	}
+}`,
+  readDir: `func TnReadDir(path string) []string {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		panic(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}`,
+  copyFile: `func TnCopyFile(src string, dst string) {
+	in, err := os.Open(src)
+	if err != nil {
+		panic(err)
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		panic(err)
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		panic(err)
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		panic(err)
+	}
+}`,
+  removeAll: `func TnRemoveAll(path string) {
+	if err := os.RemoveAll(path); err != nil {
+		panic(err)
+	}
+}`,
+  fileURLToPath: `func TnFileURLToPath(u string) string {
+	trimmed := strings.TrimPrefix(u, "file://")
+	if unescaped, err := url.PathUnescape(trimmed); err == nil {
+		trimmed = unescaped
+	}
+	return filepath.FromSlash(trimmed)
+}`,
+  pathToFileURL: `func TnPathToFileURL(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		panic(err)
+	}
+	return "file://" + url.PathEscape(filepath.ToSlash(abs))
+}`,
+  osPlatform: `func TnOsPlatform() string {
+	if runtime.GOOS == "windows" {
+		return "win32"
+	}
+	if runtime.GOOS == "darwin" {
+		return "darwin"
+	}
+	return runtime.GOOS
+}`,
+  exec: `type tnExecResult struct {
+	stdout   string
+	stderr   string
+	status   float64
+}
+
+func TnExec(name string, args ...string) tnExecResult {
+	cmd := exec.Command(name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	status := 0.0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			status = float64(exitErr.ExitCode())
+		} else {
+			panic(err)
+		}
+	}
+	return tnExecResult{stdout: stdout.String(), stderr: stderr.String(), status: status}
+}
+
+func TnExecShell(command string) tnExecResult {
+	if runtime.GOOS == "windows" {
+		return TnExec("cmd", "/C", command)
+	}
+	return TnExec("sh", "-c", command)
+}`,
+  execSync: `func TnExecShellSync(command string) string {
+	result := TnExecShell(command)
+	if result.status != 0 {
+		panic(result.stderr)
+	}
+	return result.stdout
+}`,
+  runInherit: `func TnRunInherit(name string, args ...string) float64 {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return float64(exitErr.ExitCode())
+		}
+		panic(err)
+	}
+	return 0
+}`,
+  question: `var tnStdinReader = bufio.NewReader(os.Stdin)
+
+func TnQuestion(prompt string) string {
+	if prompt != "" {
+		fmt.Print(prompt)
+	}
+	// Reuse one buffered reader: a fresh reader per call would discard
+	// buffered stdin and hit EOF on the second question.
+	line, err := tnStdinReader.ReadString('\\n')
+	if err != nil && line == "" {
+		panic(err)
+	}
+	return strings.TrimRight(line, "\\r\\n")
+}`
+};
+
+// Returns the Go source for all helpers used in this transpilation, or '' if none.
+// Emitted only into the main output file: every generated file shares `package main`,
+// so helpers are visible across files and must not be duplicated.
+function emitGoHelpers(): string {
+  return [...usedHelpers]
+    .map((id) => goHelpers[id])
+    .filter(Boolean)
+    .join('\n\n');
+}
 
 // Mapping from Node.js stdlib module names to Go setup functions.
 // Each entry adds the required Go imports and registers call handlers for the local identifier.
 function setupNodeModuleImport(node: ts.ImportDeclaration, nodeModule: string): void {
   const mapping = nodeModuleMappings[nodeModule];
   if (!mapping) return;
-
-  importedPackages.add(mapping.goPackage);
 
   const clause = node.importClause;
   if (!clause) return;
