@@ -81,3 +81,5 @@ typings/
 # Others
 \code
 disttsparser/tsparser.exe
+.zcode
+dist
