@@ -20,6 +20,8 @@ Goal: TypeNative transpiles itself into a native Go binary (1.0 milestone).
 - [x] Verified byte-identical AST signatures across all 32 test specs AND all
       compiler sources (incl. transpiler.ts, 521k-char signature)
 
+- [x] ts shim converted to plain isX() functions + string kind literals
+      (object-literal shim was itself untranspilable)
 - [x] Phase 3c: transpiler.ts no longer imports `typescript` — consumes the JSON AST
       via an injected parse function (ts shim keeps predicate call sites); operator
       tokens, process.env, stdin-exec mappings added; verified identical Go output
