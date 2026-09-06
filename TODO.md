@@ -13,9 +13,17 @@ Goal: TypeNative transpiles itself into a native Go binary (1.0 milestone).
 - [x] nanoid/fs-extra/execa removed from src; inquirer isolated in Node-only cli.ts
 - [x] Transpilable core: src/index.ts (run/createProject), src/prompt.ts, src/main.ts (self-host entry)
 
+## Done (phase 3a/3b)
+- [x] tsparser/ Go tool: parses TS via buke/typescript-go-internal (no JS runtime),
+      emits normalized JSON AST (kind + TS-spec field names)
+- [x] src/parse-node.ts: Node adapter (typescript npm pkg → same JSON shape)
+- [x] Verified byte-identical AST signatures across all 32 test specs AND all
+      compiler sources (incl. transpiler.ts, 521k-char signature)
+
 ## Remaining
-- [ ] Phase 3: Go TypeScript parser binding (replace the `typescript` npm package at
-      transpile time — evaluate Go TS parsers vs embedding a JS runtime like goja)
+- [ ] Phase 3c: refactor transpiler.ts to consume the JSON AST (replace ts.* walking);
+      src/parse-native.ts (spawn tsparser binary with stdin); child_process stdin input
+      mapping; inject parser via options from cli.ts
 - [ ] Phase 4: dogfood src/transpiler.ts (2.6k lines): regex /g semantics,
       String.replace with function replacer, JSON.parse result typing, object spread,
       Array.includes on untyped values, default-import namespace stripping (ts.x → x)
