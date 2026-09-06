@@ -7,7 +7,7 @@
       "outDir": "bin",
       "rootDir": "src",
       "strict": true,         
-      "noImplicitAny": true,
+      "noImplicitAny": false, // AST nodes are dynamically typed (normalized JSON)
       "allowJs": true,
       "esModuleInterop": true,
       "allowSyntheticDefaultImports": true

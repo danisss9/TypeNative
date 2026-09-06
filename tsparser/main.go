@@ -154,8 +154,12 @@ func collectFields(data reflect.Value, obj map[string]any) {
 		if !field.IsExported() {
 			continue
 		}
+		// Embedded base structs are hoisted — except NodeDefault/Node, whose
+		// fields (Kind/Flags/Loc/Parent) are parser bookkeeping, not AST
 		if field.Anonymous && field.Type.Kind() == reflect.Struct {
-			collectFields(data.Field(i), obj)
+			if field.Type.Name() != "NodeDefault" && field.Type.Name() != "Node" {
+				collectFields(data.Field(i), obj)
+			}
 			continue
 		}
 		name, val, ok := serializeField(field.Name, data.Field(i))
@@ -172,11 +176,24 @@ func serializeField(name string, v reflect.Value) (string, any, bool) {
 	} else {
 		name = lowerFirst(name)
 	}
+	// Never emit parser bookkeeping fields from the embedded ast.Node
+	switch name {
+	case "kind", "flags", "loc", "parent", "id", "data":
+		return "", nil, false
+	}
 	switch v.Kind() {
 	case reflect.String:
 		return lowerFirst(name), v.String(), true
 	case reflect.Bool:
 		return lowerFirst(name), v.Bool(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		// Operator fields hold token kinds; emit the kind name (matches the
+		// Node producer, which converts ts.SyntaxKind numbers to names)
+		if name == "operator" { // prelude lowercased the field name
+			kind := ast.Kind(v.Int())
+			return lowerFirst(name), strings.TrimPrefix(kind.String(), "Kind"), true
+		}
+		return "", nil, false
 	case reflect.Ptr:
 		if v.IsNil() {
 			return "", nil, false

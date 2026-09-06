@@ -4,6 +4,7 @@
 
 import { run, createProject } from './index.js';
 import { ask, askMultiline, confirm } from './prompt.js';
+import { parseAstJsonNative } from './parse-native.js';
 
 (function main() {
   const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
@@ -34,5 +35,5 @@ import { ask, askMultiline, confirm } from './prompt.js';
     tsCode = askMultiline('Write your typescript code here:');
   }
 
-  run({ source, output, scriptMode, tsCode });
+  run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative });
 })();

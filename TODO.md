@@ -20,10 +20,10 @@ Goal: TypeNative transpiles itself into a native Go binary (1.0 milestone).
 - [x] Verified byte-identical AST signatures across all 32 test specs AND all
       compiler sources (incl. transpiler.ts, 521k-char signature)
 
-## Remaining
-- [ ] Phase 3c: refactor transpiler.ts to consume the JSON AST (replace ts.* walking);
-      src/parse-native.ts (spawn tsparser binary with stdin); child_process stdin input
-      mapping; inject parser via options from cli.ts
+- [x] Phase 3c: transpiler.ts no longer imports `typescript` — consumes the JSON AST
+      via an injected parse function (ts shim keeps predicate call sites); operator
+      tokens, process.env, stdin-exec mappings added; verified identical Go output
+      via npm parser and Go-parser paths on all 33 test specs
 - [ ] Phase 4: dogfood src/transpiler.ts (2.6k lines): regex /g semantics,
       String.replace with function replacer, JSON.parse result typing, object spread,
       Array.includes on untyped values, default-import namespace stripping (ts.x → x)

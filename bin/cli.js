@@ -3,6 +3,7 @@
 // the actual compiler logic lives in the transpilable src/index.ts.
 import inquirer from 'inquirer';
 import { run, createProject } from './index.js';
+import { parseAstJson } from './parse-node.js';
 (async function main() {
     const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
     const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
@@ -55,6 +56,7 @@ import { run, createProject } from './index.js';
         source: sourcePath,
         output: output ?? answers.output ?? null,
         scriptMode,
-        tsCode: answers.tsCode ?? null
+        tsCode: answers.tsCode ?? null,
+        parse: parseAstJson
     });
 })();

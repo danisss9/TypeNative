@@ -17,6 +17,9 @@ export interface RunOptions {
   output: string | null;
   scriptMode: boolean;
   tsCode: string | null;
+  // Parses TypeScript source into the normalized JSON AST
+  // (src/parse-node.ts under Node, src/parse-native.ts self-hosted)
+  parse: (code: string) => any;
 }
 
 export interface CommandResult {
@@ -70,11 +73,9 @@ export function run(opts: RunOptions): void {
   const tsCode: string = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath!, 'utf-8');
 
   const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-  const transpileResult = transpileToNative(
-    tsCode,
-    sourceDir
-      ? {
-          readFile: (specifier, fromDir) => {
+  const transpileOptions: any = { parse: opts.parse };
+  if (sourceDir) {
+    transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
             const baseDir = fromDir ?? sourceDir;
 
             // Relative or absolute path → resolve from baseDir
@@ -111,11 +112,10 @@ export function run(opts: RunOptions): void {
             // Inject types from a local ambient .d.ts if available
             const typed = tryInjectDtsTypes(content, specifier, sourceDir);
             if (typed) content = typed;
-            return { content, dir };
-          }
-        }
-      : undefined
-  );
+      return { content, dir };
+    };
+  }
+  const transpileResult = transpileToNative(tsCode, transpileOptions);
 
   const exeName = platform() === 'win32' ? 'native.exe' : 'native';
   const exePath = `dist/${exeName}`;

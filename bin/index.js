@@ -47,48 +47,48 @@ export function run(opts) {
     const sourcePath = opts.tsCode ? null : opts.source;
     const tsCode = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath, 'utf-8');
     const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-    const transpileResult = transpileToNative(tsCode, sourceDir
-        ? {
-            readFile: (specifier, fromDir) => {
-                const baseDir = fromDir ?? sourceDir;
-                // Relative or absolute path → resolve from baseDir
-                if (specifier.startsWith('.') || specifier.startsWith('/')) {
-                    // ES convention: ./x.js may refer to x.ts
-                    const tsSpecifier = specifier.endsWith('.js')
-                        ? specifier.replace(/\.js$/, '.ts')
-                        : specifier;
-                    for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
-                        try {
-                            const fullPath = path.resolve(baseDir, candidate);
-                            return {
-                                content: fs.readFileSync(fullPath, 'utf-8'),
-                                dir: path.dirname(fullPath)
-                            };
-                        }
-                        catch {
-                            /* not found */
-                        }
+    const transpileOptions = { parse: opts.parse };
+    if (sourceDir) {
+        transpileOptions.readFile = (specifier, fromDir) => {
+            const baseDir = fromDir ?? sourceDir;
+            // Relative or absolute path → resolve from baseDir
+            if (specifier.startsWith('.') || specifier.startsWith('/')) {
+                // ES convention: ./x.js may refer to x.ts
+                const tsSpecifier = specifier.endsWith('.js')
+                    ? specifier.replace(/\.js$/, '.ts')
+                    : specifier;
+                for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
+                    try {
+                        const fullPath = path.resolve(baseDir, candidate);
+                        return {
+                            content: fs.readFileSync(fullPath, 'utf-8'),
+                            dir: path.dirname(fullPath)
+                        };
                     }
-                    return null;
+                    catch {
+                        /* not found */
+                    }
                 }
-                // npm package — walk up from baseDir looking for node_modules/<name>
-                const resolved = resolveNpmPackage(baseDir, specifier);
-                if (!resolved)
-                    return null;
-                let { content, dir } = resolved;
-                // Normalize CommonJS to ES module syntax
-                if (!content.includes('export ') &&
-                    (content.includes('module.exports') || content.includes('exports.'))) {
-                    content = normalizeCjsContent(content);
-                }
-                // Inject types from a local ambient .d.ts if available
-                const typed = tryInjectDtsTypes(content, specifier, sourceDir);
-                if (typed)
-                    content = typed;
-                return { content, dir };
+                return null;
             }
-        }
-        : undefined);
+            // npm package — walk up from baseDir looking for node_modules/<name>
+            const resolved = resolveNpmPackage(baseDir, specifier);
+            if (!resolved)
+                return null;
+            let { content, dir } = resolved;
+            // Normalize CommonJS to ES module syntax
+            if (!content.includes('export ') &&
+                (content.includes('module.exports') || content.includes('exports.'))) {
+                content = normalizeCjsContent(content);
+            }
+            // Inject types from a local ambient .d.ts if available
+            const typed = tryInjectDtsTypes(content, specifier, sourceDir);
+            if (typed)
+                content = typed;
+            return { content, dir };
+        };
+    }
+    const transpileResult = transpileToNative(tsCode, transpileOptions);
     const exeName = platform() === 'win32' ? 'native.exe' : 'native';
     const exePath = `dist/${exeName}`;
     fs.mkdirSync('dist', { recursive: true });

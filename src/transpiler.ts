@@ -1,4 +1,109 @@
-import ts from 'typescript';
+// Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
+type AstNode = any;
+// Parser injected by the caller: Node CLI uses the typescript npm package,
+// the self-hosted binary spawns the tsparser Go tool.
+type ParseFunction = (code: string) => AstNode;
+
+// Shim over the removed `typescript` import: predicates and kind names operate
+// on the normalized JSON AST ({kind: 'Xxx', ...} plain objects) produced by
+// src/parse-node.ts (Node) or the tsparser Go tool (self-hosted).
+// Kept as a `ts` object so the transpiler code keeps its shape.
+const ts = {
+  isArrayBindingPattern: (n: AstNode) => n?.kind === 'ArrayBindingPattern',
+  isArrayLiteralExpression: (n: AstNode) => n?.kind === 'ArrayLiteralExpression',
+  isArrayTypeNode: (n: AstNode) => n?.kind === 'ArrayTypeNode',
+  isArrowFunction: (n: AstNode) => n?.kind === 'ArrowFunction',
+  isAsExpression: (n: AstNode) => n?.kind === 'AsExpression',
+  isAwaitExpression: (n: AstNode) => n?.kind === 'AwaitExpression',
+  isBinaryExpression: (n: AstNode) => n?.kind === 'BinaryExpression',
+  isBlock: (n: AstNode) => n?.kind === 'Block',
+  isBreakStatement: (n: AstNode) => n?.kind === 'BreakStatement',
+  isCallExpression: (n: AstNode) => n?.kind === 'CallExpression',
+  isCaseBlock: (n: AstNode) => n?.kind === 'CaseBlock',
+  isCaseClause: (n: AstNode) => n?.kind === 'CaseClause',
+  isClassDeclaration: (n: AstNode) => n?.kind === 'ClassDeclaration',
+  isConditionalExpression: (n: AstNode) => n?.kind === 'ConditionalExpression',
+  isConstructorDeclaration: (n: AstNode) => n?.kind === 'ConstructorDeclaration',
+  isDefaultClause: (n: AstNode) => n?.kind === 'DefaultClause',
+  isDoStatement: (n: AstNode) => n?.kind === 'DoStatement',
+  isElementAccessExpression: (n: AstNode) => n?.kind === 'ElementAccessExpression',
+  isEnumDeclaration: (n: AstNode) => n?.kind === 'EnumDeclaration',
+  isExportAssignment: (n: AstNode) => n?.kind === 'ExportAssignment',
+  isExportDeclaration: (n: AstNode) => n?.kind === 'ExportDeclaration',
+  isExpressionStatement: (n: AstNode) => n?.kind === 'ExpressionStatement',
+  isForInStatement: (n: AstNode) => n?.kind === 'ForInStatement',
+  isForOfStatement: (n: AstNode) => n?.kind === 'ForOfStatement',
+  isForStatement: (n: AstNode) => n?.kind === 'ForStatement',
+  isFunctionDeclaration: (n: AstNode) => n?.kind === 'FunctionDeclaration',
+  isFunctionExpression: (n: AstNode) => n?.kind === 'FunctionExpression',
+  isFunctionTypeNode: (n: AstNode) => n?.kind === 'FunctionTypeNode',
+  isGetAccessor: (n: AstNode) => n?.kind === 'GetAccessor',
+  isIdentifier: (n: AstNode) => n?.kind === 'Identifier',
+  isIfStatement: (n: AstNode) => n?.kind === 'IfStatement',
+  isImportDeclaration: (n: AstNode) => n?.kind === 'ImportDeclaration',
+  isInterfaceDeclaration: (n: AstNode) => n?.kind === 'InterfaceDeclaration',
+  isLiteralTypeNode: (n: AstNode) => n?.kind === 'LiteralTypeNode',
+  isMethodDeclaration: (n: AstNode) => n?.kind === 'MethodDeclaration',
+  isMethodSignature: (n: AstNode) => n?.kind === 'MethodSignature',
+  isNamedImports: (n: AstNode) => n?.kind === 'NamedImports',
+  isNamespaceImport: (n: AstNode) => n?.kind === 'NamespaceImport',
+  isNewExpression: (n: AstNode) => n?.kind === 'NewExpression',
+  isNoSubstitutionTemplateLiteral: (n: AstNode) => n?.kind === 'NoSubstitutionTemplateLiteral',
+  isNonNullExpression: (n: AstNode) => n?.kind === 'NonNullExpression',
+  isNumericLiteral: (n: AstNode) => n?.kind === 'NumericLiteral',
+  isObjectBindingPattern: (n: AstNode) => n?.kind === 'ObjectBindingPattern',
+  isObjectLiteralExpression: (n: AstNode) => n?.kind === 'ObjectLiteralExpression',
+  isOmittedExpression: (n: AstNode) => n?.kind === 'OmittedExpression',
+  isParenthesizedExpression: (n: AstNode) => n?.kind === 'ParenthesizedExpression',
+  isPostfixUnaryExpression: (n: AstNode) => n?.kind === 'PostfixUnaryExpression',
+  isPrefixUnaryExpression: (n: AstNode) => n?.kind === 'PrefixUnaryExpression',
+  isPropertyAccessExpression: (n: AstNode) => n?.kind === 'PropertyAccessExpression',
+  isPropertyAssignment: (n: AstNode) => n?.kind === 'PropertyAssignment',
+  isPropertyDeclaration: (n: AstNode) => n?.kind === 'PropertyDeclaration',
+  isPropertySignature: (n: AstNode) => n?.kind === 'PropertySignature',
+  isRegularExpressionLiteral: (n: AstNode) => n?.kind === 'RegularExpressionLiteral',
+  isReturnStatement: (n: AstNode) => n?.kind === 'ReturnStatement',
+  isSetAccessor: (n: AstNode) => n?.kind === 'SetAccessor',
+  isShorthandPropertyAssignment: (n: AstNode) => n?.kind === 'ShorthandPropertyAssignment',
+  isSourceFile: (n: AstNode) => n?.kind === 'SourceFile',
+  isSpreadElement: (n: AstNode) => n?.kind === 'SpreadElement',
+  isStringLiteral: (n: AstNode) => n?.kind === 'StringLiteral',
+  isSwitchStatement: (n: AstNode) => n?.kind === 'SwitchStatement',
+  isTemplateExpression: (n: AstNode) => n?.kind === 'TemplateExpression',
+  isThrowStatement: (n: AstNode) => n?.kind === 'ThrowStatement',
+  isTryStatement: (n: AstNode) => n?.kind === 'TryStatement',
+  isTypeAliasDeclaration: (n: AstNode) => n?.kind === 'TypeAliasDeclaration',
+  isTypeAssertionExpression: (n: AstNode) => n?.kind === 'TypeAssertionExpression',
+  isTypeReferenceNode: (n: AstNode) => n?.kind === 'TypeReferenceNode',
+  isUnionTypeNode: (n: AstNode) => n?.kind === 'UnionTypeNode',
+  isVariableDeclaration: (n: AstNode) => n?.kind === 'VariableDeclaration',
+  isVariableDeclarationList: (n: AstNode) => n?.kind === 'VariableDeclarationList',
+  isVariableStatement: (n: AstNode) => n?.kind === 'VariableStatement',
+  isWhileStatement: (n: AstNode) => n?.kind === 'WhileStatement',
+  // tokens reach the guards below already kind-filtered; every JSON node is a token-like
+  isToken: (_n: AstNode) => true,
+  SyntaxKind: {
+    BooleanKeyword: 'BooleanKeyword',
+    ExclamationToken: 'ExclamationToken',
+    ExtendsKeyword: 'ExtendsKeyword',
+    FalseKeyword: 'FalseKeyword',
+    MinusMinusToken: 'MinusMinusToken',
+    MinusToken: 'MinusToken',
+    NullKeyword: 'NullKeyword',
+    NumberKeyword: 'NumberKeyword',
+    PlusPlusToken: 'PlusPlusToken',
+    PlusToken: 'PlusToken',
+    QuestionDotToken: 'QuestionDotToken',
+    QuestionQuestionToken: 'QuestionQuestionToken',
+    StaticKeyword: 'StaticKeyword',
+    StringKeyword: 'StringKeyword',
+    SuperKeyword: 'SuperKeyword',
+    ThisKeyword: 'ThisKeyword',
+    TildeToken: 'TildeToken',
+    TrueKeyword: 'TrueKeyword',
+    UndefinedKeyword: 'UndefinedKeyword',
+  },
+};
 
 // Local replacement for nanoid's customAlphabet — must stay transpilable by
 // TypeNative itself (no dependencies), only using mapped String methods.
@@ -12,9 +117,9 @@ function goSafeId(): string {
   return id;
 }
 
-let TypeCheker: ts.TypeChecker;
+let parseFunction: ParseFunction;
 const importedPackages = new Set<string>();
-let outsideNodes: ts.Node[] = [];
+let outsideNodes: AstNode[] = [];
 const classNames = new Set<string>();
 let promiseResolveName: string = '';
 // Go keywords that cannot be used as identifiers
@@ -34,7 +139,7 @@ const variableClassNames = new Map<string, string>();
 const classPropertyTypes = new Map<string, Map<string, string>>();
 const classMethodReturnTypes = new Map<string, Map<string, string>>();
 const interfacePropertyTypes = new Map<string, Map<string, string>>();
-const typeAliases = new Map<string, ts.TypeNode>();
+const typeAliases = new Map<string, AstNode>();
 const enumNames = new Set<string>();
 const enumBaseTypes = new Map<string, 'string' | 'float64'>();
 // Maps local TS name → Go qualified name (e.g. 'Println' → 'fmt.Println', 'myFmt' → 'fmt')
@@ -56,6 +161,98 @@ let currentFileDir: string | null = null;
 const includedLocalImports = new Set<string>();
 // Collects Go source files generated from local TS imports (filename → content)
 let localImportFiles: Map<string, string> = new Map();
+// Token kind names → operator source text (JSON AST tokens carry kind names)
+const OPERATOR_TEXT = {
+    EqualsEqualsEqualsToken: '===',
+    ExclamationEqualsEqualsToken: '!==',
+    EqualsEqualsToken: '==',
+    ExclamationEqualsToken: '!=',
+    LessThanToken: '<',
+    LessThanEqualsToken: '<=',
+    GreaterThanToken: '>',
+    GreaterThanEqualsToken: '>=',
+    PlusToken: '+',
+    MinusToken: '-',
+    AsteriskToken: '*',
+    SlashToken: '/',
+    PercentToken: '%',
+    AsteriskAsteriskToken: '**',
+    AmpersandToken: '&',
+    BarToken: '|',
+    CaretToken: '^',
+    LessThanLessThanToken: '<<',
+    GreaterThanGreaterThanToken: '>>',
+    AmpersandAmpersandToken: '&&',
+    BarBarToken: '||',
+    EqualsToken: '=',
+    PlusEqualsToken: '+=',
+    MinusEqualsToken: '-=',
+    AsteriskEqualsToken: '*=',
+    SlashEqualsToken: '/=',
+    PercentEqualsToken: '%=',
+    CommaToken: ',',
+    QuestionQuestionToken: '??'
+}
+
+function operatorTokenText(token) {
+    return OPERATOR_TEXT[token?.kind] ?? token?.kind ?? '';
+}
+
+function defaultParseFunction(_code) {
+    throw new Error('transpileToNative: no parse function injected (options.parse)');
+}
+
+// Renders a type node's source text syntactically (no typechecker needed).
+function typeNodeToText(node) {
+    if (!node)
+        return 'any';
+    const keywordMap = {
+        NumberKeyword: 'number',
+        StringKeyword: 'string',
+        BooleanKeyword: 'boolean',
+        AnyKeyword: 'any',
+        UnknownKeyword: 'any',
+        VoidKeyword: 'void',
+        UndefinedKeyword: 'undefined',
+        NullKeyword: 'null',
+        NeverKeyword: 'never',
+        ObjectKeyword: 'object',
+        TrueKeyword: 'true',
+        FalseKeyword: 'false'
+    };
+    if (keywordMap[node.kind])
+        return keywordMap[node.kind];
+    if (node.kind === 'TypeReferenceNode' && node.typeName) {
+        return typeNodeToText(node.typeName);
+    }
+    if (node.kind === 'Identifier')
+        return node.text;
+    if (node.kind === 'ArrayTypeNode' && node.elementType) {
+        return `${'{'}${''}}typeNodeToText(node.elementType)[]`;
+    }
+    return 'any';
+}
+
+// Iterates the child nodes of a normalized JSON AST node (own enumerable
+function childNodes(node) {
+    const out: any[] = [];
+    for (const key of Object.keys(node ?? {})) {
+        if (key === 'kind' || key === 'text')
+            continue;
+        const v = node[key];
+        if (v && typeof v === 'object' && typeof v.kind === 'string') {
+            out.push(v);
+        }
+        else if (Array.isArray(v)) {
+            for (const el of v) {
+                if (el && typeof el === 'object' && typeof el.kind === 'string')
+                    out.push(el);
+            }
+        }
+    }
+    return out;
+}
+
 // Default import namespaces from npm/local packages (e.g. `import ts from 'typescript'` → 'ts')
 // Property accesses on these are stripped: ts.createSourceFile → createSourceFile
 const defaultImportNamespaces = new Set<string>();
@@ -76,19 +273,13 @@ export function transpileToNative(
       specifier: string,
       fromDir: string | null
     ) => { content: string; dir: string } | null;
+    parse?: ParseFunction;
   }
 ): TranspileResult {
   fileResolver = options?.readFile ?? null;
+  parseFunction = options?.parse ?? defaultParseFunction;
   currentFileDir = null;
-  const sourceFile = ts.createSourceFile(
-    'main.ts',
-    code,
-    ts.ScriptTarget.ES2020,
-    true,
-    ts.ScriptKind.TS
-  );
-
-  TypeCheker = ts.createProgram(['main.ts'], {}).getTypeChecker();
+  const sourceFile = parseFunction(code);
   importedPackages.clear();
   outsideNodes = [];
   classNames.clear();
@@ -127,11 +318,11 @@ ${emitGoHelpers()}`.trimEnd();
   return { main, files: localImportFiles };
 }
 
-export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
+export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   let code: string = '';
 
   if (ts.isSourceFile(node)) {
-    return node.statements
+    return (node.statements ?? [])
       .map((n) => visit(n, { addFunctionOutside: true }))
       .filter((n) => !!n)
       .join(options.inline ? '' : '\n\t');
@@ -167,13 +358,13 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `regexp.MustCompile("${goFlags}${escaped}")`;
   } else if (ts.isArrayLiteralExpression(node)) {
     const type = ts.isVariableDeclaration(node.parent) ? getType(node.parent.type!, true) : '';
-    const hasSpread = node.elements.some((e) => ts.isSpreadElement(e));
+    const hasSpread = (node.elements ?? []).some((e) => ts.isSpreadElement(e));
     if (hasSpread) {
       return visitSpreadArrayLiteral(node, type);
     }
-    return `[]${type} {${node.elements.map((e) => visit(e)).join(', ')}}`;
+    return `[]${type} {${(node.elements ?? []).map((e) => visit(e)).join(', ')}}`;
   } else if (ts.isBlock(node)) {
-    return `{\n\t\t${options.prefixBlockContent ?? ''}${node.statements
+    return `{\n\t\t${options.prefixBlockContent ?? ''}${(node.statements ?? [])
       .map((n) => visit(n))
       .join('\t')}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
   } else if (ts.isElementAccessExpression(node)) {
@@ -225,7 +416,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       const parts = [`${tmpVar} := ${initExpr}`];
       node.name.elements.forEach((el, idx) => {
         if (ts.isOmittedExpression(el)) return;
-        const bindEl = el as ts.BindingElement;
+        const bindEl = el as AstNode;
         const localName = visit(bindEl.name);
         // Variables starting with _ are intentionally unused — use blank identifier
         if (localName === '_' || localName.startsWith('_')) {
@@ -301,20 +492,20 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       ts.isFunctionExpression(node.expression.expression)
     ) {
       const fn = node.expression.expression;
-      const parameterInfo = getFunctionParametersInfo(fn.parameters);
+      const parameterInfo = getFunctionParametersInfo(fn.parameters ?? []);
       if (fn.body && ts.isBlock(fn.body)) {
         prescanVariableDeclarations(fn.body);
       }
       const inferredRetType = inferFunctionBodyReturnType(fn);
       const returnType = inferredRetType ? ` ${inferredRetType}` : '';
-      const args = node.arguments.map((a) => visit(a)).join(', ');
+      const args = (node.arguments ?? []).map((a) => visit(a)).join(', ');
       return `func(${parameterInfo.signature})${returnType} ${visit(fn.body!, { prefixBlockContent: parameterInfo.prefixBlockContent })}(${args})`;
     }
     // Handle setTimeout specially to get raw delay value
     if (ts.isIdentifier(node.expression) && node.expression.text === 'setTimeout') {
       importedPackages.add('time');
-      const callback = visit(node.arguments[0]);
-      const delayNode = node.arguments[1];
+      const callback = visit((node.arguments ?? [])[0]);
+      const delayNode = (node.arguments ?? [])[1];
       const delay = ts.isNumericLiteral(delayNode) ? delayNode.text : visit(delayNode);
       return `time.AfterFunc(${delay} * time.Millisecond, ${callback.trimEnd()})`;
     }
@@ -324,14 +515,14 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     }
     const caller = visit(node.expression);
     const safeCaller = getSafeName(caller);
-    const typeArgs = getTypeArguments(node.typeArguments);
+    const typeArgs = getTypeArguments((node.typeArguments ?? []));
     // Handle spread arguments: fn(...arr) → fn(arr...)
-    const hasSpreadArg = node.arguments.some((a) => ts.isSpreadElement(a));
+    const hasSpreadArg = (node.arguments ?? []).some((a) => ts.isSpreadElement(a));
     const args = hasSpreadArg
-      ? node.arguments.map((a) =>
+      ? (node.arguments ?? []).map((a) =>
           ts.isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a)
         )
-      : node.arguments.map((a) => visit(a));
+      : (node.arguments ?? []).map((a) => visit(a));
     // Resolve object type for type-aware method dispatch
     let objectType: string | undefined;
     if (ts.isPropertyAccessExpression(node.expression)) {
@@ -348,7 +539,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     if (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
       return visitNullishCoalescingExpression(node);
     }
-    let op = node.operatorToken.getText();
+    let op = operatorTokenText(node.operatorToken);
     if (op === '===') op = '==';
     if (op === '!==') op = '!=';
     // Go's % is not defined on float64 (TS numbers all map to float64)
@@ -368,7 +559,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return `<-${visit(node.expression)}`;
   } else if (ts.isVariableDeclarationList(node)) {
     return (
-      node.declarations.map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
+      (node.declarations ?? []).map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
       (options.inline ? '' : ';\n\t')
     );
   } else if (ts.isExpressionStatement(node)) {
@@ -380,11 +571,11 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isForInStatement(node)) {
     const varName = ts.isVariableDeclarationList(node.initializer)
       ? visit(node.initializer.declarations[0].name)
-      : visit(node.initializer as ts.Expression);
+      : visit(node.initializer as AstNode);
     return `for ${varName} := range ${visit(node.expression, { inline: true })}${visit(node.statement)}`;
   } else if (ts.isForOfStatement(node)) {
     // Unwrap Object.entries(x) → treat x as the iterable
-    let iterNode: ts.Expression = node.expression;
+    let iterNode: AstNode = node.expression;
     if (
       ts.isCallExpression(iterNode) &&
       ts.isPropertyAccessExpression(iterNode.expression) &&
@@ -393,7 +584,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       iterNode.expression.name.text === 'entries' &&
       iterNode.arguments.length > 0
     ) {
-      iterNode = iterNode.arguments[0] as ts.Expression;
+      iterNode = iterNode.arguments[0] as AstNode;
     }
     const iterExpr = visit(iterNode, { inline: true });
     const iterType = inferExpressionType(iterNode);
@@ -440,15 +631,15 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
   } else if (ts.isSwitchStatement(node)) {
     return `switch ${visit(node.expression)} ${visit(node.caseBlock)}`;
   } else if (ts.isCaseBlock(node)) {
-    return `{\n\t\t${node.clauses.map((c) => visit(c)).join('\n\t\t')}\n\t}`;
+    return `{\n\t\t${(node.clauses ?? []).map((c) => visit(c)).join('\n\t\t')}\n\t}`;
   } else if (ts.isCaseClause(node)) {
-    const isFallThrough = !node.statements.some((c) => ts.isBreakStatement(c));
-    return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${node.statements
+    const isFallThrough = !(node.statements ?? []).some((c) => ts.isBreakStatement(c));
+    return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${(node.statements ?? [])
       .filter((n) => !ts.isBreakStatement(n))
       .map((s) => visit(s))
       .join('')}${isFallThrough ? 'fallthrough\n\t' : ''}`;
   } else if (ts.isDefaultClause(node)) {
-    return `default: \n\t\t\t${node.statements
+    return `default: \n\t\t\t${(node.statements ?? [])
       .filter((n) => !ts.isBreakStatement(n))
       .map((s) => visit(s))
       .join('')}`;
@@ -488,7 +679,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     }
 
     const typeParams = getTypeParameters(node.typeParameters);
-    const parameterInfo = getFunctionParametersInfo(node.parameters);
+    const parameterInfo = getFunctionParametersInfo((node.parameters ?? []));
 
     if (node.body && ts.isBlock(node.body)) {
       prescanVariableDeclarations(node.body);
@@ -522,14 +713,14 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       }
     )}`;
   } else if (ts.isArrowFunction(node)) {
-    const parameterInfo = getFunctionParametersInfo(node.parameters);
+    const parameterInfo = getFunctionParametersInfo((node.parameters ?? []));
     const inferredRetType = inferFunctionBodyReturnType(node);
     const returnType = inferredRetType ? ` ${inferredRetType}` : '';
     if (parameterInfo.prefixBlockContent && !ts.isBlock(node.body)) {
       return `func(${parameterInfo.signature})${returnType} {\n\t\t${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
     }
     if (!ts.isBlock(node.body)) {
-      return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body as ts.Expression)}; }`;
+      return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body as AstNode)}; }`;
     }
     return `func(${parameterInfo.signature})${returnType} ${visit(node.body, {
       prefixBlockContent: parameterInfo.prefixBlockContent
@@ -555,7 +746,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       outsideNodes.push(node);
 
       const properties = new Map<string, string>();
-      for (const member of node.members) {
+      for (const member of (node.members ?? [])) {
         if (ts.isPropertySignature(member) && ts.isIdentifier(member.name)) {
           properties.set(
             member.name.text,
@@ -573,10 +764,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const typeParams = getTypeParameters(node.typeParameters);
 
     const extendedInterfaces: string[] = [];
-    if (node.heritageClauses) {
-      for (const clause of node.heritageClauses) {
-        if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
-          for (const type of clause.types) {
+    if ((node.heritageClauses ?? [])) {
+      for (const clause of (node.heritageClauses ?? [])) {
+        if (clause.token?.kind === 'ExtendsKeyword') {
+          for (const type of (clause.types ?? [])) {
             extendedInterfaces.push(visit(type.expression));
           }
         }
@@ -585,10 +776,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 
     const methods: string[] = [];
     const properties: string[] = [];
-    for (const member of node.members) {
+    for (const member of (node.members ?? [])) {
       if (ts.isMethodSignature(member)) {
         const methodName = visit(member.name);
-        const params = member.parameters
+        const params = (member.parameters ?? [])
           .map((p) => `${visit(p.name)} ${getType(p.type!)}`)
           .join(', ');
         const returnType = member.type ? ` ${getType(member.type)}` : '';
@@ -616,8 +807,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 
       const properties = new Map<string, string>();
       const methods = new Map<string, string>();
-      for (const member of node.members) {
-        const memberModifiers = (member as ts.HasModifiers).modifiers;
+      for (const member of (node.members ?? [])) {
+        const memberModifiers = (member as AstNode).modifiers;
         const isStatic = memberModifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
         if (ts.isPropertyDeclaration(member) && ts.isIdentifier(member.name)) {
           if (isStatic) {
@@ -647,9 +838,9 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     const typeParamNames = getTypeParameterNames(node.typeParameters);
 
     let parentClass: string | null = null;
-    if (node.heritageClauses) {
-      for (const clause of node.heritageClauses) {
-        if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+    if ((node.heritageClauses ?? [])) {
+      for (const clause of (node.heritageClauses ?? [])) {
+        if (clause.token?.kind === 'ExtendsKeyword') {
           parentClass = visit(clause.types[0].expression);
         }
       }
@@ -659,7 +850,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     if (parentClass) {
       fields.push(`\t${parentClass}`);
     }
-    for (const member of node.members) {
+    for (const member of (node.members ?? [])) {
       if (ts.isPropertyDeclaration(member)) {
         const fieldName = visit(member.name);
         let fieldType: string;
@@ -674,11 +865,11 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
 
     let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\n`;
 
-    const ctor = node.members.find((m) => ts.isConstructorDeclaration(m)) as
-      | ts.ConstructorDeclaration
+    const ctor = (node.members ?? []).find((m) => ts.isConstructorDeclaration(m)) as
+      | AstNode
       | undefined;
     if (ctor) {
-      const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters);
+      const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters ?? []);
 
       const bodyStatements =
         ctor.body?.statements
@@ -696,10 +887,10 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\treturn &${name}${typeParamNames}{}\n\t}\n\n`;
     }
 
-    for (const member of node.members) {
+    for (const member of (node.members ?? [])) {
       if (ts.isMethodDeclaration(member)) {
         const methodName = visit(member.name);
-        const methodParameterInfo = getFunctionParametersInfo(member.parameters);
+        const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
         const returnType = member.type ? ` ${getType(member.type)}` : '';
         const isStatic = member.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
         if (isStatic) {
@@ -722,13 +913,13 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       } else if (ts.isSetAccessor(member)) {
         // Setter: set prop(val) { ... } → func (self *T) SetProp(val ValType) { ... }
         const setterName = visit(member.name);
-        const parameterInfo = getFunctionParametersInfo(member.parameters);
+        const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
         result += `func (self *${name}${typeParamNames}) Set_${setterName}(${parameterInfo.signature}) ${visit(member.body!, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
       }
     }
 
     // Static property declarations → package-level vars named ClassName_propName
-    for (const member of node.members) {
+    for (const member of (node.members ?? [])) {
       if (
         ts.isPropertyDeclaration(member) &&
         member.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
@@ -765,8 +956,8 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     if (className === 'Set') {
       return visitNewSet(node);
     }
-    const typeArgs = getTypeArguments(node.typeArguments);
-    const args = node.arguments ? node.arguments.map((a) => visit(a)) : [];
+    const typeArgs = getTypeArguments((node.typeArguments ?? []));
+    const args = node.arguments ? (node.arguments ?? []).map((a) => visit(a)) : [];
     return `New${className}${typeArgs}(${args.join(', ')})`;
   } else if (ts.isObjectLiteralExpression(node)) {
     let typeName = '';
@@ -774,7 +965,7 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
       typeName = getTypeText(node.parent.type);
     }
 
-    const properties = node.properties
+    const properties = (node.properties ?? [])
       .map((p) => {
         if (ts.isPropertyAssignment(p)) {
           return `${visit(p.name)}: ${visit(p.initializer)}`;
@@ -801,15 +992,15 @@ export function visit(node: ts.Node, options: VisitNodeOptions = {}): string {
     return '';
   }
 
-  const syntaxKind = ts.SyntaxKind[node.kind];
+  const syntaxKind = node.kind;
   if (!['FirstStatement', 'EndOfFileToken'].includes(syntaxKind)) {
-    const snippet = node.getText().substring(0, 60).replace(/\n/g, ' ');
+    const snippet = String(node.text ?? node.kind).substring(0, 60).replace(/\n/g, ' ');
     console.warn(`[TypeNative] Unsupported syntax: ${syntaxKind} — "${snippet}"`);
   }
 
-  ts.forEachChild(node, (subNode) => {
-    code += visit(subNode);
-  });
+  for (const child of childNodes(node)) {
+    code += visit(child);
+  }
 
   return code;
 }
@@ -822,7 +1013,7 @@ export type VisitNodeOptions = {
   isOutside?: boolean;
 };
 
-function getTypeText(typeNode: ts.TypeNode): string {
+function getTypeText(typeNode: AstNode): string {
   if (!typeNode) return ':';
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     return typeNode.typeName.text;
@@ -834,13 +1025,13 @@ function toGoStringLiteral(value: string): string {
   return JSON.stringify(value);
 }
 
-function visitSpreadArrayLiteral(node: ts.ArrayLiteralExpression, elemType: string): string {
+function visitSpreadArrayLiteral(node: AstNode, elemType: string): string {
   // Build append chain for arrays with spread elements
   // [...arr1, x, y, ...arr2] → append(append(append([]T{}, arr1...), x, y), arr2...)
-  type Chunk = { isSpread: boolean; items: ts.Expression[] };
+  type Chunk = { isSpread: boolean; items: AstNode[] };
   const chunks: Chunk[] = [];
 
-  for (const el of node.elements) {
+  for (const el of (node.elements ?? [])) {
     if (ts.isSpreadElement(el)) {
       chunks.push({ isSpread: true, items: [el.expression] });
     } else {
@@ -865,7 +1056,7 @@ function visitSpreadArrayLiteral(node: ts.ArrayLiteralExpression, elemType: stri
   return result;
 }
 
-function visitTemplateExpression(node: ts.TemplateExpression): string {
+function visitTemplateExpression(node: AstNode): string {
   const parts: string[] = [];
 
   if (node.head.text.length > 0) {
@@ -888,10 +1079,10 @@ function visitTemplateExpression(node: ts.TemplateExpression): string {
   return parts.join(' + ');
 }
 
-function hasQuestionDot(node: ts.Node): boolean {
+function hasQuestionDot(node: AstNode): boolean {
   return (
     'questionDotToken' in node &&
-    !!(node as { questionDotToken?: ts.Token<ts.SyntaxKind.QuestionDotToken> }).questionDotToken
+    !!(node as { questionDotToken?: AstNode }).questionDotToken
   );
 }
 
@@ -899,13 +1090,13 @@ function getTempName(prefix: string): string {
   return `__${prefix}_${goSafeId()}__`;
 }
 
-function inferExpectedTypeFromContext(node: ts.Node): string | undefined {
+function inferExpectedTypeFromContext(node: AstNode): string | undefined {
   const parent = node.parent;
   if (ts.isVariableDeclaration(parent) && parent.initializer === node && parent.type) {
     return getType(parent.type);
   }
   if (ts.isReturnStatement(parent)) {
-    let scope: ts.Node | undefined = parent.parent;
+    let scope: AstNode | undefined = parent.parent;
     while (scope) {
       if (
         ts.isFunctionDeclaration(scope) ||
@@ -922,7 +1113,7 @@ function inferExpectedTypeFromContext(node: ts.Node): string | undefined {
   return undefined;
 }
 
-function prescanVariableDeclarations(block: ts.Block): void {
+function prescanVariableDeclarations(block: AstNode): void {
   for (const stmt of block.statements) {
     if (ts.isVariableStatement(stmt)) {
       for (const decl of stmt.declarationList.declarations) {
@@ -940,11 +1131,11 @@ function prescanVariableDeclarations(block: ts.Block): void {
 }
 
 function inferFunctionBodyReturnType(
-  node: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction
+  node: AstNode | AstNode | AstNode
 ): string | undefined {
   if (node.type) return getType(node.type);
   if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) {
-    return inferExpressionType(node.body as ts.Expression);
+    return inferExpressionType(node.body as AstNode);
   }
   if (node.body && ts.isBlock(node.body)) {
     for (const stmt of node.body.statements) {
@@ -957,13 +1148,13 @@ function inferFunctionBodyReturnType(
   return undefined;
 }
 
-function inferArrowFunctionGoType(node: ts.ArrowFunction | ts.FunctionExpression): string {
-  const params = node.parameters.map((p) => (p.type ? getType(p.type) : 'interface{}')).join(', ');
+function inferArrowFunctionGoType(node: AstNode | AstNode): string {
+  const params = (node.parameters ?? []).map((p) => (p.type ? getType(p.type) : 'interface{}')).join(', ');
   const retType = inferFunctionBodyReturnType(node);
   return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
 
-function inferExpressionType(expr: ts.Expression): string | undefined {
+function inferExpressionType(expr: AstNode): string | undefined {
   if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
     return inferArrowFunctionGoType(expr);
   }
@@ -986,7 +1177,7 @@ function inferExpressionType(expr: ts.Expression): string | undefined {
   if (ts.isArrayLiteralExpression(expr)) {
     if (expr.elements.length === 0) return '[]interface{}';
     const firstElementType =
-      inferExpressionType(expr.elements[0] as ts.Expression) ?? 'interface{}';
+      inferExpressionType(expr.elements[0] as AstNode) ?? 'interface{}';
     return `[]${firstElementType}`;
   }
   if (ts.isNewExpression(expr) && ts.isIdentifier(expr.expression)) {
@@ -1112,7 +1303,7 @@ function makeNullableType(typeName: string): string {
   return typeName;
 }
 
-function visitConditionalExpression(node: ts.ConditionalExpression): string {
+function visitConditionalExpression(node: AstNode): string {
   const whenTrue = visit(node.whenTrue);
   const whenFalse = visit(node.whenFalse);
   const resultType =
@@ -1127,7 +1318,7 @@ function visitConditionalExpression(node: ts.ConditionalExpression): string {
   return `func() ${resultType} { if ${visit(node.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
 }
 
-function visitNullishCoalescingExpression(node: ts.BinaryExpression): string {
+function visitNullishCoalescingExpression(node: AstNode): string {
   const leftType = inferExpressionType(node.left);
   const rightType = inferExpressionType(node.right);
 
@@ -1146,7 +1337,7 @@ function visitNullishCoalescingExpression(node: ts.BinaryExpression): string {
   return visit(node.left);
 }
 
-function visitOptionalPropertyAccess(node: ts.PropertyAccessExpression): string {
+function visitOptionalPropertyAccess(node: AstNode): string {
   const baseExpr = visit(node.expression);
   const baseType = inferExpressionType(node.expression);
   if (!baseType || !baseType.startsWith('*')) {
@@ -1168,7 +1359,7 @@ function visitOptionalPropertyAccess(node: ts.PropertyAccessExpression): string 
   return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${propertyAccess} }()`;
 }
 
-function visitOptionalElementAccess(node: ts.ElementAccessExpression): string {
+function visitOptionalElementAccess(node: AstNode): string {
   const baseExpr = visit(node.expression);
   const baseType = inferExpressionType(node.expression);
   if (!baseType || !baseType.startsWith('*')) {
@@ -1188,16 +1379,16 @@ function visitOptionalElementAccess(node: ts.ElementAccessExpression): string {
   return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${elementExpr} }()`;
 }
 
-function visitOptionalCall(node: ts.CallExpression): string {
+function visitOptionalCall(node: AstNode): string {
   if (!ts.isPropertyAccessExpression(node.expression)) {
-    return `${visit(node.expression)}(${node.arguments.map((a) => visit(a)).join(', ')})`;
+    return `${visit(node.expression)}(${(node.arguments ?? []).map((a) => visit(a)).join(', ')})`;
   }
 
   const baseNode = node.expression.expression;
   const methodName = node.expression.name.text;
   const baseExpr = visit(baseNode);
   const baseType = inferExpressionType(baseNode);
-  const args = node.arguments.map((a) => visit(a)).join(', ');
+  const args = (node.arguments ?? []).map((a) => visit(a)).join(', ');
 
   if (!baseType || !baseType.startsWith('*')) {
     return `${baseExpr}.${methodName}(${args})`;
@@ -1228,7 +1419,7 @@ function getArrayElementTypeFromGoType(goType: string): string {
 }
 
 function inferArrayCallbackReturnType(
-  callback: ts.Expression,
+  callback: AstNode,
   elementType: string,
   fallbackType: string
 ): string {
@@ -1259,7 +1450,7 @@ type ArrayCallbackInfo = {
 };
 
 function buildArrayCallbackInfo(
-  callback: ts.Expression,
+  callback: AstNode,
   elementType: string,
   forcedReturnType?: string
 ): ArrayCallbackInfo {
@@ -1326,7 +1517,7 @@ function buildArrayCallbackInvocationReduce(
   return `(${callbackInfo.fnExpr})(${args.join(', ')})`;
 }
 
-function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined {
+function visitArrayHigherOrderCall(node: AstNode): string | undefined {
   if (!ts.isPropertyAccessExpression(node.expression)) return undefined;
 
   const methodName = node.expression.name.text;
@@ -1346,13 +1537,13 @@ function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined 
     if (!isArrayLikeGoType(ownerType)) return undefined;
     importedPackages.add('strings');
     importedPackages.add('fmt');
-    const separator = node.arguments[0] ? visit(node.arguments[0]) : '""';
+    const separator = (node.arguments ?? [])[0] ? visit((node.arguments ?? [])[0]) : '""';
     const arrVar = getTempName('arrjoin');
     const partsVar = getTempName('parts');
     return `func() string { ${arrVar} := ${arrayExpr}; ${partsVar} := make([]string, len(${arrVar})); for i, v := range ${arrVar} { ${partsVar}[i] = fmt.Sprintf("%v", v) }; return strings.Join(${partsVar}, ${separator}) }()`;
   }
 
-  const callback = node.arguments[0];
+  const callback = (node.arguments ?? [])[0];
   if (!callback) {
     return undefined;
   }
@@ -1406,11 +1597,11 @@ function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined 
   }
 
   if (methodName === 'reduce') {
-    const reduceCallback = node.arguments[0];
+    const reduceCallback = (node.arguments ?? [])[0];
     if (!reduceCallback) return undefined;
-    const initialValue = node.arguments[1] ? visit(node.arguments[1] as ts.Expression) : undefined;
+    const initialValue = (node.arguments ?? [])[1] ? visit((node.arguments ?? [])[1] as AstNode) : undefined;
     const accType = initialValue
-      ? (inferExpressionType(node.arguments[1] as ts.Expression) ?? elementType)
+      ? (inferExpressionType((node.arguments ?? [])[1] as AstNode) ?? elementType)
       : elementType;
     const accVar = getTempName('acc');
     // Build a callback that takes (acc, item, idx, arr) — param count determines what gets passed
@@ -1431,7 +1622,7 @@ function visitArrayHigherOrderCall(node: ts.CallExpression): string | undefined 
   return `func() ${elementType} { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { if ${callbackCall} { return ${itemVar} } }; var __zero ${elementType}; return __zero }()`;
 }
 
-function getAliasType(name: string, seen = new Set<string>()): ts.TypeNode | undefined {
+function getAliasType(name: string, seen = new Set<string>()): AstNode | undefined {
   const aliasType = typeAliases.get(name);
   if (!aliasType) return undefined;
 
@@ -1447,7 +1638,7 @@ function getAliasType(name: string, seen = new Set<string>()): ts.TypeNode | und
   return aliasType;
 }
 
-function getOptionalNodeType(typeNode: ts.TypeNode | undefined, isOptional: boolean): string {
+function getOptionalNodeType(typeNode: AstNode | undefined, isOptional: boolean): string {
   const baseType = typeNode ? getType(typeNode) : 'interface{}';
   if (!isOptional) return baseType;
   if (baseType === 'interface{}' || baseType.startsWith('*')) return baseType;
@@ -1455,7 +1646,7 @@ function getOptionalNodeType(typeNode: ts.TypeNode | undefined, isOptional: bool
   return baseType;
 }
 
-function getEnumMemberName(name: ts.PropertyName): string {
+function getEnumMemberName(name: AstNode): string {
   if (ts.isIdentifier(name)) {
     return getSafeName(name.text);
   }
@@ -1468,8 +1659,8 @@ function getEnumMemberName(name: ts.PropertyName): string {
   return 'Member';
 }
 
-function getEnumBaseType(node: ts.EnumDeclaration): 'string' | 'float64' {
-  for (const member of node.members) {
+function getEnumBaseType(node: AstNode): 'string' | 'float64' {
+  for (const member of (node.members ?? [])) {
     const initializer = member.initializer;
     if (!initializer) continue;
     if (ts.isStringLiteral(initializer) || ts.isNoSubstitutionTemplateLiteral(initializer)) {
@@ -1479,7 +1670,7 @@ function getEnumBaseType(node: ts.EnumDeclaration): 'string' | 'float64' {
   return 'float64';
 }
 
-function readNumericEnumInitializer(initializer: ts.Expression): number | undefined {
+function readNumericEnumInitializer(initializer: AstNode): number | undefined {
   if (ts.isNumericLiteral(initializer)) {
     return Number(initializer.text);
   }
@@ -1495,7 +1686,7 @@ function readNumericEnumInitializer(initializer: ts.Expression): number | undefi
   return undefined;
 }
 
-function visitEnumDeclaration(node: ts.EnumDeclaration): string {
+function visitEnumDeclaration(node: AstNode): string {
   const enumName = getSafeName(node.name.text);
   const baseType = enumBaseTypes.get(node.name.text) ?? getEnumBaseType(node);
 
@@ -1503,7 +1694,7 @@ function visitEnumDeclaration(node: ts.EnumDeclaration): string {
   let canAutoIncrement = true;
   const members: string[] = [];
 
-  for (const member of node.members) {
+  for (const member of (node.members ?? [])) {
     const memberName = getEnumMemberName(member.name);
     const symbolName = `${enumName}_${memberName}`;
 
@@ -1536,7 +1727,7 @@ function visitEnumDeclaration(node: ts.EnumDeclaration): string {
   return `type ${enumName} ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
 }
 
-function getType(typeNode: ts.TypeNode, getArrayType = false): string {
+function getType(typeNode: AstNode, getArrayType = false): string {
   if (!typeNode) return ':';
   if (ts.isArrayTypeNode(typeNode)) {
     const elementType = getType(typeNode.elementType);
@@ -1600,8 +1791,8 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
     return `${name}${typeArgs}`;
   }
 
-  const type = TypeCheker.getTypeFromTypeNode(typeNode);
-  let typeName = TypeCheker.typeToString(type);
+  // Syntactic replacement for the ts typechecker: render the type node's text
+  let typeName = typeNodeToText(typeNode);
   const isArray = typeName.includes('[]');
 
   if (isArray) {
@@ -1626,7 +1817,7 @@ function getType(typeNode: ts.TypeNode, getArrayType = false): string {
   }
 }
 
-function getTypeCategory(typeNode: ts.TypeNode | undefined): string | undefined {
+function getTypeCategory(typeNode: AstNode | undefined): string | undefined {
   if (!typeNode) return undefined;
   if (ts.isArrayTypeNode(typeNode)) return 'array';
   if (typeNode.kind === ts.SyntaxKind.StringKeyword) return 'string';
@@ -1651,7 +1842,7 @@ function getTypeCategory(typeNode: ts.TypeNode | undefined): string | undefined 
   return undefined;
 }
 
-function getClassNameFromTypeNode(typeNode: ts.TypeNode): string | undefined {
+function getClassNameFromTypeNode(typeNode: AstNode): string | undefined {
   if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
     return classNames.has(typeNode.typeName.text) ? typeNode.typeName.text : undefined;
   }
@@ -1669,7 +1860,7 @@ function getClassNameFromTypeNode(typeNode: ts.TypeNode): string | undefined {
   return undefined;
 }
 
-function resolveExpressionType(expr: ts.Expression): string | undefined {
+function resolveExpressionType(expr: AstNode): string | undefined {
   if (ts.isIdentifier(expr)) {
     return variableTypes.get(expr.text);
   }
@@ -1679,7 +1870,7 @@ function resolveExpressionType(expr: ts.Expression): string | undefined {
   return undefined;
 }
 
-function isNilLiteral(node: ts.Expression): boolean {
+function isNilLiteral(node: AstNode): boolean {
   if (node.kind === ts.SyntaxKind.NullKeyword) return true;
   if (ts.isIdentifier(node) && node.text === 'undefined') return true;
   return false;
@@ -1703,11 +1894,16 @@ function getAcessString(leftSide: string, rightSide: string, objectType?: string
       return 'runtime.GOOS';
     }
     if (rightSide === 'env') {
-      // process.env.X is handled by nested property access; just return a placeholder object
-      return 'os.Environ()';
+      // process.env.X is detected via the nested access below
+      return 'process.env';
     }
   }
 
+  // process.env.X → TnGetenv("X") (os.Environ() is a []string in Go, not a map)
+  if (leftSide === 'process.env') {
+    useHelper('getenv');
+    return `TnGetenv("${rightSide}")`;
+  }
   return `${leftSide}.${rightSide}`;
 }
 
@@ -2085,7 +2281,7 @@ function getCallString(
   return `${caller}${typeArgs}(${args.join(', ')})`;
 }
 
-function getOperatorText(operator: ts.PrefixUnaryOperator | ts.PostfixUnaryExpression): string {
+function getOperatorText(operator: AstNode | AstNode): string {
   switch (operator) {
     case ts.SyntaxKind.PlusToken:
       return '+';
@@ -2118,7 +2314,7 @@ function jsRegexFlagsToGo(flags: string): string {
 }
 
 function getTypeParameters(
-  typeParameters: ts.NodeArray<ts.TypeParameterDeclaration> | undefined
+  typeParameters: any
 ): string {
   if (!typeParameters || typeParameters.length === 0) return '';
   const params = typeParameters.map((tp) => {
@@ -2130,14 +2326,14 @@ function getTypeParameters(
 }
 
 function getTypeParameterNames(
-  typeParameters: ts.NodeArray<ts.TypeParameterDeclaration> | undefined
+  typeParameters: any
 ): string {
   if (!typeParameters || typeParameters.length === 0) return '';
   const names = typeParameters.map((tp) => visit(tp.name));
   return `[${names.join(', ')}]`;
 }
 
-function getTypeArguments(typeArguments: readonly ts.TypeNode[] | undefined): string {
+function getTypeArguments(typeArguments: readonly AstNode[] | undefined): string {
   if (!typeArguments || typeArguments.length === 0) return '';
   const args = typeArguments.map((ta) => getType(ta));
   return `[${args.join(', ')}]`;
@@ -2148,7 +2344,7 @@ type FunctionParametersInfo = {
   prefixBlockContent: string;
 };
 
-function getParameterGoType(param: ts.ParameterDeclaration): string {
+function getParameterGoType(param: AstNode): string {
   // Rest parameter: ...args — use variadic syntax
   if (param.dotDotDotToken) {
     if (param.type) {
@@ -2175,7 +2371,7 @@ function getParameterGoType(param: ts.ParameterDeclaration): string {
 }
 
 function getFunctionParametersInfo(
-  parameters: ts.NodeArray<ts.ParameterDeclaration>
+  parameters: AstNode[]
 ): FunctionParametersInfo {
   if (parameters.length === 0) {
     return { signature: '', prefixBlockContent: '' };
@@ -2235,8 +2431,8 @@ function getSafeName(name: string): string {
   return renamedFunctions.get(name)!;
 }
 
-function getPromiseChannelType(node: ts.NewExpression): string {
-  let parent: ts.Node | undefined = node.parent;
+function getPromiseChannelType(node: AstNode): string {
+  let parent: AstNode | undefined = node.parent;
   while (parent) {
     if (
       ts.isFunctionDeclaration(parent) ||
@@ -2263,7 +2459,7 @@ function getPromiseChannelType(node: ts.NewExpression): string {
   return 'interface{}';
 }
 
-function visitPromiseReturn(node: ts.NewExpression, options: VisitNodeOptions): string {
+function visitPromiseReturn(node: AstNode, options: VisitNodeOptions): string {
   const callback = node.arguments?.[0];
   if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
     return `return ${visit(node)}` + (options.inline ? '' : ';\n\t');
@@ -2286,7 +2482,7 @@ function visitPromiseReturn(node: ts.NewExpression, options: VisitNodeOptions): 
   );
 }
 
-function visitNewPromise(node: ts.NewExpression): string {
+function visitNewPromise(node: AstNode): string {
   const callback = node.arguments?.[0];
   if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
     return 'NewPromise()';
@@ -2320,41 +2516,41 @@ function extractMapValueType(mapType: string): string {
   return 'interface{}';
 }
 
-function visitNewMap(node: ts.NewExpression): string {
+function visitNewMap(node: AstNode): string {
   let keyType = 'interface{}';
   let valueType = 'interface{}';
-  if (node.typeArguments && node.typeArguments.length === 2) {
-    keyType = getType(node.typeArguments[0]);
-    valueType = getType(node.typeArguments[1]);
+  if ((node.typeArguments ?? []) && (node.typeArguments ?? []).length === 2) {
+    keyType = getType((node.typeArguments ?? [])[0]);
+    valueType = getType((node.typeArguments ?? [])[1]);
   }
   const mapType = `map[${keyType}]${valueType}`;
-  const args = node.arguments;
+  const args = (node.arguments ?? []);
   if (!args || args.length === 0 || !ts.isArrayLiteralExpression(args[0])) {
     return `make(${mapType})`;
   }
-  const initArg = args[0] as ts.ArrayLiteralExpression;
+  const initArg = args[0] as AstNode;
   const tmp = getTempName('map');
   const entries = initArg.elements
     .filter((el) => ts.isArrayLiteralExpression(el) && el.elements.length >= 2)
     .map((el) => {
-      const pair = el as ts.ArrayLiteralExpression;
+      const pair = el as AstNode;
       return `${tmp}[${visit(pair.elements[0])}] = ${visit(pair.elements[1])}`;
     })
     .join('; ');
   return `func() ${mapType} { ${tmp} := make(${mapType}); ${entries}; return ${tmp} }()`;
 }
 
-function visitNewSet(node: ts.NewExpression): string {
+function visitNewSet(node: AstNode): string {
   let elementType = 'interface{}';
-  if (node.typeArguments && node.typeArguments.length === 1) {
-    elementType = getType(node.typeArguments[0]);
+  if ((node.typeArguments ?? []) && (node.typeArguments ?? []).length === 1) {
+    elementType = getType((node.typeArguments ?? [])[0]);
   }
   const setType = `map[${elementType}]struct{}`;
-  const args = node.arguments;
+  const args = (node.arguments ?? []);
   if (!args || args.length === 0 || !ts.isArrayLiteralExpression(args[0])) {
     return `make(${setType})`;
   }
-  const initArg = args[0] as ts.ArrayLiteralExpression;
+  const initArg = args[0] as AstNode;
   const tmp = getTempName('set');
   const values = initArg.elements.map((el) => `${tmp}[${visit(el)}] = struct{}{}`).join('; ');
   return `func() ${setType} { ${tmp} := make(${setType}); ${values}; return ${tmp} }()`;
@@ -2399,7 +2595,7 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
 
   if (!goFileName) {
     // Inline mode (npm packages): pull declarations into the current transpilation context
-    const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+    const sf = parseFunction(code);
     for (const stmt of sf.statements) {
       visit(stmt, { addFunctionOutside: true });
     }
@@ -2416,7 +2612,7 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   importedPackages.clear();
   helperProvidedPackages.clear();
 
-  const sf = ts.createSourceFile('imported.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+  const sf = parseFunction(code);
   const inlineLines: string[] = [];
   for (const stmt of sf.statements) {
     const result = visit(stmt, { addFunctionOutside: true });
@@ -2455,7 +2651,7 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   currentFileDir = prevDir;
 }
 
-function registerGoPackageAliases(node: ts.ImportDeclaration, goPkg: string): void {
+function registerGoPackageAliases(node: AstNode, goPkg: string): void {
   const pkgName = goPkg.split('/').pop()!;
   if (!node.importClause) return;
   const clause = node.importClause;
@@ -2484,7 +2680,7 @@ function registerGoPackageAliases(node: ts.ImportDeclaration, goPkg: string): vo
   }
 }
 
-function getImportLocalName(node: ts.ImportDeclaration): string | null {
+function getImportLocalName(node: AstNode): string | null {
   const clause = node.importClause;
   if (!clause) return null;
   if (clause.name) return clause.name.text;
@@ -2641,6 +2837,13 @@ const nodeModuleMappings: Record<
         const typedArg = arrArg.startsWith('[]') && !arrArg.startsWith('[]string')
           ? `[]string ${arrArg.slice(2)}`
           : arrArg;
+        if (args[2]?.includes('input')) {
+          // {input: expr, ...} → run with expr as stdin
+          useHelper('execInput');
+          const m = /input:\s*([^,}]+)/.exec(args[2]);
+          const inputExpr = m ? m[1] : '""';
+          return `TnExecInput(${args[0]}, ${inputExpr}, ${typedArg}...)`;
+        }
         return `TnExec(${args[0]}, ${typedArg}...)`;
       }
     }
@@ -2671,7 +2874,9 @@ const helperPackages: Record<string, string[]> = {
   exec: ['os/exec', 'bytes', 'runtime'],
   execSync: ['os/exec', 'bytes', 'runtime'],
   runInherit: ['os/exec', 'os'],
-  question: ['bufio', 'fmt', 'os', 'strings']
+  question: ['bufio', 'fmt', 'os', 'strings'],
+  getenv: ['os'],
+  execInput: ['os/exec', 'bytes', 'strings']
 };
 
 // Go helper sources emitted (once) into the main output file when used.
@@ -2798,6 +3003,26 @@ func TnExecShell(command string) tnExecResult {
 	}
 	return result.stdout
 }`,
+  getenv: `func TnGetenv(name string) string {
+	return os.Getenv(name)
+}`,
+  execInput: `func TnExecInput(name string, input string, args ...string) tnExecResult {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	status := 0.0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			status = float64(exitErr.ExitCode())
+		} else {
+			panic(err)
+		}
+	}
+	return tnExecResult{stdout: stdout.String(), stderr: stderr.String(), status: status}
+}`,
   runInherit: `func TnRunInherit(name string, args ...string) float64 {
 	cmd := exec.Command(name, args...)
 	cmd.Stdin = os.Stdin
@@ -2840,7 +3065,7 @@ function emitGoHelpers(): string {
 
 // Mapping from Node.js stdlib module names to Go setup functions.
 // Each entry adds the required Go imports and registers call handlers for the local identifier.
-function setupNodeModuleImport(node: ts.ImportDeclaration, nodeModule: string): void {
+function setupNodeModuleImport(node: AstNode, nodeModule: string): void {
   const mapping = nodeModuleMappings[nodeModule];
   if (!mapping) return;
 
@@ -2871,7 +3096,7 @@ function setupNodeModuleImport(node: ts.ImportDeclaration, nodeModule: string): 
   }
 }
 
-function visitImportDeclaration(node: ts.ImportDeclaration): string {
+function visitImportDeclaration(node: AstNode): string {
   if (!ts.isStringLiteral(node.moduleSpecifier)) return '';
   const moduleSpec = node.moduleSpecifier.text;
 
@@ -2931,7 +3156,7 @@ function visitImportDeclaration(node: ts.ImportDeclaration): string {
   return '';
 }
 
-function getForOfVarNames(initializer: ts.ForInitializer): string[] {
+function getForOfVarNames(initializer: AstNode): string[] {
   if (!ts.isVariableDeclarationList(initializer) || initializer.declarations.length === 0) {
     return ['_'];
   }
@@ -2939,13 +3164,13 @@ function getForOfVarNames(initializer: ts.ForInitializer): string[] {
   if (ts.isArrayBindingPattern(decl.name)) {
     return decl.name.elements.map((el) => {
       if (ts.isOmittedExpression(el)) return '_';
-      return visit((el as ts.BindingElement).name);
+      return visit((el as AstNode).name);
     });
   }
   return [visit(decl.name)];
 }
 
-function visitTryStatement(node: ts.TryStatement, options: VisitNodeOptions): string {
+function visitTryStatement(node: AstNode, options: VisitNodeOptions): string {
   const deferreds: string[] = [];
 
   // Register finally first (LIFO: runs last after catch)

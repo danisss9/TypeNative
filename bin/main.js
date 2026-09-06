@@ -3,6 +3,7 @@
 // prompt module (sync stdin) instead of inquirer.
 import { run, createProject } from './index.js';
 import { ask, askMultiline, confirm } from './prompt.js';
+import { parseAstJsonNative } from './parse-native.js';
 (function main() {
     const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
     const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
@@ -26,5 +27,5 @@ import { ask, askMultiline, confirm } from './prompt.js';
     if (!newCommand && scriptMode && !source) {
         tsCode = askMultiline('Write your typescript code here:');
     }
-    run({ source, output, scriptMode, tsCode });
+    run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative });
 })();
