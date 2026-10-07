@@ -803,6 +803,12 @@ export function visit(node, options = {}) {
             if (logical)
                 return logical;
         }
+        // x ??= v → assign only when x is nil
+        if (node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
+            const target = visit(node.left);
+            const value = toGoValueOfType(node.right, inferExpressionType(node.left));
+            return `if ${target} == nil { ${target} = ${value} }`;
+        }
         let op = operatorTokenText(node.operatorToken);
         if (op === '===')
             op = '==';
