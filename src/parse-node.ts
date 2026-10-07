@@ -91,8 +91,8 @@ function convertNode(node: ts.Node): any {
     } else if (Array.isArray(v)) {
       const arr = v.filter((e) => isNode(e)).map((e) => convertNode(e));
       if (arr.length > 0) obj[key] = arr;
-    } else if (typeof v === 'number' && key === 'operator') {
-      // unary operator: emit the kind name (matches the Go producer)
+    } else if (typeof v === 'number' && (key === 'operator' || key === 'token')) {
+      // operator / heritage-clause token: emit the kind name (matches the Go producer)
       obj[key] = KIND_NAMES[v] ?? String(v);
     } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
       if (key !== 'kind') obj[key] = v;

@@ -187,9 +187,9 @@ func serializeField(name string, v reflect.Value) (string, any, bool) {
 	case reflect.Bool:
 		return lowerFirst(name), v.Bool(), true
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		// Operator fields hold token kinds; emit the kind name (matches the
+		// Operator/Token fields hold token kinds; emit the kind name (matches the
 		// Node producer, which converts ts.SyntaxKind numbers to names)
-		if name == "operator" { // prelude lowercased the field name
+		if name == "operator" || name == "token" { // prelude lowercased the field name
 			kind := ast.Kind(v.Int())
 			return lowerFirst(name), strings.TrimPrefix(kind.String(), "Kind"), true
 		}

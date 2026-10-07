@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { execa } from 'execa';
-import { readdirSync } from 'fs';
-import path from 'path';
+import { spawnSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import path from 'node:path';
 
 if (process.argv.length < 3) {
   console.error('Usage: node test-runner.js <test-folder>');
@@ -15,13 +15,15 @@ for (const file of readdirSync(process.argv[2])) {
   if (!file.endsWith('.spec.ts')) continue;
 
   const name = file.replace('.spec.ts', '');
-  try {
-    await execa('node', ['./bin/index', '--source', path.join(process.argv[2], file), '--script'], {
-      timeout: 30000
-    });
+  const result = spawnSync(
+    'node',
+    ['./bin/cli.js', '--source', path.join(process.argv[2], file), '--script'],
+    { timeout: 30000, stdio: 'ignore' }
+  );
+  if (result.status === 0) {
     console.log(`  \x1b[32m✔\x1b[0m ${name}`);
     passed++;
-  } catch (err) {
+  } else {
     console.log(`  \x1b[31m✘\x1b[0m ${name}`);
     failed++;
   }
