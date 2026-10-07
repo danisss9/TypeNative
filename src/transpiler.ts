@@ -3779,8 +3779,8 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
   },
   charAt: (obj, args) => `string(${obj}[int(${args[0]})])`,
   substring: (obj, args) => {
-    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
-    return `${obj}[int(${args[0]}):]`;
+    if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
+    return `${obj}[${sliceIndex(obj, args[0])}:]`;
   },
   slice: (obj, args) => {
     if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
@@ -3859,12 +3859,10 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     }
     return `func() ${arrayType} { __s := ${obj}; sort.SliceStable(__s, func(i, j int) bool { return ${less} }); return __s }()`;
   },
-  indexOf: (obj, args) => {
-    return `func() float64 { for __i, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return float64(__i) } }; return float64(-1) }()`;
-  },
-  includes: (obj, args) => {
-    return `func() bool { for _, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return true } }; return false }()`;
-  },
+  indexOf: (obj, args) =>
+    `func() float64 { __x := ${args[0]}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
+  includes: (obj, args) =>
+    `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
   concat: (obj, args) => `append(${obj}, ${args.join(', ')}...)`,
   // [][]T → []T (one level, like JS's default depth)
   flat: (obj) => {
@@ -3899,8 +3897,20 @@ function toGoRegexp(arg: string): string {
 }
 
 // A JS slice index: negative values count from the end
+// A JS slice index: negative values count from the end; out-of-range values clamp
 function sliceIndex(obj: string, index: string): string {
-  return index.startsWith('-') ? `int(float64(len(${obj})) + ${index})` : `int(${index})`;
+  if (index.startsWith('-')) return `max(0, int(float64(len(${obj})) + ${index}))`;
+  return `min(int(${index}), len(${obj}))`;
+}
+
+// Equality of two array elements of the current receiver's element type
+function elementEquals(a: string, b: string): string {
+  const elementType = receiverElementType();
+  if (elementType === 'interface{}' || elementType.startsWith('map[') || elementType.startsWith('[]')) {
+    useHelper('dynamic');
+    return `TnSame(${a}, ${b})`;
+  }
+  return `${a} == ${b}`;
 }
 
 const mapMethodHandlers: Record<string, MethodHandler> = {
@@ -5013,7 +5023,7 @@ func TnIndexOf(v interface{}, x interface{}) float64 {
 		}
 	case []interface{}:
 		for i, item := range t {
-			if item == x {
+			if TnSame(item, x) {
 				return float64(i)
 			}
 		}
