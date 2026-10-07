@@ -607,6 +607,10 @@ export function visit(node, options = {}) {
         return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
     }
     else if (isPropertyAccessExpression(node)) {
+        if (isDynamicValue(node.expression) && node.name.text === 'length' && !isCallee(node)) {
+            useHelper('dynamic');
+            return `TnLength(${visit(node.expression)})`;
+        }
         if (isDynamicValue(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
             useHelper('dynamic');
             return `TnGet(${visit(node.expression)}, "${node.name.text}")`;
@@ -650,7 +654,9 @@ export function visit(node, options = {}) {
         }
         // Array destructuring: const [a, b] = arr
         if (isArrayBindingPattern(node.name) && node.initializer) {
-            const initExpr = visit(node.initializer);
+            const initExpr = isDynamicValue(node.initializer)
+                ? toGoValueOfType(node.initializer, '[]interface{}')
+                : visit(node.initializer);
             const tmpVar = getTempName('arr');
             const parts = [`${tmpVar} := ${initExpr}`];
             node.name.elements.forEach((el, idx) => {
@@ -818,6 +824,10 @@ export function visit(node, options = {}) {
             return visitNullishCoalescingExpression(node);
         }
         if (node.operatorToken.kind === 'InKeyword') {
+            if (isDynamicValue(node.right)) {
+                useHelper('dynamic');
+                return `TnHas(${visit(node.right)}, ${visit(node.left)})`;
+            }
             return `func() bool { _, ok := ${visit(node.right)}[${visit(node.left)}]; return ok }()`;
         }
         if (isLogicalOperator(node.operatorToken)) {
@@ -877,7 +887,7 @@ export function visit(node, options = {}) {
         // Assigning to a nullable primitive (*T) boxes the value
         if (op === '=' && isIdentifier(node.left)) {
             const leftType = variableGoTypes.get(node.left.text);
-            if (leftType && NULLABLE_PRIMITIVE_TYPES.includes(leftType)) {
+            if (leftType && (leftType.startsWith('*') || isDynamicValue(node.right))) {
                 return `${getSafeName(node.left.text)} = ${toGoValueOfType(node.right, leftType)}`;
             }
         }
@@ -1026,11 +1036,12 @@ export function visit(node, options = {}) {
         }
         const enclosingFn = getEnclosingFunction(node);
         const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
-        const returnType = enclosingFn && !isAsync ? getReturnTypeNode(enclosingFn) : undefined;
-        const value = node.expression
-            ? toGoValueOfType(node.expression, returnType ? getType(returnType) : undefined)
-            : '';
-        return `return ${value}` + (options.inline ? '' : ';\n\t');
+        const returnGoType = enclosingFn && !isAsync ? inferFunctionBodyReturnType(enclosingFn) : undefined;
+        const value = node.expression ? toGoValueOfType(node.expression, returnGoType) : '';
+        const terminator = options.inline ? '' : ';\n\t';
+        if (tryReturn && enclosingFn === tryReturn.fn)
+            return tryAwareReturn(value) + terminator;
+        return `return ${value}` + terminator;
     }
     else if (isFunctionDeclaration(node) || isFunctionExpression(node)) {
         if (options.addFunctionOutside) {
@@ -1349,7 +1360,11 @@ export function visit(node, options = {}) {
                     return `__obj = ${visit(p.expression)}`;
                 if (isShorthandPropertyAssignment(p))
                     return `__obj.${goFieldName(p.name.text)} = ${visit(p.name)}`;
-                return `__obj.${visit(p.name)} = ${visit(p.initializer)}`;
+                const spreadFieldType = isIdentifier(p.name)
+                    ? (interfacePropertyTypes.get(typeName)?.get(p.name.text) ??
+                        getStructFieldGoType(typeName, p.name.text))
+                    : undefined;
+                return `__obj.${visit(p.name)} = ${toGoValueOfType(p.initializer, spreadFieldType)}`;
             });
             return `func() ${typeName} { var __obj ${typeName}; ${steps.join('; ')}; return __obj }()`;
         }
@@ -2289,13 +2304,28 @@ function inferExpressionType(expr) {
         if (builtinType && !declaredFunctions.has(expr.expression.text))
             return builtinType;
     }
+    if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && isDynamicValue(expr.expression)) {
+        return 'float64';
+    }
     if ((isPropertyAccessExpression(expr) || isElementAccessExpression(expr)) && isDynamicValue(expr.expression)) {
+        return 'interface{}';
+    }
+    if (isCallExpression(expr) && isObjectKeysOfDynamic(expr))
+        return '[]string';
+    if (isCallExpression(expr) &&
+        isPropertyAccessExpression(expr.expression) &&
+        isIdentifier(expr.expression.expression) &&
+        expr.expression.expression.text === 'JSON' &&
+        expr.expression.name.text === 'parse') {
         return 'interface{}';
     }
     if (isCallExpression(expr) &&
         isPropertyAccessExpression(expr.expression) &&
         isDynamicValue(expr.expression.expression)) {
         const method = expr.expression.name.text;
+        const castCall = castDynamicReceiverCall(expr);
+        if (castCall)
+            return inferExpressionType(castCall);
         if (method === 'includes')
             return 'bool';
         if (method === 'indexOf')
@@ -2661,7 +2691,9 @@ function getNullishResultType(expr) {
         return rightType;
     if (leftValueType && rightType === `*${leftValueType}`)
         return rightType;
-    if (leftValueType === 'interface{}' || !leftValueType)
+    if (leftValueType === 'interface{}')
+        return 'interface{}';
+    if (!leftValueType)
         return rightType;
     return leftValueType;
 }
@@ -2905,7 +2937,12 @@ function buildArrayCallbackInvocation(callbackInfo, itemVar, indexVar, arrayVar)
         args.push(`float64(${indexVar})`);
     if (callbackInfo.paramCount > 2)
         args.push(arrayVar);
-    return `(${callbackInfo.fnExpr})(${args.join(', ')})`;
+    const call = `(${callbackInfo.fnExpr})(${args.join(', ')})`;
+    if (callbackInfo.paramCount > 0)
+        return call;
+    const returnType = callbackInfo.returnType ? ` ${callbackInfo.returnType}` : '';
+    const ret = callbackInfo.returnType ? 'return ' : '';
+    return `func()${returnType} { _ = ${itemVar}; ${ret}${call} }()`;
 }
 // Like buildArrayCallbackInvocation but for reduce: (acc, item, idx, arr)
 function buildArrayCallbackInvocationReduce(callbackInfo, accVar, itemVar, indexVar, arrayVar) {
@@ -3780,6 +3817,35 @@ function visitTypeOf(node) {
     useHelper('typeOf');
     return `TnTypeOf(${visit(node.expression)})`;
 }
+// x.method(...) with an any receiver, as a call on the receiver cast to the type
+// that defines the method (array or string); undefined for other methods
+function castDynamicReceiverCall(node) {
+    if (!isPropertyAccessExpression(node.expression) || !isDynamicValue(node.expression.expression)) {
+        return undefined;
+    }
+    const method = node.expression.name.text;
+    let castType;
+    if (ARRAY_ONLY_METHODS.has(method))
+        castType = { kind: 'ArrayType', elementType: { kind: 'AnyKeyword' } };
+    else if (STRING_ONLY_METHODS.has(method))
+        castType = { kind: 'StringKeyword' };
+    if (!castType)
+        return undefined;
+    const cast = { kind: 'AsExpression', expression: node.expression.expression, type: castType };
+    const access = { ...node.expression, expression: cast };
+    const call = { ...node, expression: access };
+    cast.parent = access;
+    access.parent = call;
+    return call;
+}
+function isObjectKeysOfDynamic(node) {
+    return (isPropertyAccessExpression(node.expression) &&
+        isIdentifier(node.expression.expression) &&
+        node.expression.expression.text === 'Object' &&
+        node.expression.name.text === 'keys' &&
+        !!node.arguments?.[0] &&
+        isDynamicValue(node.arguments[0]));
+}
 const ARRAY_ONLY_METHODS = new Set([
     'map', 'filter', 'some', 'every', 'find', 'findIndex', 'forEach', 'reduce', 'join', 'flat', 'sort', 'reverse'
 ]);
@@ -3791,24 +3857,17 @@ const STRING_ONLY_METHODS = new Set([
 // x.method(...) where x is any: re-visit with the receiver cast to the type the
 // method belongs to; methods of both strings and arrays dispatch at runtime
 function visitDynamicMethodCall(node) {
+    if (isObjectKeysOfDynamic(node)) {
+        useHelper('dynamic');
+        return `TnKeys(${visit(node.arguments[0])})`;
+    }
     if (!isPropertyAccessExpression(node.expression) || !isDynamicValue(node.expression.expression)) {
         return undefined;
     }
     const method = node.expression.name.text;
-    let castType;
-    if (ARRAY_ONLY_METHODS.has(method))
-        castType = { kind: 'ArrayType', elementType: { kind: 'AnyKeyword' } };
-    else if (STRING_ONLY_METHODS.has(method))
-        castType = { kind: 'StringKeyword' };
-    if (castType) {
-        const receiver = node.expression.expression;
-        const cast = { kind: 'AsExpression', expression: receiver, type: castType };
-        const access = { ...node.expression, expression: cast };
-        const call = { ...node, expression: access };
-        cast.parent = access;
-        access.parent = call;
-        return visit(call);
-    }
+    const castCall = castDynamicReceiverCall(node);
+    if (castCall)
+        return visit(castCall);
     const dynamicHelpers = {
         includes: 'TnIncludes',
         indexOf: 'TnIndexOf',
@@ -4321,7 +4380,7 @@ function includeLocalImport(code, dir, goFileName) {
         if (!helperProvidedPackages.has(pkg))
             return true;
         const name = pkg.split('/').pop();
-        return fileCode.includes(`${name}.`);
+        return stripGoStrings(fileCode).includes(`${name}.`);
     })
         .map((pkg) => `import "${pkg}"`)
         .join('\n');
@@ -4342,6 +4401,10 @@ function includeLocalImport(code, dir, goFileName) {
     for (const p of helperProvidedPackages)
         importedPackages.add(p);
     currentFileDir = prevDir;
+}
+// Go source without its string literals (for detecting real package use)
+function stripGoStrings(code) {
+    return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`/g, '""');
 }
 function registerGoPackageAliases(node, goPkg) {
     const pkgName = goPkg.split('/').pop();
@@ -4554,7 +4617,7 @@ const nodeModuleMappings = {
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
     typeOf: ['reflect'],
-    dynamic: ['math', 'strings', 'fmt'],
+    dynamic: ['math', 'strings', 'fmt', 'sort'],
     regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
@@ -4619,6 +4682,36 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 		}
 	}
 	return nil
+}
+
+func TnLength(v interface{}) float64 {
+	switch t := v.(type) {
+	case string:
+		return float64(len(t))
+	case []interface{}:
+		return float64(len(t))
+	}
+	return 0
+}
+
+func TnHas(obj interface{}, key interface{}) bool {
+	if o, ok := obj.(map[string]interface{}); ok {
+		if k, ok := key.(string); ok {
+			_, found := o[k]
+			return found
+		}
+	}
+	return false
+}
+
+func TnKeys(obj interface{}) []string {
+	o, _ := obj.(map[string]interface{})
+	keys := make([]string, 0, len(o))
+	for k := range o {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func TnIncludes(v interface{}, x interface{}) bool {
@@ -5115,6 +5208,42 @@ function visitForOfSequence(node, iterExpr, iterType) {
     }
     return `for _, ${loopVar} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
 }
+// try/catch with returns: the closure reports (value, done) and the caller
+// returns when done
+function visitReturningTryStatement(node, fn, options) {
+    const returnGoType = inferFunctionBodyReturnType(fn);
+    const hasValue = !!returnGoType;
+    const saved = tryReturn;
+    const retVar = getTempName('tryret');
+    const doneVar = getTempName('trydone');
+    const blockCode = (block, inCatch) => {
+        tryReturn = { fn, hasValue, inCatch, retVar, doneVar };
+        const code = (block.statements ?? []).map((s) => visit(s)).join('\t');
+        tryReturn = saved;
+        return code;
+    };
+    const deferreds = [];
+    if (node.finallyBlock) {
+        const finallyBody = (node.finallyBlock.statements ?? []).map((s) => visit(s)).join('\t');
+        deferreds.push(`defer func() {\n\t\t\t${finallyBody}\t\t\t}()`);
+    }
+    if (node.catchClause) {
+        const varDecl = node.catchClause.variableDeclaration;
+        const catchVar = varDecl ? visit(varDecl.name) : '_r';
+        const catchBody = blockCode(node.catchClause.block, true);
+        deferreds.push(`defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := r\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`);
+    }
+    const tryBody = blockCode(node.tryBlock, false);
+    const results = hasValue
+        ? `(${retVar} ${returnGoType}, ${doneVar} bool)`
+        : `(${doneVar} bool)`;
+    const body = [...deferreds, tryBody, 'return'].join('\n\t\t\t');
+    const outer = hasValue ? `${retVar}, ${doneVar}` : doneVar;
+    // Leaving through an enclosing try/catch closure of the same function passes the value on
+    const exit = tryAwareReturn(hasValue ? retVar : '');
+    return (`if ${outer} := func() ${results} {\n\t\t\t${body}\n\t\t\t}(); ${doneVar} { ${exit} }` +
+        (options.inline ? '' : ';\n\t'));
+}
 function getForOfVarNames(initializer) {
     if (!isVariableDeclarationList(initializer) || initializer.declarations.length === 0) {
         return ['_'];
@@ -5129,7 +5258,27 @@ function getForOfVarNames(initializer) {
     }
     return [visit(decl.name)];
 }
+// Set while emitting a try/catch whose blocks return from the enclosing function
+let tryReturn;
+// `return value` from inside a try/catch closure: report (value, done)
+function tryAwareReturn(value) {
+    if (!tryReturn)
+        return `return ${value}`;
+    const results = tryReturn.hasValue ? `${value}, true` : 'true';
+    if (tryReturn.inCatch) {
+        const targets = tryReturn.hasValue
+            ? `${tryReturn.retVar}, ${tryReturn.doneVar}`
+            : tryReturn.doneVar;
+        return `${targets} = ${results}; return`;
+    }
+    return `return ${results}`;
+}
 function visitTryStatement(node, options) {
+    const fn = getEnclosingFunction(node);
+    const returnsFromFunction = (block) => !!block && containsNode(block, (n) => isReturnStatement(n) && getEnclosingFunction(n) === fn);
+    if (fn && (returnsFromFunction(node.tryBlock) || returnsFromFunction(node.catchClause?.block))) {
+        return visitReturningTryStatement(node, fn, options);
+    }
     const deferreds = [];
     // Register finally first (LIFO: runs last after catch)
     if (node.finallyBlock) {

@@ -10,7 +10,7 @@ import { platform } from 'node:os';
 // from Node's; under Node these functions are never called (the CLI wrapper does
 // not reach them), so they're accessed through `any` casts for type-checking.
 import * as childProcess from 'node:child_process';
-import { transpileToNative } from './transpiler.js';
+import { transpileToNative, TranspileOptions } from './transpiler.js';
 
 export interface RunOptions {
   source: string | null;
@@ -73,7 +73,7 @@ export function run(opts: RunOptions): void {
   const tsCode: string = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath!, 'utf-8');
 
   const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-  const transpileOptions: any = { parse: opts.parse };
+  const transpileOptions: TranspileOptions = { parse: opts.parse };
   if (sourceDir) {
     transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
             const baseDir = fromDir ?? sourceDir;
