@@ -695,7 +695,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
   } else if (isPropertyAccessExpression(node)) {
-    if (isDynamicValue(node.expression) && !isCallee(node)) {
+    if (isDynamicValue(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
       useHelper('dynamic');
       return `TnGet(${visit(node.expression)}, "${node.name.text}")`;
     }
@@ -2417,7 +2417,10 @@ function inferExpressionType(expr: AstNode): string | undefined {
 
     if (hasQuestionDot(expr)) {
       if (leftType && leftType.startsWith('*')) {
-        const memberType = resolvedPropertyType ?? 'interface{}';
+        const memberType =
+          resolvedPropertyType ??
+          getStructFieldGoType(leftType.slice(1), expr.name.text) ??
+          'interface{}';
         return makeNullableType(memberType);
       }
       return 'interface{}';
@@ -2809,14 +2812,20 @@ function getMapLookup(expr: AstNode): { map: string; key: string; mapNode: AstNo
     expr.expression.name.text === 'get' &&
     inferExpressionType(expr.expression.expression)?.startsWith('map[')
   ) {
+    const mapType = inferExpressionType(expr.expression.expression)!;
     return {
       map: visit(expr.expression.expression),
-      key: visit(expr.arguments[0]),
+      key: toGoValueOfType(expr.arguments[0], extractMapKeyType(mapType)),
       mapNode: expr.expression.expression
     };
   }
   if (isElementAccessExpression(expr) && inferExpressionType(expr.expression)?.startsWith('map[')) {
-    return { map: visit(expr.expression), key: visit(expr.argumentExpression), mapNode: expr.expression };
+    const mapType = inferExpressionType(expr.expression)!;
+    return {
+      map: visit(expr.expression),
+      key: toGoValueOfType(expr.argumentExpression, extractMapKeyType(mapType)),
+      mapNode: expr.expression
+    };
   }
   return undefined;
 }
@@ -3695,8 +3704,8 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `${obj}[int(${args[0]}):]`;
   },
   slice: (obj, args) => {
-    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
-    return `${obj}[int(${args[0]}):]`;
+    if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
+    return `${obj}[${sliceIndex(obj, args[0])}:]`;
   },
   concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
   padStart: (obj, args) => {
@@ -3753,8 +3762,8 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     return `strings.Join(${obj}, ${args[0] ?? '""'})`;
   },
   slice: (obj, args) => {
-    if (args.length >= 2) return `${obj}[int(${args[0]}):int(${args[1]})]`;
-    return `${obj}[int(${args[0]}):]`;
+    if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
+    return `${obj}[${sliceIndex(obj, args[0])}:]`;
   },
   reverse: (obj) => {
     importedPackages.add('slices');
@@ -3808,6 +3817,11 @@ function isAddressable(code: string): boolean {
 function toGoRegexp(arg: string): string {
   importedPackages.add('regexp');
   return arg.startsWith('regexp.MustCompile(') ? arg : `regexp.MustCompile(${arg})`;
+}
+
+// A JS slice index: negative values count from the end
+function sliceIndex(obj: string, index: string): string {
+  return index.startsWith('-') ? `int(float64(len(${obj})) + ${index})` : `int(${index})`;
 }
 
 const mapMethodHandlers: Record<string, MethodHandler> = {
