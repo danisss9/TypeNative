@@ -862,6 +862,14 @@ export function visit(node, options = {}) {
                 return dynamicArithmetic;
         }
         if (op === '==' || op === '!=') {
+            // any values: JS equality (objects by identity) without Go's uncomparable-type panic
+            if ((isDynamicValue(node.left) || isDynamicValue(node.right)) &&
+                !isNilLiteral(node.left) &&
+                !isNilLiteral(node.right)) {
+                useHelper('dynamic');
+                const same = `TnSame(${visit(node.left)}, ${visit(node.right)})`;
+                return op === '==' ? same : `!${same}`;
+            }
             const nullableComparison = visitNullableComparison(node, op);
             if (nullableComparison)
                 return nullableComparison;
@@ -4617,7 +4625,7 @@ const nodeModuleMappings = {
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
     typeOf: ['reflect'],
-    dynamic: ['math', 'strings', 'fmt', 'sort'],
+    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect'],
     regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
@@ -4682,6 +4690,23 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 		}
 	}
 	return nil
+}
+
+// JS ===: objects and arrays compare by identity, other values by value
+func TnSame(a interface{}, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	switch va.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Func, reflect.Pointer:
+		return va.Kind() == vb.Kind() && va.Type() == vb.Type() && va.Pointer() == vb.Pointer() &&
+			(va.Kind() != reflect.Slice || va.Len() == vb.Len())
+	}
+	if !va.Type().Comparable() || !vb.Type().Comparable() {
+		return false
+	}
+	return a == b
 }
 
 func TnLength(v interface{}) float64 {
