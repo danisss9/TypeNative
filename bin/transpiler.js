@@ -2271,6 +2271,8 @@ function inferExpressionType(expr) {
                 return 'float64';
             if (['pop', 'shift', 'at'].includes(methodName))
                 return elementType;
+            if (methodName === 'flat' && elementType.startsWith('[]'))
+                return elementType;
             if (methodName === 'find')
                 return elementType;
             if (methodName === 'join')
@@ -2329,6 +2331,12 @@ function inferExpressionType(expr) {
         }
         if (isLogicalOperator(expr.operatorToken)) {
             return isLogicalValueExpression(expr) ? getLogicalValueType(expr) : 'bool';
+        }
+        if (['MinusToken', 'AsteriskToken', 'SlashToken', 'PercentToken'].includes(kind))
+            return 'float64';
+        if (kind === 'PlusToken') {
+            const isString = [expr.left, expr.right].some((side) => inferExpressionType(side) === 'string');
+            return isString ? 'string' : 'float64';
         }
     }
     return undefined;
@@ -3444,9 +3452,16 @@ const arrayMethodHandlers = {
         importedPackages.add('slices');
         return `func() interface{} { slices.Reverse(${obj}); return nil }()`;
     },
-    sort: (obj) => {
+    // Sorts in place and returns the array; without a comparator, compares as strings (like JS)
+    sort: (obj, args) => {
         importedPackages.add('sort');
-        return `func() interface{} { sort.Slice(${obj}, func(i, j int) bool { return fmt.Sprintf("%v", ${obj}[i]) < fmt.Sprintf("%v", ${obj}[j]) }); return nil }()`;
+        const arrayType = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType : '[]interface{}';
+        let less = `(${args[0]})(__s[i], __s[j]) < 0`;
+        if (!args[0]) {
+            importedPackages.add('fmt');
+            less = `fmt.Sprintf("%v", __s[i]) < fmt.Sprintf("%v", __s[j])`;
+        }
+        return `func() ${arrayType} { __s := ${obj}; sort.SliceStable(__s, func(i, j int) bool { return ${less} }); return __s }()`;
     },
     indexOf: (obj, args) => {
         return `func() float64 { for __i, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return float64(__i) } }; return float64(-1) }()`;
@@ -3455,7 +3470,13 @@ const arrayMethodHandlers = {
         return `func() bool { for _, __v := range ${obj} { if fmt.Sprintf("%v", __v) == fmt.Sprintf("%v", ${args[0]}) { return true } }; return false }()`;
     },
     concat: (obj, args) => `append(${obj}, ${args.join(', ')}...)`,
-    flat: (obj) => obj,
+    // [][]T → []T (one level, like JS's default depth)
+    flat: (obj) => {
+        const elementType = receiverElementType();
+        if (!elementType.startsWith('[]'))
+            return obj;
+        return `func() ${elementType} { var __flat ${elementType}; for _, __inner := range ${obj} { __flat = append(__flat, __inner...) }; return __flat }()`;
+    },
     toString: (obj) => {
         importedPackages.add('fmt');
         return `fmt.Sprintf("%v", ${obj})`;
@@ -3605,6 +3626,17 @@ function isRegexReplaceCall(node) {
         inferExpressionType(pattern) === '*regexp.Regexp' ||
         resolveExpressionType(pattern) === 'RegExp');
 }
+// Element type of the array whose .sort(fn) receives this comparator
+function getSortComparatorElementType(fn) {
+    const call = fn.parent;
+    if (!isCallExpression(call) || call.arguments?.[0] !== fn)
+        return undefined;
+    if (!isPropertyAccessExpression(call.expression) || call.expression.name.text !== 'sort') {
+        return undefined;
+    }
+    const arrayType = inferExpressionType(call.expression.expression);
+    return arrayType?.startsWith('[]') ? arrayType.slice(2) : undefined;
+}
 function isRegexReplacerCallback(fn) {
     if (!isArrowFunction(fn) && !isFunctionExpression(fn))
         return false;
@@ -3703,6 +3735,9 @@ function getParameterGoType(param) {
     }
     if (param.parent && isRegexReplacerCallback(param.parent))
         return 'string';
+    const sortElementType = param.parent ? getSortComparatorElementType(param.parent) : undefined;
+    if (sortElementType)
+        return sortElementType;
     const contextualFn = param.parent ? getContextualFunctionType(param.parent) : undefined;
     if (contextualFn) {
         const index = (param.parent.parameters ?? []).indexOf(param);
