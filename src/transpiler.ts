@@ -1555,6 +1555,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   const code = visit(expr);
   if (goType && goType !== 'interface{}' && goType !== ':' && isDynamicValue(expr)) {
     useHelper('dynamic');
+    // T | undefined: box the dynamic value (nil when missing or of another type)
+    if (goType.startsWith('*')) return `TnAsPtr[${goType.slice(1)}](${code})`;
     return `TnAs[${goType}](${code})`;
   }
   // *Struct slot: take the address (shares the value, like a JS object reference)
@@ -5116,6 +5118,16 @@ func TnConcat(v interface{}, others ...interface{}) interface{} {
 		}
 	}
 	return result
+}
+
+func TnAsPtr[T any](v interface{}) *T {
+	if p, ok := v.(*T); ok {
+		return p
+	}
+	if t, ok := v.(T); ok {
+		return &t
+	}
+	return nil
 }
 
 func TnAs[T any](v interface{}) T {
