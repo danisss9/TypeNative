@@ -2297,6 +2297,19 @@ function inferExpressionType(expr: AstNode): string | undefined {
     const nodeResultType = callee ? nodeCallResultTypes.get(callee) : undefined;
     if (nodeResultType) return nodeResultType;
   }
+  // Object.keys(map) / Object.values(map)
+  if (
+    isCallExpression(expr) &&
+    isPropertyAccessExpression(expr.expression) &&
+    isIdentifier(expr.expression.expression) &&
+    expr.expression.expression.text === 'Object'
+  ) {
+    const mapType = inferExpressionType(expr.arguments?.[0]);
+    if (mapType?.startsWith('map[')) {
+      if (expr.expression.name.text === 'keys') return `[]${extractMapKeyType(mapType)}`;
+      if (expr.expression.name.text === 'values') return `[]${extractMapValueType(mapType)}`;
+    }
+  }
   if (isCallExpression(expr) && isIdentifier(expr.expression)) {
     const builtinType = BUILTIN_FUNCTION_TYPES[expr.expression.text];
     if (builtinType && !declaredFunctions.has(expr.expression.text)) return builtinType;
@@ -3470,10 +3483,13 @@ const callHandlers: Record<string, CallHandler> = {
   },
   'Object.keys': (_caller, args) => {
     importedPackages.add('maps');
-    return `func() []string { __k := make([]string, 0); for k := range ${args[0]} { __k = append(__k, k) }; return __k }()`;
+    importedPackages.add('slices');
+    return `slices.Sorted(maps.Keys(${args[0]}))`;
   },
   'Object.values': (_caller, args) => {
-    return `func() []interface{} { __v := make([]interface{}, 0); for _, v := range ${args[0]} { __v = append(__v, v) }; return __v }()`;
+    importedPackages.add('maps');
+    importedPackages.add('slices');
+    return `slices.Collect(maps.Values(${args[0]}))`;
   },
   'Object.entries': (_caller, args) => {
     // When used outside for...of, produce a slice of [key, value] pairs — rarely needed
