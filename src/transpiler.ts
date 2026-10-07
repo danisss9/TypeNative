@@ -2881,7 +2881,7 @@ function inferArrayCallbackReturnType(
       return explicitType || fallbackType;
     }
     if (isBlock(callback.body)) {
-      return fallbackType;
+      return inferFunctionBodyReturnType(callback) ?? fallbackType;
     }
     const inferred = inferExpressionType(callback.body);
     return inferred ?? fallbackType;
@@ -2904,27 +2904,20 @@ type ArrayCallbackInfo = {
 function buildArrayCallbackInfo(
   callback: AstNode,
   elementType: string,
-  forcedReturnType?: string
+  forcedReturnType?: string,
+  paramTypes: string[] = [elementType, 'float64', `[]${elementType}`]
 ): ArrayCallbackInfo {
   if (isArrowFunction(callback) || isFunctionExpression(callback)) {
     const paramCount = callback.parameters.length;
-    const paramTypes = [elementType, 'float64', `[]${elementType}`];
-    callback.parameters.slice(0, 3).forEach((p: AstNode, index: number) => {
+    callback.parameters.slice(0, paramTypes.length).forEach((p: AstNode, index: number) => {
       if (isIdentifier(p.name)) registerLocalVariable(p.name.text, paramTypes[index]);
     });
     const callbackReturnType =
-      forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, 'interface{}');
+      forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, elementType);
 
-    const params: string[] = [];
-    if (paramCount > 0) {
-      params.push(`${visit(callback.parameters[0].name)} ${elementType}`);
-    }
-    if (paramCount > 1) {
-      params.push(`${visit(callback.parameters[1].name)} float64`);
-    }
-    if (paramCount > 2) {
-      params.push(`${visit(callback.parameters[2].name)} []${elementType}`);
-    }
+    const params = callback.parameters
+      .slice(0, paramTypes.length)
+      .map((p: AstNode, index: number) => `${visit(p.name)} ${paramTypes[index]}`);
 
     const body = isBlock(callback.body)
       ? visit(callback.body, { inline: true })
@@ -3011,7 +3004,7 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
   const itemVar = getTempName('item');
 
   if (methodName === 'map') {
-    const callbackInfo = buildArrayCallbackInfo(callback, elementType, elementType);
+    const callbackInfo = buildArrayCallbackInfo(callback, elementType);
     const mappedType = callbackInfo.returnType || 'interface{}';
     const resultVar = getTempName('mapres');
     const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
@@ -3063,7 +3056,12 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
       : elementType;
     const accVar = getTempName('acc');
     // Build a callback that takes (acc, item, idx, arr) — param count determines what gets passed
-    const cbInfo = buildArrayCallbackInfo(reduceCallback, elementType, accType ?? 'interface{}');
+    const cbInfo = buildArrayCallbackInfo(reduceCallback, elementType, accType, [
+      accType,
+      elementType,
+      'float64',
+      `[]${elementType}`
+    ]);
     const cbCall = buildArrayCallbackInvocationReduce(cbInfo, accVar, itemVar, idxVar, arrVar);
     // Only include the index loop var if the callback uses it (paramCount > 2)
     const reduceIdxVar = cbInfo.paramCount > 2 ? idxVar : '_';
