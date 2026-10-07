@@ -4097,6 +4097,39 @@ function withContextualParameters(
   return { ...info, signature };
 }
 
+// Destructured parameters ({ a, b }: T / [x, y]: T[]) get a temporary name
+function getParameterName(param: AstNode, parameters: AstNode[]): string {
+  if (isIdentifier(param.name)) return visit(param.name);
+  return `__param${parameters.indexOf(param)}`;
+}
+
+// Unpacks destructured parameters at the start of the function body
+function getParameterDestructuring(parameters: AstNode[]): string {
+  let code = '';
+  for (const param of parameters) {
+    if (isIdentifier(param.name)) continue;
+    const source = getParameterName(param, parameters);
+    const paramType = getParameterGoType(param);
+    (param.name.elements ?? []).forEach((el: AstNode, index: number) => {
+      if (isOmittedExpression(el) || !isIdentifier(el.name)) return;
+      let value: string;
+      let valueType: string | undefined;
+      if (isObjectBindingPattern(param.name)) {
+        const field = (el.propertyName ?? el.name).text;
+        value = `${source}.${goFieldName(field)}`;
+        valueType =
+          interfacePropertyTypes.get(paramType)?.get(field) ?? getStructFieldGoType(paramType, field);
+      } else {
+        value = `${source}[${index}]`;
+        valueType = paramType.startsWith('[]') ? paramType.slice(2) : undefined;
+      }
+      registerLocalVariable(el.name.text, valueType);
+      code += `${visit(el.name)} := ${value}\n\t\t_ = ${visit(el.name)}\n\t\t`;
+    });
+  }
+  return code;
+}
+
 function getFunctionParametersInfo(
   parameters: AstNode[]
 ): FunctionParametersInfo {
@@ -4104,12 +4137,13 @@ function getFunctionParametersInfo(
   if (parameters.length === 0) {
     return { signature: '', prefixBlockContent: '' };
   }
+  const destructuring = getParameterDestructuring(parameters);
 
   const firstDefaultIndex = parameters.findIndex((p) => !!p.initializer);
   if (firstDefaultIndex === -1) {
     return {
-      signature: parameters.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`).join(', '),
-      prefixBlockContent: ''
+      signature: parameters.map((p) => `${getParameterName(p, parameters)} ${getParameterGoType(p)}`).join(', '),
+      prefixBlockContent: destructuring
     };
   }
 
@@ -4117,15 +4151,15 @@ function getFunctionParametersInfo(
 
   if (hasRequiredAfterDefault) {
     return {
-      signature: parameters.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`).join(', '),
-      prefixBlockContent: ''
+      signature: parameters.map((p) => `${getParameterName(p, parameters)} ${getParameterGoType(p)}`).join(', '),
+      prefixBlockContent: destructuring
     };
   }
 
   const requiredParams = parameters.slice(0, firstDefaultIndex);
   const defaultedParams = parameters.slice(firstDefaultIndex);
 
-  const signatureParts = requiredParams.map((p) => `${visit(p.name)} ${getParameterGoType(p)}`);
+  const signatureParts = requiredParams.map((p) => `${getParameterName(p, parameters)} ${getParameterGoType(p)}`);
   signatureParts.push('__defaultArgs ...interface{}');
 
   const prefixBlockContent = defaultedParams
@@ -4144,7 +4178,7 @@ function getFunctionParametersInfo(
 
   return {
     signature: signatureParts.join(', '),
-    prefixBlockContent
+    prefixBlockContent: prefixBlockContent + destructuring
   };
 }
 
