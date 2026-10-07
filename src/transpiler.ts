@@ -672,6 +672,11 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (hasQuestionDot(node)) {
       return visitOptionalElementAccess(node);
     }
+    // process.env['X'] → TnGetenv("X")
+    if (isProcessEnv(node.expression)) {
+      useHelper('getenv');
+      return `TnGetenv(${visit(node.argumentExpression)})`;
+    }
     // Maps (Record/Map) and string keys index directly; arrays/strings need an int index
     const targetType = inferExpressionType(node.expression);
     if (targetType === 'string') {
@@ -4487,6 +4492,10 @@ const nodeModuleMappings: Record<
         return `TnCopyFile(${args[0]}, ${args[1]})`;
       },
       rmSync: (args) => {
+        useHelper('removeAll');
+        return `TnRemoveAll(${args[0]})`;
+      },
+      unlinkSync: (args) => {
         useHelper('removeAll');
         return `TnRemoveAll(${args[0]})`;
       }
