@@ -788,6 +788,9 @@ export function visit(node, options = {}) {
     else if (isPostfixUnaryExpression(node)) {
         return `${visit(node.operand, { inline: true })}${getOperatorText(node.operator)}`;
     }
+    else if (node.kind === 'TypeOfExpression') {
+        return visitTypeOf(node);
+    }
     else if (isConditionalExpression(node)) {
         return visitConditionalExpression(node);
     }
@@ -2096,6 +2099,8 @@ function inferExpressionType(expr) {
     }
     if (isNumericLiteral(expr))
         return 'float64';
+    if (expr.kind === 'TypeOfExpression')
+        return 'string';
     if (isRegularExpressionLiteral(expr))
         return '*regexp.Regexp';
     if (isNewExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'RegExp') {
@@ -3626,6 +3631,19 @@ function getOperatorText(operator) {
 function getTimerName(name) {
     return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
 }
+// typeof x: a constant when the Go type is known, a runtime check for any values
+function visitTypeOf(node) {
+    const goType = inferExpressionType(node.expression);
+    const known = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined' };
+    if (goType && known[goType])
+        return toGoStringLiteral(known[goType]);
+    if (goType?.startsWith('func'))
+        return '"function"';
+    if (goType && goType !== 'interface{}' && !NULLABLE_PRIMITIVE_TYPES.includes(goType))
+        return '"object"';
+    useHelper('typeOf');
+    return `TnTypeOf(${visit(node.expression)})`;
+}
 function isRegexReplaceCall(node) {
     if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression))
         return false;
@@ -4283,6 +4301,7 @@ const nodeModuleMappings = {
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
+    typeOf: ['reflect'],
     regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
@@ -4305,6 +4324,22 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    typeOf: `func TnTypeOf(v interface{}) string {
+	switch v.(type) {
+	case nil:
+		return "undefined"
+	case string, *string:
+		return "string"
+	case float64, *float64:
+		return "number"
+	case bool, *bool:
+		return "boolean"
+	}
+	if reflect.ValueOf(v).Kind() == reflect.Func {
+		return "function"
+	}
+	return "object"
+}`,
     regexReplaceFirst: `func TnRegexReplaceFirst(re *regexp.Regexp, s string, repl string) string {
 	loc := re.FindStringSubmatchIndex(s)
 	if loc == nil {
