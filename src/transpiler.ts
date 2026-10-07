@@ -1265,6 +1265,9 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
           }
         }
       }
+      for (const param of getParameterProperties(node)) {
+        properties.set(param.name.text, getParameterGoType(param));
+      }
       classPropertyTypes.set(className, properties);
       classMethodReturnTypes.set(className, methods);
       return '';
@@ -1299,6 +1302,9 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         fields.push(`\t${fieldName} ${fieldType}`);
       }
     }
+    for (const param of getParameterProperties(node)) {
+      fields.push(`\t${goFieldName(param.name.text)} ${getParameterGoType(param)}`);
+    }
 
     let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\n`;
 
@@ -1309,7 +1315,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters ?? []);
 
       const bodyStatements =
-        ctor.body?.statements
+        (ctor.body?.statements ?? [])
           .filter((s) => {
             if (isExpressionStatement(s) && isCallExpression(s.expression)) {
               return s.expression.expression.kind !== 'SuperKeyword';
@@ -1319,7 +1325,10 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
           .map((s) => visit(s))
           .join('\t') ?? '';
 
-      result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${bodyStatements}return self;\n\t}\n\n`;
+      const parameterAssignments = getParameterProperties(node)
+        .map((p) => `self.${goFieldName(p.name.text)} = ${visit(p.name)}\n\t\t`)
+        .join('');
+      result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${parameterAssignments}${bodyStatements}return self;\n\t}\n\n`;
     } else {
       result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\treturn &${name}${typeParamNames}{}\n\t}\n\n`;
     }
@@ -4041,6 +4050,14 @@ function registerParameterType(param: AstNode): void {
   narrowedVariables.delete(name);
   if (param.type) variableTypeNodes.set(name, param.type);
   else variableTypeNodes.delete(name);
+}
+
+// Constructor parameter properties: constructor(private x: T) declares field x
+function getParameterProperties(classNode: AstNode): AstNode[] {
+  const ctor = (classNode.members ?? []).find((m: AstNode) => isConstructorDeclaration(m));
+  return (ctor?.parameters ?? []).filter(
+    (p: AstNode) => isIdentifier(p.name) && (p.modifiers ?? []).length > 0
+  );
 }
 
 // TS lets a function literal omit trailing parameters of its contextual type;
