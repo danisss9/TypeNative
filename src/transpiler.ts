@@ -635,7 +635,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
   } else if (isAsExpression(node)) {
-    return visit(node.expression);
+    return toGoValueOfType(node.expression, getType(node.type));
   } else if (isTypeAssertionExpression(node)) {
     return visit(node.expression);
   } else if (isTemplateExpression(node)) {
@@ -833,6 +833,8 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         return visitNullablePrimitiveOptionalCall(node, visit(node.expression.expression), receiverType);
       }
     }
+    const dynamicCall = visitDynamicMethodCall(node);
+    if (dynamicCall) return dynamicCall;
     const regexReplace = visitRegexReplace(node);
     if (regexReplace) return regexReplace;
     // IIFE with named function expression: (function name() { ... })()
@@ -991,7 +993,9 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     ) {
       iterNode = iterNode.arguments[0] as AstNode;
     }
-    const iterExpr = visit(iterNode, { inline: true });
+    const iterExpr = isDynamicValue(iterNode)
+      ? toGoValueOfType(iterNode, '[]interface{}')
+      : visit(iterNode, { inline: true });
     const iterType = inferExpressionType(iterNode);
     if (iterType && iterType.startsWith('map[')) {
       const valueType = extractMapValueType(iterType);
@@ -2392,6 +2396,16 @@ function inferExpressionType(expr: AstNode): string | undefined {
 
   if ((isPropertyAccessExpression(expr) || isElementAccessExpression(expr)) && isDynamicValue(expr.expression)) {
     return 'interface{}';
+  }
+  if (
+    isCallExpression(expr) &&
+    isPropertyAccessExpression(expr.expression) &&
+    isDynamicValue(expr.expression.expression)
+  ) {
+    const method = expr.expression.name.text;
+    if (method === 'includes') return 'bool';
+    if (method === 'indexOf') return 'float64';
+    if (method === 'slice' || method === 'concat') return 'interface{}';
   }
   if (isPropertyAccessExpression(expr)) {
     const narrowingKey = getNarrowingKey(expr);
@@ -3960,6 +3974,46 @@ function visitTypeOf(node: AstNode): string {
   return `TnTypeOf(${visit(node.expression)})`;
 }
 
+const ARRAY_ONLY_METHODS = new Set([
+  'map', 'filter', 'some', 'every', 'find', 'findIndex', 'forEach', 'reduce', 'join', 'flat', 'sort', 'reverse'
+]);
+const STRING_ONLY_METHODS = new Set([
+  'startsWith', 'endsWith', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase', 'split',
+  'replace', 'replaceAll', 'charAt', 'charCodeAt', 'padStart', 'padEnd', 'repeat', 'match', 'matchAll', 'search'
+]);
+
+// x.method(...) where x is any: re-visit with the receiver cast to the type the
+// method belongs to; methods of both strings and arrays dispatch at runtime
+function visitDynamicMethodCall(node: AstNode): string | undefined {
+  if (!isPropertyAccessExpression(node.expression) || !isDynamicValue(node.expression.expression)) {
+    return undefined;
+  }
+  const method = node.expression.name.text;
+  let castType: AstNode | undefined;
+  if (ARRAY_ONLY_METHODS.has(method)) castType = { kind: 'ArrayType', elementType: { kind: 'AnyKeyword' } };
+  else if (STRING_ONLY_METHODS.has(method)) castType = { kind: 'StringKeyword' };
+  if (castType) {
+    const receiver = node.expression.expression;
+    const cast: AstNode = { kind: 'AsExpression', expression: receiver, type: castType };
+    const access: AstNode = { ...node.expression, expression: cast };
+    const call: AstNode = { ...node, expression: access };
+    cast.parent = access;
+    access.parent = call;
+    return visit(call);
+  }
+  const dynamicHelpers: Record<string, string> = {
+    includes: 'TnIncludes',
+    indexOf: 'TnIndexOf',
+    slice: 'TnSlice',
+    concat: 'TnConcat'
+  };
+  const helper = dynamicHelpers[method];
+  if (!helper) return undefined;
+  useHelper('dynamic');
+  const args = (node.arguments ?? []).map((a: AstNode) => visit(a));
+  return `${helper}(${[visit(node.expression.expression), ...args].join(', ')})`;
+}
+
 function isRegexReplaceCall(node: AstNode): boolean {
   if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression)) return false;
   const method = node.expression.name.text;
@@ -4733,7 +4787,7 @@ const nodeModuleMappings: Record<
 const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
   typeOf: ['reflect'],
-  dynamic: ['math'],
+  dynamic: ['math', 'strings', 'fmt'],
   regexReplaceFunc: ['regexp'],
   readFile: ['os'],
   writeFile: ['os'],
@@ -4799,6 +4853,77 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 		}
 	}
 	return nil
+}
+
+func TnIncludes(v interface{}, x interface{}) bool {
+	return TnIndexOf(v, x) >= 0
+}
+
+func TnIndexOf(v interface{}, x interface{}) float64 {
+	switch t := v.(type) {
+	case string:
+		if s, ok := x.(string); ok {
+			return float64(strings.Index(t, s))
+		}
+	case []interface{}:
+		for i, item := range t {
+			if item == x {
+				return float64(i)
+			}
+		}
+	}
+	return -1
+}
+
+func TnSlice(v interface{}, bounds ...float64) interface{} {
+	length := 0
+	switch t := v.(type) {
+	case string:
+		length = len(t)
+	case []interface{}:
+		length = len(t)
+	default:
+		return nil
+	}
+	clamp := func(i float64) int {
+		n := int(i)
+		if n < 0 {
+			n += length
+		}
+		return max(0, min(n, length))
+	}
+	start, end := 0, length
+	if len(bounds) > 0 {
+		start = clamp(bounds[0])
+	}
+	if len(bounds) > 1 {
+		end = clamp(bounds[1])
+	}
+	if start > end {
+		start = end
+	}
+	if s, ok := v.(string); ok {
+		return s[start:end]
+	}
+	return v.([]interface{})[start:end]
+}
+
+func TnConcat(v interface{}, others ...interface{}) interface{} {
+	if s, ok := v.(string); ok {
+		for _, o := range others {
+			s += fmt.Sprint(o)
+		}
+		return s
+	}
+	result := append([]interface{}{}, TnAs[[]interface{}](v)...)
+	for _, o := range others {
+		if items, ok := o.([]interface{}); ok {
+			result = append(result, items...)
+		} else {
+			result = append(result, o)
+		}
+	}
+	return result
 }
 
 func TnAs[T any](v interface{}) T {
@@ -5191,6 +5316,7 @@ function registerLocalVariable(name: string, goType: string | undefined): void {
 
 // for...of over arrays and strings (a string yields one-character strings)
 function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | undefined): string {
+  if (iterType === 'interface{}') iterType = '[]interface{}';
   const elementType =
     iterType === 'string' ? 'string' : iterType?.startsWith('[]') ? iterType.slice(2) : undefined;
   const declaration = isVariableDeclarationList(node.initializer)
