@@ -62,7 +62,8 @@
     "test46": "node ./bin/cli.js --source test/test46.spec.ts --script",
     "test47": "node ./bin/cli.js --source test/test47.spec.ts --script",
     "test48": "node ./bin/cli.js --source test/test48.spec.ts --script",
-    "test49": "node ./bin/cli.js --source test/test49.spec.ts --script"
+    "test49": "node ./bin/cli.js --source test/test49.spec.ts --script",
+    "test50": "node ./bin/cli.js --source test/test50.spec.ts --script"
   },
   "repository": {
     "type": "git",
