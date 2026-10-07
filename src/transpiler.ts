@@ -672,6 +672,10 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (hasQuestionDot(node)) {
       return visitOptionalElementAccess(node);
     }
+    if (isDynamicValue(node.expression)) {
+      useHelper('dynamic');
+      return `TnIndex(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
+    }
     // process.env['X'] → TnGetenv("X")
     if (isProcessEnv(node.expression)) {
       useHelper('getenv');
@@ -683,11 +687,18 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       // s[i] in JS is a one-character string; in Go it is a byte
       return `string(${visit(node.expression)}[int(${visit(node.argumentExpression)})])`;
     }
-    if (targetType?.startsWith('map[') || isStringLiteral(node.argumentExpression)) {
+    if (targetType?.startsWith('map[')) {
+      return `${visit(node.expression)}[${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))}]`;
+    }
+    if (isStringLiteral(node.argumentExpression)) {
       return `${visit(node.expression)}[${visit(node.argumentExpression)}]`;
     }
     return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
   } else if (isPropertyAccessExpression(node)) {
+    if (isDynamicValue(node.expression) && !isCallee(node)) {
+      useHelper('dynamic');
+      return `TnGet(${visit(node.expression)}, "${node.name.text}")`;
+    }
     if (hasQuestionDot(node)) {
       return visitOptionalPropertyAccess(node);
     }
@@ -791,7 +802,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
     // Wrap non-nil values assigned to nullable primitive pointer types
     // Only wrap for primitive pointers (*string, *float64, *bool), not class pointers
-    if (node.initializer && type.startsWith('*')) {
+    if (node.initializer && (type.startsWith('*') || isDynamicValue(node.initializer))) {
       initializer = `= ${toGoValueOfType(node.initializer, type)}`;
     }
     // Package scope has no `:=`: module-level declarations need `var x = expr`
@@ -920,6 +931,10 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       if (otherType && otherType !== 'nil' && !isNilableGoType(otherType)) {
         return op === '!=' ? 'true' : 'false';
       }
+    }
+    if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
+      useHelper('dynamic');
+      return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${visit(node.right)})`;
     }
     // arr.length = n truncates the slice
     if (
@@ -1406,6 +1421,16 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const args = node.arguments ? (node.arguments ?? []).map((a) => visit(a)) : [];
     return `New${className}${typeArgs}(${args.join(', ')})`;
   } else if (isObjectLiteralExpression(node)) {
+    if (isAnyContext(getContextualTypeNode(node))) {
+      const entries = (node.properties ?? [])
+        .map((p) => {
+          if (isPropertyAssignment(p)) return `${mapKeyText(p.name)}: ${visit(p.initializer)}`;
+          if (isShorthandPropertyAssignment(p)) return `${mapKeyText(p.name)}: ${visit(p.name)}`;
+          return '';
+        })
+        .filter((e) => e);
+      return `map[string]interface{}${compositeBody(entries)}`;
+    }
     const contextualType = resolveTypeNode(getContextualTypeNode(node));
     if (isRecordTypeNode(contextualType)) {
       return visitMapLiteral(node, contextualType);
@@ -1494,6 +1519,10 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     return `${goType}{}`;
   }
   const code = visit(expr);
+  if (goType && goType !== 'interface{}' && goType !== ':' && isDynamicValue(expr)) {
+    useHelper('dynamic');
+    return `TnAs[${goType}](${code})`;
+  }
   // *Struct slot: take the address (shares the value, like a JS object reference)
   if (goType?.startsWith('*') && isStructGoType(goType.slice(1)) && !isNilLiteral(expr)) {
     if (isObjectLiteralExpression(expr)) return `&${code}`;
@@ -1803,6 +1832,26 @@ function getObjectLiteralGoType(node: AstNode): string {
       return `${goFieldName(p.name.text)} ${toFieldGoType(inferExpressionType(value))}`;
     });
   return `struct{ ${fields.join('; ')} }`;
+}
+
+// Values typed `any`/`unknown` are handled at runtime (TnGet/TnSet/...),
+// never by guessing their type
+function isDynamicValue(expr: AstNode): boolean {
+  return inferExpressionType(expr) === 'interface{}';
+}
+
+function isCallee(node: AstNode): boolean {
+  return isCallExpression(node.parent) && node.parent.expression === node;
+}
+
+// Whether a type node is `any`/`unknown`, directly or through aliases
+function isAnyContext(typeNode: AstNode | undefined): boolean {
+  for (let depth = 0; typeNode && depth < 10; depth++) {
+    if (isAnyTypeNode(typeNode)) return true;
+    if (!isTypeReferenceNode(typeNode) || !isIdentifier(typeNode.typeName)) return false;
+    typeNode = declaredTypeAliases.get(typeNode.typeName.text);
+  }
+  return false;
 }
 
 function isRecordTypeNode(typeNode: AstNode): boolean {
@@ -2341,6 +2390,9 @@ function inferExpressionType(expr: AstNode): string | undefined {
     if (builtinType && !declaredFunctions.has(expr.expression.text)) return builtinType;
   }
 
+  if ((isPropertyAccessExpression(expr) || isElementAccessExpression(expr)) && isDynamicValue(expr.expression)) {
+    return 'interface{}';
+  }
   if (isPropertyAccessExpression(expr)) {
     const narrowingKey = getNarrowingKey(expr);
     if (narrowingKey && narrowedVariables.has(narrowingKey)) {
@@ -2591,6 +2643,10 @@ function toGoCondition(expr: AstNode): string {
 
 function truthinessCheck(code: string, goType: string | undefined): string {
   if (!goType || goType === 'bool' || goType === ':') return code;
+  if (goType === 'interface{}') {
+    useHelper('dynamic');
+    return `TnTruthy(${code})`;
+  }
   if (NULLABLE_PRIMITIVE_TYPES.includes(goType) && !/^[\w.()*]+$/.test(code)) {
     return `func() bool { __t := ${code}; return ${truthinessCheck('__t', goType)} }()`;
   }
@@ -2934,14 +2990,14 @@ function buildArrayCallbackInfo(
   paramTypes: string[] = [elementType, 'float64', `[]${elementType}`]
 ): ArrayCallbackInfo {
   if (isArrowFunction(callback) || isFunctionExpression(callback)) {
-    const paramCount = callback.parameters.length;
-    callback.parameters.slice(0, paramTypes.length).forEach((p: AstNode, index: number) => {
+    const paramCount = (callback.parameters ?? []).length;
+    (callback.parameters ?? []).slice(0, paramTypes.length).forEach((p: AstNode, index: number) => {
       if (isIdentifier(p.name)) registerLocalVariable(p.name.text, paramTypes[index]);
     });
     const callbackReturnType =
       forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, elementType);
 
-    const params = callback.parameters
+    const params = (callback.parameters ?? [])
       .slice(0, paramTypes.length)
       .map((p: AstNode, index: number) => `${visit(p.name)} ${paramTypes[index]}`);
 
@@ -4060,6 +4116,24 @@ function getParameterProperties(classNode: AstNode): AstNode[] {
   );
 }
 
+// Argument types of map.get/has/set/delete, set.add/has/delete, array.push
+function getCollectionArgumentTypes(node: AstNode): string[] | undefined {
+  if (!isPropertyAccessExpression(node.expression)) return undefined;
+  const method = node.expression.name.text;
+  const receiverType = inferExpressionType(node.expression.expression);
+  if (receiverType?.startsWith('map[')) {
+    const keyType = extractMapKeyType(receiverType);
+    const valueType = extractMapValueType(receiverType);
+    if (valueType === 'struct{}' && ['add', 'has', 'delete'].includes(method)) return [keyType];
+    if (['get', 'has', 'delete'].includes(method)) return [keyType];
+    if (method === 'set') return [keyType, valueType];
+  }
+  if (receiverType?.startsWith('[]') && method === 'push') {
+    return (node.arguments ?? []).map(() => receiverType.slice(2));
+  }
+  return undefined;
+}
+
 // TS lets a function literal omit trailing parameters of its contextual type;
 // Go func types must match exactly, so the omitted ones are added as unused `_`
 // Arguments of a call; for calls to declared functions, values are converted to
@@ -4067,6 +4141,8 @@ function getParameterProperties(classNode: AstNode): AstNode[] {
 // parameters are passed as zero values (nil for pointers)
 function visitCallArguments(node: AstNode): string[] {
   const args: AstNode[] = node.arguments ?? [];
+  const collectionTypes = getCollectionArgumentTypes(node);
+  if (collectionTypes) return args.map((arg, index) => toGoValueOfType(arg, collectionTypes[index]));
   const fn = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
   if (!fn) return args.map((a) => visit(a));
   const params: AstNode[] = fn.parameters ?? [];
@@ -4643,6 +4719,7 @@ const nodeModuleMappings: Record<
 const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
   typeOf: ['reflect'],
+  dynamic: ['math'],
   regexReplaceFunc: ['regexp'],
   readFile: ['os'],
   writeFile: ['os'],
@@ -4666,6 +4743,68 @@ const helperPackages: Record<string, string[]> = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers: Record<string, string> = {
+  dynamic: `// Dynamic (any) values: JSON-like objects are map[string]interface{},
+// arrays []interface{}, numbers float64
+func TnGet(obj interface{}, key string) interface{} {
+	switch o := obj.(type) {
+	case map[string]interface{}:
+		return o[key]
+	case []interface{}:
+		if key == "length" {
+			return float64(len(o))
+		}
+	case string:
+		if key == "length" {
+			return float64(len(o))
+		}
+	}
+	return nil
+}
+
+func TnSet(obj interface{}, key string, value interface{}) {
+	if o, ok := obj.(map[string]interface{}); ok {
+		o[key] = value
+		return
+	}
+	panic("TnSet: cannot set property " + key)
+}
+
+func TnIndex(obj interface{}, key interface{}) interface{} {
+	switch o := obj.(type) {
+	case map[string]interface{}:
+		if k, ok := key.(string); ok {
+			return o[k]
+		}
+	case []interface{}:
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
+			return o[int(i)]
+		}
+	case string:
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
+			return string(o[int(i)])
+		}
+	}
+	return nil
+}
+
+func TnAs[T any](v interface{}) T {
+	t, _ := v.(T)
+	return t
+}
+
+func TnTruthy(v interface{}) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return t
+	case float64:
+		return t != 0 && !math.IsNaN(t)
+	case string:
+		return t != ""
+	}
+	return true
+}`,
   typeOf: `func TnTypeOf(v interface{}) string {
 	switch v.(type) {
 	case nil:
