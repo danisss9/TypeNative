@@ -3373,7 +3373,6 @@ const stringMethodHandlers = {
     },
     concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
     padStart: (obj, args) => {
-        importedPackages.add('fmt');
         importedPackages.add('strings');
         const pad = args[1] ?? '" "';
         return `func() string { __s := ${obj}; __n := int(${args[0]}) - len(__s); if __n > 0 { __s = strings.Repeat(${pad}, __n)[:__n] + __s }; return __s }()`;
