@@ -924,6 +924,10 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       const left = visit(node.left);
       return `${left} = math.Mod(${left}, ${visit(node.right)})`;
     }
+    if (['<', '>', '<=', '>=', '-', '*', '/', '+'].includes(op)) {
+      const dynamicArithmetic = visitDynamicArithmetic(node, op);
+      if (dynamicArithmetic) return dynamicArithmetic;
+    }
     if (op === '==' || op === '!=') {
       const nullableComparison = visitNullableComparison(node, op);
       if (nullableComparison) return nullableComparison;
@@ -1714,6 +1718,24 @@ function visitBlockStatements(statements: AstNode[]): string {
   }
   for (const name of added) narrowedVariables.delete(name);
   return parts.join('\t');
+}
+
+function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
+  const leftDynamic = isDynamicValue(node.left);
+  const rightDynamic = isDynamicValue(node.right);
+  if (!leftDynamic && !rightDynamic) return undefined;
+  const isConcat =
+    op === '+' && [node.left, node.right].some((side) => inferExpressionType(side) === 'string');
+  const operand = (side: AstNode, dynamic: boolean) => {
+    if (!dynamic) return visit(side);
+    if (isConcat) {
+      importedPackages.add('fmt');
+      return `fmt.Sprint(${visit(side)})`;
+    }
+    useHelper('dynamic');
+    return `TnAs[float64](${visit(side)})`;
+  };
+  return `${operand(node.left, leftDynamic)} ${op} ${operand(node.right, rightDynamic)}`;
 }
 
 // `x === v` where x is *T and v is T: equal only when x is non-nil and *x == v
@@ -2574,6 +2596,9 @@ function inferExpressionType(expr: AstNode): string | undefined {
     if (kind === 'PlusToken') {
       const isString = [expr.left, expr.right].some((side) => inferExpressionType(side) === 'string');
       return isString ? 'string' : 'float64';
+    }
+    if (['LessThanToken', 'GreaterThanToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind)) {
+      return 'bool';
     }
   }
 
@@ -3979,7 +4004,8 @@ const ARRAY_ONLY_METHODS = new Set([
 ]);
 const STRING_ONLY_METHODS = new Set([
   'startsWith', 'endsWith', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase', 'split',
-  'replace', 'replaceAll', 'charAt', 'charCodeAt', 'padStart', 'padEnd', 'repeat', 'match', 'matchAll', 'search'
+  'replace', 'replaceAll', 'charAt', 'charCodeAt', 'padStart', 'padEnd', 'repeat', 'match', 'matchAll', 'search',
+  'substring', 'lastIndexOf'
 ]);
 
 // x.method(...) where x is any: re-visit with the receiver cast to the type the
@@ -4211,7 +4237,11 @@ function visitCallArguments(node: AstNode): string[] {
   const args: AstNode[] = node.arguments ?? [];
   const collectionTypes = getCollectionArgumentTypes(node);
   if (collectionTypes) return args.map((arg, index) => toGoValueOfType(arg, collectionTypes[index]));
-  const fn = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
+  let fn = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
+  if (!fn && isIdentifier(node.expression)) {
+    const fnType = resolveTypeNode(variableTypeNodes.get(node.expression.text));
+    if (isFunctionTypeNode(fnType)) fn = fnType;
+  }
   if (!fn) return args.map((a) => visit(a));
   const params: AstNode[] = fn.parameters ?? [];
   const result = args.map((arg, index) => {
