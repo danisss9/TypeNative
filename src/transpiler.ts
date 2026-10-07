@@ -583,7 +583,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
 
   const main = `package main
 
-${[...importedPackages].map((pkg) => `import "${pkg}"`).join('\n')}
+${[...importedPackages].sort().map((pkg) => `import "${pkg}"`).join('\n')}
 
 ${mainPackageVariables.join('\n')}
 
@@ -3661,11 +3661,8 @@ const callHandlers: Record<string, CallHandler> = {
     return `func() string { __d, _ := os.Getwd(); return __d }()`;
   },
   'JSON.stringify': (_caller, args) => {
-    importedPackages.add('encoding/json');
-    if (args.length >= 3) {
-      return `func() string { __b, _ := json.MarshalIndent(${args[0]}, "", "  "); return string(__b) }()`;
-    }
-    return `func() string { __b, _ := json.Marshal(${args[0]}); return string(__b) }()`;
+    useHelper('jsonStringify');
+    return `TnJSONStringify(${args[0]}, ${args.length >= 3 ? '"  "' : '""'})`;
   },
   'JSON.parse': (_caller, args) => {
     importedPackages.add('encoding/json');
@@ -4680,6 +4677,7 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
       const name = pkg.split('/').pop()!;
       return stripGoStrings(fileCode).includes(`${name}.`);
     })
+    .sort()
     .map((pkg) => `import "${pkg}"`)
     .join('\n');
 
@@ -4918,6 +4916,7 @@ const nodeModuleMappings: Record<
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
+  jsonStringify: ['encoding/json', 'bytes', 'strings'],
   typeOf: ['reflect'],
   dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect'],
   regexReplaceFunc: ['regexp'],
@@ -5163,6 +5162,14 @@ func TnTruthy(v interface{}) bool {
 		return "function"
 	}
 	return "object"
+}`,
+  jsonStringify: `func TnJSONStringify(v interface{}, indent string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", indent)
+	enc.Encode(v)
+	return strings.TrimSuffix(buf.String(), "\\n")
 }`,
   regexReplaceFirst: `func TnRegexReplaceFirst(re *regexp.Regexp, s string, repl string) string {
 	loc := re.FindStringSubmatchIndex(s)
