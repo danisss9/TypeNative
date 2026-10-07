@@ -3504,6 +3504,13 @@ function getDynamicCallHandler(caller, objectType) {
                 return `fmt.Sprintf("%v", ${obj})`;
             };
         }
+        // number.toFixed(digits)
+        if (methodName === 'toFixed') {
+            return (c, args) => {
+                importedPackages.add('strconv');
+                return `strconv.FormatFloat(${c.substring(0, dotIndex)}, 'f', int(${args[0] ?? '0'}), 64)`;
+            };
+        }
         // Class instances use their own methods — never intercept
         if (objectType === 'class')
             return null;
