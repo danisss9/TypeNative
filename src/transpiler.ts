@@ -1405,6 +1405,15 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (!typeName || typeName === 'interface{}') {
       return visitAnonymousStructLiteral(node);
     }
+    // { ...base, x: 1 } → copy base (Go structs copy by value), then set fields
+    if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
+      const steps = (node.properties ?? []).map((p) => {
+        if (p.kind === 'SpreadAssignment') return `__obj = ${visit(p.expression)}`;
+        if (isShorthandPropertyAssignment(p)) return `__obj.${goFieldName(p.name.text)} = ${visit(p.name)}`;
+        return `__obj.${visit(p.name)} = ${visit(p.initializer)}`;
+      });
+      return `func() ${typeName} { var __obj ${typeName}; ${steps.join('; ')}; return __obj }()`;
+    }
 
     const fieldTypes =
       interfacePropertyTypes.get(typeName) ?? classPropertyTypes.get(typeName.replace(/^&|\*/, ''));
