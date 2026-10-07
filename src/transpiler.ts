@@ -631,7 +631,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
   } else if (isAsExpression(node)) {
-    return toGoValueOfType(node.expression, getType(node.type));
+    return toGoValueOfType(node.expression, getAsExpressionType(node));
   } else if (isTypeAssertionExpression(node)) {
     return visit(node.expression);
   } else if (isTemplateExpression(node)) {
@@ -1908,6 +1908,16 @@ function isAssignmentTarget(node: AstNode): boolean {
   return isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent);
 }
 
+// `x as T`: an any value cast to an object type stays dynamic (a JS object
+// cannot become a Go struct); other casts convert to T
+function getAsExpressionType(node: AstNode): string {
+  const target = getType(node.type);
+  if (isDynamicValue(node.expression) && (isStructGoType(target) || target.startsWith('*'))) {
+    return 'interface{}';
+  }
+  return target;
+}
+
 function isCallee(node: AstNode): boolean {
   return isCallExpression(node.parent) && node.parent.expression === node;
 }
@@ -2368,7 +2378,7 @@ function inferExpressionType(expr: AstNode): string | undefined {
     const innerType = inferExpressionType(expr.expression);
     return innerType && NULLABLE_PRIMITIVE_TYPES.includes(innerType) ? innerType.slice(1) : innerType;
   }
-  if (isAsExpression(expr)) return getType(expr.type);
+  if (isAsExpression(expr)) return getAsExpressionType(expr);
   if (isTypeAssertionExpression(expr)) return getType(expr.type);
   if (
     isStringLiteral(expr) ||
@@ -5379,6 +5389,7 @@ func TnQuestion(prompt string) string {
 // so helpers are visible across files and must not be duplicated.
 function emitGoHelpers(): string {
   return [...usedHelpers]
+    .sort()
     .map((id) => goHelpers[id])
     .filter(Boolean)
     .join('\n\n');
