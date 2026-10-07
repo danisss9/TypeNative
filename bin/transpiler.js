@@ -490,6 +490,9 @@ export function visit(node, options = {}) {
         const goAlias = importAliases.get(node.text);
         if (goAlias)
             return goAlias;
+        if (narrowedVariables.has(node.text) && isNarrowableReference(node)) {
+            return `(*${getSafeName(node.text)})`;
+        }
         return getSafeName(node.text);
     }
     else if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
@@ -535,9 +538,7 @@ export function visit(node, options = {}) {
         return `[]${type} {${(node.elements ?? []).map((e) => visit(e)).join(', ')}}`;
     }
     else if (isBlock(node)) {
-        return `{\n\t\t${options.prefixBlockContent ?? ''}${(node.statements ?? [])
-            .map((n) => visit(n))
-            .join('\t')}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
+        return `{\n\t\t${options.prefixBlockContent ?? ''}${visitBlockStatements(node.statements ?? [])}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
     }
     else if (isElementAccessExpression(node)) {
         if (hasQuestionDot(node)) {
@@ -613,8 +614,21 @@ export function visit(node, options = {}) {
         const type = isInferredAny ? ':' : getType(node.type);
         // Track variable type for type-aware method dispatch
         if (isIdentifier(node.name)) {
+            // A declaration replaces whatever an earlier variable of the same name recorded
+            const inferredType = node.initializer && (!node.type || isInferredAny)
+                ? inferExpressionType(node.initializer)
+                : undefined;
+            variableTypes.delete(node.name.text);
+            variableClassNames.delete(node.name.text);
+            narrowedVariables.delete(node.name.text);
             if (node.type && !isInferredAny) {
                 variableGoTypes.set(node.name.text, getType(node.type));
+            }
+            else if (inferredType) {
+                variableGoTypes.set(node.name.text, inferredType);
+            }
+            else {
+                variableGoTypes.delete(node.name.text);
             }
             const cat = node.type ? getTypeCategory(node.type) : undefined;
             if (cat) {
@@ -640,12 +654,6 @@ export function visit(node, options = {}) {
             else if (node.initializer && isRegularExpressionLiteral(node.initializer)) {
                 variableTypes.set(node.name.text, 'RegExp');
             }
-            if (!variableGoTypes.has(node.name.text) && node.initializer) {
-                const inferredType = inferExpressionType(node.initializer);
-                if (inferredType) {
-                    variableGoTypes.set(node.name.text, inferredType);
-                }
-            }
         }
         let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
         // Wrap non-nil values assigned to nullable primitive pointer types
@@ -669,6 +677,9 @@ export function visit(node, options = {}) {
             (isPropertyAccessExpression(node.expression) && hasQuestionDot(node.expression))) {
             return visitOptionalCall(node);
         }
+        const regexReplace = visitRegexReplace(node);
+        if (regexReplace)
+            return regexReplace;
         // IIFE with named function expression: (function name() { ... })()
         if (isParenthesizedExpression(node.expression) &&
             isFunctionExpression(node.expression.expression)) {
@@ -701,7 +712,7 @@ export function visit(node, options = {}) {
         const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
         const args = hasSpreadArg
             ? (node.arguments ?? []).map((a) => isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))
-            : (node.arguments ?? []).map((a) => visit(a));
+            : visitCallArguments(node);
         // Resolve object type for type-aware method dispatch
         let objectType;
         if (isPropertyAccessExpression(node.expression)) {
@@ -710,6 +721,9 @@ export function visit(node, options = {}) {
         return getCallString(safeCaller, args, typeArgs, objectType);
     }
     else if (isPrefixUnaryExpression(node)) {
+        if (node.operator === 'ExclamationToken') {
+            return `!${wrapCondition(toGoCondition(node.operand))}`;
+        }
         return `${getOperatorText(node.operator)}${visit(node.operand)}`;
     }
     else if (isPostfixUnaryExpression(node)) {
@@ -725,6 +739,11 @@ export function visit(node, options = {}) {
         if (node.operatorToken.kind === 'InKeyword') {
             return `func() bool { _, ok := ${visit(node.right)}[${visit(node.left)}]; return ok }()`;
         }
+        if (isLogicalOperator(node.operatorToken)) {
+            const logical = visitLogicalExpression(node);
+            if (logical)
+                return logical;
+        }
         let op = operatorTokenText(node.operatorToken);
         if (op === '===')
             op = '==';
@@ -739,6 +758,17 @@ export function visit(node, options = {}) {
             importedPackages.add('math');
             const left = visit(node.left);
             return `${left} = math.Mod(${left}, ${visit(node.right)})`;
+        }
+        // Assigning to a nullable primitive (*T) boxes the value
+        if (op === '=' && isIdentifier(node.left)) {
+            const leftType = variableGoTypes.get(node.left.text);
+            if (leftType && NULLABLE_PRIMITIVE_TYPES.includes(leftType)) {
+                return `${getSafeName(node.left.text)} = ${toGoValueOfType(node.right, leftType)}`;
+            }
+        }
+        if (op === '&&' || op === '||') {
+            const right = withNarrowing(getNarrowedNames(node.left, op === '&&'), () => visit(node.right));
+            return `${visit(node.left)} ${op} ${right}`;
         }
         return `${visit(node.left)} ${op} ${visit(node.right)}`;
     }
@@ -756,9 +786,7 @@ export function visit(node, options = {}) {
         return visit(node.expression) + (options.inline ? '' : ';\n\t');
     }
     else if (isForStatement(node)) {
-        return `for ${visit(node.initializer, { inline: true })}; ${visit(node.condition, {
-            inline: true
-        })}; ${visit(node.incrementor, { inline: true })}${visitLoopBody(node.statement)}`;
+        return `for ${visit(node.initializer, { inline: true })}; ${node.condition ? toGoCondition(node.condition) : ''}; ${visit(node.incrementor, { inline: true })}${visitLoopBody(node.statement)}`;
     }
     else if (isForInStatement(node)) {
         const varName = isVariableDeclarationList(node.initializer)
@@ -805,12 +833,10 @@ export function visit(node, options = {}) {
             })}) {\n\t\t\tbreak\n\t\t}\n\t\t`;
             return `for ${visitLoopBody(node.statement, prefix)}`;
         }
-        return `for ${visit(node.expression, { inline: true })}${visitLoopBody(node.statement)}`;
+        return `for ${toGoCondition(node.expression)}${visitLoopBody(node.statement)}`;
     }
     else if (isDoStatement(node)) {
-        const condition = `\tif !(${visit(node.expression, {
-            inline: true
-        })}) {\n\t\t\tbreak \n\t\t}\n\t`;
+        const condition = `\tif !(${toGoCondition(node.expression)}) {\n\t\t\tbreak \n\t\t}\n\t`;
         return `for ${visit(node.statement, { inline: true, extraBlockContent: condition })}`;
     }
     else if (isIfStatement(node)) {
@@ -818,18 +844,15 @@ export function visit(node, options = {}) {
         // Go requires a block body; `} else` must stay on the same line, so the
         // terminating ';' is only added when no else branch follows
         const thenTerm = node.elseStatement ? '' : ';';
-        const thenCode = isBlock(node.thenStatement)
+        const thenCode = withNarrowing(getNarrowedNames(node.expression, true), () => isBlock(node.thenStatement)
             ? visit(node.thenStatement, { inline: !!node.elseStatement })
-            : `{\n${visit(node.thenStatement)}\n}${thenTerm}`;
-        const condition = `if ${visit(node.expression, { inline: true })} ${thenCode}`;
+            : `{\n${visit(node.thenStatement)}\n}${thenTerm}`);
+        const condition = `if ${toGoCondition(node.expression)} ${thenCode}`;
         if (node.elseStatement) {
-            if (isBlock(node.elseStatement)) {
-                return `${condition} else ${visit(node.elseStatement)}`;
-            }
             // else-if chains stay chained; other single statements get a block
-            const elseCode = isIfStatement(node.elseStatement)
+            const elseCode = withNarrowing(getNarrowedNames(node.expression, false), () => isBlock(node.elseStatement) || isIfStatement(node.elseStatement)
                 ? visit(node.elseStatement)
-                : `{\n${visit(node.elseStatement)}\n}`;
+                : `{\n${visit(node.elseStatement)}\n};\n\t`);
             return `${condition} else ${elseCode}`;
         }
         return condition;
@@ -878,7 +901,13 @@ export function visit(node, options = {}) {
             node.expression.expression.text === 'Promise') {
             return visitPromiseReturn(node.expression, options);
         }
-        return (`return ${node.expression ? visit(node.expression) : ''}` + (options.inline ? '' : ';\n\t'));
+        const enclosingFn = getEnclosingFunction(node);
+        const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
+        const returnType = enclosingFn && !isAsync ? getReturnTypeNode(enclosingFn) : undefined;
+        const value = node.expression
+            ? toGoValueOfType(node.expression, returnType ? getType(returnType) : undefined)
+            : '';
+        return `return ${value}` + (options.inline ? '' : ';\n\t');
     }
     else if (isFunctionDeclaration(node) || isFunctionExpression(node)) {
         if (options.addFunctionOutside) {
@@ -886,7 +915,7 @@ export function visit(node, options = {}) {
             return '';
         }
         const typeParams = getTypeParameters(node.typeParameters);
-        const parameterInfo = getFunctionParametersInfo((node.parameters ?? []));
+        const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
         if (node.body && isBlock(node.body)) {
             prescanVariableDeclarations(node.body);
         }
@@ -911,7 +940,7 @@ export function visit(node, options = {}) {
         })}`;
     }
     else if (isArrowFunction(node)) {
-        const parameterInfo = getFunctionParametersInfo((node.parameters ?? []));
+        const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
         const inferredRetType = inferFunctionBodyReturnType(node);
         const returnType = inferredRetType ? ` ${inferredRetType}` : '';
         if (parameterInfo.prefixBlockContent && !isBlock(node.body)) {
@@ -1161,10 +1190,12 @@ export function visit(node, options = {}) {
         if (!typeName || typeName === 'interface{}') {
             return visitAnonymousStructLiteral(node);
         }
+        const fieldTypes = interfacePropertyTypes.get(typeName) ?? classPropertyTypes.get(typeName.replace(/^&|\*/, ''));
         const properties = (node.properties ?? [])
             .map((p) => {
             if (isPropertyAssignment(p)) {
-                return `${visit(p.name)}: ${visit(p.initializer)}`;
+                const fieldType = isIdentifier(p.name) ? fieldTypes?.get(p.name.text) : undefined;
+                return `${visit(p.name)}: ${toGoValueOfType(p.initializer, fieldType)}`;
             }
             // Shorthand: { name } → name: name
             if (isShorthandPropertyAssignment(p)) {
@@ -1201,6 +1232,120 @@ export function visit(node, options = {}) {
 }
 // Renders composite literal entries; multi-line entries need trailing commas
 // (Go inserts a semicolon after a newline that ends in `}`)
+// Visits a value going into a slot of Go type `goType`; non-nil values for
+// nullable primitives (*string/*float64/*bool) are boxed into pointers
+function toGoValueOfType(expr, goType) {
+    const code = visit(expr);
+    if (!goType || !NULLABLE_PRIMITIVE_TYPES.includes(goType) || isNilLiteral(expr)) {
+        return code;
+    }
+    if (isBinaryExpression(expr) && expr.operatorToken.kind === 'QuestionQuestionToken')
+        return code;
+    if (inferExpressionType(expr) !== goType.slice(1))
+        return code;
+    return `func() ${goType} { v := ${code}; return &v }()`;
+}
+const NULLABLE_PRIMITIVE_TYPES = ['*string', '*float64', '*bool'];
+// Nullable primitives (T | null → *T) that a guard has narrowed to T in the
+// code being emitted; reads of them dereference the pointer
+const narrowedVariables = new Set();
+function isNullablePrimitiveVariable(name) {
+    return NULLABLE_PRIMITIVE_TYPES.includes(variableGoTypes.get(name) ?? '');
+}
+// Emits `emit()` with `names` narrowed
+function withNarrowing(names, emit) {
+    const added = names.filter((n) => !narrowedVariables.has(n) && isNullablePrimitiveVariable(n));
+    for (const name of added)
+        narrowedVariables.add(name);
+    const code = emit();
+    for (const name of added)
+        narrowedVariables.delete(name);
+    return code;
+}
+// Variables known non-null when `condition` evaluates to `whenTrue`
+function getNarrowedNames(condition, whenTrue) {
+    if (isParenthesizedExpression(condition))
+        return getNarrowedNames(condition.expression, whenTrue);
+    if (isIdentifier(condition))
+        return whenTrue ? [condition.text] : [];
+    if (isPrefixUnaryExpression(condition) && condition.operator === 'ExclamationToken') {
+        return getNarrowedNames(condition.operand, !whenTrue);
+    }
+    if (!isBinaryExpression(condition))
+        return [];
+    const kind = condition.operatorToken.kind;
+    if (kind === 'AmpersandAmpersandToken') {
+        return whenTrue
+            ? [...getNarrowedNames(condition.left, true), ...getNarrowedNames(condition.right, true)]
+            : [];
+    }
+    if (kind === 'BarBarToken') {
+        return whenTrue
+            ? []
+            : [...getNarrowedNames(condition.left, false), ...getNarrowedNames(condition.right, false)];
+    }
+    const isNotEqual = kind === 'ExclamationEqualsEqualsToken' || kind === 'ExclamationEqualsToken';
+    const isEqual = kind === 'EqualsEqualsEqualsToken' || kind === 'EqualsEqualsToken';
+    if (!isNotEqual && !isEqual)
+        return [];
+    const checked = isNilLiteral(condition.right)
+        ? condition.left
+        : isNilLiteral(condition.left)
+            ? condition.right
+            : undefined;
+    if (!checked || !isIdentifier(checked))
+        return [];
+    return isNotEqual === whenTrue ? [checked.text] : [];
+}
+// Identifier occurrences that read the variable (not declarations, member
+// names, or assignment targets)
+function isNarrowableReference(node) {
+    const parent = node.parent;
+    if (!parent)
+        return false;
+    if (isPropertyAccessExpression(parent) && parent.name === node)
+        return false;
+    if (parent.name === node)
+        return false;
+    if (isBinaryExpression(parent) && parent.left === node) {
+        const op = parent.operatorToken.kind;
+        if (op === 'EqualsToken' || op === 'QuestionQuestionEqualsToken')
+            return false;
+    }
+    return true;
+}
+function alwaysExits(statement) {
+    if (isReturnStatement(statement) ||
+        isThrowStatement(statement) ||
+        isBreakStatement(statement) ||
+        statement.kind === 'ContinueStatement') {
+        return true;
+    }
+    if (isBlock(statement)) {
+        const statements = statement.statements ?? [];
+        return statements.length > 0 && alwaysExits(statements[statements.length - 1]);
+    }
+    return false;
+}
+// Statements of a block; after `if (!x) return;`, x stays narrowed for the rest
+function visitBlockStatements(statements) {
+    const added = [];
+    const parts = [];
+    for (const statement of statements) {
+        parts.push(visit(statement));
+        if (isIfStatement(statement) && !statement.elseStatement && alwaysExits(statement.thenStatement)) {
+            for (const name of getNarrowedNames(statement.expression, false)) {
+                if (!narrowedVariables.has(name) && isNullablePrimitiveVariable(name)) {
+                    narrowedVariables.add(name);
+                    added.push(name);
+                }
+            }
+        }
+    }
+    for (const name of added)
+        narrowedVariables.delete(name);
+    return parts.join('\t');
+}
 function compositeBody(rawEntries) {
     const entries = rawEntries.map((e) => e.trimEnd());
     if (!entries.some((e) => e.includes('\n')))
@@ -1359,7 +1504,9 @@ function getContextualTypeNode(node) {
         if (index > -1 && fn)
             return fn.parameters?.[index]?.type;
     }
-    if (isPropertyAssignment(parent) && parent.initializer === node && isIdentifier(parent.name)) {
+    if (isPropertyAssignment(parent) &&
+        parent.initializer === node &&
+        (isIdentifier(parent.name) || isStringLiteral(parent.name))) {
         const objectType = getContextualTypeNode(parent.parent);
         return objectType ? getMemberTypeNode(objectType, parent.name.text) : undefined;
     }
@@ -1570,8 +1717,10 @@ function inferExpressionType(expr) {
         return 'bool';
     if (expr.kind === 'NullKeyword')
         return 'nil';
-    if (isIdentifier(expr))
-        return variableGoTypes.get(expr.text);
+    if (isIdentifier(expr)) {
+        const varType = variableGoTypes.get(expr.text);
+        return narrowedVariables.has(expr.text) && varType?.startsWith('*') ? varType.slice(1) : varType;
+    }
     if (isArrayLiteralExpression(expr)) {
         return `[]${getArrayLiteralElementType(expr)}`;
     }
@@ -1616,9 +1765,22 @@ function inferExpressionType(expr) {
                 return memberType;
         }
     }
+    if (isCallExpression(expr) && isIdentifier(expr.expression)) {
+        const fn = declaredFunctions.get(expr.expression.text);
+        if (fn?.type)
+            return getType(fn.type);
+        const fnValueType = variableGoTypes.get(expr.expression.text);
+        if (fnValueType?.startsWith('func('))
+            return goFuncReturnType(fnValueType);
+    }
     if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression)) {
         const methodName = expr.expression.name.text;
         const ownerType = inferExpressionType(expr.expression.expression);
+        if (ownerType === 'string') {
+            const stringMethodType = STRING_METHOD_RETURN_TYPES[methodName];
+            if (stringMethodType)
+                return stringMethodType;
+        }
         if (ownerType && ownerType.startsWith('map[')) {
             if (methodName === 'has')
                 return 'bool';
@@ -1634,10 +1796,15 @@ function inferExpressionType(expr) {
                     : elementType;
                 return `[]${mappedType}`;
             }
-            if (methodName === 'filter')
+            if (['filter', 'slice', 'concat', 'reverse', 'sort'].includes(methodName)) {
                 return `[]${elementType}`;
-            if (methodName === 'some')
+            }
+            if (['some', 'every', 'includes'].includes(methodName))
                 return 'bool';
+            if (['indexOf', 'lastIndexOf', 'findIndex'].includes(methodName))
+                return 'float64';
+            if (['pop', 'shift', 'at'].includes(methodName))
+                return elementType;
             if (methodName === 'find')
                 return elementType;
             if (methodName === 'join')
@@ -1682,7 +1849,143 @@ function inferExpressionType(expr) {
         }
         return rightType ?? leftType;
     }
+    if (isPrefixUnaryExpression(expr) && expr.operator === 'ExclamationToken')
+        return 'bool';
+    if (isBinaryExpression(expr)) {
+        const kind = expr.operatorToken.kind;
+        if (COMPARISON_OPERATORS.has(kind) || kind === 'InKeyword' || kind === 'InstanceOfKeyword') {
+            return 'bool';
+        }
+        if (isLogicalOperator(expr.operatorToken)) {
+            return isLogicalValueExpression(expr) ? getLogicalValueType(expr) : 'bool';
+        }
+    }
     return undefined;
+}
+const STRING_METHOD_RETURN_TYPES = {
+    trim: 'string',
+    trimStart: 'string',
+    trimEnd: 'string',
+    toUpperCase: 'string',
+    toLowerCase: 'string',
+    slice: 'string',
+    substring: 'string',
+    replace: 'string',
+    replaceAll: 'string',
+    padStart: 'string',
+    padEnd: 'string',
+    repeat: 'string',
+    charAt: 'string',
+    concat: 'string',
+    at: 'string',
+    split: '[]string',
+    includes: 'bool',
+    startsWith: 'bool',
+    endsWith: 'bool',
+    indexOf: 'float64',
+    lastIndexOf: 'float64',
+    search: 'float64',
+    charCodeAt: 'float64'
+};
+// Return type of a Go func type string: `func(a T) R` → `R`
+function goFuncReturnType(funcType) {
+    let depth = 0;
+    for (let i = 4; i < funcType.length; i++) {
+        const ch = funcType[i];
+        if (ch === '(')
+            depth++;
+        else if (ch === ')') {
+            depth--;
+            if (depth === 0)
+                return funcType.slice(i + 1).trim() || undefined;
+        }
+    }
+    return undefined;
+}
+const COMPARISON_OPERATORS = new Set([
+    'EqualsEqualsEqualsToken',
+    'ExclamationEqualsEqualsToken',
+    'EqualsEqualsToken',
+    'ExclamationEqualsToken',
+    'LessThanToken',
+    'LessThanEqualsToken',
+    'GreaterThanToken',
+    'GreaterThanEqualsToken'
+]);
+function isLogicalOperator(token) {
+    return token?.kind === 'AmpersandAmpersandToken' || token?.kind === 'BarBarToken';
+}
+// JS truthiness of an expression as a Go bool, by its Go type
+function toGoCondition(expr) {
+    if (isParenthesizedExpression(expr))
+        return `(${toGoCondition(expr.expression)})`;
+    if (isPrefixUnaryExpression(expr) && expr.operator === 'ExclamationToken') {
+        return `!${wrapCondition(toGoCondition(expr.operand))}`;
+    }
+    if (isBinaryExpression(expr) && isLogicalOperator(expr.operatorToken)) {
+        const isAnd = expr.operatorToken.kind === 'AmpersandAmpersandToken';
+        const right = withNarrowing(getNarrowedNames(expr.left, isAnd), () => toGoCondition(expr.right));
+        return `${toGoCondition(expr.left)} ${isAnd ? '&&' : '||'} ${right}`;
+    }
+    return truthinessCheck(visit(expr, { inline: true }), inferExpressionType(expr));
+}
+function truthinessCheck(code, goType) {
+    if (!goType || goType === 'bool' || goType === ':')
+        return code;
+    if (goType === 'string')
+        return `${code} != ""`;
+    if (goType === 'float64')
+        return `${code} != 0`;
+    if (goType === '*bool')
+        return `(${code} != nil && *${code})`;
+    if (goType === '*string')
+        return `(${code} != nil && *${code} != "")`;
+    if (goType === '*float64')
+        return `(${code} != nil && *${code} != 0)`;
+    if (goType.startsWith('*') ||
+        goType.startsWith('[]') ||
+        goType.startsWith('map[') ||
+        goType.startsWith('func') ||
+        goType.startsWith('chan ') ||
+        goType === 'interface{}') {
+        return `${code} != nil`;
+    }
+    return code;
+}
+// Parenthesizes a condition unless it is already atomic
+function wrapCondition(condition) {
+    return /^[\w.]+$/.test(condition) || /^\(.*\)$/.test(condition) ? condition : `(${condition})`;
+}
+// `a || b` with non-bool operands is a value (JS returns an operand), not a bool
+function isLogicalValueExpression(expr) {
+    if (expr.operatorToken.kind !== 'BarBarToken')
+        return false;
+    const leftType = inferExpressionType(expr.left);
+    const rightType = inferExpressionType(expr.right);
+    return !!leftType && leftType !== 'bool' && !!rightType && rightType !== 'bool';
+}
+function getLogicalValueType(expr) {
+    const leftType = inferExpressionType(expr.left);
+    const rightType = inferExpressionType(expr.right);
+    if (leftType.startsWith('*') && rightType === leftType.slice(1))
+        return rightType;
+    return leftType;
+}
+// && / || : boolean form when any operand is non-bool (truthiness), value form for
+// `a || fallback`; undefined keeps the plain Go operator (both operands bool/unknown)
+function visitLogicalExpression(expr) {
+    const leftType = inferExpressionType(expr.left);
+    const rightType = inferExpressionType(expr.right);
+    const isBoolOrUnknown = (t) => !t || t === 'bool' || t === ':';
+    if (isBoolOrUnknown(leftType) && isBoolOrUnknown(rightType))
+        return undefined;
+    if (!isLogicalValueExpression(expr))
+        return toGoCondition(expr);
+    // a || b → func() T { if truthy(a) { return a }; return b }()
+    const resultType = getLogicalValueType(expr);
+    const tmp = getTempName('or');
+    const leftValue = leftType.startsWith('*') && resultType === leftType.slice(1) ? `*${tmp}` : tmp;
+    return `func() ${resultType} { ${tmp} := ${visit(expr.left)}; if ${truthinessCheck(tmp, leftType)} { return ${leftValue} }; return ${visit(expr.right)} }()`;
 }
 function makeNullableType(typeName) {
     if (!typeName || typeName === 'interface{}' || typeName.startsWith('*'))
@@ -1692,8 +1995,8 @@ function makeNullableType(typeName) {
     return typeName;
 }
 function visitConditionalExpression(node) {
-    const whenTrue = visit(node.whenTrue);
-    const whenFalse = visit(node.whenFalse);
+    const whenTrue = withNarrowing(getNarrowedNames(node.condition, true), () => visit(node.whenTrue));
+    const whenFalse = withNarrowing(getNarrowedNames(node.condition, false), () => visit(node.whenFalse));
     const resultType = inferExpectedTypeFromContext(node) ||
         (() => {
             const whenTrueType = inferExpressionType(node.whenTrue);
@@ -1702,7 +2005,7 @@ function visitConditionalExpression(node) {
                 return whenTrueType;
             return whenTrueType ?? whenFalseType ?? 'interface{}';
         })();
-    return `func() ${resultType} { if ${visit(node.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
+    return `func() ${resultType} { if ${toGoCondition(node.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
 }
 function visitNullishCoalescingExpression(node) {
     const leftType = inferExpressionType(node.left);
@@ -2186,11 +2489,25 @@ function getClassNameFromTypeNode(typeNode) {
 }
 function resolveExpressionType(expr) {
     if (isIdentifier(expr)) {
-        return variableTypes.get(expr.text);
+        return variableTypes.get(expr.text) ?? goTypeCategory(variableGoTypes.get(expr.text));
     }
     if (expr.kind === 'ThisKeyword') {
         return 'class';
     }
+    return goTypeCategory(inferExpressionType(expr));
+}
+// Method-dispatch category of an inferred Go type (e.g. `const s = new Set<T>()`)
+function goTypeCategory(goType) {
+    if (!goType)
+        return undefined;
+    if (goType.startsWith('map['))
+        return goType.endsWith(']struct{}') ? 'Set' : 'Map';
+    if (goType.startsWith('[]'))
+        return 'array';
+    if (goType === 'string')
+        return 'string';
+    if (goType === '*regexp.Regexp')
+        return 'RegExp';
     return undefined;
 }
 function isNilLiteral(node) {
@@ -2612,6 +2929,59 @@ function getOperatorText(operator) {
 function getTimerName(name) {
     return `__timer_${name.replaceAll(' ', '_').replaceAll('"', '')}__`;
 }
+function isRegexReplaceCall(node) {
+    if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression))
+        return false;
+    const method = node.expression.name.text;
+    if (method !== 'replace' && method !== 'replaceAll')
+        return false;
+    const pattern = (node.arguments ?? [])[0];
+    if (!pattern || (node.arguments ?? []).length < 2)
+        return false;
+    return (isRegularExpressionLiteral(pattern) ||
+        inferExpressionType(pattern) === '*regexp.Regexp' ||
+        resolveExpressionType(pattern) === 'RegExp');
+}
+function isRegexReplacerCallback(fn) {
+    if (!isArrowFunction(fn) && !isFunctionExpression(fn))
+        return false;
+    const call = fn.parent;
+    return !!call && isRegexReplaceCall(call) && call.arguments[1] === fn;
+}
+// JS replacement patterns → Go: $& (whole match) → ${0}, $1 → ${1}
+function jsReplacementToGo(replacement) {
+    if (!isStringLiteral(replacement) && !isNoSubstitutionTemplateLiteral(replacement)) {
+        return visit(replacement);
+    }
+    const goPattern = replacement.text.replace(/\$&/g, '${0}').replace(/\$(\d+)/g, '${$1}');
+    return toGoStringLiteral(goPattern);
+}
+// str.replace(/re/g, x) → re.ReplaceAllString; without g only the first match is
+// replaced; a function replacer receives (match, ...groups)
+function visitRegexReplace(node) {
+    if (!isRegexReplaceCall(node))
+        return undefined;
+    const [pattern, replacement] = node.arguments;
+    const isGlobal = node.expression.name.text === 'replaceAll' ||
+        (isRegularExpressionLiteral(pattern) &&
+            pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g'));
+    const target = visit(node.expression.expression);
+    const re = visit(pattern);
+    importedPackages.add('regexp');
+    if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {
+        useHelper('regexReplaceFunc');
+        const callback = visit(replacement);
+        const groupArgs = (replacement.parameters ?? [])
+            .map((_p, index) => `TnGroup(__m, ${index})`)
+            .join(', ');
+        return `TnRegexReplaceFunc(${re}, ${target}, func(__m []string) string { return (${callback})(${groupArgs}) }, ${isGlobal})`;
+    }
+    const goReplacement = jsReplacementToGo(replacement);
+    if (isGlobal)
+        return `${re}.ReplaceAllString(${target}, ${goReplacement})`;
+    useHelper('regexReplaceFirst');
+    return `TnRegexReplaceFirst(${re}, ${target}, ${goReplacement})`;
+}
 function jsRegexFlagsToGo(flags) {
     let goFlags = '';
     if (flags.includes('i'))
@@ -2658,7 +3028,9 @@ function getParameterGoType(param) {
     }
     if (param.type) {
         const explicitType = getType(param.type);
-        return explicitType === ':' ? 'interface{}' : explicitType;
+        if (explicitType === ':')
+            return 'interface{}';
+        return param.questionToken ? makeNullableType(explicitType) : explicitType;
     }
     if (param.initializer) {
         const inferredType = inferExpressionType(param.initializer);
@@ -2666,6 +3038,8 @@ function getParameterGoType(param) {
             return inferredType;
         }
     }
+    if (param.parent && isRegexReplacerCallback(param.parent))
+        return 'string';
     const contextualFn = param.parent ? getContextualFunctionType(param.parent) : undefined;
     if (contextualFn) {
         const index = (param.parent.parameters ?? []).indexOf(param);
@@ -2675,7 +3049,63 @@ function getParameterGoType(param) {
     }
     return 'interface{}';
 }
+// Parameters are variables of the function body: record their types (replacing
+// whatever an earlier variable of the same name had)
+function registerParameterType(param) {
+    if (!isIdentifier(param.name))
+        return;
+    const name = param.name.text;
+    const goType = getParameterGoType(param);
+    variableGoTypes.set(name, goType.startsWith('...') ? `[]${goType.slice(3)}` : goType);
+    const category = param.type ? getTypeCategory(param.type) : undefined;
+    if (category)
+        variableTypes.set(name, category);
+    else
+        variableTypes.delete(name);
+    const className = param.type ? getClassNameFromTypeNode(param.type) : undefined;
+    if (className)
+        variableClassNames.set(name, className);
+    else
+        variableClassNames.delete(name);
+}
+// TS lets a function literal omit trailing parameters of its contextual type;
+// Go func types must match exactly, so the omitted ones are added as unused `_`
+// Arguments of a call; for calls to declared functions, values are converted to
+// the parameter types (nullable primitives boxed) and omitted optional
+// parameters are passed as zero values (nil for pointers)
+function visitCallArguments(node) {
+    const args = node.arguments ?? [];
+    const fn = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
+    if (!fn)
+        return args.map((a) => visit(a));
+    const params = fn.parameters ?? [];
+    const result = args.map((arg, index) => {
+        const param = params[index];
+        return param && !param.dotDotDotToken ? toGoValueOfType(arg, getParameterGoType(param)) : visit(arg);
+    });
+    for (let i = args.length; i < params.length; i++) {
+        const param = params[i];
+        if (!param.questionToken || param.initializer || param.dotDotDotToken)
+            break;
+        result.push(`*new(${getParameterGoType(param)})`);
+    }
+    return result;
+}
+function withContextualParameters(fn, info) {
+    const contextualFn = getContextualFunctionType(fn);
+    const declaredCount = (fn.parameters ?? []).length;
+    const contextualParams = contextualFn?.parameters ?? [];
+    if (contextualParams.length <= declaredCount || info.signature.includes('...'))
+        return info;
+    const extra = contextualParams
+        .slice(declaredCount)
+        .map((p) => `_ ${p.dotDotDotToken ? '...' : ''}${p.type ? getType(p.type) : 'interface{}'}`);
+    const signature = [info.signature, ...extra].filter((part) => part).join(', ');
+    return { ...info, signature };
+}
 function getFunctionParametersInfo(parameters) {
+    for (const param of parameters)
+        registerParameterType(param);
     if (parameters.length === 0) {
         return { signature: '', prefixBlockContent: '' };
     }
@@ -3124,6 +3554,8 @@ const nodeModuleMappings = {
 };
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
+    regexReplaceFirst: ['regexp'],
+    regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
     appendFile: ['os'],
@@ -3145,6 +3577,39 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    regexReplaceFirst: `func TnRegexReplaceFirst(re *regexp.Regexp, s string, repl string) string {
+	loc := re.FindStringSubmatchIndex(s)
+	if loc == nil {
+		return s
+	}
+	return s[:loc[0]] + string(re.ExpandString(nil, repl, s, loc)) + s[loc[1]:]
+}`,
+    regexReplaceFunc: `func TnRegexReplaceFunc(re *regexp.Regexp, s string, fn func([]string) string, all bool) string {
+	limit := 1
+	if all {
+		limit = -1
+	}
+	result := ""
+	last := 0
+	for _, loc := range re.FindAllStringSubmatchIndex(s, limit) {
+		groups := make([]string, len(loc)/2)
+		for i := range groups {
+			if loc[2*i] >= 0 {
+				groups[i] = s[loc[2*i]:loc[2*i+1]]
+			}
+		}
+		result += s[last:loc[0]] + fn(groups)
+		last = loc[1]
+	}
+	return result + s[last:]
+}
+
+func TnGroup(groups []string, i int) string {
+	if i < len(groups) {
+		return groups[i]
+	}
+	return ""
+}`,
     readFile: `func TnReadFile(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
