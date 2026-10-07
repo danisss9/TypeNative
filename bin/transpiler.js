@@ -960,6 +960,9 @@ export function visit(node, options = {}) {
     else if (isBreakStatement(node)) {
         return 'break';
     }
+    else if (node.kind === 'ContinueStatement') {
+        return 'continue;\n\t';
+    }
     else if (isThrowStatement(node)) {
         const expr = node.expression;
         if (isNewExpression(expr) &&
