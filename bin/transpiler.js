@@ -3194,13 +3194,20 @@ const callHandlers = {
         importedPackages.add('math');
         return `math.Abs(${args[0]})`;
     },
+    // Math.max(...arr) → slices.Max(arr); otherwise Go's variadic builtin
     'Math.max': (_caller, args) => {
-        importedPackages.add('math');
-        return `math.Max(${args[0]}, ${args[1]})`;
+        if (args.length === 1 && args[0].endsWith('...')) {
+            importedPackages.add('slices');
+            return `slices.Max(${args[0].slice(0, -3)})`;
+        }
+        return `max(${args.join(', ')})`;
     },
     'Math.min': (_caller, args) => {
-        importedPackages.add('math');
-        return `math.Min(${args[0]}, ${args[1]})`;
+        if (args.length === 1 && args[0].endsWith('...')) {
+            importedPackages.add('slices');
+            return `slices.Min(${args[0].slice(0, -3)})`;
+        }
+        return `min(${args.join(', ')})`;
     },
     'Math.sqrt': (_caller, args) => {
         importedPackages.add('math');
