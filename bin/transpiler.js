@@ -595,14 +595,20 @@ export function visit(node, options = {}) {
         // Maps (Record/Map) and string keys index directly; arrays/strings need an int index
         const targetType = inferExpressionType(node.expression);
         if (targetType === 'string') {
-            // s[i] in JS is a one-character string; in Go it is a byte
-            return `string(${visit(node.expression)}[int(${visit(node.argumentExpression)})])`;
+            // s[i] in JS is a one-character string ("" when out of range)
+            useHelper('dynamic');
+            return `TnCharAt(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
         }
         if (targetType?.startsWith('map[')) {
             return `${visit(node.expression)}[${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))}]`;
         }
         if (isStringLiteral(node.argumentExpression)) {
             return `${visit(node.expression)}[${visit(node.argumentExpression)}]`;
+        }
+        // Reading past the end of an array gives undefined in JS: the zero value here
+        if (targetType?.startsWith('[]') && !isAssignmentTarget(node)) {
+            useHelper('dynamic');
+            return `TnAt(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
         }
         return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
     }
@@ -1441,7 +1447,11 @@ function toGoValueOfType(expr, goType) {
             return `&${code}`;
         if (inferExpressionType(expr) !== goType.slice(1))
             return code;
-        if (isIdentifier(expr) || isElementAccessExpression(expr) || isPropertyAccessExpression(expr)) {
+        // the element itself (not a bounds-checked copy), so mutations are shared
+        if (isElementAccessExpression(expr) && inferExpressionType(expr.expression)?.startsWith('[]')) {
+            return `&${visit(expr.expression)}[int(${visit(expr.argumentExpression)})]`;
+        }
+        if (isIdentifier(expr) || isPropertyAccessExpression(expr)) {
             return `&${code}`;
         }
         return `func() ${goType} { v := ${code}; return &v }()`;
@@ -1774,6 +1784,15 @@ function getObjectLiteralGoType(node) {
 // never by guessing their type
 function isDynamicValue(expr) {
     return inferExpressionType(expr) === 'interface{}';
+}
+// Whether an expression is written to (x = …, x += …, x++)
+function isAssignmentTarget(node) {
+    const parent = node.parent;
+    if (isBinaryExpression(parent) && parent.left === node) {
+        return /^(EqualsToken|.*EqualsToken)$/.test(parent.operatorToken.kind) &&
+            !['EqualsEqualsToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsToken', 'ExclamationEqualsEqualsToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(parent.operatorToken.kind);
+    }
+    return isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent);
 }
 function isCallee(node) {
     return isCallExpression(node.parent) && node.parent.expression === node;
@@ -3944,7 +3963,7 @@ function visitRegexReplace(node) {
     const isGlobal = node.expression.name.text === 'replaceAll' ||
         (isRegularExpressionLiteral(pattern) &&
             pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g'));
-    const target = visit(node.expression.expression);
+    const target = toGoValueOfType(node.expression.expression, 'string');
     const re = visit(pattern);
     importedPackages.add('regexp');
     if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {
@@ -4076,6 +4095,8 @@ function getCollectionArgumentTypes(node) {
         if (method === 'set')
             return [keyType, valueType];
     }
+    if (receiverType === '*regexp.Regexp' && (method === 'test' || method === 'exec'))
+        return ['string'];
     if (receiverType?.startsWith('[]') && method === 'push') {
         return (node.arguments ?? []).map(() => receiverType.slice(2));
     }
@@ -4715,6 +4736,21 @@ func TnSame(a interface{}, b interface{}) bool {
 		return false
 	}
 	return a == b
+}
+
+func TnAt[T any](s []T, i float64) T {
+	if i < 0 || int(i) >= len(s) {
+		var zero T
+		return zero
+	}
+	return s[int(i)]
+}
+
+func TnCharAt(s string, i float64) string {
+	if i < 0 || int(i) >= len(s) {
+		return ""
+	}
+	return string(s[int(i)])
 }
 
 func TnLength(v interface{}) float64 {
