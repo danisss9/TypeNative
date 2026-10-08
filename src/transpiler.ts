@@ -2268,7 +2268,13 @@ function visitTemplateExpression(node: AstNode): string {
 
   for (const span of node.templateSpans) {
     importedPackages.add('fmt');
-    parts.push(`fmt.Sprintf("%v", ${visit(span.expression)})`);
+    const spanType = inferExpressionType(span.expression);
+    if (spanType && NULLABLE_PRIMITIVE_TYPES.includes(spanType)) {
+      useHelper('dynamic');
+      parts.push(`TnFormat(${visit(span.expression)})`);
+    } else {
+      parts.push(`fmt.Sprintf("%v", ${visit(span.expression)})`);
+    }
 
     if (span.literal.text.length > 0) {
       parts.push(toGoStringLiteral(span.literal.text));
@@ -4178,7 +4184,31 @@ function jsReplacementToGo(replacement: AstNode): string {
   if (!isStringLiteral(replacement) && !isNoSubstitutionTemplateLiteral(replacement)) {
     return visit(replacement);
   }
-  const goPattern = replacement.text.replace(/\$&/g, '${0}').replace(/\$(\d+)/g, '${$1}');
+  const text: string = replacement.text;
+  let goPattern = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = i + 1 < text.length ? text[i + 1] : '';
+    if (ch !== '$') {
+      goPattern += ch;
+    } else if (next === '$') {
+      goPattern += '$$';
+      i++;
+    } else if (next === '&') {
+      goPattern += '${0}';
+      i++;
+    } else if (next >= '0' && next <= '9') {
+      let digits = next;
+      i++;
+      while (i + 1 < text.length && text[i + 1] >= '0' && text[i + 1] <= '9') {
+        digits += text[i + 1];
+        i++;
+      }
+      goPattern += '${' + digits + '}';
+    } else {
+      goPattern += '$$';
+    }
+  }
   return toGoStringLiteral(goPattern);
 }
 
@@ -5036,6 +5066,18 @@ func TnLength(v interface{}) float64 {
 		return float64(len(t))
 	}
 	return 0
+}
+
+// A value as JS prints it in a template literal (nil pointers are "undefined")
+func TnFormat(v interface{}) string {
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() || (rv.Kind() == reflect.Pointer && rv.IsNil()) {
+		return "undefined"
+	}
+	if rv.Kind() == reflect.Pointer {
+		return fmt.Sprintf("%v", rv.Elem().Interface())
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
