@@ -910,6 +910,16 @@ export function visit(node, options = {}) {
             const right = withNarrowing(getNarrowedNames(node.left, op === '&&'), () => visit(node.right));
             return `${visit(node.left)} ${op} ${right}`;
         }
+        if (op === '+') {
+            const leftType = inferExpressionType(node.left);
+            const rightType = inferExpressionType(node.right);
+            if (leftType === 'string' && rightType !== 'string') {
+                return `${visit(node.left)} + ${jsStringOf(visit(node.right), rightType)}`;
+            }
+            if (rightType === 'string' && leftType !== 'string') {
+                return `${jsStringOf(visit(node.left), leftType)} + ${visit(node.right)}`;
+            }
+        }
         return `${visit(node.left)} ${op} ${visit(node.right)}`;
     }
     else if (isParenthesizedExpression(node)) {
@@ -1738,6 +1748,22 @@ function getStructFieldGoType(structType, field) {
     }
     return undefined;
 }
+// A Go expression as the string JS would produce for it (numbers like JS:
+// 1000000, 0.5, NaN; not Go's 1e+06)
+function jsStringOf(code, goType) {
+    if (goType === 'string')
+        return code;
+    if (goType === 'float64') {
+        useHelper('dynamic');
+        return `TnNumStr(${code})`;
+    }
+    if (goType === 'bool') {
+        importedPackages.add('strconv');
+        return `strconv.FormatBool(${code})`;
+    }
+    importedPackages.add('fmt');
+    return `fmt.Sprintf("%v", ${code})`;
+}
 function compositeBody(rawEntries) {
     const entries = rawEntries.map((e) => e.trimEnd());
     if (!entries.some((e) => e.includes('\n')))
@@ -2175,14 +2201,13 @@ function visitTemplateExpression(node) {
         parts.push(toGoStringLiteral(node.head.text));
     }
     for (const span of node.templateSpans) {
-        importedPackages.add('fmt');
         const spanType = inferExpressionType(span.expression);
         if (spanType && NULLABLE_PRIMITIVE_TYPES.includes(spanType)) {
             useHelper('dynamic');
             parts.push(`TnFormat(${visit(span.expression)})`);
         }
         else {
-            parts.push(`fmt.Sprintf("%v", ${visit(span.expression)})`);
+            parts.push(jsStringOf(visit(span.expression), spanType));
         }
         if (span.literal.text.length > 0) {
             parts.push(toGoStringLiteral(span.literal.text));
@@ -4748,7 +4773,7 @@ const helperPackages = {
     regexReplaceFirst: ['regexp'],
     jsonStringify: ['encoding/json', 'bytes', 'strings'],
     typeOf: ['reflect'],
-    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect'],
+    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv'],
     regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
@@ -4876,6 +4901,21 @@ func TnAssign(dst map[string]interface{}, src interface{}) {
 			dst[k] = v
 		}
 	}
+}
+
+// A number as JS prints it
+func TnNumStr(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	case f == math.Trunc(f) && math.Abs(f) < 1e21:
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
