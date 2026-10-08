@@ -1815,7 +1815,8 @@ function isAssignmentTarget(node) {
         return /^(EqualsToken|.*EqualsToken)$/.test(parent.operatorToken.kind) &&
             !['EqualsEqualsToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsToken', 'ExclamationEqualsEqualsToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(parent.operatorToken.kind);
     }
-    return isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent);
+    return ((isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent)) &&
+        ['PlusPlusToken', 'MinusMinusToken'].includes(parent.operator));
 }
 // `x as T`: an any value cast to an object type stays dynamic (a JS object
 // cannot become a Go struct); other casts convert to T
