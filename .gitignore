@@ -82,4 +82,5 @@ typings/
 \code
 disttsparser/tsparser.exe
 .zcode
-distnative
+dist
+native
