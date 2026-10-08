@@ -2981,7 +2981,16 @@ function visitNullishCoalescingExpression(node: AstNode): string {
     const tmp = getTempName('nullish');
     const lookup = isLast ? undefined : getMapLookup(operand);
     const operandType = inferExpressionType(operand);
-    if (lookup) {
+    const arrayType =
+      !isLast && isElementAccessExpression(operand) ? inferExpressionType(operand.expression) : undefined;
+    if (arrayType?.startsWith('[]')) {
+      // arr[i] ?? x: out of range is undefined in JS
+      const array = getTempName('arr');
+      const index = getTempName('idx');
+      steps.push(
+        `if ${array}, ${index} := ${visit(operand.expression)}, int(${visit(operand.argumentExpression)}); ${index} >= 0 && ${index} < len(${array}) { return ${convertGoValue(`${array}[${index}]`, arrayType.slice(2), resultType)} }`
+      );
+    } else if (lookup) {
       const valueType = extractMapValueType(inferExpressionType(lookup.mapNode) ?? '');
       steps.push(
         `if ${tmp}, ok := ${lookup.map}[${lookup.key}]; ok { return ${convertGoValue(tmp, valueType, resultType)} }`
