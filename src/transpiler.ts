@@ -1948,6 +1948,10 @@ function isCallee(node: AstNode): boolean {
 function isAnyContext(typeNode: AstNode | undefined): boolean {
   for (let depth = 0; typeNode && depth < 10; depth++) {
     if (isAnyTypeNode(typeNode)) return true;
+    // any | undefined is still any
+    if (isUnionTypeNode(typeNode)) {
+      return (typeNode.types ?? []).some((t: AstNode) => isAnyContext(t));
+    }
     if (!isTypeReferenceNode(typeNode) || !isIdentifier(typeNode.typeName)) return false;
     typeNode = declaredTypeAliases.get(typeNode.typeName.text);
   }
@@ -4110,9 +4114,10 @@ function visitTypeOf(node: AstNode): string {
 // x.method(...) with an any receiver, as a call on the receiver cast to the type
 // that defines the method (array or string); undefined for other methods
 function castDynamicReceiverCall(node: AstNode): AstNode | undefined {
-  if (!isPropertyAccessExpression(node.expression) || !isDynamicValue(node.expression.expression)) {
+  if (!isPropertyAccessExpression(node.expression) || isAsExpression(node.expression.expression)) {
     return undefined;
   }
+  if (!isDynamicValue(node.expression.expression)) return undefined;
   const method = node.expression.name.text;
   let castType: AstNode | undefined;
   if (ARRAY_ONLY_METHODS.has(method)) castType = { kind: 'ArrayType', elementType: { kind: 'AnyKeyword' } };
@@ -5214,6 +5219,9 @@ func TnAsPtr[T any](v interface{}) *T {
 }
 
 func TnAs[T any](v interface{}) T {
+	if p, ok := v.(*T); ok && p != nil {
+		return *p
+	}
 	t, _ := v.(T)
 	return t
 }

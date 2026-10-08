@@ -26,9 +26,13 @@ Goal: TypeNative transpiles itself into a native Go binary (1.0 milestone).
       via an injected parse function (ts shim keeps predicate call sites); operator
       tokens, process.env, stdin-exec mappings added; verified identical Go output
       via npm parser and Go-parser paths on all 33 test specs
-- [ ] Phase 4: dogfood src/transpiler.ts (2.6k lines): regex /g semantics,
-      String.replace with function replacer, JSON.parse result typing, object spread,
-      Array.includes on untyped values, default-import namespace stripping (ts.x → x)
+- [x] Phase 4: src/main.ts (incl. transpiler.ts) compiles to a native binary;
+      `any` values use a small Go runtime (TnGet/TnSet/TnAs/...) instead of guessed types
+- [x] Phase 5: stage-1/stage-2 bootstrap — the native compiler passes all test specs
+      and reproduces its own Go source identically (fixpoint)
+
+## Next
+- [ ] CI self-hosting job (stage 1 → stage 2 → compare); README/CHANGELOG updates
+- [ ] Stateful RegExp /g (`lastIndex`, `while ((m = re.exec(s)))` loops)
 - [ ] import.meta.url lowering
-- [ ] Phase 5: stage-1/stage-2 bootstrap + run test suite through the native binary
-- [ ] Phase 5: CI self-hosting job; README/CHANGELOG updates
+- [ ] Gradually type the AST in transpiler.ts (fewer dynamic lookups, faster binary)
