@@ -1347,7 +1347,19 @@ export function visit(node, options = {}) {
         return `New${className}${typeArgs}(${args.join(', ')})`;
     }
     else if (isObjectLiteralExpression(node)) {
-        if (isAnyContext(getContextualTypeNode(node))) {
+        if (isDynamicObjectLiteral(node)) {
+            // { ...a, k: v } → copy a's properties, then set k (in source order)
+            if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
+                useHelper('dynamic');
+                const steps = (node.properties ?? []).map((p) => {
+                    if (p.kind === 'SpreadAssignment')
+                        return `TnAssign(__obj, ${visit(p.expression)})`;
+                    if (isShorthandPropertyAssignment(p))
+                        return `__obj[${mapKeyText(p.name)}] = ${visit(p.name)}`;
+                    return `__obj[${mapKeyText(p.name)}] = ${visit(p.initializer)}`;
+                });
+                return `func() map[string]interface{} { __obj := map[string]interface{}{}; ${steps.join('; ')}; return __obj }()`;
+            }
             const entries = (node.properties ?? [])
                 .map((p) => {
                 if (isPropertyAssignment(p))
@@ -1766,7 +1778,15 @@ function getDictionaryValueType(node) {
     return valueType ?? 'interface{}';
 }
 // Go type of an object literal, matching what the visitor emits
+// Object literals that are dynamic objects: in an any context, or spreading an any value
+function isDynamicObjectLiteral(node) {
+    if (isAnyContext(getContextualTypeNode(node)))
+        return true;
+    return (node.properties ?? []).some((p) => p.kind === 'SpreadAssignment' && isDynamicValue(p.expression));
+}
 function getObjectLiteralGoType(node) {
+    if (isDynamicObjectLiteral(node))
+        return 'interface{}';
     const contextualType = resolveTypeNode(getContextualTypeNode(node));
     if (isRecordTypeNode(contextualType))
         return getType(contextualType);
@@ -4819,6 +4839,15 @@ func TnFormat(v interface{}) string {
 		return fmt.Sprintf("%v", rv.Elem().Interface())
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// Object spread: copies the properties of src into dst
+func TnAssign(dst map[string]interface{}, src interface{}) {
+	if o, ok := src.(map[string]interface{}); ok {
+		for k, v := range o {
+			dst[k] = v
+		}
+	}
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
