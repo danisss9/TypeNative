@@ -737,11 +737,12 @@ export function visit(node, options = {}) {
             initializer = `= ${toGoValueOfType(node.initializer, type)}`;
         }
         // Package scope has no `:=`: module-level declarations need `var x = expr`
-        const isPackageScope = emittingModuleFile && isSourceFile(node.parent?.parent?.parent);
+        const isTopLevelStatement = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
+        const isPackageScope = emittingModuleFile && isTopLevelStatement;
         if (type === ':' && isPackageScope) {
             return `var ${visit(node.name)} ${initializer}`;
         }
-        const isMainTopLevel = !emittingModuleFile && isSourceFile(node.parent?.parent?.parent);
+        const isMainTopLevel = !emittingModuleFile && isTopLevelStatement;
         const packageType = type === ':' ? variableGoTypes.get(node.name.text) : type;
         if (isMainTopLevel && packageType && packageType !== 'nil' && isIdentifier(node.name)) {
             const name = visit(node.name);
