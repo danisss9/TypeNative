@@ -6,4 +6,5 @@ test
 TypeScript
 .gitignore
 .prettierrc.json
-tsconfig.json
+tsconfig.jsonnative
+scripts

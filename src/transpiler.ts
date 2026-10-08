@@ -3606,8 +3606,9 @@ function getAcessString(leftSide: string, rightSide: string, objectType?: string
       return 'os.Args';
     }
     if (rightSide === 'platform') {
-      importedPackages.add('runtime');
-      return 'runtime.GOOS';
+      // Node's names: win32 / darwin / linux
+      useHelper('osPlatform');
+      return 'TnOsPlatform()';
     }
     if (rightSide === 'env') {
       // process.env.X is detected via the nested access below
