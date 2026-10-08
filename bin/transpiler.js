@@ -1379,22 +1379,24 @@ export function visit(node, options = {}) {
         if (!typeName || typeName === 'interface{}') {
             return visitAnonymousStructLiteral(node);
         }
-        // { ...base, x: 1 } → copy base (Go structs copy by value), then set fields
+        // Objects are pointers: the struct type is typeName without its *
+        const structName = typeName.replace(/^\*/, '');
+        // { ...base, x: 1 } → a copy of *base with fields set
         if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
             const steps = (node.properties ?? []).map((p) => {
                 if (p.kind === 'SpreadAssignment')
-                    return `__obj = ${visit(p.expression)}`;
+                    return `__obj = *(${visit(p.expression)})`;
                 if (isShorthandPropertyAssignment(p))
                     return `__obj.${goFieldName(p.name.text)} = ${visit(p.name)}`;
                 const spreadFieldType = isIdentifier(p.name)
-                    ? (interfacePropertyTypes.get(typeName)?.get(p.name.text) ??
-                        getStructFieldGoType(typeName, p.name.text))
+                    ? (interfacePropertyTypes.get(structName)?.get(p.name.text) ??
+                        getStructFieldGoType(structName, p.name.text))
                     : undefined;
                 return `__obj.${visit(p.name)} = ${toGoValueOfType(p.initializer, spreadFieldType)}`;
             });
-            return `func() ${typeName} { var __obj ${typeName}; ${steps.join('; ')}; return __obj }()`;
+            return `func() *${structName} { var __obj ${structName}; ${steps.join('; ')}; return &__obj }()`;
         }
-        const fieldTypes = interfacePropertyTypes.get(typeName) ?? classPropertyTypes.get(typeName.replace(/^&|\*/, ''));
+        const fieldTypes = interfacePropertyTypes.get(structName) ?? classPropertyTypes.get(structName);
         const properties = (node.properties ?? [])
             .map((p) => {
             if (isPropertyAssignment(p)) {
@@ -1411,7 +1413,7 @@ export function visit(node, options = {}) {
             return '';
         })
             .filter((p) => p);
-        return `${typeName}${compositeBody(properties)}`;
+        return `&${structName}${compositeBody(properties)}`;
     }
     else if (isPropertyAssignment(node)) {
         return `${visit(node.name)}: ${visit(node.initializer)}`;
@@ -1458,8 +1460,9 @@ function toGoValueOfType(expr, goType) {
     }
     // *Struct slot: take the address (shares the value, like a JS object reference)
     if (goType?.startsWith('*') && isStructGoType(goType.slice(1)) && !isNilLiteral(expr)) {
+        // an untyped literal (&struct{...}) converts to the named pointer type
         if (isObjectLiteralExpression(expr))
-            return `&${code}`;
+            return code.startsWith('&struct{') ? `(${goType})(${code})` : code;
         if (inferExpressionType(expr) !== goType.slice(1))
             return code;
         // the element itself (not a bounds-checked copy), so mutations are shared
@@ -1709,6 +1712,7 @@ function extractMapKeyType(mapType) {
 }
 // Field type of an anonymous struct type string: struct{ a T; b U } → field b → U
 function getStructFieldGoType(structType, field) {
+    structType = structType.replace(/^\*/, '');
     if (!structType.startsWith('struct{'))
         return undefined;
     const body = structType.slice(7, structType.lastIndexOf('}'));
@@ -1790,8 +1794,8 @@ function getObjectLiteralGoType(node) {
     const contextualType = resolveTypeNode(getContextualTypeNode(node));
     if (isRecordTypeNode(contextualType))
         return getType(contextualType);
-    const typeName = contextualType ? getTypeText(contextualType) : '';
-    if (typeName && typeName !== 'interface{}')
+    const typeName = contextualType ? getType(contextualType) : '';
+    if (typeName && typeName !== 'interface{}' && typeName !== ':')
         return typeName;
     if (isDictionaryLiteral(node))
         return `map[string]${getDictionaryValueType(node)}`;
@@ -1801,7 +1805,7 @@ function getObjectLiteralGoType(node) {
         const value = isPropertyAssignment(p) ? p.initializer : p.name;
         return `${goFieldName(p.name.text)} ${toFieldGoType(inferExpressionType(value))}`;
     });
-    return `struct{ ${fields.join('; ')} }`;
+    return `*struct{ ${fields.join('; ')} }`;
 }
 // Values typed `any`/`unknown` are handled at runtime (TnGet/TnSet/...),
 // never by guessing their type
@@ -1898,7 +1902,7 @@ function visitAnonymousStructLiteral(node) {
             values.push(`${field}: ${visit(p.name)}`);
         }
     }
-    return `struct{ ${fields.join('; ')} }${compositeBody(values)}`;
+    return `&struct{ ${fields.join('; ')} }${compositeBody(values)}`;
 }
 // Follows type aliases and strips null/undefined from unions
 function resolveTypeNode(typeNode, depth = 0) {
@@ -2742,6 +2746,19 @@ function makeNullableType(typeName) {
 }
 // Go struct types (value types that cannot be nil): anonymous structs and
 // property-only interfaces / object type aliases
+// Object types that compile to Go structs: property-only interfaces and
+// object type aliases (values of these types are *Name, like JS references)
+function isObjectTypeName(name) {
+    const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
+    if (alias)
+        return alias.kind === 'TypeLiteral';
+    const iface = declaredInterfaces.get(name);
+    if (iface) {
+        const members = iface.members ?? [];
+        return members.some((m) => isPropertySignature(m)) && !members.some((m) => isMethodSignature(m));
+    }
+    return interfacePropertyTypes.has(name);
+}
 function isStructGoType(goType) {
     return goType.startsWith('struct{') || interfacePropertyTypes.has(goType);
 }
@@ -3286,7 +3303,7 @@ function getType(typeNode, getArrayType = false) {
             return `map[${elementType}]struct{}`;
         }
         const typeArgs = getTypeArguments(typeNode.typeArguments);
-        if (classNames.has(name)) {
+        if (classNames.has(name) || isObjectTypeName(name)) {
             return `*${name}${typeArgs}`;
         }
         return `${name}${typeArgs}`;
@@ -3296,7 +3313,7 @@ function getType(typeNode, getArrayType = false) {
         const fields = (typeNode.members ?? [])
             .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
             .map((m) => `${goFieldName(m.name.text)} ${getOptionalNodeType(m.type, !!m.questionToken)}`);
-        return fields.length > 0 ? `struct{ ${fields.join('; ')} }` : 'interface{}';
+        return fields.length > 0 ? `*struct{ ${fields.join('; ')} }` : 'interface{}';
     }
     // Syntactic replacement for the ts typechecker: render the type node's text
     let typeName = typeNodeToText(typeNode);
