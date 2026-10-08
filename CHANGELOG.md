@@ -5,6 +5,43 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+TypeNative compiles itself: `src/main.ts` builds into a native `typenative` binary that passes the
+whole test suite and regenerates its own Go source identically (stage-1/stage-2 bootstrap).
+
+### Added
+
+- **Native compiler**: `npm run build:native` builds `native/typenative` and `native/tsparser`
+- **`any` / `unknown` at runtime**: property and index access, truthiness, equality (objects by
+  identity), method calls, spreads and conversions to typed values via a small Go runtime
+  (`TnGet`, `TnSet`, `TnAs`, …) — no guessed types
+- **Language**: object spread, `??=`, `in`, `typeof`, `continue`, optional and destructured
+  parameters, constructor parameter properties, `return` inside `try`/`catch`, object type
+  aliases and inline object types → Go structs, `Record<K, V>` and dictionaries → Go maps
+- **Typing**: contextual types for object/array/function literals, narrowing of `T | undefined`,
+  JS truthiness, `??` chains, nullable ternaries, optional chains across calls
+- **Library**: `toFixed`, `Math.max(...arr)`, `sort` with comparators, `flat`, typed
+  `Object.keys`/`values`, regex `replace` (`/g`, `$1`/`$&`, function replacers), `match`/`split`
+  with regexes, `Array.isArray`, `console.warn`, `fs.unlinkSync`, `process.env['X']`
+- Tests 33–50
+
+### Changed
+
+- **Go 1.23 or newer is required** (generated code uses `slices`/`maps` iterator helpers)
+- `process.platform` reports Node's names (`win32`, `darwin`, `linux`)
+- `JSON.stringify` no longer escapes `<`, `>`, `&` (like JS)
+- Out-of-range array/string reads give zero values instead of panicking (JS `undefined`)
+- Imports and helpers are emitted in sorted order; `[...set]` yields sorted elements
+
+### Fixed
+
+- The test suite never ran (scripts called `bin/index.js`, which has no entry point); it now runs
+  through `bin/cli.js`
+- Phase 3c regressions (19 tests): AST kind names, missing parent links, `extends` detection
+- Main-file top-level variables were invisible to functions
+- `spawnSync` with `stdio: 'inherit'` dropped its arguments
+
 ## [0.0.21] - 2026-09-06
 
 Self-hosting milestone: the compiler no longer depends on `execa`, `fs-extra`, or `nanoid`, and the

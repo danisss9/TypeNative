@@ -24,7 +24,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | boolean        |    ✅     | Transpiled to `bool`                                          |
 | string         |    ✅     |                                                               |
 | null           |    ✅     |                                                               |
-| any            |    ✅     | Used for type inference                                       |
+| any / unknown  |    ✅     | Dynamic values handled at runtime (JSON-like objects, arrays, primitives) |
 | Nullable types |    ✅     | `T \| null` / `T \| undefined` transpiled to Go pointer types |
 
 **Variables & Objects**
@@ -36,6 +36,9 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Object shorthand       |    ✅     | `{ name }` → `{ name: name }`                  |
 | Array destructuring    |    ✅     | `const [a, b] = arr`                            |
 | Object destructuring   |    ✅     | `const { x, y } = obj`                          |
+| Object spread          |    ✅     | `{ ...base, x: 1 }`                             |
+| Records / dictionaries |    ✅     | `Record<K, V>` and objects indexed by key → Go maps |
+| Object type aliases    |    ✅     | `type P = { x: number }` → Go struct            |
 
 **Operators**
 
@@ -50,6 +53,9 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Ternary expressions      |    ✅     | `condition ? a : b`            |
 | Nullish coalescing       |    ✅     | `??` operator                  |
 | Optional chaining        |    ✅     | `obj?.prop`, `arr?.[i]`        |
+| Nullish assignment       |    ✅     | `x ??= value`                  |
+| `in` / `typeof`          |    ✅     | `"key" in obj`, `typeof x === "string"` |
+| JS truthiness            |    ✅     | `if (str)`, `!count`, `a \|\| fallback` on any type |
 
 **Control Flow**
 
@@ -58,11 +64,13 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | If/Else statements |    ✅     | Fully supported                                        |
 | Switch statements  |    ✅     | Case and default statements                            |
 | For loops          |    ✅     | Standard `for` loops                                   |
+| Continue           |    ✅     | `continue` in all loop kinds                           |
 | For...of loops     |    ✅     | Arrays, Maps, Sets; `Object.entries()` unwrapping      |
 | For...in loops     |    ✅     | Iterates keys via Go `range`                           |
 | While loops        |    ✅     | Transpiled to Go's `for` loops                         |
 | Do...while loops   |    ✅     | Implemented with conditional break                     |
 | Try/Catch/Finally  |    ✅     | `throw` → `panic`; catch/finally via `defer`/`recover` |
+| Narrowing          |    ✅     | `T \| undefined` narrowed after `if (x)`, `x !== undefined`, early returns |
 
 **Data Structures & Array Methods**
 
@@ -74,6 +82,8 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Method chaining            |    ✅     | e.g. `.map(...).filter(...).join(...)`                                                        |
 | Map                        |    ✅     | `Map<K, V>` → Go `map[K]V`; `.set()`, `.get()`, `.has()`, `.delete()`, `.clear()`, `.size`  |
 | Set                        |    ✅     | `Set<T>` → Go `map[T]struct{}`; `.add()`, `.has()`, `.delete()`, `.clear()`, `.size`         |
+| Object.keys / values       |    ✅     | Typed results for maps and records                                                            |
+| Array sort / flat          |    ✅     | `sort((a, b) => a - b)` in place, `flat()` one level                                          |
 
 **Functions**
 
@@ -87,12 +97,15 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Generics (functions/classes) |    ✅     | Type parameters via Go generics                             |
 | Default parameter values     |    ✅     | `function(x = defaultValue)`                                |
 | Rest parameters              |    ✅     | `function(...args: T[])` → Go variadic                      |
+| Optional parameters          |    ✅     | `function f(x?: string)`                                    |
+| Destructured parameters      |    ✅     | `function f({ a, b }: T)`, `([x, y]: number[])`             |
 
 **Classes & Interfaces**
 
 | Feature             | Supported | Notes                                                          |
 | ------------------- | :-------: | -------------------------------------------------------------- |
 | Classes             |    ✅     | Transpiled to Go structs with constructor and receiver methods |
+| Parameter properties |    ✅     | `constructor(private x: number)`                              |
 | Class inheritance   |    ✅     | `extends` via embedded structs, `super()` supported            |
 | Static members      |    ✅     | `static method()` / `static prop` → package-level declarations |
 | Getters / Setters   |    ✅     | `get prop()` → `Get_prop()`, `set prop(v)` → `Set_prop(v)`    |
@@ -131,7 +144,8 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Math.random               |    ✅     | Mapped to `rand.Float64()`                        |
 | Math.floor / ceil / round |    ✅     | Mapped to `math.Floor`, `math.Ceil`, `math.Round` |
 | Math.abs / sqrt / pow     |    ✅     | Mapped to corresponding `math` functions          |
-| Math.min / max            |    ✅     | Mapped to `math.Min`, `math.Max`                  |
+| Math.min / max            |    ✅     | Go builtins `min` / `max`                         |
+| Math.max(...arr)          |    ✅     | Spread and any number of arguments via `slices.Max` / `max` |
 | Math.log / log2 / log10   |    ✅     | Mapped to `math.Log`, `math.Log2`, `math.Log10`   |
 | Math.sin / cos / tan      |    ✅     | Mapped to `math.Sin`, `math.Cos`, `math.Tan`      |
 | Math.trunc / sign         |    ✅     | Mapped to `math.Trunc` and inline sign check      |
@@ -146,6 +160,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | split / includes / indexOf |    ✅     | Via `strings` package                         |
 | startsWith / endsWith      |    ✅     | Via `strings` package                         |
 | replace / replaceAll       |    ✅     | Via `strings` package                         |
+| replace with RegExp        |    ✅     | `/g` vs first match, `$1`/`$&` patterns, function replacers |
 | charAt / substring / slice |    ✅     | Direct Go string indexing/slicing             |
 | concat / repeat            |    ✅     | String concatenation and `strings.Repeat`     |
 | padStart / padEnd          |    ✅     | Via `strings.Repeat`                          |
@@ -157,6 +172,7 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | Feature  | Supported | Notes                                                 |
 | -------- | :-------: | ----------------------------------------------------- |
 | toString |    ✅     | Universal `toString()` via `fmt.Sprintf` for any type |
+| toFixed  |    ✅     | `n.toFixed(2)` via `strconv.FormatFloat`               |
 
 **RegExp**
 
@@ -180,4 +196,25 @@ TypeNative currently supports a focused subset of TypeScript syntax elements tha
 | npm package imports      |    ✅     | `import { x } from 'pkg'` mapped to Go module imports              |
 | Named exports            |    ✅     | `export function` / `export const` declarations                    |
 
-TypeNative is currently in early development and new features are being added regularly. The goal for `1.0` release is for TypeNative to transpile itself.
+## Native (self-hosted) compiler
+
+TypeNative compiles itself: `src/main.ts` transpiles to Go and builds into a native `typenative`
+binary that needs no Node.js at runtime and produces the same Go output as the npm package.
+
+```sh
+npm run build              # compile the TypeScript sources
+npm run build:native       # build native/typenative and native/tsparser
+native/typenative --source app.ts --script
+```
+
+Building the native compiler requires Go 1.26 (for the TypeScript parser, `tsparser/`). The
+`typenative` binary finds `tsparser` next to itself, or via the `TYPENATIVE_TSPARSER`
+environment variable.
+
+### Known limitations
+
+- Stateful `/g` regex loops (`while ((m = re.exec(s)))`) are not supported — use `matchAll`
+- `import.meta.url` is not lowered
+- Object types compile to Go structs, which are copied by value (JS objects are references)
+
+TypeNative is in early development and new features are being added regularly.
