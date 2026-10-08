@@ -5,7 +5,7 @@ Build native applications using Typescript.
 ## PreRequisites
 
 - [Nodejs v24](https://nodejs.org/en) or newer.
-- [Go 1.21](https://go.dev/doc/install) or newer.
+- [Go 1.23](https://go.dev/doc/install) or newer.
 
 ## Get Started
 
