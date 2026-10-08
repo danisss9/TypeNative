@@ -526,6 +526,10 @@ export function visit(node, options = {}) {
         }
         if (node.text === 'undefined')
             return 'nil';
+        if (node.text === 'NaN' || node.text === 'Infinity') {
+            importedPackages.add('math');
+            return node.text === 'NaN' ? 'math.NaN()' : 'math.Inf(1)';
+        }
         const goAlias = importAliases.get(node.text);
         if (goAlias)
             return goAlias;
@@ -854,6 +858,18 @@ export function visit(node, options = {}) {
         if (op === '!==')
             op = '!=';
         // Go's % is not defined on float64 (TS numbers all map to float64)
+        if (op === '/' && isNumericLiteral(node.right) && Number(node.right.text) === 0) {
+            return `func(a, b float64) float64 { return a / b }(${visit(node.left)}, ${visit(node.right)})`;
+        }
+        if (op === '**') {
+            importedPackages.add('math');
+            return `math.Pow(${visit(node.left)}, ${visit(node.right)})`;
+        }
+        if (op === '**=') {
+            importedPackages.add('math');
+            const target = visit(node.left);
+            return `${target} = math.Pow(${target}, ${visit(node.right)})`;
+        }
         if (op === '%') {
             importedPackages.add('math');
             return `math.Mod(${visit(node.left)}, ${visit(node.right)})`;
@@ -2371,6 +2387,11 @@ function inferExpressionType(expr) {
         expr.name.text === 'argv') {
         return '[]string';
     }
+    if (isIdentifier(expr) && (expr.text === 'NaN' || expr.text === 'Infinity'))
+        return 'float64';
+    if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Number') {
+        return 'float64';
+    }
     // process.env.X (also through casts: (process.env as any).X)
     if (isPropertyAccessExpression(expr) && isProcessEnv(expr.expression))
         return 'string';
@@ -2384,6 +2405,10 @@ function inferExpressionType(expr) {
                 ? `${expr.expression.expression.text}.${expr.expression.name.text}`
                 : undefined;
         const nodeResultType = callee ? nodeCallResultTypes.get(callee) : undefined;
+        if (callee && BUILTIN_CALL_TYPES[callee])
+            return BUILTIN_CALL_TYPES[callee];
+        if (callee?.startsWith('Math.'))
+            return 'float64';
         if (nodeResultType)
             return nodeResultType;
     }
@@ -2612,6 +2637,12 @@ function inferExpressionType(expr) {
     }
     return undefined;
 }
+const BUILTIN_CALL_TYPES = {
+    'Number.isNaN': 'bool',
+    'Number.isFinite': 'bool',
+    'Number.isInteger': 'bool',
+    isNaN: 'bool'
+};
 const BUILTIN_FUNCTION_TYPES = {
     parseFloat: 'float64',
     parseInt: 'float64',
@@ -3462,6 +3493,21 @@ function getAcessString(leftSide, rightSide, objectType) {
             return 'process.env';
         }
     }
+    if (leftSide === 'Number') {
+        const constants = {
+            MAX_SAFE_INTEGER: 'float64(9007199254740991)',
+            MIN_SAFE_INTEGER: 'float64(-9007199254740991)',
+            EPSILON: 'float64(2.220446049250313e-16)'
+        };
+        if (constants[rightSide])
+            return constants[rightSide];
+        if (rightSide === 'MAX_VALUE' || rightSide === 'POSITIVE_INFINITY' || rightSide === 'NaN') {
+            importedPackages.add('math');
+            if (rightSide === 'MAX_VALUE')
+                return 'math.MaxFloat64';
+            return rightSide === 'NaN' ? 'math.NaN()' : 'math.Inf(1)';
+        }
+    }
     // process.env.X → TnGetenv("X") (os.Environ() is a []string in Go, not a map)
     if (leftSide === 'process.env' || leftSide === '(process.env)') {
         useHelper('getenv');
@@ -3531,12 +3577,12 @@ const callHandlers = {
         return `math.Pow(${args[0]}, ${args[1]})`;
     },
     parseInt: (_caller, args) => {
-        importedPackages.add('strconv');
-        return `func() float64 { v, _ := strconv.Atoi(${args[0]}); return float64(v) }()`;
+        useHelper('dynamic');
+        return `TnParseInt(${args[0]}, ${args[1] ?? '10'})`;
     },
     parseFloat: (_caller, args) => {
-        importedPackages.add('strconv');
-        return `func() float64 { v, _ := strconv.ParseFloat(${args[0]}, 64); return v }()`;
+        useHelper('dynamic');
+        return `TnParseFloat(${args[0]})`;
     },
     'process.exit': (_caller, args) => {
         importedPackages.add('os');
@@ -3618,8 +3664,24 @@ const callHandlers = {
         return `fmt.Sprintf("%v", ${args[0]})`;
     },
     'Number': (_caller, args) => {
-        importedPackages.add('strconv');
-        return `func() float64 { v, _ := strconv.ParseFloat(fmt.Sprintf("%v", ${args[0]}), 64); return v }()`;
+        useHelper('dynamic');
+        return `TnNumber(${args[0]})`;
+    },
+    'Number.isNaN': (_caller, args) => {
+        importedPackages.add('math');
+        return `math.IsNaN(${args[0]})`;
+    },
+    isNaN: (_caller, args) => {
+        importedPackages.add('math');
+        return `math.IsNaN(${args[0]})`;
+    },
+    'Number.isFinite': (_caller, args) => {
+        importedPackages.add('math');
+        return `!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]})`;
+    },
+    'Number.isInteger': (_caller, args) => {
+        importedPackages.add('math');
+        return `(${args[0]} == math.Trunc(${args[0]}) && !math.IsInf(${args[0]}, 0))`;
     },
     'Boolean': (_caller, args) => {
         return `(${args[0]} != nil && ${args[0]} != false && ${args[0]} != 0 && ${args[0]} != "")`;
@@ -3847,10 +3909,13 @@ function getDynamicCallHandler(caller, objectType) {
         const methodName = caller.substring(dotIndex + 1);
         // toString() is universal — works for any type including numbers and objects
         if (methodName === 'toString') {
-            return (c) => {
+            return (c, args) => {
                 const obj = c.substring(0, dotIndex);
-                importedPackages.add('fmt');
-                return `fmt.Sprintf("%v", ${obj})`;
+                if (args.length > 0) {
+                    importedPackages.add('strconv');
+                    return `strconv.FormatInt(int64(${obj}), int(${args[0]}))`;
+                }
+                return jsStringOf(obj, objectType === 'number' || objectType === 'float64' ? 'float64' : undefined);
             };
         }
         // number.toFixed(digits)
@@ -4773,7 +4838,7 @@ const helperPackages = {
     regexReplaceFirst: ['regexp'],
     jsonStringify: ['encoding/json', 'bytes', 'strings'],
     typeOf: ['reflect'],
-    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv'],
+    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp'],
     regexReplaceFunc: ['regexp'],
     readFile: ['os'],
     writeFile: ['os'],
@@ -4916,6 +4981,89 @@ func TnNumStr(f float64) string {
 		return strconv.FormatFloat(f, 'f', -1, 64)
 	}
 	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+// Number(x) like JS: "" → 0, invalid → NaN, booleans → 0/1
+func TnNumber(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case bool:
+		if t {
+			return 1
+		}
+		return 0
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return 0
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	case nil:
+		return 0
+	}
+	return math.NaN()
+}
+
+var tnLeadingFloat = regexp.MustCompile("^[+-]?(Infinity|[0-9]+[.]?[0-9]*([eE][+-]?[0-9]+)?|[.][0-9]+([eE][+-]?[0-9]+)?)")
+
+// parseFloat: the leading number of the string, NaN if none
+func TnParseFloat(s string) float64 {
+	m := tnLeadingFloat.FindString(strings.TrimSpace(s))
+	if m == "" {
+		return math.NaN()
+	}
+	if strings.HasSuffix(m, "Infinity") {
+		if strings.HasPrefix(m, "-") {
+			return math.Inf(-1)
+		}
+		return math.Inf(1)
+	}
+	f, _ := strconv.ParseFloat(m, 64)
+	return f
+}
+
+// parseInt: the leading integer in the given radix, NaN if none
+func TnParseInt(s string, radix float64) float64 {
+	s = strings.TrimSpace(s)
+	base := int(radix)
+	sign := 1.0
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+		if s[0] == '-' {
+			sign = -1
+		}
+		s = s[1:]
+	}
+	if (base == 16 || base == 0) && (strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X")) {
+		s, base = s[2:], 16
+	}
+	if base == 0 {
+		base = 10
+	}
+	end := 0
+	for end < len(s) {
+		c := s[end]
+		d := 99
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'z':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'Z':
+			d = int(c-'A') + 10
+		}
+		if d >= base {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return math.NaN()
+	}
+	v, _ := strconv.ParseInt(s[:end], base, 64)
+	return sign * float64(v)
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
