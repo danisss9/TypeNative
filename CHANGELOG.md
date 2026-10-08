@@ -32,7 +32,8 @@ whole test suite and regenerates its own Go source identically (stage-1/stage-2 
 - `process.platform` reports Node's names (`win32`, `darwin`, `linux`)
 - `JSON.stringify` no longer escapes `<`, `>`, `&` (like JS)
 - Out-of-range array/string reads give zero values instead of panicking (JS `undefined`)
-- Imports and helpers are emitted in sorted order; `[...set]` yields sorted elements
+- Imports and helpers are emitted in sorted order
+- Map, Set and Record keep insertion order (like JS); objects are references (Go pointers)
 
 ### Fixed
 

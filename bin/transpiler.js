@@ -603,8 +603,8 @@ export function visit(node, options = {}) {
             useHelper('dynamic');
             return `TnCharAt(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
         }
-        if (targetType?.startsWith('map[')) {
-            return `${visit(node.expression)}[${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))}]`;
+        if (targetType?.startsWith('*TnMap[')) {
+            return `${visit(node.expression)}.Get(${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))})`;
         }
         if (isStringLiteral(node.argumentExpression)) {
             return `${visit(node.expression)}[${visit(node.argumentExpression)}]`;
@@ -839,7 +839,7 @@ export function visit(node, options = {}) {
                 useHelper('dynamic');
                 return `TnHas(${visit(node.right)}, ${visit(node.left)})`;
             }
-            return `func() bool { _, ok := ${visit(node.right)}[${visit(node.left)}]; return ok }()`;
+            return `${visit(node.right)}.Has(${visit(node.left)})`;
         }
         if (isLogicalOperator(node.operatorToken)) {
             const logical = visitLogicalExpression(node);
@@ -907,6 +907,18 @@ export function visit(node, options = {}) {
             useHelper('dynamic');
             return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${visit(node.right)})`;
         }
+        // m[k] = v on an ordered map
+        if (isElementAccessExpression(node.left) && isAssignmentTarget(node.left)) {
+            const mapType = inferExpressionType(node.left.expression);
+            if (mapType?.startsWith('*TnMap[')) {
+                const map = visit(node.left.expression);
+                const key = toGoValueOfType(node.left.argumentExpression, extractMapKeyType(mapType));
+                const value = op === '='
+                    ? toGoValueOfType(node.right, extractMapValueType(mapType))
+                    : `${map}.Get(${key}) ${op.slice(0, -1)} ${visit(node.right)}`;
+                return `${map}.Set(${key}, ${value})`;
+            }
+        }
         // arr.length = n truncates the slice
         if (op === '=' &&
             isPropertyAccessExpression(node.left) &&
@@ -958,7 +970,9 @@ export function visit(node, options = {}) {
         const varName = isVariableDeclarationList(node.initializer)
             ? visit(node.initializer.declarations[0].name)
             : visit(node.initializer);
-        return `for ${varName} := range ${visit(node.expression, { inline: true })}${visitLoopBody(node.statement)}`;
+        const iterated = visit(node.expression, { inline: true });
+        const isOrderedMap = inferExpressionType(node.expression)?.startsWith('*TnMap[');
+        return `for ${varName} := range ${iterated}${isOrderedMap ? '.All()' : ''}${visitLoopBody(node.statement)}`;
     }
     else if (isForOfStatement(node)) {
         // Unwrap Object.entries(x) → treat x as the iterable
@@ -975,22 +989,17 @@ export function visit(node, options = {}) {
             ? toGoValueOfType(iterNode, '[]interface{}')
             : visit(iterNode, { inline: true });
         const iterType = inferExpressionType(iterNode);
-        if (iterType && iterType.startsWith('map[')) {
+        if (iterType && iterType.startsWith('*TnMap[')) {
             const valueType = extractMapValueType(iterType);
             const isSet = valueType === 'struct{}';
             const varInfo = getForOfVarNames(node.initializer);
             registerLocalVariable(varInfo[0], extractMapKeyType(iterType));
             if (varInfo.length >= 2 && !isSet)
                 registerLocalVariable(varInfo[1], valueType);
-            if (isSet) {
-                return `for ${varInfo[0]} := range ${iterExpr}${visitLoopBody(node.statement)}`;
+            if (varInfo.length >= 2 && !isSet) {
+                return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}.All()${visitLoopBody(node.statement)}`;
             }
-            else if (varInfo.length >= 2) {
-                return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}${visitLoopBody(node.statement)}`;
-            }
-            else {
-                return `for ${varInfo[0]} := range ${iterExpr}${visitLoopBody(node.statement)}`;
-            }
+            return `for ${varInfo[0]} := range ${iterExpr}.All()${visitLoopBody(node.statement)}`;
         }
         return visitForOfSequence(node, iterExpr, iterType);
     }
@@ -1473,8 +1482,11 @@ export function visit(node, options = {}) {
 // nullable primitives (*string/*float64/*bool) are boxed into pointers
 function toGoValueOfType(expr, goType) {
     if (goType &&
-        ((isObjectLiteralExpression(expr) && (expr.properties ?? []).length === 0 && goType.startsWith('map[')) ||
+        ((isObjectLiteralExpression(expr) && (expr.properties ?? []).length === 0 && goType.startsWith('*TnMap[')) ||
             (isArrayLiteralExpression(expr) && (expr.elements ?? []).length === 0 && goType.startsWith('[]')))) {
+        const mapArgs = splitMapTypeArgs(goType);
+        if (mapArgs)
+            return orderedMapLiteral(mapArgs[0], mapArgs[1], []);
         return `${goType}{}`;
     }
     const code = visit(expr);
@@ -1723,8 +1735,33 @@ function visitNullableComparison(node, op) {
     const equal = `${tmp} != nil && *${tmp} == ${visit(valueSide)}`;
     return `func() bool { ${tmp} := ${visit(pointerSide)}; return ${op === '==' ? equal : `!(${equal})`} }()`;
 }
-// Key type of a Go map type string: map[K]V → K
+// Go type of a Map/Set/Record: an insertion-ordered map
+function mapGoType(keyType, valueType) {
+    useHelper('orderedMap');
+    return `*TnMap[${keyType}, ${valueType}]`;
+}
+// [K, V] of a *TnMap[K, V] type string
+function splitMapTypeArgs(mapType) {
+    if (!mapType.startsWith('*TnMap['))
+        return undefined;
+    const body = mapType.slice(7, -1);
+    let depth = 0;
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i];
+        if (ch === '[' || ch === '(' || ch === '{')
+            depth++;
+        else if (ch === ']' || ch === ')' || ch === '}')
+            depth--;
+        else if (ch === ',' && depth === 0)
+            return [body.slice(0, i).trim(), body.slice(i + 1).trim()];
+    }
+    return undefined;
+}
+// Key type of a map type string: *TnMap[K, V] → K
 function extractMapKeyType(mapType) {
+    const args = splitMapTypeArgs(mapType);
+    if (args)
+        return args[0];
     let depth = 0;
     for (let i = 4; i < mapType.length; i++) {
         if (mapType[i] === '[')
@@ -1841,7 +1878,7 @@ function getObjectLiteralGoType(node) {
     if (typeName && typeName !== 'interface{}' && typeName !== ':')
         return typeName;
     if (isDictionaryLiteral(node))
-        return `map[string]${getDictionaryValueType(node)}`;
+        return mapGoType('string', getDictionaryValueType(node));
     const fields = (node.properties ?? [])
         .filter((p) => (isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && isIdentifier(p.name))
         .map((p) => {
@@ -1907,19 +1944,26 @@ function mapKeyText(name) {
     return visit(name);
 }
 // { a: 1 } typed as Record<K, V> → map[K]V{"a": 1}
+// An ordered map built from "key, value" entries (in source order)
+function orderedMapLiteral(keyType, valueType, entries) {
+    useHelper('orderedMap');
+    const constructor = `TnNewMap[${keyType}, ${valueType}]()`;
+    if (entries.length === 0)
+        return constructor;
+    const sets = entries.map((e) => `.Set(${e})`).join('');
+    return `${constructor}${sets}`;
+}
 function visitMapLiteral(node, recordType) {
     const keyType = getType(recordType.typeArguments[0]);
     const valueType = getType(recordType.typeArguments[1]);
-    const entries = (node.properties ?? [])
-        .map((p) => {
+    const entries = [];
+    for (const p of node.properties ?? []) {
         if (isPropertyAssignment(p))
-            return `${mapKeyText(p.name)}: ${visit(p.initializer)}`;
-        if (isShorthandPropertyAssignment(p))
-            return `${mapKeyText(p.name)}: ${visit(p.name)}`;
-        return '';
-    })
-        .filter((e) => e);
-    return `map[${keyType}]${valueType}${compositeBody(entries)}`;
+            entries.push(`${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)}`);
+        else if (isShorthandPropertyAssignment(p))
+            entries.push(`${mapKeyText(p.name)}, ${visit(p.name)}`);
+    }
+    return orderedMapLiteral(keyType, valueType, entries);
 }
 // Object literal with no contextual type → anonymous struct with inferred fields,
 // or a map when the variable holding it is indexed dynamically (obj[key])
@@ -1928,8 +1972,8 @@ function visitAnonymousStructLiteral(node) {
         const valueType = getDictionaryValueType(node);
         const entries = (node.properties ?? [])
             .filter((p) => isPropertyAssignment(p))
-            .map((p) => `${mapKeyText(p.name)}: ${visit(p.initializer)}`);
-        return `map[string]${valueType}${compositeBody(entries)}`;
+            .map((p) => `${mapKeyText(p.name)}, ${visit(p.initializer)}`);
+        return orderedMapLiteral('string', valueType, entries);
     }
     const fields = [];
     const values = [];
@@ -2115,6 +2159,8 @@ function getArrayLiteralElementType(node) {
     const contextual = resolveTypeNode(getContextualTypeNode(node));
     if (isArrayTypeNode(contextual))
         return getType(contextual.elementType);
+    if (contextual?.kind === 'TupleType')
+        return getTupleElementType(contextual);
     if (isTypeReferenceNode(contextual) &&
         isIdentifier(contextual.typeName) &&
         contextual.typeName.text === 'Array' &&
@@ -2126,7 +2172,7 @@ function getArrayLiteralElementType(node) {
             const spreadType = inferExpressionType(element.expression);
             if (spreadType?.startsWith('[]'))
                 return spreadType.slice(2);
-            if (spreadType?.startsWith('map[') && spreadType.endsWith(']struct{}')) {
+            if (spreadType?.startsWith('*TnMap[') && extractMapValueType(spreadType) === 'struct{}') {
                 return extractMapKeyType(spreadType);
             }
             continue;
@@ -2162,6 +2208,15 @@ function getContextualFunctionType(fn) {
     const contextual = resolveTypeNode(getContextualTypeNode(fn));
     return isFunctionTypeNode(contextual) ? contextual : undefined;
 }
+function unwrapParentheses(expr) {
+    while (isParenthesizedExpression(expr))
+        expr = expr.expression;
+    return expr;
+}
+function getTupleElementType(tuple) {
+    const types = (tuple.elements ?? []).map((t) => getType(t.kind === 'NamedTupleMember' ? t.type : t));
+    return types.length > 0 && types.every((t) => t === types[0]) ? types[0] : 'interface{}';
+}
 function getTypeText(typeNode) {
     if (!typeNode)
         return ':';
@@ -2176,10 +2231,8 @@ function toGoStringLiteral(value) {
 // A spread source as a Go slice; Sets spread their elements (map keys)
 function visitSpreadSource(expr) {
     const sourceType = inferExpressionType(expr);
-    if (sourceType?.startsWith('map[') && sourceType.endsWith(']struct{}')) {
-        importedPackages.add('slices');
-        importedPackages.add('maps');
-        return `slices.Sorted(maps.Keys(${visit(expr)}))`;
+    if (sourceType?.startsWith('*TnMap[') && extractMapValueType(sourceType) === 'struct{}') {
+        return `${visit(expr)}.Keys()`;
     }
     return visit(expr);
 }
@@ -2360,13 +2413,13 @@ function inferExpressionType(expr) {
         const ctorName = expr.expression.text;
         const typeArguments = getCollectionTypeArguments(expr);
         if (ctorName === 'Map' && typeArguments.length === 2) {
-            return `map[${getType(typeArguments[0])}]${getType(typeArguments[1])}`;
+            return mapGoType(getType(typeArguments[0]), getType(typeArguments[1]));
         }
         if (ctorName === 'Set' && typeArguments.length === 1) {
-            return `map[${getType(typeArguments[0])}]struct{}`;
+            return mapGoType(getType(typeArguments[0]), 'struct{}');
         }
         if (ctorName === 'Set' && expr.arguments?.length && isArrayLiteralExpression(expr.arguments[0])) {
-            return `map[${getArrayLiteralElementType(expr.arguments[0])}]struct{}`;
+            return mapGoType(getArrayLiteralElementType(expr.arguments[0]), 'struct{}');
         }
     }
     if (isElementAccessExpression(expr)) {
@@ -2375,7 +2428,7 @@ function inferExpressionType(expr) {
             return 'string';
         if (objectType?.startsWith('[]'))
             return objectType.slice(2);
-        if (objectType?.startsWith('map['))
+        if (objectType?.startsWith('*TnMap['))
             return extractMapValueType(objectType);
         const declared = getExpressionTypeNode(expr);
         if (declared)
@@ -2418,11 +2471,13 @@ function inferExpressionType(expr) {
         isIdentifier(expr.expression.expression) &&
         expr.expression.expression.text === 'Object') {
         const mapType = inferExpressionType(expr.arguments?.[0]);
-        if (mapType?.startsWith('map[')) {
+        if (mapType?.startsWith('*TnMap[')) {
             if (expr.expression.name.text === 'keys')
                 return `[]${extractMapKeyType(mapType)}`;
             if (expr.expression.name.text === 'values')
                 return `[]${extractMapValueType(mapType)}`;
+            if (expr.expression.name.text === 'entries')
+                return '[][]interface{}';
         }
     }
     if (isCallExpression(expr) && isIdentifier(expr.expression)) {
@@ -2538,7 +2593,7 @@ function inferExpressionType(expr) {
             if (methodName === 'test')
                 return 'bool';
         }
-        if (ownerType && ownerType.startsWith('map[')) {
+        if (ownerType && ownerType.startsWith('*TnMap[')) {
             if (methodName === 'has')
                 return 'bool';
             if (methodName === 'get') {
@@ -2869,7 +2924,7 @@ function visitNullishCoalescingExpression(node) {
         }
         else if (lookup) {
             const valueType = extractMapValueType(inferExpressionType(lookup.mapNode) ?? '');
-            steps.push(`if ${tmp}, ok := ${lookup.map}[${lookup.key}]; ok { return ${convertGoValue(tmp, valueType, resultType)} }`);
+            steps.push(`if ${tmp}, ok := ${lookup.map}.Lookup(${lookup.key}); ok { return ${convertGoValue(tmp, valueType, resultType)} }`);
         }
         else if (!isLast && operandType && isNilableGoType(operandType)) {
             steps.push(`if ${tmp} := ${visit(operand)}; ${tmp} != nil { return ${convertGoValue(tmp, operandType, resultType)} }`);
@@ -2905,7 +2960,7 @@ function getMapLookup(expr) {
     if (isCallExpression(expr) &&
         isPropertyAccessExpression(expr.expression) &&
         expr.expression.name.text === 'get' &&
-        inferExpressionType(expr.expression.expression)?.startsWith('map[')) {
+        inferExpressionType(expr.expression.expression)?.startsWith('*TnMap[')) {
         const mapType = inferExpressionType(expr.expression.expression);
         return {
             map: visit(expr.expression.expression),
@@ -2913,7 +2968,7 @@ function getMapLookup(expr) {
             mapNode: expr.expression.expression
         };
     }
-    if (isElementAccessExpression(expr) && inferExpressionType(expr.expression)?.startsWith('map[')) {
+    if (isElementAccessExpression(expr) && inferExpressionType(expr.expression)?.startsWith('*TnMap[')) {
         const mapType = inferExpressionType(expr.expression);
         return {
             map: visit(expr.expression),
@@ -2955,7 +3010,7 @@ function visitOptionalPropertyAccess(node) {
 function visitOptionalElementAccess(node) {
     const baseExpr = visit(node.expression);
     const baseType = inferExpressionType(node.expression);
-    if (!baseType || !baseType.startsWith('*')) {
+    if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
         const plainAccess = { ...node, questionDotToken: undefined };
         return visit(plainAccess);
     }
@@ -3008,7 +3063,7 @@ function visitOptionalCall(node) {
     if (baseType && NULLABLE_PRIMITIVE_TYPES.includes(baseType)) {
         return visitNullablePrimitiveOptionalCall(node, baseExpr, baseType);
     }
-    if (!baseType || !baseType.startsWith('*')) {
+    if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
         const plainAccess = { ...node.expression, questionDotToken: undefined };
         const plainCall = { ...node, questionDotToken: undefined, expression: plainAccess };
         plainAccess.parent = plainCall;
@@ -3068,7 +3123,9 @@ function buildArrayCallbackInfo(callback, elementType, forcedReturnType, paramTy
             ? visit(callback.body, { inline: true })
             : forcedReturnType === 'bool'
                 ? `{ return ${toGoCondition(callback.body)}; }`
-                : `{ return ${visit(callback.body)}; }`;
+                : forcedReturnType === ''
+                    ? `{ ${visit(unwrapParentheses(callback.body))}; }`
+                    : `{ return ${visit(callback.body)}; }`;
         return {
             fnExpr: `func(${params.join(', ')}) ${callbackReturnType} ${body}`,
             paramCount,
@@ -3122,6 +3179,21 @@ function visitArrayHigherOrderCall(node) {
     const elementType = isArrayLikeGoType(ownerType)
         ? getArrayElementTypeFromGoType(ownerType)
         : 'interface{}';
+    if (methodName === 'forEach' && ownerType?.startsWith('*TnMap[')) {
+        const callback = (node.arguments ?? [])[0];
+        if (!callback)
+            return undefined;
+        const keyType = extractMapKeyType(ownerType);
+        const valueType = extractMapValueType(ownerType);
+        const info = buildArrayCallbackInfo(callback, valueType, '', [
+            valueType === 'struct{}' ? keyType : valueType,
+            keyType
+        ]);
+        const key = getTempName('key');
+        const value = getTempName('value');
+        const args = [valueType === 'struct{}' ? key : value, key].slice(0, info.paramCount).join(', ');
+        return `func() { for ${key}, ${value} := range ${arrayExpr}.All() { _, _ = ${key}, ${value}; (${info.fnExpr})(${args}) } }()`;
+    }
     if (methodName === 'join') {
         // Only intercept array.join — if owner type is unknown/not array, fall through to callHandlers
         if (!isArrayLikeGoType(ownerType))
@@ -3313,6 +3385,11 @@ function getType(typeNode, getArrayType = false) {
         const elementType = getType(typeNode.elementType);
         return getArrayType ? elementType : `[]${elementType}`;
     }
+    // [A, B] tuples are slices: []A when all elements share a type, else []interface{}
+    if (typeNode.kind === 'TupleType') {
+        const elementType = getTupleElementType(typeNode);
+        return getArrayType ? elementType : `[]${elementType}`;
+    }
     // Handle union types (e.g. string | null, number | undefined)
     if (isUnionTypeNode(typeNode)) {
         const nonNullTypes = typeNode.types.filter((t) => t.kind !== 'NullKeyword' &&
@@ -3358,13 +3435,10 @@ function getType(typeNode, getArrayType = false) {
         if ((name === 'Map' || name === 'Record') &&
             typeNode.typeArguments &&
             typeNode.typeArguments.length === 2) {
-            const keyType = getType(typeNode.typeArguments[0]);
-            const valueType = getType(typeNode.typeArguments[1]);
-            return `map[${keyType}]${valueType}`;
+            return mapGoType(getType(typeNode.typeArguments[0]), getType(typeNode.typeArguments[1]));
         }
         if (name === 'Set' && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
-            const elementType = getType(typeNode.typeArguments[0]);
-            return `map[${elementType}]struct{}`;
+            return mapGoType(getType(typeNode.typeArguments[0]), 'struct{}');
         }
         const typeArgs = getTypeArguments(typeNode.typeArguments);
         if (classNames.has(name) || isObjectTypeName(name)) {
@@ -3460,8 +3534,8 @@ function resolveExpressionType(expr) {
 function goTypeCategory(goType) {
     if (!goType)
         return undefined;
-    if (goType.startsWith('map['))
-        return goType.endsWith(']struct{}') ? 'Set' : 'Map';
+    if (goType.startsWith('*TnMap['))
+        return extractMapValueType(goType) === 'struct{}' ? 'Set' : 'Map';
     if (goType.startsWith('[]'))
         return 'array';
     if (goType === 'string')
@@ -3482,7 +3556,7 @@ function getAcessString(leftSide, rightSide, objectType) {
         return `float64(len(${leftSide}))`;
     }
     if (rightSide === 'size' && (objectType === 'Map' || objectType === 'Set')) {
-        return `float64(len(${leftSide}))`;
+        return `float64(${leftSide}.Len())`;
     }
     // process global properties
     if (leftSide === 'process') {
@@ -3607,20 +3681,10 @@ const callHandlers = {
         importedPackages.add('encoding/json');
         return `func() interface{} { var __v interface{}; json.Unmarshal([]byte(${args[0]}), &__v); return __v }()`;
     },
-    'Object.keys': (_caller, args) => {
-        importedPackages.add('maps');
-        importedPackages.add('slices');
-        return `slices.Sorted(maps.Keys(${args[0]}))`;
-    },
-    'Object.values': (_caller, args) => {
-        importedPackages.add('maps');
-        importedPackages.add('slices');
-        return `slices.Collect(maps.Values(${args[0]}))`;
-    },
-    'Object.entries': (_caller, args) => {
-        // When used outside for...of, produce a slice of [key, value] pairs — rarely needed
-        return args[0];
-    },
+    'Object.keys': (_caller, args) => `${args[0]}.Keys()`,
+    'Object.values': (_caller, args) => `${args[0]}.Values()`,
+    // Outside for...of (which iterates the map directly): [key, value] pairs
+    'Object.entries': (_caller, args) => `${args[0]}.Entries()`,
     'Math.log': (_caller, args) => {
         importedPackages.add('math');
         return `math.Log(${args[0]})`;
@@ -3875,37 +3939,27 @@ function sliceIndex(obj, index) {
 // Equality of two array elements of the current receiver's element type
 function elementEquals(a, b) {
     const elementType = receiverElementType();
-    if (elementType === 'interface{}' || elementType.startsWith('map[') || elementType.startsWith('[]')) {
+    if (elementType === 'interface{}' || elementType.startsWith('*TnMap[') || elementType.startsWith('[]')) {
         useHelper('dynamic');
         return `TnSame(${a}, ${b})`;
     }
     return `${a} == ${b}`;
 }
 const mapMethodHandlers = {
-    set: (obj, args) => `${obj}[${args[0]}] = ${args[1]}`,
-    get: (obj, args) => {
-        const valueType = currentReceiverGoType ? extractMapValueType(currentReceiverGoType) : '';
-        if (isStructGoType(valueType)) {
-            const tmp = getTempName('get');
-            return `func() *${valueType} { ${tmp}, ok := ${obj}[${args[0]}]; if !ok { return nil }; return &${tmp} }()`;
-        }
-        return `${obj}[${args[0]}]`;
-    },
-    has: (obj, args) => {
-        const tmp = getTempName('ok');
-        return `func() bool { _, ${tmp} := ${obj}[${args[0]}]; return ${tmp} }()`;
-    },
-    delete: (obj, args) => `delete(${obj}, ${args[0]})`,
-    clear: (obj) => `clear(${obj})`
+    set: (obj, args) => `${obj}.Set(${args[0]}, ${args[1]})`,
+    get: (obj, args) => `${obj}.Get(${args[0]})`,
+    has: (obj, args) => `${obj}.Has(${args[0]})`,
+    delete: (obj, args) => `${obj}.Delete(${args[0]})`,
+    clear: (obj) => `${obj}.Clear()`,
+    keys: (obj) => `${obj}.Keys()`,
+    values: (obj) => `${obj}.Values()`
 };
 const setMethodHandlers = {
-    add: (obj, args) => `${obj}[${args[0]}] = struct{}{}`,
-    has: (obj, args) => {
-        const tmp = getTempName('ok');
-        return `func() bool { _, ${tmp} := ${obj}[${args[0]}]; return ${tmp} }()`;
-    },
-    delete: (obj, args) => `delete(${obj}, ${args[0]})`,
-    clear: (obj) => `clear(${obj})`
+    add: (obj, args) => `${obj}.Set(${args[0]}, struct{}{})`,
+    has: (obj, args) => `${obj}.Has(${args[0]})`,
+    delete: (obj, args) => `${obj}.Delete(${args[0]})`,
+    clear: (obj) => `${obj}.Clear()`,
+    values: (obj) => `${obj}.Keys()`
 };
 function getDynamicCallHandler(caller, objectType) {
     if (promiseResolveName && caller === promiseResolveName) {
@@ -4274,7 +4328,7 @@ function getCollectionArgumentTypes(node) {
         return undefined;
     const method = node.expression.name.text;
     const receiverType = inferExpressionType(node.expression.expression);
-    if (receiverType?.startsWith('map[')) {
+    if (receiverType?.startsWith('*TnMap[')) {
         const keyType = extractMapKeyType(receiverType);
         const valueType = extractMapValueType(receiverType);
         if (valueType === 'struct{}' && ['add', 'has', 'delete'].includes(method))
@@ -4470,7 +4524,9 @@ function visitNewPromise(node) {
     return `func() chan ${channelType} {\n\t\tch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch;\n\t}()`;
 }
 function extractMapValueType(mapType) {
-    // mapType is "map[K]V" — find the closing bracket of K accounting for nesting
+    const args = splitMapTypeArgs(mapType);
+    if (args)
+        return args[1];
     if (!mapType.startsWith('map['))
         return 'interface{}';
     let depth = 0;
@@ -4500,21 +4556,13 @@ function visitNewMap(node) {
         keyType = getType(typeArguments[0]);
         valueType = getType(typeArguments[1]);
     }
-    const mapType = `map[${keyType}]${valueType}`;
-    const args = (node.arguments ?? []);
-    if (!args || args.length === 0 || !isArrayLiteralExpression(args[0])) {
-        return `make(${mapType})`;
-    }
-    const initArg = args[0];
-    const tmp = getTempName('map');
-    const entries = initArg.elements
-        .filter((el) => isArrayLiteralExpression(el) && el.elements.length >= 2)
-        .map((el) => {
-        const pair = el;
-        return `${tmp}[${visit(pair.elements[0])}] = ${visit(pair.elements[1])}`;
-    })
-        .join('; ');
-    return `func() ${mapType} { ${tmp} := make(${mapType}); ${entries}; return ${tmp} }()`;
+    const args = node.arguments ?? [];
+    const entries = args.length > 0 && isArrayLiteralExpression(args[0])
+        ? args[0].elements
+            .filter((el) => isArrayLiteralExpression(el) && el.elements.length >= 2)
+            .map((pair) => `${visit(pair.elements[0])}, ${visit(pair.elements[1])}`)
+        : [];
+    return orderedMapLiteral(keyType, valueType, entries);
 }
 function visitNewSet(node) {
     let elementType = 'interface{}';
@@ -4525,15 +4573,11 @@ function visitNewSet(node) {
     else if (node.arguments?.length && isArrayLiteralExpression(node.arguments[0])) {
         elementType = getArrayLiteralElementType(node.arguments[0]);
     }
-    const setType = `map[${elementType}]struct{}`;
-    const args = (node.arguments ?? []);
-    if (!args || args.length === 0 || !isArrayLiteralExpression(args[0])) {
-        return `make(${setType})`;
-    }
-    const initArg = args[0];
-    const tmp = getTempName('set');
-    const values = initArg.elements.map((el) => `${tmp}[${visit(el)}] = struct{}{}`).join('; ');
-    return `func() ${setType} { ${tmp} := make(${setType}); ${values}; return ${tmp} }()`;
+    const args = node.arguments ?? [];
+    const values = args.length > 0 && isArrayLiteralExpression(args[0])
+        ? args[0].elements.map((el) => `${visit(el)}, struct{}{}`)
+        : [];
+    return orderedMapLiteral(elementType, 'struct{}', values);
 }
 function specifierToGoFileName(specifier) {
     const segments = specifier.split(/[/\\]/);
@@ -4843,6 +4887,7 @@ const nodeModuleMappings = {
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
+    orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt'],
     jsonStringify: ['encoding/json', 'bytes', 'strings'],
     typeOf: ['reflect'],
     dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp'],
@@ -5218,6 +5263,131 @@ func TnTruthy(v interface{}) bool {
 	enc.SetIndent("", indent)
 	enc.Encode(v)
 	return strings.TrimSuffix(buf.String(), "\\n")
+}`,
+    orderedMap: `// TnMap: JS Map/Set/object semantics — keys iterate in insertion order
+type TnMap[K comparable, V any] struct {
+	keys   []K
+	values map[K]V
+}
+
+func TnNewMap[K comparable, V any]() *TnMap[K, V] {
+	return &TnMap[K, V]{values: map[K]V{}}
+}
+
+func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
+	if _, ok := m.values[k]; !ok {
+		m.keys = append(m.keys, k)
+	}
+	m.values[k] = v
+	return m
+}
+
+func (m *TnMap[K, V]) Get(k K) V {
+	if m == nil {
+		var zero V
+		return zero
+	}
+	return m.values[k]
+}
+
+func (m *TnMap[K, V]) Lookup(k K) (V, bool) {
+	if m == nil {
+		var zero V
+		return zero, false
+	}
+	v, ok := m.values[k]
+	return v, ok
+}
+
+func (m *TnMap[K, V]) Has(k K) bool {
+	if m == nil {
+		return false
+	}
+	_, ok := m.values[k]
+	return ok
+}
+
+func (m *TnMap[K, V]) Delete(k K) bool {
+	if _, ok := m.values[k]; !ok {
+		return false
+	}
+	delete(m.values, k)
+	for i, key := range m.keys {
+		if key == k {
+			m.keys = append(m.keys[:i], m.keys[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+func (m *TnMap[K, V]) Clear() {
+	m.keys = nil
+	m.values = map[K]V{}
+}
+
+func (m *TnMap[K, V]) Len() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.keys)
+}
+
+func (m *TnMap[K, V]) Keys() []K {
+	if m == nil {
+		return nil
+	}
+	return append([]K{}, m.keys...)
+}
+
+func (m *TnMap[K, V]) Values() []V {
+	if m == nil {
+		return nil
+	}
+	values := make([]V, 0, len(m.keys))
+	for _, k := range m.keys {
+		values = append(values, m.values[k])
+	}
+	return values
+}
+
+func (m *TnMap[K, V]) Entries() [][]interface{} {
+	entries := make([][]interface{}, 0, m.Len())
+	for _, k := range m.Keys() {
+		entries = append(entries, []interface{}{k, m.values[k]})
+	}
+	return entries
+}
+
+func (m *TnMap[K, V]) All() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		for _, k := range m.Keys() {
+			if v, ok := m.values[k]; ok && !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// JSON objects keep insertion order
+func (m *TnMap[K, V]) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, k := range m.keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		key, _ := json.Marshal(fmt.Sprint(k))
+		value, err := json.Marshal(m.values[k])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteByte(':')
+		buf.Write(value)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }`,
     regexReplaceFirst: `func TnRegexReplaceFirst(re *regexp.Regexp, s string, repl string) string {
 	loc := re.FindStringSubmatchIndex(s)
