@@ -186,8 +186,7 @@ function tryInjectDtsTypes(
   // Extract typed function signatures from the .d.ts module body
   const signatures = new Map<string, { params: string; returnType: string }>();
   const sigRegex = /export function (\w+)\(([^)]*)\)\s*:\s*([^\n;]+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = sigRegex.exec(dtsBody)) !== null) {
+  for (const m of dtsBody.matchAll(sigRegex)) {
     signatures.set(m[1], { params: m[2].trim(), returnType: m[3].trim() });
   }
   if (signatures.size === 0) return null;

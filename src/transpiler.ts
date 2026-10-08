@@ -3947,7 +3947,8 @@ function isAddressable(code: string): boolean {
 // strings are compiled
 function toGoRegexp(arg: string): string {
   importedPackages.add('regexp');
-  return arg.startsWith('regexp.MustCompile(') ? arg : `regexp.MustCompile(${arg})`;
+  if (arg.startsWith('regexp.MustCompile(') || variableGoTypes.get(arg) === '*regexp.Regexp') return arg;
+  return `regexp.MustCompile(${arg})`;
 }
 
 // A JS slice index: negative values count from the end
