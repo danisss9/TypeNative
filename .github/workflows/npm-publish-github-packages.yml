@@ -30,8 +30,8 @@ jobs:
           go-version: '1.23'
       - run: npm ci
       - run: npm ci
-        working-directory: test
-      - run: npm test
+        working-directory: conformance
+      - run: npm run conformance
 
   release:
     needs: test

@@ -2,11 +2,10 @@
 dist
 node_modules
 src
-test
+conformance
 TypeScript
 .gitignore
 .prettierrc.json
 tsconfig.json
 native
 scripts
-features

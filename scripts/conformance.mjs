@@ -1,6 +1,6 @@
-// Feature coverage report: runs every probe in features/ through TypeNative and
+// Conformance runner: runs every probe in conformance/ through TypeNative and
 // prints the pass rate per category (syntax / semantics / lib) plus the failures.
-// Usage: node scripts/features.mjs [--native] [filter]
+// Usage: node scripts/conformance.mjs [--native] [filter]
 import { spawnSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -12,8 +12,8 @@ const compiler = native
   ? [path.join(root, 'native', process.platform === 'win32' ? 'typenative.exe' : 'typenative')]
   : ['node', path.join(root, 'bin', 'cli.js')];
 
-const probes = readdirSync(path.join(root, 'features'))
-  .filter((f) => f.endsWith('.ts') && f.includes(filter))
+const probes = readdirSync(path.join(root, 'conformance'))
+  .filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts') && f.includes(filter))
   .sort();
 
 const categories = new Map();
@@ -22,7 +22,7 @@ for (const file of probes) {
   const name = file.replace(/\.ts$/, '');
   const category = name.split('-')[0];
   const [command, ...args] = compiler;
-  const result = spawnSync(command, [...args, '--source', path.join('features', file), '--script'], {
+  const result = spawnSync(command, [...args, '--source', path.join('conformance', file), '--script'], {
     cwd: root,
     encoding: 'utf-8',
     timeout: 60000
@@ -49,3 +49,5 @@ for (const [category, { passed, total }] of categories) {
   console.log(`  ${category.padEnd(10)} ${passed}/${total} (${Math.round((passed / total) * 100)}%)`);
 }
 console.log(`  ${'total'.padEnd(10)} ${passedTotal}/${probes.length} (${Math.round((passedTotal / probes.length) * 100)}%)`);
+
+if (passedTotal < probes.length) process.exit(1);
