@@ -76,42 +76,42 @@ export function run(opts: RunOptions): void {
   const transpileOptions: TranspileOptions = { parse: opts.parse };
   if (sourceDir) {
     transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
-            const baseDir = fromDir ?? sourceDir;
+      const baseDir = fromDir ?? sourceDir;
 
-            // Relative or absolute path → resolve from baseDir
-            if (specifier.startsWith('.') || specifier.startsWith('/')) {
-              // ES convention: ./x.js may refer to x.ts
-              const tsSpecifier = specifier.endsWith('.js')
-                ? specifier.replace(/\.js$/, '.ts')
-                : specifier;
-              for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
-                try {
-                  const fullPath = path.resolve(baseDir, candidate);
-                  return {
-                    content: fs.readFileSync(fullPath, 'utf-8'),
-                    dir: path.dirname(fullPath)
-                  };
-                } catch {
-                  /* not found */
-                }
-              }
-              return null;
-            }
+      // Relative or absolute path → resolve from baseDir
+      if (specifier.startsWith('.') || specifier.startsWith('/')) {
+        // ES convention: ./x.js may refer to x.ts
+        const tsSpecifier = specifier.endsWith('.js')
+          ? specifier.replace(/\.js$/, '.ts')
+          : specifier;
+        for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
+          try {
+            const fullPath = path.resolve(baseDir, candidate);
+            return {
+              content: fs.readFileSync(fullPath, 'utf-8'),
+              dir: path.dirname(fullPath)
+            };
+          } catch {
+            /* not found */
+          }
+        }
+        return null;
+      }
 
-            // npm package — walk up from baseDir looking for node_modules/<name>
-            const resolved = resolveNpmPackage(baseDir, specifier);
-            if (!resolved) return null;
-            let { content, dir } = resolved;
-            // Normalize CommonJS to ES module syntax
-            if (
-              !content.includes('export ') &&
-              (content.includes('module.exports') || content.includes('exports.'))
-            ) {
-              content = normalizeCjsContent(content);
-            }
-            // Inject types from a local ambient .d.ts if available
-            const typed = tryInjectDtsTypes(content, specifier, sourceDir);
-            if (typed) content = typed;
+      // npm package — walk up from baseDir looking for node_modules/<name>
+      const resolved = resolveNpmPackage(baseDir, specifier);
+      if (!resolved) return null;
+      let { content, dir } = resolved;
+      // Normalize CommonJS to ES module syntax
+      if (
+        !content.includes('export ') &&
+        (content.includes('module.exports') || content.includes('exports.'))
+      ) {
+        content = normalizeCjsContent(content);
+      }
+      // Inject types from a local ambient .d.ts if available
+      const typed = tryInjectDtsTypes(content, specifier, sourceDir);
+      if (typed) content = typed;
       return { content, dir };
     };
   }
@@ -256,7 +256,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${exeName}`
     },
     devDependencies: {
-      typenative: '^0.0.19'
+      typenative: '^0.1.0'
     }
   };
   return JSON.stringify(pckg, null, 2);
