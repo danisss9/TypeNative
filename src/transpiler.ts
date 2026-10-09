@@ -883,11 +883,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const typeArgs = getTypeArguments((node.typeArguments ?? []));
     // Handle spread arguments: fn(...arr) → fn(arr...)
     const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
-    const args = hasSpreadArg
-      ? (node.arguments ?? []).map((a) =>
-          isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a)
-        )
-      : visitCallArguments(node);
+    const args = hasSpreadArg ? visitSpreadCallArguments(node) : visitCallArguments(node);
     // Resolve object type for type-aware method dispatch
     let objectType: string | undefined;
     if (isPropertyAccessExpression(node.expression)) {
@@ -901,9 +897,16 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (node.operator === 'ExclamationToken') {
       return `!${wrapCondition(toGoCondition(node.operand))}`;
     }
+    if (isIncrementOrDecrement(node)) return visitIncrementOrDecrement(node, true);
+    if (node.operator === 'TildeToken') {
+      useHelper('dynamic');
+      return `float64(^TnInt32(${visit(node.operand)}))`;
+    }
     return `${getOperatorText(node.operator)}${visit(node.operand)}`;
   } else if (isPostfixUnaryExpression(node)) {
-    return `${visit(node.operand, { inline: true })}${getOperatorText(node.operator)}`;
+    return visitIncrementOrDecrement(node, false);
+  } else if (node.kind === 'DeleteExpression') {
+    return visitDelete(node);
   } else if (node.kind === 'TypeOfExpression') {
     return visitTypeOf(node);
   } else if (isConditionalExpression(node)) {
@@ -911,6 +914,10 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isBinaryExpression(node)) {
     if (node.operatorToken.kind === 'QuestionQuestionToken') {
       return visitNullishCoalescingExpression(node);
+    }
+    if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right)) {
+      // x instanceof C: the runtime type is C's pointer type
+      return `func() bool { _, ok := interface{}(${visit(node.left)}).(*${getSafeName(node.right.text)}); return ok }()`;
     }
     if (node.operatorToken.kind === 'InKeyword') {
       if (isDynamicValue(node.right)) {
@@ -924,6 +931,14 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       if (logical) return logical;
     }
     // x ??= v → assign only when x is nil
+    if (node.operatorToken.kind === 'BarBarEqualsToken' || node.operatorToken.kind === 'AmpersandAmpersandEqualsToken') {
+      // a ||= b assigns when a is falsy; a &&= b when a is truthy
+      const target = visit(node.left);
+      const condition = toGoCondition(node.left);
+      const value = toGoValueOfType(node.right, inferExpressionType(node.left));
+      const test = node.operatorToken.kind === 'BarBarEqualsToken' ? `!${wrapCondition(condition)}` : condition;
+      return `if ${test} { ${target} = ${value} }`;
+    }
     if (node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
       const target = visit(node.left);
       const value = toGoValueOfType(node.right, inferExpressionType(node.left));
@@ -936,6 +951,8 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (op === '/' && isNumericLiteral(node.right) && Number(node.right.text) === 0) {
       return `func(a, b float64) float64 { return a / b }(${visit(node.left)}, ${visit(node.right)})`;
     }
+    const bitwise = visitBitwise(node, op);
+    if (bitwise) return bitwise;
     if (op === '**') {
       importedPackages.add('math');
       return `math.Pow(${visit(node.left)}, ${visit(node.right)})`;
@@ -1336,10 +1353,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
           if (isStatic) {
             classStaticProps.add(`${className}.${member.name.text}`);
           } else {
-            properties.set(
-              member.name.text,
-              getOptionalNodeType(member.type, !!member.questionToken)
-            );
+            properties.set(member.name.text, getPropertyDeclarationType(member));
           }
         }
         if (isMethodDeclaration(member) && isIdentifier(member.name)) {
@@ -1382,7 +1396,7 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         if (member.type && isArrayTypeNode(member.type)) {
           fieldType = `[]${getType(member.type, true)}`;
         } else {
-          fieldType = getOptionalNodeType(member.type, !!member.questionToken);
+          fieldType = getPropertyDeclarationType(member);
         }
         fields.push(`\t${fieldName} ${fieldType}`);
       }
@@ -1413,9 +1427,9 @@ export function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       const parameterAssignments = getParameterProperties(node)
         .map((p) => `self.${goFieldName(p.name.text)} = ${visit(p.name)}\n\t\t`)
         .join('');
-      result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${parameterAssignments}${bodyStatements}return self;\n\t}\n\n`;
+      result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${fieldInitializers(node)}${parameterAssignments}${bodyStatements}return self;\n\t}\n\n`;
     } else {
-      result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\treturn &${name}${typeParamNames}{}\n\t}\n\n`;
+      result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${fieldInitializers(node)}return self\n\t}\n\n`;
     }
 
     for (const member of (node.members ?? [])) {
@@ -1921,6 +1935,109 @@ function jsStringOf(code: string, goType: string | undefined): string {
   }
   importedPackages.add('fmt');
   return `fmt.Sprintf("%v", ${code})`;
+}
+
+// JS bitwise operators work on 32-bit integers (ToInt32 / ToUint32)
+function visitBitwise(node: AstNode, op: string): string | undefined {
+  const kind = node.operatorToken.kind;
+  const base: Record<string, string> = {
+    AmpersandToken: '&',
+    BarToken: '|',
+    CaretToken: '^',
+    LessThanLessThanToken: '<<',
+    GreaterThanGreaterThanToken: '>>',
+    GreaterThanGreaterThanGreaterThanToken: '>>>',
+    AmpersandEqualsToken: '&',
+    BarEqualsToken: '|',
+    CaretEqualsToken: '^',
+    LessThanLessThanEqualsToken: '<<',
+    GreaterThanGreaterThanEqualsToken: '>>',
+    GreaterThanGreaterThanGreaterThanEqualsToken: '>>>'
+  };
+  const bitOp = base[kind];
+  if (!bitOp) return undefined;
+  useHelper('dynamic');
+  const left = visit(node.left);
+  const right = visit(node.right);
+  let value: string;
+  if (bitOp === '>>>') value = `float64(TnUint32(${left}) >> (TnUint32(${right}) & 31))`;
+  else if (bitOp === '<<' || bitOp === '>>') {
+    value = `float64(TnInt32(${left}) ${bitOp} (TnUint32(${right}) & 31))`;
+  } else value = `float64(TnInt32(${left}) ${bitOp} TnInt32(${right}))`;
+  const isAssignment = kind.endsWith('EqualsToken');
+  return isAssignment ? `${left} = ${value}` : value;
+}
+
+// delete obj.key / delete obj[key] on maps (Records and dynamic objects)
+function visitDelete(node: AstNode): string {
+  const target = unwrapParentheses(node.expression);
+  const object = target.expression;
+  const key = isPropertyAccessExpression(target)
+    ? toGoStringLiteral(target.name.text)
+    : visit(target.argumentExpression);
+  const objectType = inferExpressionType(object);
+  if (objectType?.startsWith('*TnMap[')) return `${visit(object)}.Delete(${key})`;
+  useHelper('dynamic');
+  return `TnDelete(${visit(object)}, ${key})`;
+}
+
+// f(...xs): variadic callees take xs...; fixed-parameter functions get
+// xs[0], xs[1], … for their remaining parameters
+function visitSpreadCallArguments(node: AstNode): string[] {
+  const fn = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
+  const params: AstNode[] = fn?.parameters ?? [];
+  const isVariadic = !fn || params.some((p) => p.dotDotDotToken);
+  const result: string[] = [];
+  for (const arg of node.arguments ?? []) {
+    if (!isSpreadElement(arg)) {
+      result.push(visit(arg));
+    } else if (isVariadic) {
+      result.push(`${visit(arg.expression)}...`);
+    } else {
+      useHelper('dynamic');
+      const source = visit(arg.expression);
+      const start = result.length;
+      for (let i = start; i < params.length; i++) result.push(`TnAt(${source}, ${i - start})`);
+    }
+  }
+  return result;
+}
+
+// self.field = initializer for each instance field that has one
+function fieldInitializers(classNode: AstNode): string {
+  return (classNode.members ?? [])
+    .filter(
+      (m: AstNode) =>
+        isPropertyDeclaration(m) &&
+        m.initializer &&
+        isIdentifier(m.name) &&
+        !(m.modifiers ?? []).some((mod: AstNode) => mod.kind === 'StaticKeyword')
+    )
+    .map((m: AstNode) => `self.${goFieldName(m.name.text)} = ${toGoValueOfType(m.initializer, getPropertyDeclarationType(m))}\n\t\t`)
+    .join('');
+}
+
+// A class field's type: declared, else inferred from its initializer (n = 1 → float64)
+function getPropertyDeclarationType(member: AstNode): string {
+  if (member.type || !member.initializer) return getOptionalNodeType(member.type, !!member.questionToken);
+  return toFieldGoType(inferExpressionType(member.initializer));
+}
+
+function isIncrementOrDecrement(node: AstNode): boolean {
+  return node.operator === 'PlusPlusToken' || node.operator === 'MinusMinusToken';
+}
+
+// x++ / ++x: Go only has the statement form, so used as a value they become
+// a closure returning the old (postfix) or new (prefix) value
+function visitIncrementOrDecrement(node: AstNode, isPrefix: boolean): string {
+  const target = visit(node.operand, { inline: true });
+  const op = node.operator === 'PlusPlusToken' ? '++' : '--';
+  const parent = node.parent;
+  const isStatement =
+    isExpressionStatement(parent) || (isForStatement(parent) && parent.incrementor === node);
+  if (isStatement) return `${target}${op}`;
+  if (isPrefix) return `func() float64 { ${target}${op}; return ${target} }()`;
+  return `func() float64 { __old := ${target}; ${target}${op}; return __old }()`;
 }
 
 function compositeBody(rawEntries: string[]): string {
@@ -2572,7 +2689,10 @@ function inferExpressionType(expr: AstNode): string | undefined {
   }
   // process.env.X (also through casts: (process.env as any).X)
   if (isPropertyAccessExpression(expr) && isProcessEnv(expr.expression)) return 'string';
-  if (isPrefixUnaryExpression(expr) && ['MinusToken', 'PlusToken'].includes(expr.operator)) {
+  if (
+    (isPrefixUnaryExpression(expr) || isPostfixUnaryExpression(expr)) &&
+    ['MinusToken', 'PlusToken', 'TildeToken', 'PlusPlusToken', 'MinusMinusToken'].includes(expr.operator)
+  ) {
     return 'float64';
   }
   if (isCallExpression(expr)) {
@@ -2796,7 +2916,23 @@ function inferExpressionType(expr: AstNode): string | undefined {
     if (isLogicalOperator(expr.operatorToken)) {
       return isLogicalValueExpression(expr) ? getLogicalValueType(expr) : 'bool';
     }
-    if (['MinusToken', 'AsteriskToken', 'SlashToken', 'PercentToken'].includes(kind)) return 'float64';
+    if (
+      [
+        'MinusToken',
+        'AsteriskToken',
+        'SlashToken',
+        'PercentToken',
+        'AsteriskAsteriskToken',
+        'AmpersandToken',
+        'BarToken',
+        'CaretToken',
+        'LessThanLessThanToken',
+        'GreaterThanGreaterThanToken',
+        'GreaterThanGreaterThanGreaterThanToken'
+      ].includes(kind)
+    ) {
+      return 'float64';
+    }
     if (kind === 'PlusToken') {
       const isString = [expr.left, expr.right].some((side) => inferExpressionType(side) === 'string');
       return isString ? 'string' : 'float64';
@@ -5371,6 +5507,26 @@ func TnParseInt(s string, radix float64) float64 {
 	}
 	v, _ := strconv.ParseInt(s[:end], base, 64)
 	return sign * float64(v)
+}
+
+// JS ToInt32 / ToUint32 (wrapping modulo 2^32; NaN and Infinity → 0)
+func TnInt32(f float64) int32 {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0
+	}
+	return int32(int64(math.Trunc(math.Mod(f, 4294967296))))
+}
+
+func TnUint32(f float64) uint32 { return uint32(TnInt32(f)) }
+
+func TnDelete(obj interface{}, key interface{}) bool {
+	o, ok := obj.(map[string]interface{})
+	k, isString := key.(string)
+	if !ok || !isString {
+		return false
+	}
+	delete(o, k)
+	return true
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
