@@ -11,9 +11,10 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "build:native": "node scripts/build-native.mjs",
+    "conformance": "node scripts/conformance.mjs",
+    "conformance:parallel": "node scripts/conformance-parallel.mjs",
     "test": "npm run conformance",
-    "release": "npm publish",
-    "conformance": "node scripts/conformance.mjs"
+    "release": "npm publish"
   },
   "repository": {
     "type": "git",
@@ -26,13 +27,12 @@
   },
   "homepage": "https://github.com/danisss9/typenative#readme",
   "devDependencies": {
-    "@types/inquirer": "^9.0.9",
-    "@types/node": "^25.3.5",
-    "execa": "^9.6.1",
+    "@types/inquirer": "^9.0.10",
+    "@types/node": "^24.19.2",
     "rimraf": "^6.1.3"
   },
   "dependencies": {
-    "inquirer": "^13.3.0",
-    "typescript": "^5.9.3"
+    "inquirer": "^14.2.3",
+    "typescript": "^6.0.3"
   }
 }
