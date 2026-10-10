@@ -5,6 +5,55 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-10
+
+Go standard library support through `go:` imports: 46 packages with typed function surfaces
+(up from 3 hand-picked functions), 24 new conformance probes — the suite is 172/172.
+
+### Added
+
+- **Go stdlib via `go:` imports** (named, namespace and default import styles):
+  `bufio`, `bytes`, `cmp`, `context`, `crypto/hmac`, `crypto/md5`, `crypto/rand`, `crypto/sha1`,
+  `crypto/sha256`, `crypto/sha512`, `crypto/subtle`, `encoding/base64`, `encoding/hex`,
+  `encoding/json`, `errors`, `fmt`, `hash/adler32`, `hash/crc32`, `hash/crc64`, `hash/fnv`,
+  `html`, `io`, `log`, `log/slog`, `math`, `math/big`, `math/bits`, `math/rand`, `math/rand/v2`,
+  `net/http`, `net/url`, `os`, `os/exec`, `path`, `path/filepath`, `reflect`, `regexp`,
+  `runtime`, `runtime/debug`, `slices`, `sort`, `strconv`, `strings`, `time`, `unicode`,
+  `unicode/utf8` — every supported symbol is declared in `types/typenative-go.d.ts`
+  (`"types": ["typenative/go"]`)
+- **`(T, error)` → throw/catch**: Go functions returning `(T, error)` are lowered through a
+  `TnTry` helper that panics with a `TnError` on failure, so `try { Atoi('x') } catch (e) { e.message }`
+  catches the Go error text; error-only functions lower through `TnTryE`; dynamic values
+  (caught exceptions) convert to `error` via `TnAsError`
+- **Argument coercion**: TS `number` converts to the declared Go parameter type (`int`, `int64`,
+  `os.FileMode`, `time.Duration`, …), `string` → `[]byte`, single-char strings → `byte`/`rune`,
+  `[N]byte` digests slice to `[]byte` when passed to bytes parameters
+- **Mixed numeric unification**: `time.Second * 2`, `int` vs `int64` arithmetic/comparisons and
+  compound assignments cast operands to a common Go type instead of failing to compile
+- **Result typing**: stdlib call results infer their Go type (`const n = Atoi("42")` is `int`),
+  method results and fields of stdlib types are tracked (`now.UnixNano()`, `resp.StatusCode`,
+  `u.Host`, `err.message` → `err.Error()`), and generic identity results keep the argument's
+  element type (`slices.Max`, `slices.Clone`)
+- **Methods on stdlib types**: `regexp` (`MatchString`/`FindString`/`FindAllString`/
+  `ReplaceAllString`/`Split`/`SubexpNames`…), `time.Time`/`time.Duration` (`Year`/`Format`/
+  `Add`/`Sub`/`Seconds`…), `os.File`, `os/exec.Cmd`, `bufio.Scanner`/`Reader`, `bytes.Buffer`,
+  `base64.Encoding`, `hash.Hash`, `http.Header`/`Request`/`Response`, `url.URL`/`Values`,
+  `reflect.Type`/`Value`, `os.FileInfo`/`DirEntry`, `log.Logger`
+- **Constants and values**: `math` (`Pi`, `MaxInt32`, …), `time` (`Second`, `RFC3339`,
+  month/weekday constants), `os.Args`/`Stdout`, `runtime.GOOS`/`GOARCH`, `io.EOF`,
+  `base64.StdEncoding`, `crc64.ECMA`
+- **Conformance**: 24 new probes (`lib-go-*.ts`) covering every supported package, including a
+  cross-package throw/catch matrix and an offline `net/http` probe (connection-refused error path)
+
+### Changed
+
+- `go:math/big` joins the alias scheme (`tnbig`, shared with the `bigint` helper), and
+  `math/rand/v2` / `crypto/rand` import under fixed aliases to avoid declared-name collisions
+- Package-level generated imports are pruned when the emitted code does not reference them
+  (previously only module files did this), so recorded result types can pull in packages like
+  `hash` without leaving unused imports
+- `err.message` on Go `error` values reads through `Error()`
+
 ## [0.1.1] - 2026-10-10
 
 The conformance suite is fully green: all 147 probes pass (up from 95/147), through both the dev

@@ -503,6 +503,9 @@ export function transpileToNative(code, options) {
     variableTypeNodes.clear();
     narrowedVariables.clear();
     nodeCallResultTypes.clear();
+    goCallSigs.clear();
+    goValueTypes.clear();
+    goTypeProvidedPackages.clear();
     asyncFunctionNames.clear();
     generatorFunctionNames.clear();
     currentFileDir = null;
@@ -545,9 +548,23 @@ export function transpileToNative(code, options) {
     if (usedHelpers.has('timerWait'))
         drains.push('__tnTimers.Wait()');
     const drainCode = drains.length > 0 ? `\n\t${drains.join('\n\t')}` : '';
+    const mainImports = [...importedPackages]
+        .filter((pkg) => {
+        // Helper-provided and stdlib-type-provided packages are kept only
+        // when the emitted code actually references them (Go rejects unused
+        // imports). Package-level variable declarations count as usage.
+        if (!helperProvidedPackages.has(pkg) && !goTypeProvidedPackages.has(pkg))
+            return true;
+        const pkgName = goPackageName(pkg);
+        const mainCode = `${transpiledCode}\n${transpiledCodeOutside}\n${mainPackageVariables.join('\n')}\n${emitGoHelpers()}`;
+        return stripGoStrings(mainCode).includes(`${pkgName}.`);
+    })
+        .sort()
+        .map((pkg) => goImportLine(pkg))
+        .join('\n');
     const main = `package main
 
-${[...importedPackages].sort().map((pkg) => goImportLine(pkg)).join('\n')}
+${mainImports}
 
 ${mainPackageVariables.join('\n')}
 
@@ -1075,6 +1092,11 @@ function visit(node, options = {}) {
         if (arrayHigherOrderCall) {
             return arrayHigherOrderCall;
         }
+        // Go stdlib calls: argument coercion + (T, error) lowering
+        const goLibCall = emitGoStdlibCall(node);
+        if (goLibCall !== undefined) {
+            return goLibCall;
+        }
         const caller = visit(node.expression);
         const safeCaller = getSafeName(caller);
         const typeArgs = getTypeArguments((node.typeArguments ?? []));
@@ -1311,6 +1333,10 @@ function visit(node, options = {}) {
                 return `${jsStringOf(visit(node.left), leftType)} + ${visit(node.right)}`;
             }
         }
+        // Mixed Go numeric types (time.Second * 2, int + int64) unify to one type
+        const unifiedNumeric = unifyNumericBinaryOperands(node, op);
+        if (unifiedNumeric)
+            return unifiedNumeric;
         return `${visit(node.left)} ${op} ${visit(node.right)}`;
     }
     else if (isParenthesizedExpression(node)) {
@@ -3319,6 +3345,10 @@ function inferExpressionType(expr) {
     if (isIdentifier(expr) && expr.text === 'undefined')
         return 'nil';
     if (isIdentifier(expr)) {
+        // Go stdlib value imported by name (os.Args, io.EOF, time.Second...)
+        const goValueType = goValueTypes.get(expr.text);
+        if (goValueType)
+            return goValueType;
         let varType = variableGoTypes.get(expr.text);
         // Array references are read as the slice they point to
         if (varType?.startsWith('*[]'))
@@ -3362,6 +3392,9 @@ function inferExpressionType(expr) {
             return 'string';
         if (objectType?.startsWith('[]'))
             return objectType.slice(2);
+        // Go [N]byte digest arrays index to byte
+        if (objectType && /^\[\d+\]byte$/.test(objectType))
+            return 'byte';
         if (objectType?.startsWith('*TnMap['))
             return extractMapValueType(objectType);
         const declared = getExpressionTypeNode(expr);
@@ -3412,6 +3445,14 @@ function inferExpressionType(expr) {
             const fn = declaredFunctions.get(expr.expression.text);
             if (fn)
                 return `chan ${getGeneratorYieldType(fn)}`;
+        }
+        const goSig = callee ? goCallSigs.get(callee) : undefined;
+        if (goSig?.resultFromArg !== undefined) {
+            return stripArrayRef(inferExpressionType(expr.arguments?.[goSig.resultFromArg]));
+        }
+        if (goSig?.resultElemOfArg !== undefined) {
+            const elem = stripArrayRef(inferExpressionType(expr.arguments?.[goSig.resultElemOfArg]));
+            return elem?.startsWith('[]') ? elem.slice(2) : elem;
         }
         const nodeResultType = callee ? nodeCallResultTypes.get(callee) : undefined;
         if (callee && BUILTIN_CALL_TYPES[callee])
@@ -3478,6 +3519,12 @@ function inferExpressionType(expr) {
             return 'interface{}';
     }
     if (isPropertyAccessExpression(expr)) {
+        // Go stdlib value through a namespace/default import (os.Args, time.Second)
+        if (isIdentifier(expr.expression)) {
+            const qualifiedValueType = goValueTypes.get(`${expr.expression.text}.${expr.name.text}`);
+            if (qualifiedValueType)
+                return qualifiedValueType;
+        }
         const narrowingKey = getNarrowingKey(expr);
         if (narrowingKey && narrowedVariables.has(narrowingKey)) {
             // Narrowed: the declared (pointer) type without its pointer
@@ -3497,6 +3544,8 @@ function inferExpressionType(expr) {
         const leftType = inferExpressionType(expr.expression);
         if (expr.name.text === 'length')
             return 'float64';
+        if (leftType === 'error' && expr.name.text === 'message')
+            return 'string';
         const resolvedLeftType = leftType?.replace(/^\*/, '').replace(/\[.*\]$/, '');
         const resolvedPropertyType = resolvedLeftType
             ? (classPropertyTypes.get(resolvedLeftType)?.get(expr.name.text) ??
@@ -3514,6 +3563,11 @@ function inferExpressionType(expr) {
         if (resolvedPropertyType) {
             return resolvedPropertyType;
         }
+        // Fields of Go stdlib types (url.Parse(...).Host, resp.StatusCode...)
+        const goFieldReceiver = leftType?.replace(/^\*/, '').replace(/\[.*\]$/, '');
+        const goFieldType = goFieldReceiver ? GO_TYPE_PROPERTIES[goFieldReceiver]?.[expr.name.text] : undefined;
+        if (goFieldType)
+            return goFieldType;
         const structFieldType = leftType ? getStructFieldGoType(leftType.replace(/^\*/, ''), expr.name.text) : undefined;
         if (structFieldType)
             return structFieldType;
@@ -3547,6 +3601,18 @@ function inferExpressionType(expr) {
             const resultType = withNarrowingType([tmp], () => inferExpressionType(call));
             variableGoTypes.delete(tmp);
             return resultType ? makeNullableType(resultType) : undefined;
+        }
+        // Methods on Go stdlib types (now.Format, re.MatchString, file.Close...)
+        const goMethodSig = lookupGoMethodSig(ownerType, methodName);
+        if (goMethodSig?.resultFromArg !== undefined) {
+            return stripArrayRef(inferExpressionType(expr.arguments?.[goMethodSig.resultFromArg]));
+        }
+        if (goMethodSig?.resultElemOfArg !== undefined) {
+            const elem = stripArrayRef(inferExpressionType(expr.arguments?.[goMethodSig.resultElemOfArg]));
+            return elem?.startsWith('[]') ? elem.slice(2) : elem;
+        }
+        if (goMethodSig?.result) {
+            return goMethodSig.result;
         }
         if (ownerType === 'string') {
             const stringMethodType = STRING_METHOD_RETURN_TYPES[methodName];
@@ -3685,11 +3751,36 @@ function inferExpressionType(expr) {
             'GreaterThanGreaterThanToken',
             'GreaterThanGreaterThanGreaterThanToken'
         ].includes(kind)) {
+            // Mixed Go numeric types unify like the emission side (time.Second * 2)
+            const leftNum = inferExpressionType(expr.left);
+            const rightNum = inferExpressionType(expr.right);
+            const leftIsGoNum = !!leftNum && GO_NUMERIC_TYPES.has(leftNum) && leftNum !== 'float64';
+            const rightIsGoNum = !!rightNum && GO_NUMERIC_TYPES.has(rightNum) && rightNum !== 'float64';
+            if (leftIsGoNum && rightIsGoNum) {
+                return (GO_NUMERIC_RANK[leftNum] ?? 0) >= (GO_NUMERIC_RANK[rightNum] ?? 0) ? leftNum : rightNum;
+            }
+            if (leftIsGoNum && (rightNum === 'float64' || rightNum === undefined))
+                return leftNum;
+            if (rightIsGoNum && (leftNum === 'float64' || leftNum === undefined))
+                return rightNum;
             return 'float64';
         }
         if (kind === 'PlusToken') {
             const isString = [expr.left, expr.right].some((side) => inferExpressionType(side) === 'string');
-            return isString ? 'string' : 'float64';
+            if (isString)
+                return 'string';
+            const leftNum = inferExpressionType(expr.left);
+            const rightNum = inferExpressionType(expr.right);
+            const leftIsGoNum = !!leftNum && GO_NUMERIC_TYPES.has(leftNum) && leftNum !== 'float64';
+            const rightIsGoNum = !!rightNum && GO_NUMERIC_TYPES.has(rightNum) && rightNum !== 'float64';
+            if (leftIsGoNum && rightIsGoNum) {
+                return (GO_NUMERIC_RANK[leftNum] ?? 0) >= (GO_NUMERIC_RANK[rightNum] ?? 0) ? leftNum : rightNum;
+            }
+            if (leftIsGoNum)
+                return leftNum;
+            if (rightIsGoNum)
+                return rightNum;
+            return 'float64';
         }
         if (['LessThanToken', 'GreaterThanToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind)) {
             return 'bool';
@@ -3999,7 +4090,8 @@ function isNilableGoType(goType) {
         goType.startsWith('map[') ||
         goType.startsWith('func') ||
         goType.startsWith('chan ') ||
-        goType === 'interface{}');
+        goType === 'interface{}' ||
+        goType === 'error');
 }
 function visitOptionalPropertyAccess(node) {
     const baseExpr = visit(node.expression);
@@ -4624,6 +4716,8 @@ function goTypeCategory(goType) {
         return 'RegExp';
     if (goType === 'time.Time')
         return 'Date';
+    if (goType === 'error')
+        return 'error';
     return undefined;
 }
 function isNilLiteral(node) {
@@ -4634,6 +4728,10 @@ function isNilLiteral(node) {
     return false;
 }
 function getAcessString(leftSide, rightSide, objectType) {
+    if (rightSide === 'message' && objectType === 'error') {
+        // Go error values expose their text through Error(), matching JS .message
+        return `${leftSide}.Error()`;
+    }
     if (rightSide === 'length' && objectType === 'string') {
         // JS .length counts UTF-16 code units; rune count matches for the BMP
         importedPackages.add('unicode/utf8');
@@ -5945,9 +6043,9 @@ function includeLocalImport(code, dir, goFileName) {
     const fileCode = `${fileInline}\n${fileOutside}`;
     const fileImports = [...importedPackages]
         .filter((pkg) => {
-        if (!helperProvidedPackages.has(pkg))
+        if (!helperProvidedPackages.has(pkg) && !goTypeProvidedPackages.has(pkg))
             return true;
-        const pkgName = goImportAliases[pkg] ?? pkg.split('/').pop();
+        const pkgName = goPackageName(pkg);
         return stripGoStrings(fileCode).includes(`${pkgName}.`);
     })
         .sort()
@@ -5976,7 +6074,7 @@ function stripGoStrings(code) {
     return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`/g, '""');
 }
 function registerGoPackageAliases(node, goPkg) {
-    const pkgName = goPkg.split('/').pop();
+    const pkgName = goPackageName(goPkg);
     if (!node.importClause)
         return;
     const clause = node.importClause;
@@ -6016,6 +6114,1093 @@ function getImportLocalName(node) {
     }
     return null;
 }
+// Go stdlib free functions per import path (without the `go:` prefix).
+const GO_STDLIB = {
+    bufio: {
+        NewReader: { result: '*bufio.Reader' },
+        NewScanner: { result: '*bufio.Scanner' },
+        NewWriter: { result: '*bufio.Writer' }
+    },
+    bytes: {
+        Compare: { params: ['[]byte', '[]byte'], result: 'int' },
+        Contains: { params: ['[]byte', '[]byte'], result: 'bool' },
+        ContainsAny: { params: ['[]byte', 'string'], result: 'bool' },
+        ContainsRune: { params: ['[]byte', 'rune'], result: 'bool' },
+        Count: { params: ['[]byte', '[]byte'], result: 'int' },
+        Equal: { params: ['[]byte', '[]byte'], result: 'bool' },
+        EqualFold: { params: ['[]byte', '[]byte'], result: 'bool' },
+        Fields: { params: ['[]byte'], result: '[][]byte' },
+        HasPrefix: { params: ['[]byte', '[]byte'], result: 'bool' },
+        HasSuffix: { params: ['[]byte', '[]byte'], result: 'bool' },
+        Index: { params: ['[]byte', '[]byte'], result: 'int' },
+        IndexAny: { params: ['[]byte', 'string'], result: 'int' },
+        IndexByte: { params: ['[]byte', 'byte'], result: 'int' },
+        IndexRune: { params: ['[]byte', 'rune'], result: 'int' },
+        Join: { params: ['[][]byte', '[]byte'], result: '[]byte' },
+        LastIndex: { params: ['[]byte', '[]byte'], result: 'int' },
+        LastIndexAny: { params: ['[]byte', 'string'], result: 'int' },
+        NewBuffer: { params: ['[]byte'], result: '*bytes.Buffer' },
+        NewBufferString: { params: ['string'], result: '*bytes.Buffer' },
+        Repeat: { params: ['[]byte', 'int'], result: '[]byte' },
+        Replace: { params: ['[]byte', '[]byte', '[]byte', 'int'], result: '[]byte' },
+        ReplaceAll: { params: ['[]byte', '[]byte', '[]byte'], result: '[]byte' },
+        Runes: { params: ['[]byte'], result: '[]rune' },
+        Split: { params: ['[]byte', '[]byte'], result: '[][]byte' },
+        SplitAfter: { params: ['[]byte', '[]byte'], result: '[][]byte' },
+        SplitN: { params: ['[]byte', '[]byte', 'int'], result: '[][]byte' },
+        Title: { params: ['[]byte'], result: '[]byte' },
+        ToLower: { params: ['[]byte'], result: '[]byte' },
+        ToTitle: { params: ['[]byte'], result: '[]byte' },
+        ToUpper: { params: ['[]byte'], result: '[]byte' },
+        Trim: { params: ['[]byte', 'string'], result: '[]byte' },
+        TrimLeft: { params: ['[]byte', 'string'], result: '[]byte' },
+        TrimPrefix: { params: ['[]byte', '[]byte'], result: '[]byte' },
+        TrimRight: { params: ['[]byte', 'string'], result: '[]byte' },
+        TrimSpace: { params: ['[]byte'], result: '[]byte' },
+        TrimSuffix: { params: ['[]byte', '[]byte'], result: '[]byte' }
+    },
+    cmp: {
+        Compare: { result: 'int' },
+        Less: { result: 'bool' }
+    },
+    context: {
+        Background: { result: 'context.Context' },
+        TODO: { result: 'context.Context' },
+        WithValue: { params: ['context.Context', 'any', 'any'], result: 'context.Context' }
+    },
+    'crypto/hmac': {
+        New: { params: ['func() hash.Hash', '[]byte'], result: 'hash.Hash' },
+        Equal: { params: ['[]byte', '[]byte'], result: 'bool' }
+    },
+    'crypto/md5': {
+        Sum: { params: ['[]byte'], result: '[16]byte' },
+        New: { result: 'hash.Hash' }
+    },
+    'crypto/rand': {
+        Text: { result: 'string' }
+    },
+    'crypto/sha1': {
+        Sum: { params: ['[]byte'], result: '[20]byte' },
+        New: { result: 'hash.Hash' }
+    },
+    'crypto/sha256': {
+        Sum224: { params: ['[]byte'], result: '[28]byte' },
+        Sum256: { params: ['[]byte'], result: '[32]byte' },
+        New: { result: 'hash.Hash' },
+        New224: { result: 'hash.Hash' }
+    },
+    'crypto/sha512': {
+        Sum384: { params: ['[]byte'], result: '[48]byte' },
+        Sum512: { params: ['[]byte'], result: '[64]byte' },
+        New384: { result: 'hash.Hash' },
+        New512: { result: 'hash.Hash' }
+    },
+    'crypto/subtle': {
+        ConstantTimeCompare: { params: ['[]byte', '[]byte'], result: 'int' },
+        ConstantTimeByteEq: { params: ['byte', 'byte'], result: 'bool' }
+    },
+    'encoding/base64': {},
+    'encoding/hex': {
+        EncodeToString: { params: ['[]byte'], result: 'string' },
+        DecodeString: { params: ['string'], result: '[]byte', error: true },
+        Encode: { params: ['[]byte'], result: '[]byte' },
+        Decode: { params: ['[]byte'], result: '[]byte', error: true },
+        Dump: { params: ['[]byte'], result: 'string' }
+    },
+    'encoding/json': {
+        Marshal: { params: ['any'], result: '[]byte', error: true },
+        MarshalIndent: { params: ['any', 'string', 'string'], result: '[]byte', error: true },
+        Valid: { params: ['[]byte'], result: 'bool' }
+    },
+    'encoding/pem': {
+        EncodeToMemory: { params: ['any', '[]byte'], result: '[]byte' }
+    },
+    errors: {
+        New: { params: ['string'], result: 'error' },
+        Is: { params: ['error', 'error'], result: 'bool' },
+        Unwrap: { params: ['error'], result: 'error' },
+        Join: { result: 'error' }
+    },
+    fmt: {
+        Append: { params: ['[]byte'], result: '[]byte' },
+        Appendf: { params: ['[]byte', 'string'], result: '[]byte' },
+        Errorf: { params: ['string'], result: 'error' },
+        Fprint: { params: ['any'], result: '' },
+        Fprintf: { params: ['any', 'string'], result: '' },
+        Fprintln: { params: ['any'], result: '' },
+        Print: { result: '' },
+        Printf: { params: ['string'], result: '' },
+        Println: { result: '' },
+        Sprint: { result: 'string' },
+        Sprintf: { params: ['string'], result: 'string' },
+        Sprintln: { result: 'string' }
+    },
+    'hash/adler32': {
+        Checksum: { params: ['[]byte'], result: 'uint32' },
+        New: { result: 'hash.Hash' }
+    },
+    'hash/crc32': {
+        Checksum: { params: ['[]byte', 'any'], result: 'uint32' },
+        ChecksumIEEE: { params: ['[]byte'], result: 'uint32' },
+        Update: { params: ['uint32', 'any', '[]byte'], result: 'uint32' },
+        NewIEEE: { result: 'hash.Hash' }
+    },
+    'hash/crc64': {
+        Checksum: { params: ['[]byte', 'any'], result: 'uint64' },
+        Update: { params: ['uint64', 'any', '[]byte'], result: 'uint64' },
+        NewIEEE: { result: 'hash.Hash' },
+        MakeTable: { params: ['uint64'], result: 'any' }
+    },
+    'hash/fnv': {
+        New32: { result: 'hash.Hash' },
+        New32a: { result: 'hash.Hash' },
+        New64: { result: 'hash.Hash' },
+        New64a: { result: 'hash.Hash' }
+    },
+    html: {
+        EscapeString: { params: ['string'], result: 'string' },
+        UnescapeString: { params: ['string'], result: 'string' }
+    },
+    io: {
+        Copy: { params: ['any', 'any'], result: '' },
+        CopyN: { params: ['any', 'any', 'int64'], result: '' },
+        Discard: { params: ['any', 'int64'], result: '' },
+        NopCloser: { params: ['any'], result: 'any' },
+        ReadAll: { params: ['any'], result: '[]byte', error: true },
+        WriteString: { params: ['any', 'string'], result: '' }
+    },
+    log: {
+        Fatal: { result: '' },
+        Fatalf: { params: ['string'], result: '' },
+        Fatalln: { result: '' },
+        Panic: { result: '' },
+        Panicf: { params: ['string'], result: '' },
+        Panicln: { result: '' },
+        Print: { result: '' },
+        Printf: { params: ['string'], result: '' },
+        Println: { result: '' },
+        SetFlags: { params: ['int'], result: '' },
+        SetOutput: { params: ['any'], result: '' },
+        SetPrefix: { params: ['string'], result: '' }
+    },
+    'log/slog': {
+        Debug: { params: ['string'], result: '' },
+        Error: { params: ['string'], result: '' },
+        Info: { params: ['string'], result: '' },
+        Warn: { params: ['string'], result: '' }
+    },
+    math: {
+        Abs: { params: ['float64'], result: 'float64' },
+        Acos: { params: ['float64'], result: 'float64' },
+        Acosh: { params: ['float64'], result: 'float64' },
+        Asin: { params: ['float64'], result: 'float64' },
+        Asinh: { params: ['float64'], result: 'float64' },
+        Atan: { params: ['float64'], result: 'float64' },
+        Atan2: { params: ['float64', 'float64'], result: 'float64' },
+        Atanh: { params: ['float64'], result: 'float64' },
+        Cbrt: { params: ['float64'], result: 'float64' },
+        Ceil: { params: ['float64'], result: 'float64' },
+        Copysign: { params: ['float64', 'float64'], result: 'float64' },
+        Cos: { params: ['float64'], result: 'float64' },
+        Cosh: { params: ['float64'], result: 'float64' },
+        Dim: { params: ['float64', 'float64'], result: 'float64' },
+        Erf: { params: ['float64'], result: 'float64' },
+        Erfc: { params: ['float64'], result: 'float64' },
+        Erfinv: { params: ['float64'], result: 'float64' },
+        Exp: { params: ['float64'], result: 'float64' },
+        Exp2: { params: ['float64'], result: 'float64' },
+        Expm1: { params: ['float64'], result: 'float64' },
+        Floor: { params: ['float64'], result: 'float64' },
+        Gamma: { params: ['float64'], result: 'float64' },
+        Hypot: { params: ['float64', 'float64'], result: 'float64' },
+        Ilogb: { params: ['float64'], result: 'int' },
+        Inf: { params: ['int'], result: 'float64' },
+        IsInf: { params: ['float64', 'int'], result: 'bool' },
+        IsNaN: { params: ['float64'], result: 'bool' },
+        Jn: { params: ['int', 'float64'], result: 'float64' },
+        Ldexp: { params: ['float64', 'int'], result: 'float64' },
+        Log: { params: ['float64'], result: 'float64' },
+        Log10: { params: ['float64'], result: 'float64' },
+        Log1p: { params: ['float64'], result: 'float64' },
+        Log2: { params: ['float64'], result: 'float64' },
+        Logb: { params: ['float64'], result: 'float64' },
+        Max: { params: ['float64', 'float64'], result: 'float64' },
+        Min: { params: ['float64', 'float64'], result: 'float64' },
+        Mod: { params: ['float64', 'float64'], result: 'float64' },
+        NaN: { result: 'float64' },
+        Nextafter: { params: ['float64', 'float64'], result: 'float64' },
+        Pow: { params: ['float64', 'float64'], result: 'float64' },
+        Remainder: { params: ['float64', 'float64'], result: 'float64' },
+        Round: { params: ['float64'], result: 'float64' },
+        RoundToEven: { params: ['float64'], result: 'float64' },
+        Signbit: { params: ['float64'], result: 'bool' },
+        Sin: { params: ['float64'], result: 'float64' },
+        Sinh: { params: ['float64'], result: 'float64' },
+        Sqrt: { params: ['float64'], result: 'float64' },
+        Tan: { params: ['float64'], result: 'float64' },
+        Tanh: { params: ['float64'], result: 'float64' },
+        Trunc: { params: ['float64'], result: 'float64' }
+    },
+    'math/big': {
+        NewInt: { params: ['int64'], result: '*tnbig.Int' }
+    },
+    'math/bits': {
+        LeadingZeros: { params: ['uint'], result: 'int' },
+        LeadingZeros8: { params: ['uint8'], result: 'int' },
+        LeadingZeros16: { params: ['uint16'], result: 'int' },
+        LeadingZeros32: { params: ['uint32'], result: 'int' },
+        LeadingZeros64: { params: ['uint64'], result: 'int' },
+        Len: { params: ['uint'], result: 'int' },
+        Len8: { params: ['uint8'], result: 'int' },
+        Len16: { params: ['uint16'], result: 'int' },
+        Len32: { params: ['uint32'], result: 'int' },
+        Len64: { params: ['uint64'], result: 'int' },
+        OnesCount: { params: ['uint'], result: 'int' },
+        OnesCount8: { params: ['uint8'], result: 'int' },
+        OnesCount16: { params: ['uint16'], result: 'int' },
+        OnesCount32: { params: ['uint32'], result: 'int' },
+        OnesCount64: { params: ['uint64'], result: 'int' },
+        Reverse: { params: ['uint'], result: 'uint' },
+        Reverse8: { params: ['uint8'], result: 'uint8' },
+        Reverse16: { params: ['uint16'], result: 'uint16' },
+        Reverse32: { params: ['uint32'], result: 'uint32' },
+        Reverse64: { params: ['uint64'], result: 'uint64' },
+        ReverseBytes: { params: ['uint'], result: 'uint' },
+        ReverseBytes16: { params: ['uint16'], result: 'uint16' },
+        ReverseBytes32: { params: ['uint32'], result: 'uint32' },
+        ReverseBytes64: { params: ['uint64'], result: 'uint64' },
+        RotateLeft: { params: ['uint', 'int'], result: 'uint' },
+        RotateLeft8: { params: ['uint8', 'int'], result: 'uint8' },
+        RotateLeft16: { params: ['uint16', 'int'], result: 'uint16' },
+        RotateLeft32: { params: ['uint32', 'int'], result: 'uint32' },
+        RotateLeft64: { params: ['uint64', 'int'], result: 'uint64' },
+        RotateRight: { params: ['uint', 'int'], result: 'uint' },
+        TrailingZeros: { params: ['uint'], result: 'int' },
+        TrailingZeros8: { params: ['uint8'], result: 'int' },
+        TrailingZeros16: { params: ['uint16'], result: 'int' },
+        TrailingZeros32: { params: ['uint32'], result: 'int' },
+        TrailingZeros64: { params: ['uint64'], result: 'int' }
+    },
+    'math/rand': {
+        ExpFloat64: { result: 'float64' },
+        Float32: { result: 'float32' },
+        Float64: { result: 'float64' },
+        Int: { result: 'int' },
+        Int31: { result: 'int32' },
+        Int31N: { params: ['int32'], result: 'int32' },
+        Int63: { result: 'int64' },
+        Int63N: { params: ['int64'], result: 'int64' },
+        Intn: { params: ['int'], result: 'int' },
+        NormFloat64: { result: 'float64' },
+        Perm: { params: ['int'], result: '[]int' },
+        Seed: { params: ['int64'], result: '' },
+        Uint32: { result: 'uint32' },
+        Uint64: { result: 'uint64' }
+    },
+    'math/rand/v2': {
+        ExpFloat64: { result: 'float64' },
+        Float32: { result: 'float32' },
+        Float64: { result: 'float64' },
+        Int: { result: 'int' },
+        Int32N: { params: ['int32'], result: 'int32' },
+        Int64N: { params: ['int64'], result: 'int64' },
+        IntN: { params: ['int'], result: 'int' },
+        NormFloat64: { result: 'float64' },
+        Perm: { params: ['int'], result: '[]int' },
+        Uint32: { result: 'uint32' },
+        Uint64: { result: 'uint64' },
+        UintN: { params: ['uint'], result: 'uint' }
+    },
+    'net/http': {
+        Get: { params: ['string'], result: '*http.Response', error: true },
+        Head: { params: ['string'], result: '*http.Response', error: true },
+        Post: { params: ['string', 'string', 'any'], result: '*http.Response', error: true },
+        PostForm: { params: ['string', 'any'], result: '*http.Response', error: true },
+        NewRequest: { params: ['string', 'string', 'any'], result: '*http.Request', error: true },
+        ReadResponse: { params: ['any', 'string'], result: '*http.Response', error: true }
+    },
+    'net/url': {
+        JoinPath: { params: ['string'], result: '*tnurl.URL', error: true },
+        Parse: { params: ['string'], result: '*tnurl.URL', error: true },
+        ParseQuery: { params: ['string'], result: 'tnurl.Values', error: true },
+        ParseRequestURI: { params: ['string'], result: '*tnurl.URL', error: true },
+        PathEscape: { params: ['string'], result: 'string' },
+        PathUnescape: { params: ['string'], result: 'string', error: true },
+        QueryEscape: { params: ['string'], result: 'string' },
+        QueryUnescape: { params: ['string'], result: 'string', error: true }
+    },
+    os: {
+        Chdir: { params: ['string'], errorOnly: true },
+        Chmod: { params: ['string', 'os.FileMode'], errorOnly: true },
+        Create: { params: ['string'], result: '*os.File', error: true },
+        Environ: { result: '[]string' },
+        Executable: { result: 'string', error: true },
+        Exit: { params: ['int'], result: '' },
+        Expand: { params: ['string', 'any'], result: 'string' },
+        Getenv: { params: ['string'], result: 'string' },
+        Gethostname: { result: 'string', error: true },
+        Getpagesize: { result: 'int' },
+        Getwd: { result: 'string', error: true },
+        Hostname: { result: 'string', error: true },
+        LookupEnv: { params: ['string'], result: 'string', error: true },
+        Mkdir: { params: ['string', 'os.FileMode'], errorOnly: true },
+        MkdirAll: { params: ['string', 'os.FileMode'], errorOnly: true },
+        MkdirTemp: { params: ['string', 'string'], result: 'string', error: true },
+        Open: { params: ['string'], result: '*os.File', error: true },
+        OpenFile: { params: ['string', 'int', 'os.FileMode'], result: '*os.File', error: true },
+        ReadDir: { params: ['string'], result: '[]os.DirEntry', error: true },
+        ReadFile: { params: ['string'], result: '[]byte', error: true },
+        Remove: { params: ['string'], errorOnly: true },
+        RemoveAll: { params: ['string'], errorOnly: true },
+        Rename: { params: ['string', 'string'], errorOnly: true },
+        SameFile: { params: ['any', 'any'], result: 'bool' },
+        Setenv: { params: ['string', 'string'], errorOnly: true },
+        Stat: { params: ['string'], result: 'os.FileInfo', error: true },
+        TempDir: { result: 'string' },
+        Truncate: { params: ['string', 'int64'], errorOnly: true },
+        Unsetenv: { params: ['string'], errorOnly: true },
+        UserCacheDir: { result: 'string', error: true },
+        UserConfigDir: { result: 'string', error: true },
+        UserHomeDir: { result: 'string', error: true },
+        WriteFile: { params: ['string', '[]byte', 'os.FileMode'], errorOnly: true }
+    },
+    'os/exec': {
+        Command: { result: '*exec.Cmd' },
+        CommandContext: { params: ['context.Context', 'string'], result: '*exec.Cmd' }
+    },
+    path: {
+        Base: { params: ['string'], result: 'string' },
+        Clean: { params: ['string'], result: 'string' },
+        Dir: { params: ['string'], result: 'string' },
+        Ext: { params: ['string'], result: 'string' },
+        IsAbs: { params: ['string'], result: 'bool' },
+        Join: { result: 'string' },
+        Match: { params: ['string', 'string'], result: 'bool', error: true }
+    },
+    'path/filepath': {
+        Abs: { params: ['string'], result: 'string', error: true },
+        Base: { params: ['string'], result: 'string' },
+        Clean: { params: ['string'], result: 'string' },
+        Dir: { params: ['string'], result: 'string' },
+        EvalSymlinks: { params: ['string'], result: 'string', error: true },
+        Ext: { params: ['string'], result: 'string' },
+        FromSlash: { params: ['string'], result: 'string' },
+        Glob: { params: ['string'], result: '[]string', error: true },
+        IsAbs: { params: ['string'], result: 'bool' },
+        Join: { result: 'string' },
+        Localize: { params: ['string'], result: 'string', error: true },
+        Match: { params: ['string', 'string'], result: 'bool', error: true },
+        Rel: { params: ['string', 'string'], result: 'string', error: true },
+        SplitList: { params: ['string'], result: '[]string' },
+        ToSlash: { params: ['string'], result: 'string' },
+        VolumeName: { params: ['string'], result: 'string' }
+    },
+    reflect: {
+        DeepEqual: { params: ['any', 'any'], result: 'bool' },
+        Indirect: { params: ['any'], result: 'any' },
+        TypeOf: { params: ['any'], result: 'reflect.Type' },
+        ValueOf: { params: ['any'], result: 'reflect.Value' }
+    },
+    regexp: {
+        Compile: { params: ['string'], result: '*regexp.Regexp', error: true },
+        MustCompile: { params: ['string'], result: '*regexp.Regexp' },
+        QuoteMeta: { params: ['string'], result: 'string' }
+    },
+    runtime: {
+        GC: { result: '' },
+        GOROOT: { result: 'string' },
+        NumCPU: { result: 'int' },
+        NumGoroutine: { result: 'int' },
+        Version: { result: 'string' }
+    },
+    'runtime/debug': {
+        FreeOSMemory: { result: '' },
+        PrintStack: { result: '' },
+        SetGCPercent: { params: ['int'], result: 'int' },
+        SetMemoryLimit: { params: ['int64'], result: 'int64' },
+        SetTraceback: { params: ['string'], result: '' },
+        Stack: { result: '[]byte' }
+    },
+    slices: {
+        Clone: { resultFromArg: 0 },
+        Compare: { params: ['any', 'any'], result: 'int' },
+        Compact: { resultFromArg: 0 },
+        Concat: { resultFromArg: 0 },
+        Contains: { params: ['any', 'any'], result: 'bool' },
+        Delete: { params: ['any', 'int', 'int'], resultFromArg: 0 },
+        Equal: { params: ['any', 'any'], result: 'bool' },
+        Index: { params: ['any', 'any'], result: 'int' },
+        IsSorted: { params: ['any'], result: 'bool' },
+        Max: { resultElemOfArg: 0 },
+        Min: { resultElemOfArg: 0 },
+        Repeat: { params: ['any', 'int'], resultFromArg: 0 },
+        Reverse: { resultFromArg: 0 },
+        Sort: { result: '' }
+    },
+    sort: {
+        Float64s: { result: '' },
+        Float64sAreSorted: { result: 'bool' },
+        SearchFloat64s: { params: ['float64'], result: 'int' },
+        SearchStrings: { params: ['string'], result: 'int' },
+        Strings: { result: '' },
+        StringsAreSorted: { result: 'bool' }
+    },
+    strconv: {
+        AppendQuote: { params: ['[]byte', 'string'], result: '[]byte' },
+        Atoi: { params: ['string'], result: 'int', error: true },
+        FormatBool: { params: ['bool'], result: 'string' },
+        FormatFloat: { params: ['float64', 'byte', 'int', 'int'], result: 'string' },
+        FormatInt: { params: ['int64', 'int'], result: 'string' },
+        FormatUint: { params: ['uint64', 'int'], result: 'string' },
+        Itoa: { params: ['int'], result: 'string' },
+        ParseBool: { params: ['string'], result: 'bool', error: true },
+        ParseFloat: { params: ['string', 'int'], result: 'float64', error: true },
+        ParseInt: { params: ['string', 'int', 'int'], result: 'int64', error: true },
+        ParseUint: { params: ['string', 'int', 'int'], result: 'uint64', error: true },
+        Quote: { params: ['string'], result: 'string' },
+        QuoteToASCII: { params: ['string'], result: 'string' },
+        Unquote: { params: ['string'], result: 'string', error: true }
+    },
+    strings: {
+        Compare: { params: ['string', 'string'], result: 'int' },
+        Contains: { params: ['string', 'string'], result: 'bool' },
+        ContainsAny: { params: ['string', 'string'], result: 'bool' },
+        ContainsRune: { params: ['string', 'rune'], result: 'bool' },
+        Count: { params: ['string', 'string'], result: 'int' },
+        EqualFold: { params: ['string', 'string'], result: 'bool' },
+        Fields: { params: ['string'], result: '[]string' },
+        HasPrefix: { params: ['string', 'string'], result: 'bool' },
+        HasSuffix: { params: ['string', 'string'], result: 'bool' },
+        Index: { params: ['string', 'string'], result: 'int' },
+        IndexAny: { params: ['string', 'string'], result: 'int' },
+        IndexByte: { params: ['string', 'byte'], result: 'int' },
+        IndexRune: { params: ['string', 'rune'], result: 'int' },
+        Join: { params: ['[]string', 'string'], result: 'string' },
+        LastIndex: { params: ['string', 'string'], result: 'int' },
+        LastIndexAny: { params: ['string', 'string'], result: 'int' },
+        LastIndexByte: { params: ['string', 'byte'], result: 'int' },
+        Repeat: { params: ['string', 'int'], result: 'string' },
+        Replace: { params: ['string', 'string', 'string', 'int'], result: 'string' },
+        ReplaceAll: { params: ['string', 'string', 'string'], result: 'string' },
+        Split: { params: ['string', 'string'], result: '[]string' },
+        SplitAfter: { params: ['string', 'string'], result: '[]string' },
+        SplitN: { params: ['string', 'string', 'int'], result: '[]string' },
+        ToLower: { params: ['string'], result: 'string' },
+        ToTitle: { params: ['string'], result: 'string' },
+        ToUpper: { params: ['string'], result: 'string' },
+        ToValidUTF8: { params: ['string', 'string'], result: 'string' },
+        Trim: { params: ['string', 'string'], result: 'string' },
+        TrimLeft: { params: ['string', 'string'], result: 'string' },
+        TrimPrefix: { params: ['string', 'string'], result: 'string' },
+        TrimRight: { params: ['string', 'string'], result: 'string' },
+        TrimSpace: { params: ['string'], result: 'string' },
+        TrimSuffix: { params: ['string', 'string'], result: 'string' }
+    },
+    time: {
+        Date: { params: ['int', 'time.Month', 'int', 'int', 'int', 'int', 'int', 'any'], result: 'time.Time' },
+        FixedZone: { params: ['string', 'int'], result: '*time.Location' },
+        LoadLocation: { params: ['string'], result: '*time.Location', error: true },
+        Now: { result: 'time.Time' },
+        Parse: { params: ['string', 'string'], result: 'time.Time', error: true },
+        ParseDuration: { params: ['string'], result: 'time.Duration', error: true },
+        ParseInLocation: { params: ['string', 'string', 'any'], result: 'time.Time', error: true },
+        Since: { params: ['time.Time'], result: 'time.Duration' },
+        Unix: { params: ['int64', 'int64'], result: 'time.Time' },
+        UnixMicro: { params: ['int64'], result: 'time.Time' },
+        UnixMilli: { params: ['int64'], result: 'time.Time' },
+        Until: { params: ['time.Time'], result: 'time.Duration' }
+    },
+    unicode: {
+        IsControl: { params: ['rune'], result: 'bool' },
+        IsDigit: { params: ['rune'], result: 'bool' },
+        IsGraphic: { params: ['rune'], result: 'bool' },
+        IsLetter: { params: ['rune'], result: 'bool' },
+        IsLower: { params: ['rune'], result: 'bool' },
+        IsMark: { params: ['rune'], result: 'bool' },
+        IsNumber: { params: ['rune'], result: 'bool' },
+        IsPrint: { params: ['rune'], result: 'bool' },
+        IsPunct: { params: ['rune'], result: 'bool' },
+        IsSpace: { params: ['rune'], result: 'bool' },
+        IsSymbol: { params: ['rune'], result: 'bool' },
+        IsTitle: { params: ['rune'], result: 'bool' },
+        IsUpper: { params: ['rune'], result: 'bool' },
+        SimpleFold: { params: ['rune'], result: 'rune' },
+        ToLower: { params: ['rune'], result: 'rune' },
+        ToTitle: { params: ['rune'], result: 'rune' },
+        ToUpper: { params: ['rune'], result: 'rune' }
+    },
+    'unicode/utf8': {
+        FullRuneInString: { params: ['string'], result: 'bool' },
+        RuneCountInString: { params: ['string'], result: 'int' },
+        RuneLen: { params: ['rune'], result: 'int' },
+        RuneStart: { params: ['byte'], result: 'bool' },
+        Valid: { params: ['[]byte'], result: 'bool' },
+        ValidRune: { params: ['rune'], result: 'bool' },
+        ValidString: { params: ['string'], result: 'bool' }
+    }
+};
+// Methods on Go types returned by stdlib functions (receiver type without a
+// leading `*`). Pointer/value receivers are not distinguished: Go auto-derefs
+// pointer receivers on pointer values, so one table serves both.
+const GO_METHODS = {
+    'base64.Encoding': {
+        DecodeString: { params: ['string'], result: '[]byte', error: true },
+        DecodedLen: { params: ['int'], result: 'int' },
+        EncodeToString: { params: ['[]byte'], result: 'string' },
+        EncodedLen: { params: ['int'], result: 'int' }
+    },
+    'bufio.Reader': {
+        Buffered: { result: 'int' },
+        ReadByte: { result: 'byte', error: true },
+        ReadRune: { result: 'rune', error: true },
+        ReadString: { params: ['byte'], result: 'string', error: true }
+    },
+    'bufio.Scanner': {
+        Bytes: { result: '[]byte' },
+        Err: { result: 'error' },
+        Scan: { result: 'bool' },
+        Text: { result: 'string' }
+    },
+    'bufio.Writer': {
+        Flush: { errorOnly: true }
+    },
+    'bytes.Buffer': {
+        Bytes: { result: '[]byte' },
+        Len: { result: 'int' },
+        Reset: { result: '' },
+        String: { result: 'string' },
+        WriteByte: { params: ['byte'], errorOnly: true },
+        WriteString: { params: ['string'], result: 'int', error: true }
+    },
+    'exec.Cmd': {
+        CombinedOutput: { result: '[]byte', error: true },
+        Output: { result: '[]byte', error: true },
+        Run: { errorOnly: true },
+        Start: { errorOnly: true },
+        String: { result: 'string' },
+        Wait: { errorOnly: true }
+    },
+    'hash.Hash': {
+        BlockSize: { result: 'int' },
+        Reset: { result: '' },
+        Size: { result: 'int' },
+        Sum: { params: ['[]byte'], result: '[]byte' }
+    },
+    'http.Header': {
+        Add: { params: ['string', 'string'], result: '' },
+        Del: { params: ['string'], result: '' },
+        Get: { params: ['string'], result: 'string' },
+        Set: { params: ['string', 'string'], result: '' },
+        Values: { params: ['string'], result: '[]string' }
+    },
+    'http.Request': {
+        Context: { result: 'context.Context' },
+        SetBasicAuth: { params: ['string', 'string'], result: '' },
+        UserAgent: { result: 'string' }
+    },
+    'http.Response': {
+        Cookies: { result: 'any' }
+    },
+    'log.Logger': {
+        Fatal: { result: '' },
+        Fatalf: { params: ['string'], result: '' },
+        Panic: { result: '' },
+        Panicf: { params: ['string'], result: '' },
+        Print: { result: '' },
+        Printf: { params: ['string'], result: '' },
+        Println: { result: '' }
+    },
+    'os.DirEntry': {
+        IsDir: { result: 'bool' },
+        Name: { result: 'string' }
+    },
+    'os.File': {
+        Close: { errorOnly: true },
+        Name: { result: 'string' },
+        Stat: { result: 'os.FileInfo', error: true },
+        Sync: { errorOnly: true }
+    },
+    'os.FileInfo': {
+        IsDir: { result: 'bool' },
+        ModTime: { result: 'time.Time' },
+        Name: { result: 'string' },
+        Size: { result: 'int64' }
+    },
+    'reflect.Type': {
+        Kind: { result: 'reflect.Kind' },
+        Name: { result: 'string' },
+        String: { result: 'string' }
+    },
+    'reflect.Value': {
+        Bool: { result: 'bool' },
+        Float: { result: 'float64' },
+        Int: { result: 'int64' },
+        Interface: { result: 'any' },
+        IsNil: { result: 'bool' },
+        IsValid: { result: 'bool' },
+        Kind: { result: 'reflect.Kind' },
+        Len: { result: 'int' },
+        String: { result: 'string' },
+        Type: { result: 'reflect.Type' }
+    },
+    'regexp.Regexp': {
+        FindAllString: { params: ['string', 'int'], result: '[]string' },
+        FindAllStringIndex: { params: ['string', 'int'], result: '[][]int' },
+        FindAllStringSubmatch: { params: ['string', 'int'], result: '[][]string' },
+        FindString: { params: ['string'], result: 'string' },
+        FindStringIndex: { params: ['string'], result: '[]int' },
+        FindStringSubmatch: { params: ['string'], result: '[]string' },
+        Longest: { result: '' },
+        Match: { params: ['[]byte'], result: 'bool' },
+        MatchString: { params: ['string'], result: 'bool' },
+        NumSubexp: { result: 'int' },
+        ReplaceAllLiteralString: { params: ['string', 'string'], result: 'string' },
+        ReplaceAllString: { params: ['string', 'string'], result: 'string' },
+        Split: { params: ['string', 'int'], result: '[]string' },
+        String: { result: 'string' },
+        SubexpNames: { result: '[]string' }
+    },
+    'time.Duration': {
+        Hours: { result: 'float64' },
+        Microseconds: { result: 'int64' },
+        Milliseconds: { result: 'int64' },
+        Minutes: { result: 'float64' },
+        Nanoseconds: { result: 'int64' },
+        Round: { params: ['time.Duration'], result: 'time.Duration' },
+        Seconds: { result: 'float64' },
+        String: { result: 'string' },
+        Truncate: { params: ['time.Duration'], result: 'time.Duration' }
+    },
+    'time.Location': {
+        String: { result: 'string' }
+    },
+    'time.Time': {
+        Add: { params: ['time.Duration'], result: 'time.Time' },
+        AddDate: { params: ['int', 'int', 'int'], result: 'time.Time' },
+        After: { params: ['time.Time'], result: 'bool' },
+        Before: { params: ['time.Time'], result: 'bool' },
+        Day: { result: 'int' },
+        Equal: { params: ['time.Time'], result: 'bool' },
+        Format: { params: ['string'], result: 'string' },
+        Hour: { result: 'int' },
+        IsZero: { result: 'bool' },
+        Local: { result: 'time.Time' },
+        Location: { result: '*time.Location' },
+        Minute: { result: 'int' },
+        Month: { result: 'time.Month' },
+        Nanosecond: { result: 'int' },
+        Second: { result: 'int' },
+        String: { result: 'string' },
+        Sub: { params: ['time.Time'], result: 'time.Duration' },
+        Truncate: { params: ['time.Duration'], result: 'time.Time' },
+        UTC: { result: 'time.Time' },
+        Unix: { result: 'int64' },
+        UnixMicro: { result: 'int64' },
+        UnixMilli: { result: 'int64' },
+        UnixNano: { result: 'int64' },
+        Weekday: { result: 'time.Weekday' },
+        Year: { result: 'int' },
+        YearDay: { result: 'int' }
+    },
+    'tnurl.URL': {
+        EscapedPath: { result: 'string' },
+        Hostname: { result: 'string' },
+        IsAbs: { result: 'bool' },
+        Port: { result: 'string' },
+        Query: { result: 'tnurl.Values' },
+        RequestURI: { result: 'string' },
+        String: { result: 'string' }
+    },
+    'tnurl.Values': {
+        Add: { params: ['string', 'string'], result: '' },
+        Del: { params: ['string'], result: '' },
+        Encode: { result: 'string' },
+        Get: { params: ['string'], result: 'string' },
+        Has: { params: ['string'], result: 'bool' },
+        Set: { params: ['string', 'string'], result: '' }
+    }
+};
+// Fields of Go types returned by stdlib functions (read via property access).
+const GO_TYPE_PROPERTIES = {
+    'http.Request': {
+        Host: 'string',
+        Method: 'string',
+        Proto: 'string',
+        RemoteAddr: 'string',
+        URL: '*url.URL'
+    },
+    'http.Response': {
+        Body: 'io.ReadCloser',
+        ContentLength: 'int64',
+        Proto: 'string',
+        Status: 'string',
+        StatusCode: 'int'
+    },
+    'tnurl.URL': {
+        Fragment: 'string',
+        Host: 'string',
+        Opaque: 'string',
+        Path: 'string',
+        RawFragment: 'string',
+        RawPath: 'string',
+        RawQuery: 'string',
+        Scheme: 'string'
+    }
+};
+// Constants / variables exposed by stdlib packages (typed values, not calls).
+const GO_VALUES = {
+    'crypto/sha256': { Size: 'int', BlockSize: 'int' },
+    'encoding/base64': {
+        StdEncoding: '*base64.Encoding',
+        URLEncoding: '*base64.Encoding',
+        RawStdEncoding: '*base64.Encoding',
+        RawURLEncoding: '*base64.Encoding'
+    },
+    'hash/crc64': { ECMA: '*crc64.Table', ISO: '*crc64.Table' },
+    io: { EOF: 'error', ErrClosed: 'error', ErrUnexpectedEOF: 'error' },
+    math: {
+        E: 'float64',
+        Ln10: 'float64',
+        Ln2: 'float64',
+        Log10E: 'float64',
+        Log2E: 'float64',
+        MaxFloat64: 'float64',
+        MaxInt: 'int',
+        MaxInt8: 'int8',
+        MaxInt16: 'int16',
+        MaxInt32: 'int32',
+        MaxInt64: 'int64',
+        MaxUint8: 'uint8',
+        MaxUint16: 'uint16',
+        MaxUint32: 'uint32',
+        MaxUint64: 'uint64',
+        MinInt: 'int',
+        MinInt8: 'int8',
+        MinInt16: 'int16',
+        MinInt32: 'int32',
+        MinInt64: 'int64',
+        Phi: 'float64',
+        Pi: 'float64',
+        SmallestNonzeroFloat64: 'float64',
+        Sqrt2: 'float64',
+        SqrtE: 'float64',
+        SqrtPi: 'float64'
+    },
+    'net/http': { DefaultMaxHeaderBytes: 'int', DefaultMaxIdleConns: 'int' },
+    os: {
+        Args: '[]string',
+        DevNull: 'string',
+        Stderr: '*os.File',
+        Stdin: '*os.File',
+        Stdout: '*os.File'
+    },
+    runtime: { Compiler: 'string', GOARCH: 'string', GOOS: 'string' },
+    strconv: { IntSize: 'int' },
+    time: {
+        ANSIC: 'string',
+        April: 'time.Month',
+        August: 'time.Month',
+        DateOnly: 'string',
+        DateTime: 'string',
+        December: 'time.Month',
+        February: 'time.Month',
+        Friday: 'time.Weekday',
+        Hour: 'time.Duration',
+        January: 'time.Month',
+        July: 'time.Month',
+        June: 'time.Month',
+        Kitchen: 'string',
+        March: 'time.Month',
+        May: 'time.Month',
+        Microsecond: 'time.Duration',
+        Millisecond: 'time.Duration',
+        Minute: 'time.Duration',
+        Monday: 'time.Weekday',
+        Nanosecond: 'time.Duration',
+        November: 'time.Month',
+        October: 'time.Month',
+        RFC1123: 'string',
+        RFC1123Z: 'string',
+        RFC3339: 'string',
+        RFC3339Nano: 'string',
+        RFC822: 'string',
+        RFC822Z: 'string',
+        RFC850: 'string',
+        RubyDate: 'string',
+        Saturday: 'time.Weekday',
+        Second: 'time.Duration',
+        September: 'time.Month',
+        Stamp: 'string',
+        StampMicro: 'string',
+        StampMilli: 'string',
+        StampNano: 'string',
+        Sunday: 'time.Weekday',
+        Thursday: 'time.Weekday',
+        TimeOnly: 'string',
+        Tuesday: 'time.Weekday',
+        UnixDate: 'string',
+        UTC: '*time.Location',
+        Wednesday: 'time.Weekday'
+    }
+};
+// Signature + result-type registrations for one `go:` import declaration.
+// Both named imports (`import { Atoi } from ...`) and default/namespace
+// imports (`import strconv from ...`) register every table entry; call sites
+// resolve through goCallSigs, value identifiers through goValueTypes.
+const goCallSigs = new Map();
+const goValueTypes = new Map();
+// Packages referenced by recorded stdlib result types (hash.Hash, url.URL...):
+// imported only when the generated code actually mentions them, mirroring the
+// helper-provided package rule (Go rejects unused imports).
+const goTypeProvidedPackages = new Set();
+function registerGoStdlibSignatures(node, goPkg) {
+    const clause = node.importClause;
+    if (!clause)
+        return;
+    const funcs = GO_STDLIB[goPkg] ?? {};
+    const values = GO_VALUES[goPkg] ?? {};
+    const localName = getImportLocalName(node);
+    const namedElements = clause.namedBindings && isNamedImports(clause.namedBindings) ? clause.namedBindings.elements : undefined;
+    const registerEntry = (localKey, sig, valueType) => {
+        if (sig) {
+            goCallSigs.set(localKey, sig);
+            if (sig.result) {
+                nodeCallResultTypes.set(localKey, sig.result);
+                registerGoTypePackageImports(sig.result);
+            }
+        }
+        else if (valueType) {
+            goValueTypes.set(localKey, valueType);
+            registerGoTypePackageImports(valueType);
+        }
+    };
+    for (const [name, sig] of Object.entries(funcs)) {
+        if (namedElements) {
+            for (const el of namedElements) {
+                if (el.isTypeOnly)
+                    continue;
+                if ((el.propertyName?.text ?? el.name.text) !== name)
+                    continue;
+                registerEntry(el.name.text, sig);
+            }
+        }
+        else if (localName) {
+            registerEntry(`${localName}.${name}`, sig);
+        }
+    }
+    for (const [name, valueType] of Object.entries(values)) {
+        if (namedElements) {
+            for (const el of namedElements) {
+                if (el.isTypeOnly)
+                    continue;
+                if ((el.propertyName?.text ?? el.name.text) !== name)
+                    continue;
+                registerEntry(el.name.text, undefined, valueType);
+            }
+        }
+        else if (localName) {
+            registerEntry(`${localName}.${name}`, undefined, valueType);
+        }
+    }
+}
+// Short (declared) package name -> full import path, for types recorded in
+// result fields ('*url.URL' -> net/url, 'hash.Hash' -> hash, 'tnbig' -> math/big).
+// Built lazily: goImportAliases is declared later in the module.
+let goShortPackagePaths = null;
+function getGoShortPackagePaths() {
+    if (!goShortPackagePaths) {
+        goShortPackagePaths = {};
+        for (const pkgPath of Object.keys(GO_STDLIB)) {
+            const short = goImportAliases[pkgPath] ?? pkgPath.split('/').pop();
+            goShortPackagePaths[short] = pkgPath;
+        }
+    }
+    return goShortPackagePaths;
+}
+// A recorded type like '*url.URL' or 'hash.Hash' pulls in its package; the
+// import survives only when emitted code references the package name.
+function registerGoTypePackageImports(goType) {
+    const base = goType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+    const match = base.match(/^([a-z][a-z0-9_]*)\.[A-Z]/);
+    if (!match)
+        return;
+    const pkg = getGoShortPackagePaths()[match[1]] ?? match[1];
+    importedPackages.add(pkg);
+    goTypeProvidedPackages.add(pkg);
+}
+// Numeric Go types a TS `number` (Go float64) can be converted to directly.
+const GO_NUMERIC_TYPES = new Set([
+    'int',
+    'int8',
+    'int16',
+    'int32',
+    'int64',
+    'uint',
+    'uint8',
+    'uint16',
+    'uint32',
+    'uint64',
+    'byte',
+    'rune',
+    'uintptr',
+    'float32',
+    'time.Duration',
+    'time.Month',
+    'time.Weekday',
+    'os.FileMode',
+    'reflect.Kind'
+]);
+// Wider type wins when two distinct non-float64 numeric types meet in a
+// binary expression (`int` + `int64` → `int64`).
+const GO_NUMERIC_RANK = {
+    int8: 1,
+    byte: 1,
+    uint8: 1,
+    int16: 2,
+    uint16: 2,
+    int32: 3,
+    rune: 3,
+    uint32: 3,
+    'time.Month': 3,
+    'time.Weekday': 3,
+    'os.FileMode': 3,
+    'reflect.Kind': 3,
+    uint: 4,
+    int: 4,
+    'time.Duration': 5,
+    int64: 5,
+    uint64: 5,
+    float32: 6
+};
+function stripArrayRef(goType) {
+    return goType?.startsWith('*[]') ? goType.slice(1) : goType;
+}
+function lookupGoMethodSig(receiverType, method) {
+    if (!receiverType)
+        return undefined;
+    const base = receiverType.replace(/^\*/, '').replace(/\[.*\]$/, '');
+    return GO_METHODS[base]?.[method];
+}
+// Coerce one argument to the Go parameter type declared in GO_STDLIB.
+function coerceGoArg(argNode, paramType) {
+    const emitted = visit(argNode);
+    const inferred = inferExpressionType(argNode);
+    const isCharParam = paramType === 'char' || paramType === 'byte' || paramType === 'rune';
+    if (isCharParam && (inferred === 'string' || isStringLiteral(argNode) || isNoSubstitutionTemplateLiteral(argNode))) {
+        // byte/rune parameter fed from a single-character TS string
+        return `[]${paramType === 'char' ? 'byte' : paramType}(${emitted})[0]`;
+    }
+    if (paramType === '[]byte') {
+        if (inferred === 'string')
+            return `[]byte(${emitted})`;
+        // A [N]byte digest (sha256.Sum256...) slices to []byte
+        if (inferred && /^\[\d+\]byte$/.test(inferred))
+            return `${emitted}[:]`;
+    }
+    if (paramType === 'error' && (inferred === 'interface{}' || inferred === undefined)) {
+        // A dynamic value (a caught exception) flows into an error parameter
+        useHelper('tryError');
+        return `TnAsError(${emitted})`;
+    }
+    if (GO_NUMERIC_TYPES.has(paramType) && paramType !== 'float64') {
+        if (inferred === 'float64' || isNumericLiteral(argNode))
+            return `${paramType}(${emitted})`;
+    }
+    return emitted;
+}
+function coerceGoArgs(node, sig) {
+    const args = node.arguments ?? [];
+    if (!sig.params || sig.params.length === 0)
+        return args.map((a) => visit(a));
+    return args.map((a, i) => {
+        const paramType = sig.params[i];
+        if (!paramType)
+            return visit(a);
+        return coerceGoArg(a, paramType);
+    });
+}
+// Emit a call to a signature-registered Go stdlib function or method:
+// coerce arguments, then wrap (T, error) returns in TnTry / TnTryE.
+function emitGoSigCall(callee, sig, node) {
+    const args = coerceGoArgs(node, sig);
+    const call = `${callee}(${args.join(', ')})`;
+    if (sig.error) {
+        useHelper('tryError');
+        return `TnTry(${call})`;
+    }
+    if (sig.errorOnly) {
+        useHelper('tryError');
+        return `TnTryE(${call})`;
+    }
+    return call;
+}
+// Intercept a call to a `go:` stdlib function (free function or method on a
+// typed Go receiver). Returns undefined when the call is not stdlib-backed.
+function emitGoStdlibCall(node) {
+    if ((node.arguments ?? []).some((a) => isSpreadElement(a)))
+        return undefined;
+    const expr = node.expression;
+    if (isIdentifier(expr)) {
+        const sig = goCallSigs.get(expr.text);
+        if (sig) {
+            // Resolve through the import alias table directly: visit() would map
+            // the JS NaN/Infinity literals to math.NaN()/math.Inf(1) expressions.
+            const goName = importAliases.get(expr.text) ?? getSafeName(expr.text);
+            return emitGoSigCall(goName, sig, node);
+        }
+        return undefined;
+    }
+    if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression)) {
+        const qualified = `${expr.expression.text}.${expr.name.text}`;
+        const pkgSig = goCallSigs.get(qualified);
+        if (pkgSig)
+            return emitGoSigCall(visit(expr), pkgSig, node);
+    }
+    // Method call on a typed Go stdlib value (re.MatchString, now.Format,
+    // Command(...).Output() — any receiver whose type is known)
+    if (isPropertyAccessExpression(expr)) {
+        const recvType = inferExpressionType(expr.expression);
+        const methodSig = lookupGoMethodSig(recvType, expr.name.text);
+        if (methodSig)
+            return emitGoSigCall(`${visit(expr.expression)}.${expr.name.text}`, methodSig, node);
+    }
+    return undefined;
+}
+// Binary operands of distinct non-float64 numeric Go types (or one numeric and
+// one TS number) are cast to a common type so Go accepts the expression
+// (`time.Second * 2`, `int === 42`). Returns undefined when no cast is needed.
+function unifyNumericBinaryOperands(node, op) {
+    if (!['+', '-', '*', '/', '%', '<', '<=', '>', '>=', '==', '!=', '+=', '-=', '*=', '/=', '%='].includes(op)) {
+        return undefined;
+    }
+    const compound = op.endsWith('=');
+    const leftType = inferExpressionType(node.left);
+    const rightType = inferExpressionType(node.right);
+    if (!leftType || !rightType || leftType === 'interface{}' || rightType === 'interface{}')
+        return undefined;
+    const leftNum = GO_NUMERIC_TYPES.has(leftType) || leftType === 'float64';
+    const rightNum = GO_NUMERIC_TYPES.has(rightType) || rightType === 'float64';
+    if (!leftNum || !rightNum)
+        return undefined;
+    let target;
+    if (leftType === rightType)
+        return undefined;
+    if (compound) {
+        // The assignment target keeps its type; only the right side converts
+        target = leftType;
+    }
+    else if (leftType === 'float64')
+        target = rightType;
+    else if (rightType === 'float64')
+        target = leftType;
+    else
+        target = (GO_NUMERIC_RANK[leftType] ?? 0) >= (GO_NUMERIC_RANK[rightType] ?? 0) ? leftType : rightType;
+    const left = visit(node.left);
+    const right = visit(node.right);
+    if (compound)
+        return `${left} ${op} ${target}(${right})`;
+    return `${target}(${left}) ${op} ${target}(${right})`;
+}
 // Per-module table: maps Node.js function name → Go expression template.
 // For default/namespace imports (e.g. `import path from 'node:path'`), entries are registered
 // as `callHandlers[localName.funcName]`. For named imports (e.g. `import { join } from 'node:path'`),
@@ -6034,6 +7219,7 @@ const helperRequires = {
     fancyRegex: ['orderedMap'],
     dynamic: ['error'],
     moduleUrl: ['pathToFileURL'],
+    tryError: ['error'],
     timerWait: [],
     asyncWait: []
 };
@@ -6254,6 +7440,10 @@ func TnGet(obj interface{}, key string) interface{} {
 	case *TnError:
 		if key == "message" {
 			return o.message
+		}
+	case error:
+		if key == "message" {
+			return o.Error()
 		}
 	}
 	return nil
@@ -7910,6 +9100,32 @@ func (e *TnError) Error() string { return e.message }
 func TnNewError(message string) *TnError {
 	return &TnError{message: message}
 }`,
+    tryError: `// TnTry lowers a Go (value, error) return into a JS-style throwing call:
+// the panic is caught by try/catch (defer/recover) like any thrown Error.
+func TnTry[T any](v T, err error) T {
+	if err != nil {
+		panic(TnNewError(err.Error()))
+	}
+	return v
+}
+
+func TnTryE(err error) {
+	if err != nil {
+		panic(TnNewError(err.Error()))
+	}
+}
+
+// TnAsError: a dynamic value (e.g. a caught exception) as a Go error
+func TnAsError(v interface{}) error {
+	if v == nil {
+		return nil
+	}
+	err, ok := v.(error)
+	if !ok {
+		panic(TnNewError("value is not an error"))
+	}
+	return err
+}`,
     asyncWait: `// Pending async work (promise callbacks, detached async calls) is drained
 // before the process exits
 var __tnWaitGroup sync.WaitGroup`,
@@ -8131,6 +9347,7 @@ function visitImportDeclaration(node) {
         const goPkg = moduleSpec.slice(3);
         importedPackages.add(goPkg);
         registerGoPackageAliases(node, goPkg);
+        registerGoStdlibSignatures(node, goPkg);
         return '';
     }
     // Node.js standard library: `import path from 'node:path'` → mapped Go packages
@@ -8163,11 +9380,19 @@ function visitImportDeclaration(node) {
     return '';
 }
 // Go packages imported under a fixed alias to avoid collisions with user
-// variables (a variable named `big` would shadow the package name)
+// variables or with sibling packages that share a declared name
+// (a variable named `big` would shadow the package name; `math/rand/v2`
+// declares itself as `rand`, colliding with `math/rand`)
 const goImportAliases = {
+    'crypto/rand': 'tncrand',
     'math/big': 'tnbig',
+    'math/rand/v2': 'tnrand2',
     'net/url': 'tnurl'
 };
+// The Go identifier a stdlib package is referenced by
+function goPackageName(pkg) {
+    return goImportAliases[pkg] ?? pkg.split('/').pop();
+}
 function goImportLine(pkg) {
     const alias = goImportAliases[pkg];
     return alias ? `import ${alias} "${pkg}"` : `import "${pkg}"`;

@@ -166,12 +166,28 @@ Supported: `node:path` (`join`, `dirname`, `basename`, `extname`, `resolve`), `n
 
 ```ts
 import { Println, Sprintf } from 'go:fmt';
-import { ToUpper } from 'go:strings';
+import * as strings from 'go:strings';
+import * as os from 'go:os';
+import { MustCompile } from 'go:regexp';
 
-Println(Sprintf('hi %s', ToUpper('bob')));
+Println(Sprintf('hi %s', strings.ToUpper('bob')));
+
+const re = MustCompile('(\\d+)');
+console.log(re.FindString('abc123'));
+
+try {
+  os.ReadFile('missing.txt');
+} catch (e) {
+  console.log('caught:', (e as any).message);
+}
 ```
 
-Supported: `go:fmt` (`Println`, `Sprintf`), `go:strings` (`ToUpper`, `ToLower`), `go:strconv` (`FormatBool`).
+46 standard library packages are supported — `fmt`, `strings`, `strconv`, `os`, `os/exec`, `time`,
+`math`, `math/rand`, `sort`, `slices`, `regexp`, `encoding/json`, `encoding/base64`, `encoding/hex`,
+`net/url`, `net/http`, `crypto/*` hashes, `errors`, `io`, `bufio`, `bytes`, `path`, `path/filepath`,
+`unicode`, `runtime`, `reflect`, `log`, and more. The full matrix with per-package notes lives in
+[conformance.md](conformance.md); TypeScript signatures come from
+[`types/typenative-go.d.ts`](types/typenative-go.d.ts).
 
 **npm packages:**
 
@@ -181,7 +197,7 @@ import { helper } from 'my-lib';
 
 Resolved by walking up to `node_modules/<name>` (TypeScript source preferred, CommonJS normalized to ESM). Local ambient `.d.ts` declarations (`declare module "my-lib" { ... }`) are used to inject precise parameter/return types.
 
-Type mappings to keep in mind: `number` → `float64`, `boolean` → `bool`, nullable `T | null` → Go pointer, `Record<K, V>` / key-indexed objects → Go maps, object types → Go structs (copied by value, unlike JS references).
+Type mappings to keep in mind: `number` → `float64`, `boolean` → `bool`, nullable `T | null` → Go pointer, `Record<K, V>` / key-indexed objects → Go maps, object types → Go structs (copied by value, unlike JS references). For `go:` imports specifically: Go `(T, error)` returns **throw** (caught by `try`/`catch` with the Go error text as `.message`), `number` arguments coerce to the Go parameter type, and `string`/`[]byte` convert automatically.
 
 ## Examples
 
