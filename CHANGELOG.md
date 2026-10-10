@@ -5,6 +5,47 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-10
+
+The conformance suite is fully green: all 147 probes pass (up from 95/147), through both the dev
+CLI (`node bin/cli.js`) and the self-hosted native compiler (`npm run conformance -- --native`).
+
+### Added
+
+- **Language**: array/object destructuring with defaults and elision, computed keys, `for...in`,
+  labeled loops (`continue outer` / `break outer`), `as const`, type guards (`p is T`),
+  generators (`function*` / `yield` / `yield*`) and `*[Symbol.iterator]()` custom iterators,
+  `async`/`await` with `new Promise`, `.then` and `Promise.all` (lowered to goroutines over
+  channels, with pending callbacks and timers drained before exit), `setTimeout`
+- **Classes**: inheritance with `super` (methods copied onto subclasses for `this` dispatch),
+  abstract classes, `#private` fields, static members typed from initializers, getters/setters
+  (`c.v` reads/writes rewrite to `Get_v()`/`Set_v()`), interface `extends` (inherited properties
+  flattened into the derived struct), object-literal methods and getters
+- **Errors**: `throw new Error` / `new Error(message)` produce a real error value — custom error
+  classes via `extends Error`, `instanceof` and `.message` on caught values
+- **Typing**: generic functions via Go generics (call sites infer type arguments), numeric enums
+  as plain numbers, tagged templates, JS loose equality (`0 == false`) with `bool`/number/string
+  coercion, `p is T` predicates returning `bool`
+- **Runtime values**: `bigint` (`2n ** 64n` etc. via `math/big`) and `symbol` (unique pointers,
+  usable as record keys)
+- **Library**: array `splice`, `fill`, `entries`, `flatMap`, `findLast`/`findLastIndex`,
+  `lastIndexOf`, `new Array<T>(n)`, `Array.from`, `join()` defaulting to `","`, in-place
+  `reverse`; `charCodeAt`/`String.fromCharCode`/`localeCompare`; `Date` (`new Date(ms)`,
+  `getTime`, `toISOString`, `Date.now()`); `Object.assign`; `.length` counts UTF-8 code points
+  and `[...str]` spreads runes
+- **Regex**: `/g` regexes carry `lastIndex` state (`re.exec` loops terminate); named groups
+  (`(?<name>` → `(?P<name>`, `exec` returns a match with `.groups`); backreferences and
+  lookbehind/lookahead run on a small backtracking engine (RE2 does not support them)
+- **Semantics**: arrays are references — `const b = a; b.push(3)` is visible through `a`
+  (array variables hold `*[]T`)
+
+### Changed
+
+- `JSON.stringify` serializes through reflection, so unexported (auto-generated) struct fields
+  are included
+- `Object.assign` copies sources (structs, maps, dynamic objects) into an ordered map
+- `throw` panics with a `TnError` value carrying `.message` instead of a bare string
+
 ## [0.1.0] - 2026-10-09
 
 TypeNative compiles itself: `src/main.ts` builds into a native `typenative` binary that passes the
