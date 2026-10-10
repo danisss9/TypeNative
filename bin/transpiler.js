@@ -735,6 +735,11 @@ function visit(node, options = {}) {
         return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
     }
     else if (isPropertyAccessExpression(node)) {
+        // import.meta.url — the file URL of the running program
+        if (node.expression.kind === 'MetaProperty' && node.name.text === 'url') {
+            useHelper('moduleUrl');
+            return 'TnModuleURL()';
+        }
         if (isDynamicValue(node.expression) && node.name.text === 'length' && !isCallee(node)) {
             useHelper('dynamic');
             return `TnLength(${visit(node.expression)})`;
@@ -3369,6 +3374,10 @@ function inferExpressionType(expr) {
         expr.name.text === 'argv') {
         return '[]string';
     }
+    // import.meta.url is a string
+    if (isPropertyAccessExpression(expr) && expr.expression.kind === 'MetaProperty' && expr.name.text === 'url') {
+        return 'string';
+    }
     if (isIdentifier(expr) && (expr.text === 'NaN' || expr.text === 'Infinity'))
         return 'float64';
     if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Number') {
@@ -5938,8 +5947,8 @@ function includeLocalImport(code, dir, goFileName) {
         .filter((pkg) => {
         if (!helperProvidedPackages.has(pkg))
             return true;
-        const name = pkg.split('/').pop();
-        return stripGoStrings(fileCode).includes(`${name}.`);
+        const pkgName = goImportAliases[pkg] ?? pkg.split('/').pop();
+        return stripGoStrings(fileCode).includes(`${pkgName}.`);
     })
         .sort()
         .map((pkg) => goImportLine(pkg))
@@ -6024,6 +6033,7 @@ const helperRequires = {
     namedGroups: ['orderedMap'],
     fancyRegex: ['orderedMap'],
     dynamic: ['error'],
+    moduleUrl: ['pathToFileURL'],
     timerWait: [],
     asyncWait: []
 };
@@ -6212,6 +6222,7 @@ const helperPackages = {
     symbol: [],
     fancyRegex: ['regexp', 'strings', 'strconv', 'fmt'],
     namedGroups: ['regexp'],
+    moduleUrl: ['os'],
     asyncWait: ['sync'],
     timerWait: ['sync', 'time'],
     promiseAll: [],
@@ -7860,7 +7871,7 @@ func TnGroup(groups []string, i int) string {
 }`,
     fileURLToPath: `func TnFileURLToPath(u string) string {
 	trimmed := strings.TrimPrefix(u, "file://")
-	if unescaped, err := url.PathUnescape(trimmed); err == nil {
+	if unescaped, err := tnurl.PathUnescape(trimmed); err == nil {
 		trimmed = unescaped
 	}
 	return filepath.FromSlash(trimmed)
@@ -7870,7 +7881,15 @@ func TnGroup(groups []string, i int) string {
 	if err != nil {
 		panic(err)
 	}
-	return "file://" + url.PathEscape(filepath.ToSlash(abs))
+	return "file://" + tnurl.PathEscape(filepath.ToSlash(abs))
+}`,
+    moduleUrl: `// import.meta.url: the file URL of the running program
+func TnModuleURL() string {
+	exe, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	return TnPathToFileURL(exe)
 }`,
     osPlatform: `func TnOsPlatform() string {
 	if runtime.GOOS == "windows" {
@@ -8146,7 +8165,8 @@ function visitImportDeclaration(node) {
 // Go packages imported under a fixed alias to avoid collisions with user
 // variables (a variable named `big` would shadow the package name)
 const goImportAliases = {
-    'math/big': 'tnbig'
+    'math/big': 'tnbig',
+    'net/url': 'tnurl'
 };
 function goImportLine(pkg) {
     const alias = goImportAliases[pkg];

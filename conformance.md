@@ -205,7 +205,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Re-exports (`export { x } from`, `export *`)       |   ❌    | —                                                                | No probe yet                                                                                                           |
 | Dynamic `import()`                                 |   ❌    | —                                                                | No probe yet                                                                                                           |
 | Side-effect imports (`import './mod'`)             |   ❌    | —                                                                | No probe yet                                                                                                           |
-| `import.meta.url`                                  |   ❌    | —                                                                | Not lowered (see Roadmap)                                                                                              |
+| `import.meta.url`                                  |   ✅    | [syntax-import-meta.ts](conformance/syntax-import-meta.ts)       | The `file://` URL of the running program (`os.Executable` → `pathToFileURL`)                                           |
 
 ## Async & timing
 
@@ -649,7 +649,3 @@ Every standard-library API TypeNative ports, split by module. Per
 | Pattern                   | Status | Probe                                                    | Notes                                                                                             |
 | ------------------------- | :----: | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `import { x } from 'pkg'` |   ✅    | [syntax-import-npm.ts](conformance/syntax-import-npm.ts) | Mapped to Go module imports (fixture dep in [conformance/package.json](conformance/package.json)) |
-
-## Roadmap (known limitations)
-
-- `import.meta.url` is not lowered.

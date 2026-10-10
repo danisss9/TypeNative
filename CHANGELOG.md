@@ -17,6 +17,8 @@ CLI (`node bin/cli.js`) and the self-hosted native compiler (`npm run conformanc
   generators (`function*` / `yield` / `yield*`) and `*[Symbol.iterator]()` custom iterators,
   `async`/`await` with `new Promise`, `.then` and `Promise.all` (lowered to goroutines over
   channels, with pending callbacks and timers drained before exit), `setTimeout`
+- **Modules**: `import.meta.url` — the `file://` URL of the running program
+  (`os.Executable` through the `pathToFileURL` lowering)
 - **Classes**: inheritance with `super` (methods copied onto subclasses for `this` dispatch),
   abstract classes, `#private` fields, static members typed from initializers, getters/setters
   (`c.v` reads/writes rewrite to `Get_v()`/`Set_v()`), interface `extends` (inherited properties
