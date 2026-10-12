@@ -40,8 +40,8 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Tuples                                  |   ✅    | [syntax-tuples.ts](conformance/syntax-tuples.ts)                                 | `[string, number]` fixed-length arrays                                   |
 | Top-level / module-scope variables      |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)               | Functions see main-file top-level variables                              |
 | Numeric separators                      |   ✅    | [syntax-numeric-separators.ts](conformance/syntax-numeric-separators.ts)         | `1_000_000`                                                              |
-| Hex / octal / binary literals           |   ❌    | —                                                                                | `0xFF`, `0o17`, `0b1010`; no probe yet                                   |
-| `var` declarations (hoisting)           |   ❌    | —                                                                                | No probe yet                                                             |
+| Hex / octal / binary literals           |   ✅    | [syntax-numeric-literals.ts](conformance/syntax-numeric-literals.ts)             | `0xFF`, `0o17`, `0b1010`, `1e3`                                          |
+| `var` declarations (hoisting)           |   ✅    | [syntax-var.ts](conformance/syntax-var.ts)                                       | Function- and module-level `var`                                         |
 | `using` / `await using` declarations    |   ❌    | —                                                                                | Explicit resource management; no probe yet                               |
 
 ## Operators
@@ -130,7 +130,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Getters (object literals)                                        |   ✅    | [syntax-object-getters.ts](conformance/syntax-object-getters.ts)                         | Getter closures stored as function fields; reads invoke them                            |
 | Object-literal methods                                           |   ✅    | [syntax-object-methods.ts](conformance/syntax-object-methods.ts)                         | Method closures stored as function fields capturing the instance (`this` → the object)  |
 | Private `#` fields                                               |   ✅    | [syntax-class-private-fields.ts](conformance/syntax-class-private-fields.ts)             | `#secret` → a plain (name-mangled) struct field                                         |
-| Access modifiers (`private` / `protected` / `public` on members) |   ❌    | —                                                                                        | Constructor parameter properties ✅; member modifiers unprobed                           |
+| Access modifiers (`private` / `protected` / `public` on members) |   ✅    | [syntax-access-modifiers.ts](conformance/syntax-access-modifiers.ts)                     | `private` / `protected` / `public` are erased                                           |
 | Abstract classes                                                 |   ✅    | [syntax-class-abstract.ts](conformance/syntax-class-abstract.ts)                         | Abstract members skipped; concrete methods copied onto subclasses                       |
 | Static initialization blocks (`static {}`)                       |   ❌    | —                                                                                        | No probe yet                                                                            |
 | Class expressions (`const C = class {}`)                         |   ❌    | —                                                                                        | No probe yet                                                                            |
@@ -156,7 +156,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | ------------------------------------- | :----: | ------------------------------------------------------------ | --------------------------------------------                            |
 | Numeric enums                         |   ✅    | [syntax-enum-numeric.ts](conformance/syntax-enum-numeric.ts) | Numeric members are `float64` constants; string enums keep a named type |
 | String enums                          |   ✅    | [syntax-enum-string.ts](conformance/syntax-enum-string.ts)   | `enum` declarations and member access                                   |
-| `const enum`                          |   ❌    | —                                                            | No probe yet                                                            |
+| `const enum`                          |   ✅    | [syntax-const-enum.ts](conformance/syntax-const-enum.ts)     | Compiled like a regular enum                                            |
 | Computed / heterogeneous enum members |   ❌    | —                                                            | `enum E { A = f(), B = 's' }`; no probe yet                             |
 
 ## Type-system features
@@ -170,17 +170,17 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Self-host contextual typing                               |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Object/array literals typed from context, `Record` literals, `in`, `any` params |
 | Decorators (`@`)                                          |   ❌    | —                                                                    | No probe yet                                                                    |
 | Namespaces / `module` blocks                              |   ❌    | —                                                                    | No probe yet                                                                    |
-| `override` modifier                                       |   ❌    | —                                                                    | No probe yet                                                                    |
+| `override` modifier                                       |   ✅    | [syntax-override.ts](conformance/syntax-override.ts)                 | Erased                                                                          |
 | `readonly` modifier (properties, `readonly T[]`)          |   ❌    | —                                                                    | No probe yet                                                                    |
 | `satisfies` operator                                      |   ❌    | —                                                                    | No probe yet                                                                    |
 | `keyof` / mapped / conditional / `infer` types            |   ❌    | —                                                                    | No probe yet                                                                    |
-| `import type` / `export type`                             |   ❌    | —                                                                    | No probe yet                                                                    |
+| `import type` / `export type`                             |   ✅    | [syntax-import-type.ts](conformance/syntax-import-type.ts)           | Type-only imports are erased                                                    |
 | Intersection types (`A & B`)                              |   ❌    | —                                                                    | No probe yet                                                                    |
-| Literal types (`'a' \| 'b'`)                              |   ❌    | —                                                                    | No probe yet                                                                    |
+| Literal types (`'a' \| 'b'`)                              | [syntax-literal-types.ts](conformance/syntax-literal-types.ts) | String literal unions → `string`                                     | No probe yet                                                                    |
 | Tuple optional / rest / labeled elements                  |   ❌    | —                                                                    | `[number, ...string[]]`, `[name: string]`                                       |
-| Indexed access types (`T['k']`)                           |   ❌    | —                                                                    | No probe yet                                                                    |
+| Indexed access types (`T['k']`)                           |   ✅    | [syntax-indexed-access-types.ts](conformance/syntax-indexed-access-types.ts) | `T['k']` resolves to the member type                                            |
 | Type-level `typeof` (`typeof obj`)                        |   ❌    | —                                                                    | Runtime `typeof` ✅ (see Operators)                                              |
-| Template literal types                                    |   ❌    | —                                                                    | `` type S = `${A}-${B}` ``                                                      |
+| Template literal types                                    |   ✅    | [syntax-template-literal-types.ts](conformance/syntax-template-literal-types.ts) | Template literal types → `string`                                               |
 | Utility types (`Partial`, `Pick`, `Omit`, …)              |   ❌    | —                                                                    | `Record<K, V>` ✅ (see [Variables & destructuring](#variables--destructuring))   |
 | Assertion functions (`asserts x is T`)                    |   ❌    | —                                                                    | No probe yet                                                                    |
 | Callable / construct signatures (`type F = { (): void }`) |   ❌    | —                                                                    | No probe yet                                                                    |
@@ -249,8 +249,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | API                                | Status | Probe                                                  | Notes                                                  |
 | ---------------------------------- | :----: | ------------------------------------------------------ | ------------------------------------------------------ |
 | `console.log`                      |   ✅    | [lib-console-log.ts](conformance/lib-console-log.ts)   | Mapped to `fmt.Println`                                |
-| `console.error`                    |   ❌    | —                                                      | Mapped to `fmt.Fprintln(os.Stderr, ...)`; no probe yet |
-| `console.warn`                     |   ❌    | —                                                      | Mapped to stderr like `console.error`; no probe yet    |
+| `console.error`                    |   ✅    | [lib-console-error.ts](conformance/lib-console-error.ts) | `fmt.Fprintln(os.Stderr, ...)`                         |
+| `console.warn`                     |   ✅    | [lib-console-error.ts](conformance/lib-console-error.ts) | Mapped to stderr like `console.error`                  |
 | `console.time` / `console.timeEnd` |   ✅    | [lib-console-time.ts](conformance/lib-console-time.ts) | Via `time.Now` / `time.Since`                          |
 
 ### `Math`
@@ -345,7 +345,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Map` iteration (`for...of`, destructuring)              |   ✅    | [lib-map-iteration.ts](conformance/lib-map-iteration.ts)           | Key/value iteration, `Object.entries()` unwrapping      |
 | `Set` (`add` / `has` / `delete` / `size`)                |   ✅    | [lib-set.ts](conformance/lib-set.ts)                               | `Set<T>` → Go `map[T]struct{}`; constructor with values |
 | `Set` iteration / spread                                 |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts) | `for...of`, `[...set]`                                  |
-| `Map.clear` / `Set.clear`                                |   ❌    | —                                                                  | No probe yet                                            |
+| `Map.clear` / `Set.clear`                                |   ✅    | [lib-map-clear.ts](conformance/lib-map-clear.ts)                   | `TnMap.Clear()`                                         |
 | `WeakMap` / `WeakSet`                                    |   ❌    | —                                                                  | No probe yet                                            |
 | Set operations (`union` / `intersection` / `difference`) |   ❌    | —                                                                  | ES2025; no probe yet                                    |
 
@@ -382,7 +382,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | Global `exec` loop (`/g` + `lastIndex`)                |   ✅    | [lib-regex-global-exec.ts](conformance/lib-regex-global-exec.ts)     | /g regexes carry `lastIndex` state in the `TnRegex` wrapper     |
 | Lookbehind                                             |   ✅    | [lib-regex-lookbehind.ts](conformance/lib-regex-lookbehind.ts)       | Lookaround patterns run on the backtracking engine              |
 | Remaining flags (`s` / `u` / `y`) & `source` / `flags` |   ❌    | —                                                                    | No probe yet                                                    |
-| `split` with RegExp                                    |   ❌    | —                                                                    | No probe yet                                                    |
+| `split` with RegExp                                    |   ✅    | [lib-regex-split.ts](conformance/lib-regex-split.ts)                 | `re.Split(s, -1)`                                               |
 
 ### `Promise` / timers
 
@@ -404,7 +404,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `process.argv` / `process.platform`         |   ✅    | [lib-process.ts](conformance/lib-process.ts)                       | Mapped to `os.Args` / `runtime.GOOS`     |
 | `process.env`                               |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts) | Environment variable access              |
 | `process.exit`                              |   ❌    | —                                                                  | Mapped to `os.Exit`; no probe yet        |
-| `process.cwd()`                             |   ❌    | —                                                                  | Mapped to `os.Getwd()`; no probe yet     |
+| `process.cwd()`                             |   ✅    | [lib-process-cwd.ts](conformance/lib-process-cwd.ts)               | `os.Getwd()`                             |
 | `Infinity`                                  |   ❌    | —                                                                  | No probe yet (`NaN` semantics ✅)         |
 | Global `isNaN` / `isFinite`                 |   ❌    | —                                                                  | `Number.isNaN` ✅; global forms unprobed  |
 | `encodeURIComponent` / `decodeURIComponent` |   ❌    | —                                                                  | No probe yet                             |
@@ -417,7 +417,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | ------------------------------------------------------------------------------------ | :----: | ------------------------------------------------ | ----------------------------------------------------- |
 | `node:path` (`join`, `dirname`, `basename`, `extname`, `resolve`)                    |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts) | Mapped to Go `path`/`filepath`                        |
 | `node:fs` (`read/write/append/exists/mkdir/readdir/copy/rm/unlink`)                  |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | Via Go helpers                                        |
-| `node:url` (`fileURLToPath`, `pathToFileURL`)                                        |   ❌    | —                                                | Declared but no probe yet                             |
+| `node:url` (`fileURLToPath`, `pathToFileURL`)                                        |   ✅    | [lib-node-url.ts](conformance/lib-node-url.ts)   | `TnFileURLToPath` / `TnPathToFileURL`                 |
 | `node:os` (`platform`, `homedir`, `tmpdir`)                                          |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | `platform()` covered; `homedir`/`tmpdir` unprobed     |
 | `node:child_process` (`exec`, `execSync`, `spawnSync`, `spawnInherit`)               |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | Sync API shape, stdio-inherit runs                    |
 | `node:readline` (`question`)                                                         |   ❌    | —                                                | Declared (TypeNative sync extension) but no probe yet |
