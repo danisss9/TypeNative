@@ -953,6 +953,11 @@ function visit(node, options = {}) {
             if (referenceArrays.has(node.name.text) && type.startsWith('[]')) {
                 type = variableGoTypes.get(node.name.text);
             }
+            // const v = undefined / void 0: Go cannot infer a type from nil
+            if (type === ':' && inferredType === 'nil') {
+                type = 'interface{}';
+                setVarGoType(node.name.text, 'interface{}');
+            }
         }
         let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
         // Wrap non-nil values assigned to nullable primitive pointer types
@@ -1020,8 +1025,8 @@ function visit(node, options = {}) {
             const callback = visit((node.arguments ?? [])[0]);
             const delayNode = (node.arguments ?? [])[1];
             const delay = isNumericLiteral(delayNode) ? delayNode.text : visit(delayNode);
-            // Registered on the wait group so the process lives until it fires
-            return `__tnTimers.Add(1)\n\t\ttime.AfterFunc(${delay} * time.Millisecond, func() {\n\t\t\tdefer __tnTimers.Done()\n\t\t\t${callback.trim()}()\n\t\t})`;
+            // Registered on the wait group so the process lives until it fires (or is cleared)
+            return `TnSetTimeout(${delay ?? '0'}, func() { (${callback.trim()})() })`;
         }
         // p.then(cb) on a channel-based Promise: wait for the value, run the callback
         if (isPropertyAccessExpression(node.expression) &&
@@ -1086,6 +1091,7 @@ function visit(node, options = {}) {
         if (isPropertyAccessExpression(node.expression)) {
             objectType = resolveExpressionType(node.expression.expression);
         }
+        currentCallArgTypes = (node.arguments ?? []).map((a) => inferExpressionType(a));
         currentReceiverGoType = isPropertyAccessExpression(node.expression)
             ? inferExpressionType(node.expression.expression)
             : undefined;
@@ -1105,6 +1111,15 @@ function visit(node, options = {}) {
     }
     else if (isPostfixUnaryExpression(node)) {
         return visitIncrementOrDecrement(node, false);
+    }
+    else if (node.kind === 'VoidExpression') {
+        // void expr evaluates expr and gives undefined
+        if (isNumericLiteral(node.expression))
+            return 'nil';
+        return `func() interface{} { _ = ${visit(node.expression)}; return nil }()`;
+    }
+    else if (node.kind === 'SatisfiesExpression') {
+        return visit(node.expression);
     }
     else if (node.kind === 'DeleteExpression') {
         return visitDelete(node);
@@ -2137,7 +2152,7 @@ function toGoValueOfType(expr, goType) {
         return code;
     if (isBinaryExpression(expr) &&
         expr.operatorToken.kind === 'QuestionQuestionToken' &&
-        inferExpressionType(expr.left)?.startsWith('*')) {
+        getNullishEmitType(expr) === goType) {
         return code;
     }
     if (inferExpressionType(expr) !== goType.slice(1))
@@ -2533,6 +2548,23 @@ function getPropertyDeclarationType(member) {
         return getOptionalNodeType(member.type, !!member.questionToken);
     return toFieldGoType(inferExpressionType(member.initializer));
 }
+// Sorts in place and returns the array; without a comparator, compares as strings (like JS)
+function sortArray(obj, args) {
+    importedPackages.add('sort');
+    const arrayType = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType : '[]interface{}';
+    let less = `(${args[0]})(__s[i], __s[j]) < 0`;
+    if (!args[0]) {
+        importedPackages.add('fmt');
+        less = `fmt.Sprintf("%v", __s[i]) < fmt.Sprintf("%v", __s[j])`;
+    }
+    return `func() ${arrayType} { __s := ${obj}; sort.SliceStable(__s, func(i, j int) bool { return ${less} }); return __s }()`;
+}
+function mathCall(fn, args) {
+    importedPackages.add('math');
+    return `math.${fn}(${args.join(', ')})`;
+}
+// Go types of the arguments of the call being emitted (for call handlers)
+let currentCallArgTypes = [];
 function isIncrementOrDecrement(node) {
     return node.operator === 'PlusPlusToken' || node.operator === 'MinusMinusToken';
 }
@@ -2598,6 +2630,15 @@ function getDictionaryValueType(node) {
 function isDynamicObjectLiteral(node) {
     if (isAnyContext(getContextualTypeNode(node)))
         return true;
+    // { name: { … } } nested in a dynamic object (with no declared member type) is dynamic too
+    const parent = node.parent;
+    if (isPropertyAssignment(parent) &&
+        parent.initializer === node &&
+        isObjectLiteralExpression(parent.parent) &&
+        !getContextualTypeNode(node) &&
+        isDynamicObjectLiteral(parent.parent)) {
+        return true;
+    }
     return (node.properties ?? []).some((p) => p.kind === 'SpreadAssignment' && isDynamicValue(p.expression));
 }
 function getObjectLiteralGoType(node) {
@@ -2981,8 +3022,9 @@ function getContextualTypeNode(node) {
             return getExpressionTypeNode(parent.left);
         }
     }
-    if (isAsExpression(parent) || isTypeAssertionExpression(parent))
+    if (isAsExpression(parent) || isTypeAssertionExpression(parent) || parent.kind === 'SatisfiesExpression') {
         return parent.type;
+    }
     if ((isVariableDeclaration(parent) || isPropertyDeclaration(parent) || parent.kind === 'Parameter') &&
         parent.initializer === node) {
         return parent.type;
@@ -3032,6 +3074,7 @@ function getArrayLiteralElementType(node) {
         if (!isUnboundGoType(elem))
             return elem;
     }
+    let firstElementType;
     for (const element of node.elements ?? []) {
         if (isSpreadElement(element)) {
             const spreadType = inferExpressionType(element.expression);
@@ -3044,11 +3087,16 @@ function getArrayLiteralElementType(node) {
             }
             continue;
         }
+        // mixed element types ([['a', 1]]) make an interface{} array
         const elementType = inferExpressionType(element);
-        if (elementType && elementType !== 'nil' && !isUnboundGoType(elementType))
-            return elementType;
+        if (elementType && elementType !== 'nil' && !isUnboundGoType(elementType)) {
+            if (firstElementType && firstElementType !== elementType)
+                return 'interface{}';
+            if (!firstElementType)
+                firstElementType = elementType;
+        }
     }
-    return 'interface{}';
+    return firstElementType ?? 'interface{}';
 }
 // A Go type that is a generic type parameter of the enclosing function (T)
 // rather than a concrete type: unresolvable at the call site
@@ -3298,6 +3346,10 @@ function inferExpressionType(expr) {
     }
     if (isNumericLiteral(expr))
         return 'float64';
+    if (expr.kind === 'VoidExpression')
+        return 'nil';
+    if (expr.kind === 'SatisfiesExpression')
+        return inferExpressionType(expr.expression);
     if (expr.kind === 'BigIntLiteral')
         return '*tnbig.Int';
     if (expr.kind === 'TypeOfExpression')
@@ -3570,7 +3622,7 @@ function inferExpressionType(expr) {
             if (methodName === 'getTime' || methodName === 'valueOf' || methodName === 'getMilliseconds' ||
                 methodName === 'getSeconds' || methodName === 'getMinutes' || methodName === 'getHours' ||
                 methodName === 'getDate' || methodName === 'getDay' || methodName === 'getMonth' ||
-                methodName === 'getFullYear')
+                methodName === 'getFullYear' || methodName.startsWith('getUTC'))
                 return 'float64';
             if (methodName === 'toISOString' || methodName === 'toJSON' || methodName === 'toString' ||
                 methodName === 'toDateString' || methodName === 'toTimeString')
@@ -3602,6 +3654,10 @@ function inferExpressionType(expr) {
                 return 'float64';
             if (['pop', 'shift', 'at'].includes(methodName))
                 return elementType;
+            if (['concat', 'toSorted', 'toReversed', 'with'].includes(methodName))
+                return ownerType;
+            if (methodName === 'reduceRight' && expr.arguments?.[1])
+                return inferExpressionType(expr.arguments[1]);
             if (methodName === 'flat' && elementType.startsWith('[]'))
                 return elementType;
             if (methodName === 'flat' || methodName === 'flatMap')
@@ -3698,6 +3754,11 @@ function inferExpressionType(expr) {
     return undefined;
 }
 const BUILTIN_CALL_TYPES = {
+    isFinite: 'bool',
+    encodeURIComponent: 'string',
+    decodeURIComponent: 'string',
+    'Object.fromEntries': 'interface{}',
+    'Date.UTC': 'float64',
     'Number.isNaN': 'bool',
     'Number.isFinite': 'bool',
     'Number.isInteger': 'bool',
@@ -4189,7 +4250,7 @@ function visitArrayHigherOrderCall(node) {
     if (!isPropertyAccessExpression(node.expression))
         return undefined;
     const methodName = node.expression.name.text;
-    if (!['map', 'filter', 'some', 'find', 'findIndex', 'findLast', 'findLastIndex', 'every', 'forEach', 'reduce', 'join', 'entries', 'flatMap'].includes(methodName)) {
+    if (!['map', 'filter', 'some', 'find', 'findIndex', 'findLast', 'findLastIndex', 'every', 'forEach', 'reduce', 'reduceRight', 'join', 'entries', 'flatMap'].includes(methodName)) {
         return undefined;
     }
     const arrayExprNode = node.expression.expression;
@@ -4293,6 +4354,17 @@ function visitArrayHigherOrderCall(node) {
         const rangeIndexVar = callbackInfo.paramCount > 1 ? idxVar : '_';
         const callbackCall = buildArrayCallbackInvocation(callbackInfo, itemVar, idxVar, arrVar);
         return `func() { ${arrVar} := ${arrayExpr}; for ${rangeIndexVar}, ${itemVar} := range ${arrVar} { ${callbackCall} } }()`;
+    }
+    if (methodName === 'reduceRight') {
+        importedPackages.add('slices');
+        const reversed = { kind: 'Identifier', text: `func() []${elementType} { __s := slices.Clone(${arrayExpr}); slices.Reverse(__s); return __s }()` };
+        variableGoTypes.set(reversed.text, ownerType ?? '[]interface{}');
+        const access = { ...node.expression, name: { kind: 'Identifier', text: 'reduce' }, expression: reversed };
+        const call = { ...node, expression: access };
+        reversed.parent = access;
+        access.parent = call;
+        access.name.parent = access;
+        return visitArrayHigherOrderCall(call);
     }
     if (methodName === 'reduce') {
         const reduceCallback = (node.arguments ?? [])[0];
@@ -4550,7 +4622,10 @@ function getType(typeNode, getArrayType = false) {
         case 'any':
             return 'interface{}';
         case 'void':
+        case 'never':
             return '';
+        case 'object':
+            return 'interface{}';
         default:
             return typeName;
     }
@@ -4661,6 +4736,22 @@ function getAcessString(leftSide, rightSide, objectType) {
             return 'process.env';
         }
     }
+    if (leftSide === 'Math') {
+        const mathConstants = {
+            PI: 'math.Pi',
+            E: 'math.E',
+            LN2: 'math.Ln2',
+            LN10: 'math.Ln10',
+            LOG2E: 'math.Log2E',
+            LOG10E: 'math.Log10E',
+            SQRT2: 'math.Sqrt2',
+            SQRT1_2: '(1 / math.Sqrt2)'
+        };
+        if (mathConstants[rightSide]) {
+            importedPackages.add('math');
+            return `float64(${mathConstants[rightSide]})`;
+        }
+    }
     if (leftSide === 'Number') {
         const constants = {
             MAX_SAFE_INTEGER: 'float64(9007199254740991)',
@@ -4700,6 +4791,47 @@ const callHandlers = {
         importedPackages.add('time');
         importedPackages.add('fmt');
         return `fmt.Println("Elapsed time:", time.Since(${getTimerName(args[0])}))`;
+    },
+    'Math.hypot': (_caller, args) => mathCall('Hypot', args),
+    'Math.cbrt': (_caller, args) => mathCall('Cbrt', args),
+    'Math.exp': (_caller, args) => mathCall('Exp', args),
+    'Math.expm1': (_caller, args) => mathCall('Expm1', args),
+    'Math.log1p': (_caller, args) => mathCall('Log1p', args),
+    'Math.asin': (_caller, args) => mathCall('Asin', args),
+    'Math.acos': (_caller, args) => mathCall('Acos', args),
+    'Math.atan': (_caller, args) => mathCall('Atan', args),
+    'Math.atan2': (_caller, args) => mathCall('Atan2', args),
+    'Math.sinh': (_caller, args) => mathCall('Sinh', args),
+    'Math.cosh': (_caller, args) => mathCall('Cosh', args),
+    'Math.tanh': (_caller, args) => mathCall('Tanh', args),
+    isFinite: (_caller, args) => {
+        importedPackages.add('math');
+        return `(!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]}))`;
+    },
+    encodeURIComponent: (_caller, args) => {
+        useHelper('uri');
+        return `TnEncodeURIComponent(${args[0]})`;
+    },
+    decodeURIComponent: (_caller, args) => {
+        useHelper('uri');
+        return `TnDecodeURIComponent(${args[0]})`;
+    },
+    'Object.fromEntries': (_caller, args) => {
+        useHelper('dynamic');
+        return `TnFromEntries(${args[0]})`;
+    },
+    'Date.UTC': (_caller, args) => {
+        importedPackages.add('time');
+        const part = (i, fallback) => (args[i] ? `int(${args[i]})` : fallback);
+        return `float64(time.Date(${part(0, '1970')}, time.Month(${part(1, '0')}+1), ${part(2, '1')}, ${part(3, '0')}, ${part(4, '0')}, ${part(5, '0')}, ${part(6, '0')}*1000000, time.UTC).UnixMilli())`;
+    },
+    'Promise.resolve': (_caller, args) => {
+        const valueType = currentCallArgTypes[0] ?? 'interface{}';
+        return `func() chan ${valueType} { __ch := make(chan ${valueType}, 1); __ch <- ${args[0] ?? 'nil'}; return __ch }()`;
+    },
+    clearTimeout: (_caller, args) => {
+        useHelper('timerWait');
+        return `TnClearTimeout(${args[0]})`;
     },
     'Math.random': () => {
         importedPackages.add('math/rand');
@@ -4833,10 +4965,7 @@ const callHandlers = {
         importedPackages.add('reflect');
         return `(reflect.ValueOf(${args[0]}).Kind() == reflect.Slice)`;
     },
-    'String': (_caller, args) => {
-        importedPackages.add('fmt');
-        return `fmt.Sprintf("%v", ${args[0]})`;
-    },
+    'String': (_caller, args) => jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
     'String.fromCharCode': (_caller, args) => `string(rune(int(${args[0] ?? '0'})))`,
     // Symbol(description) — unique values for record keys
     Symbol: (_caller, args) => {
@@ -4863,9 +4992,7 @@ const callHandlers = {
         importedPackages.add('math');
         return `(${args[0]} == math.Trunc(${args[0]}) && !math.IsInf(${args[0]}, 0))`;
     },
-    'Boolean': (_caller, args) => {
-        return `(${args[0]} != nil && ${args[0]} != false && ${args[0]} != 0 && ${args[0]} != "")`;
-    },
+    'Boolean': (_caller, args) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
 };
 const stringMethodHandlers = {
     split: (obj, args) => {
@@ -5011,8 +5138,16 @@ const dateMethodHandlers = {
     getDay: (obj) => `float64(int((${obj}).Weekday()))`,
     getMonth: (obj) => `float64(int((${obj}).Month()) - 1)`,
     getFullYear: (obj) => `float64((${obj}).Year())`,
-    toISOString: (obj) => `(${obj}).UTC().Format("2006-01-01T15:04:05.000Z07:00")`,
-    toJSON: (obj) => `(${obj}).UTC().Format("2006-01-01T15:04:05.000Z07:00")`,
+    toISOString: (obj) => `(${obj}).UTC().Format("2006-01-02T15:04:05.000Z07:00")`,
+    toJSON: (obj) => `(${obj}).UTC().Format("2006-01-02T15:04:05.000Z07:00")`,
+    getUTCMilliseconds: (obj) => `float64((${obj}).UTC().Nanosecond() / 1000000)`,
+    getUTCSeconds: (obj) => `float64((${obj}).UTC().Second())`,
+    getUTCMinutes: (obj) => `float64((${obj}).UTC().Minute())`,
+    getUTCHours: (obj) => `float64((${obj}).UTC().Hour())`,
+    getUTCDate: (obj) => `float64((${obj}).UTC().Day())`,
+    getUTCDay: (obj) => `float64(int((${obj}).UTC().Weekday()))`,
+    getUTCMonth: (obj) => `float64(int((${obj}).UTC().Month()) - 1)`,
+    getUTCFullYear: (obj) => `float64((${obj}).UTC().Year())`,
     toString: (obj) => `(${obj}).UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (UTC)")`,
     toDateString: (obj) => `(${obj}).UTC().Format("Mon Jan 02 2006")`,
     toTimeString: (obj) => `(${obj}).UTC().Format("15:04:05 GMT+0000 (UTC)")`,
@@ -5071,19 +5206,26 @@ const arrayMethodHandlers = {
         return `func() float64 { __x := ${args[0]}; for __i := len(${obj}) - 1; __i >= 0; __i-- { if ${elementEqualsFor(elementType, `${obj}[__i]`, '__x')} { return float64(__i) } }; return float64(-1) }()`;
     },
     // Sorts in place and returns the array; without a comparator, compares as strings (like JS)
-    sort: (obj, args) => {
-        importedPackages.add('sort');
-        const arrayType = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType : '[]interface{}';
-        let less = `(${args[0]})(__s[i], __s[j]) < 0`;
-        if (!args[0]) {
-            importedPackages.add('fmt');
-            less = `fmt.Sprintf("%v", __s[i]) < fmt.Sprintf("%v", __s[j])`;
-        }
-        return `func() ${arrayType} { __s := ${obj}; sort.SliceStable(__s, func(i, j int) bool { return ${less} }); return __s }()`;
-    },
+    sort: (obj, args) => sortArray(obj, args),
     indexOf: (obj, args) => `func() float64 { __x := ${args[0]}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
     includes: (obj, args) => `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
-    concat: (obj, args) => `append(${obj}, ${args.join(', ')}...)`,
+    // concat(a, [b, c], d): arrays are flattened one level, other values appended
+    concat: (obj, args) => {
+        const parts = args.map((arg, i) => currentCallArgTypes[i]?.startsWith('[]') ? `__r = append(__r, ${arg}...)` : `__r = append(__r, ${arg})`);
+        return `func() []${receiverElementType()} { __r := append([]${receiverElementType()}{}, ${obj}...); ${parts.join('; ')}; return __r }()`;
+    },
+    toSorted: (obj, args) => {
+        importedPackages.add('slices');
+        return sortArray(`slices.Clone(${obj})`, args);
+    },
+    toReversed: (obj) => {
+        importedPackages.add('slices');
+        return `func() []${receiverElementType()} { __s := slices.Clone(${obj}); slices.Reverse(__s); return __s }()`;
+    },
+    with: (obj, args) => {
+        importedPackages.add('slices');
+        return `func() []${receiverElementType()} { __s := slices.Clone(${obj}); __s[${sliceIndex('__s', args[0])}] = ${args[1]}; return __s }()`;
+    },
     // [][]T → []T (one level, like JS's default depth)
     flat: (obj) => {
         const elementType = receiverElementType();
@@ -5166,6 +5308,12 @@ function getDynamicCallHandler(caller, objectType) {
                     return `strconv.FormatInt(int64(${obj}), int(${args[0]}))`;
                 }
                 return jsStringOf(obj, objectType === 'number' || objectType === 'float64' ? 'float64' : undefined);
+            };
+        }
+        if (methodName === 'toPrecision') {
+            return (c, args) => {
+                importedPackages.add('strconv');
+                return `strconv.FormatFloat(${c.substring(0, dotIndex)}, 'g', int(${args[0] ?? '-1'}), 64)`;
             };
         }
         // number.toFixed(digits)
@@ -5341,7 +5489,7 @@ function getSortComparatorElementType(fn) {
     const call = fn.parent;
     if (!isCallExpression(call) || call.arguments?.[0] !== fn)
         return undefined;
-    if (!isPropertyAccessExpression(call.expression) || call.expression.name.text !== 'sort') {
+    if (!isPropertyAccessExpression(call.expression) || !['sort', 'toSorted'].includes(call.expression.name.text)) {
         return undefined;
     }
     const arrayType = inferExpressionType(call.expression.expression);
@@ -6225,6 +6373,7 @@ const helperPackages = {
     moduleUrl: ['os'],
     asyncWait: ['sync'],
     timerWait: ['sync', 'time'],
+    uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
     exec: ['os/exec', 'bytes', 'runtime'],
     execSync: ['os/exec', 'bytes', 'runtime'],
@@ -6464,6 +6613,19 @@ func TnDelete(obj interface{}, key interface{}) bool {
 	}
 	delete(o, k)
 	return true
+}
+
+// Object.fromEntries: [key, value] pairs → a dynamic object
+func TnFromEntries(entries interface{}) interface{} {
+	result := map[string]interface{}{}
+	list := reflect.ValueOf(entries)
+	for i := 0; i < list.Len(); i++ {
+		pair := reflect.ValueOf(list.Index(i).Interface())
+		if pair.Kind() == reflect.Slice && pair.Len() >= 2 {
+			result[fmt.Sprint(pair.Index(0).Interface())] = pair.Index(1).Interface()
+		}
+	}
+	return result
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
@@ -7937,7 +8099,41 @@ func TnNewSymbol(description string) *TnSymbol {
 	return &TnSymbol{description: description}
 }`,
     timerWait: `// Pending setTimeout timers are waited on before the process exits
-var __tnTimers sync.WaitGroup`,
+var __tnTimers sync.WaitGroup
+
+func TnSetTimeout(ms float64, fn func()) *time.Timer {
+	__tnTimers.Add(1)
+	return time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() {
+		defer __tnTimers.Done()
+		fn()
+	})
+}
+
+func TnClearTimeout(t *time.Timer) {
+	if t != nil && t.Stop() {
+		__tnTimers.Done()
+	}
+}`,
+    uri: `// encodeURIComponent: escapes everything except A-Z a-z 0-9 - _ . ! ~ * ' ( )
+func TnEncodeURIComponent(s string) string {
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.IndexByte("-_.!~*'()", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+func TnDecodeURIComponent(s string) string {
+	decoded, err := tnurl.PathUnescape(s)
+	if err != nil {
+		panic(err)
+	}
+	return decoded
+}`,
     promiseAll: `// Promise.all: every channel drained in order, results collected
 func TnPromiseAll[T any](chs []chan T) chan []T {
 	out := make(chan []T)
