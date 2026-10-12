@@ -6926,7 +6926,7 @@ func tnJSONWrite(buf *bytes.Buffer, rv reflect.Value, indent string, depth int) 
 	case reflect.Float32, reflect.Float64:
 		buf.WriteString(TnNumStr(rv.Float()))
 	case reflect.String:
-		data, _ := json.Marshal(rv.String())
+		data, _ := tnJSONMarshal(rv.String())
 		buf.Write(data)
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
@@ -6957,7 +6957,7 @@ func tnJSONWrite(buf *bytes.Buffer, rv reflect.Value, indent string, depth int) 
 				buf.WriteByte(',')
 				tnJSONNewline(buf, indent, depth+1)
 			}
-			kd, _ := json.Marshal(ks)
+			kd, _ := tnJSONMarshal(ks)
 			buf.Write(kd)
 			buf.WriteByte(':')
 			tnJSONWrite(buf, byKey[ks], indent, depth+1)
@@ -6992,20 +6992,31 @@ func tnJSONWrite(buf *bytes.Buffer, rv reflect.Value, indent string, depth int) 
 				tnJSONNewline(buf, indent, depth+1)
 			}
 			first = false
-			kd, _ := json.Marshal(f.Name)
+			kd, _ := tnJSONMarshal(f.Name)
 			buf.Write(kd)
 			buf.WriteByte(':')
 			tnJSONWrite(buf, value, indent, depth+1)
 		}
 		buf.WriteByte('}')
 	default:
-		data, err := json.Marshal(rv.Interface())
+		data, err := tnJSONMarshal(rv.Interface())
 		if err != nil {
 			buf.WriteString("null")
 			return
 		}
 		buf.Write(data)
 	}
+}
+
+// json.Marshal without HTML escaping of <, > and & (JSON.stringify does not escape them)
+func tnJSONMarshal(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\\n")), nil
 }`,
   orderedMap: `// TnMap: JS Map/Set/object semantics — keys iterate in insertion order
 type TnMap[K comparable, V any] struct {
