@@ -483,6 +483,7 @@ function defaultParseFunction(_code: string): AstNode {
 // AST carries no parent pointers, but the transpiler walks up via node.parent.
 function parseSource(code: string): AstNode {
   const sourceFile = parseFunction(code);
+  stripThisParameters(sourceFile);
   linkParents(sourceFile, undefined);
   for (const stmt of sourceFile.statements ?? []) {
     if (!stmt.name || !isIdentifier(stmt.name)) continue;
@@ -496,6 +497,14 @@ function parseSource(code: string): AstNode {
     else if (isTypeAliasDeclaration(stmt)) declaredTypeAliases.set(stmt.name.text, stmt.type);
   }
   return sourceFile;
+}
+
+// `this: T` parameters only type `this`; they are not real parameters
+function stripThisParameters(node: AstNode): void {
+  if (Array.isArray(node.parameters)) {
+    node.parameters = node.parameters.filter((p: AstNode) => !(isIdentifier(p.name) && p.name.text === 'this'));
+  }
+  for (const child of childNodes(node)) stripThisParameters(child);
 }
 
 function linkParents(node: AstNode, parent: AstNode | undefined): void {
@@ -1071,6 +1080,16 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       return initializer ? `${name} ${initializer}` : '';
     }
     const declName = isIdentifier(node.name) ? getSafeName(node.name.text) : visit(node.name);
+    // const f = (…) => … f(…) …: a Go closure can't see itself in its own :=, so
+    // declare first, then assign
+    if (
+      type === ':' &&
+      isIdentifier(node.name) &&
+      (isArrowFunction(node.initializer) || isFunctionExpression(node.initializer)) &&
+      containsNode(node.initializer, (n) => isIdentifier(n) && n.text === node.name.text)
+    ) {
+      return `var ${declName} ${inferExpressionType(node.initializer)}\n\t\t${declName} ${initializer}`;
+    }
     return `${type === ':' ? '' : 'var '}${declName} ${type}${
       type === ':' ? '' : ' '
     }${initializer}`;
@@ -1434,6 +1453,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return visit(node.expression) + (options.inline ? '' : ';\n\t');
   } else if (isForStatement(node)) {
+    const multi = visitMultiForHeader(node);
+    if (multi) return multi;
     return `for ${visit(node.initializer!, { inline: true })}; ${
       node.condition ? toGoCondition(node.condition) : ''
     }; ${visit(node.incrementor!, { inline: true })}${visitLoopBody(node.statement)}`;
@@ -1573,6 +1594,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (tryReturn && enclosingFn === tryReturn.fn) return tryAwareReturn(value) + terminator;
     return `return ${value}` + terminator;
   } else if (isFunctionDeclaration(node) || isFunctionExpression(node)) {
+    // overload signatures have no body: only the implementation is emitted
+    if (!node.body) return '';
     if (options.addFunctionOutside) {
       outsideNodes.push(node);
       return '';
@@ -2047,6 +2070,12 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
             : toFieldGoType(member.initializer ? inferExpressionType(member.initializer) : undefined);
         const initializer = member.initializer ? ` = ${visit(member.initializer)}` : '';
         result += `var ${name}_${fieldName} ${fieldType}${initializer}\n\n`;
+      }
+    }
+    // static { … } blocks run once at program start, after the static fields
+    for (const member of node.members ?? []) {
+      if (member.kind === 'ClassStaticBlockDeclaration' && member.body) {
+        result += `func init() ${visit(member.body).trimEnd()}\n\n`;
       }
     }
 
@@ -2661,6 +2690,47 @@ function mathCall(fn: string, args: string[]): string {
 
 // Go types of the arguments of the call being emitted (for call handlers)
 let currentCallArgTypes: (string | undefined)[] = [];
+
+// for headers with several declarations / updates: Go's parallel forms
+// (i, j := 0, 10 and i, j = i+1, j-1)
+function visitMultiForHeader(node: AstNode): string | undefined {
+  const declarations: AstNode[] = isVariableDeclarationList(node.initializer) ? (node.initializer.declarations ?? []) : [];
+  const updates: AstNode[] = [];
+  const collect = (expr: AstNode | undefined) => {
+    if (!expr) return;
+    if (isBinaryExpression(expr) && expr.operatorToken.kind === 'CommaToken') {
+      collect(expr.left);
+      collect(expr.right);
+    } else updates.push(expr);
+  };
+  collect(node.incrementor);
+  if (declarations.length < 2 && updates.length < 2) return undefined;
+  let init = visit(node.initializer!, { inline: true });
+  if (declarations.length >= 2) {
+    for (const d of declarations) {
+      if (isIdentifier(d.name) && d.initializer) registerLocalVariable(d.name.text, inferExpressionType(d.initializer));
+    }
+    init = `${declarations.map((d) => visit(d.name)).join(', ')} := ${declarations.map((d) => (d.initializer ? visit(d.initializer) : 'nil')).join(', ')}`;
+  }
+  let post = visit(node.incrementor!, { inline: true });
+  if (updates.length >= 2) {
+    const targets: string[] = [];
+    const values: string[] = [];
+    for (const u of updates) {
+      if ((isPrefixUnaryExpression(u) || isPostfixUnaryExpression(u)) && isIncrementOrDecrement(u)) {
+        const target = visit(u.operand);
+        targets.push(target);
+        values.push(`${target} ${u.operator === 'PlusPlusToken' ? '+' : '-'} 1`);
+      } else if (isBinaryExpression(u) && u.operatorToken.kind === 'EqualsToken') {
+        targets.push(visit(u.left));
+        values.push(visit(u.right));
+      } else return undefined;
+    }
+    post = `${targets.join(', ')} = ${values.join(', ')}`;
+  }
+  const condition = node.condition ? toGoCondition(node.condition) : '';
+  return `for ${init}; ${condition}; ${post}${visitLoopBody(node.statement)}`;
+}
 
 function isIncrementOrDecrement(node: AstNode): boolean {
   return node.operator === 'PlusPlusToken' || node.operator === 'MinusMinusToken';
@@ -3282,6 +3352,15 @@ function getTupleElementType(tuple: AstNode): string {
 
 function getTypeText(typeNode: AstNode): string {
   if (!typeNode) return ':';
+  // Partial<T> etc. construct T
+  if (
+    isTypeReferenceNode(typeNode) &&
+    isIdentifier(typeNode.typeName) &&
+    UTILITY_TYPES.has(typeNode.typeName.text) &&
+    typeNode.typeArguments?.length
+  ) {
+    return getTypeText(typeNode.typeArguments[0]);
+  }
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     return typeNode.typeName.text;
   }
@@ -3638,6 +3717,12 @@ function inferExpressionType(expr: AstNode): string | undefined {
     return '[]interface{}';
   }
   if (isCallExpression(expr) && isObjectKeysOfDynamic(expr)) return '[]string';
+  // f?.() is undefined when f is
+  if (isCallExpression(expr) && hasQuestionDot(expr)) {
+    const fnType = inferExpressionType(expr.expression) ?? '';
+    const returnType = fnType.startsWith('func(') ? goFuncReturnType(fnType) : undefined;
+    return returnType ? makeNullableType(returnType) : undefined;
+  }
   const recordCall = isCallExpression(expr) ? getRecordFunctionCall(expr) : undefined;
   if (recordCall) return goFuncReturnType(extractMapValueType(recordCall.mapType));
   if (
@@ -4075,6 +4160,23 @@ function isObjectTypeName(name: string): boolean {
   return interfacePropertyTypes.has(name);
 }
 
+const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit', 'NonNullable']);
+
+// "name T" field declarations of an object type (type literal, alias or interface)
+function getObjectTypeFields(typeNode: AstNode): string[] {
+  let members: AstNode[] = [];
+  const resolved = typeNode.kind === 'TypeLiteral' ? typeNode : undefined;
+  if (resolved) members = resolved.members ?? [];
+  else if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
+    const name = typeNode.typeName.text;
+    const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
+    members = alias?.kind === 'TypeLiteral' ? (alias.members ?? []) : (declaredInterfaces.get(name)?.members ?? []);
+  }
+  return members
+    .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
+    .map((m) => `${goFieldName(m.name.text)} ${getOptionalNodeType(m.type, !!m.questionToken)}`);
+}
+
 function isStructGoType(goType: string): boolean {
   return goType.startsWith('struct{') || interfacePropertyTypes.has(goType);
 }
@@ -4285,6 +4387,17 @@ function withNarrowingType(names: string[], infer: () => string | undefined): st
 }
 
 function visitOptionalCall(node: AstNode): string {
+  // f?.(): call only when the function value is not nil
+  if (hasQuestionDot(node)) {
+    const fnType = inferExpressionType(node.expression) ?? '';
+    const returnType = fnType.startsWith('func(') ? goFuncReturnType(fnType) : undefined;
+    const fn = getTempName('fn');
+    const args = (node.arguments ?? []).map((a: AstNode) => visit(a)).join(', ');
+    if (!returnType) return `func() { if ${fn} := ${visit(node.expression)}; ${fn} != nil { ${fn}(${args}) } }()`;
+    const resultType = makeNullableType(returnType);
+    const value = resultType === returnType ? `${fn}(${args})` : `func() ${resultType} { v := ${fn}(${args}); return &v }()`;
+    return `func() ${resultType} { ${fn} := ${visit(node.expression)}; if ${fn} == nil { return nil }; return ${value} }()`;
+  }
   if (!isPropertyAccessExpression(node.expression)) {
     return `${visit(node.expression)}(${(node.arguments ?? []).map((a) => visit(a)).join(', ')})`;
   }
@@ -4724,6 +4837,21 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     const elementType = getType(typeNode.elementType);
     return getArrayType ? elementType : `[]${elementType}`;
   }
+  // readonly T[] → T[]; keyof T → string
+  if (typeNode.kind === 'TypeOperator') {
+    return typeNode.operator === 'KeyOfKeyword' ? 'string' : getType(typeNode.type, getArrayType);
+  }
+  // typeof x → x's type
+  if (typeNode.kind === 'TypeQuery' && isIdentifier(typeNode.exprName)) {
+    return variableGoTypes.get(typeNode.exprName.text) ?? 'interface{}';
+  }
+  // asserts x is T → no value; x is T → bool
+  if (typeNode.kind === 'TypePredicate') return typeNode.assertsModifier ? '' : 'bool';
+  // A & B of object types → one struct with all their fields
+  if (typeNode.kind === 'IntersectionType') {
+    const fields = (typeNode.types ?? []).flatMap((t: AstNode) => getObjectTypeFields(t));
+    return fields.length > 0 ? `*struct{ ${fields.join('; ')} }` : getType(typeNode.types[0]);
+  }
   // [A, B] tuples are slices: []A when all elements share a type, else []interface{}
   if (typeNode.kind === 'TupleType') {
     const elementType = getTupleElementType(typeNode);
@@ -4801,6 +4929,10 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     }
     if (name === 'Set' && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
       return mapGoType(getType(typeNode.typeArguments[0]), 'struct{}');
+    }
+    // Partial / Required / Readonly / Pick / Omit / NonNullable<T, ...> → T's Go type
+    if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
+      return getType(typeNode.typeArguments[0], getArrayType);
     }
     const typeArgs = getTypeArguments(typeNode.typeArguments);
     if (classNames.has(name) || isObjectTypeName(name)) {
@@ -5665,7 +5797,8 @@ function isObjectKeysOfDynamic(node: AstNode): boolean {
 }
 
 const ARRAY_ONLY_METHODS = new Set([
-  'map', 'filter', 'some', 'every', 'find', 'findIndex', 'forEach', 'reduce', 'join', 'flat', 'sort', 'reverse'
+  'map', 'filter', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'forEach', 'reduce',
+  'reduceRight', 'join', 'flat', 'flatMap', 'sort', 'reverse', 'toSorted', 'toReversed', 'fill', 'splice'
 ]);
 const STRING_ONLY_METHODS = new Set([
   'startsWith', 'endsWith', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase', 'split',
@@ -8609,6 +8742,16 @@ function visitImportDeclaration(node: AstNode): string {
       if (resolved) {
         const goFileName = specifierToGoFileName(moduleSpec);
         includeLocalImport(resolved.content, resolved.dir, goFileName);
+      }
+    }
+    // Renamed bindings refer to the original declaration (one Go package)
+    const bindings = node.importClause?.namedBindings;
+    if (bindings && isNamedImports(bindings)) {
+      for (const el of bindings.elements ?? []) {
+        if (!el.propertyName) continue;
+        importAliases.set(el.name.text, getSafeName(el.propertyName.text));
+        const fn = declaredFunctions.get(el.propertyName.text);
+        if (fn) declaredFunctions.set(el.name.text, fn);
       }
     }
     return '';
