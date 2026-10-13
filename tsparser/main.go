@@ -47,6 +47,21 @@ func main() {
 }
 
 
+// var / let / const / using / await using (await using sets Const | Using)
+func declarationKind(flags ast.NodeFlags) string {
+	switch {
+	case flags&ast.NodeFlagsAwaitUsing == ast.NodeFlagsAwaitUsing:
+		return "await using"
+	case flags&ast.NodeFlagsUsing != 0:
+		return "using"
+	case flags&ast.NodeFlagsConst != 0:
+		return "const"
+	case flags&ast.NodeFlagsLet != 0:
+		return "let"
+	}
+	return "var"
+}
+
 // Nodes currently being serialized (cycle guard).
 var inProgress = map[*ast.Node]bool{}
 
@@ -133,6 +148,10 @@ func serializeNode(n *ast.Node) any {
 		ast.KindTemplateTail, ast.KindJsxText:
 		obj["text"] = n.Text()
 	}
+	if n.Kind == ast.KindVariableDeclarationList {
+		obj["declarationKind"] = declarationKind(n.Flags)
+	}
+
 	// Binding-pattern holes (`[a, , b]`): ts-go parses them as an empty
 	// BindingElement; the TypeScript API exposes them as OmittedExpression
 	if n.Kind == ast.KindBindingElement {
@@ -144,6 +163,11 @@ func serializeNode(n *ast.Node) any {
 	data := asData(n)
 	if data.IsValid() {
 		collectFields(data, obj)
+	}
+	// ts-go's PostfixToken is ? or !; the TypeScript API names a ! exclamationToken
+	if tok, ok := obj["questionToken"].(map[string]any); ok && tok["kind"] == "ExclamationToken" {
+		delete(obj, "questionToken")
+		obj["exclamationToken"] = tok
 	}
 	// Template pieces: rawText is the source between their delimiters
 	// (`…`, `…${, }…${, }…`), with line endings normalized like JS

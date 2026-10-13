@@ -68,6 +68,18 @@ const KIND_NAMES = (() => {
     }
     return names;
 })();
+// var / let / const / using / await using (await using sets Const | Using)
+function declarationKind(flags) {
+    if ((flags & 6) === 6)
+        return 'await using';
+    if (flags & 4)
+        return 'using';
+    if (flags & 2)
+        return 'const';
+    if (flags & 1)
+        return 'let';
+    return 'var';
+}
 function isNode(v) {
     return typeof v === 'object' && v !== null && typeof v.kind === 'number' && typeof v.pos === 'number';
 }
@@ -76,6 +88,8 @@ function convertNode(node) {
     if (TEXT_KINDS.has(node.kind)) {
         obj.text = node.text ?? node.escapedText;
     }
+    if (node.kind === ts.SyntaxKind.VariableDeclarationList)
+        obj.declarationKind = declarationKind(node.flags);
     for (const key of Object.keys(node)) {
         if (SKIP_PROPS.has(key))
             continue;

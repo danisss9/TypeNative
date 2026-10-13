@@ -42,7 +42,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Numeric separators                      |   ✅    | [syntax-numeric-separators.ts](conformance/syntax-numeric-separators.ts)         | `1_000_000`                                                              |
 | Hex / octal / binary literals           |   ✅    | [syntax-numeric-literals.ts](conformance/syntax-numeric-literals.ts)             | `0xFF`, `0o17`, `0b1010`, `1e3`                                          |
 | `var` declarations (hoisting)           |   ✅    | [syntax-var.ts](conformance/syntax-var.ts)                                       | Function- and module-level `var`                                         |
-| `using` / `await using` declarations    |   ❌    | —                                                                                | Explicit resource management; no probe yet                               |
+| `using` / `await using` declarations    |   ✅    | [syntax-using.ts](conformance/syntax-using.ts)                                   | Disposed in reverse order when the block ends (`defer`); `[Symbol.dispose]` methods |
 
 ## Operators
 
@@ -68,7 +68,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Optional call (`fn?.()`)     |   ✅    | [syntax-optional-call.ts](conformance/syntax-optional-call.ts)               | Nil check on the function value; result is nullable                          |
 | Comma operator               |   ✅    | [syntax-comma-operator.ts](conformance/syntax-comma-operator.ts)             | In `for` headers (`i = 0, j = 10` / `i++, j--`)                              |
 | `void` operator              |   ✅    | [syntax-void-operator.ts](conformance/syntax-void-operator.ts)               | Evaluates, then `nil`                                                        |
-| `new.target`                 |   ❌    | —                                                                            | No probe yet                                                                 |
+| `new.target`                 |   ✅    | [syntax-new-target.ts](conformance/syntax-new-target.ts)                     | Constructors pass the target class name through `super()` chains             |
 
 ## Control flow
 
@@ -82,7 +82,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `break`                             |   ✅    | [syntax-if-switch.ts](conformance/syntax-if-switch.ts), [syntax-do-while.ts](conformance/syntax-do-while.ts)   | In switch cases and loops                                                  |
 | `for...of` loops                    |   ✅    | [syntax-loops.ts](conformance/syntax-loops.ts), [syntax-for-of-string.ts](conformance/syntax-for-of-string.ts) | Arrays, Maps, Sets, strings, tuples; `Object.entries()` unwrapping         |
 | `for...in` loops                    |   ✅    | [syntax-for-in.ts](conformance/syntax-for-in.ts)                                                               | Key range over records/maps                                                |
-| `for await...of`                    |   ❌    | —                                                                                                              | Requires async iteration (see [Async & timing](#async--timing))            |
+| `for await...of`                    |   ✅    | [syntax-for-await.ts](conformance/syntax-for-await.ts)                                                         | Ranges over the async generator's channel                                  |
 | `while` loops                       |   ✅    | [syntax-loops.ts](conformance/syntax-loops.ts)                                                                 | Transpiled to Go's `for` loops; assignment in condition                    |
 | `do...while` loops                  |   ✅    | [syntax-do-while.ts](conformance/syntax-do-while.ts)                                                           | Implemented with conditional break                                         |
 | Labeled loops                       |   ✅    | [syntax-labeled-loops.ts](conformance/syntax-labeled-loops.ts)                                                 | `LabeledStatement` → Go labels; labeled `continue`/`break`                 |
@@ -115,7 +115,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `as const` assertions                         |   ✅    | [syntax-as-const.ts](conformance/syntax-as-const.ts)                         | Erased during transpilation                                                         |
 | Function overloads                            |   ✅    | [syntax-function-overloads.ts](conformance/syntax-function-overloads.ts)     | Signatures are erased; the implementation is emitted                                |
 | `this` parameter (`function f(this: T)`)      |   ✅    | [syntax-this-parameter.ts](conformance/syntax-this-parameter.ts)             | Erased                                                                              |
-| `arguments` object                            |   ❌    | —                                                                            | No probe yet                                                                        |
+| `arguments` object                            |   ✅    | [syntax-arguments.ts](conformance/syntax-arguments.ts)                       | Functions reading it take extra arguments variadically (`[]interface{}`)            |
 
 ## Classes & interfaces
 
@@ -149,7 +149,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Generic constraints (`<T extends U>`)                         |   ✅    | [syntax-generic-constraints.ts](conformance/syntax-generic-constraints.ts) | Object-type bounds become `any`; properties of `T` values read dynamically |
 | Default type parameters (`<T = D>`)                           |   ✅    | [syntax-generic-defaults.ts](conformance/syntax-generic-defaults.ts)   | Defaults are erased; Go infers from arguments                  |
 | Generic interfaces / type aliases                             |   ✅    | [syntax-generic-interfaces.ts](conformance/syntax-generic-interfaces.ts) | Go generic structs; literals instantiate them (`Box[float64]{…}`) |
-| `const` type parameters / variance annotations (`in` / `out`) |   ❌    | —                                                                      | No probe yet                                                   |
+| `const` type parameters / variance annotations (`in` / `out`) |   ✅    | [syntax-const-type-parameters.ts](conformance/syntax-const-type-parameters.ts) | Erased; object literals of method interfaces use an adapter struct |
 
 ## Enums
 
@@ -158,7 +158,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Numeric enums                         |   ✅    | [syntax-enum-numeric.ts](conformance/syntax-enum-numeric.ts) | Numeric members are `float64` constants; string enums keep a named type |
 | String enums                          |   ✅    | [syntax-enum-string.ts](conformance/syntax-enum-string.ts)   | `enum` declarations and member access                                   |
 | `const enum`                          |   ✅    | [syntax-const-enum.ts](conformance/syntax-const-enum.ts)     | Compiled like a regular enum                                            |
-| Computed / heterogeneous enum members |   ❌    | —                                                            | `enum E { A = f(), B = 's' }`; no probe yet                             |
+| Computed / heterogeneous enum members |   ✅    | [syntax-enum-computed.ts](conformance/syntax-enum-computed.ts) | Computed members assigned in source order; mixed enums keep each member's type |
 
 ## Type-system features
 
@@ -170,7 +170,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `as` assertions                                           |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `x as T`, incl. angle-bracket syntax                                            |
 | Self-host contextual typing                               |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Object/array literals typed from context, `Record` literals, `in`, `any` params |
 | Decorators (`@`)                                          |   ❌    | —                                                                    | No probe yet                                                                    |
-| Namespaces / `module` blocks                              |   ❌    | —                                                                    | No probe yet                                                                    |
+| Namespaces / `module` blocks                              |   ✅    | [syntax-namespaces.ts](conformance/syntax-namespaces.ts)             | Flattened to prefixed declarations (`N.f` → `N_f`), nested and in types         |
 | `override` modifier                                       |   ✅    | [syntax-override.ts](conformance/syntax-override.ts)                 | Erased                                                                          |
 | `readonly` modifier (properties, `readonly T[]`)          |   ✅    | [syntax-readonly.ts](conformance/syntax-readonly.ts)                 | Erased (`readonly T[]` → `[]T`)                                                 |
 | `satisfies` operator                                      |   ✅    | [syntax-satisfies.ts](conformance/syntax-satisfies.ts)               | Checked by tsc, erased; the type guides literals                                |
@@ -186,10 +186,10 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Template literal types                                    |   ✅    | [syntax-template-literal-types.ts](conformance/syntax-template-literal-types.ts) | Template literal types → `string`                                               |
 | Utility types (`Partial`, `Pick`, `Omit`, …)              |   ✅    | [syntax-utility-types.ts](conformance/syntax-utility-types.ts)       | `Partial` / `Required` / `Readonly` / `Pick` / `Omit` / `NonNullable` → the base type |
 | Assertion functions (`asserts x is T`)                    |   ✅    | [syntax-assertion-functions.ts](conformance/syntax-assertion-functions.ts) | No return value                                                                 |
-| Callable / construct signatures (`type F = { (): void }`) |   ❌    | —                                                                    | No probe yet                                                                    |
+| Callable / construct signatures (`type F = { (): void }`) |   ✅    | [syntax-callable-signatures.ts](conformance/syntax-callable-signatures.ts) | Function types; a class passed as a value is its constructor                    |
 | JSX / `.tsx` syntax                                       |   ❌    | —                                                                    | No probe yet                                                                    |
-| Ambient declarations (`declare`, `.d.ts`, `x!: T`)        |   ❌    | —                                                                    | No probe yet                                                                    |
-| `export =` / `import x = require()`                       |   ❌    | —                                                                    | No probe yet                                                                    |
+| Ambient declarations (`declare`, `.d.ts`, `x!: T`)        |   ✅    | [syntax-ambient-declarations.ts](conformance/syntax-ambient-declarations.ts) | `declare` only types code; `declare const` is an unset variable                 |
+| `export =` / `import x = require()`                       |   ✅    | [syntax-export-equals.ts](conformance/syntax-export-equals.ts)       | `import x = require()` is a namespace import                                    |
 
 ## Modules & imports
 
@@ -205,9 +205,9 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Node.js built-in imports                           |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts)                 | `import { join } from 'node:path'` mapped to Go stdlib (see [Standard library](#standard-library))                     |
 | Go package imports                                 |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts)           | `import { x } from 'go:pkg'`                                                                                           |
 | npm package imports                                |   ✅    | [syntax-import-npm.ts](conformance/syntax-import-npm.ts)         | `import { x } from 'pkg'` mapped to Go module imports                                                                  |
-| Re-exports (`export { x } from`, `export *`)       |   ❌    | —                                                                | No probe yet                                                                                                           |
-| Dynamic `import()`                                 |   ❌    | —                                                                | No probe yet                                                                                                           |
-| Side-effect imports (`import './mod'`)             |   ❌    | —                                                                | No probe yet                                                                                                           |
+| Re-exports (`export { x } from`, `export *`)       |   ✅    | [syntax-re-exports.ts](conformance/syntax-re-exports.ts)         | Re-exported files are included (one Go package)                                                                        |
+| Dynamic `import()`                                 |   ✅    | [syntax-dynamic-import.ts](conformance/syntax-dynamic-import.ts) | `const m = await import('./x')` is a namespace import                                                                  |
+| Side-effect imports (`import './mod'`)             |   ✅    | [syntax-side-effect-import.ts](conformance/syntax-side-effect-import.ts) | Module top-level statements run in Go's `init()`                                                                       |
 | `import.meta.url`                                  |   ✅    | [syntax-import-meta.ts](conformance/syntax-import-meta.ts)       | The `file://` URL of the running program (`os.Executable` → `pathToFileURL`)                                           |
 
 ## Async & timing

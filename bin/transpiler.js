@@ -338,6 +338,8 @@ const interfacePropertyTypes = new Map();
 const typeAliases = new Map();
 const enumNames = new Set();
 const enumBaseTypes = new Map();
+// Member types of heterogeneous enums ("E.A" → float64 / string)
+const enumMemberGoTypes = new Map();
 // Maps local TS name → Go qualified name (e.g. 'Println' → 'fmt.Println', 'myFmt' → 'fmt')
 const importAliases = new Map();
 // Tracks static methods per class: Set of "ClassName.methodName" strings
@@ -399,6 +401,10 @@ function parseSource(code) {
     const sourceFile = parseFunction(code);
     stripThisParameters(sourceFile);
     lowerIndexSignatures(sourceFile);
+    lowerAmbientDeclarations(sourceFile);
+    lowerModuleForms(sourceFile);
+    lowerDisposeSymbols(sourceFile);
+    lowerNamespaces(sourceFile);
     lowerClassExpressions(sourceFile);
     lowerWeakCollections(sourceFile);
     lowerGlobalThis(sourceFile);
@@ -441,6 +447,26 @@ function lowerIndexSignatures(node) {
         return;
     }
     const members = node.members ?? [];
+    // { (a: A): R } / { new (a: A): C } → (a: A) => R / (a: A) => C
+    const isSignature = (m) => m.kind === 'CallSignature' || m.kind === 'ConstructSignature';
+    if (members.length === 1 && isSignature(members[0]) && (node.kind === 'TypeLiteral' || node.kind === 'InterfaceDeclaration')) {
+        const fnType = { kind: 'FunctionType', parameters: members[0].parameters ?? [], type: members[0].type };
+        if (node.kind === 'TypeLiteral') {
+            for (const key of Object.keys(node))
+                if (key !== 'parent')
+                    delete node[key];
+            node.kind = 'FunctionType';
+            node.parameters = fnType.parameters;
+            node.type = fnType.type;
+        }
+        else {
+            delete node.members;
+            delete node.heritageClauses;
+            node.kind = 'TypeAliasDeclaration';
+            node.type = fnType;
+        }
+        return;
+    }
     if (members.length !== 1 || members[0].kind !== 'IndexSignature')
         return;
     const signature = members[0];
@@ -464,6 +490,192 @@ function makeRecordReference(node, keyType, valueType) {
     node.kind = 'TypeReference';
     node.typeName = typeName;
     node.typeArguments = [keyType, valueType];
+}
+function lowerAmbientDeclarations(node) {
+    for (const child of childNodes(node))
+        lowerAmbientDeclarations(child);
+    if (!Array.isArray(node.statements))
+        return;
+    const isDeclare = (m) => m.kind === 'DeclareKeyword';
+    node.statements = node.statements.filter((statement) => {
+        if (statement.kind === 'VariableStatement' && statement.modifiers) {
+            // declare / export on variables don't change the emitted Go
+            statement.modifiers = statement.modifiers.filter((m) => !isDeclare(m) && m.kind !== 'ExportKeyword');
+            return true;
+        }
+        return !(statement.modifiers ?? []).some(isDeclare);
+    });
+}
+// Every module form becomes an import declaration (all files share one Go package):
+//   export { a, b as c } from './m'  → import { a, b as c } from './m'
+//   export * from './m'               → import './m'
+//   import x = require('./m')         → import * as x from './m'
+//   const x = await import('./m')     → import * as x from './m'
+function lowerModuleForms(node) {
+    for (const child of childNodes(node))
+        lowerModuleForms(child);
+    if (!Array.isArray(node.statements))
+        return;
+    node.statements = node.statements.map((statement) => {
+        const namespaceImport = (name, specifier) => ({
+            kind: 'ImportDeclaration',
+            moduleSpecifier: specifier,
+            importClause: { kind: 'ImportClause', namedBindings: { kind: 'NamespaceImport', name } }
+        });
+        if (statement.kind === 'ExportDeclaration' && statement.moduleSpecifier && !statement.isTypeOnly) {
+            const clause = statement.exportClause;
+            if (clause?.kind === 'NamespaceExport')
+                return namespaceImport(clause.name, statement.moduleSpecifier);
+            const importClause = clause
+                ? { kind: 'ImportClause', namedBindings: { kind: 'NamedImports', elements: clause.elements ?? [] } }
+                : undefined;
+            return { kind: 'ImportDeclaration', moduleSpecifier: statement.moduleSpecifier, importClause };
+        }
+        if (statement.kind === 'ImportEqualsDeclaration' && statement.moduleReference?.kind === 'ExternalModuleReference') {
+            return namespaceImport(statement.name, statement.moduleReference.expression);
+        }
+        const declarations = statement.kind === 'VariableStatement' ? (statement.declarationList?.declarations ?? []) : [];
+        const init = declarations.length === 1 ? declarations[0].initializer : undefined;
+        const call = init?.kind === 'AwaitExpression' ? init.expression : undefined;
+        if (call?.kind === 'CallExpression' && call.expression?.kind === 'ImportKeyword' && isStringLiteral(call.arguments?.[0]) && isIdentifier(declarations[0].name)) {
+            return namespaceImport(declarations[0].name, call.arguments[0]);
+        }
+        return statement;
+    });
+}
+// Names whose identifier is a property / member name, not a reference
+const MEMBER_NAME_PARENTS = new Set([
+    'PropertyAccessExpression', 'PropertyAssignment', 'PropertySignature', 'MethodSignature',
+    'PropertyDeclaration', 'MethodDeclaration', 'GetAccessor', 'SetAccessor', 'EnumMember'
+]);
+// Top-level names a statement list declares
+function getDeclaredNames(statements) {
+    const names = [];
+    for (const statement of statements) {
+        if (statement.kind === 'VariableStatement') {
+            for (const d of statement.declarationList?.declarations ?? [])
+                if (isIdentifier(d.name))
+                    names.push(d.name.text);
+        }
+        else if (isIdentifier(statement.name)) {
+            names.push(statement.name.text);
+        }
+    }
+    return names;
+}
+// Renames references to the given names (not property/member names) to prefix_name
+function renameIdentifiers(node, names, prefix) {
+    for (const key of Object.keys(node)) {
+        if (key === 'parent')
+            continue;
+        const value = node[key];
+        const children = Array.isArray(value) ? value : value && typeof value === 'object' ? [value] : [];
+        for (const child of children) {
+            if (!child || typeof child.kind !== 'string')
+                continue;
+            if (isIdentifier(child) && names.has(child.text)) {
+                if (key === 'name' && MEMBER_NAME_PARENTS.has(node.kind))
+                    continue;
+                if (key === 'right' && node.kind === 'QualifiedName')
+                    continue;
+                if (node.kind === 'ShorthandPropertyAssignment') {
+                    // { unit } keeps its key: { unit: N_unit }
+                    node.kind = 'PropertyAssignment';
+                    const initializer = { kind: 'Identifier', text: `${prefix}_${child.text}` };
+                    node.initializer = initializer;
+                    continue;
+                }
+                child.text = `${prefix}_${child.text}`;
+            }
+            else {
+                renameIdentifiers(child, names, prefix);
+            }
+        }
+    }
+}
+// Flattens the namespaces in a statement list; returns the namespace names found
+// (nested ones as Outer_Inner)
+function flattenNamespaces(statements) {
+    const out = [];
+    const namespaces = [];
+    for (const statement of statements) {
+        const isDeclare = (statement.modifiers ?? []).some((m) => m.kind === 'DeclareKeyword');
+        if (statement.kind !== 'ModuleDeclaration' || !isIdentifier(statement.name) || isDeclare) {
+            out.push(statement);
+            continue;
+        }
+        const prefix = statement.name.text;
+        // namespace A.B { } nests a ModuleDeclaration as the body
+        const body = statement.body?.kind === 'ModuleDeclaration' ? [statement.body] : (statement.body?.statements ?? []);
+        const inner = flattenNamespaces(body);
+        rewriteNamespaceAccess(inner.statements, new Set(inner.namespaces));
+        const names = new Set([...getDeclaredNames(inner.statements), ...inner.namespaces]);
+        for (const child of inner.statements) {
+            const wrapper = { kind: 'Block', statements: [child] };
+            renameIdentifiers(wrapper, names, prefix);
+        }
+        namespaces.push(prefix);
+        for (const n of inner.namespaces)
+            namespaces.push(`${prefix}_${n}`);
+        out.push(...inner.statements);
+    }
+    return { statements: out, namespaces };
+}
+// N.x / N.Inner.x (expressions) and N.T (types) → the flattened identifiers
+function rewriteNamespaceAccess(nodes, namespaces) {
+    const rewrite = (node) => {
+        for (const key of Object.keys(node)) {
+            if (key === 'parent')
+                continue;
+            const value = node[key];
+            if (Array.isArray(value))
+                node[key] = value.map((v) => (v && typeof v.kind === 'string' ? rewrite(v) : v));
+            else if (value && typeof value.kind === 'string')
+                node[key] = rewrite(value);
+        }
+        const left = node.kind === 'PropertyAccessExpression' ? node.expression : node.kind === 'QualifiedName' ? node.left : undefined;
+        const right = node.kind === 'PropertyAccessExpression' ? node.name : node.kind === 'QualifiedName' ? node.right : undefined;
+        if (isIdentifier(left) && namespaces.has(left.text) && isIdentifier(right)) {
+            const flattened = { kind: 'Identifier', text: `${left.text}_${right.text}` };
+            return flattened;
+        }
+        return node;
+    };
+    for (let i = 0; i < nodes.length; i++)
+        nodes[i] = rewrite(nodes[i]);
+}
+function lowerNamespaces(sourceFile) {
+    const flat = flattenNamespaces(sourceFile.statements ?? []);
+    sourceFile.statements = flat.statements;
+    if (flat.namespaces.length > 0)
+        rewriteNamespaceAccess(sourceFile.statements, new Set(flat.namespaces));
+}
+const DISPOSE_SYMBOLS = { dispose: '__dispose', asyncDispose: '__asyncDispose' };
+function getDisposeSymbolName(expr) {
+    if (!isPropertyAccessExpression(expr) || !isIdentifier(expr.expression) || expr.expression.text !== 'Symbol')
+        return undefined;
+    return DISPOSE_SYMBOLS[expr.name.text];
+}
+// [Symbol.dispose]() { … } → __dispose() { … }; x[Symbol.dispose]() → x.__dispose()
+function lowerDisposeSymbols(node) {
+    for (const child of childNodes(node))
+        lowerDisposeSymbols(child);
+    if (node.name?.kind === 'ComputedPropertyName') {
+        const name = getDisposeSymbolName(node.name.expression);
+        if (name) {
+            const identifier = { kind: 'Identifier', text: name };
+            node.name = identifier;
+        }
+    }
+    if (node.kind === 'ElementAccessExpression') {
+        const name = getDisposeSymbolName(node.argumentExpression);
+        if (name) {
+            const identifier = { kind: 'Identifier', text: name };
+            node.kind = 'PropertyAccessExpression';
+            node.name = identifier;
+            delete node.argumentExpression;
+        }
+    }
 }
 // const Point = class { … } → class Point { … } (the variable names the class)
 function lowerClassExpressions(node) {
@@ -708,6 +920,9 @@ function visit(node, options = {}) {
         const goAlias = importAliases.get(node.text);
         if (goAlias)
             return goAlias;
+        // A class passed as a value (make(Box)) is its constructor function
+        if (classNames.has(node.text) && isValuePosition(node))
+            return `New${getSafeName(node.text)}`;
         // Array references: reads go through the shared slice-header pointer
         if (referenceArrays.has(node.text)) {
             return `(*${getSafeName(node.text)})`;
@@ -840,6 +1055,8 @@ function visit(node, options = {}) {
         if (regexProperty)
             return regexProperty;
         // import.meta.url — the file URL of the running program
+        if (isNewTargetNode(node.expression) && node.name.text === 'name')
+            return '__newTarget';
         if (node.expression.kind === 'MetaProperty' && node.name.text === 'url') {
             useHelper('moduleUrl');
             return 'TnModuleURL()';
@@ -1389,6 +1606,11 @@ function visit(node, options = {}) {
                 return op === '==' ? eq : `!(${eq})`;
             }
         }
+        // new.target === C → the target class name is C's
+        if ((op === '==' || op === '!=') && (isNewTargetNode(node.left) || isNewTargetNode(node.right))) {
+            const other = isNewTargetNode(node.left) ? node.right : node.left;
+            return `__newTarget ${op} ${isIdentifier(other) ? toGoStringLiteral(other.text) : '""'}`;
+        }
         // obj[key] = v on any
         if (op === '=' && isElementAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
             useHelper('dynamic');
@@ -1654,7 +1876,7 @@ function visit(node, options = {}) {
         if (options.isOutside) {
             // async functions run their body in a goroutine sending over a channel
             const isAsync = (node.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
-            if (isAsync && node.name) {
+            if (isAsync && node.name && !node.asteriskToken) {
                 return emitChannelFunction(node, true);
             }
             if (node.asteriskToken && node.name) {
@@ -1709,6 +1931,8 @@ function visit(node, options = {}) {
         enumNames.add(enumName);
         enumBaseTypes.set(enumName, getEnumBaseType(node));
         if (options.addFunctionOutside) {
+            if (enumHasComputedMember(node))
+                return visitEnumDeclaration(node, true);
             outsideNodes.push(node);
             return '';
         }
@@ -1796,7 +2020,7 @@ function visit(node, options = {}) {
             return `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}`;
         }
         const members = [...extendedInterfaces.map((e) => `\t${e}`), ...methods];
-        return `type ${name}${typeParams} interface {\n${members.join('\n')}\n}`;
+        return `type ${name}${typeParams} interface {\n${members.join('\n')}\n}${extendedInterfaces.length === 0 ? emitInterfaceAdapter(node) : ''}`;
     }
     else if (isClassDeclaration(node)) {
         if (options.addFunctionOutside) {
@@ -1936,7 +2160,7 @@ function visit(node, options = {}) {
                     const args = (s.expression.arguments ?? []).map((a) => visit(a));
                     if (extendsError)
                         return `self.message = ${args[0] ?? '""'}\n\t\t`;
-                    return `self.${goFieldName(parentClass)} = *New${parentClass}(${args.join(', ')})\n\t\t`;
+                    return `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, args)}\n\t\t`;
                 }
                 return visit(s);
             })
@@ -1945,17 +2169,19 @@ function visit(node, options = {}) {
                 .map((p) => `self.${goFieldName(p.name.text)} = ${visit(p.name)}\n\t\t`)
                 .join('');
             const parentInit = parentClass && !extendsError && !superCalledInCtor
-                ? `self.${goFieldName(parentClass)} = *New${parentClass}()\n\t\t`
+                ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, [])}\n\t\t`
                 : '';
-            result += `func New${name}${typeParams}(${ctorParameterInfo.signature}) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${parentInit}${fieldInitializers(node)}${parameterAssignments}${bodyStatements}return self;\n\t}\n\n`;
+            const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${ctorParameterInfo.prefixBlockContent}${parentInit}${fieldInitializers(node)}${parameterAssignments}${bodyStatements}return self;\n\t}`;
+            result += emitConstructor(name, typeParams, typeParamNames, ctorParameterInfo.signature, ctorBody);
         }
         else if (extendsError) {
             // class X extends Error {} — the constructor takes the message
             result += `func New${name}${typeParams}(message string) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\tself.message = message\n\t\t${fieldInitializers(node)}return self\n\t}\n\n`;
         }
         else {
-            const parentInit = parentClass && !extendsError ? `self.${goFieldName(parentClass)} = *New${parentClass}()\n\t\t` : '';
-            result += `func New${name}${typeParams}() *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\t${parentInit}${fieldInitializers(node)}return self\n\t}\n\n`;
+            const parentInit = parentClass && !extendsError ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, [])}\n\t\t` : '';
+            const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${parentInit}${fieldInitializers(node)}return self\n\t}`;
+            result += emitConstructor(name, typeParams, typeParamNames, '', ctorBody);
         }
         // Inherited concrete methods are copied onto the subclass: Go embedding
         // promotes the parent's receiver, which would break `this` dispatch
@@ -2140,6 +2366,10 @@ function visit(node, options = {}) {
         }
         const typeArgs = getTypeArguments((node.typeArguments ?? []));
         const args = node.arguments ? (node.arguments ?? []).map((a) => visit(a)) : [];
+        // new F(…) where F holds a constructor function (construct signature)
+        if (!classNames.has(className) && inferExpressionType(node.expression)?.startsWith('func(')) {
+            return `${className}(${args.join(', ')})`;
+        }
         return `New${className}${typeArgs}(${args.join(', ')})`;
     }
     else if (isObjectLiteralExpression(node)) {
@@ -2181,6 +2411,8 @@ function visit(node, options = {}) {
             ? getTypeArguments(contextualType.typeArguments)
             : '';
         const structName = typeName.replace(/^\*/, '') + (typeName.endsWith(']') ? '' : typeArgs);
+        if (isMethodInterfaceName(typeName.replace(/^\*/, '')))
+            return visitInterfaceLiteral(node, typeName.replace(/^\*/, ''), typeArgs);
         // { ...base, x: 1 } → a copy of *base with fields set
         if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
             const steps = (node.properties ?? []).map((p) => {
@@ -2458,7 +2690,12 @@ function alwaysExits(statement) {
 function visitBlockStatements(statements) {
     const added = [];
     const parts = [];
-    for (const statement of statements) {
+    for (let index = 0; index < statements.length; index++) {
+        const statement = statements[index];
+        if (isUsingDeclaration(statement)) {
+            parts.push(visitUsingDeclaration(statement, statements.slice(index + 1)));
+            break;
+        }
         parts.push(visit(statement));
         if (isIfStatement(statement) && !statement.elseStatement && alwaysExits(statement.thenStatement)) {
             for (const name of getNarrowedNames(statement.expression, false)) {
@@ -2472,6 +2709,39 @@ function visitBlockStatements(statements) {
     for (const name of added)
         narrowedVariables.delete(name);
     return parts.join('\t');
+}
+function isUsingDeclaration(statement) {
+    const kind = statement.kind === 'VariableStatement' ? statement.declarationList?.declarationKind : undefined;
+    return kind === 'using' || kind === 'await using';
+}
+// using x = r; …rest → x := r; defer dispose(x); …rest. In a function body Go's
+// defer is the block end; nested blocks run the rest in a closure so disposal
+// happens when the block ends (return/break/continue there keep the defer form)
+function visitUsingDeclaration(statement, rest) {
+    const isAwait = statement.declarationList.declarationKind === 'await using';
+    const disposals = (statement.declarationList.declarations ?? [])
+        .filter((d) => isIdentifier(d.name))
+        .map((d) => {
+        const name = visit(d.name);
+        const goType = inferExpressionType(d.initializer) ?? '';
+        const className = goType.replace(/^\*/, '').replace(/\[.*$/, '');
+        const classNode = declaredClasses.get(className);
+        const hasAsync = (classNode?.members ?? []).some((m) => m.name?.text === '__asyncDispose');
+        if (isAwait && hasAsync)
+            useHelper('promise');
+        const call = isAwait && hasAsync ? `TnAwait(${name}.__asyncDispose())` : `${name}.__dispose()`;
+        return `defer func() { if ${name} != nil { ${call} } }()`;
+    })
+        .reverse();
+    const declaration = { ...statement, declarationList: { ...statement.declarationList, declarationKind: 'const' } };
+    const head = `${visit(declaration)}${disposals.join('\n\t\t')}\n\t\t`;
+    const block = statement.parent;
+    const isFunctionBody = !!block?.parent && block.parent.body === block;
+    const restBlock = { kind: 'Block', statements: rest };
+    const exits = containsNode(restBlock, (n) => n.kind === 'ReturnStatement' || n.kind === 'BreakStatement' || n.kind === 'ContinueStatement');
+    if (isFunctionBody || exits)
+        return head + visitBlockStatements(rest);
+    return `func() {\n\t\t${head}${visitBlockStatements(rest)}}()\n\t`;
 }
 function visitDynamicArithmetic(node, op) {
     const leftDynamic = isDynamicValue(node.left);
@@ -2677,6 +2947,66 @@ function visitSpreadCallArguments(node) {
     return result;
 }
 // self.field = initializer for each instance field that has one
+// Whether a class's constructor chain (its own or an ancestor's) reads new.target
+function usesNewTarget(className) {
+    let current = className;
+    for (let depth = 0; depth < 50; depth++) {
+        const classNode = declaredClasses.get(current);
+        if (!classNode)
+            return false;
+        const ctor = (classNode.members ?? []).find((m) => isConstructorDeclaration(m));
+        if (ctor?.body && containsNode(ctor.body, (n) => isNewTargetNode(n)))
+            return true;
+        const extendsClause = (classNode.heritageClauses ?? []).find((c) => c.token === 'ExtendsKeyword');
+        if (!extendsClause)
+            return false;
+        current = visit(extendsClause.types[0].expression);
+    }
+    return false;
+}
+function isNewTargetNode(node) {
+    return node?.kind === 'MetaProperty' && node.name?.text === 'target';
+}
+// The parent part of a subclass constructor: new.target-aware chains pass the target on
+function parentConstructorCall(parentClass, args) {
+    if (!usesNewTarget(parentClass))
+        return `New${parentClass}(${args.join(', ')})`;
+    return `new${parentClass}As(${['__newTarget', ...args].join(', ')})`;
+}
+// Splits a Go parameter list at top-level commas
+function splitGoParameters(signature) {
+    const parts = [];
+    let depth = 0;
+    let current = '';
+    for (const ch of signature) {
+        if (ch === '(' || ch === '[' || ch === '{')
+            depth++;
+        if (ch === ')' || ch === ']' || ch === '}')
+            depth--;
+        if (ch === ',' && depth === 0) {
+            parts.push(current.trim());
+            current = '';
+        }
+        else
+            current += ch;
+    }
+    if (current.trim())
+        parts.push(current.trim());
+    return parts;
+}
+// NewX(…) — or, for new.target-aware classes, newXAs(__newTarget string, …) plus a
+// NewX(…) that calls it with "X"
+function emitConstructor(name, typeParams, typeParamNames, signature, body) {
+    if (!usesNewTarget(name))
+        return `func New${name}${typeParams}(${signature}) *${name}${typeParamNames} ${body}\n\n`;
+    const forward = splitGoParameters(signature).map((p) => {
+        const [paramName, paramType] = [p.slice(0, p.indexOf(' ')), p.slice(p.indexOf(' ') + 1)];
+        return paramType.startsWith('...') ? `${paramName}...` : paramName;
+    });
+    const internal = ['__newTarget string', signature].filter((part) => part).join(', ');
+    return (`func new${name}As${typeParams}(${internal}) *${name}${typeParamNames} ${body}\n\n` +
+        `func New${name}${typeParams}(${signature}) *${name}${typeParamNames} {\n\t\treturn new${name}As${typeParamNames}(${[toGoStringLiteral(name), ...forward].join(', ')})\n\t}\n\n`);
+}
 function fieldInitializers(classNode) {
     return (classNode.members ?? [])
         .filter((m) => isPropertyDeclaration(m) &&
@@ -3673,6 +4003,8 @@ function inferExpressionType(expr) {
         return '[]string';
     }
     // import.meta.url is a string
+    if (isPropertyAccessExpression(expr) && isNewTargetNode(expr.expression) && expr.name.text === 'name')
+        return 'string';
     if (isPropertyAccessExpression(expr) && expr.expression.kind === 'MetaProperty' && expr.name.text === 'url') {
         return 'string';
     }
@@ -3813,6 +4145,9 @@ function inferExpressionType(expr) {
             // Numeric enums are float64 constants; string enums keep their type
             if (enumBaseTypes.get(expr.expression.text) === 'float64')
                 return 'float64';
+            if (enumBaseTypes.get(expr.expression.text) === 'interface{}') {
+                return enumMemberGoTypes.get(`${expr.expression.text}.${getEnumMemberName(expr.name)}`) ?? 'interface{}';
+            }
             const enumType = getSafeName(expr.expression.text);
             return enumType;
         }
@@ -4360,6 +4695,46 @@ function makeNullableType(typeName) {
 // property-only interfaces / object type aliases
 // Object types that compile to Go structs: property-only interfaces and
 // object type aliases (values of these types are *Name, like JS references)
+// A declared interface with method signatures (a Go interface type)
+function isMethodInterfaceName(name) {
+    return (declaredInterfaces.get(name)?.members ?? []).some((m) => isMethodSignature(m));
+}
+// type P_obj struct { get_fn func() T; … } + func (o *P_obj) get() T { return o.get_fn() }
+function emitInterfaceAdapter(node) {
+    const name = visit(node.name);
+    const typeParams = getTypeParameters(node.typeParameters);
+    const typeParamNames = getTypeParameterNames(node.typeParameters);
+    const fields = [];
+    const methods = [];
+    for (const member of node.members ?? []) {
+        if (!isMethodSignature(member))
+            continue;
+        const methodName = visit(member.name);
+        const params = (member.parameters ?? []).map((p) => `${visit(p.name)} ${getType(p.type)}`);
+        const args = (member.parameters ?? []).map((p) => visit(p.name));
+        const returnType = member.type ? getType(member.type) : '';
+        const signature = `func(${params.join(', ')})${returnType ? ` ${returnType}` : ''}`;
+        fields.push(`\t${methodName}_fn ${signature}`);
+        methods.push(`func (o *${name}_obj${typeParamNames}) ${methodName}(${params.join(', ')})${returnType ? ` ${returnType}` : ''} { ${returnType ? 'return ' : ''}o.${methodName}_fn(${args.join(', ')}) }`);
+    }
+    return `\n\ntype ${name}_obj${typeParams} struct {\n${fields.join('\n')}\n}\n\n${methods.join('\n\n')}`;
+}
+// { get: () => 4, set(v) { … } } typed as a method interface → &P_obj{get_fn: …, set_fn: …}
+function visitInterfaceLiteral(node, interfaceName, typeArgs) {
+    const fields = (node.properties ?? []).map((p) => {
+        const fieldName = `${visit(p.name)}_fn`;
+        if (isPropertyAssignment(p))
+            return `${fieldName}: ${visit(p.initializer)}`;
+        if (isShorthandPropertyAssignment(p))
+            return `${fieldName}: ${visit(p.name)}`;
+        if (isMethodDeclaration(p)) {
+            const fn = { kind: 'FunctionExpression', parameters: p.parameters, type: p.type, body: p.body, parent: p.parent };
+            return `${fieldName}: ${visit(fn)}`;
+        }
+        return '';
+    });
+    return `&${interfaceName}_obj${typeArgs}${compositeBody(fields.filter((f) => f))}`;
+}
 function isObjectTypeName(name) {
     const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
     if (alias)
@@ -4904,16 +5279,23 @@ function getEnumMemberName(name) {
     }
     return 'Member';
 }
+// string enums, numeric enums, or interface{} for heterogeneous ones (each member keeps its own type)
 function getEnumBaseType(node) {
+    let hasString = false;
+    let hasNumber = false;
     for (const member of (node.members ?? [])) {
         const initializer = member.initializer;
-        if (!initializer)
-            continue;
-        if (isStringLiteral(initializer) || isNoSubstitutionTemplateLiteral(initializer)) {
-            return 'string';
+        if (initializer && (isStringLiteral(initializer) || isNoSubstitutionTemplateLiteral(initializer))) {
+            hasString = true;
         }
+        else {
+            hasNumber = true;
+        }
+        enumMemberGoTypes.set(`${node.name.text}.${getEnumMemberName(member.name)}`, initializer && (isStringLiteral(initializer) || isNoSubstitutionTemplateLiteral(initializer)) ? 'string' : 'float64');
     }
-    return 'float64';
+    if (hasString && hasNumber)
+        return 'interface{}';
+    return hasString ? 'string' : 'float64';
 }
 function readNumericEnumInitializer(initializer) {
     if (isNumericLiteral(initializer)) {
@@ -4926,18 +5308,28 @@ function readNumericEnumInitializer(initializer) {
     }
     return undefined;
 }
-function visitEnumDeclaration(node) {
+function enumHasComputedMember(node) {
+    return (node.members ?? []).some((m) => m.initializer &&
+        !isStringLiteral(m.initializer) &&
+        !isNoSubstitutionTemplateLiteral(m.initializer) &&
+        readNumericEnumInitializer(m.initializer) === undefined);
+}
+function visitEnumDeclaration(node, inPlace = false) {
     const enumName = getSafeName(node.name.text);
     const baseType = enumBaseTypes.get(node.name.text) ?? getEnumBaseType(node);
     let nextNumericValue = 0;
     let canAutoIncrement = true;
+    let hasComputedMember = false;
     const members = [];
     for (const member of (node.members ?? [])) {
         const memberName = getEnumMemberName(member.name);
         const symbolName = `${enumName}_${memberName}`;
         let valueExpr;
         if (member.initializer) {
-            if (baseType === 'float64') {
+            if (baseType === 'interface{}' && (isStringLiteral(member.initializer) || isNoSubstitutionTemplateLiteral(member.initializer))) {
+                valueExpr = visit(member.initializer);
+            }
+            else if (baseType !== 'string') {
                 const numericValue = readNumericEnumInitializer(member.initializer);
                 if (numericValue !== undefined) {
                     valueExpr = `${numericValue}`;
@@ -4947,13 +5339,14 @@ function visitEnumDeclaration(node) {
                 else {
                     valueExpr = `float64(${visit(member.initializer)})`;
                     canAutoIncrement = false;
+                    hasComputedMember = true;
                 }
             }
             else {
                 valueExpr = visit(member.initializer);
             }
         }
-        else if (baseType === 'float64') {
+        else if (baseType !== 'string') {
             const currentValue = canAutoIncrement ? nextNumericValue : 0;
             valueExpr = `${currentValue}`;
             nextNumericValue = currentValue + 1;
@@ -4963,10 +5356,37 @@ function visitEnumDeclaration(node) {
         }
         members.push(`\t${symbolName} ${enumName} = ${enumName}(${valueExpr})`);
     }
-    // Numeric enums are plain float64 constants so they compare against numbers;
-    // string enums keep a named type
+    // Assigned in place: package variables declared, values set in source order
+    if (inPlace) {
+        return members
+            .map((m) => {
+            const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
+            const raw = m.slice(m.indexOf(`= ${enumName}(`) + enumName.length + 3, -1);
+            const value = /^-?[0-9.]+$/.test(raw) ? `float64(${raw})` : raw;
+            const memberType = baseType === 'interface{}'
+                ? (enumMemberGoTypes.get(`${node.name.text}.${name.slice(enumName.length + 1)}`) ?? 'interface{}')
+                : baseType === 'float64'
+                    ? 'float64'
+                    : enumName;
+            mainPackageVariables.push(`var ${name} ${memberType}`);
+            return `${name} = ${memberType === enumName ? `${enumName}(${raw})` : value};\n\t`;
+        })
+            .join('');
+    }
+    // Heterogeneous enums: plain variables of each member's own type
+    if (baseType === 'interface{}') {
+        return `var (\n${members
+            .map((m) => {
+            const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
+            const value = m.slice(m.indexOf(`= ${enumName}(`) + enumName.length + 3, -1);
+            return `\t${name} = ${/^-?[0-9.]+$/.test(value) ? `float64(${value})` : value}`;
+        })
+            .join('\n')}\n)`;
+    }
+    // Numeric enums are plain float64 constants so they compare against numbers
+    // (variables when a member is computed); string enums keep a named type
     if (baseType === 'float64') {
-        return `const (\n${members
+        return `${hasComputedMember ? 'var' : 'const'} (\n${members
             .map((m) => {
             const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
             const value = m.slice(m.lastIndexOf('=') + 1).trim();
@@ -5051,6 +5471,8 @@ function getType(typeNode, getArrayType = false) {
             // Numeric enums lowered to float64 constants have no named type
             if (enumBaseTypes.get(name) === 'float64')
                 return 'float64';
+            if (enumBaseTypes.get(name) === 'interface{}')
+                return 'interface{}';
             return getSafeName(name);
         }
         const aliasType = getAliasType(name);
@@ -6186,6 +6608,21 @@ function visitRegexProperty(node) {
     importedPackages.add('strings');
     return `strings.Contains(TnRegexpFlags(${receiver}), "${REGEX_FLAG_PROPERTIES[name]}")`;
 }
+// Whether an expression is used as a value (argument, initializer, element, assigned or returned)
+function isValuePosition(node) {
+    const parent = node.parent;
+    if (!parent)
+        return false;
+    if (isCallExpression(parent))
+        return (parent.arguments ?? []).includes(node);
+    if (isVariableDeclaration(parent) || isPropertyAssignment(parent))
+        return parent.initializer === node;
+    if (isArrayLiteralExpression(parent))
+        return true;
+    if (isReturnStatement(parent))
+        return true;
+    return isBinaryExpression(parent) && parent.operatorToken.kind === 'EqualsToken' && parent.right === node;
+}
 function isStringRawTag(tag) {
     return isPropertyAccessExpression(tag) && isIdentifier(tag.expression) && tag.expression.text === 'String' && tag.name.text === 'raw';
 }
@@ -6361,6 +6798,14 @@ function visitCallArguments(node) {
     return result;
 }
 function withContextualParameters(fn, info) {
+    if (usesArgumentsObject(fn) && !info.signature.includes('...')) {
+        const names = (fn.parameters ?? []).map((p) => getParameterName(p, fn.parameters));
+        registerLocalVariable('arguments', '[]interface{}');
+        return {
+            signature: [info.signature, '__arguments ...interface{}'].filter((part) => part).join(', '),
+            prefixBlockContent: `${info.prefixBlockContent}arguments := append([]interface{}{${names.join(', ')}}, __arguments...)\n\t\t_ = arguments\n\t\t`
+        };
+    }
     const contextualFn = getContextualFunctionType(fn);
     const declaredCount = (fn.parameters ?? []).length;
     const contextualParams = contextualFn?.parameters ?? [];
@@ -6371,6 +6816,16 @@ function withContextualParameters(fn, info) {
         .map((p) => `_ ${p.dotDotDotToken ? '...' : ''}${p.type ? getType(p.type) : 'interface{}'}`);
     const signature = [info.signature, ...extra].filter((part) => part).join(', ');
     return { ...info, signature };
+}
+// A non-arrow function whose own body reads `arguments` (arrows see their parent's)
+function usesArgumentsObject(fn) {
+    if (isArrowFunction(fn) || !fn.body)
+        return false;
+    return containsNode(fn.body, (n) => {
+        if (n !== fn.body && (isFunctionDeclaration(n) || isFunctionExpression(n) || isMethodDeclaration(n)))
+            return false;
+        return isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n);
+    });
 }
 // Destructured parameters ({ a, b }: T / [x, y]: T[]) get a temporary name
 function getParameterName(param, parameters) {
@@ -6612,8 +7067,8 @@ function visitNewSet(node) {
         elementType = getArrayLiteralElementType(node.arguments[0]);
     }
     const args = node.arguments ?? [];
-    // new Set(otherSet/values()) — copy at runtime
-    if (args.length > 0 && !isArrayLiteralExpression(args[0])) {
+    // new Set(otherSet/values()) / new Set([...a, ...b]) — copy at runtime
+    if (args.length > 0 && (!isArrayLiteralExpression(args[0]) || (args[0].elements ?? []).some((e) => isSpreadElement(e)))) {
         useHelper('orderedMap');
         const src = getTempName('setsrc');
         const item = getTempName('item');
@@ -6683,7 +7138,13 @@ function includeLocalImport(code, dir, goFileName) {
     }
     emittingModuleFile = prevEmittingModuleFile;
     const fileOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
-    const fileInline = inlineLines.join('\n');
+    const isDeclarationLine = (line) => /^(var|const|type|func|import)\b/.test(line.trim());
+    const declarationLines = inlineLines.filter(isDeclarationLine);
+    const statementLines = inlineLines.filter((line) => !isDeclarationLine(line));
+    const fileInline = [
+        ...declarationLines,
+        ...(statementLines.length > 0 ? [`func init() {\n\t${statementLines.join('\n\t')}\n}`] : [])
+    ].join('\n');
     // Computed after all visits: function bodies (outside nodes) register
     // packages too, and imports must be captured after those visits.
     // Helper-provided packages are only imported here if the file's own code
@@ -7420,14 +7881,30 @@ func TnIsNil(v interface{}) bool {
 	return false
 }`,
     typeOf: `func TnTypeOf(v interface{}) string {
-	switch v.(type) {
+	// an unset nullable primitive (*T nil) is undefined
+	switch t := v.(type) {
 	case nil:
 		return "undefined"
-	case string, *string:
+	case string:
 		return "string"
-	case float64, *float64:
+	case *string:
+		if t == nil {
+			return "undefined"
+		}
+		return "string"
+	case float64:
 		return "number"
-	case bool, *bool:
+	case *float64:
+		if t == nil {
+			return "undefined"
+		}
+		return "number"
+	case bool:
+		return "boolean"
+	case *bool:
+		if t == nil {
+			return "undefined"
+		}
 		return "boolean"
 	}
 	if reflect.ValueOf(v).Kind() == reflect.Func {
@@ -9352,6 +9829,8 @@ function visitImportDeclaration(node) {
         }
         // Renamed bindings refer to the original declaration (one Go package)
         const bindings = node.importClause?.namedBindings;
+        if (bindings && isNamespaceImport(bindings))
+            defaultImportNamespaces.add(bindings.name.text);
         if (bindings && isNamedImports(bindings)) {
             for (const el of bindings.elements ?? []) {
                 if (!el.propertyName)
