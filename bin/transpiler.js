@@ -999,6 +999,9 @@ function visit(node, options = {}) {
                 return visitNullablePrimitiveOptionalCall(node, visit(node.expression.expression), receiverType);
             }
         }
+        const recordCall = visitRecordFunctionCall(node);
+        if (recordCall)
+            return recordCall;
         const dynamicCall = visitDynamicMethodCall(node);
         if (dynamicCall)
             return dynamicCall;
@@ -2285,7 +2288,8 @@ function isNarrowableReference(node) {
         return false;
     if (isPropertyAccessExpression(parent) && parent.name === node)
         return false;
-    if (parent.name === node)
+    // { x } reads the variable x
+    if (parent.name === node && !isShorthandPropertyAssignment(parent))
         return false;
     if (isBinaryExpression(parent) && parent.left === node) {
         const op = parent.operatorToken.kind;
@@ -2720,6 +2724,30 @@ function isAnyContext(typeNode) {
         typeNode = declaredTypeAliases.get(typeNode.typeName.text);
     }
     return false;
+}
+const JS_MAP_METHODS = new Set(['get', 'set', 'has', 'delete', 'clear', 'keys', 'values', 'entries', 'forEach']);
+// rec.fn(args) where rec is a Record/dictionary (an ordered map) holding functions.
+// Names of JS Map methods (get, set, …) are Map methods unless rec is typed as a Record.
+function getRecordFunctionCall(node) {
+    if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression))
+        return undefined;
+    const receiver = node.expression.expression;
+    const mapType = inferExpressionType(receiver);
+    if (!mapType?.startsWith('*TnMap['))
+        return undefined;
+    if (!extractMapValueType(mapType).startsWith('func('))
+        return undefined;
+    if (JS_MAP_METHODS.has(node.expression.name.text) && !isRecordTypeNode(resolveTypeNode(getExpressionTypeNode(receiver)))) {
+        return undefined;
+    }
+    return { receiver, mapType };
+}
+function visitRecordFunctionCall(node) {
+    const call = getRecordFunctionCall(node);
+    if (!call)
+        return undefined;
+    const args = (node.arguments ?? []).map((a) => visit(a)).join(', ');
+    return `${visit(call.receiver)}.Get(${toGoStringLiteral(node.expression.name.text)})(${args})`;
 }
 function isRecordTypeNode(typeNode) {
     return (isTypeReferenceNode(typeNode) &&
@@ -3508,6 +3536,9 @@ function inferExpressionType(expr) {
     }
     if (isCallExpression(expr) && isObjectKeysOfDynamic(expr))
         return '[]string';
+    const recordCall = isCallExpression(expr) ? getRecordFunctionCall(expr) : undefined;
+    if (recordCall)
+        return goFuncReturnType(extractMapValueType(recordCall.mapType));
     if (isCallExpression(expr) &&
         isPropertyAccessExpression(expr.expression) &&
         isIdentifier(expr.expression.expression) &&

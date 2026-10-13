@@ -239,6 +239,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | String-number concatenation order         |   ✅    | [semantics-string-number-concat.ts](conformance/semantics-string-number-concat.ts) | `'a' + 1 + 2` vs `1 + 2 + 'a'`                                                                              |
 | Array truthiness                          |   ✅    | [semantics-array-truthy.ts](conformance/semantics-array-truthy.ts)                 | Empty array is truthy                                                                                       |
 | Loop closures capture per-iteration `let` |   ✅    | [semantics-loop-closures.ts](conformance/semantics-loop-closures.ts)               |                                                                                                             |
+| Functions stored in Records               |   ✅    | [semantics-record-functions.ts](conformance/semantics-record-functions.ts)         | `rec.fn()` → `rec.Get("fn")()`, also for names like `get` / `sort`                                          |
 
 ## Standard library
 

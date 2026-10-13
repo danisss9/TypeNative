@@ -1087,6 +1087,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         return visitNullablePrimitiveOptionalCall(node, visit(node.expression.expression), receiverType);
       }
     }
+    const recordCall = visitRecordFunctionCall(node);
+    if (recordCall) return recordCall;
     const dynamicCall = visitDynamicMethodCall(node);
     if (dynamicCall) return dynamicCall;
     const regexReplace = visitRegexReplace(node);
@@ -2381,7 +2383,8 @@ function isNarrowableReference(node: AstNode): boolean {
   const parent = node.parent;
   if (!parent) return false;
   if (isPropertyAccessExpression(parent) && parent.name === node) return false;
-  if (parent.name === node) return false;
+  // { x } reads the variable x
+  if (parent.name === node && !isShorthandPropertyAssignment(parent)) return false;
   if (isBinaryExpression(parent) && parent.left === node) {
     const op = parent.operatorToken.kind;
     if (op === 'EqualsToken' || op === 'QuestionQuestionEqualsToken') return false;
@@ -2822,6 +2825,29 @@ function isAnyContext(typeNode: AstNode | undefined): boolean {
     typeNode = declaredTypeAliases.get(typeNode.typeName.text);
   }
   return false;
+}
+
+const JS_MAP_METHODS = new Set(['get', 'set', 'has', 'delete', 'clear', 'keys', 'values', 'entries', 'forEach']);
+
+// rec.fn(args) where rec is a Record/dictionary (an ordered map) holding functions.
+// Names of JS Map methods (get, set, …) are Map methods unless rec is typed as a Record.
+function getRecordFunctionCall(node: AstNode): { receiver: AstNode; mapType: string } | undefined {
+  if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression)) return undefined;
+  const receiver = node.expression.expression;
+  const mapType = inferExpressionType(receiver);
+  if (!mapType?.startsWith('*TnMap[')) return undefined;
+  if (!extractMapValueType(mapType).startsWith('func(')) return undefined;
+  if (JS_MAP_METHODS.has(node.expression.name.text) && !isRecordTypeNode(resolveTypeNode(getExpressionTypeNode(receiver)))) {
+    return undefined;
+  }
+  return { receiver, mapType };
+}
+
+function visitRecordFunctionCall(node: AstNode): string | undefined {
+  const call = getRecordFunctionCall(node);
+  if (!call) return undefined;
+  const args = (node.arguments ?? []).map((a: AstNode) => visit(a)).join(', ');
+  return `${visit(call.receiver)}.Get(${toGoStringLiteral(node.expression.name.text)})(${args})`;
 }
 
 function isRecordTypeNode(typeNode: AstNode): boolean {
@@ -3612,6 +3638,8 @@ function inferExpressionType(expr: AstNode): string | undefined {
     return '[]interface{}';
   }
   if (isCallExpression(expr) && isObjectKeysOfDynamic(expr)) return '[]string';
+  const recordCall = isCallExpression(expr) ? getRecordFunctionCall(expr) : undefined;
+  if (recordCall) return goFuncReturnType(extractMapValueType(recordCall.mapType));
   if (
     isCallExpression(expr) &&
     isPropertyAccessExpression(expr.expression) &&
