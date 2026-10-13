@@ -9,7 +9,7 @@ import os from 'node:os';
 const root = path.resolve(import.meta.dirname, '..');
 const filter = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? '';
 const probes = readdirSync(path.join(root, 'conformance'))
-  .filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts') && f.includes(filter))
+  .filter((f) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts') && f.includes(filter))
   .sort();
 
 const N = 8;
@@ -19,7 +19,7 @@ const failures = [];
 
 function runOne(file) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'conf-'));
-  const name = file.replace(/\.ts$/, '');
+  const name = file.replace(/\.tsx?$/, '');
   return new Promise((resolve) => {
     const p = spawn(
       'node',
@@ -64,7 +64,7 @@ for (const f of failures) console.log(`  ✘ ${f.name}: ${f.reason}`);
 const failed = new Set(failures.map((f) => f.name));
 const cats = new Map();
 for (const file of probes) {
-  const name = file.replace(/\.ts$/, '');
+  const name = file.replace(/\.tsx?$/, '');
   const cat = name.split('-')[0];
   const s = cats.get(cat) ?? { passed: 0, total: 0 };
   s.total++;

@@ -1,7 +1,8 @@
 {
-    "include": ["*.ts"],
+    "include": ["*.ts", "*.tsx"],
     "compilerOptions": {
-      "target": "es2020",    
+      "target": "es2020",
+      "jsx": "preserve",    
       "lib": [], 
       "types": ["../types/typenative.d.ts", "../types/typenative-go.d.ts", "../types/typenative-npm.d.ts"],
       "rootDir": ".",

@@ -32,10 +32,17 @@ func main() {
 		os.Exit(1)
 	}
 	sourceText = string(sourceBytes)
+	// --tsx: parse JSX (.tsx sources)
+	fileName, scriptKind := "/main.ts", core.ScriptKindTS
+	for _, arg := range os.Args[1:] {
+		if arg == "--tsx" {
+			fileName, scriptKind = "/main.tsx", core.ScriptKindTSX
+		}
+	}
 	sourceFile := parser.ParseSourceFile(
-		ast.SourceFileParseOptions{FileName: "/main.ts"},
+		ast.SourceFileParseOptions{FileName: fileName},
 		string(sourceBytes),
-		core.ScriptKindTS,
+		scriptKind,
 	)
 	out := serializeNode(sourceFile.AsNode())
 	enc := json.NewEncoder(os.Stdout)
@@ -145,8 +152,11 @@ func serializeNode(n *ast.Node) any {
 	case ast.KindIdentifier, ast.KindPrivateIdentifier, ast.KindStringLiteral,
 		ast.KindNumericLiteral, ast.KindBigIntLiteral, ast.KindNoSubstitutionTemplateLiteral,
 		ast.KindRegularExpressionLiteral, ast.KindTemplateHead, ast.KindTemplateMiddle,
-		ast.KindTemplateTail, ast.KindJsxText:
+		ast.KindTemplateTail:
 		obj["text"] = n.Text()
+	case ast.KindJsxText:
+		// Node.Text() doesn't cover JsxText
+		obj["text"] = n.AsJsxText().Text
 	}
 	if n.Kind == ast.KindVariableDeclarationList {
 		obj["declarationKind"] = declarationKind(n.Flags)

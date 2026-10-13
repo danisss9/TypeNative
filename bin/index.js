@@ -12,6 +12,23 @@ import * as childProcess from 'node:child_process';
 import { transpileToNative } from './transpiler.js';
 // Run a command and capture its output. Uses Node's spawnSync under Node and a
 // Go helper (os/exec) once transpiled — both synchronous, same result shape.
+// dist/go.mod + dist/tnvendor/x-text: golang.org/x/text's transform and unicode/norm
+// packages, copied from GOROOT/src/vendor (no network needed)
+function vendorXText() {
+    const goroot = runCommand('go', ['env', 'GOROOT']).stdout.trim();
+    const source = path.join(goroot, 'src', 'vendor', 'golang.org', 'x', 'text');
+    for (const pkg of ['transform', path.join('unicode', 'norm')]) {
+        const target = path.join('dist', 'tnvendor', 'x-text', pkg);
+        fs.mkdirSync(target, { recursive: true });
+        for (const file of fs.readdirSync(path.join(source, pkg))) {
+            if (file.endsWith('.go') && !file.endsWith('_test.go')) {
+                fs.writeFileSync(path.join(target, file), fs.readFileSync(path.join(source, pkg, file), 'utf-8'));
+            }
+        }
+    }
+    fs.writeFileSync(path.join('dist', 'tnvendor', 'x-text', 'go.mod'), 'module golang.org/x/text\n\ngo 1.23\n');
+    fs.writeFileSync(path.join('dist', 'go.mod'), 'module tnapp\n\ngo 1.23\n\nrequire golang.org/x/text v0.0.0\n\nreplace golang.org/x/text => ./tnvendor/x-text\n');
+}
 export function runCommand(name, args) {
     const result = childProcess.spawnSync(name, args, { encoding: 'utf-8' });
     return { stdout: result.stdout, stderr: result.stderr, status: result.status };
@@ -47,7 +64,7 @@ export function run(opts) {
     const sourcePath = opts.tsCode ? null : opts.source;
     const tsCode = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath, 'utf-8');
     const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-    const transpileOptions = { parse: opts.parse };
+    const transpileOptions = { parse: opts.parse, tsx: !!sourcePath && sourcePath.endsWith('.tsx') };
     if (sourceDir) {
         transpileOptions.readFile = (specifier, fromDir) => {
             const baseDir = fromDir ?? sourceDir;
@@ -57,12 +74,14 @@ export function run(opts) {
                 const tsSpecifier = specifier.endsWith('.js')
                     ? specifier.replace(/\.js$/, '.ts')
                     : specifier;
-                for (const candidate of [tsSpecifier + '.ts', tsSpecifier, specifier]) {
+                const tsxSpecifier = specifier.endsWith('.js') ? specifier.replace(/\.js$/, '.tsx') : specifier + '.tsx';
+                for (const candidate of [tsSpecifier + '.ts', tsxSpecifier, tsSpecifier, specifier]) {
                     try {
                         const fullPath = path.resolve(baseDir, candidate);
                         return {
                             content: fs.readFileSync(fullPath, 'utf-8'),
-                            dir: path.dirname(fullPath)
+                            dir: path.dirname(fullPath),
+                            tsx: fullPath.endsWith('.tsx')
                         };
                     }
                     catch {
@@ -94,7 +113,7 @@ export function run(opts) {
     fs.mkdirSync('dist', { recursive: true });
     // Clean up stale Go files from previous runs before writing new ones
     for (const existing of fs.readdirSync('dist')) {
-        if (existing.endsWith('.go'))
+        if (existing.endsWith('.go') || existing === 'go.mod' || existing === 'go.sum')
             fs.rmSync(`dist/${existing}`);
     }
     fs.writeFileSync('dist/code.go', transpileResult.main);
@@ -103,7 +122,18 @@ export function run(opts) {
         fs.writeFileSync(`dist/${filename}`, content);
         goFiles.push(`dist/${filename}`);
     }
-    const buildResult = runCommand('go', ['build', '-o', exePath, ...goFiles]);
+    // golang.org/x/text (String.normalize) comes from the copy vendored in GOROOT
+    const xTextImport = /^import (\w+ )?"golang\.org\/x\/text\//m;
+    let usesXText = xTextImport.test(transpileResult.main);
+    for (const content of transpileResult.files.values()) {
+        if (xTextImport.test(content))
+            usesXText = true;
+    }
+    if (usesXText)
+        vendorXText();
+    const buildResult = usesXText
+        ? runCommand('go', ['build', '-C', 'dist', '-o', exeName, ...goFiles.map((f) => f.slice('dist/'.length))])
+        : runCommand('go', ['build', '-o', exePath, ...goFiles]);
     if (buildResult.status !== 0) {
         console.error('go build failed:');
         if (buildResult.stderr)

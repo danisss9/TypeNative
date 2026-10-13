@@ -169,7 +169,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Type guards (`is`)                                        |   ✅    | [syntax-type-guards.ts](conformance/syntax-type-guards.ts)           | `p is T` → Go `bool`; `in` checks struct fields at runtime                      |
 | `as` assertions                                           |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `x as T`, incl. angle-bracket syntax                                            |
 | Self-host contextual typing                               |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Object/array literals typed from context, `Record` literals, `in`, `any` params |
-| Decorators (`@`)                                          |   ❌    | —                                                                    | No probe yet                                                                    |
+| Decorators (`@`)                                          |   ✅    | [syntax-decorators.ts](conformance/syntax-decorators.ts)             | Standard method & class decorators, applied in source order; `this` is the receiver |
 | Namespaces / `module` blocks                              |   ✅    | [syntax-namespaces.ts](conformance/syntax-namespaces.ts)             | Flattened to prefixed declarations (`N.f` → `N_f`), nested and in types         |
 | `override` modifier                                       |   ✅    | [syntax-override.ts](conformance/syntax-override.ts)                 | Erased                                                                          |
 | `readonly` modifier (properties, `readonly T[]`)          |   ✅    | [syntax-readonly.ts](conformance/syntax-readonly.ts)                 | Erased (`readonly T[]` → `[]T`)                                                 |
@@ -187,7 +187,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Utility types (`Partial`, `Pick`, `Omit`, …)              |   ✅    | [syntax-utility-types.ts](conformance/syntax-utility-types.ts)       | `Partial` / `Required` / `Readonly` / `Pick` / `Omit` / `NonNullable` → the base type |
 | Assertion functions (`asserts x is T`)                    |   ✅    | [syntax-assertion-functions.ts](conformance/syntax-assertion-functions.ts) | No return value                                                                 |
 | Callable / construct signatures (`type F = { (): void }`) |   ✅    | [syntax-callable-signatures.ts](conformance/syntax-callable-signatures.ts) | Function types; a class passed as a value is its constructor                    |
-| JSX / `.tsx` syntax                                       |   ❌    | —                                                                    | No probe yet                                                                    |
+| JSX / `.tsx` syntax                                       |   ✅    | [syntax-jsx.tsx](conformance/syntax-jsx.tsx)                           | Renders to HTML strings (text escaped); components are calls with props         |
 | Ambient declarations (`declare`, `.d.ts`, `x!: T`)        |   ✅    | [syntax-ambient-declarations.ts](conformance/syntax-ambient-declarations.ts) | `declare` only types code; `declare const` is an unset variable                 |
 | `export =` / `import x = require()`                       |   ✅    | [syntax-export-equals.ts](conformance/syntax-export-equals.ts)       | `import x = require()` is a namespace import                                    |
 
@@ -312,7 +312,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `at` (negative indices)                                   |   ✅    | [lib-array-at.ts](conformance/lib-array-at.ts)                         | Supports negative indices                                              |
 | Unicode length / iteration                                |   ✅    | [lib-string-unicode.ts](conformance/lib-string-unicode.ts)             | `.length` counts runes; `[...str]` spreads runes                       |
 | `String.raw`                                              |   ✅    | [lib-string-raw.ts](conformance/lib-string-raw.ts)                     | Raw template text with values interpolated                             |
-| `normalize`                                               |   ❌    | —                                                                      | Unicode normalization; no probe yet                                    |
+| `normalize`                                               |   ✅    | [lib-string-normalize.ts](conformance/lib-string-normalize.ts)         | `golang.org/x/text/unicode/norm`, copied from GOROOT's vendor tree (offline) |
 
 ### `Array`
 

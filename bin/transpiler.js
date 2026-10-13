@@ -392,13 +392,13 @@ const OPERATOR_TEXT = {
 function operatorTokenText(token) {
     return OPERATOR_TEXT[token?.kind] ?? token?.kind ?? '';
 }
-function defaultParseFunction(_code) {
+function defaultParseFunction(_code, _tsx) {
     throw new Error('transpileToNative: no parse function injected (options.parse)');
 }
 // Parses via the injected parser and links each node to its parent: the JSON
 // AST carries no parent pointers, but the transpiler walks up via node.parent.
 function parseSource(code) {
-    const sourceFile = parseFunction(code);
+    const sourceFile = parseFunction(code, currentFileIsTsx);
     stripThisParameters(sourceFile);
     lowerIndexSignatures(sourceFile);
     lowerAmbientDeclarations(sourceFile);
@@ -789,9 +789,12 @@ const usedHelpers = new Set();
 // per-file import lists can exclude them (helpers are emitted once, in the
 // main file, which carries these imports instead).
 const helperProvidedPackages = new Set();
+// Whether the file being parsed is .tsx
+let currentFileIsTsx = false;
 export function transpileToNative(code, options) {
     fileResolver = options?.readFile ?? null;
     parseFunction = options?.parse ?? defaultParseFunction;
+    currentFileIsTsx = !!options?.tsx;
     declaredFunctions.clear();
     declaredInterfaces.clear();
     declaredTypeAliases.clear();
@@ -896,6 +899,9 @@ function visit(node, options = {}) {
             .map((n) => visit(n, { addFunctionOutside: true }))
             .filter((n) => !!n)
             .join(options.inline ? '' : '\n\t');
+    }
+    else if (isJsxNode(node)) {
+        return visitJsx(node);
     }
     else if (isIdentifier(node) && node.text === 'globalThis') {
         useHelper('globalThis');
@@ -1414,6 +1420,9 @@ function visit(node, options = {}) {
         const promiseCall = visitPromiseCall(node);
         if (promiseCall)
             return promiseCall;
+        const functionCall = visitFunctionCallApply(node);
+        if (functionCall)
+            return functionCall;
         const objectCall = visitObjectCall(node);
         if (objectCall)
             return objectCall;
@@ -1920,6 +1929,10 @@ function visit(node, options = {}) {
     else if (node.kind === 'ThisKeyword') {
         if (thisOverrideName && getEnclosingFunction(node) === thisOverrideFn)
             return thisOverrideName;
+        if (isThisOfPlainFunction(node)) {
+            useHelper('decorators');
+            return 'TnThis';
+        }
         return 'self';
     }
     else if (node.kind === 'PrivateIdentifier') {
@@ -2104,7 +2117,7 @@ function visit(node, options = {}) {
             }
             classPropertyTypes.set(className, properties);
             classMethodReturnTypes.set(className, methods);
-            return '';
+            return visitClassDecorators(node);
         }
         const name = visit(node.name);
         const typeParams = getTypeParameters(node.typeParameters);
@@ -2233,6 +2246,10 @@ function visit(node, options = {}) {
                     if (!methodName || ownMethodNames.has(methodName))
                         continue;
                     ownMethodNames.add(methodName);
+                    if (getDecorators(member).length > 0) {
+                        copiedMethods.push(emitDecoratedMethod(name, typeParamNames, member, visit(ancestor.name)));
+                        continue;
+                    }
                     const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
                     const returnType = member.type ? ` ${getType(member.type)}` : '';
                     copiedMethods.push(`func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n`);
@@ -2279,7 +2296,10 @@ function visit(node, options = {}) {
                     continue; // abstract method — implemented by subclasses
                 if (isAbstractClass && !isStatic)
                     continue; // only reachable via subclasses
-                if (isStatic) {
+                if (getDecorators(member).length > 0) {
+                    result += emitDecoratedMethod(name, typeParamNames, member, name);
+                }
+                else if (isStatic) {
                     // Static methods become package-level functions named ClassName_methodName
                     result += `func ${name}_${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
                 }
@@ -2477,6 +2497,8 @@ function visit(node, options = {}) {
 // Visits a value going into a slot of Go type `goType`; non-nil values for
 // nullable primitives (*string/*float64/*bool) are boxed into pointers
 function toGoValueOfType(expr, goType) {
+    if (goType === 'string' && inferExpressionType(expr) === 'TnJsxNode')
+        return `string(${visit(expr)})`;
     if (goType &&
         ((isObjectLiteralExpression(expr) && (expr.properties ?? []).length === 0 && goType.startsWith('*TnMap[')) ||
             (isArrayLiteralExpression(expr) && (expr.elements ?? []).length === 0 && goType.startsWith('[]')))) {
@@ -3928,6 +3950,8 @@ function inferExpressionType(expr) {
         return '*tnbig.Int';
     if (expr.kind === 'TypeOfExpression')
         return 'string';
+    if (isJsxNode(expr))
+        return 'TnJsxNode';
     if (expr.kind === 'TaggedTemplateExpression' && isStringRawTag(expr.tag))
         return 'string';
     if (isRegularExpressionLiteral(expr)) {
@@ -4083,6 +4107,9 @@ function inferExpressionType(expr) {
     const regexPropertyType = inferRegexPropertyType(expr);
     if (regexPropertyType)
         return regexPropertyType;
+    if (isPropertyAccessExpression(expr) && inferExpressionType(expr.expression) === '*TnDecoratorContext') {
+        return ['static', 'private'].includes(expr.name.text) ? 'bool' : 'string';
+    }
     if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && hasDynamicProperties(expr.expression)) {
         return 'float64';
     }
@@ -4541,6 +4568,7 @@ const BUILTIN_FUNCTION_TYPES = {
 const STRING_METHOD_RETURN_TYPES = {
     trim: 'string',
     trimStart: 'string',
+    normalize: 'string',
     trimEnd: 'string',
     toUpperCase: 'string',
     toLowerCase: 'string',
@@ -5411,6 +5439,17 @@ function getType(typeNode, getArrayType = false) {
     }
     if (typeNode.kind === 'MappedType')
         return getMappedType(typeNode);
+    if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName) && /DecoratorContext$/.test(typeNode.typeName.text)) {
+        useHelper('decorators');
+        return '*TnDecoratorContext';
+    }
+    if (isTypeReferenceNode(typeNode) &&
+        typeNode.typeName?.kind === 'QualifiedName' &&
+        typeNode.typeName.left?.text === 'JSX' &&
+        typeNode.typeName.right?.text === 'Element') {
+        useHelper('jsx');
+        return 'TnJsxNode';
+    }
     // readonly T[] → T[]; keyof T → string
     if (typeNode.kind === 'TypeOperator') {
         return typeNode.operator === 'KeyOfKeyword' ? 'string' : getType(typeNode.type, getArrayType);
@@ -5450,8 +5489,12 @@ function getType(typeNode, getArrayType = false) {
         return 'interface{}';
     }
     if (isFunctionTypeNode(typeNode)) {
+        // (...args: T[]) => R is variadic: func(...T) R
         const params = (typeNode.parameters ?? [])
-            .map((p) => (p.type ? getType(p.type) : 'interface{}'))
+            .map((p) => {
+            const paramType = p.type ? getType(p.type) : 'interface{}';
+            return p.dotDotDotToken && paramType.startsWith('[]') ? `...${paramType.slice(2)}` : paramType;
+        })
             .join(', ');
         const ret = typeNode.type ? ` ${getType(typeNode.type)}` : '';
         return `func(${params})${ret}`;
@@ -6003,6 +6046,15 @@ const stringMethodHandlers = {
         return `${obj}[${sliceIndex(obj, args[0])}:]`;
     },
     concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
+    // normalize('NFC' | 'NFD' | 'NFKC' | 'NFKD')
+    normalize: (obj, args) => {
+        importedPackages.add('golang.org/x/text/unicode/norm');
+        const form = args[0] ?? '"NFC"';
+        const literal = /^"(NFC|NFD|NFKC|NFKD)"$/.exec(form);
+        if (literal)
+            return `tnnorm.${literal[1]}.String(${obj})`;
+        return `func() string { switch ${form} { case "NFD": return tnnorm.NFD.String(${obj}); case "NFKC": return tnnorm.NFKC.String(${obj}); case "NFKD": return tnnorm.NFKD.String(${obj}) }; return tnnorm.NFC.String(${obj}) }()`;
+    },
     padStart: (obj, args) => {
         importedPackages.add('strings');
         const pad = args[1] ?? '" "';
@@ -6623,6 +6675,201 @@ function isValuePosition(node) {
         return true;
     return isBinaryExpression(parent) && parent.operatorToken.kind === 'EqualsToken' && parent.right === node;
 }
+function isJsxNode(node) {
+    return node?.kind === 'JsxElement' || node?.kind === 'JsxSelfClosingElement' || node?.kind === 'JsxFragment';
+}
+// JSX text: lines trimmed at their inner edges, blank lines dropped, joined by a space
+function cleanJsxText(text) {
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
+    const kept = [];
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].replace(/\t/g, ' ');
+        if (i > 0)
+            line = line.replace(/^ +/, '');
+        if (i < lines.length - 1)
+            line = line.replace(/ +$/, '');
+        if (line)
+            kept.push(line);
+    }
+    return kept.join(' ');
+}
+// The children of an element as []interface{} (text, {expressions}, nested elements)
+function visitJsxChildren(children) {
+    const parts = [];
+    for (const child of children) {
+        if (child.kind === 'JsxText') {
+            const text = cleanJsxText(child.text ?? '');
+            if (text)
+                parts.push(toGoStringLiteral(text));
+        }
+        else if (child.kind === 'JsxExpression') {
+            if (child.expression)
+                parts.push(visit(child.expression));
+        }
+        else {
+            parts.push(visit(child));
+        }
+    }
+    return `[]interface{}{${parts.join(', ')}}`;
+}
+// An attribute's value: name="x", name={expr}, or a bare name (true)
+function getJsxAttributeValue(attribute) {
+    if (!attribute.initializer) {
+        const trueNode = { kind: 'TrueKeyword', parent: attribute };
+        return trueNode;
+    }
+    return attribute.initializer.kind === 'JsxExpression' ? attribute.initializer.expression : attribute.initializer;
+}
+function visitJsx(node) {
+    useHelper('jsx');
+    if (node.kind === 'JsxFragment')
+        return `TnJsxChildren(${visitJsxChildren(node.children ?? [])})`;
+    const opening = node.kind === 'JsxElement' ? node.openingElement : node;
+    const children = node.kind === 'JsxElement' ? (node.children ?? []) : [];
+    const tag = opening.tagName;
+    const attributes = (opening.attributes?.properties ?? []).filter((a) => a.kind === 'JsxAttribute');
+    // <div …> / <my-element …>: an HTML element
+    if (isIdentifier(tag) && (/^[a-z]/.test(tag.text) || tag.text.includes('-'))) {
+        const attrs = attributes.map((a) => `{${toGoStringLiteral(a.name.text)}, ${visit(getJsxAttributeValue(a))}}`);
+        return `TnJsxElement(${toGoStringLiteral(tag.text)}, []TnJsxAttr{${attrs.join(', ')}}, ${visitJsxChildren(children)})`;
+    }
+    // <Card title="x">…</Card> → Card({ title: "x", children: … })
+    const call = { kind: 'CallExpression', expression: tag, arguments: [], parent: node.parent };
+    tag.parent = call;
+    const properties = [];
+    for (const a of attributes) {
+        const name = { kind: 'Identifier', text: a.name.text };
+        const property = { kind: 'PropertyAssignment', name, initializer: getJsxAttributeValue(a) };
+        property.initializer.parent = property;
+        name.parent = property;
+        properties.push(property);
+    }
+    const meaningful = children.filter((c) => c.kind !== 'JsxText' || cleanJsxText(c.text ?? ''));
+    if (meaningful.length > 0) {
+        const name = { kind: 'Identifier', text: 'children' };
+        const fragment = { kind: 'JsxFragment', children };
+        const property = { kind: 'PropertyAssignment', name, initializer: fragment };
+        fragment.parent = property;
+        name.parent = property;
+        properties.push(property);
+    }
+    const props = { kind: 'ObjectLiteralExpression', properties, parent: call };
+    for (const property of properties)
+        property.parent = props;
+    const declared = isIdentifier(tag) ? declaredFunctions.get(tag.text) : undefined;
+    if (properties.length > 0 || (declared?.parameters ?? []).length > 0) {
+        const args = [props];
+        call.arguments = args;
+    }
+    return visit(call);
+}
+function getDecorators(node) {
+    return (node.modifiers ?? []).filter((m) => m.kind === 'Decorator');
+}
+// `this` inside a function / function expression (not a class member, not an arrow's)
+function isThisOfPlainFunction(node) {
+    for (let n = node.parent; n; n = n.parent) {
+        if (isArrowFunction(n))
+            continue;
+        if (isFunctionExpression(n) || isFunctionDeclaration(n))
+            return !isPropertyAssignment(n.parent);
+        if (isMethodDeclaration(n) || isConstructorDeclaration(n) || isPropertyDeclaration(n) || isGetAccessor(n) || isSetAccessor(n) || isClassDeclaration(n))
+            return false;
+    }
+    return false;
+}
+// f.call(thisArg, a, b) → f(a, b); f.apply(thisArg, args) → f(args...) (this is TnThis)
+function visitFunctionCallApply(node) {
+    if (!isPropertyAccessExpression(node.expression))
+        return undefined;
+    const method = node.expression.name.text;
+    if (method !== 'call' && method !== 'apply')
+        return undefined;
+    if (!inferExpressionType(node.expression.expression)?.startsWith('func('))
+        return undefined;
+    const fn = visit(node.expression.expression);
+    const args = (node.arguments ?? []).slice(1);
+    if (method === 'apply')
+        return `${fn}(${args[0] ? `${visit(args[0])}...` : ''})`;
+    return `${fn}(${args.map((a) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))).join(', ')})`;
+}
+// Whether a decorator call returns a value (a replacement), or only has effects
+function decoratorReturnsValue(decorator) {
+    let fnType = inferExpressionType(decorator.expression);
+    // @factory(args): the decorator is what the factory returns
+    const factoryCall = decorator.expression;
+    if (isCallExpression(factoryCall) && isIdentifier(factoryCall.expression)) {
+        const factory = declaredFunctions.get(factoryCall.expression.text);
+        if (factory)
+            fnType = factory.type ? getType(factory.type) : inferFunctionBodyReturnType(factory);
+    }
+    if (fnType?.startsWith('func('))
+        return !!goFuncReturnType(fnType);
+    const call = { kind: 'CallExpression', expression: decorator.expression, arguments: [], parent: decorator };
+    const returnType = inferExpressionType(call);
+    return !!returnType && returnType !== 'struct{}';
+}
+// The decorated method m: m__undecorated holds the body; m calls the decorated function
+// (Owner_m__decorated) with TnThis set to the receiver
+function emitDecoratedMethod(className, typeParamNames, member, ownerClass) {
+    useHelper('decorators');
+    useHelper('dynamic');
+    const methodName = visit(member.name);
+    const info = getFunctionParametersInfo(member.parameters ?? []);
+    if (info.signature.includes('...'))
+        throw new Error(`decorated method ${methodName}: rest/default parameters are not supported`);
+    const names = splitGoParameters(info.signature).map((p) => p.slice(0, p.indexOf(' ')));
+    const returnType = member.type ? getType(member.type) : '';
+    const result = returnType ? ` ${returnType}` : '';
+    const body = visit(member.body, { prefixBlockContent: info.prefixBlockContent });
+    const call = `${ownerClass}_${methodName}__decorated(${names.join(', ')})`;
+    const invoke = returnType ? `return TnAs[${returnType}](${call})` : call;
+    if ((member.modifiers ?? []).some((m) => m.kind === 'StaticKeyword')) {
+        return `func ${className}_${methodName}__undecorated(${info.signature})${result} ${body}\n\nfunc ${className}_${methodName}(${info.signature})${result} {\n\t\t${invoke}\n\t}\n\n`;
+    }
+    return (`func (self *${className}${typeParamNames}) ${methodName}__undecorated(${info.signature})${result} ${body}\n\n` +
+        `func (self *${className}${typeParamNames}) ${methodName}(${info.signature})${result} {\n\t\t__prevThis := TnThis\n\t\tTnThis = self\n\t\tdefer func() { TnThis = __prevThis }()\n\t\t${invoke}\n\t}\n\n`);
+}
+// Applies a class's decorators where it is defined (in source order): each decorated
+// method's function is wrapped bottom-up, then class decorators run
+function visitClassDecorators(node) {
+    const className = visit(node.name);
+    const statements = [];
+    for (const member of node.members ?? []) {
+        const decorators = getDecorators(member);
+        if (decorators.length === 0)
+            continue;
+        if (!isMethodDeclaration(member) || !member.body)
+            throw new Error(`${className}: only method and class decorators are supported`);
+        useHelper('decorators');
+        useHelper('dynamic');
+        const methodName = visit(member.name);
+        const isStatic = (member.modifiers ?? []).some((m) => m.kind === 'StaticKeyword');
+        const isPrivate = member.name?.kind === 'PrivateIdentifier';
+        const params = splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature);
+        const paramTypes = params.map((p) => p.slice(p.indexOf(' ') + 1));
+        const returnType = member.type ? getType(member.type) : '';
+        const varName = `${className}_${methodName}__decorated`;
+        mainPackageVariables.push(`var ${varName} func(...interface{}) interface{}`);
+        const args = paramTypes.map((t, i) => `TnAs[${t}](__args[${i}])`).join(', ');
+        const target = isStatic
+            ? `${className}_${methodName}__undecorated(${args})`
+            : `TnThis.(interface{ ${methodName}__undecorated(${paramTypes.join(', ')})${returnType ? ` ${returnType}` : ''} }).${methodName}__undecorated(${args})`;
+        statements.push(`${varName} = func(__args ...interface{}) interface{} { ${returnType ? `return ${target}` : `${target}; return nil`} }`);
+        for (const decorator of [...decorators].reverse()) {
+            const context = `&TnDecoratorContext{kind: "method", name: ${toGoStringLiteral(isPrivate ? member.name.text : methodName)}, static: ${isStatic}, private: ${isPrivate}}`;
+            const call = `(${visit(decorator.expression)})(${varName}, ${context})`;
+            statements.push(decoratorReturnsValue(decorator) ? `${varName} = TnDecorate(${varName}, ${call})` : call);
+        }
+    }
+    for (const decorator of [...getDecorators(node)].reverse()) {
+        useHelper('decorators');
+        const context = `&TnDecoratorContext{kind: "class", name: ${toGoStringLiteral(className)}}`;
+        const call = `(${visit(decorator.expression)})(New${className}, ${context})`;
+        statements.push(decoratorReturnsValue(decorator) ? `TnDecorateClass(${call})` : call);
+    }
+    return statements.map((statement) => `${statement};\n\t`).join('');
+}
 function isStringRawTag(tag) {
     return isPropertyAccessExpression(tag) && isIdentifier(tag.expression) && tag.expression.text === 'String' && tag.name.text === 'raw';
 }
@@ -7103,9 +7350,11 @@ function normalizeCjsToEsm(code) {
     code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
     return code;
 }
-function includeLocalImport(code, dir, goFileName) {
+function includeLocalImport(code, dir, goFileName, tsx = false) {
     const prevDir = currentFileDir;
+    const prevTsx = currentFileIsTsx;
     currentFileDir = dir;
+    currentFileIsTsx = tsx;
     // Normalize CommonJS modules to ES module syntax before parsing
     if (!code.includes('export ') && (code.includes('module.exports') || code.includes('exports.'))) {
         code = normalizeCjsToEsm(code);
@@ -7117,6 +7366,7 @@ function includeLocalImport(code, dir, goFileName) {
             visit(stmt, { addFunctionOutside: true });
         }
         currentFileDir = prevDir;
+        currentFileIsTsx = prevTsx;
         return;
     }
     // Separate-file mode (local TS imports): transpile to its own Go file.
@@ -7175,6 +7425,7 @@ function includeLocalImport(code, dir, goFileName) {
     importedPackages.clear();
     for (const p of savedPackages)
         importedPackages.add(p);
+    currentFileIsTsx = prevTsx;
     for (const p of helperProvidedPackages)
         importedPackages.add(p);
     currentFileDir = prevDir;
@@ -7239,6 +7490,8 @@ const helperRequires = {
     objectAssign: ['orderedMap'],
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
     promise: ['error'],
+    decorators: [],
+    jsx: [],
     objectIntegrity: [],
     structuredClone: [],
     globalThis: ['dynamic'],
@@ -7440,6 +7693,8 @@ const helperPackages = {
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
     promise: ['sync'],
+    decorators: [],
+    jsx: ['strings', 'html', 'reflect', 'strconv', 'fmt'],
     objectIntegrity: ['sync', 'reflect'],
     structuredClone: ['reflect', 'unsafe'],
     globalThis: [],
@@ -9471,6 +9726,128 @@ func tnCloneValue(v reflect.Value) reflect.Value {
 }`,
     globalThis: `// (globalThis as any).x: properties set on the global object at runtime
 var TnGlobalThis = map[string]interface{}{}`,
+    jsx: `// JSX renders to HTML: TnJsxNode is markup, plain strings are escaped text
+type TnJsxNode string
+
+type TnJsxAttr struct {
+	name  string
+	value interface{}
+}
+
+var tnJsxVoidTags = map[string]bool{"area": true, "base": true, "br": true, "col": true, "embed": true, "hr": true, "img": true, "input": true, "link": true, "meta": true, "source": true, "track": true, "wbr": true}
+
+func TnJsxElement(tag string, attrs []TnJsxAttr, children []interface{}) TnJsxNode {
+	var b strings.Builder
+	b.WriteString("<" + tag)
+	for _, a := range attrs {
+		name := a.name
+		switch name {
+		case "key", "ref":
+			continue
+		case "className":
+			name = "class"
+		case "htmlFor":
+			name = "for"
+		}
+		if a.value == nil {
+			continue
+		}
+		if v, ok := a.value.(bool); ok {
+			if v {
+				b.WriteString(" " + name)
+			}
+			continue
+		}
+		if reflect.ValueOf(a.value).Kind() == reflect.Func {
+			continue
+		}
+		b.WriteString(" " + name + "=\\"" + html.EscapeString(tnJsxString(a.value)) + "\\"")
+	}
+	if tnJsxVoidTags[tag] {
+		b.WriteString("/>")
+		return TnJsxNode(b.String())
+	}
+	b.WriteString(">")
+	b.WriteString(string(TnJsxChildren(children)))
+	b.WriteString("</" + tag + ">")
+	return TnJsxNode(b.String())
+}
+
+func TnJsxChildren(children []interface{}) TnJsxNode {
+	var b strings.Builder
+	for _, c := range children {
+		tnJsxWriteChild(&b, c)
+	}
+	return TnJsxNode(b.String())
+}
+
+// null / booleans render nothing; arrays render each item
+func tnJsxWriteChild(b *strings.Builder, c interface{}) {
+	switch v := c.(type) {
+	case nil, bool:
+		return
+	case TnJsxNode:
+		b.WriteString(string(v))
+		return
+	case string:
+		b.WriteString(html.EscapeString(v))
+		return
+	}
+	rv := reflect.ValueOf(c)
+	switch rv.Kind() {
+	case reflect.Slice:
+		for i := 0; i < rv.Len(); i++ {
+			tnJsxWriteChild(b, rv.Index(i).Interface())
+		}
+		return
+	case reflect.Pointer:
+		if !rv.IsNil() {
+			tnJsxWriteChild(b, rv.Elem().Interface())
+		}
+		return
+	}
+	b.WriteString(html.EscapeString(tnJsxString(c)))
+}
+
+func tnJsxString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case TnJsxNode:
+		return string(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	}
+	return fmt.Sprint(v)
+}`,
+    decorators: `// this inside plain functions: the receiver of the decorated method being called
+var TnThis interface{}
+
+// The context a decorator receives (kind is "method" or "class")
+type TnDecoratorContext struct {
+	kind    string
+	name    string
+	static  bool
+	private bool
+}
+
+// A method decorator's result replaces the method; undefined keeps it
+func TnDecorate(prev func(...interface{}) interface{}, result interface{}) func(...interface{}) interface{} {
+	if result == nil {
+		return prev
+	}
+	if f, ok := result.(func(...interface{}) interface{}); ok && f != nil {
+		return f
+	}
+	return prev
+}
+
+// Class decorators may not replace a class (a Go type)
+func TnDecorateClass(result interface{}) {
+	if result != nil {
+		panic("class decorators cannot replace the class")
+	}
+}`,
     promise: `// Promises are channels; a rejected promise is a closed channel with a reason
 var tnRejections sync.Map
 
@@ -9824,7 +10201,7 @@ function visitImportDeclaration(node) {
             const resolved = fileResolver(moduleSpec, currentFileDir);
             if (resolved) {
                 const goFileName = specifierToGoFileName(moduleSpec);
-                includeLocalImport(resolved.content, resolved.dir, goFileName);
+                includeLocalImport(resolved.content, resolved.dir, goFileName, !!resolved.tsx);
             }
         }
         // Renamed bindings refer to the original declaration (one Go package)
@@ -9886,7 +10263,8 @@ function visitImportDeclaration(node) {
 // variables (a variable named `big` would shadow the package name)
 const goImportAliases = {
     'math/big': 'tnbig',
-    'net/url': 'tnurl'
+    'net/url': 'tnurl',
+    'golang.org/x/text/unicode/norm': 'tnnorm'
 };
 function goImportLine(pkg) {
     const alias = goImportAliases[pkg];

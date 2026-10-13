@@ -13,13 +13,13 @@ const compiler = native
   : ['node', path.join(root, 'bin', 'cli.js')];
 
 const probes = readdirSync(path.join(root, 'conformance'))
-  .filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts') && f.includes(filter))
+  .filter((f) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts') && f.includes(filter))
   .sort();
 
 const categories = new Map();
 const failures = [];
 for (const file of probes) {
-  const name = file.replace(/\.ts$/, '');
+  const name = file.replace(/\.tsx?$/, '');
   const category = name.split('-')[0];
   const [command, ...args] = compiler;
   const result = spawnSync(command, [...args, '--source', path.join('conformance', file), '--script'], {

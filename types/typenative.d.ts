@@ -2,6 +2,17 @@
 
 interface Boolean {}
 
+// JSX (.tsx) renders to HTML strings
+declare namespace JSX {
+  type Element = string;
+  interface IntrinsicElements {
+    [name: string]: any;
+  }
+  interface ElementChildrenAttribute {
+    children: {};
+  }
+}
+
 interface CallableFunction extends Function {}
 
 interface Function {

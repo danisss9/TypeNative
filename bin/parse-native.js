@@ -4,9 +4,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as childProcess from 'node:child_process';
-export function parseAstJsonNative(code) {
+export function parseAstJsonNative(code, tsx) {
     const exe = findTsparser();
-    const result = childProcess.spawnSync(exe, [], { input: code, encoding: 'utf-8' });
+    const args = tsx ? ['--tsx'] : [];
+    const result = childProcess.spawnSync(exe, args, { input: code, encoding: 'utf-8' });
     if (result.status !== 0) {
         throw new Error('tsparser failed: ' + result.stderr);
     }

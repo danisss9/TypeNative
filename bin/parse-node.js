@@ -118,7 +118,9 @@ function convertNode(node) {
     return obj;
 }
 // Parse TypeScript source into the normalized JSON AST shape.
-export function parseAstJson(code) {
-    const sourceFile = ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+export function parseAstJson(code, tsx) {
+    const sourceFile = tsx
+        ? ts.createSourceFile('main.tsx', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TSX)
+        : ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
     return convertNode(sourceFile);
 }
