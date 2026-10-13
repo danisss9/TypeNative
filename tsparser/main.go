@@ -19,7 +19,11 @@ import (
 	"github.com/buke/typescript-go-internal/pkg/ast"
 	"github.com/buke/typescript-go-internal/pkg/core"
 	"github.com/buke/typescript-go-internal/pkg/parser"
+	"github.com/buke/typescript-go-internal/pkg/scanner"
 )
+
+// The parsed source, for template raw text
+var sourceText string
 
 func main() {
 	sourceBytes, err := io.ReadAll(os.Stdin)
@@ -27,6 +31,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "read stdin:", err)
 		os.Exit(1)
 	}
+	sourceText = string(sourceBytes)
 	sourceFile := parser.ParseSourceFile(
 		ast.SourceFileParseOptions{FileName: "/main.ts"},
 		string(sourceBytes),
@@ -128,7 +133,6 @@ func serializeNode(n *ast.Node) any {
 		ast.KindTemplateTail, ast.KindJsxText:
 		obj["text"] = n.Text()
 	}
-
 	// Binding-pattern holes (`[a, , b]`): ts-go parses them as an empty
 	// BindingElement; the TypeScript API exposes them as OmittedExpression
 	if n.Kind == ast.KindBindingElement {
@@ -140,6 +144,18 @@ func serializeNode(n *ast.Node) any {
 	data := asData(n)
 	if data.IsValid() {
 		collectFields(data, obj)
+	}
+	// Template pieces: rawText is the source between their delimiters
+	// (`…`, `…${, }…${, }…`), with line endings normalized like JS
+	switch n.Kind {
+	case ast.KindNoSubstitutionTemplateLiteral, ast.KindTemplateHead, ast.KindTemplateMiddle, ast.KindTemplateTail:
+		start, end := scanner.SkipTrivia(sourceText, n.Pos())+1, n.End()-1
+		if n.Kind == ast.KindTemplateHead || n.Kind == ast.KindTemplateMiddle {
+			end--
+		}
+		if start <= end && end <= len(sourceText) {
+			obj["rawText"] = strings.ReplaceAll(sourceText[start:end], "\r\n", "\n")
+		}
 	}
 	return obj
 }

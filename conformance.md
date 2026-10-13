@@ -110,7 +110,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Recursion                                     |   ✅    | [syntax-recursion.ts](conformance/syntax-recursion.ts)                       | Direct self-recursion                                                               |
 | Recursive arrow functions                     |   ✅    | [syntax-recursive-arrow.ts](conformance/syntax-recursive-arrow.ts)           | `const f = () => … f() …` → declared, then assigned                                 |
 | Generators (`function*` / `yield` / `yield*`) |   ✅    | [syntax-generators.ts](conformance/syntax-generators.ts)                     | `function*` runs in a goroutine sending yields over a channel; `for...of` ranges it |
-| Async generators (`async function*`)          |   ❌    | —                                                                            | Depends on generators and async                                                     |
+| Async generators (`async function*`)          |   ✅    | [syntax-async-generators.ts](conformance/syntax-async-generators.ts)         | Goroutine + channel, consumed with `for await`                                      |
 | Custom iterators (`Symbol.iterator`)          |   ✅    | [syntax-custom-iterators.ts](conformance/syntax-custom-iterators.ts)         | `*[Symbol.iterator]()` → a `Symbol_iterator()` channel method                       |
 | `as const` assertions                         |   ✅    | [syntax-as-const.ts](conformance/syntax-as-const.ts)                         | Erased during transpilation                                                         |
 | Function overloads                            |   ✅    | [syntax-function-overloads.ts](conformance/syntax-function-overloads.ts)     | Signatures are erased; the implementation is emitted                                |
@@ -176,11 +176,11 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `satisfies` operator                                      |   ✅    | [syntax-satisfies.ts](conformance/syntax-satisfies.ts)               | Checked by tsc, erased; the type guides literals                                |
 | `keyof` / mapped types                                    |   ✅    | [syntax-keyof-mapped-types.ts](conformance/syntax-keyof-mapped-types.ts) | `keyof` → `string`; mapped types → structs (literal keys) or maps               |
 | Conditional types                                         |   ✅    | [syntax-conditional-types.ts](conformance/syntax-conditional-types.ts) | Resolved to their branch's Go type                                              |
-| `infer` types                                             |   ❌    | —                                                                    | No probe yet                                                                    |
+| `infer` types                                             |   ✅    | [syntax-infer-types.ts](conformance/syntax-infer-types.ts)           | Resolved to their branch's Go type                                              |
 | `import type` / `export type`                             |   ✅    | [syntax-import-type.ts](conformance/syntax-import-type.ts)           | Type-only imports are erased                                                    |
 | Intersection types (`A & B`)                              |   ✅    | [syntax-intersection-types.ts](conformance/syntax-intersection-types.ts) | Object types merge into one struct                                              |
 | Literal types (`'a' \| 'b'`)                              | [syntax-literal-types.ts](conformance/syntax-literal-types.ts) | String literal unions → `string`                                     | No probe yet                                                                    |
-| Tuple optional / rest / labeled elements                  |   ❌    | —                                                                    | `[number, ...string[]]`, `[name: string]`                                       |
+| Tuple optional / rest / labeled elements                  |   ✅    | [syntax-tuple-elements.ts](conformance/syntax-tuple-elements.ts)     | Tuples are slices                                                               |
 | Indexed access types (`T['k']`)                           |   ✅    | [syntax-indexed-access-types.ts](conformance/syntax-indexed-access-types.ts) | `T['k']` resolves to the member type                                            |
 | Type-level `typeof` (`typeof obj`)                        |   ✅    | [syntax-type-typeof.ts](conformance/syntax-type-typeof.ts)           | The variable's Go type                                                          |
 | Template literal types                                    |   ✅    | [syntax-template-literal-types.ts](conformance/syntax-template-literal-types.ts) | Template literal types → `string`                                               |
@@ -218,11 +218,11 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | `new Promise` executor runs in a goroutine; `.then` consumes the channel on a wait group       |
 | `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | `TnPromiseAll` drains every promise channel into a slice                                       |
 | `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                                             |
-| `Promise.reject` / `.catch` / `.finally`             |   ❌    | —                                                            | No probe yet                                                                                   |
-| `Promise.race` / `allSettled` / `any`                |   ❌    | —                                                            | No probe yet                                                                                   |
+| `Promise.reject` / `.catch` / `.finally`             |   ✅    | [lib-promise-catch.ts](conformance/lib-promise-catch.ts)     | Rejected promises are closed channels with a reason; `await` rethrows                          |
+| `Promise.race` / `allSettled` / `any`                |   ✅    | [lib-promise-combinators.ts](conformance/lib-promise-combinators.ts) | Goroutine per promise; first settled / all settled / first fulfilled                           |
 | `clearTimeout`                                       |   ✅    | [lib-timers.ts](conformance/lib-timers.ts)                   | `TnClearTimeout` stops the timer                                                               |
-| `setInterval` / `clearInterval`                      |   ❌    | —                                                            | No probe yet                                                                                   |
-| `queueMicrotask`                                     |   ❌    | —                                                            | No probe yet                                                                                   |
+| `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker`; the process lives until cleared                                                 |
+| `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or a timer callback)                      |
 | `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` registered on a wait group the process waits on                               |
 
 ## Semantics (JS behaviour preserved)
@@ -287,9 +287,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | ---------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------------------- |
 | `Object.keys` / `values` / `entries`                       |   ✅    | [lib-object-helpers.ts](conformance/lib-object-helpers.ts) | Map key/value iteration helpers; typed results for maps and records |
 | `Object.assign`                                            |   ✅    | [lib-object-assign.ts](conformance/lib-object-assign.ts)   | Sources (structs, maps, dynamic objects) copied into an ordered map |
-| `Object.freeze` / `seal` / `isFrozen`                      |   ❌    | —                                                          | No probe yet                                                        |
+| `Object.freeze` / `seal` / `isFrozen`                      |   ✅    | [lib-object-freeze.ts](conformance/lib-object-freeze.ts)   | Integrity level tracked by identity; writes rejected by `Readonly<T>` types |
 | `Object.fromEntries`                                       |   ✅    | [lib-object-from-entries.ts](conformance/lib-object-from-entries.ts) | `TnFromEntries` → dynamic object                                    |
-| `Object.hasOwn` / `defineProperty` / `getOwnPropertyNames` |   ❌    | —                                                          | No probe yet                                                        |
+| `Object.hasOwn` / `defineProperty` / `getOwnPropertyNames` |   ✅    | [lib-object-own.ts](conformance/lib-object-own.ts)         | Maps, dynamic objects and typed objects (literal keys); `{ value }` descriptors |
 
 ### `String`
 
@@ -311,7 +311,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `match` / `matchAll` / `search`                           |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)     | Via `regexp` package (`String.match` with groups)                      |
 | `at` (negative indices)                                   |   ✅    | [lib-array-at.ts](conformance/lib-array-at.ts)                         | Supports negative indices                                              |
 | Unicode length / iteration                                |   ✅    | [lib-string-unicode.ts](conformance/lib-string-unicode.ts)             | `.length` counts runes; `[...str]` spreads runes                       |
-| `String.raw`                                              |   ❌    | —                                                                      | No probe yet                                                           |
+| `String.raw`                                              |   ✅    | [lib-string-raw.ts](conformance/lib-string-raw.ts)                     | Raw template text with values interpolated                             |
 | `normalize`                                               |   ❌    | —                                                                      | Unicode normalization; no probe yet                                    |
 
 ### `Array`
@@ -340,9 +340,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | `filter(Boolean)`                                                           |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)           | Constructor as predicate                                                      |
 | `concat`                                                                    |   ✅    | [lib-array-concat.ts](conformance/lib-array-concat.ts)                       | Arrays flattened one level, values appended                                   |
 | `reduceRight`                                                               |   ✅    | [lib-array-reduce-right.ts](conformance/lib-array-reduce-right.ts)           | `reduce` over a reversed copy                                                 |
-| `copyWithin`                                                                |   ❌    | —                                                                            | No probe yet                                                                  |
+| `copyWithin`                                                                |   ✅    | [lib-array-copy-within.ts](conformance/lib-array-copy-within.ts)             | Go `copy` (overlap-safe)                                                      |
 | Change-preserving copies (`toSorted` / `toReversed` / `with`)               |   ✅    | [lib-array-copies.ts](conformance/lib-array-copies.ts)                       | Clone, then sort / reverse / set                                              |
-| `toSpliced`                                                                 |   ❌    | —                                                                            | ES2023; no probe yet                                                          |
+| `toSpliced`                                                                 |   ✅    | [lib-array-to-spliced.ts](conformance/lib-array-to-spliced.ts)               | `slices.Concat` of the kept parts                                             |
 
 ### `Map` / `Set`
 
@@ -353,8 +353,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Set` (`add` / `has` / `delete` / `size`)                |   ✅    | [lib-set.ts](conformance/lib-set.ts)                               | `Set<T>` → Go `map[T]struct{}`; constructor with values |
 | `Set` iteration / spread                                 |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts) | `for...of`, `[...set]`                                  |
 | `Map.clear` / `Set.clear`                                |   ✅    | [lib-map-clear.ts](conformance/lib-map-clear.ts)                   | `TnMap.Clear()`                                         |
-| `WeakMap` / `WeakSet`                                    |   ❌    | —                                                                  | No probe yet                                            |
-| Set operations (`union` / `intersection` / `difference`) |   ❌    | —                                                                  | ES2025; no probe yet                                    |
+| `WeakMap` / `WeakSet`                                    |   ✅    | [lib-weak-collections.ts](conformance/lib-weak-collections.ts)     | Same as `Map` / `Set` (weakness is not observable)      |
+| Set operations (`union` / `intersection` / `difference`) |   ✅    | [lib-set-operations.ts](conformance/lib-set-operations.ts)         | Plus `symmetricDifference` / `isSubsetOf` / `isSupersetOf` / `isDisjointFrom` |
 
 ### `Number`
 
@@ -388,7 +388,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | Named groups                                           |   ✅    | [lib-regex-named-groups.ts](conformance/lib-regex-named-groups.ts)   | `(?<name>` → `(?P<name>`; `exec` returns a match with `.groups` |
 | Global `exec` loop (`/g` + `lastIndex`)                |   ✅    | [lib-regex-global-exec.ts](conformance/lib-regex-global-exec.ts)     | /g regexes carry `lastIndex` state in the `TnRegex` wrapper     |
 | Lookbehind                                             |   ✅    | [lib-regex-lookbehind.ts](conformance/lib-regex-lookbehind.ts)       | Lookaround patterns run on the backtracking engine              |
-| Remaining flags (`s` / `u` / `y`) & `source` / `flags` |   ❌    | —                                                                    | No probe yet                                                    |
+| Remaining flags (`s` / `u` / `y`) & `source` / `flags` |   ✅    | [lib-regex-more-flags.ts](conformance/lib-regex-more-flags.ts)       | Sticky matching, `\u{…}` escapes, `lastIndex` / `source` / `flags` / flag getters |
 | `split` with RegExp                                    |   ✅    | [lib-regex-split.ts](conformance/lib-regex-split.ts)                 | `re.Split(s, -1)`                                               |
 
 ### `Promise` / timers
@@ -398,11 +398,11 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | Channel lowering works (see [Async & timing](#async--timing))       |
 | `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | Channel lowering works (see [Async & timing](#async--timing))       |
 | `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                  |
-| `Promise.reject` / `.catch` / `.finally`             |   ❌    | —                                                            | No probe yet                                                        |
-| `Promise.race` / `allSettled` / `any`                |   ❌    | —                                                            | No probe yet                                                        |
+| `Promise.reject` / `.catch` / `.finally`             |   ✅    | [lib-promise-catch.ts](conformance/lib-promise-catch.ts)     | Rejected promises are closed channels with a reason; `await` rethrows |
+| `Promise.race` / `allSettled` / `any`                |   ✅    | [lib-promise-combinators.ts](conformance/lib-promise-combinators.ts) | Goroutine per promise; first settled / all settled / first fulfilled |
 | `clearTimeout`                                       |   ✅    | [lib-timers.ts](conformance/lib-timers.ts)                   | `TnClearTimeout` stops the timer                                    |
-| `setInterval` / `clearInterval`                      |   ❌    | —                                                            | No probe yet                                                        |
-| `queueMicrotask`                                     |   ❌    | —                                                            | No probe yet                                                        |
+| `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker`; the process lives until cleared                      |
+| `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or a timer callback) |
 | `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | Lowered to `time.AfterFunc` (see [Async & timing](#async--timing))  |
 
 ### Misc globals
@@ -412,13 +412,13 @@ Every standard-library API TypeNative ports, split by module. Per
 | `assert`                                    |   ✅    | [lib-console-log.ts](conformance/lib-console-log.ts)               | Transpiled to `panic` on failure         |
 | `process.argv` / `process.platform`         |   ✅    | [lib-process.ts](conformance/lib-process.ts)                       | Mapped to `os.Args` / `runtime.GOOS`     |
 | `process.env`                               |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts) | Environment variable access              |
-| `process.exit`                              |   ❌    | —                                                                  | Mapped to `os.Exit`; no probe yet        |
+| `process.exit`                              |   ✅    | [lib-process-exit.ts](conformance/lib-process-exit.ts)             | `os.Exit`                                |
 | `process.cwd()`                             |   ✅    | [lib-process-cwd.ts](conformance/lib-process-cwd.ts)               | `os.Getwd()`                             |
 | `Infinity`                                  |   ✅    | [lib-globals.ts](conformance/lib-globals.ts)                       | `math.Inf(1)`                            |
 | Global `isNaN` / `isFinite`                 |   ✅    | [lib-globals.ts](conformance/lib-globals.ts)                       | `math.IsNaN` / `math.IsInf`              |
 | `encodeURIComponent` / `decodeURIComponent` |   ✅    | [lib-uri.ts](conformance/lib-uri.ts)                               | `TnEncodeURIComponent` / `url.PathUnescape` |
-| `structuredClone`                           |   ❌    | —                                                                  | No probe yet                             |
-| `globalThis`                                |   ❌    | —                                                                  | No probe yet                             |
+| `structuredClone`                           |   ✅    | [lib-structured-clone.ts](conformance/lib-structured-clone.ts)     | Reflection deep copy                     |
+| `globalThis`                                |   ✅    | [lib-global-this.ts](conformance/lib-global-this.ts)               | `globalThis.x` is the global `x`; `(globalThis as any)` is a dynamic object |
 
 ### Node builtins (`node:*`)
 

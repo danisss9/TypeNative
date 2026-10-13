@@ -263,6 +263,7 @@ const importedPackages = new Set();
 let outsideNodes = [];
 const classNames = new Set();
 let promiseResolveName = '';
+let promiseRejectName = '';
 // Go keywords that cannot be used as identifiers
 const dangerousNames = new Set([
     'main',
@@ -399,6 +400,8 @@ function parseSource(code) {
     stripThisParameters(sourceFile);
     lowerIndexSignatures(sourceFile);
     lowerClassExpressions(sourceFile);
+    lowerWeakCollections(sourceFile);
+    lowerGlobalThis(sourceFile);
     linkParents(sourceFile, undefined);
     for (const stmt of sourceFile.statements ?? []) {
         if (!stmt.name || !isIdentifier(stmt.name))
@@ -475,6 +478,25 @@ function lowerClassExpressions(node) {
             return statement;
         return { ...initializer, kind: 'ClassDeclaration', name: declarations[0].name, modifiers: statement.modifiers };
     });
+}
+// WeakMap / WeakSet → Map / Set: same API; weakness is not observable
+function lowerWeakCollections(node) {
+    for (const child of childNodes(node))
+        lowerWeakCollections(child);
+    const name = node.kind === 'NewExpression' ? node.expression : node.kind === 'TypeReference' ? node.typeName : undefined;
+    if (isIdentifier(name) && (name.text === 'WeakMap' || name.text === 'WeakSet'))
+        name.text = name.text.slice(4);
+}
+// globalThis.x (typed) is the global x itself; (globalThis as any) stays a dynamic object
+function lowerGlobalThis(node) {
+    for (const key of Object.keys(node)) {
+        const child = node[key];
+        if (isPropertyAccessExpression(child) && isIdentifier(child.expression) && child.expression.text === 'globalThis') {
+            node[key] = child.name;
+        }
+    }
+    for (const child of childNodes(node))
+        lowerGlobalThis(child);
 }
 function linkParents(node, parent) {
     node.parent = parent;
@@ -604,6 +626,8 @@ export function transpileToNative(code, options) {
     if (usedHelpers.has('asyncWait'))
         drains.push('__tnWaitGroup.Wait()');
     if (usedHelpers.has('timerWait'))
+        drains.unshift('TnRunMicrotasks()');
+    if (usedHelpers.has('timerWait'))
         drains.push('__tnTimers.Wait()');
     const drainCode = drains.length > 0 ? `\n\t${drains.join('\n\t')}` : '';
     const main = `package main
@@ -661,6 +685,10 @@ function visit(node, options = {}) {
             .filter((n) => !!n)
             .join(options.inline ? '' : '\n\t');
     }
+    else if (isIdentifier(node) && node.text === 'globalThis') {
+        useHelper('globalThis');
+        return 'TnGlobalThis';
+    }
     else if (isIdentifier(node)) {
         if (isFieldNameIdentifier(node))
             return goFieldName(node.text);
@@ -700,6 +728,18 @@ function visit(node, options = {}) {
     }
     else if (isTemplateExpression(node)) {
         return visitTemplateExpression(node);
+    }
+    else if (node.kind === 'TaggedTemplateExpression' && isStringRawTag(node.tag)) {
+        // String.raw`a\n${x}`: the raw source text with the values interpolated
+        const template = node.template;
+        const raw = (part) => toGoStringLiteral(part.rawText ?? part.text);
+        if (template.kind === 'NoSubstitutionTemplateLiteral')
+            return raw(template);
+        const pieces = [raw(template.head)];
+        for (const span of template.templateSpans ?? []) {
+            pieces.push(jsStringOf(visit(span.expression), inferExpressionType(span.expression)), raw(span.literal));
+        }
+        return `(${pieces.join(' + ')})`;
     }
     else if (node.kind === 'TaggedTemplateExpression') {
         // tag`x${2}` → tag(["x", ""], 2)
@@ -745,7 +785,7 @@ function visit(node, options = {}) {
         // backtracking engine — both live in the TnRegex wrapper
         if (needsStatefulRegex(pattern, flags)) {
             useHelper('fancyRegex');
-            return `TnRegexCompile("${goPattern}", ${flags.includes('g') ? 'true' : 'false'})`;
+            return `TnRegexCompile("${goPattern}", "${flags}", ${toGoStringLiteral(pattern)})`;
         }
         importedPackages.add('regexp');
         const goFlags = jsRegexFlagsToGo(flags);
@@ -796,6 +836,9 @@ function visit(node, options = {}) {
         return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
     }
     else if (isPropertyAccessExpression(node)) {
+        const regexProperty = visitRegexProperty(node);
+        if (regexProperty)
+            return regexProperty;
         // import.meta.url — the file URL of the running program
         if (node.expression.kind === 'MetaProperty' && node.name.text === 'url') {
             useHelper('moduleUrl');
@@ -1047,12 +1090,11 @@ function visit(node, options = {}) {
             return initializer ? `${name} ${initializer}` : '';
         }
         const declName = isIdentifier(node.name) ? getSafeName(node.name.text) : visit(node.name);
-        // const f = (…) => … f(…) …: a Go closure can't see itself in its own :=, so
-        // declare first, then assign
+        // const f = (…) => … f(…) … / const id = setInterval(() => clearInterval(id)):
+        // a Go closure can't see the variable in its own :=, so declare first, then assign
         if (type === ':' &&
             isIdentifier(node.name) &&
-            (isArrowFunction(node.initializer) || isFunctionExpression(node.initializer)) &&
-            containsNode(node.initializer, (n) => isIdentifier(n) && n.text === node.name.text)) {
+            containsNode(node.initializer, (n) => isIdentifier(n) && n.text === node.name.text && !isFieldNameIdentifier(n))) {
             return `var ${declName} ${inferExpressionType(node.initializer)}\n\t\t${declName} ${initializer}`;
         }
         return `${type === ':' ? '' : 'var '}${declName} ${type}${type === ':' ? '' : ' '}${initializer}`;
@@ -1152,6 +1194,12 @@ function visit(node, options = {}) {
         if (arrayHigherOrderCall) {
             return arrayHigherOrderCall;
         }
+        const promiseCall = visitPromiseCall(node);
+        if (promiseCall)
+            return promiseCall;
+        const objectCall = visitObjectCall(node);
+        if (objectCall)
+            return objectCall;
         const caller = visit(node.expression);
         const safeCaller = getSafeName(caller);
         const typeArgs = getTypeArguments((node.typeArguments ?? []));
@@ -1341,6 +1389,11 @@ function visit(node, options = {}) {
                 return op === '==' ? eq : `!(${eq})`;
             }
         }
+        // obj[key] = v on any
+        if (op === '=' && isElementAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
+            useHelper('dynamic');
+            return `TnSetIndex(${visit(node.left.expression)}, ${visit(node.left.argumentExpression)}, ${visit(node.right)})`;
+        }
         if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
             useHelper('dynamic');
             return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${visit(node.right)})`;
@@ -1415,6 +1468,10 @@ function visit(node, options = {}) {
         return '';
     }
     else if (isAwaitExpression(node)) {
+        if (inferExpressionType(node.expression)?.startsWith('chan ')) {
+            useHelper('promise');
+            return `TnAwait(${visit(node.expression)})`;
+        }
         return `<-${visit(node.expression)}`;
     }
     else if (isVariableDeclarationList(node)) {
@@ -1429,7 +1486,8 @@ function visit(node, options = {}) {
             asyncFunctionNames.has(exprStmt.expression.text) &&
             !emittingModuleFile) {
             useHelper('asyncWait');
-            return `__tnWaitGroup.Add(1)\n\t\tgo func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t<-${getSafeName(exprStmt.expression.text)}()\n\t\t}();\n\t`;
+            useHelper('promise');
+            return `__tnWaitGroup.Add(1)\n\t\tgo func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\tTnAwait(${getSafeName(exprStmt.expression.text)}())\n\t\t}();\n\t`;
         }
         return visit(node.expression) + (options.inline ? '' : ';\n\t');
     }
@@ -1628,7 +1686,7 @@ function visit(node, options = {}) {
         }
         if (!isBlock(node.body)) {
             // void-style calls (console.*, assert) emit statements, not values
-            if (isVoidStatementCall(node.body)) {
+            if (isVoidStatementCall(node.body) || !inferredRetType) {
                 return `func(${parameterInfo.signature})${returnType} { ${visit(node.body)}; }`;
             }
             return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body)}; }`;
@@ -3419,8 +3477,10 @@ function visitTemplateExpression(node) {
 function isVoidStatementCall(expr) {
     if (!isCallExpression(expr))
         return false;
-    if (isIdentifier(expr.expression))
-        return expr.expression.text === 'assert';
+    if (isIdentifier(expr.expression)) {
+        const name = expr.expression.text;
+        return name === 'assert' || (!!promiseResolveName && name === promiseResolveName) || (!!promiseRejectName && name === promiseRejectName);
+    }
     return (isPropertyAccessExpression(expr.expression) &&
         isIdentifier(expr.expression.expression) &&
         expr.expression.expression.text === 'console');
@@ -3538,6 +3598,8 @@ function inferExpressionType(expr) {
         return '*tnbig.Int';
     if (expr.kind === 'TypeOfExpression')
         return 'string';
+    if (expr.kind === 'TaggedTemplateExpression' && isStringRawTag(expr.tag))
+        return 'string';
     if (isRegularExpressionLiteral(expr)) {
         const lastSlash = expr.text.lastIndexOf('/');
         if (needsStatefulRegex(expr.text.substring(1, lastSlash), expr.text.substring(lastSlash + 1))) {
@@ -3632,6 +3694,15 @@ function inferExpressionType(expr) {
             : isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression)
                 ? `${expr.expression.expression.text}.${expr.expression.name.text}`
                 : undefined;
+        const promiseType = inferPromiseCallType(expr);
+        if (promiseType)
+            return promiseType;
+        const objectCallType = inferObjectCallType(expr);
+        if (objectCallType)
+            return objectCallType;
+        if (isIdentifier(expr.expression) && expr.expression.text === 'structuredClone') {
+            return inferExpressionType(expr.arguments?.[0]);
+        }
         // Promise.all([...]) resolves to a slice over a channel
         if (isPropertyAccessExpression(expr.expression) &&
             isIdentifier(expr.expression.expression) &&
@@ -3677,6 +3748,9 @@ function inferExpressionType(expr) {
         if (builtinType && !declaredFunctions.has(expr.expression.text))
             return builtinType;
     }
+    const regexPropertyType = inferRegexPropertyType(expr);
+    if (regexPropertyType)
+        return regexPropertyType;
     if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && hasDynamicProperties(expr.expression)) {
         return 'float64';
     }
@@ -3825,8 +3899,10 @@ function inferExpressionType(expr) {
                 return 'string';
         }
         if (ownerType && ownerType.startsWith('*TnMap[')) {
-            if (methodName === 'has')
+            if (['has', 'isSubsetOf', 'isSupersetOf', 'isDisjointFrom'].includes(methodName))
                 return 'bool';
+            if (['union', 'intersection', 'difference', 'symmetricDifference'].includes(methodName))
+                return ownerType;
             if (methodName === 'get') {
                 const valueType = extractMapValueType(ownerType);
                 return isStructGoType(valueType) ? `*${valueType}` : valueType;
@@ -3850,7 +3926,7 @@ function inferExpressionType(expr) {
                 return 'float64';
             if (['pop', 'shift', 'at'].includes(methodName))
                 return elementType;
-            if (['concat', 'toSorted', 'toReversed', 'with'].includes(methodName))
+            if (['concat', 'toSorted', 'toReversed', 'with', 'copyWithin', 'toSpliced'].includes(methodName))
                 return ownerType;
             if (methodName === 'reduceRight' && expr.arguments?.[1])
                 return inferExpressionType(expr.arguments[1]);
@@ -3962,6 +4038,156 @@ const BUILTIN_CALL_TYPES = {
     'Object.assign': '*TnMap[string, interface{}]',
     'Date.now': 'float64'
 };
+// Object.freeze & co. record the integrity level (1 preventExtensions, 2 seal,
+// 3 freeze) by identity; TypeScript's Readonly<T> result types reject writes
+const OBJECT_INTEGRITY_LEVELS = { preventExtensions: 1, seal: 2, freeze: 3 };
+const OBJECT_INTEGRITY_CHECKS = { isExtensible: 1, isSealed: 2, isFrozen: 3 };
+function getObjectCallName(node) {
+    if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression))
+        return undefined;
+    if (!isIdentifier(node.expression.expression) || node.expression.expression.text !== 'Object')
+        return undefined;
+    return node.expression.name.text;
+}
+// The Go type of a property of an object type (anonymous struct, interface or class)
+function getObjectFieldGoType(objectType, field) {
+    const base = objectType.replace(/^\*/, '').replace(/\[.*$/, '');
+    return (getStructFieldGoType(objectType, field) ??
+        interfacePropertyTypes.get(base)?.get(field) ??
+        classPropertyTypes.get(base)?.get(field));
+}
+function inferObjectCallType(expr) {
+    const name = getObjectCallName(expr);
+    if (!name)
+        return undefined;
+    if (OBJECT_INTEGRITY_LEVELS[name] || name === 'defineProperty')
+        return inferExpressionType(expr.arguments?.[0]);
+    if (OBJECT_INTEGRITY_CHECKS[name] || name === 'hasOwn')
+        return 'bool';
+    if (name === 'getOwnPropertyNames')
+        return inferExpressionType({ ...expr, expression: { ...expr.expression, name: { kind: 'Identifier', text: 'keys' } } });
+    return undefined;
+}
+function visitObjectCall(node) {
+    const name = getObjectCallName(node);
+    if (!name)
+        return undefined;
+    const args = node.arguments ?? [];
+    if (OBJECT_INTEGRITY_LEVELS[name]) {
+        useHelper('objectIntegrity');
+        return `TnSetIntegrity(${visit(args[0])}, ${OBJECT_INTEGRITY_LEVELS[name]})`;
+    }
+    if (OBJECT_INTEGRITY_CHECKS[name]) {
+        useHelper('objectIntegrity');
+        const check = `TnHasIntegrity(${visit(args[0])}, ${OBJECT_INTEGRITY_CHECKS[name]})`;
+        return name === 'isExtensible' ? `!${check}` : check;
+    }
+    if (name === 'getOwnPropertyNames') {
+        return visit({ ...node, expression: { ...node.expression, name: { kind: 'Identifier', text: 'keys' } } });
+    }
+    const objectType = inferExpressionType(args[0]) ?? '';
+    const key = args[1];
+    if (name === 'hasOwn') {
+        if (isDynamicValue(args[0])) {
+            useHelper('dynamic');
+            return `TnHas(${visit(args[0])}, ${visit(key)})`;
+        }
+        if (objectType.startsWith('*TnMap['))
+            return `${visit(args[0])}.Has(${visit(key)})`;
+        if (!isStringLiteral(key))
+            throw new Error('Object.hasOwn on a typed object needs a literal key');
+        const fieldType = getObjectFieldGoType(objectType, key.text);
+        if (!fieldType)
+            return 'false';
+        // an absent optional primitive is nil
+        return /^\*(float64|string|bool)$/.test(fieldType) ? `(${visit(args[0])}.${goFieldName(key.text)} != nil)` : 'true';
+    }
+    if (name === 'defineProperty') {
+        const descriptor = args[2];
+        const valueProp = isObjectLiteralExpression(descriptor)
+            ? (descriptor.properties ?? []).find((p) => isPropertyAssignment(p) && isIdentifier(p.name) && p.name.text === 'value')
+            : undefined;
+        if (!valueProp)
+            throw new Error('Object.defineProperty needs a { value } descriptor literal');
+        const target = visit(args[0]);
+        if (isDynamicValue(args[0])) {
+            useHelper('dynamic');
+            return `TnSet(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+        }
+        if (objectType.startsWith('*TnMap[')) {
+            return `${target}.Set(${visit(key)}, ${toGoValueOfType(valueProp.initializer, extractMapValueType(objectType))})`;
+        }
+        if (!isStringLiteral(key))
+            throw new Error('Object.defineProperty on a typed object needs a literal key');
+        return `${target}.${goFieldName(key.text)} = ${toGoValueOfType(valueProp.initializer, getObjectFieldGoType(objectType, key.text))}`;
+    }
+    return undefined;
+}
+const PROMISE_COMBINATORS = new Set(['race', 'allSettled', 'any']);
+function isPromiseStaticCall(node, names) {
+    return (isCallExpression(node) &&
+        isPropertyAccessExpression(node.expression) &&
+        isIdentifier(node.expression.expression) &&
+        node.expression.expression.text === 'Promise' &&
+        names.has(node.expression.name.text));
+}
+// p.catch(cb) / p.finally(cb) on a promise channel
+function isPromiseMethodCall(node) {
+    return (isCallExpression(node) &&
+        isPropertyAccessExpression(node.expression) &&
+        ['catch', 'finally'].includes(node.expression.name.text) &&
+        !!inferExpressionType(node.expression.expression)?.startsWith('chan '));
+}
+// The value type of Promise.reject(…): from sibling promises in an array, else the
+// enclosing function's Promise<T>
+function getRejectedPromiseType(node) {
+    const parent = node.parent;
+    if (isArrayLiteralExpression(parent)) {
+        for (const sibling of parent.elements ?? []) {
+            if (sibling === node || isPromiseStaticCall(sibling, new Set(['reject'])))
+                continue;
+            const type = inferExpressionType(sibling);
+            if (type?.startsWith('chan '))
+                return type.slice(5);
+        }
+    }
+    return getPromiseChannelType(node);
+}
+function inferPromiseCallType(expr) {
+    if (isPromiseStaticCall(expr, new Set(['reject'])))
+        return `chan ${getRejectedPromiseType(expr)}`;
+    if (isPromiseStaticCall(expr, PROMISE_COMBINATORS)) {
+        const elem = promiseAllElementType(expr) ?? 'interface{}';
+        return expr.expression.name.text === 'allSettled' ? `chan []*TnSettled[${elem}]` : `chan ${elem}`;
+    }
+    if (isPromiseMethodCall(expr))
+        return inferExpressionType(expr.expression.expression);
+    return undefined;
+}
+function visitPromiseCall(node) {
+    const args = node.arguments ?? [];
+    if (isPromiseStaticCall(node, new Set(['reject']))) {
+        useHelper('promise');
+        return `TnPromiseReject[${getRejectedPromiseType(node)}](${args[0] ? visit(args[0]) : 'nil'})`;
+    }
+    if (isPromiseStaticCall(node, PROMISE_COMBINATORS)) {
+        useHelper('promise');
+        const name = node.expression.name.text;
+        return `TnPromise${name[0].toUpperCase()}${name.slice(1)}(${args[0] ? visit(args[0]) : '[]chan interface{}{}'})`;
+    }
+    if (!isPromiseMethodCall(node))
+        return undefined;
+    useHelper('promise');
+    const receiver = visit(node.expression.expression);
+    const callback = args[0];
+    const cb = callback ? visit(callback) : 'func() {}';
+    if (node.expression.name.text === 'finally')
+        return `TnPromiseFinally(${receiver}, ${cb})`;
+    // .catch(() => …) ignores the reason; .catch((e) => value) settles with the value
+    const handler = callback && (callback.parameters ?? []).length === 0 ? `func(_ interface{}) { (${cb})() }` : cb;
+    const returnsValue = callback && !/\)$/.test(inferExpressionType(callback) ?? ')');
+    return `TnPromiseCatch${returnsValue ? 'Value' : ''}(${receiver}, ${handler})`;
+}
 // Element type of `await Promise.all([...])` from the first promise channel
 function promiseAllElementType(expr) {
     const arrayNode = (expr.arguments ?? [])[0];
@@ -3973,7 +4199,9 @@ const BUILTIN_FUNCTION_TYPES = {
     parseFloat: 'float64',
     parseInt: 'float64',
     Number: 'float64',
-    String: 'string'
+    String: 'string',
+    setTimeout: '*time.Timer',
+    setInterval: '*TnInterval'
 };
 const STRING_METHOD_RETURN_TYPES = {
     trim: 'string',
@@ -5096,6 +5324,22 @@ const callHandlers = {
         const valueType = currentCallArgTypes[0] ?? 'interface{}';
         return `func() chan ${valueType} { __ch := make(chan ${valueType}, 1); __ch <- ${args[0] ?? 'nil'}; return __ch }()`;
     },
+    structuredClone: (_caller, args) => {
+        useHelper('structuredClone');
+        return `TnStructuredClone(${args[0]})`;
+    },
+    setInterval: (_caller, args) => {
+        useHelper('timerWait');
+        return `TnSetInterval(${args[1] ?? '0'}, ${args[0]})`;
+    },
+    clearInterval: (_caller, args) => {
+        useHelper('timerWait');
+        return `TnClearInterval(${args[0]})`;
+    },
+    queueMicrotask: (_caller, args) => {
+        useHelper('timerWait');
+        return `TnQueueMicrotask(${args[0]})`;
+    },
     clearTimeout: (_caller, args) => {
         useHelper('timerWait');
         return `TnClearTimeout(${args[0]})`;
@@ -5485,6 +5729,18 @@ const arrayMethodHandlers = {
         importedPackages.add('slices');
         return sortArray(`slices.Clone(${obj})`, args);
     },
+    // copyWithin(target, start, end?): copies in place (overlap-safe) and returns the array
+    copyWithin: (obj, args) => {
+        const end = args[2] ? sliceIndex('__s', args[2]) : 'len(__s)';
+        return `func() []${receiverElementType()} { __s := ${obj}; __t := ${sliceIndex('__s', args[0] ?? '0')}; __start := ${sliceIndex('__s', args[1] ?? '0')}; __end := ${end}; if __start < __end { copy(__s[__t:], __s[__start:__end]) }; return __s }()`;
+    },
+    // toSpliced(start, deleteCount?, ...items): a spliced copy
+    toSpliced: (obj, args) => {
+        importedPackages.add('slices');
+        const elementType = receiverElementType();
+        const end = args.length >= 2 ? `min(__start+max(int(${args[1]}), 0), len(__s))` : 'len(__s)';
+        return `func() []${elementType} { __s := ${obj}; __start := ${sliceIndex('__s', args[0] ?? '0')}; return slices.Concat(__s[:__start:__start], []${elementType}{${args.slice(2).join(', ')}}, __s[${end}:]) }()`;
+    },
     toReversed: (obj) => {
         importedPackages.add('slices');
         return `func() []${receiverElementType()} { __s := slices.Clone(${obj}); slices.Reverse(__s); return __s }()`;
@@ -5557,11 +5813,24 @@ const setMethodHandlers = {
     has: (obj, args) => `${obj}.Has(${args[0]})`,
     delete: (obj, args) => `${obj}.Delete(${args[0]})`,
     clear: (obj) => `${obj}.Clear()`,
-    values: (obj) => `${obj}.Keys()`
+    values: (obj) => `${obj}.Keys()`,
+    union: (obj, args) => `${obj}.Union(${args[0]})`,
+    intersection: (obj, args) => `${obj}.Intersection(${args[0]})`,
+    difference: (obj, args) => `${obj}.Difference(${args[0]})`,
+    symmetricDifference: (obj, args) => `${obj}.SymmetricDifference(${args[0]})`,
+    isSubsetOf: (obj, args) => `${obj}.IsSubsetOf(${args[0]})`,
+    isSupersetOf: (obj, args) => `${args[0]}.IsSubsetOf(${obj})`,
+    isDisjointFrom: (obj, args) => `(${obj}.Intersection(${args[0]}).Len() == 0)`
 };
 function getDynamicCallHandler(caller, objectType) {
     if (promiseResolveName && caller === promiseResolveName) {
         return (_caller, args) => `ch <- ${args[0]}`;
+    }
+    if (promiseRejectName && caller === promiseRejectName) {
+        return (_caller, args) => {
+            useHelper('promise');
+            return `TnReject(ch, ${args[0] ?? 'nil'})`;
+        };
     }
     const dotIndex = caller.lastIndexOf('.');
     if (dotIndex !== -1) {
@@ -5705,7 +5974,8 @@ function isObjectKeysOfDynamic(node) {
 }
 const ARRAY_ONLY_METHODS = new Set([
     'map', 'filter', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'forEach', 'reduce',
-    'reduceRight', 'join', 'flat', 'flatMap', 'sort', 'reverse', 'toSorted', 'toReversed', 'fill', 'splice'
+    'reduceRight', 'join', 'flat', 'flatMap', 'sort', 'reverse', 'toSorted', 'toReversed', 'fill', 'splice',
+    'copyWithin', 'toSpliced'
 ]);
 const STRING_ONLY_METHODS = new Set([
     'startsWith', 'endsWith', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase', 'split',
@@ -5857,6 +6127,9 @@ function jsRegexFlagsToGo(flags) {
 // groups to RE2 syntax: (?<name> → (?P<name>
 function translateJsRegexPattern(pattern) {
     return pattern
+        // \u{1F600} / \u00e9 → RE2's \x{…}
+        .replace(/\\u\{([0-9A-Fa-f]+)\}/g, '\\x{$1}')
+        .replace(/\\u([0-9A-Fa-f]{4})/g, '\\x{$1}')
         .replace(/\\/g, '\\\\')
         .replace(/"/g, '\\"')
         .replace(/\(\?<([A-Za-z_][A-Za-z0-9_]*)>/g, '(?P<$1>');
@@ -5865,11 +6138,56 @@ function translateJsRegexPattern(pattern) {
 // Named groups (?<name> are fine (translated to (?P<name>), so strip them
 // before testing for lookarounds (?= (?! (?<= (?<!
 function needsStatefulRegex(pattern, flags) {
-    if (flags.includes('g'))
+    // /g and /y keep lastIndex state; /u keeps its flag for .flags
+    if (flags.includes('g') || flags.includes('y') || flags.includes('u'))
         return true;
     const stripped = pattern.replace(/\(\?<[A-Za-z_][A-Za-z0-9_]*>/g, '');
     // (?= (?! and any remaining (?< (lookbehind) need the backtracker
     return /\\[1-9]|\(\?[=!<]/.test(stripped);
+}
+const REGEX_FLAG_PROPERTIES = {
+    global: 'g', ignoreCase: 'i', multiline: 'm', dotAll: 's', unicode: 'u', sticky: 'y'
+};
+function inferRegexPropertyType(expr) {
+    if (!isPropertyAccessExpression(expr))
+        return undefined;
+    const receiverType = inferExpressionType(expr.expression);
+    if (receiverType !== '*TnRegex' && receiverType !== '*regexp.Regexp')
+        return undefined;
+    const name = expr.name.text;
+    if (name === 'lastIndex')
+        return 'float64';
+    if (name === 'source' || name === 'flags')
+        return 'string';
+    if (REGEX_FLAG_PROPERTIES[name])
+        return 'bool';
+    return undefined;
+}
+function visitRegexProperty(node) {
+    const type = inferRegexPropertyType(node);
+    if (!type || isCallee(node))
+        return undefined;
+    const name = node.name.text;
+    const receiver = visit(node.expression);
+    useHelper('fancyRegex');
+    if (inferExpressionType(node.expression) === '*TnRegex') {
+        if (name === 'lastIndex' || name === 'source' || name === 'flags')
+            return `${receiver}.${name}`;
+        importedPackages.add('strings');
+        return `strings.Contains(${receiver}.flags, "${REGEX_FLAG_PROPERTIES[name]}")`;
+    }
+    // plain RE2 regexes have no state; their flags (i/m/s) lead the pattern
+    if (name === 'lastIndex')
+        return 'float64(0)';
+    if (name === 'source')
+        return `TnRegexpSource(${receiver})`;
+    if (name === 'flags')
+        return `TnRegexpFlags(${receiver})`;
+    importedPackages.add('strings');
+    return `strings.Contains(TnRegexpFlags(${receiver}), "${REGEX_FLAG_PROPERTIES[name]}")`;
+}
+function isStringRawTag(tag) {
+    return isPropertyAccessExpression(tag) && isIdentifier(tag.expression) && tag.expression.text === 'String' && tag.name.text === 'raw';
 }
 // Whether a visited regex argument is the stateful wrapper type
 function isTnRegexArg(arg) {
@@ -6154,7 +6472,8 @@ function getPromiseChannelType(node) {
     while (parent) {
         if (isFunctionDeclaration(parent) ||
             isMethodDeclaration(parent) ||
-            isFunctionExpression(parent)) {
+            isFunctionExpression(parent) ||
+            isArrowFunction(parent)) {
             if (parent.type &&
                 isTypeReferenceNode(parent.type) &&
                 isIdentifier(parent.type.typeName)) {
@@ -6181,6 +6500,9 @@ function emitChannelFunction(node, isAsync) {
     }
     const chanType = isAsync ? getPromiseChannelType(node) : getGeneratorYieldType(node);
     const channelVar = '__ch';
+    if (isAsync)
+        useHelper('promise');
+    const rejectOnPanic = isAsync ? `\n\t\tdefer TnRejectOnPanic(${channelVar})` : '';
     const prevChannel = asyncChannelVar;
     const prevFn = asyncFunctionNode;
     asyncChannelVar = channelVar;
@@ -6188,7 +6510,7 @@ function emitChannelFunction(node, isAsync) {
     const body = visit(node.body, { prefixBlockContent: parameterInfo.prefixBlockContent });
     asyncChannelVar = prevChannel;
     asyncFunctionNode = prevFn;
-    return (`func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
+    return (`func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
 }
 // The type a generator yields: from its first yield expression's operand
 function getGeneratorYieldType(fn) {
@@ -6210,10 +6532,14 @@ function visitPromiseReturn(node, options) {
     const channelType = getPromiseChannelType(node);
     const resolveParam = callback.parameters[0];
     const resolveName = resolveParam ? visit(resolveParam.name) : '';
+    const rejectParam = callback.parameters[1];
     const prevResolveName = promiseResolveName;
+    const prevRejectName = promiseRejectName;
     promiseResolveName = resolveName;
+    promiseRejectName = rejectParam ? visit(rejectParam.name) : '';
     const body = isBlock(callback.body) ? visit(callback.body) : `{ ${visit(callback.body)} }`;
     promiseResolveName = prevResolveName;
+    promiseRejectName = prevRejectName;
     return (`ch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch` +
         (options.inline ? '' : ';\n\t'));
 }
@@ -6225,10 +6551,14 @@ function visitNewPromise(node) {
     const channelType = getPromiseChannelType(node);
     const resolveParam = callback.parameters[0];
     const resolveName = resolveParam ? visit(resolveParam.name) : '';
+    const rejectParam = callback.parameters[1];
     const prevResolveName = promiseResolveName;
+    const prevRejectName = promiseRejectName;
     promiseResolveName = resolveName;
+    promiseRejectName = rejectParam ? visit(rejectParam.name) : '';
     const body = isBlock(callback.body) ? visit(callback.body) : `{ ${visit(callback.body)} }`;
     promiseResolveName = prevResolveName;
+    promiseRejectName = prevRejectName;
     return `func() chan ${channelType} {\n\t\tch := make(chan ${channelType})\n\t\tgo func() ${body.trimEnd()}()\n\t\treturn ch;\n\t}()`;
 }
 function extractMapValueType(mapType) {
@@ -6446,7 +6776,11 @@ function needPkg(pkg) {
 // since the import list is serialized before helpers are emitted.
 const helperRequires = {
     objectAssign: ['orderedMap'],
-    promiseAll: ['orderedMap', 'asyncWait'],
+    promiseAll: ['orderedMap', 'asyncWait', 'promise'],
+    promise: ['error'],
+    objectIntegrity: [],
+    structuredClone: [],
+    globalThis: ['dynamic'],
     namedGroups: ['orderedMap'],
     fancyRegex: ['orderedMap'],
     dynamic: ['error'],
@@ -6644,6 +6978,10 @@ const helperPackages = {
     timerWait: ['sync', 'time'],
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
+    promise: ['sync'],
+    objectIntegrity: ['sync', 'reflect'],
+    structuredClone: ['reflect', 'unsafe'],
+    globalThis: [],
     exec: ['os/exec', 'bytes', 'runtime'],
     execSync: ['os/exec', 'bytes', 'runtime'],
     runInherit: ['os/exec', 'os'],
@@ -6695,6 +7033,22 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		return
 	}
 	panic("TnSet: cannot set property " + key)
+}
+
+func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
+	switch o := obj.(type) {
+	case map[string]interface{}:
+		if k, ok := key.(string); ok {
+			o[k] = value
+			return
+		}
+	case []interface{}:
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
+			o[int(i)] = value
+			return
+		}
+	}
+	panic(fmt.Sprintf("TnSetIndex: cannot set property %v", key))
 }
 
 func TnIndex(obj interface{}, key interface{}) interface{} {
@@ -7268,6 +7622,51 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 	return true
 }
 
+// Set operations (ES2025), in the receiver's insertion order then the argument's
+func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
+	r := TnNewMap[K, V]()
+	for _, k := range m.keys {
+		r.Set(k, m.values[k])
+	}
+	for _, k := range o.keys {
+		r.Set(k, o.values[k])
+	}
+	return r
+}
+
+func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
+	r := TnNewMap[K, V]()
+	for _, k := range m.keys {
+		if o.Has(k) {
+			r.Set(k, m.values[k])
+		}
+	}
+	return r
+}
+
+func (m *TnMap[K, V]) Difference(o *TnMap[K, V]) *TnMap[K, V] {
+	r := TnNewMap[K, V]()
+	for _, k := range m.keys {
+		if !o.Has(k) {
+			r.Set(k, m.values[k])
+		}
+	}
+	return r
+}
+
+func (m *TnMap[K, V]) SymmetricDifference(o *TnMap[K, V]) *TnMap[K, V] {
+	return m.Difference(o).Union(o.Difference(m))
+}
+
+func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
+	for _, k := range m.keys {
+		if !o.Has(k) {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *TnMap[K, V]) Clear() {
 	m.keys = nil
 	m.values = map[K]V{}
@@ -7367,15 +7766,44 @@ func TnRegexExecNamed(re *regexp.Regexp, s string) *TnMatch {
 type TnRegex struct {
 	re        *regexp.Regexp
 	bt        *tnBt
-	lastIndex int
+	lastIndex float64
 	global    bool
+	sticky    bool
+	source    string
+	flags     string
 }
 
-func TnRegexCompile(pattern string, global bool) *TnRegex {
-	if re, err := regexp.Compile(pattern); err == nil {
-		return &TnRegex{re: re, global: global}
+func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
+	r := &TnRegex{global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags}
+	prefix := ""
+	for _, f := range "ims" {
+		if strings.ContainsRune(flags, f) {
+			prefix += string(f)
+		}
 	}
-	return &TnRegex{bt: tnBtCompile(pattern), global: global}
+	if prefix != "" {
+		prefix = "(?" + prefix + ")"
+	}
+	if re, err := regexp.Compile(prefix + pattern); err == nil {
+		r.re = re
+	} else {
+		r.bt = tnBtCompile(pattern)
+	}
+	return r
+}
+
+// .source / .flags of a plain RE2 regex: flags lead the pattern as (?ims)
+var tnRegexpFlagPrefix = regexp.MustCompile("^\\\\(\\\\?([ims]+)\\\\)")
+
+func TnRegexpSource(re *regexp.Regexp) string {
+	return strings.ReplaceAll(tnRegexpFlagPrefix.ReplaceAllString(re.String(), ""), "(?P<", "(?<")
+}
+
+func TnRegexpFlags(re *regexp.Regexp) string {
+	if m := tnRegexpFlagPrefix.FindStringSubmatch(re.String()); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 func (r *TnRegex) Test(s string) bool {
@@ -7522,15 +7950,15 @@ func (r *TnRegex) find(s string) ([]string, []int) {
 	runs := []rune(s)
 	if r.bt != nil {
 		start := 0
-		if r.global {
-			if r.lastIndex > len(runs) {
+		if r.global || r.sticky {
+			if int(r.lastIndex) > len(runs) {
 				r.lastIndex = 0
 				return nil, nil
 			}
-			start = r.lastIndex
+			start = int(r.lastIndex)
 		}
 		offs := tnByteOffsets(runs)
-		for pos := start; pos <= len(runs); pos++ {
+		for pos := start; pos <= len(runs) && (!r.sticky || pos == start); pos++ {
 			caps := make([]int, (r.bt.ngroups+1)*2)
 			for i := range caps {
 				caps[i] = -1
@@ -7550,22 +7978,22 @@ func (r *TnRegex) find(s string) ([]string, []int) {
 						loc[2*i], loc[2*i+1] = -1, -1
 					}
 				}
-				if r.global {
+				if r.global || r.sticky {
 					next := end
 					if next == pos {
 						next++
 					}
-					r.lastIndex = next
+					r.lastIndex = float64(next)
 				}
 				return groups, loc
 			}
 		}
-		if r.global {
+		if r.global || r.sticky {
 			r.lastIndex = 0
 		}
 		return nil, nil
 	}
-	if !r.global {
+	if !r.global && !r.sticky {
 		loc := r.re.FindStringSubmatchIndex(s)
 		if loc == nil {
 			return nil, nil
@@ -7578,16 +8006,16 @@ func (r *TnRegex) find(s string) ([]string, []int) {
 		}
 		return groups, loc
 	}
-	if r.lastIndex >= len(runs) {
+	if int(r.lastIndex) >= len(runs) {
 		r.lastIndex = 0
 		return nil, nil
 	}
 	byteStart := 0
-	for i := 0; i < r.lastIndex; i++ {
+	for i := 0; i < int(r.lastIndex); i++ {
 		byteStart += len(string(runs[i]))
 	}
 	loc := r.re.FindStringSubmatchIndex(s[byteStart:])
-	if loc == nil {
+	if loc == nil || (r.sticky && loc[0] != 0) {
 		r.lastIndex = 0
 		return nil, nil
 	}
@@ -7602,16 +8030,16 @@ func (r *TnRegex) find(s string) ([]string, []int) {
 			groups[i] = s[loc[2*i]:loc[2*i+1]]
 		}
 	}
-	endRune := r.lastIndex
+	endRune := int(r.lastIndex)
 	bo := byteStart
-	for ri := r.lastIndex; ri < len(runs) && bo < loc[1]; ri++ {
+	for ri := int(r.lastIndex); ri < len(runs) && bo < loc[1]; ri++ {
 		bo += len(string(runs[ri]))
 		endRune = ri + 1
 	}
-	if endRune == r.lastIndex {
+	if endRune == int(r.lastIndex) {
 		endRune++
 	}
-	r.lastIndex = endRune
+	r.lastIndex = float64(endRune)
 	return groups, loc
 }
 
@@ -8390,7 +8818,66 @@ func TnSetTimeout(ms float64, fn func()) *time.Timer {
 	return time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() {
 		defer __tnTimers.Done()
 		fn()
+		TnRunMicrotasks()
 	})
+}
+
+// setInterval: fn every ms until cleared (the process lives until then)
+type TnInterval struct {
+	stop chan struct{}
+	once sync.Once
+}
+
+func TnSetInterval(ms float64, fn func()) *TnInterval {
+	__tnTimers.Add(1)
+	t := &TnInterval{stop: make(chan struct{})}
+	go func() {
+		ticker := time.NewTicker(max(time.Duration(ms*float64(time.Millisecond)), time.Millisecond))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stop:
+				return
+			case <-ticker.C:
+				fn()
+				TnRunMicrotasks()
+			}
+		}
+	}()
+	return t
+}
+
+func TnClearInterval(t *TnInterval) {
+	if t != nil {
+		t.once.Do(func() {
+			close(t.stop)
+			__tnTimers.Done()
+		})
+	}
+}
+
+// queueMicrotask: run after the current synchronous code (end of main or of a timer callback)
+var tnMicrotasks []func()
+var tnMicrotasksMu sync.Mutex
+
+func TnQueueMicrotask(fn func()) {
+	tnMicrotasksMu.Lock()
+	tnMicrotasks = append(tnMicrotasks, fn)
+	tnMicrotasksMu.Unlock()
+}
+
+func TnRunMicrotasks() {
+	for {
+		tnMicrotasksMu.Lock()
+		if len(tnMicrotasks) == 0 {
+			tnMicrotasksMu.Unlock()
+			return
+		}
+		fn := tnMicrotasks[0]
+		tnMicrotasks = tnMicrotasks[1:]
+		tnMicrotasksMu.Unlock()
+		fn()
+	}
 }
 
 func TnClearTimeout(t *time.Timer) {
@@ -8418,13 +8905,264 @@ func TnDecodeURIComponent(s string) string {
 	}
 	return decoded
 }`,
+    objectIntegrity: `// Object.freeze / seal / preventExtensions levels, by object identity
+var tnIntegrity sync.Map
+
+func tnIdentity(v interface{}) (uintptr, bool) {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.Pointer(), true
+	}
+	return 0, false
+}
+
+func TnSetIntegrity[T any](v T, level int) T {
+	if id, ok := tnIdentity(v); ok {
+		if prev, had := tnIntegrity.Load(id); !had || prev.(int) < level {
+			tnIntegrity.Store(id, level)
+		}
+	}
+	return v
+}
+
+// Primitives are always frozen
+func TnHasIntegrity(v interface{}, level int) bool {
+	id, ok := tnIdentity(v)
+	if !ok {
+		return true
+	}
+	l, had := tnIntegrity.Load(id)
+	return had && l.(int) >= level
+}`,
+    structuredClone: `// structuredClone: a deep copy (pointers, structs, slices, maps)
+func TnStructuredClone[T any](v T) T {
+	return tnCloneValue(reflect.ValueOf(&v).Elem()).Interface().(T)
+}
+
+func tnCloneValue(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		c := reflect.New(v.Elem().Type())
+		c.Elem().Set(tnCloneValue(v.Elem()))
+		return c
+	case reflect.Struct:
+		if !v.CanAddr() {
+			tmp := reflect.New(v.Type()).Elem()
+			tmp.Set(v)
+			v = tmp
+		}
+		c := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.NumField(); i++ {
+			// unexported fields are read and written through their addresses
+			src := reflect.NewAt(v.Field(i).Type(), unsafe.Pointer(v.Field(i).UnsafeAddr())).Elem()
+			dst := reflect.NewAt(c.Field(i).Type(), unsafe.Pointer(c.Field(i).UnsafeAddr())).Elem()
+			dst.Set(tnCloneValue(src))
+		}
+		return c
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		c := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			c.Index(i).Set(tnCloneValue(v.Index(i)))
+		}
+		return c
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		c := reflect.MakeMapWithSize(v.Type(), v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			c.SetMapIndex(iter.Key(), tnCloneValue(iter.Value()))
+		}
+		return c
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		c := reflect.New(v.Type()).Elem()
+		c.Set(tnCloneValue(v.Elem()))
+		return c
+	}
+	return v
+}`,
+    globalThis: `// (globalThis as any).x: properties set on the global object at runtime
+var TnGlobalThis = map[string]interface{}{}`,
+    promise: `// Promises are channels; a rejected promise is a closed channel with a reason
+var tnRejections sync.Map
+
+func TnReject[T any](ch chan T, reason interface{}) {
+	tnRejections.Store(ch, reason)
+	close(ch)
+}
+
+// Deferred in async functions: a throw rejects the function's promise
+func TnRejectOnPanic[T any](ch chan T) {
+	if r := recover(); r != nil {
+		tnRejections.Store(ch, r)
+	}
+}
+
+// Waits for a promise: its value, or its rejection reason
+func tnSettle[T any](ch chan T) (T, interface{}, bool) {
+	v, ok := <-ch
+	if !ok {
+		if reason, rejected := tnRejections.Load(ch); rejected {
+			return v, reason, true
+		}
+	}
+	return v, nil, false
+}
+
+// await: the value, or the rejection rethrown
+func TnAwait[T any](ch chan T) T {
+	v, reason, rejected := tnSettle(ch)
+	if rejected {
+		panic(reason)
+	}
+	return v
+}
+
+func TnPromiseReject[T any](reason interface{}) chan T {
+	ch := make(chan T)
+	TnReject(ch, reason)
+	return ch
+}
+
+func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
+	out := make(chan T, 1)
+	go func() {
+		v, reason, rejected := tnSettle(p)
+		if rejected {
+			e, _ := reason.(E)
+			onRejected(e)
+		}
+		out <- v
+		close(out)
+	}()
+	return out
+}
+
+func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
+	out := make(chan T, 1)
+	go func() {
+		v, reason, rejected := tnSettle(p)
+		if rejected {
+			e, _ := reason.(E)
+			v = onRejected(e)
+		}
+		out <- v
+		close(out)
+	}()
+	return out
+}
+
+func TnPromiseFinally[T any](p chan T, onFinally func()) chan T {
+	out := make(chan T, 1)
+	go func() {
+		v, reason, rejected := tnSettle(p)
+		onFinally()
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		out <- v
+		close(out)
+	}()
+	return out
+}
+
+// Promise.race: the first promise to settle, fulfilled or rejected
+func TnPromiseRace[T any](chs []chan T) chan T {
+	out := make(chan T, 1)
+	var once sync.Once
+	for _, ch := range chs {
+		go func(ch chan T) {
+			v, reason, rejected := tnSettle(ch)
+			once.Do(func() {
+				if rejected {
+					TnReject(out, reason)
+					return
+				}
+				out <- v
+				close(out)
+			})
+		}(ch)
+	}
+	return out
+}
+
+type TnSettled[T any] struct {
+	status string
+	value  T
+	reason interface{}
+}
+
+func TnPromiseAllSettled[T any](chs []chan T) chan []*TnSettled[T] {
+	out := make(chan []*TnSettled[T], 1)
+	go func() {
+		results := make([]*TnSettled[T], len(chs))
+		for i, ch := range chs {
+			v, reason, rejected := tnSettle(ch)
+			if rejected {
+				results[i] = &TnSettled[T]{status: "rejected", reason: reason}
+			} else {
+				results[i] = &TnSettled[T]{status: "fulfilled", value: v}
+			}
+		}
+		out <- results
+		close(out)
+	}()
+	return out
+}
+
+// Promise.any: the first promise to fulfil; rejected when all of them reject
+func TnPromiseAny[T any](chs []chan T) chan T {
+	out := make(chan T, 1)
+	go func() {
+		values := make(chan T, len(chs))
+		failures := make(chan interface{}, len(chs))
+		for _, ch := range chs {
+			go func(ch chan T) {
+				v, reason, rejected := tnSettle(ch)
+				if rejected {
+					failures <- reason
+				} else {
+					values <- v
+				}
+			}(ch)
+		}
+		for range chs {
+			select {
+			case v := <-values:
+				out <- v
+				close(out)
+				return
+			case <-failures:
+			}
+		}
+		TnReject(out, TnNewError("All promises were rejected"))
+	}()
+	return out
+}`,
     promiseAll: `// Promise.all: every channel drained in order, results collected
 func TnPromiseAll[T any](chs []chan T) chan []T {
 	out := make(chan []T)
 	go func() {
 		results := make([]T, len(chs))
 		for i, ch := range chs {
-			results[i] = <-ch
+			v, reason, rejected := tnSettle(ch)
+			if rejected {
+				TnReject(out, reason)
+				return
+			}
+			results[i] = v
 		}
 		out <- results
 		close(out)
