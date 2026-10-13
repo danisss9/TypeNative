@@ -134,11 +134,11 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Access modifiers (`private` / `protected` / `public` on members) |   ✅    | [syntax-access-modifiers.ts](conformance/syntax-access-modifiers.ts)                     | `private` / `protected` / `public` are erased                                           |
 | Abstract classes                                                 |   ✅    | [syntax-class-abstract.ts](conformance/syntax-class-abstract.ts)                         | Abstract members skipped; concrete methods copied onto subclasses                       |
 | Static initialization blocks (`static {}`)                       |   ✅    | [syntax-static-blocks.ts](conformance/syntax-static-blocks.ts)                           | Go `func init()`                                                                        |
-| Class expressions (`const C = class {}`)                         |   ❌    | —                                                                                        | No probe yet                                                                            |
+| Class expressions (`const C = class {}`)                         |   ✅    | [syntax-class-expressions.ts](conformance/syntax-class-expressions.ts)                   | `const C = class {…}` becomes a class named after the variable                          |
 | Interfaces                                                       |   ✅    | [syntax-class-implements.ts](conformance/syntax-class-implements.ts)                     | Transpiled to Go interfaces                                                             |
 | Optional properties                                              |   ✅    | [syntax-optional-chaining.ts](conformance/syntax-optional-chaining.ts)                   | `prop?: Type` in interfaces/types                                                       |
 | Type-aware method dispatch                                       |   ✅    | [semantics-method-dispatch.ts](conformance/semantics-method-dispatch.ts)                 | Class `.push()` / `.length` not confused with array builtins                            |
-| Index signatures (`[key: string]: T`)                            |   ❌    | —                                                                                        | No probe yet (records/dicts → Go maps ✅)                                                |
+| Index signatures (`[key: string]: T`)                            |   ✅    | [syntax-index-signatures.ts](conformance/syntax-index-signatures.ts)                     | `{ [k: K]: V }` is `Record<K, V>` (an ordered Go map)                                   |
 
 ## Generics
 
@@ -146,9 +146,9 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | ------------------------------------------------------------- | :----: | ---------------------------------------------------------------------- | ----------------------------------                             |
 | Generic functions                                             |   ✅    | [syntax-generic-functions.ts](conformance/syntax-generic-functions.ts) | Type parameters → Go generics; call sites infer from arguments |
 | Generic classes                                               |   ✅    | [syntax-generic-classes.ts](conformance/syntax-generic-classes.ts)     | Type parameters via Go generics                                |
-| Generic constraints (`<T extends U>`)                         |   ❌    | —                                                                      | No probe yet                                                   |
-| Default type parameters (`<T = D>`)                           |   ❌    | —                                                                      | No probe yet                                                   |
-| Generic interfaces / type aliases                             |   ❌    | —                                                                      | No probe yet                                                   |
+| Generic constraints (`<T extends U>`)                         |   ✅    | [syntax-generic-constraints.ts](conformance/syntax-generic-constraints.ts) | Object-type bounds become `any`; properties of `T` values read dynamically |
+| Default type parameters (`<T = D>`)                           |   ✅    | [syntax-generic-defaults.ts](conformance/syntax-generic-defaults.ts)   | Defaults are erased; Go infers from arguments                  |
+| Generic interfaces / type aliases                             |   ✅    | [syntax-generic-interfaces.ts](conformance/syntax-generic-interfaces.ts) | Go generic structs; literals instantiate them (`Box[float64]{…}`) |
 | `const` type parameters / variance annotations (`in` / `out`) |   ❌    | —                                                                      | No probe yet                                                   |
 
 ## Enums
@@ -174,7 +174,9 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `override` modifier                                       |   ✅    | [syntax-override.ts](conformance/syntax-override.ts)                 | Erased                                                                          |
 | `readonly` modifier (properties, `readonly T[]`)          |   ✅    | [syntax-readonly.ts](conformance/syntax-readonly.ts)                 | Erased (`readonly T[]` → `[]T`)                                                 |
 | `satisfies` operator                                      |   ✅    | [syntax-satisfies.ts](conformance/syntax-satisfies.ts)               | Checked by tsc, erased; the type guides literals                                |
-| `keyof` / mapped / conditional / `infer` types            |   ❌    | —                                                                    | No probe yet                                                                    |
+| `keyof` / mapped types                                    |   ✅    | [syntax-keyof-mapped-types.ts](conformance/syntax-keyof-mapped-types.ts) | `keyof` → `string`; mapped types → structs (literal keys) or maps               |
+| Conditional types                                         |   ✅    | [syntax-conditional-types.ts](conformance/syntax-conditional-types.ts) | Resolved to their branch's Go type                                              |
+| `infer` types                                             |   ❌    | —                                                                    | No probe yet                                                                    |
 | `import type` / `export type`                             |   ✅    | [syntax-import-type.ts](conformance/syntax-import-type.ts)           | Type-only imports are erased                                                    |
 | Intersection types (`A & B`)                              |   ✅    | [syntax-intersection-types.ts](conformance/syntax-intersection-types.ts) | Object types merge into one struct                                              |
 | Literal types (`'a' \| 'b'`)                              | [syntax-literal-types.ts](conformance/syntax-literal-types.ts) | String literal unions → `string`                                     | No probe yet                                                                    |

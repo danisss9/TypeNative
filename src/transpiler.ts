@@ -484,6 +484,8 @@ function defaultParseFunction(_code: string): AstNode {
 function parseSource(code: string): AstNode {
   const sourceFile = parseFunction(code);
   stripThisParameters(sourceFile);
+  lowerIndexSignatures(sourceFile);
+  lowerClassExpressions(sourceFile);
   linkParents(sourceFile, undefined);
   for (const stmt of sourceFile.statements ?? []) {
     if (!stmt.name || !isIdentifier(stmt.name)) continue;
@@ -505,6 +507,51 @@ function stripThisParameters(node: AstNode): void {
     node.parameters = node.parameters.filter((p: AstNode) => !(isIdentifier(p.name) && p.name.text === 'this'));
   }
   for (const child of childNodes(node)) stripThisParameters(child);
+}
+
+// { [k: K]: V } and { [K in string]: V } → Record<K, V>; an interface that is
+// only an index signature becomes an alias of that Record
+function lowerIndexSignatures(node: AstNode): void {
+  for (const child of childNodes(node)) lowerIndexSignatures(child);
+  const keyKind = node.typeParameter?.constraint?.kind;
+  if (node.kind === 'MappedType' && (keyKind === 'StringKeyword' || keyKind === 'NumberKeyword')) {
+    const keyType: AstNode = { kind: keyKind };
+    makeRecordReference(node, keyType, node.type);
+    return;
+  }
+  const members: AstNode[] = node.members ?? [];
+  if (members.length !== 1 || members[0].kind !== 'IndexSignature') return;
+  const signature = members[0];
+  if (node.kind === 'TypeLiteral') makeRecordReference(node, signature.parameters[0].type, signature.type);
+  if (node.kind === 'InterfaceDeclaration') {
+    const record: AstNode = { kind: 'TypeLiteral' };
+    makeRecordReference(record, signature.parameters[0].type, signature.type);
+    delete node.members;
+    delete node.heritageClauses;
+    node.kind = 'TypeAliasDeclaration';
+    node.type = record;
+  }
+}
+
+// Turns node into the type reference Record<keyType, valueType>
+function makeRecordReference(node: AstNode, keyType: AstNode, valueType: AstNode): void {
+  for (const key of Object.keys(node)) if (key !== 'parent') delete node[key];
+  const typeName: AstNode = { kind: 'Identifier', text: 'Record' };
+  node.kind = 'TypeReference';
+  node.typeName = typeName;
+  node.typeArguments = [keyType, valueType];
+}
+
+// const Point = class { … } → class Point { … } (the variable names the class)
+function lowerClassExpressions(node: AstNode): void {
+  for (const child of childNodes(node)) lowerClassExpressions(child);
+  if (!Array.isArray(node.statements)) return;
+  node.statements = node.statements.map((statement: AstNode): AstNode => {
+    const declarations: AstNode[] = statement.kind === 'VariableStatement' ? (statement.declarationList?.declarations ?? []) : [];
+    const initializer = declarations.length === 1 ? declarations[0].initializer : undefined;
+    if (initializer?.kind !== 'ClassExpression' || !isIdentifier(declarations[0].name)) return statement;
+    return { ...initializer, kind: 'ClassDeclaration', name: declarations[0].name, modifiers: statement.modifiers };
+  });
 }
 
 function linkParents(node: AstNode, parent: AstNode | undefined): void {
@@ -824,11 +871,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('moduleUrl');
       return 'TnModuleURL()';
     }
-    if (isDynamicValue(node.expression) && node.name.text === 'length' && !isCallee(node)) {
+    if (hasDynamicProperties(node.expression) && node.name.text === 'length' && !isCallee(node)) {
       useHelper('dynamic');
       return `TnLength(${visit(node.expression)})`;
     }
-    if (isDynamicValue(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
+    if (hasDynamicProperties(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
       useHelper('dynamic');
       return `TnGet(${visit(node.expression)}, "${node.name.text}")`;
     }
@@ -2154,8 +2201,13 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (!typeName || typeName === 'interface{}') {
       return visitAnonymousStructLiteral(node);
     }
-    // Objects are pointers: the struct type is typeName without its *
-    const structName = typeName.replace(/^\*/, '');
+    // Objects are pointers: the struct type is typeName without its *; generic
+    // types are instantiated with the contextual type arguments (Box<number> → Box[float64])
+    const typeArgs =
+      isTypeReferenceNode(contextualType) && contextualType.typeName.text === typeName.replace(/^\*/, '')
+        ? getTypeArguments(contextualType.typeArguments)
+        : '';
+    const structName = typeName.replace(/^\*/, '') + (typeName.endsWith(']') ? '' : typeArgs);
     // { ...base, x: 1 } → a copy of *base with fields set
     if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
       const steps = (node.properties ?? []).map((p) => {
@@ -2170,7 +2222,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       return `func() *${structName} { var __obj ${structName}; ${steps.join('; ')}; return &__obj }()`;
     }
 
-    const fieldTypes = interfacePropertyTypes.get(structName) ?? classPropertyTypes.get(structName);
+    const fieldTypes = typeArgs ? undefined : (interfacePropertyTypes.get(structName) ?? classPropertyTypes.get(structName));
     const properties = (node.properties ?? [])
       .map((p) => {
         if (isPropertyAssignment(p)) {
@@ -2849,6 +2901,16 @@ function isDynamicValue(expr: AstNode): boolean {
   return inferExpressionType(expr) === 'interface{}';
 }
 
+// A value whose type is a type parameter (a: T in f<T>): its properties are read dynamically
+function isTypeParameterValue(expr: AstNode): boolean {
+  const type = inferExpressionType(expr);
+  return !!type && isUnboundGoType(type) && isTypeParameterInScope(type, expr);
+}
+
+function hasDynamicProperties(expr: AstNode): boolean {
+  return isDynamicValue(expr) || isTypeParameterValue(expr);
+}
+
 // Whether an expression is written to (x = …, x += …, x++)
 function isAssignmentTarget(node: AstNode): boolean {
   const parent = node.parent;
@@ -3252,6 +3314,14 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
   return undefined;
 }
 
+// A type parameter of an enclosing function or class (T inside function f<T>)
+function isTypeParameterInScope(name: string, node: AstNode): boolean {
+  for (let n = node; n; n = n.parent) {
+    if ((n.typeParameters ?? []).some((tp: AstNode) => tp.name?.text === name)) return true;
+  }
+  return false;
+}
+
 // Element type of an array literal: from its contextual type (declared
 // variable/parameter/return type), else inferred from its first typed element
 function getArrayLiteralElementType(node: AstNode): string {
@@ -3259,7 +3329,7 @@ function getArrayLiteralElementType(node: AstNode): string {
   if (isArrayTypeNode(contextual)) {
     const elem = getType(contextual.elementType);
     // An unbound type parameter (call-site []T) resolves from the elements
-    if (!isUnboundGoType(elem)) return elem;
+    if (!isUnboundGoType(elem) || isTypeParameterInScope(elem, node)) return elem;
   }
   if (contextual?.kind === 'TupleType') return getTupleElementType(contextual);
   if (
@@ -3701,10 +3771,13 @@ function inferExpressionType(expr: AstNode): string | undefined {
     if (builtinType && !declaredFunctions.has(expr.expression.text)) return builtinType;
   }
 
-  if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && isDynamicValue(expr.expression)) {
+  if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && hasDynamicProperties(expr.expression)) {
     return 'float64';
   }
   if ((isPropertyAccessExpression(expr) || isElementAccessExpression(expr)) && isDynamicValue(expr.expression)) {
+    return 'interface{}';
+  }
+  if (isPropertyAccessExpression(expr) && !isCallee(expr) && isTypeParameterValue(expr.expression)) {
     return 'interface{}';
   }
   if (
@@ -4158,6 +4231,26 @@ function isObjectTypeName(name: string): boolean {
     return members.some((m) => isPropertySignature(m)) && !members.some((m) => isMethodSignature(m));
   }
   return interfacePropertyTypes.has(name);
+}
+
+// The keys a mapped type iterates: string literals of a union, or keyof an object type
+function getMappedTypeKeys(constraint: AstNode | undefined): string[] | undefined {
+  const keys = resolveTypeNode(constraint);
+  if (!keys) return undefined;
+  if (keys.kind === 'TypeOperator' && keys.operator === 'KeyOfKeyword') {
+    const fields = getObjectTypeFields(keys.type);
+    return fields.length > 0 ? fields.map((f) => f.split(' ')[0]) : undefined;
+  }
+  const types: AstNode[] = isUnionTypeNode(keys) ? (keys.types ?? []) : [keys];
+  if (!types.every((t) => isLiteralTypeNode(t) && isStringLiteral(t.literal))) return undefined;
+  return types.map((t) => goFieldName(t.literal.text));
+}
+
+function getMappedType(typeNode: AstNode): string {
+  const valueType = typeNode.type ? getOptionalNodeType(typeNode.type, !!typeNode.questionToken) : 'interface{}';
+  const keys = getMappedTypeKeys(typeNode.typeParameter?.constraint);
+  if (keys) return `*struct{ ${keys.map((k) => `${k} ${valueType}`).join('; ')} }`;
+  return 'interface{}';
 }
 
 const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit', 'NonNullable']);
@@ -4837,6 +4930,7 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     const elementType = getType(typeNode.elementType);
     return getArrayType ? elementType : `[]${elementType}`;
   }
+  if (typeNode.kind === 'MappedType') return getMappedType(typeNode);
   // readonly T[] → T[]; keyof T → string
   if (typeNode.kind === 'TypeOperator') {
     return typeNode.operator === 'KeyOfKeyword' ? 'string' : getType(typeNode.type, getArrayType);
@@ -5974,7 +6068,8 @@ function getTypeParameters(
   const params = typeParameters.map((tp) => {
     const name = visit(tp.name);
     const constraint = tp.constraint ? getType(tp.constraint) : 'any';
-    return `${name} ${constraint}`;
+    // Go constraints cannot require fields: object-type bounds become any
+    return `${name} ${constraint.startsWith('*') ? 'any' : constraint}`;
   });
   return `[${params.join(', ')}]`;
 }
@@ -6766,7 +6861,7 @@ const helperPackages: Record<string, string[]> = {
   jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe'],
   objectAssign: ['reflect', 'unsafe'],
   typeOf: ['reflect'],
-  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp'],
+  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe'],
   regexReplaceFunc: ['regexp'],
   readFile: ['os'],
   writeFile: ['os'],
@@ -6818,6 +6913,18 @@ func TnGet(obj interface{}, key string) interface{} {
 		if key == "message" {
 			return o.message
 		}
+	}
+	rv := reflect.ValueOf(obj)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+		for _, name := range []string{key, key + "_"} {
+			if f := rv.Elem().FieldByName(name); f.IsValid() {
+				// Unexported field: read it through a pointer to bypass the flag
+				return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
+			}
+		}
+	}
+	if key == "length" {
+		return TnLength(obj)
 	}
 	return nil
 }
@@ -6886,6 +6993,9 @@ func TnLength(v interface{}) float64 {
 		return float64(len(t))
 	case []interface{}:
 		return float64(len(t))
+	}
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map {
+		return float64(rv.Len())
 	}
 	return 0
 }
