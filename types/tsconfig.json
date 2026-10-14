@@ -1,0 +1,16 @@
+{
+  // Standalone project for the TypeNative lib replacement.
+  // typenative.d.ts *replaces* the default lib (scaffolded projects use
+  // `lib: []`), so it must be checked with NO default lib. Without this,
+  // editors load lib.es5.d.ts etc. alongside it and report TS6200
+  // (Boolean, Awaited, Partial, ...) plus duplicate-identifier errors.
+  // VS Code picks this config up for files under types/.
+  "compilerOptions": {
+    "target": "es2020",
+    "lib": [],
+    "types": [],
+    "strict": true,
+    "noEmit": true
+  },
+  "include": ["./*.d.ts"]
+}
