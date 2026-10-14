@@ -32,7 +32,7 @@ npx typenative --source hello.ts --script
 ## Requirements
 
 - [Node.js v24](https://nodejs.org/en) or newer.
-- [Go 1.26](https://go.dev/doc/install) or newer.
+- [Go 1.26](https://go.dev/doc/install) or newer
 
 ## Install
 
@@ -105,11 +105,14 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 {
   "compilerOptions": {
     "target": "es2020",
-    "strict": true,
-    "types": ["typenative", "typenative/go", "typenative/npm"]
+    "lib": [],
+    "types": ["typenative", "typenative/go", "typenative/npm"],
+    "strict": true
   }
 }
 ```
+
+`lib: []` disables the standard TypeScript libraries, so `typenative`'s own declarations are the entire type surface — the compiler only accepts what actually transpiles.
 
 ## CLI reference
 
@@ -128,24 +131,30 @@ TypeNative supports a growing subset of TypeScript, not the whole language. The 
 
 **Language highlights that work today:**
 
-- `let`/`const`, functions, arrow functions, closures, recursion, rest/spread, default and optional params, destructured params.
-- Classes (inheritance, static members, getters, parameter properties, abstract, `implements`), interfaces, type aliases, generics, enums (numeric + string).
-- `if`/`switch` (incl. fallthrough), `for`/`for...of`/`while`/`do...while`, `try`/`catch`/`finally` (`throw` → `panic`, catch via `defer`/`recover`), ternaries, optional chaining, nullish coalescing, `in`, `typeof`, `instanceof`.
-- `async`/`await`, generators, custom iterators, tagged templates.
+- `let`/`const`, functions, arrow functions, closures, recursion, rest/spread, default and optional params, destructured params, `arguments`.
+- Classes (inheritance, static members/blocks, getters/setters, parameter properties, abstract, `implements`, decorators on classes and methods), interfaces, type aliases, generics (constraints, defaults), namespaces, enums (numeric, string, computed, `const`), tuples.
+- `if`/`switch` (incl. fallthrough), `for`/`for...of`/`for...in`/`while`/`do...while`, labeled loops, `try`/`catch`/`finally` (`throw` → `panic`, catch via `defer`/`recover`), ternaries, optional chaining, nullish coalescing (`??`/`??=`), `in`, `typeof`, `instanceof`, `delete`, logical assignment.
+- `async`/`await`, generators and async generators (`for await`), custom iterators (`*[Symbol.iterator]()`), tagged templates (`String.raw`), `using` (`[Symbol.dispose]`), `new.target`, `import.meta.url`, `import = require` / `export =`, dynamic `import()`.
+- Type system: literal and template-literal types, union/intersection types, conditional types with `infer`, `keyof`/mapped/indexed-access types, utility types (`Partial`, `Readonly`, `Pick`, `Omit`, `Required`, `NonNullable`, `Record`), `as const`, `satisfies`, type guards (`p is T`), assertion functions.
+- Runtime values: `bigint` literals (`2n ** 64n`) and `symbol` keys.
+- JSX: `.tsx` files render to HTML strings.
 
 **Standard library that works today:**
 
-| Area            | What to use                                                                                                                                                                            |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Console         | `console.log`, `assert` (→ `panic` on failure)                                                                                                                                         |
-| `Array`         | `push`/`pop`, `slice`/`splice`, `map`/`filter`/`reduce`, `find`/`some`/`every`, `sort` with comparator, `flat`/`flatMap`, `at`, `entries`, `join`, `reverse`, `shift`/`unshift`        |
-| `Object`        | `assign`, `keys`/`values`/`entries`, spread of records → Go maps                                                                                                                       |
-| `String`        | `split`/`slice`/`replace`, `padStart`/`padEnd`, `repeat`, search/compare, char codes, unicode                                                                                          |
-| `Number`/`Math` | `parseInt`/`parseFloat`, `toFixed`/`toString(radix)`, `isInteger`/`isNaN`, `min`/`max`/`random`                                                                                        |
-| `Map`/`Set`     | Full `set`/`get`/`has`/`delete`/`size` plus `for...of` iteration (→ Go maps)                                                                                                           |
-| `JSON`          | `parse` / `stringify`                                                                                                                                                                  |
-| `RegExp`        | Literals + `new RegExp()`, `test()`, `exec()` with groups, `i`/`m` flags (backreferences, named groups, stateful `/g` loops and lookbehind are not supported — Go `regexp` limitation) |
-| `process`       | `argv` (→ `os.Args`), `platform` (→ `runtime.GOOS`), `env`                                                                                                                             |
+| Area            | What to use                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Console         | `console.log`/`error`/`warn`, `console.time`/`timeEnd`, `assert` (→ `panic` on failure)                                                                                                                                                                                                                                                                                                                                         |
+| `Array`         | `push`/`pop`, `shift`/`unshift`, `slice`/`splice`/`concat`, `map`/`filter`/`reduce`/`reduceRight`, `find`/`findLast`/`findIndex`/`findLastIndex`, `some`/`every`/`forEach`/`includes`/`indexOf`/`lastIndexOf`, `sort` with comparator, `flat`/`flatMap`, `fill`, `at`, `entries`, `join`, `reverse`, change-by-copy (`toSorted`/`toReversed`/`toSpliced`/`with`/`copyWithin`), `Array.from`, `Array.isArray`, `new Array<T>(n)` |
+| `Object`        | `assign`, `keys`/`values`/`entries`, `fromEntries`, `hasOwn`, `defineProperty`, `getOwnPropertyNames`, integrity (`freeze`/`seal`/`preventExtensions` + `isFrozen`/`isSealed`/`isExtensible`), spread of records → Go maps                                                                                                                                                                                                      |
+| `String`        | `split`/`slice`/`replace`/`replaceAll`, `padStart`/`padEnd`, `repeat`, `match`/`matchAll`/`search`, `includes`/`startsWith`/`endsWith`, `indexOf`/`lastIndexOf`, char codes (`charAt`/`charCodeAt`/`fromCharCode`), `at`, `trim`/`trimStart`/`trimEnd`, `normalize`, `localeCompare`, `String.raw`                                                                                                                              |
+| `Number`/`Math` | `parseInt`/`parseFloat`, `toFixed`/`toPrecision`/`toString(radix)`, `Number.isInteger`/`isNaN`/`isFinite` + `MAX_SAFE_INTEGER` & friends, full `Math` (trig, hyperbolic, `log*`, `cbrt`/`hypot`, `min`/`max` incl. spread, constants)                                                                                                                                                                                           |
+| `Map`/`Set`     | Full `set`/`get`/`has`/`delete`/`clear`/`size`, `forEach`, `keys`/`values`, `for...of` iteration (→ ordered Go maps), Set operations (`union`/`intersection`/`difference`/`symmetricDifference`/`isSubsetOf`/`isSupersetOf`/`isDisjointFrom`), `WeakMap`/`WeakSet`                                                                                                                                                              |
+| `Promise`       | `new Promise` (resolve + reject), `then`/`catch`/`finally`, `resolve`/`reject`, `all`/`race`/`allSettled`/`any` (→ goroutines over channels)                                                                                                                                                                                                                                                                                    |
+| `Date`          | `new Date()` / `new Date(ms)`, `getTime`/`valueOf`, local + UTC getters, `toISOString`/`toDateString`/`toTimeString`, `Date.now()`, `Date.UTC()`                                                                                                                                                                                                                                                                                |
+| `JSON`          | `parse` / `stringify`                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `RegExp`        | Literals + `new RegExp()`, `test()`, `exec()` with named groups (`.groups`), flags `i`/`m`/`s`/`g`/`y`/`u`, stateful `lastIndex` for `/g` loops, `source`/`flags`/`global`/... properties. Backreferences, lookahead and lookbehind run on a small backtracking engine (RE2 does not support them)                                                                                                                              |
+| Globals         | `setTimeout`/`clearTimeout`, `setInterval`/`clearInterval`, `queueMicrotask`, `structuredClone`, `globalThis`, `encodeURIComponent`/`decodeURIComponent`, `isNaN`/`isFinite`, `NaN`/`Infinity`                                                                                                                                                                                                                                  |
+| `process`       | `argv` (→ `os.Args`), `platform` (→ Node-style names), `env`, `cwd`, `exit`                                                                                                                                                                                                                                                                                                                                                     |
 
 **Node built-ins (import with the `node:` prefix, mapped to Go helpers):**
 
@@ -160,7 +169,7 @@ fs.readFileSync('file.txt', 'utf-8');
 childProcess.spawnSync('go', ['version'], { encoding: 'utf-8' });
 ```
 
-Supported: `node:path` (`join`, `dirname`, `basename`, `extname`, `resolve`), `node:fs` (`read/write/append/exists/mkdir/readdir/copy/rm`), `node:os` (`platform`, `homedir`, `tmpdir`), `node:child_process` (sync `exec`/`execSync`/`spawnSync`/`spawnInherit` shape). `node:readline.question()` exists as a TypeNative sync extension for self-hosted prompts.
+Supported: `node:path` (`join`, `dirname`, `basename`, `extname`, `resolve`), `node:fs` (`read`/`write`/`append`/`exists`/`mkdir`/`readdir`/`copy`/`rm`/`unlink`), `node:url` (`fileURLToPath`, `pathToFileURL`), `node:os` (`platform`, `homedir`, `tmpdir`), `node:child_process` (sync `exec`, `execSync`, and `spawnSync` shaped like Node's `{ stdout, stderr, status }`; pass `{ stdio: 'inherit' }` to run with the parent's stdio or `{ input }` to pipe stdin). `node:readline.question()` exists as a TypeNative sync extension for self-hosted prompts.
 
 **Direct Go access (import with the `go:` prefix):**
 
@@ -171,7 +180,7 @@ import { ToUpper } from 'go:strings';
 Println(Sprintf('hi %s', ToUpper('bob')));
 ```
 
-Supported: `go:fmt` (`Println`, `Sprintf`), `go:strings` (`ToUpper`, `ToLower`), `go:strconv` (`FormatBool`).
+Any Go package can be imported this way (`import { X } from 'go:pkg'` → `pkg.X`); the typed subset declared for typechecking is `go:fmt` (`Println`, `Sprintf`), `go:strings` (`ToUpper`, `ToLower`), `go:strconv` (`FormatBool`).
 
 **npm packages:**
 

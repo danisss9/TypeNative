@@ -9,7 +9,7 @@ declare module 'node:path' {
 }
 
 declare module 'node:fs' {
-  export function readFileSync(path: string): string;
+  export function readFileSync(path: string, encoding?: string): string;
   export function writeFileSync(path: string, content: string): void;
   export function appendFileSync(path: string, content: string): void;
   export function existsSync(path: string): boolean;
@@ -17,6 +17,7 @@ declare module 'node:fs' {
   export function readdirSync(path: string): string[];
   export function copyFileSync(src: string, dest: string): void;
   export function rmSync(path: string, options?: { recursive?: boolean }): void;
+  export function unlinkSync(path: string): void;
 }
 
 declare module 'node:url' {
@@ -38,8 +39,11 @@ declare module 'node:child_process' {
   }
   export function exec(command: string): ExecResult;
   export function execSync(command: string): string;
-  export function spawnSync(file: string, args: string[], options?: object): ExecResult;
-  export function spawnInherit(file: string, ...args: string[]): number;
+  export function spawnSync(
+    file: string,
+    args: string[],
+    options?: { stdio?: string; input?: string; encoding?: string }
+  ): ExecResult;
 }
 
 declare module 'node:readline' {
