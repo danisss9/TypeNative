@@ -40,11 +40,17 @@ function vendorXText(): void {
     fs.mkdirSync(target, { recursive: true });
     for (const file of fs.readdirSync(path.join(source, pkg))) {
       if (file.endsWith('.go') && !file.endsWith('_test.go')) {
-        fs.writeFileSync(path.join(target, file), fs.readFileSync(path.join(source, pkg, file), 'utf-8'));
+        fs.writeFileSync(
+          path.join(target, file),
+          fs.readFileSync(path.join(source, pkg, file), 'utf-8')
+        );
       }
     }
   }
-  fs.writeFileSync(path.join('dist', 'tnvendor', 'x-text', 'go.mod'), 'module golang.org/x/text\n\ngo 1.23\n');
+  fs.writeFileSync(
+    path.join('dist', 'tnvendor', 'x-text', 'go.mod'),
+    'module golang.org/x/text\n\ngo 1.23\n'
+  );
   fs.writeFileSync(
     path.join('dist', 'go.mod'),
     'module tnapp\n\ngo 1.23\n\nrequire golang.org/x/text v0.0.0\n\nreplace golang.org/x/text => ./tnvendor/x-text\n'
@@ -94,7 +100,10 @@ export function run(opts: RunOptions): void {
   const tsCode: string = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath!, 'utf-8');
 
   const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-  const transpileOptions: TranspileOptions = { parse: opts.parse, tsx: !!sourcePath && sourcePath.endsWith('.tsx') };
+  const transpileOptions: TranspileOptions = {
+    parse: opts.parse,
+    tsx: !!sourcePath && sourcePath.endsWith('.tsx')
+  };
   if (sourceDir) {
     transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
       const baseDir = fromDir ?? sourceDir;
@@ -105,7 +114,9 @@ export function run(opts: RunOptions): void {
         const tsSpecifier = specifier.endsWith('.js')
           ? specifier.replace(/\.js$/, '.ts')
           : specifier;
-        const tsxSpecifier = specifier.endsWith('.js') ? specifier.replace(/\.js$/, '.tsx') : specifier + '.tsx';
+        const tsxSpecifier = specifier.endsWith('.js')
+          ? specifier.replace(/\.js$/, '.tsx')
+          : specifier + '.tsx';
         for (const candidate of [tsSpecifier + '.ts', tsxSpecifier, tsSpecifier, specifier]) {
           try {
             const fullPath = path.resolve(baseDir, candidate);
@@ -146,7 +157,8 @@ export function run(opts: RunOptions): void {
   fs.mkdirSync('dist', { recursive: true });
   // Clean up stale Go files from previous runs before writing new ones
   for (const existing of fs.readdirSync('dist')) {
-    if (existing.endsWith('.go') || existing === 'go.mod' || existing === 'go.sum') fs.rmSync(`dist/${existing}`);
+    if (existing.endsWith('.go') || existing === 'go.mod' || existing === 'go.sum')
+      fs.rmSync(`dist/${existing}`);
   }
   fs.writeFileSync('dist/code.go', transpileResult.main);
 
@@ -164,7 +176,14 @@ export function run(opts: RunOptions): void {
   }
   if (usesXText) vendorXText();
   const buildResult = usesXText
-    ? runCommand('go', ['build', '-C', 'dist', '-o', exeName, ...goFiles.map((f) => f.slice('dist/'.length))])
+    ? runCommand('go', [
+        'build',
+        '-C',
+        'dist',
+        '-o',
+        exeName,
+        ...goFiles.map((f) => f.slice('dist/'.length))
+      ])
     : runCommand('go', ['build', '-o', exePath, ...goFiles]);
   if (buildResult.status !== 0) {
     console.error('go build failed:');
@@ -288,7 +307,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${exeName}`
     },
     devDependencies: {
-      typenative: '^0.1.1'
+      typenative: '^0.1.3'
     }
   };
   return JSON.stringify(pckg, null, 2);
