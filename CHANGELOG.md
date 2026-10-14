@@ -5,6 +5,111 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-15
+
+Decorators and JSX arrive alongside a broad language-surface expansion (`using`, `new.target`,
+`for await`, namespaces, dynamic `import()`), and `types/typenative.d.ts` grows into a complete
+lib replacement. The conformance suite grows to 241 probes — including its first `.tsx` probe —
+and passes fully through the dev CLI.
+
+### Added
+
+- **Language**: `using` declarations — `[Symbol.dispose]()` runs when the enclosing block or
+  function exits, in reverse declaration order; `new.target` (constructors pass the target class
+  name through `super()` chains); `for await...of`; the `arguments` object; namespaces; computed
+  and heterogeneous enums; callable/construct signatures (`type F = { (): void }` — a class passed
+  as a value is its constructor); ambient declarations (`declare const` / `declare function` /
+  `declare module`); string, numeric and boolean literal types (single literals, unions,
+  literal-union `Record` keys)
+- **Decorators**: standard method and class decorators — decorator factories (`@tag('x')`),
+  stacked decorators, static methods — applied where the class is defined; `this` in the wrapper
+  is the decorated method's receiver; `f.call` / `f.apply`
+- **JSX**: `.tsx` files render JSX to HTML strings — text is escaped, void tags self-close
+  (`<br/>`), components are called with their props, `className` maps to `class`, boolean
+  attribute shorthand (`disabled`) and fragments flatten; both parsers take a tsx flag and
+  `.tsx` imports resolve
+- **Modules**: re-exports (`export { x } from './y'`), side-effect imports (`import './x'`),
+  dynamic `import()` (async), `import x = require('y')`; top-level statements of imported
+  modules execute through a generated `init()`
+- **Typing**: rest-parameter function types `(...args: T[]) => R` become variadic Go func types
+- **Library**: `String.normalize` — backed by `golang.org/x/text/unicode/norm`, vendored from
+  GOROOT's vendor tree via a `replace` in `dist/go.mod`, so builds need no network; object
+  literals of method-bearing interfaces; `new Set([...spread])`
+- **Type definitions**: `types/typenative.d.ts` expands by ~500 lines — `Generator`/`AsyncGenerator`
+  and the `Iterable`/`AsyncIterable` families, `Disposable`, `Awaited`, `TemplateStringsArray`,
+  `ArrayLike`, real mapped types for `Partial`/`Required`/`Readonly`/`Pick`/`Omit`/`Record`,
+  `RegExpExecArray`, constructor interfaces (`Array`/`String`/`Number`) and the `JSX` namespace
+- **Project config**: `types/tsconfig.json` — a standalone `lib: []` project for the
+  lib-replacement d.ts, so editors don't load es5 libs alongside it (TS6200, duplicate identifiers)
+
+### Changed
+
+- The conformance runner picks up `.tsx` probes; scaffolds pin `typenative ^0.1.3`; `dist/`
+  cleanup also removes stale `go.mod`/`go.sum`
+- Both parsers emit `declarationKind` (`var`/`let`/`const`/`using`/`await using`) on variable
+  declaration lists; tsparser takes `--tsx` and emits `JsxText`
+- README rewritten: requirements, quick start, CLI reference, and expanded language/stdlib tables
+
+## [0.1.2] - 2026-10-13
+
+The type system and standard library catch up with the conformance matrix: generics gain
+constraints, defaults and generic interfaces; utility types, `keyof`/`typeof`, intersections,
+conditional types and mapped types lower to Go; Promise, timer, Object, collection and math
+built-ins round out. The conformance suite grows to 219 probes (including 15 for rows that
+already worked — `console.error`/`warn`, `Map`/`Set.clear`, `node:url`, `process.cwd`, `split`
+with a RegExp, access modifiers, `const enum`, `import type`, indexed access types, literal
+types, hex/octal/binary literals, `override`, template literal types, `var`) and passes fully
+through the dev CLI; the stage-1/stage-2 bootstrap fixpoint holds.
+
+### Added
+
+- **Generics**: constraints (`T extends U`), defaults (`T = U`), generic interfaces, class
+  expressions, index signatures, `keyof` and mapped types
+- **Type operators**: `keyof T`, `typeof x`, `readonly T[]`, intersections `A & B` (merged into
+  one struct), conditional types (`T extends U ? X : Y`) with `infer`, `void`/`never`/`object`,
+  the `void` operator, `satisfies`
+- **Utility types**: `Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `NonNullable` (lowered to
+  the base type)
+- **Language**: async generators (`async function*` driven by `for await`), labeled tuple
+  elements with optional and rest members (`[x: number, y?: string, ...rest: number[]]`),
+  overload signatures, `this: T` parameters, `asserts x is T`, optional call `f?.()` (checks the
+  function value; the result is nullable), comma-separated declarators/updates in `for` headers
+  (`for (let i = 0, j = 10; …; i++, j--)` via Go's parallel forms), import renaming
+  (`import { a as b }`), `static { … }` blocks → `func init()`, self-referencing arrow functions
+  (`const f = (…) => … f(…) …`)
+- **Promises & timers**: `Promise.prototype.reject`/`catch`/`finally`, combinators
+  `race`/`allSettled`/`any`, `Promise.resolve`; `setTimeout` returns a handle that `clearTimeout`
+  stops; `setInterval`; `queueMicrotask`
+- **Objects**: `Object.hasOwn`, `Object.defineProperty`, `Object.fromEntries`, integrity methods
+  (`freeze`/`seal`/`preventExtensions`)
+- **Collections**: `WeakMap`/`WeakSet`; ES2024 `Set` operations (`union`, `intersection`,
+  `difference`, `isSubsetOf`, …); array `concat` (flattens one level), `copyWithin`, `toSpliced`,
+  `toSorted`, `toReversed`, `with`, `reduceRight`; `any` receivers accept the newer array methods
+  through array-only method casts
+- **Strings, numbers, regex**: `String.raw`, `toPrecision`, `String()`/`Boolean()` with JS
+  formatting and truthiness; regex `y`/`u` flags and `.source`/`.flags`
+- **Globals**: `globalThis`, `structuredClone`, `isFinite`, `encodeURIComponent`/
+  `decodeURIComponent`; `Math` constants (`PI`, `E`, `SQRT2`, …) and `hypot`/`cbrt`/`expm1`/
+  `log1p`/hyperbolics/inverse trig/`atan2`
+- **Date**: `getUTC*` getters and `Date.UTC`
+- **Semantics**: functions stored in `Record`s are called as values — `rec.fn(args)` lowers to
+  `rec.Get("fn")(args)` (previously dispatched as a built-in method, so `handlers.sort(x)` ran an
+  array sort); names that are also JS `Map` methods stay Map methods unless the receiver is typed
+  as a `Record`; dynamic `obj[key] = v` writes; mixed array literals (`[['a', 1]]`) become
+  `[]interface{}`
+
+### Changed
+
+- tsparser emits the raw text of template literals
+
+### Fixed
+
+- `JSON.stringify` no longer HTML-escapes `<`, `>`, `&` in the reflection path (`json.Marshal`
+  produced `\u003c`); stage 1 and stage 2 of the bootstrap generate identical Go again
+- `Date.toISOString` printed the month twice (`2006-01-01` instead of `2006-01-02`)
+- `??` passed to a nullable parameter is boxed; object literals nested in dynamic objects stay
+  dynamic; shorthand properties (`{ x }`) read narrowed variables correctly
+
 ## [0.1.1] - 2026-10-10
 
 The conformance suite is fully green: all 147 probes pass (up from 95/147), through both the dev
