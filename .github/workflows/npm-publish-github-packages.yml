@@ -27,7 +27,7 @@ jobs:
           node-version: 24
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
       - run: npm ci
       - run: npm ci
         working-directory: conformance

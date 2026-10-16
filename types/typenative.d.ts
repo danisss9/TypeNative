@@ -404,10 +404,21 @@ declare var Number: NumberConstructor;
 
 interface Console {
   log(...data: any[]): void;
+  info(...data: any[]): void;
+  debug(...data: any[]): void;
   error(...data: any[]): void;
   warn(...data: any[]): void;
+  trace(...data: any[]): void;
+  dir(item?: any, options?: { depth?: number | null }): void;
+  assert(condition?: boolean, ...data: any[]): void;
+  count(label?: string): void;
+  countReset(label?: string): void;
+  group(...label: any[]): void;
+  groupCollapsed(...label: any[]): void;
+  groupEnd(): void;
   time(label?: string): void;
   timeEnd(label?: string): void;
+  timeLog(label?: string, ...data: any[]): void;
 }
 declare var console: Console;
 
@@ -510,24 +521,73 @@ declare var Object: ObjectConstructor;
 
 interface Process {
   argv: string[];
-  platform: string;
+  readonly argv0: string;
+  readonly execArgv: string[];
+  readonly execPath: string;
+  readonly platform: string;
+  readonly arch: string;
+  readonly pid: number;
+  readonly ppid: number;
+  readonly version: string;
+  readonly versions: { readonly node: string; readonly [name: string]: string | undefined };
+  readonly title: string;
+  exitCode: number | undefined;
+  env: { [key: string]: string | undefined };
   exit(code?: number): never;
   cwd(): string;
-  env: { [key: string]: string | undefined };
+  chdir(directory: string): void;
+  hrtime: { (time?: [number, number]): [number, number]; bigint(): bigint };
+  uptime(): number;
+  memoryUsage: {
+    (): { rss: number; heapTotal: number; heapUsed: number; external: number; arrayBuffers: number };
+    rss(): number;
+  };
+  nextTick<A extends any[]>(callback: (...args: A) => void, ...args: A): void;
+  kill(pid: number, signal?: string | number): true;
+  emitWarning(warning: string | Error): void;
+  getuid(): number;
+  getgid(): number;
+  geteuid(): number;
+  getegid(): number;
+  readonly stdout: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 1 };
+  readonly stderr: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 2 };
+  readonly stdin: import('node:stream').Readable & { readonly isTTY?: boolean; readonly fd: 0 };
+  on(event: 'exit', listener: (code: number) => void): this;
+  on(event: string, listener: (...args: any[]) => void): this;
+  once(event: 'exit', listener: (code: number) => void): this;
+  once(event: string, listener: (...args: any[]) => void): this;
+  addListener(event: string, listener: (...args: any[]) => void): this;
+  off(event: string, listener: (...args: any[]) => void): this;
+  removeListener(event: string, listener: (...args: any[]) => void): this;
+  emit(event: string, ...args: any[]): boolean;
+  listenerCount(event: string): number;
 }
 declare var process: Process;
 
 // --- Error / Date ---
 
 interface Error {
+  name: string;
   message: string;
+  stack?: string;
 }
 
 interface ErrorConstructor {
   new (message?: string): Error;
+  (message?: string): Error;
 }
 
 declare var Error: ErrorConstructor;
+// Built-in Error subclasses: TnErrors carrying their name
+declare var TypeError: ErrorConstructor;
+declare var RangeError: ErrorConstructor;
+declare var SyntaxError: ErrorConstructor;
+declare var ReferenceError: ErrorConstructor;
+declare var EvalError: ErrorConstructor;
+declare var URIError: ErrorConstructor;
+type TypeError = Error;
+type RangeError = Error;
+type SyntaxError = Error;
 
 interface Date {
   getTime(): number;
@@ -719,6 +779,247 @@ interface ClassMethodDecoratorContext<
     get(object: This): Value;
   };
   addInitializer(initializer: (this: This) => void): void;
+}
+
+// --- Node.js globals (Buffer, URL, TextEncoder, AbortController, performance, …) ---
+
+type BufferEncoding =
+  | 'ascii'
+  | 'utf8'
+  | 'utf-8'
+  | 'utf16le'
+  | 'utf-16le'
+  | 'ucs2'
+  | 'ucs-2'
+  | 'base64'
+  | 'base64url'
+  | 'latin1'
+  | 'binary'
+  | 'hex';
+
+// Byte arrays: Uint8Array and Buffer are Go []byte (slices share memory)
+interface Uint8Array {
+  readonly length: number;
+  readonly byteLength: number;
+  [index: number]: number;
+  subarray(start?: number, end?: number): Uint8Array;
+  slice(start?: number, end?: number): Uint8Array;
+  set(array: ArrayLike<number>, offset?: number): void;
+  at(index: number): number | undefined;
+  [Symbol.iterator](): IterableIterator<number>;
+}
+
+interface Uint8ArrayConstructor {
+  new (length: number): Uint8Array;
+  new (array: ArrayLike<number> | Uint8Array): Uint8Array;
+  from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
+}
+
+declare var Uint8Array: Uint8ArrayConstructor;
+
+// hkdfSync returns key bytes (an ArrayBuffer in Node); wrap with Buffer.from
+interface ArrayBuffer {
+  readonly byteLength: number;
+}
+
+interface Buffer extends Uint8Array {
+  toString(encoding?: BufferEncoding, start?: number, end?: number): string;
+  toJSON(): { type: 'Buffer'; data: number[] };
+  equals(otherBuffer: Uint8Array): boolean;
+  compare(otherBuffer: Uint8Array): number;
+  subarray(start?: number, end?: number): Buffer;
+  slice(start?: number, end?: number): Buffer;
+  indexOf(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): number;
+  lastIndexOf(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): number;
+  includes(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): boolean;
+  fill(value: string | number | Uint8Array, offset?: number, end?: number): this;
+  fill(value: string, encoding: BufferEncoding): this;
+  write(string: string, offset?: number, length?: number, encoding?: BufferEncoding): number;
+  write(string: string, encoding: BufferEncoding): number;
+  copy(target: Uint8Array, targetStart?: number, sourceStart?: number, sourceEnd?: number): number;
+  readUInt8(offset?: number): number;
+  readUint8(offset?: number): number;
+  readUInt16LE(offset?: number): number;
+  readUint16LE(offset?: number): number;
+  readUInt16BE(offset?: number): number;
+  readUint16BE(offset?: number): number;
+  readUInt32LE(offset?: number): number;
+  readUint32LE(offset?: number): number;
+  readUInt32BE(offset?: number): number;
+  readUint32BE(offset?: number): number;
+  readInt8(offset?: number): number;
+  readInt16LE(offset?: number): number;
+  readInt16BE(offset?: number): number;
+  readInt32LE(offset?: number): number;
+  readInt32BE(offset?: number): number;
+  readFloatLE(offset?: number): number;
+  readFloatBE(offset?: number): number;
+  readDoubleLE(offset?: number): number;
+  readDoubleBE(offset?: number): number;
+  writeUInt8(value: number, offset?: number): number;
+  writeUint8(value: number, offset?: number): number;
+  writeUInt16LE(value: number, offset?: number): number;
+  writeUint16LE(value: number, offset?: number): number;
+  writeUInt16BE(value: number, offset?: number): number;
+  writeUint16BE(value: number, offset?: number): number;
+  writeUInt32LE(value: number, offset?: number): number;
+  writeUint32LE(value: number, offset?: number): number;
+  writeUInt32BE(value: number, offset?: number): number;
+  writeUint32BE(value: number, offset?: number): number;
+  writeInt8(value: number, offset?: number): number;
+  writeInt16LE(value: number, offset?: number): number;
+  writeInt16BE(value: number, offset?: number): number;
+  writeInt32LE(value: number, offset?: number): number;
+  writeInt32BE(value: number, offset?: number): number;
+  writeFloatLE(value: number, offset?: number): number;
+  writeFloatBE(value: number, offset?: number): number;
+  writeDoubleLE(value: number, offset?: number): number;
+  writeDoubleBE(value: number, offset?: number): number;
+}
+
+interface BufferConstructor {
+  from(data: string, encoding?: BufferEncoding): Buffer;
+  from(data: ArrayLike<number> | Uint8Array | ArrayBuffer): Buffer;
+  alloc(size: number, fill?: string | number | Uint8Array, encoding?: BufferEncoding): Buffer;
+  allocUnsafe(size: number): Buffer;
+  allocUnsafeSlow(size: number): Buffer;
+  concat(list: readonly Uint8Array[], totalLength?: number): Buffer;
+  byteLength(string: string | Uint8Array, encoding?: BufferEncoding): number;
+  isBuffer(obj: any): obj is Buffer;
+  isEncoding(encoding: string): encoding is BufferEncoding;
+  compare(buf1: Uint8Array, buf2: Uint8Array): -1 | 0 | 1;
+}
+
+declare var Buffer: BufferConstructor;
+
+declare function atob(data: string): string;
+declare function btoa(data: string): string;
+
+interface TextEncoder {
+  readonly encoding: string;
+  encode(input?: string): Uint8Array;
+}
+declare var TextEncoder: { new (): TextEncoder };
+
+interface TextDecoder {
+  readonly encoding: string;
+  decode(input?: Uint8Array): string;
+}
+declare var TextDecoder: { new (label?: string): TextDecoder };
+
+interface URLSearchParams extends Iterable<[string, string]> {
+  readonly size: number;
+  append(name: string, value: string): void;
+  delete(name: string, value?: string): void;
+  get(name: string): string | null;
+  getAll(name: string): string[];
+  has(name: string, value?: string): boolean;
+  set(name: string, value: string): void;
+  sort(): void;
+  toString(): string;
+  forEach(callback: (value: string, key: string, parent: URLSearchParams) => void): void;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  entries(): IterableIterator<[string, string]>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+declare var URLSearchParams: {
+  new (init?: string | Record<string, string> | readonly (readonly [string, string])[] | URLSearchParams): URLSearchParams;
+};
+
+interface URL {
+  href: string;
+  protocol: string;
+  username: string;
+  password: string;
+  host: string;
+  hostname: string;
+  port: string;
+  pathname: string;
+  search: string;
+  hash: string;
+  readonly origin: string;
+  readonly searchParams: URLSearchParams;
+  toString(): string;
+  toJSON(): string;
+}
+declare var URL: {
+  new (input: string | URL, base?: string | URL): URL;
+  canParse(input: string, base?: string): boolean;
+  parse(input: string, base?: string): URL | null;
+};
+
+interface Event {
+  readonly type: string;
+  readonly defaultPrevented: boolean;
+  readonly target: any;
+  readonly timeStamp: number;
+  preventDefault(): void;
+}
+declare var Event: { new (type: string, options?: { cancelable?: boolean }): Event };
+
+interface EventTarget {
+  addEventListener(type: string, listener: (event: Event) => void, options?: { once?: boolean }): void;
+  removeEventListener(type: string, listener: (event: Event) => void): void;
+  dispatchEvent(event: Event): boolean;
+}
+declare var EventTarget: { new (): EventTarget };
+
+interface AbortSignal extends EventTarget {
+  readonly aborted: boolean;
+  readonly reason: any;
+  onabort: ((event: Event) => void) | null;
+  throwIfAborted(): void;
+}
+declare var AbortSignal: {
+  abort(reason?: any): AbortSignal;
+  timeout(milliseconds: number): AbortSignal;
+  any(signals: AbortSignal[]): AbortSignal;
+};
+
+interface AbortController {
+  readonly signal: AbortSignal;
+  abort(reason?: any): void;
+}
+declare var AbortController: { new (): AbortController };
+
+interface PerformanceEntry {
+  readonly name: string;
+  readonly entryType: string;
+  readonly startTime: number;
+  readonly duration: number;
+  readonly detail?: any;
+}
+interface Performance {
+  readonly timeOrigin: number;
+  now(): number;
+  mark(name: string, options?: { startTime?: number; detail?: any }): PerformanceEntry;
+  measure(name: string, startMark?: string, endMark?: string): PerformanceEntry;
+  measure(name: string, options: { start?: string; end?: string }): PerformanceEntry;
+  getEntries(): PerformanceEntry[];
+  getEntriesByName(name: string, type?: string): PerformanceEntry[];
+  getEntriesByType(type: string): PerformanceEntry[];
+  clearMarks(name?: string): void;
+  clearMeasures(name?: string): void;
+}
+declare var performance: Performance;
+
+declare var crypto: {
+  randomUUID(): string;
+  getRandomValues<T extends Uint8Array>(array: T): T;
+};
+
+declare function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): number;
+declare function clearImmediate(immediate?: number): void;
+
+declare namespace NodeJS {
+  // Errors thrown by Node APIs: err.code ('ENOENT', 'ERR_INVALID_URL', …)
+  interface ErrnoException extends Error {
+    errno?: number;
+    code?: string;
+    path?: string;
+    syscall?: string;
+  }
 }
 
 // --- Test helper ---

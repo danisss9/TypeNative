@@ -202,7 +202,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Namespace imports                                  |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts)           | `import * as x from 'pkg'`                                                                                             |
 | Local file imports                                 |   ✅    | [syntax-import-local.ts](conformance/syntax-import-local.ts)     | Relative paths transpiled to a separate Go file (helper: [import-local-helper.ts](conformance/import-local-helper.ts)) |
 | Default export                                     |   ✅    | [syntax-default-export.ts](conformance/syntax-default-export.ts) | `export default function`                                                                                              |
-| Node.js built-in imports                           |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts)                 | `import { join } from 'node:path'` mapped to Go stdlib (see [Standard library](#standard-library))                     |
+| Node.js built-in imports                           |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts)                 | `node:x` or bare (`'fs'`), named / default / namespace imports, subpaths (`fs/promises`) (see [Node builtins](#node-builtins-node)) |
 | Go package imports                                 |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts)           | `import { x } from 'go:pkg'`                                                                                           |
 | npm package imports                                |   ✅    | [syntax-import-npm.ts](conformance/syntax-import-npm.ts)         | `import { x } from 'pkg'` mapped to Go module imports                                                                  |
 | Re-exports (`export { x } from`, `export *`)       |   ✅    | [syntax-re-exports.ts](conformance/syntax-re-exports.ts)         | Re-exported files are included (one Go package)                                                                        |
@@ -214,16 +214,16 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 
 | Feature                                              | Status | Probe                                                        | Notes                                                                                          |
 | ---------------------------------------------------- | :----: | ------------------------------------------------------------ | --------------------------------------                                                         |
-| `async` / `await`                                    |   ✅    | [syntax-async-await.ts](conformance/syntax-async-await.ts)   | Async functions send returns over a channel; `await` receives; pending work drains before exit |
-| `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | `new Promise` executor runs in a goroutine; `.then` consumes the channel on a wait group       |
+| `async` / `await`                                    |   ✅    | [syntax-async-await.ts](conformance/syntax-async-await.ts)   | The body runs synchronously until its first `await`; `await` runs pending event-loop tasks while it waits; the loop drains before exit |
+| `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | The executor runs synchronously; promises are buffered channels; `.then` callbacks run on the event loop |
 | `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | `TnPromiseAll` drains every promise channel into a slice                                       |
 | `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                                             |
 | `Promise.reject` / `.catch` / `.finally`             |   ✅    | [lib-promise-catch.ts](conformance/lib-promise-catch.ts)     | Rejected promises are closed channels with a reason; `await` rethrows                          |
 | `Promise.race` / `allSettled` / `any`                |   ✅    | [lib-promise-combinators.ts](conformance/lib-promise-combinators.ts) | Goroutine per promise; first settled / all settled / first fulfilled                           |
 | `clearTimeout`                                       |   ✅    | [lib-timers.ts](conformance/lib-timers.ts)                   | `TnClearTimeout` stops the timer                                                               |
-| `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker`; the process lives until cleared                                                 |
-| `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or a timer callback)                      |
-| `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` registered on a wait group the process waits on                               |
+| `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker` posting to the event loop; the process lives until cleared                       |
+| `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or of an event-loop task)                 |
+| `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` posting the callback to the event loop, which keeps the process alive          |
 
 ## Semantics (JS behaviour preserved)
 
@@ -254,10 +254,12 @@ Every standard-library API TypeNative ports, split by module. Per
 
 | API                                | Status | Probe                                                  | Notes                                                  |
 | ---------------------------------- | :----: | ------------------------------------------------------ | ------------------------------------------------------ |
-| `console.log`                      |   ✅    | [lib-console-log.ts](conformance/lib-console-log.ts)   | Mapped to `fmt.Println`                                |
+| `console.log`                      |   ✅    | [lib-console-log.ts](conformance/lib-console-log.ts)   | `fmt.Println`; non-string arguments print like Node (`util.inspect`), format strings like `util.format` |
 | `console.error`                    |   ✅    | [lib-console-error.ts](conformance/lib-console-error.ts) | `fmt.Fprintln(os.Stderr, ...)`                         |
 | `console.warn`                     |   ✅    | [lib-console-error.ts](conformance/lib-console-error.ts) | Mapped to stderr like `console.error`                  |
-| `console.time` / `console.timeEnd` |   ✅    | [lib-console-time.ts](conformance/lib-console-time.ts) | Via `time.Now` / `time.Since`                          |
+| `console.time` / `console.timeEnd` / `console.timeLog` |   ✅    | [lib-console-time.ts](conformance/lib-console-time.ts) | Node's format: `label: 1.234ms`                         |
+| `console.info` / `debug` / `dir` / `count` / `countReset` / `group` / `groupEnd` / `assert` / `trace` | ✅ | [lib-console-more.ts](conformance/lib-console-more.ts) | `group` indents every later console line; `assert` prints `Assertion failed` |
+| `console.table`                    |   ❌    | —                                                      | Not implemented                                        |
 
 ### `Math`
 
@@ -410,10 +412,15 @@ Every standard-library API TypeNative ports, split by module. Per
 | API                                         | Status | Probe                                                              | Notes                                    |
 | ------------------------------------------- | :----: | ------------------------------------------------------------------ | ---------------------------------------- |
 | `assert`                                    |   ✅    | [lib-console-log.ts](conformance/lib-console-log.ts)               | Transpiled to `panic` on failure         |
-| `process.argv` / `process.platform`         |   ✅    | [lib-process.ts](conformance/lib-process.ts)                       | Mapped to `os.Args` / `runtime.GOOS`     |
+| `process.argv` / `process.platform`         |   ✅    | [lib-process.ts](conformance/lib-process.ts)                       | Node's shapes (`[execPath, script, ...args]`, `win32`); the rest of `process` is in [node:process](#nodeprocess) |
 | `process.env`                               |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts) | Environment variable access              |
-| `process.exit`                              |   ✅    | [lib-process-exit.ts](conformance/lib-process-exit.ts)             | `os.Exit`                                |
+| `process.exit`                              |   ✅    | [lib-process-exit.ts](conformance/lib-process-exit.ts)             | `os.Exit`, after `process.on('exit')` listeners |
 | `process.cwd()`                             |   ✅    | [lib-process-cwd.ts](conformance/lib-process-cwd.ts)               | `os.Getwd()`                             |
+| `Buffer` / `Uint8Array` / `TextEncoder` / `TextDecoder` / `atob` / `btoa` | ✅ | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts) | See [node:buffer](#nodebuffer)           |
+| `URL` / `URLSearchParams`                   |   ✅    | [lib-node-url-class.ts](conformance/lib-node-url-class.ts)         | See [node:url](#nodeurl)                 |
+| `EventTarget` / `Event` / `AbortController` / `AbortSignal` | ✅ | [lib-node-abort.ts](conformance/lib-node-abort.ts) | See [node:events](#nodeevents)           |
+| `performance` / `setImmediate` / `crypto`   |   ✅    | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts)       | See [perf_hooks](#nodeperf_hooks), [timers](#nodetimers), [crypto](#nodecrypto) |
+| `TypeError` / `RangeError` / `SyntaxError` & co. | ✅ | [lib-node-assert.ts](conformance/lib-node-assert.ts)             | `TnError`s carrying their `name`; `instanceof` checks the name |
 | `Infinity`                                  |   ✅    | [lib-globals.ts](conformance/lib-globals.ts)                       | `math.Inf(1)`                            |
 | Global `isNaN` / `isFinite`                 |   ✅    | [lib-globals.ts](conformance/lib-globals.ts)                       | `math.IsNaN` / `math.IsInf`              |
 | `encodeURIComponent` / `decodeURIComponent` |   ✅    | [lib-uri.ts](conformance/lib-uri.ts)                               | `TnEncodeURIComponent` / `url.PathUnescape` |
@@ -422,56 +429,250 @@ Every standard-library API TypeNative ports, split by module. Per
 
 ### Node builtins (`node:*`)
 
-| Module                                                                               | Status | Probe                                            | Notes                                                 |
-| ------------------------------------------------------------------------------------ | :----: | ------------------------------------------------ | ----------------------------------------------------- |
-| `node:path` (`join`, `dirname`, `basename`, `extname`, `resolve`)                    |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts) | Mapped to Go `path`/`filepath`                        |
-| `node:fs` (`read/write/append/exists/mkdir/readdir/copy/rm/unlink`)                  |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | Via Go helpers                                        |
-| `node:url` (`fileURLToPath`, `pathToFileURL`)                                        |   ✅    | [lib-node-url.ts](conformance/lib-node-url.ts)   | `TnFileURLToPath` / `TnPathToFileURL`                 |
-| `node:os` (`platform`, `homedir`, `tmpdir`)                                          |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | `platform()` covered; `homedir`/`tmpdir` unprobed     |
-| `node:child_process` (`exec`, `execSync`, `spawnSync`, `spawnInherit`)               |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)     | Sync API shape, stdio-inherit runs                    |
-| `node:readline` (`question`)                                                         |   ❌    | —                                                | Declared (TypeNative sync extension) but no probe yet |
-| `node:assert` / `node:assert/strict`                                                 |   ❌    | —                                                | Undeclared; global `assert` is mapped to `panic`      |
-| `node:async_hooks`                                                                   |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:buffer`                                                                        |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:cluster`                                                                       |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:console`                                                                       |   ❌    | —                                                | Undeclared; global `console` methods are mapped       |
-| `node:constants`                                                                     |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:crypto`                                                                        |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:dgram`                                                                         |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:diagnostics_channel`                                                           |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:dns` / `node:dns/promises`                                                     |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:domain`                                                                        |   ❌    | —                                                | Deprecated upstream; undeclared                       |
-| `node:events`                                                                        |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:fs/promises`                                                                   |   ❌    | —                                                | Undeclared; sync `node:fs` subset only                |
-| `node:http`                                                                          |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:http2`                                                                         |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:https`                                                                         |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:inspector` / `node:inspector/promises`                                         |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:module`                                                                        |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:net`                                                                           |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:path/posix` / `node:path/win32`                                                |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:perf_hooks`                                                                    |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:process`                                                                       |   ❌    | —                                                | Undeclared; global `process` partially mapped         |
-| `node:punycode`                                                                      |   ❌    | —                                                | Deprecated upstream; undeclared                       |
-| `node:querystring`                                                                   |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:readline/promises`                                                             |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:repl`                                                                          |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:sea`                                                                           |   ❌    | —                                                | Undeclared; unsupported (`node:`-only module)         |
-| `node:sqlite`                                                                        |   ❌    | —                                                | Undeclared; unsupported (`node:`-only module)         |
-| `node:stream` / `node:stream/consumers` / `node:stream/promises` / `node:stream/web` |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:string_decoder`                                                                |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:sys`                                                                           |   ❌    | —                                                | Deprecated alias of `node:util`; undeclared           |
-| `node:test` / `node:test/reporters`                                                  |   ❌    | —                                                | Undeclared; unsupported (`node:`-only module)         |
-| `node:timers` / `node:timers/promises`                                               |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:tls`                                                                           |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:trace_events`                                                                  |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:tty`                                                                           |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:util` / `node:util/types`                                                      |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:v8`                                                                            |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:vm`                                                                            |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:wasi`                                                                          |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:worker_threads`                                                                |   ❌    | —                                                | Undeclared; unsupported                               |
-| `node:zlib`                                                                          |   ❌    | —                                                | Undeclared; unsupported                               |
+Every module can be imported as `node:x` or by its bare name (`fs`), with
+named, default or namespace imports; subpaths (`fs/promises`, `path/posix`,
+`stream/promises`, …) work too. Signatures follow `@types/node`
+([types/typenative-npm.d.ts](types/typenative-npm.d.ts)). Callbacks, timers, I/O
+completions and events run on one event loop, one at a time, as in Node; an
+async function runs synchronously until its first `await`.
+
+| Module                                      | Status | Section                                                    |
+| ------------------------------------------- | :----: | ---------------------------------------------------------- |
+| `node:assert` / `node:assert/strict`        |   ✅    | [assert](#nodeassert)                                       |
+| `node:buffer` (+ globals `Buffer`, `Uint8Array`, `atob`, `btoa`) | ✅ | [buffer](#nodebuffer)                                 |
+| `node:child_process`                        |   ✅    | [child_process](#nodechild_process)                         |
+| `node:console`                              |   ✅    | [console](#nodeconsole)                                     |
+| `node:constants`                            |   ✅    | [constants](#nodeconstants--nodesys)                        |
+| `node:crypto` (+ global `crypto`)           |   ✅    | [crypto](#nodecrypto)                                       |
+| `node:diagnostics_channel`                  |   ✅    | [diagnostics_channel](#nodediagnostics_channel)             |
+| `node:events` (+ `EventTarget`, `AbortController`) | ✅ | [events](#nodeevents)                                      |
+| `node:fs` / `node:fs/promises`              |   ✅    | [fs](#nodefs)                                               |
+| `node:os`                                   |   ✅    | [os](#nodeos)                                               |
+| `node:path` / `path/posix` / `path/win32`   |   ✅    | [path](#nodepath)                                           |
+| `node:perf_hooks` (+ global `performance`)  |   ✅    | [perf_hooks](#nodeperf_hooks)                               |
+| `node:process` (+ global `process`)         |   ✅    | [process](#nodeprocess)                                     |
+| `node:punycode`                             |   ✅    | [punycode](#nodepunycode)                                   |
+| `node:querystring`                          |   ✅    | [querystring](#nodequerystring)                             |
+| `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
+| `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
+| `node:string_decoder`                       |   ✅    | [string_decoder](#nodestring_decoder)                       |
+| `node:sys`                                  |   ✅    | [constants / sys](#nodeconstants--nodesys)                  |
+| `node:timers` / `node:timers/promises`      |   ✅    | [timers](#nodetimers)                                       |
+| `node:tty`                                  |   ✅    | [tty](#nodetty)                                             |
+| `node:url` (+ globals `URL`, `URLSearchParams`) | ✅  | [url](#nodeurl)                                             |
+| `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
+| `node:zlib`                                 |   ✅    | [zlib](#nodezlib)                                           |
+
+#### `node:path`
+
+| API                                                                 | Status | Probe                                                                    | Notes                                                                 |
+| ------------------------------------------------------------------- | :----: | ------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `join` / `dirname` / `basename` / `extname` / `resolve`             |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts)                         | Ports of Node's algorithms (not Go's `filepath`): same results as Node |
+| `normalize` / `relative` / `isAbsolute` / `parse` / `format` / `sep` / `delimiter` | ✅ | [lib-node-path-more.ts](conformance/lib-node-path-more.ts) | Trailing separators, `.bashrc`-style extensions, `''` for same paths   |
+| `path.posix` / `path.win32` / `node:path/posix` / `toNamespacedPath` |   ✅    | [lib-node-path-posix-win32.ts](conformance/lib-node-path-posix-win32.ts) | Both flavours on every OS (drive letters, UNC roots); `path` is the platform's |
+| `matchesGlob`                                                       |   ❌    | —                                                                        | Not implemented                                                       |
+
+#### `node:buffer`
+
+| API                                                                                     | Status | Probe                                                                          | Notes                                                                                  |
+| --------------------------------------------------------------------------------------- | :----: | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `Buffer.from` / `alloc` / `concat` / `byteLength` / `isBuffer` / `compare`; `buf[i]`, `length` | ✅ | [lib-node-buffer.ts](conformance/lib-node-buffer.ts)                          | Buffers are Go `[]byte`; `subarray` / `slice` share memory; writes wrap modulo 256      |
+| `toString` / `equals` / `indexOf` / `includes` / `fill` / `write` / `copy`              |   ✅    | [lib-node-buffer.ts](conformance/lib-node-buffer.ts)                           | `` `${buf}` `` decodes UTF-8; `console.log(buf)` prints `<Buffer 68 69>`                |
+| Encodings (utf8, hex, base64, base64url, latin1, ascii, utf16le); `atob` / `btoa`        |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | Invalid UTF-8 bytes decode to U+FFFD, as in Node                                        |
+| `TextEncoder` / `TextDecoder`, minimal `Uint8Array`                                     |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | `Uint8Array` is `[]byte` too: `length`, indexing, `subarray`, `slice`, `set`            |
+| `read*` / `write*` (U)Int8/16/32 LE/BE, Float, Double                                    |   ✅    | [lib-node-buffer-binary.ts](conformance/lib-node-buffer-binary.ts)             | Out-of-range offsets throw `ERR_OUT_OF_RANGE`                                           |
+| BigInt64 reads / writes, `swap16/32/64`, other typed arrays                             |   ❌    | —                                                                              | Not implemented                                                                        |
+
+#### `node:fs`
+
+| API                                                                                     | Status | Probe                                                                  | Notes                                                                                     |
+| --------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `readFileSync` / `writeFileSync` / `appendFileSync` / `existsSync` / `rmSync`           |   ✅    | [lib-node-fs.ts](conformance/lib-node-fs.ts)                           | `readFileSync` returns a Buffer without an encoding, a string with one; `flag` option     |
+| `statSync` / `lstatSync` (`Stats`) / `renameSync` / `copyFileSync` / `truncateSync` / `realpathSync` / `accessSync` / `unlinkSync` | ✅ | [lib-node-fs-stat.ts](conformance/lib-node-fs-stat.ts) | `throwIfNoEntry: false`; Go exposes only the modification time portably, so `atime` / `ctime` / `birthtime` report it too |
+| `mkdirSync` / `mkdtempSync` / `readdirSync` (`withFileTypes`, `recursive`) / `rmdirSync` / `cpSync` |   ✅    | [lib-node-fs-dirs.ts](conformance/lib-node-fs-dirs.ts)                 | `Dirent` with `isFile()` / `isDirectory()` / `parentPath`                                  |
+| Node system errors (`err.code` / `syscall` / `path` / `errno`)                          |   ✅    | [lib-node-fs-errors.ts](conformance/lib-node-fs-errors.ts)             | `ENOENT: no such file or directory, open 'x'`; `EEXIST`, `ENOTEMPTY`, `ERR_FS_EISDIR`, `COPYFILE_EXCL` |
+| File descriptors: `openSync` / `readSync` / `writeSync` / `fstatSync` / `closeSync`     |   ✅    | [lib-node-fs-fd.ts](conformance/lib-node-fs-fd.ts)                     | Flags `r`, `w`, `a`, `+`, `x`; positional reads and writes                                 |
+| Callback API (`readFile(path, enc, (err, data) => …)` & co.)                            |   ✅    | [lib-node-fs-callbacks.ts](conformance/lib-node-fs-callbacks.ts)       | Work runs on a goroutine; callbacks run on the event loop                                 |
+| `fs/promises` / `fs.promises` (incl. `FileHandle` from `open`)                          |   ✅    | [lib-node-fs-promises.ts](conformance/lib-node-fs-promises.ts)         | Rejections carry the error code                                                            |
+| `createReadStream` / `createWriteStream`                                                |   ✅    | [lib-node-fs-streams.ts](conformance/lib-node-fs-streams.ts)           | `encoding`, `start` / `end`, `highWaterMark`, `flags`                                      |
+| `chmodSync` / `utimesSync` / `symlinkSync` / `readlinkSync` / `linkSync`                |   ✅    | —                                                                      | Implemented, not probed (symlinks need privileges on Windows)                             |
+| `watch` / `watchFile`                                                                   |   ❌    | —                                                                      | Go's standard library has no file-system notifications                                    |
+
+#### `node:os`
+
+| API                                                                                          | Status | Probe                                        | Notes                                                                   |
+| -------------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | ----------------------------------------------------------------------- |
+| `platform` / `arch` / `type` / `machine` / `EOL` / `devNull` / `endianness`                  |   ✅    | [lib-node-os.ts](conformance/lib-node-os.ts) | Node's names (`win32`, `x64`, `Windows_NT`, `x86_64`)                    |
+| `hostname` / `homedir` / `tmpdir` / `userInfo` / `cpus` / `availableParallelism` / `networkInterfaces` / `constants.signals` | ✅ | [lib-node-os.ts](conformance/lib-node-os.ts) | `cpus()` has one entry per logical CPU (model / speed / times are zero) |
+| `totalmem` / `freemem` / `uptime` / `loadavg` / `release` / `version`                         |   ❌    | —                                            | Not portable in Go's standard library                                   |
+
+#### `node:process`
+
+| API                                                                                                  | Status | Probe                                                          | Notes                                                                       |
+| ---------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `argv` / `argv0` / `execPath` / `execArgv` / `pid` / `ppid` / `arch` / `version` / `versions`         |   ✅    | [lib-node-process.ts](conformance/lib-node-process.ts)         | `argv` has Node's shape: `[execPath, script, ...args]`; `version` is `v24.0.0`; `versions.go` is Go's |
+| `hrtime` / `hrtime.bigint` / `uptime` / `memoryUsage` / `chdir` / `cwd` / `stdout.write` / `nextTick` / `exitCode` | ✅ | [lib-node-process.ts](conformance/lib-node-process.ts) | `exitCode` is applied when the event loop drains                            |
+| `process.env` reads, writes, `delete`, `in`, `Object.keys(process.env)`; `import { env } from 'node:process'` | ✅ | [lib-node-process-env.ts](conformance/lib-node-process-env.ts) | `os.Setenv` / `os.Unsetenv`; missing variables read as `""`                  |
+| `process.on('exit' \| 'SIGINT' \| 'SIGTERM' \| 'SIGHUP')` / `once` / `off` / `emit`                   |   ✅    | [lib-node-process-events.ts](conformance/lib-node-process-events.ts) | `'exit'` runs after the event loop with the exit code; signals arrive on the loop |
+| `process.stdin` / `stdout` / `stderr` as streams                                                     |   ✅    | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `stdin` keeps the process alive only while flowing                           |
+| `kill` / `emitWarning` / `getuid` / `getgid`                                                         |   ✅    | —                                                              | Implemented, not probed                                                     |
+| `on('uncaughtException')` / `on('beforeExit')` / `cpuUsage` / `umask` / `stdout.columns`              |   ❌    | —                                                              | Not implemented                                                             |
+
+#### `node:console`
+
+| API                                                         | Status | Probe                                                      | Notes                                                   |
+| ----------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------- |
+| Module re-export (`import { log } from 'node:console'`)     |   ✅    | [lib-node-console-class.ts](conformance/lib-node-console-class.ts) | Same as the global `console`                            |
+| `new Console(stdout, stderr)` / `new Console({ stdout, stderr })` |   ✅    | [lib-node-console-class.ts](conformance/lib-node-console-class.ts) | `log` / `info` / `debug` / `error` / `warn` / `dir` |
+
+#### `node:util`
+
+| API                                                                                   | Status | Probe                                                            | Notes                                                                                     |
+| ------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `format` / `formatWithOptions` (`%s %d %i %f %j %o %O %c %%`)                          |   ✅    | [lib-node-util-format.ts](conformance/lib-node-util-format.ts)   | Extra arguments appended; also used by `console.log`                                       |
+| `inspect` (`depth`, `breakLength`, `compact`)                                          |   ✅    | [lib-node-util-inspect.ts](conformance/lib-node-util-inspect.ts) | Node's layout rules: single line up to 80 columns, number arrays grouped in columns, `Map(1) {…}`, `ClassName {…}`, `[Circular *1]` |
+| `isDeepStrictEqual` / `types.*` (`node:util/types`) / `deprecate` / `stripVTControlCharacters` / `styleText` | ✅ | [lib-node-util-misc.ts](conformance/lib-node-util-misc.ts) | `styleText` colours only TTYs unless `validateStream: false`                               |
+| `promisify` / `callbackify`                                                           |   ✅    | [lib-node-util-promisify.ts](conformance/lib-node-util-promisify.ts) | Node functions map to their promise versions at compile time (`fs.readFile`, `setTimeout`, `exec`); other functions are wrapped |
+| `parseArgs` / `inherits` / `inspect.custom` / `getSystemErrorName`                     |   ❌    | —                                                                | Not implemented                                                                           |
+
+#### `node:assert`
+
+| API                                                                                       | Status | Probe                                                          | Notes                                                                       |
+| ----------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `assert` / `ok` / `equal` / `strictEqual` (+ `not*`) / `match` / `throws` / `doesNotThrow` / `fail` / `ifError`; `node:assert/strict` | ✅ | [lib-node-assert.ts](conformance/lib-node-assert.ts) | Failures throw an `AssertionError` (`code: 'ERR_ASSERTION'`, `actual`, `expected`, `operator`); `throws` validates with a RegExp, class or object |
+| `deepEqual` / `deepStrictEqual` (+ `not*`) / `rejects` / `doesNotReject`                   |   ✅    | [lib-node-assert-deep.ts](conformance/lib-node-assert-deep.ts) | Key order is ignored for objects, Maps and Sets; failure messages are simplified (no diff) |
+
+#### `node:url`
+
+| API                                                                                          | Status | Probe                                                                  | Notes                                                                                      |
+| -------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `fileURLToPath` / `pathToFileURL`                                                            |   ✅    | [lib-node-url.ts](conformance/lib-node-url.ts)                         | `pathToFileURL` returns a `URL`; Windows drive letters                                      |
+| `URL` (WHATWG): parsing, relative resolution, getters / setters, `canParse`, `parse`; `domainToASCII` / `domainToUnicode`; `format` | ✅ | [lib-node-url-class.ts](conformance/lib-node-url-class.ts) | Special schemes, dot segments, default ports, percent-encode sets, IDN hosts (punycode); invalid input throws `ERR_INVALID_URL` |
+| `URLSearchParams` (and `url.searchParams`, kept in sync)                                     |   ✅    | [lib-node-url-search-params.ts](conformance/lib-node-url-search-params.ts) | `for...of`, `forEach`, `sort`, construction from strings / objects / pairs                  |
+| Legacy `url.parse` / `url.resolve`                                                           |   ❌    | —                                                                      | Deprecated upstream; not implemented                                                       |
+
+#### `node:querystring`
+
+| API                                                                   | Status | Probe                                                        | Notes                                      |
+| --------------------------------------------------------------------- | :----: | ------------------------------------------------------------ | ------------------------------------------ |
+| `parse` / `stringify` / `escape` / `unescape` / `decode` / `encode`   |   ✅    | [lib-node-querystring.ts](conformance/lib-node-querystring.ts) | Repeated keys become arrays; custom separators |
+
+#### `node:punycode`
+
+| API                                           | Status | Probe                                                    | Notes                           |
+| --------------------------------------------- | :----: | -------------------------------------------------------- | ------------------------------- |
+| `encode` / `decode` / `toASCII` / `toUnicode` |   ✅    | [lib-node-punycode.ts](conformance/lib-node-punycode.ts) | RFC 3492 (deprecated upstream)  |
+
+#### `node:string_decoder`
+
+| API                                     | Status | Probe                                                              | Notes                                                       |
+| --------------------------------------- | :----: | ------------------------------------------------------------------ | ----------------------------------------------------------- |
+| `StringDecoder` (`write` / `end`)       |   ✅    | [lib-node-string-decoder.ts](conformance/lib-node-string-decoder.ts) | Holds back split UTF-8 / UTF-16LE characters and base64 groups |
+
+#### `node:crypto`
+
+| API                                                                       | Status | Probe                                                            | Notes                                                                     |
+| ------------------------------------------------------------------------- | :----: | ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `createHash` / `createHmac` / `hash` / `getHashes` (`update` / `digest` / `copy`) | ✅ | [lib-node-crypto-hash.ts](conformance/lib-node-crypto-hash.ts) | md5, sha1, sha224/256/384/512, sha512-224/256, sha3-224/256/384/512        |
+| `randomBytes` / `randomUUID` / `randomInt` / `getRandomValues` / `timingSafeEqual`; global `crypto` | ✅ | [lib-node-crypto-random.ts](conformance/lib-node-crypto-random.ts) | `crypto/rand`                                                              |
+| `pbkdf2Sync` / `hkdfSync`                                                 |   ✅    | [lib-node-crypto-kdf.ts](conformance/lib-node-crypto-kdf.ts)     | `crypto/pbkdf2` / `crypto/hkdf` (Go 1.24+)                                 |
+| `createCipheriv` / `createDecipheriv` (aes-128/192/256-cbc/ctr/gcm)       |   ✅    | [lib-node-crypto-cipher.ts](conformance/lib-node-crypto-cipher.ts) | GCM output arrives from `final()` (authenticated as a whole)               |
+| `scrypt` / async `pbkdf2` / `randomBytes(n, cb)` / keys / `sign` / `verify` / `webcrypto.subtle` | ❌ | — | Not implemented (`scrypt` has no Go standard-library implementation)       |
+
+#### `node:zlib`
+
+| API                                                                                                  | Status | Probe                                                      | Notes                                                    |
+| ---------------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | -------------------------------------------------------- |
+| `gzipSync` / `gunzipSync` / `deflateSync` / `inflateSync` / `deflateRawSync` / `inflateRawSync` / `unzipSync` / `crc32` / `constants` | ✅ | [lib-node-zlib.ts](conformance/lib-node-zlib.ts) | `{ level }`; invalid input throws `Z_DATA_ERROR` |
+| `createGzip` / `createGunzip` / `createDeflate` / `createInflate` / `createDeflateRaw` / `createInflateRaw` / `createUnzip` | ✅ | [lib-node-zlib-streams.ts](conformance/lib-node-zlib-streams.ts) | Transforms that (de)compress when the input ends |
+| Brotli (`brotliCompressSync` & co.) and callback forms                                                |   ❌    | —                                                          | Go's standard library has no Brotli codec                 |
+
+#### `node:timers`
+
+| API                                                                              | Status | Probe                                                              | Notes                                                                      |
+| -------------------------------------------------------------------------------- | :----: | ------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| `setTimeout` / `setInterval` / `setImmediate` (+ extra arguments) / `clear*`; global `setImmediate` | ✅ | [lib-node-timers.ts](conformance/lib-node-timers.ts) | Callbacks run on the event loop                                             |
+| `node:timers/promises` (`setTimeout`, `setImmediate`, `setInterval`, `scheduler`) |   ✅    | [lib-node-timers-promises.ts](conformance/lib-node-timers-promises.ts) | `{ signal }` aborts; `setInterval` is an async iterator                      |
+| `Timeout#ref` / `unref` / `refresh`                                              |   ❌    | —                                                                  | Timers are Go timers without those methods                                 |
+
+#### `node:perf_hooks`
+
+| API                                                                                    | Status | Probe                                                      | Notes                                       |
+| -------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------- |
+| `performance.now` / `timeOrigin` / `mark` / `measure` / `getEntries*` / `clearMarks`; global `performance` | ✅ | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Monotonic milliseconds since process start |
+| `PerformanceObserver` / `monitorEventLoopDelay` / `timerify`                            |   ❌    | —                                                          | Not implemented                             |
+
+#### `node:tty`
+
+| API          | Status | Probe                                                      | Notes                                    |
+| ------------ | :----: | ---------------------------------------------------------- | ---------------------------------------- |
+| `isatty(fd)` |   ✅    | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Character-device check on fds 0–2        |
+| `ReadStream` / `WriteStream` (`columns`, `setRawMode`) | ❌ | — | Terminal sizes need non-portable syscalls |
+
+#### `node:constants` / `node:sys`
+
+| API                                       | Status | Probe                                                      | Notes                                                |
+| ----------------------------------------- | :----: | ---------------------------------------------------------- | ---------------------------------------------------- |
+| `node:constants` (`F_OK`, `SIGINT`, …)    |   ✅    | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Deprecated upstream: `fs.constants` + `os.constants.signals` |
+| `node:sys`                                |   ✅    | —                                                          | Deprecated alias of `node:util`                      |
+
+#### `node:events`
+
+| API                                                                                                  | Status | Probe                                                          | Notes                                                                      |
+| ---------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `EventEmitter`: `on` / `once` / `off` / `prepend*` / `emit` / `removeAllListeners` / `listenerCount` / `eventNames` / max listeners / `newListener`; unhandled `'error'` throws | ✅ | [lib-node-events.ts](conformance/lib-node-events.ts) | Listeners are called with any signature; removal by identity                |
+| `class X extends EventEmitter`                                                                       |   ✅    | [lib-node-events-extends.ts](conformance/lib-node-events-extends.ts) | The emitter is embedded; `this.emit` and inherited methods work           |
+| `events.once` (→ promise) / `events.on` (async iterator)                                             |   ✅    | [lib-node-events-once.ts](conformance/lib-node-events-once.ts) | `'error'` rejects `once`                                                   |
+| `EventTarget` / `Event` / `AbortController` / `AbortSignal` (`abort`, `timeout`, `any`, `throwIfAborted`) | ✅ | [lib-node-abort.ts](conformance/lib-node-abort.ts)            | Globals (also exported by `node:events`)                                   |
+| `captureRejections` / `errorMonitor` / symbol event names                                            |   ❌    | —                                                              | Not implemented                                                            |
+
+#### `node:stream`
+
+| API                                                                                                   | Status | Probe                                                                | Notes                                                                                        |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `Readable` (`push`, `read`, `pause` / `resume`, `setEncoding`, `destroy`), `Readable.from`, `for await` | ✅    | [lib-node-stream-readable.ts](conformance/lib-node-stream-readable.ts) | Arrays, strings, Buffers and async generators as sources                                      |
+| `Writable` (`write` / `end` / callbacks, `final`, `'finish'`, write after end)                         |   ✅    | [lib-node-stream-writable.ts](conformance/lib-node-stream-writable.ts) | Strings become Buffers unless `decodeStrings: false` or `objectMode`                          |
+| `Transform` / `PassThrough` / `Duplex`, `pipe` chains, subclasses overriding `_transform` & co.        |   ✅    | [lib-node-stream-transform.ts](conformance/lib-node-stream-transform.ts) | Option methods (`transform`, `flush`, `write`, `final`, `read`) and `_`-overrides both work; `this` inside option methods is not the stream (use the callback) |
+| `pipeline` / `finished` / `stream/promises` / `stream/consumers` (`text`, `json`, `buffer`)           |   ✅    | [lib-node-stream-pipeline.ts](conformance/lib-node-stream-pipeline.ts) | Errors destroy the pipeline and reach the callback / rejection                               |
+| Backpressure (`highWaterMark` beyond `write()`'s return value), `stream/web`, `compose`, `Readable.toWeb` | ❌  | —                                                                    | Not implemented                                                                              |
+
+#### `node:readline`
+
+| API                                                                                     | Status | Probe                                                                    | Notes                                                                   |
+| --------------------------------------------------------------------------------------- | :----: | ------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `createInterface` (`'line'` / `'close'`, `question(q, cb)`, `prompt`, `close`, `for await`) |   ✅    | [lib-node-readline.ts](conformance/lib-node-readline.ts)                 | Any readable stream as input (`process.stdin` included)                  |
+| `node:readline/promises` (`await rl.question(q)`)                                        |   ✅    | [lib-node-readline-promises.ts](conformance/lib-node-readline-promises.ts) |                                                                         |
+| `question(prompt)` (synchronous)                                                        |   ✅    | [lib-node-readline-question.ts](conformance/lib-node-readline-question.ts) | TypeNative extension (not in Node): used by the self-hosted compiler     |
+| Terminal features (`cursorTo`, `emitKeypressEvents`, history, completer)                |   ❌    | —                                                                        | Not implemented                                                         |
+
+#### `node:child_process`
+
+| API                                                                                              | Status | Probe                                                                      | Notes                                                                                     |
+| ------------------------------------------------------------------------------------------------ | :----: | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `execSync` / `execFileSync` / `spawnSync` (`encoding`, `input`, `cwd`, `env`, `shell`, `stdio: 'inherit'`) | ✅ | [lib-node-child-process-sync.ts](conformance/lib-node-child-process-sync.ts) | Buffers unless an encoding is given (as in Node); a non-zero exit throws with `status` / `stdout` / `stderr` |
+| `exec` / `execFile` (callbacks), `spawn` → `ChildProcess` (stdio streams, `'exit'` / `'close'`, `kill`); `promisify(exec)` | ✅ | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `'close'` follows the end of the stdio streams being read; exit codes on `err.code`     |
+| `fork` / IPC / `detached`, `stdio` arrays beyond stdout                                          |   ❌    | —                                                                          | Not implemented                                                                           |
+
+#### `node:diagnostics_channel`
+
+| API                                                                                  | Status | Probe                                                                        | Notes                         |
+| ------------------------------------------------------------------------------------ | :----: | ---------------------------------------------------------------------------- | ----------------------------- |
+| `channel` / `publish` / `subscribe` / `unsubscribe` / `hasSubscribers`               |   ✅    | [lib-node-diagnostics-channel.ts](conformance/lib-node-diagnostics-channel.ts) | Synchronous; shared by name   |
+| `tracingChannel`                                                                     |   ❌    | —                                                                            | Not implemented               |
+
+#### Not supported yet
+
+| Module                                                                               | Status | Probe | Notes                                                                                      |
+| ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
+| `node:async_hooks` (`AsyncLocalStorage`, `createHook`)                               |   ❌    | —     | Async function bodies resume on their own goroutines; context can't follow them reliably    |
+| `node:http` / `node:https` / `node:http2`                                            |   ❌    | —     | Networking: a later phase                                                                  |
+| `node:net` / `node:tls` / `node:dgram` / `node:dns` / `node:dns/promises`            |   ❌    | —     | Networking: a later phase                                                                  |
+| `node:worker_threads` / `node:cluster`                                               |   ❌    | —     | A later phase (one Go binary, no JS isolates)                                              |
+| `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
+| `node:test` / `node:test/reporters`                                                  |   ❌    | —     | Not implemented                                                                            |
+| `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
+| `node:domain`                                                                        |   ❌    | —     | Deprecated upstream                                                                        |
+| `node:stream/web`                                                                    |   ❌    | —     | Web streams are not implemented                                                            |
 
 ### Go bridges (`go:*`)
 

@@ -1,53 +1,989 @@
-// Type definitions for TypeNative NPM standard library modules
+// Type definitions for the Node.js standard library modules TypeNative lowers
+// to Go (see conformance.md for the feature matrix). Signatures follow
+// @types/node; only what the transpiler implements is declared.
+// `readline.question()` is a TypeNative extension (synchronous line input).
+//
+// Each module uses `export =` so named, default and namespace imports all work;
+// bare specifiers ('fs') and subpaths ('fs/promises') re-export the `node:` ones.
 
 declare module 'node:path' {
-  export function join(...parts: string[]): string;
-  export function dirname(p: string): string;
-  export function basename(p: string, ext?: string): string;
-  export function extname(p: string): string;
-  export function resolve(...parts: string[]): string;
+  namespace path {
+    interface ParsedPath {
+      root: string;
+      dir: string;
+      base: string;
+      ext: string;
+      name: string;
+    }
+    interface FormatInputPathObject {
+      root?: string;
+      dir?: string;
+      base?: string;
+      ext?: string;
+      name?: string;
+    }
+    interface PlatformPath {
+      readonly sep: '\\' | '/';
+      readonly delimiter: ';' | ':';
+      join(...paths: string[]): string;
+      resolve(...paths: string[]): string;
+      normalize(path: string): string;
+      relative(from: string, to: string): string;
+      dirname(path: string): string;
+      basename(path: string, suffix?: string): string;
+      extname(path: string): string;
+      isAbsolute(path: string): boolean;
+      parse(path: string): ParsedPath;
+      format(pathObject: FormatInputPathObject): string;
+      toNamespacedPath(path: string): string;
+      readonly posix: PlatformPath;
+      readonly win32: PlatformPath;
+    }
+  }
+  const path: path.PlatformPath;
+  export = path;
+}
+declare module 'node:path/posix' {
+  import path = require('node:path');
+  const posix: path.PlatformPath;
+  export = posix;
+}
+declare module 'node:path/win32' {
+  import path = require('node:path');
+  const win32: path.PlatformPath;
+  export = win32;
+}
+
+declare module 'node:buffer' {
+  namespace buffer {
+    const Buffer: BufferConstructor;
+    type Buffer = globalThis.Buffer;
+    function atob(data: string): string;
+    function btoa(data: string): string;
+    const constants: { readonly MAX_LENGTH: number };
+  }
+  export = buffer;
 }
 
 declare module 'node:fs' {
-  export function readFileSync(path: string, encoding?: string): string;
-  export function writeFileSync(path: string, content: string): void;
-  export function appendFileSync(path: string, content: string): void;
-  export function existsSync(path: string): boolean;
-  export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
-  export function readdirSync(path: string): string[];
-  export function copyFileSync(src: string, dest: string): void;
-  export function rmSync(path: string, options?: { recursive?: boolean }): void;
-  export function unlinkSync(path: string): void;
+  import { Readable, Writable } from 'node:stream';
+  namespace fs {
+    type PathLike = string;
+    type EncodingOption = BufferEncoding | { encoding?: BufferEncoding | null; flag?: string } | null;
+    interface StatsBase {
+      isFile(): boolean;
+      isDirectory(): boolean;
+      isSymbolicLink(): boolean;
+      isFIFO(): boolean;
+      isSocket(): boolean;
+      isBlockDevice(): boolean;
+      isCharacterDevice(): boolean;
+    }
+    interface Stats extends StatsBase {
+      dev: number;
+      ino: number;
+      mode: number;
+      nlink: number;
+      uid: number;
+      gid: number;
+      rdev: number;
+      size: number;
+      blksize: number;
+      blocks: number;
+      atimeMs: number;
+      mtimeMs: number;
+      ctimeMs: number;
+      birthtimeMs: number;
+      atime: Date;
+      mtime: Date;
+      ctime: Date;
+      birthtime: Date;
+    }
+    interface Dirent extends StatsBase {
+      name: string;
+      parentPath: string;
+      path: string;
+    }
+    interface WriteFileOptions {
+      encoding?: BufferEncoding | null;
+      flag?: string;
+      mode?: number;
+    }
+    interface MakeDirectoryOptions {
+      recursive?: boolean;
+      mode?: number;
+    }
+    interface RmOptions {
+      recursive?: boolean;
+      force?: boolean;
+    }
+    interface ReadStream extends Readable {
+      readonly path: string;
+      readonly bytesRead: number;
+    }
+    interface WriteStream extends Writable {
+      readonly path: string;
+      readonly bytesWritten: number;
+    }
+    type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
+
+    const constants: {
+      readonly F_OK: number;
+      readonly R_OK: number;
+      readonly W_OK: number;
+      readonly X_OK: number;
+      readonly COPYFILE_EXCL: number;
+      readonly COPYFILE_FICLONE: number;
+      readonly COPYFILE_FICLONE_FORCE: number;
+      readonly O_RDONLY: number;
+      readonly O_WRONLY: number;
+      readonly O_RDWR: number;
+      readonly S_IFMT: number;
+      readonly S_IFREG: number;
+      readonly S_IFDIR: number;
+      readonly S_IFLNK: number;
+    };
+    const F_OK: number;
+    const R_OK: number;
+    const W_OK: number;
+    const X_OK: number;
+
+    // --- sync ---
+    function readFileSync(path: PathLike | number, options?: { encoding?: null; flag?: string } | null): Buffer;
+    function readFileSync(path: PathLike | number, options: BufferEncoding | { encoding: BufferEncoding; flag?: string }): string;
+    function writeFileSync(file: PathLike | number, data: string | Uint8Array, options?: WriteFileOptions | BufferEncoding): void;
+    function appendFileSync(file: PathLike | number, data: string | Uint8Array, options?: WriteFileOptions | BufferEncoding): void;
+    function existsSync(path: PathLike): boolean;
+    function mkdirSync(path: PathLike, options?: MakeDirectoryOptions | number): string | undefined;
+    function readdirSync(path: PathLike, options?: BufferEncoding | { encoding?: BufferEncoding; withFileTypes?: false; recursive?: boolean }): string[];
+    function readdirSync(path: PathLike, options: { withFileTypes: true; recursive?: boolean }): Dirent[];
+    function statSync(path: PathLike, options?: { throwIfNoEntry?: true }): Stats;
+    function statSync(path: PathLike, options: { throwIfNoEntry: false }): Stats | undefined;
+    function lstatSync(path: PathLike, options?: { throwIfNoEntry?: true }): Stats;
+    function lstatSync(path: PathLike, options: { throwIfNoEntry: false }): Stats | undefined;
+    function fstatSync(fd: number): Stats;
+    function renameSync(oldPath: PathLike, newPath: PathLike): void;
+    function rmSync(path: PathLike, options?: RmOptions): void;
+    function rmdirSync(path: PathLike, options?: { recursive?: boolean }): void;
+    function unlinkSync(path: PathLike): void;
+    function copyFileSync(src: PathLike, dest: PathLike, mode?: number): void;
+    function cpSync(source: string, destination: string, options?: { recursive?: boolean; force?: boolean }): void;
+    function realpathSync(path: PathLike): string;
+    namespace realpathSync {
+      function native(path: PathLike): string;
+    }
+    function mkdtempSync(prefix: string): string;
+    function truncateSync(path: PathLike, len?: number): void;
+    function chmodSync(path: PathLike, mode: number | string): void;
+    function utimesSync(path: PathLike, atime: number | string | Date, mtime: number | string | Date): void;
+    function symlinkSync(target: PathLike, path: PathLike, type?: string): void;
+    function readlinkSync(path: PathLike): string;
+    function linkSync(existingPath: PathLike, newPath: PathLike): void;
+    function accessSync(path: PathLike, mode?: number): void;
+    function openSync(path: PathLike, flags?: string, mode?: number | string): number;
+    function closeSync(fd: number): void;
+    function readSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
+    function writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
+    function writeSync(fd: number, string: string, position?: number | null): number;
+    function fsyncSync(fd: number): void;
+    function ftruncateSync(fd: number, len?: number): void;
+
+    // --- callbacks: work on a goroutine, the callback on the event loop ---
+    function readFile(path: PathLike, callback: (err: NodeJS.ErrnoException | null, data: Buffer) => void): void;
+    function readFile(path: PathLike, options: { encoding?: null; flag?: string } | null | undefined, callback: (err: NodeJS.ErrnoException | null, data: Buffer) => void): void;
+    function readFile(path: PathLike, options: BufferEncoding | { encoding: BufferEncoding; flag?: string }, callback: (err: NodeJS.ErrnoException | null, data: string) => void): void;
+    function writeFile(file: PathLike, data: string | Uint8Array, callback: NoParamCallback): void;
+    function writeFile(file: PathLike, data: string | Uint8Array, options: WriteFileOptions | BufferEncoding, callback: NoParamCallback): void;
+    function appendFile(file: PathLike, data: string | Uint8Array, callback: NoParamCallback): void;
+    function appendFile(file: PathLike, data: string | Uint8Array, options: WriteFileOptions | BufferEncoding, callback: NoParamCallback): void;
+    function mkdir(path: PathLike, callback: (err: NodeJS.ErrnoException | null, path?: string) => void): void;
+    function mkdir(path: PathLike, options: MakeDirectoryOptions | number, callback: (err: NodeJS.ErrnoException | null, path?: string) => void): void;
+    function readdir(path: PathLike, callback: (err: NodeJS.ErrnoException | null, files: string[]) => void): void;
+    function readdir(path: PathLike, options: { withFileTypes?: false; recursive?: boolean } | BufferEncoding, callback: (err: NodeJS.ErrnoException | null, files: string[]) => void): void;
+    function readdir(path: PathLike, options: { withFileTypes: true; recursive?: boolean }, callback: (err: NodeJS.ErrnoException | null, files: Dirent[]) => void): void;
+    function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function unlink(path: PathLike, callback: NoParamCallback): void;
+    function rm(path: PathLike, callback: NoParamCallback): void;
+    function rm(path: PathLike, options: RmOptions, callback: NoParamCallback): void;
+    function rmdir(path: PathLike, callback: NoParamCallback): void;
+    function rename(oldPath: PathLike, newPath: PathLike, callback: NoParamCallback): void;
+    function copyFile(src: PathLike, dest: PathLike, callback: NoParamCallback): void;
+    function copyFile(src: PathLike, dest: PathLike, mode: number, callback: NoParamCallback): void;
+    function cp(source: string, destination: string, options: { recursive?: boolean; force?: boolean }, callback: NoParamCallback): void;
+    function access(path: PathLike, callback: NoParamCallback): void;
+    function access(path: PathLike, mode: number, callback: NoParamCallback): void;
+    function realpath(path: PathLike, callback: (err: NodeJS.ErrnoException | null, resolvedPath: string) => void): void;
+    function mkdtemp(prefix: string, callback: (err: NodeJS.ErrnoException | null, folder: string) => void): void;
+    function truncate(path: PathLike, len: number, callback: NoParamCallback): void;
+    function chmod(path: PathLike, mode: number | string, callback: NoParamCallback): void;
+    function utimes(path: PathLike, atime: number | string | Date, mtime: number | string | Date, callback: NoParamCallback): void;
+    function symlink(target: PathLike, path: PathLike, callback: NoParamCallback): void;
+    function readlink(path: PathLike, callback: (err: NodeJS.ErrnoException | null, linkString: string) => void): void;
+    function link(existingPath: PathLike, newPath: PathLike, callback: NoParamCallback): void;
+    /** @deprecated */
+    function exists(path: PathLike, callback: (exists: boolean) => void): void;
+
+    // --- streams ---
+    function createReadStream(path: PathLike, options?: BufferEncoding | { encoding?: BufferEncoding; start?: number; end?: number; highWaterMark?: number }): ReadStream;
+    function createWriteStream(path: PathLike, options?: BufferEncoding | { flags?: string; encoding?: BufferEncoding }): WriteStream;
+
+    const promises: typeof import('node:fs/promises');
+  }
+  export = fs;
+}
+
+declare module 'node:fs/promises' {
+  import fs = require('node:fs');
+  namespace promises {
+    interface FileHandle {
+      readonly fd: number;
+      readFile(options?: { encoding?: null } | null): Promise<Buffer>;
+      readFile(options: BufferEncoding | { encoding: BufferEncoding }): Promise<string>;
+      writeFile(data: string | Uint8Array, options?: fs.WriteFileOptions | BufferEncoding): Promise<void>;
+      appendFile(data: string | Uint8Array, options?: fs.WriteFileOptions | BufferEncoding): Promise<void>;
+      read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Buffer }>;
+      write(data: string | Uint8Array, ...args: any[]): Promise<{ bytesWritten: number; buffer: any }>;
+      stat(): Promise<fs.Stats>;
+      truncate(len?: number): Promise<void>;
+      sync(): Promise<void>;
+      close(): Promise<void>;
+    }
+    const constants: typeof fs.constants;
+    function readFile(path: fs.PathLike, options?: { encoding?: null; flag?: string } | null): Promise<Buffer>;
+    function readFile(path: fs.PathLike, options: BufferEncoding | { encoding: BufferEncoding; flag?: string }): Promise<string>;
+    function writeFile(file: fs.PathLike, data: string | Uint8Array, options?: fs.WriteFileOptions | BufferEncoding): Promise<void>;
+    function appendFile(file: fs.PathLike, data: string | Uint8Array, options?: fs.WriteFileOptions | BufferEncoding): Promise<void>;
+    function mkdir(path: fs.PathLike, options?: fs.MakeDirectoryOptions | number): Promise<string | undefined>;
+    function readdir(path: fs.PathLike, options?: BufferEncoding | { withFileTypes?: false; recursive?: boolean }): Promise<string[]>;
+    function readdir(path: fs.PathLike, options: { withFileTypes: true; recursive?: boolean }): Promise<fs.Dirent[]>;
+    function stat(path: fs.PathLike): Promise<fs.Stats>;
+    function lstat(path: fs.PathLike): Promise<fs.Stats>;
+    function unlink(path: fs.PathLike): Promise<void>;
+    function rm(path: fs.PathLike, options?: fs.RmOptions): Promise<void>;
+    function rmdir(path: fs.PathLike, options?: { recursive?: boolean }): Promise<void>;
+    function rename(oldPath: fs.PathLike, newPath: fs.PathLike): Promise<void>;
+    function copyFile(src: fs.PathLike, dest: fs.PathLike, mode?: number): Promise<void>;
+    function cp(source: string, destination: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+    function access(path: fs.PathLike, mode?: number): Promise<void>;
+    function realpath(path: fs.PathLike): Promise<string>;
+    function mkdtemp(prefix: string): Promise<string>;
+    function truncate(path: fs.PathLike, len?: number): Promise<void>;
+    function chmod(path: fs.PathLike, mode: number | string): Promise<void>;
+    function utimes(path: fs.PathLike, atime: number | string | Date, mtime: number | string | Date): Promise<void>;
+    function symlink(target: fs.PathLike, path: fs.PathLike): Promise<void>;
+    function readlink(path: fs.PathLike): Promise<string>;
+    function link(existingPath: fs.PathLike, newPath: fs.PathLike): Promise<void>;
+    function open(path: fs.PathLike, flags?: string, mode?: number | string): Promise<FileHandle>;
+  }
+  export = promises;
 }
 
 declare module 'node:url' {
-  export function fileURLToPath(url: string): string;
-  export function pathToFileURL(path: string): string;
+  namespace url {
+    const URL: typeof globalThis.URL;
+    type URL = globalThis.URL;
+    const URLSearchParams: typeof globalThis.URLSearchParams;
+    type URLSearchParams = globalThis.URLSearchParams;
+    function fileURLToPath(url: string | URL): string;
+    function pathToFileURL(path: string): URL;
+    function format(url: URL | string): string;
+    function domainToASCII(domain: string): string;
+    function domainToUnicode(domain: string): string;
+  }
+  export = url;
+}
+
+declare module 'node:querystring' {
+  namespace querystring {
+    interface ParsedUrlQuery {
+      [key: string]: string | string[] | undefined;
+    }
+    type ParsedUrlQueryInput = { [key: string]: string | number | boolean | bigint | readonly (string | number | boolean | bigint)[] | null | undefined };
+    function parse(str: string, sep?: string, eq?: string): ParsedUrlQuery;
+    function decode(str: string, sep?: string, eq?: string): ParsedUrlQuery;
+    function stringify(obj: ParsedUrlQueryInput, sep?: string, eq?: string): string;
+    function encode(obj: ParsedUrlQueryInput, sep?: string, eq?: string): string;
+    function escape(str: string): string;
+    function unescape(str: string): string;
+  }
+  export = querystring;
+}
+
+declare module 'node:punycode' {
+  /** @deprecated punycode is deprecated upstream */
+  namespace punycode {
+    function encode(input: string): string;
+    function decode(input: string): string;
+    function toASCII(domain: string): string;
+    function toUnicode(domain: string): string;
+    const version: string;
+  }
+  export = punycode;
+}
+
+declare module 'node:string_decoder' {
+  namespace string_decoder {
+    class StringDecoder {
+      constructor(encoding?: BufferEncoding);
+      readonly encoding: BufferEncoding;
+      write(buffer: string | Uint8Array): string;
+      end(buffer?: string | Uint8Array): string;
+    }
+  }
+  export = string_decoder;
 }
 
 declare module 'node:os' {
-  export function platform(): string;
-  export function homedir(): string;
-  export function tmpdir(): string;
+  namespace os {
+    interface UserInfo {
+      username: string;
+      uid: number;
+      gid: number;
+      shell: string | null;
+      homedir: string;
+    }
+    interface CpuInfo {
+      model: string;
+      speed: number;
+      times: { user: number; nice: number; sys: number; idle: number; irq: number };
+    }
+    interface NetworkInterfaceInfo {
+      address: string;
+      netmask: string;
+      family: 'IPv4' | 'IPv6';
+      mac: string;
+      internal: boolean;
+      cidr: string | null;
+      scopeid?: number;
+    }
+    const EOL: string;
+    const devNull: string;
+    const constants: { readonly signals: { readonly [name: string]: number; readonly SIGINT: number; readonly SIGTERM: number; readonly SIGKILL: number; readonly SIGHUP: number } };
+    function platform(): string;
+    function arch(): string;
+    function type(): string;
+    function machine(): string;
+    function hostname(): string;
+    function homedir(): string;
+    function tmpdir(): string;
+    function endianness(): 'BE' | 'LE';
+    function userInfo(): UserInfo;
+    function cpus(): CpuInfo[];
+    function availableParallelism(): number;
+    function networkInterfaces(): Record<string, NetworkInterfaceInfo[]>;
+  }
+  export = os;
+}
+
+declare module 'node:process' {
+  const process: Process;
+  export = process;
+}
+
+declare module 'node:console' {
+  namespace console {
+    class Console {
+      constructor(stdout: import('node:stream').Writable, stderr?: import('node:stream').Writable);
+      constructor(options: { stdout: import('node:stream').Writable; stderr?: import('node:stream').Writable });
+      log(...data: any[]): void;
+      info(...data: any[]): void;
+      debug(...data: any[]): void;
+      error(...data: any[]): void;
+      warn(...data: any[]): void;
+      dir(item: any, options?: { depth?: number | null }): void;
+    }
+    function log(...data: any[]): void;
+    function info(...data: any[]): void;
+    function debug(...data: any[]): void;
+    function error(...data: any[]): void;
+    function warn(...data: any[]): void;
+    function dir(item: any, options?: { depth?: number | null }): void;
+    function count(label?: string): void;
+    function countReset(label?: string): void;
+    function group(...label: any[]): void;
+    function groupEnd(): void;
+    function time(label?: string): void;
+    function timeEnd(label?: string): void;
+    function timeLog(label?: string, ...data: any[]): void;
+    function trace(...data: any[]): void;
+    function assert(condition?: boolean, ...data: any[]): void;
+  }
+  export = console;
+}
+
+declare module 'node:util' {
+  namespace util {
+    interface InspectOptions {
+      depth?: number | null;
+      breakLength?: number;
+      compact?: boolean | number;
+    }
+    function format(format?: any, ...param: any[]): string;
+    function formatWithOptions(inspectOptions: InspectOptions, format?: any, ...param: any[]): string;
+    function inspect(object: any, options?: InspectOptions): string;
+    function isDeepStrictEqual(val1: unknown, val2: unknown): boolean;
+    function deprecate<T extends (...args: any[]) => any>(fn: T, msg: string, code?: string): T;
+    function stripVTControlCharacters(str: string): string;
+    function styleText(format: string | string[], text: string, options?: { validateStream?: boolean }): string;
+    /** @deprecated */
+    function isArray(object: unknown): object is unknown[];
+    // Node callback functions map to their promise variants (fs.readFile → fs/promises.readFile,
+    // exec → { stdout, stderr }); other (…args, (err, value) => void) functions are wrapped
+    function promisify(fn: typeof import('node:child_process').exec): (command: string, options?: { cwd?: string; env?: Record<string, string | undefined> }) => Promise<{ stdout: string; stderr: string }>;
+    function promisify(fn: typeof import('node:child_process').execFile): (file: string, args?: readonly string[], options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
+    function promisify(fn: typeof globalThis.setTimeout): <T = void>(ms?: number, value?: T) => Promise<T>;
+    function promisify(fn: typeof import('node:fs').readFile): typeof import('node:fs/promises').readFile;
+    function promisify(fn: typeof import('node:fs').writeFile): typeof import('node:fs/promises').writeFile;
+    function promisify<T, A extends any[]>(fn: (...args: [...A, (err: any, result?: T) => void]) => void): (...args: A) => Promise<T>;
+    function promisify(fn: Function): (...args: any[]) => Promise<any>;
+    function callbackify<T, A extends any[]>(fn: (...args: A) => Promise<T>): (...args: [...A, (err: unknown, result: T) => void]) => void;
+    const types: typeof import('node:util/types');
+    const TextEncoder: typeof globalThis.TextEncoder;
+    const TextDecoder: typeof globalThis.TextDecoder;
+  }
+  export = util;
+}
+
+declare module 'node:util/types' {
+  namespace types {
+    function isDate(object: unknown): object is Date;
+    function isRegExp(object: unknown): object is RegExp;
+    function isPromise(object: unknown): object is Promise<unknown>;
+    function isMap(object: unknown): object is Map<unknown, unknown>;
+    function isSet(object: unknown): object is Set<unknown>;
+    function isNativeError(object: unknown): object is Error;
+    function isUint8Array(object: unknown): object is Uint8Array;
+    function isAnyArrayBuffer(object: unknown): boolean;
+    function isBoxedPrimitive(object: unknown): boolean;
+    function isGeneratorObject(object: unknown): boolean;
+    function isAsyncFunction(object: unknown): boolean;
+  }
+  export = types;
+}
+
+declare module 'node:assert' {
+  function assert(value: unknown, message?: string | Error): asserts value;
+  namespace assert {
+    class AssertionError extends Error {
+      actual: unknown;
+      expected: unknown;
+      operator: string;
+      generatedMessage: boolean;
+      code: 'ERR_ASSERTION';
+    }
+    type ErrorValidator = RegExp | Function | { message?: string | RegExp; code?: string; name?: string } | ((err: any) => boolean);
+    function ok(value: unknown, message?: string | Error): asserts value;
+    function equal(actual: unknown, expected: unknown, message?: string | Error): void;
+    function notEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+    function strictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T;
+    function notStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+    function deepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+    function notDeepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+    function deepStrictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T;
+    function notDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+    function throws(block: () => unknown, message?: string | Error): void;
+    function throws(block: () => unknown, error: ErrorValidator, message?: string | Error): void;
+    function doesNotThrow(block: () => unknown, message?: string | Error): void;
+    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
+    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, error: ErrorValidator, message?: string | Error): Promise<void>;
+    function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
+    function match(value: string, regExp: RegExp, message?: string | Error): void;
+    function doesNotMatch(value: string, regExp: RegExp, message?: string | Error): void;
+    function fail(message?: string | Error): never;
+    function ifError(value: unknown): asserts value is null | undefined;
+    const strict: typeof assert;
+  }
+  export = assert;
+}
+declare module 'node:assert/strict' {
+  import assert = require('node:assert');
+  export = assert;
+}
+
+declare module 'node:crypto' {
+  namespace crypto {
+    type BinaryLike = string | Uint8Array;
+    type BinaryToTextEncoding = 'base64' | 'base64url' | 'hex' | 'binary';
+    interface Hash {
+      update(data: BinaryLike, inputEncoding?: BufferEncoding): Hash;
+      digest(): Buffer;
+      digest(encoding: BinaryToTextEncoding | BufferEncoding): string;
+      copy(): Hash;
+    }
+    interface Hmac {
+      update(data: BinaryLike, inputEncoding?: BufferEncoding): Hmac;
+      digest(): Buffer;
+      digest(encoding: BinaryToTextEncoding | BufferEncoding): string;
+    }
+    interface Cipheriv {
+      update(data: BinaryLike): Buffer;
+      update(data: string, inputEncoding: BufferEncoding | undefined, outputEncoding: BufferEncoding): string;
+      final(): Buffer;
+      final(outputEncoding: BufferEncoding): string;
+      setAAD(buffer: Uint8Array, options?: { plaintextLength: number }): this;
+      getAuthTag(): Buffer;
+      setAutoPadding(autoPadding?: boolean): this;
+    }
+    interface Decipheriv {
+      update(data: Uint8Array): Buffer;
+      update(data: string, inputEncoding: BufferEncoding, outputEncoding: BufferEncoding): string;
+      final(): Buffer;
+      final(outputEncoding: BufferEncoding): string;
+      setAAD(buffer: Uint8Array, options?: { plaintextLength: number }): this;
+      setAuthTag(buffer: Uint8Array): this;
+      setAutoPadding(autoPadding?: boolean): this;
+    }
+    function createHash(algorithm: string): Hash;
+    function createHmac(algorithm: string, key: BinaryLike): Hmac;
+    function hash(algorithm: string, data: BinaryLike, outputEncoding?: BinaryToTextEncoding): string;
+    function getHashes(): string[];
+    function getCiphers(): string[];
+    function randomBytes(size: number): Buffer;
+    function randomUUID(): string;
+    function randomInt(max: number): number;
+    function randomInt(min: number, max: number): number;
+    function getRandomValues<T extends Uint8Array>(typedArray: T): T;
+    function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean;
+    function pbkdf2Sync(password: BinaryLike, salt: BinaryLike, iterations: number, keylen: number, digest: string): Buffer;
+    function hkdfSync(digest: string, ikm: BinaryLike, salt: BinaryLike, info: BinaryLike, keylen: number): ArrayBuffer;
+    function createCipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Cipheriv;
+    function createDecipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Decipheriv;
+    const webcrypto: typeof crypto;
+  }
+  export = crypto;
+}
+
+declare module 'node:zlib' {
+  namespace zlib {
+    interface ZlibOptions {
+      level?: number;
+    }
+    type InputType = string | Uint8Array;
+    function gzipSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function gunzipSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function deflateSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function inflateSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function deflateRawSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function inflateRawSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function unzipSync(buf: InputType, options?: ZlibOptions): Buffer;
+    function crc32(data: string | Uint8Array, value?: number): number;
+    function createGzip(options?: ZlibOptions): import('node:stream').Transform;
+    function createGunzip(options?: ZlibOptions): import('node:stream').Transform;
+    function createDeflate(options?: ZlibOptions): import('node:stream').Transform;
+    function createInflate(options?: ZlibOptions): import('node:stream').Transform;
+    function createDeflateRaw(options?: ZlibOptions): import('node:stream').Transform;
+    function createInflateRaw(options?: ZlibOptions): import('node:stream').Transform;
+    function createUnzip(options?: ZlibOptions): import('node:stream').Transform;
+    const constants: {
+      readonly Z_NO_FLUSH: number;
+      readonly Z_SYNC_FLUSH: number;
+      readonly Z_FULL_FLUSH: number;
+      readonly Z_FINISH: number;
+      readonly Z_OK: number;
+      readonly Z_STREAM_END: number;
+      readonly Z_DATA_ERROR: number;
+      readonly Z_BUF_ERROR: number;
+      readonly Z_NO_COMPRESSION: number;
+      readonly Z_BEST_SPEED: number;
+      readonly Z_BEST_COMPRESSION: number;
+      readonly Z_DEFAULT_COMPRESSION: number;
+    };
+  }
+  export = zlib;
+}
+
+declare module 'node:timers' {
+  namespace timers {
+    function setTimeout<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): number;
+    function clearTimeout(timeout?: number): void;
+    function setInterval<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): number;
+    function clearInterval(interval?: number): void;
+    function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): number;
+    function clearImmediate(immediate?: number): void;
+    function queueMicrotask(callback: () => void): void;
+    const promises: typeof import('node:timers/promises');
+  }
+  export = timers;
+}
+
+declare module 'node:timers/promises' {
+  namespace promises {
+    interface TimerOptions {
+      signal?: AbortSignal;
+    }
+    function setTimeout<T = void>(delay?: number, value?: T, options?: TimerOptions): Promise<T>;
+    function setImmediate<T = void>(value?: T, options?: TimerOptions): Promise<T>;
+    function setInterval<T = void>(delay?: number, value?: T): AsyncIterableIterator<T>;
+    const scheduler: {
+      wait(delay: number, options?: TimerOptions): Promise<void>;
+      yield(): Promise<void>;
+    };
+  }
+  export = promises;
+}
+
+declare module 'node:perf_hooks' {
+  namespace perf_hooks {
+    const performance: Performance;
+    type PerformanceEntry = globalThis.PerformanceEntry;
+  }
+  export = perf_hooks;
+}
+
+declare module 'node:tty' {
+  namespace tty {
+    function isatty(fd: number): boolean;
+  }
+  export = tty;
+}
+
+declare module 'node:constants' {
+  /** @deprecated fs.constants and os.constants.signals */
+  namespace constants {
+    const F_OK: number;
+    const R_OK: number;
+    const W_OK: number;
+    const X_OK: number;
+    const COPYFILE_EXCL: number;
+    const O_RDONLY: number;
+    const O_WRONLY: number;
+    const O_RDWR: number;
+    const S_IFMT: number;
+    const S_IFREG: number;
+    const S_IFDIR: number;
+    const S_IFLNK: number;
+    const SIGHUP: number;
+    const SIGINT: number;
+    const SIGQUIT: number;
+    const SIGKILL: number;
+    const SIGTERM: number;
+  }
+  export = constants;
+}
+
+declare module 'node:events' {
+  class EventEmitter {
+    constructor(options?: { captureRejections?: boolean });
+    static defaultMaxListeners: number;
+    on(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    addListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    once(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    prependListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    prependOnceListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    off(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    removeListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+    removeAllListeners(eventName?: string | symbol): this;
+    emit(eventName: string | symbol, ...args: any[]): boolean;
+    listeners(eventName: string | symbol): Function[];
+    rawListeners(eventName: string | symbol): Function[];
+    listenerCount(eventName: string | symbol, listener?: Function): number;
+    eventNames(): (string | symbol)[];
+    setMaxListeners(n: number): this;
+    getMaxListeners(): number;
+    static once(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): Promise<any[]>;
+    static on(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): AsyncIterableIterator<any[]>;
+    static getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
+    static listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
+  }
+  namespace EventEmitter {
+    export { EventEmitter };
+    const defaultMaxListeners: number;
+    function once(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): Promise<any[]>;
+    function on(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): AsyncIterableIterator<any[]>;
+    function getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
+    function listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
+    const EventTarget: typeof globalThis.EventTarget;
+    const Event: typeof globalThis.Event;
+    const AbortController: typeof globalThis.AbortController;
+    const AbortSignal: typeof globalThis.AbortSignal;
+  }
+  export = EventEmitter;
+}
+
+declare module 'node:stream' {
+  import { EventEmitter } from 'node:events';
+  class Stream extends EventEmitter {}
+  namespace Stream {
+    type TransformCallback = (error?: Error | null, data?: any) => void;
+    interface ReadableOptions {
+      objectMode?: boolean;
+      encoding?: BufferEncoding;
+      highWaterMark?: number;
+      read?(this: Readable, size: number): void;
+      destroy?(error: Error | null, callback: (error?: Error | null) => void): void;
+    }
+    interface WritableOptions {
+      objectMode?: boolean;
+      decodeStrings?: boolean;
+      highWaterMark?: number;
+      write?(this: Writable, chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
+      final?(this: Writable, callback: (error?: Error | null) => void): void;
+      destroy?(error: Error | null, callback: (error?: Error | null) => void): void;
+    }
+    interface DuplexOptions extends ReadableOptions, WritableOptions {}
+    interface TransformOptions extends DuplexOptions {
+      transform?(this: Transform, chunk: any, encoding: BufferEncoding, callback: TransformCallback): void;
+      flush?(this: Transform, callback: TransformCallback): void;
+    }
+    class Readable extends Stream implements AsyncIterable<any> {
+      constructor(options?: ReadableOptions);
+      static from(iterable: Iterable<any> | AsyncIterable<any> | string | Uint8Array, options?: ReadableOptions): Readable;
+      readonly readable: boolean;
+      readonly readableEnded: boolean;
+      readonly readableFlowing: boolean | null;
+      readonly readableLength: number;
+      readonly readableObjectMode: boolean;
+      readonly destroyed: boolean;
+      readonly closed: boolean;
+      readonly errored: Error | null;
+      _read(size: number): void;
+      _destroy(error: Error | null, callback: (error?: Error | null) => void): void;
+      push(chunk: any, encoding?: BufferEncoding): boolean;
+      unshift(chunk: any, encoding?: BufferEncoding): void;
+      read(size?: number): any;
+      setEncoding(encoding: BufferEncoding): this;
+      pause(): this;
+      resume(): this;
+      isPaused(): boolean;
+      pipe<T extends Writable>(destination: T, options?: { end?: boolean }): T;
+      destroy(error?: Error): this;
+      [Symbol.asyncIterator](): AsyncIterator<any>;
+    }
+    class Writable extends Stream {
+      constructor(options?: WritableOptions);
+      readonly writable: boolean;
+      readonly writableEnded: boolean;
+      readonly writableFinished: boolean;
+      readonly writableLength: number;
+      readonly writableObjectMode: boolean;
+      readonly destroyed: boolean;
+      readonly closed: boolean;
+      readonly errored: Error | null;
+      _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
+      _final(callback: (error?: Error | null) => void): void;
+      _destroy(error: Error | null, callback: (error?: Error | null) => void): void;
+      write(chunk: any, callback?: (error: Error | null | undefined) => void): boolean;
+      write(chunk: any, encoding: BufferEncoding, callback?: (error: Error | null | undefined) => void): boolean;
+      end(cb?: () => void): this;
+      end(chunk: any, cb?: () => void): this;
+      end(chunk: any, encoding: BufferEncoding, cb?: () => void): this;
+      cork(): void;
+      uncork(): void;
+      setDefaultEncoding(encoding: BufferEncoding): this;
+      destroy(error?: Error): this;
+    }
+    class Duplex extends Readable implements Writable {
+      constructor(options?: DuplexOptions);
+      readonly writable: boolean;
+      readonly writableEnded: boolean;
+      readonly writableFinished: boolean;
+      readonly writableLength: number;
+      readonly writableObjectMode: boolean;
+      _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
+      _final(callback: (error?: Error | null) => void): void;
+      write(chunk: any, callback?: (error: Error | null | undefined) => void): boolean;
+      write(chunk: any, encoding: BufferEncoding, callback?: (error: Error | null | undefined) => void): boolean;
+      end(cb?: () => void): this;
+      end(chunk: any, cb?: () => void): this;
+      end(chunk: any, encoding: BufferEncoding, cb?: () => void): this;
+      cork(): void;
+      uncork(): void;
+      setDefaultEncoding(encoding: BufferEncoding): this;
+    }
+    class Transform extends Duplex {
+      constructor(options?: TransformOptions);
+      _transform(chunk: any, encoding: BufferEncoding, callback: TransformCallback): void;
+      _flush(callback: TransformCallback): void;
+    }
+    class PassThrough extends Transform {}
+    function pipeline<T extends Writable | Duplex>(...args: [...streams: (Readable | Writable | Duplex)[], callback: (err: NodeJS.ErrnoException | null) => void]): T;
+    function finished(stream: Readable | Writable, callback: (err?: NodeJS.ErrnoException | null) => void): void;
+    const promises: typeof import('node:stream/promises');
+  }
+  export = Stream;
+}
+
+declare module 'node:stream/promises' {
+  import { Readable, Writable, Duplex } from 'node:stream';
+  function pipeline(...streams: (Readable | Writable | Duplex)[]): Promise<void>;
+  function finished(stream: Readable | Writable): Promise<void>;
+  export { pipeline, finished };
+}
+
+declare module 'node:stream/consumers' {
+  import { Readable } from 'node:stream';
+  function text(stream: Readable | AsyncIterable<any>): Promise<string>;
+  function json(stream: Readable | AsyncIterable<any>): Promise<unknown>;
+  function buffer(stream: Readable | AsyncIterable<any>): Promise<Buffer>;
+  export { text, json, buffer };
 }
 
 declare module 'node:child_process' {
-  export interface ExecResult {
-    stdout: string;
-    stderr: string;
-    status: number;
+  import { EventEmitter } from 'node:events';
+  import { Readable, Writable } from 'node:stream';
+  namespace child_process {
+    type StdioOption = 'pipe' | 'inherit' | 'ignore';
+    interface CommonOptions {
+      cwd?: string;
+      env?: Record<string, string | undefined>;
+      shell?: boolean | string;
+      stdio?: StdioOption | StdioOption[];
+      input?: string | Uint8Array;
+    }
+    interface ExecException extends Error {
+      code?: number;
+      killed?: boolean;
+      signal?: string;
+      cmd?: string;
+      stdout?: string;
+      stderr?: string;
+    }
+    type ExecFileException = ExecException;
+    interface SpawnSyncReturns<T> {
+      pid: number;
+      output: (T | null)[];
+      stdout: T;
+      stderr: T;
+      status: number | null;
+      signal: string | null;
+      error?: Error;
+    }
+    class ChildProcess extends EventEmitter {
+      readonly stdin: Writable;
+      readonly stdout: Readable;
+      readonly stderr: Readable;
+      readonly pid: number | undefined;
+      readonly exitCode: number | null;
+      readonly signalCode: string | null;
+      readonly killed: boolean;
+      readonly spawnfile: string;
+      kill(signal?: string | number): boolean;
+    }
+    type ExecCallback = (error: ExecException | null, stdout: string, stderr: string) => void;
+    function exec(command: string, callback?: ExecCallback): ChildProcess;
+    function exec(command: string, options: CommonOptions & { encoding?: BufferEncoding | null }, callback?: ExecCallback): ChildProcess;
+    function execFile(file: string, callback?: ExecCallback): ChildProcess;
+    function execFile(file: string, args: readonly string[], callback?: ExecCallback): ChildProcess;
+    function execFile(file: string, args: readonly string[], options: CommonOptions & { encoding?: BufferEncoding | null }, callback?: ExecCallback): ChildProcess;
+    function spawn(command: string, options?: CommonOptions): ChildProcess;
+    function spawn(command: string, args: readonly string[], options?: CommonOptions): ChildProcess;
+    function execSync(command: string, options: CommonOptions & { encoding: BufferEncoding }): string;
+    function execSync(command: string, options?: CommonOptions & { encoding?: 'buffer' | null }): Buffer;
+    function execFileSync(file: string, args: readonly string[], options: CommonOptions & { encoding: BufferEncoding }): string;
+    function execFileSync(file: string, args?: readonly string[], options?: CommonOptions & { encoding?: 'buffer' | null }): Buffer;
+    function spawnSync(command: string, args: readonly string[], options: CommonOptions & { encoding: BufferEncoding }): SpawnSyncReturns<string>;
+    function spawnSync(command: string, args?: readonly string[], options?: CommonOptions & { encoding?: 'buffer' | null }): SpawnSyncReturns<Buffer>;
   }
-  export function exec(command: string): ExecResult;
-  export function execSync(command: string): string;
-  export function spawnSync(
-    file: string,
-    args: string[],
-    options?: { stdio?: string; input?: string; encoding?: string }
-  ): ExecResult;
+  export = child_process;
 }
 
 declare module 'node:readline' {
-  // TypeNative extension: synchronous line reading (mapped to a Go helper).
-  // Not part of Node's real readline API — used by self-hosted prompts.
-  export function question(prompt: string): string;
+  import { EventEmitter } from 'node:events';
+  import { Readable, Writable } from 'node:stream';
+  namespace readline {
+    interface ReadLineOptions {
+      input: Readable;
+      output?: Writable;
+      prompt?: string;
+      terminal?: boolean;
+    }
+    class Interface extends EventEmitter implements AsyncIterable<string> {
+      readonly closed: boolean;
+      question(query: string, callback: (answer: string) => void): void;
+      prompt(preserveCursor?: boolean): void;
+      setPrompt(prompt: string): void;
+      getPrompt(): string;
+      write(data: string): void;
+      pause(): this;
+      resume(): this;
+      close(): void;
+      [Symbol.asyncIterator](): AsyncIterator<string>;
+    }
+    function createInterface(options: ReadLineOptions): Interface;
+    function createInterface(input: Readable, output?: Writable): Interface;
+    /** TypeNative extension: prints the prompt and reads one line from stdin, synchronously */
+    function question(prompt: string): string;
+    const promises: typeof import('node:readline/promises');
+  }
+  export = readline;
 }
+
+declare module 'node:readline/promises' {
+  import { EventEmitter } from 'node:events';
+  import { Readable, Writable } from 'node:stream';
+  namespace promises {
+    class Interface extends EventEmitter implements AsyncIterable<string> {
+      readonly closed: boolean;
+      question(query: string, options?: { signal?: AbortSignal }): Promise<string>;
+      prompt(preserveCursor?: boolean): void;
+      setPrompt(prompt: string): void;
+      getPrompt(): string;
+      pause(): this;
+      resume(): this;
+      close(): void;
+      [Symbol.asyncIterator](): AsyncIterator<string>;
+    }
+    function createInterface(options: { input: Readable; output?: Writable; prompt?: string; terminal?: boolean }): Interface;
+    function createInterface(input: Readable, output?: Writable): Interface;
+  }
+  export = promises;
+}
+
+declare module 'node:diagnostics_channel' {
+  namespace diagnostics_channel {
+    type ChannelListener = (message: unknown, name: string | symbol) => void;
+    class Channel {
+      readonly name: string | symbol;
+      readonly hasSubscribers: boolean;
+      publish(message: unknown): void;
+      subscribe(onMessage: ChannelListener): void;
+      unsubscribe(onMessage: ChannelListener): boolean;
+    }
+    function channel(name: string | symbol): Channel;
+    function subscribe(name: string | symbol, onMessage: ChannelListener): void;
+    function unsubscribe(name: string | symbol, onMessage: ChannelListener): boolean;
+    function hasSubscribers(name: string | symbol): boolean;
+  }
+  export = diagnostics_channel;
+}
+
+declare module 'node:sys' {
+  import util = require('node:util');
+  export = util;
+}
+
+// Bare specifiers ('fs') are the same builtins as 'node:fs'
+declare module 'path' { import m = require('node:path'); export = m; }
+declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
+declare module 'path/win32' { import m = require('node:path/win32'); export = m; }
+declare module 'buffer' { import m = require('node:buffer'); export = m; }
+declare module 'fs' { import m = require('node:fs'); export = m; }
+declare module 'fs/promises' { import m = require('node:fs/promises'); export = m; }
+declare module 'url' { import m = require('node:url'); export = m; }
+declare module 'querystring' { import m = require('node:querystring'); export = m; }
+declare module 'punycode' { import m = require('node:punycode'); export = m; }
+declare module 'string_decoder' { import m = require('node:string_decoder'); export = m; }
+declare module 'os' { import m = require('node:os'); export = m; }
+declare module 'process' { import m = require('node:process'); export = m; }
+declare module 'console' { import m = require('node:console'); export = m; }
+declare module 'util' { import m = require('node:util'); export = m; }
+declare module 'util/types' { import m = require('node:util/types'); export = m; }
+declare module 'assert' { import m = require('node:assert'); export = m; }
+declare module 'assert/strict' { import m = require('node:assert/strict'); export = m; }
+declare module 'crypto' { import m = require('node:crypto'); export = m; }
+declare module 'zlib' { import m = require('node:zlib'); export = m; }
+declare module 'timers' { import m = require('node:timers'); export = m; }
+declare module 'timers/promises' { import m = require('node:timers/promises'); export = m; }
+declare module 'perf_hooks' { import m = require('node:perf_hooks'); export = m; }
+declare module 'tty' { import m = require('node:tty'); export = m; }
+declare module 'constants' { import m = require('node:constants'); export = m; }
+declare module 'events' { import m = require('node:events'); export = m; }
+declare module 'stream' { import m = require('node:stream'); export = m; }
+declare module 'stream/promises' { export * from 'node:stream/promises'; }
+declare module 'stream/consumers' { export * from 'node:stream/consumers'; }
+declare module 'child_process' { import m = require('node:child_process'); export = m; }
+declare module 'readline' { import m = require('node:readline'); export = m; }
+declare module 'readline/promises' { import m = require('node:readline/promises'); export = m; }
+declare module 'diagnostics_channel' { import m = require('node:diagnostics_channel'); export = m; }
+declare module 'sys' { import m = require('node:sys'); export = m; }
