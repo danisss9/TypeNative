@@ -64,6 +64,10 @@ generated types say they do.
   Diffie-Hellman (MODP groups); `generatePrime` / `checkPrime`; `X509Certificate`; and
   `crypto.subtle` (digest, keys, sign / verify, AES-GCM / CBC / CTR, RSA-OAEP, PBKDF2 / HKDF /
   ECDH / X25519 derivation, wrap / unwrap)
+- **`child_process.fork`** with an IPC channel (`send` / `'message'` / `disconnect`;
+  `process.send` / `process.on('message')` in the child) and **`node:cluster`**: workers share
+  listening ports through the primary, which relays connections round-robin; cluster and worker
+  events, `disconnect`, `setupPrimary`
 
 ### Fixed
 

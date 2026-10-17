@@ -462,11 +462,17 @@ var tnProcessEmitter = TnNewEventEmitter()
 var tnSignalsWatched = map[string]bool{}
 var tnSignalsMu sync.Mutex
 
+// Set by the IPC helper in forked children: a 'message' listener keeps the channel open
+var tnProcessMessageHook func()
+
 func TnProcessOn(event string, fn interface{}, once bool) {
 	if once {
 		tnProcessEmitter.once(event, fn)
 	} else {
 		tnProcessEmitter.on(event, fn)
+	}
+	if event == "message" && tnProcessMessageHook != nil {
+		tnProcessMessageHook()
 	}
 	sig, isSignal := map[string]os.Signal{"SIGINT": os.Interrupt, "SIGTERM": syscall.SIGTERM, "SIGHUP": syscall.SIGHUP}[event]
 	if !isSignal {
@@ -590,6 +596,9 @@ export function registerEvents(r: NodeRegistry): void {
   // process.on / once / off / emit
   const processOn = (once: boolean) => (call: NodeCall) => {
     use();
+    // IPC events of forked children
+    const event = call.nodes[0];
+    if (event && event.kind === 'StringLiteral' && (event.text === 'message' || event.text === 'disconnect')) r.helper('nodeIpc');
     return `TnProcessOn(${call.args[0]}, ${call.args[1]}, ${once})`;
   };
   r.functions['process.on'] = processOn(false);
@@ -611,7 +620,11 @@ export function registerEvents(r: NodeRegistry): void {
   setResults(r, 'process', 'emit=bool; listenerCount=float64');
   r.paramTypers['process.on'] = (nodes: any[]) => {
     const event = nodes[0];
-    return event && event.kind === 'StringLiteral' && event.text === 'exit' ? ['float64'] : ['string'];
+    const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
+    if (name === 'exit') return ['float64'];
+    if (name === 'message') return ['interface{}'];
+    if (name === 'disconnect') return [];
+    return ['string'];
   };
   r.paramTypers['process.once'] = r.paramTypers['process.on'];
 }

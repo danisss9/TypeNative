@@ -31,6 +31,7 @@ import { registerStreamWeb } from './node/stream_web.js';
 import { registerAsyncHooks } from './node/async_hooks.js';
 import { registerTest } from './node/test.js';
 import { registerWorkerThreads } from './node/worker_threads.js';
+import { registerCluster } from './node/cluster.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import {
   goPackage,
@@ -8430,6 +8431,7 @@ registerStreamWeb(nodeRegistry);
 registerAsyncHooks(nodeRegistry);
 registerTest(nodeRegistry);
 registerWorkerThreads(nodeRegistry);
+registerCluster(nodeRegistry);
 
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {

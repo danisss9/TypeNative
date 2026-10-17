@@ -249,6 +249,8 @@ type TnChildProcess struct {
 	killed     bool
 	cmd        *exec.Cmd
 	spawnfile  string
+	// IPC state of forked children (node:cluster / fork)
+	ipc interface{}
 }
 
 func (cp *TnChildProcess) Get_stdin() *TnStream       { return cp.stdin }
@@ -510,7 +512,8 @@ export function registerChildProcess(r: NodeRegistry): void {
   r.paramTypers['child_process.ChildProcess#on'] = (nodes: any[]) => {
     const event = nodes[0];
     const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
-    return name === 'exit' || name === 'close' ? ['interface{}', 'interface{}'] : name === 'error' ? ['interface{}'] : [];
+    if (name === 'exit' || name === 'close') return ['interface{}', 'interface{}'];
+    return name === 'error' || name === 'message' ? ['interface{}'] : [];
   };
   r.paramTypers['child_process.ChildProcess#once'] = r.paramTypers['child_process.ChildProcess#on'];
   const use = () => r.helper('nodeChild');

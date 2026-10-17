@@ -593,6 +593,9 @@ func (s *TnSocket) destroySoon() {
 	s.end()
 }
 
+// Cluster workers listen through the primary (set by node:cluster)
+var tnListenHook func(srv *TnNetServer, network string, address string) (net.Listener, error)
+
 // net.Server
 type TnNetServer struct {
 	TnEventEmitter
@@ -673,7 +676,13 @@ func (srv *TnNetServer) listen(args ...interface{}) *TnNetServer {
 	if network != "unix" {
 		address = net.JoinHostPort(host, strconv.FormatFloat(port, 'f', -1, 64))
 	}
-	ln, err := net.Listen(network, address)
+	var ln net.Listener
+	var err error
+	if tnListenHook != nil && network != "unix" {
+		ln, err = tnListenHook(srv, network, address)
+	} else {
+		ln, err = net.Listen(network, address)
+	}
 	if err != nil {
 		target := host
 		if network == "unix" {

@@ -571,6 +571,10 @@ interface Process {
   removeListener(event: string, listener: (...args: any[]) => void): this;
   emit(event: string, ...args: any[]): boolean;
   listenerCount(event: string): number;
+  // IPC of forked children (child_process.fork, cluster workers)
+  send?(message: any, callback?: (error: Error | null) => void): boolean;
+  readonly connected: boolean;
+  disconnect(): void;
 }
 declare var process: Process;
 
