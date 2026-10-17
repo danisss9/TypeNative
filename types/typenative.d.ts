@@ -474,6 +474,14 @@ declare function encodeURIComponent(uriComponent: string): string;
 declare function decodeURIComponent(uriComponent: string): string;
 declare function structuredClone<T>(value: T): T;
 
+// The running program (a native binary has no separate script file)
+declare var __filename: string;
+declare var __dirname: string;
+
+declare var MessageChannel: typeof import('node:worker_threads').MessageChannel;
+declare var MessagePort: typeof import('node:worker_threads').MessagePort;
+declare var BroadcastChannel: typeof import('node:worker_threads').BroadcastChannel;
+
 declare var NaN: number;
 declare var Infinity: number;
 

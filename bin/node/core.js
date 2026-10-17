@@ -77,10 +77,14 @@ func tnInvokeArg(a interface{}, t reflect.Type) reflect.Value {
 	if numeric(v.Kind()) && numeric(t.Kind()) {
 		return v.Convert(t)
 	}
+	// Decoded JSON-like values into typed parameters (worker messages …)
+	if converted, ok := TnConvertDynamic(a, t); ok {
+		return converted
+	}
 	return reflect.Zero(t)
 }`;
 export function registerCore(r) {
-    defineHelper(r, 'nodeInvoke', ['reflect'], [], invokeHelper);
+    defineHelper(r, 'nodeInvoke', ['reflect'], ['dynamic'], invokeHelper);
     defineClass(r, 'NodeJS.ErrnoException', '*TnError', 'class', '', 'message=string; code=string', 'name=string; stack=string; syscall=string; path=string; errno=float64; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool', '');
     r.globals['NodeJS'] = 'NodeJS';
     // Callback types of Node's typings (TransformCallback …)
