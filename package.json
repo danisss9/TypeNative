@@ -8,9 +8,12 @@
   },
   "types": "./index.d.ts",
   "scripts": {
+    "prebuild": "node scripts/gen-version.mjs",
     "build": "tsc",
+    "prewatch": "node scripts/gen-version.mjs",
     "watch": "tsc --watch",
     "build:native": "node scripts/build-native.mjs",
+    "gen:go": "go run ./scripts/gostd",
     "conformance": "node scripts/conformance.mjs",
     "conformance:parallel": "node scripts/conformance-parallel.mjs",
     "test": "npm run conformance",

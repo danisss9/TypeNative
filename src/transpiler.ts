@@ -20,6 +20,33 @@ import { registerTimers } from './node/timers.js';
 import { registerEvents } from './node/events.js';
 import { registerStream } from './node/stream.js';
 import { registerDiagnosticsChannel } from './node/diagnostics_channel.js';
+import { goStdlib } from './go/stdlib.generated.js';
+import {
+  goPackage,
+  goTypeInfo as goMetaTypeInfo,
+  hasGoPackage,
+  isGoNumeric as isGoNumericType
+} from './go/metadata.js';
+import { bindConvertServices, initConvertPaths, isGoBasicKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
+import { goPathAliases } from './go/overrides.js';
+import {
+  bindBridgeServices,
+  resetGoBridge,
+  initKnownPaths,
+  goLocalType,
+  ensureGoTypePackages,
+  registerGoBuiltin,
+  registerGoImport,
+  goQualifier,
+  goPathOf,
+  goMemberOf,
+  visitGoCall,
+  visitGoMethod,
+  visitGoNew,
+  inferGoType,
+  goFieldType,
+  goMethodInfo
+} from './go/bridge.js';
 
 // Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
 type AstNode = any;
@@ -904,6 +931,9 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   bindNodeRegistryServices();
   nodeLocalNames.clear();
   goPackageLocalNames.clear();
+  resetGoBridge();
+  initKnownPaths();
+  initConvertPaths();
   nodeParentClassKeys.clear();
   asyncFunctionNames.clear();
   generatorFunctionNames.clear();
@@ -1159,6 +1189,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const regexProperty = visitRegexProperty(node);
     if (regexProperty) return regexProperty;
+    // Go package member or field on a Go value.
+    if (!isCallee(node) || isCallee(node)) {
+      const goProp = visitGoProperty(node);
+      if (goProp !== undefined) return goProp;
+    }
     // import.meta.url — the file URL of the running program
     if (isNewTargetNode(node.expression) && node.name.text === 'name') return '__newTarget';
     if (node.expression.kind === 'MetaProperty' && node.name.text === 'url') {
@@ -1419,7 +1454,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const packageType = type === ':' ? variableGoTypes.get(node.name.text) : type;
     if (isMainTopLevel && packageType && packageType !== 'nil' && isIdentifier(node.name)) {
       const name = getSafeName(node.name.text);
-      mainPackageVariables.push(`var ${name} ${packageType}`);
+      ensureGoTypePackages(packageType);
+      mainPackageVariables.push(`var ${name} ${goLocalType(packageType)}`);
       return initializer ? `${name} ${initializer}` : '';
     }
     const declName = isIdentifier(node.name) ? getSafeName(node.name.text) : visit(node.name);
@@ -1430,9 +1466,13 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       isIdentifier(node.name) &&
       containsNode(node.initializer, (n) => isIdentifier(n) && n.text === node.name.text && !isFieldNameIdentifier(n))
     ) {
-      return `var ${declName} ${inferExpressionType(node.initializer)}\n\t\t${declName} ${initializer}`;
+      const initType = inferExpressionType(node.initializer) ?? '';
+      ensureGoTypePackages(initType);
+      return `var ${declName} ${goLocalType(initType)}\n\t\t${declName} ${initializer}`;
     }
-    return `${type === ':' ? '' : 'var '}${declName} ${type}${
+    const emitType = type === ':' ? type : goLocalType(type);
+    if (type !== ':') ensureGoTypePackages(type);
+    return `${type === ':' ? '' : 'var '}${declName} ${emitType}${
       type === ':' ? '' : ' '
     }${initializer}`;
   } else if (isCallExpression(node)) {
@@ -1450,6 +1490,20 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const nodeCall = visitNodeCall(node);
     if (nodeCall !== undefined) return nodeCall;
+    const goCall = visitGoCall(node);
+    if (goCall !== undefined) return goCall;
+    // Method call on a Go-typed receiver (pkg.Type value).
+    if (isPropertyAccessExpression(node.expression)) {
+      const recvType = inferExpressionType(node.expression.expression);
+      if (recvType && recvType.startsWith('chan ')) {
+        const chanCall = visitGoChanCall(node, visit(node.expression.expression));
+        if (chanCall !== undefined) return chanCall;
+      }
+      if (recvType && goMetaTypeInfo(recvType)) {
+        const goMethod = visitGoMethod(node, visit(node.expression.expression), recvType);
+        if (goMethod !== undefined) return goMethod;
+      }
+    }
     const recordCall = visitRecordFunctionCall(node);
     if (recordCall) return recordCall;
     const dynamicCall = visitDynamicMethodCall(node);
@@ -1666,6 +1720,12 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (op === '**') {
       importedPackages.add('math');
       return `math.Pow(${visit(node.left)}, ${visit(node.right)})`;
+    }
+    // Named Go numerics (time.Duration): coerce the float64 side so Go's
+    // operator type-checks (time.Second * 2 → time.Second * time.Duration(2)).
+    if (['<', '>', '<=', '>=', '-', '*', '/', '+', '+=', '-=', '*=', '/='].includes(op)) {
+      const numericCoercion = visitGoNumericArithmetic(node, op);
+      if (numericCoercion) return numericCoercion;
     }
     if (op === '**=') {
       importedPackages.add('math');
@@ -2495,6 +2555,12 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isNewExpression(node)) {
     const nodeNew = visitNodeNew(node);
     if (nodeNew !== undefined) return nodeNew;
+    const goTarget = goNewTarget(node);
+    if (goTarget) {
+      importedPackages.add(goTarget.path);
+      const goNew = visitGoNew(node, goTarget.path, goTarget.typeName);
+      if (goNew !== undefined) return goNew;
+    }
     const className = visit(node.expression);
     if (className === 'Promise') {
       return visitNewPromise(node);
@@ -2934,6 +3000,26 @@ function visitUsingDeclaration(statement: AstNode, rest: AstNode[]): string {
   );
   if (isFunctionBody || exits) return head + visitBlockStatements(rest);
   return `func() {\n\t\t${head}${visitBlockStatements(rest)}}()\n\t`;
+}
+
+// Binary arithmetic with a bridged named numeric: coerce the float64 side.
+function visitGoNumericArithmetic(node: AstNode, op: string): string | undefined {
+  const leftType = inferExpressionType(node.left);
+  const rightType = inferExpressionType(node.right);
+  const leftNumeric = leftType && isGoNumericType(leftType) ? leftType : undefined;
+  const rightNumeric = rightType && isGoNumericType(rightType) ? rightType : undefined;
+  if (!leftNumeric && !rightNumeric) return undefined;
+  if (leftNumeric && rightNumeric) return undefined;
+  const numericType = leftNumeric ?? rightNumeric;
+  if (!numericType) return undefined;
+  const left = leftNumeric ? visit(node.left) : `${numericType}(${visit(node.left)})`;
+  const right = rightNumeric ? visit(node.right) : `${numericType}(${visit(node.right)})`;
+  if (op.endsWith('=')) {
+    const target = visit(node.left);
+    const baseOp = op.slice(0, -1);
+    return `${target} = ${left} ${baseOp} ${right}`;
+  }
+  return `${left} ${op} ${right}`;
 }
 
 function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
@@ -4180,6 +4266,8 @@ function inferExpressionType(expr: AstNode): string | undefined {
   if (isTypeAssertionExpression(expr)) return getType(expr.type);
   const nodeType = inferNodeExpressionType(expr);
   if (nodeType !== undefined) return nodeType === '' ? undefined : nodeType;
+  const goType = inferGoExpressionType(expr);
+  if (goType !== undefined) return goType;
   if (
     isStringLiteral(expr) ||
     isNoSubstitutionTemplateLiteral(expr) ||
@@ -5859,11 +5947,27 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (name === 'RegExp') {
       return '*regexp.Regexp';
     }
+    // go:builtin GoError values are Go errors.
+    if (name === 'GoError') {
+      return 'error';
+    }
+    if (name === 'GoChan' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
+      const inner = getType(typeNode.typeArguments[0]);
+      return `chan ${inner || 'interface{}'}`;
+    }
+    if (name === 'GoRef' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
+      const inner = getType(typeNode.typeArguments[0]);
+      return `*${inner || 'interface{}'}`;
+    }
     if (name === 'Error' || (BUILTIN_ERROR_NAMES.has(name) && !classNames.has(name))) {
       return '*TnError';
     }
     if (name === 'RegExpExecArray' || name === 'RegExpMatchArray') {
       return '[]string';
+    }
+    // Uint8Array / Buffer annotations are Go []byte.
+    if (name === 'Uint8Array' || name === 'Buffer') {
+      return '[]byte';
     }
     if (name === 'TemplateStringsArray' || name === 'ReadonlyArray') {
       return name === 'TemplateStringsArray' ? '[]string' : getType(typeNode.typeArguments?.[0]);
@@ -5990,10 +6094,15 @@ function goTypeCategory(goType: string | undefined): string | undefined {
   const nodeClassKey = nodeRegistry.classByGoType[goType];
   if (nodeClassKey) return nodeRegistry.classes[nodeClassKey].category;
   if (goType.startsWith('*[]')) goType = goType.slice(1);
-  if (goType.startsWith('[]')) return 'array';
+  if (goType.startsWith('[]')) {
+    if (goType === '[]byte') return 'Buffer';
+    return 'array';
+  }
   if (goType === 'string') return 'string';
   if (goType === '*regexp.Regexp' || goType === '*TnRegex') return 'RegExp';
   if (goType === 'time.Time') return 'Date';
+  // Bridged Go values: methods pass through as Go methods.
+  if (goMetaTypeInfo(goType)) return 'class';
   return undefined;
 }
 
@@ -6678,7 +6787,8 @@ function toGoRegexp(arg: string): string {
 
 // A JS slice index: negative values count from the end
 // A JS slice index: negative values count from the end; out-of-range values clamp
-function sliceIndex(obj: string, index: string): string {
+function sliceIndex(obj: string, index: string | undefined): string {
+  if (index === undefined) return '0';
   if (index.startsWith('-')) return `max(0, int(float64(len(${obj})) + ${index}))`;
   return `min(int(${index}), len(${obj}))`;
 }
@@ -7936,7 +8046,7 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   const fileImports = [...importedPackages]
     .filter((pkg) => {
       if (!helperProvidedPackages.has(pkg)) return true;
-      const pkgName = goImportAliases[pkg] ?? pkg.split('/').pop()!;
+      const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop()!;
       return stripGoStrings(fileCode).includes(`${pkgName}.`);
     })
     .sort()
@@ -7965,23 +8075,62 @@ function stripGoStrings(code: string): string {
   return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`/g, '""');
 }
 
-function registerGoPackageAliases(node: AstNode, goPkg: string): void {
-  const pkgName = goPkg.split('/').pop()!;
-  goPackageLocalNames.add(pkgName);
+// go:builtin is virtual: ref<T> → new(T), chan<T> → make(chan T),
+// GoError → *TnError. No Go import; local names map to inline emitters.
+function registerGoBuiltinAliases(node: AstNode): void {
   if (!node.importClause) return;
+  const clause = node.importClause;
+  if (clause.name) importAliases.set(clause.name.text, 'go:builtin');
+  const bindings = clause.namedBindings;
+  if (!bindings) return;
+  if (isNamespaceImport(bindings)) {
+    importAliases.set(bindings.name.text, 'go:builtin');
+    return;
+  }
+  if (isNamedImports(bindings)) {
+    for (const el of bindings.elements ?? []) {
+      if (el.isTypeOnly) continue;
+      const localName = el.name.text;
+      const importedName = el.propertyName?.text ?? localName;
+      importAliases.set(localName, `go:builtin.${importedName}`);
+      registerGoBuiltin(localName, importedName);
+    }
+  }
+}
+
+function registerGoPackageAliases(node: AstNode, goPkg: string): void {
+  // Real package name from metadata (math/rand/v2 → rand); fall back to the
+  // last path segment for packages without metadata.
+  const info = goPackage(goPkg);
+  const pkgName = info ? info.name : goPkg.split('/').pop()!;
+  // Collision alias (crypto/rand vs math/rand): the emitted qualifier.
+  const qualifier = goPathAliases[goPkg] ?? pkgName;
+  goPackageLocalNames.add(pkgName);
+  goPackageLocalNames.add(qualifier);
+  const named: Array<{ imported: string; local: string }> = [];
+  let defaultName: string | null = null;
+  let namespaceName: string | null = null;
+  if (!node.importClause) {
+    registerGoImport(goPkg, qualifier, null, null, []);
+    return;
+  }
   const clause = node.importClause;
 
   // Default import: `import fmt from 'go:fmt'` or `import myFmt from 'go:fmt'`
-  if (clause.name && clause.name.text !== pkgName) {
-    importAliases.set(clause.name.text, pkgName);
+  if (clause.name) {
+    defaultName = clause.name.text;
+    if (clause.name.text !== pkgName && clause.name.text !== qualifier) {
+      importAliases.set(clause.name.text, qualifier);
+    }
   }
 
   if (clause.namedBindings) {
     if (isNamespaceImport(clause.namedBindings)) {
       // `import * as myFmt from 'go:fmt'`
       const localName = clause.namedBindings.name.text;
-      if (localName !== pkgName) {
-        importAliases.set(localName, pkgName);
+      namespaceName = localName;
+      if (localName !== pkgName && localName !== qualifier) {
+        importAliases.set(localName, qualifier);
       }
     } else if (isNamedImports(clause.namedBindings)) {
       // `import { Println, Sprintf as Spf } from 'go:fmt'`
@@ -7989,10 +8138,12 @@ function registerGoPackageAliases(node: AstNode, goPkg: string): void {
         if (el.isTypeOnly) continue;
         const localName = el.name.text;
         const importedName = el.propertyName?.text ?? localName;
-        importAliases.set(localName, `${pkgName}.${importedName}`);
+        importAliases.set(localName, `${qualifier}.${importedName}`);
+        named.push({ imported: importedName, local: localName });
       }
     }
   }
+  registerGoImport(goPkg, qualifier, defaultName, namespaceName, named);
 }
 
 function getImportLocalName(node: AstNode): string | null {
@@ -8021,6 +8172,8 @@ const helperRequires: Record<string, string[]> = {
   objectAssign: ['orderedMap'],
   promiseAll: ['orderedMap', 'asyncWait', 'promise'],
   promise: ['error', 'eventLoop', 'asyncWait'],
+  goMust: ['error'],
+  goBlocking: ['error', 'eventLoop'],
   decorators: [],
   jsx: [],
   objectIntegrity: [],
@@ -8065,6 +8218,25 @@ function bindNodeRegistryServices(): void {
   nodeRegistry.typeOf = (node: AstNode) => inferExpressionType(node) ?? '';
   nodeRegistry.visit = (node: AstNode) => visit(node);
   nodeRegistry.categoryOf = (node: AstNode) => resolveExpressionType(node) ?? '';
+  bindConvertServices({
+    pkg: needPkg,
+    helper: useHelper,
+    typeOf: (node: AstNode) => inferExpressionType(node) ?? ''
+  });
+  bindBridgeServices({
+    pkg: needPkg,
+    helper: useHelper,
+    temp: getTempName,
+    typeOf: (node: AstNode) => inferExpressionType(node) ?? '',
+    visit: (node: AstNode) => visit(node),
+    categoryOf: (node: AstNode) => resolveExpressionType(node) ?? '',
+    goTypeOf: (node: AstNode) => getType(node),
+    isIdentifier: (node: AstNode) => isIdentifier(node),
+    isPropertyAccess: (node: AstNode) => isPropertyAccessExpression(node),
+    isArrowFunction: (node: AstNode) => isArrowFunction(node),
+    isFunctionExpression: (node: AstNode) => isFunctionExpression(node),
+    isObjectLiteral: (node: AstNode) => isObjectLiteralExpression(node)
+  });
 }
 registerCore(nodeRegistry);
 registerBuffer(nodeRegistry);
@@ -8112,6 +8284,10 @@ const helperPackages: Record<string, string[]> = {
   uri: ['strings', 'fmt', 'net/url'],
   promiseAll: [],
   promise: ['sync'],
+  goMust: [],
+  goNums: [],
+  goStrings: [],
+  goBlocking: [],
   decorators: [],
   jsx: ['strings', 'html', 'reflect', 'strconv', 'fmt'],
   objectIntegrity: ['sync', 'reflect'],
@@ -9923,6 +10099,7 @@ type TnError struct {
 	message string
 	code    string
 	props   map[string]interface{}
+	goErr   error
 }
 
 func (e *TnError) Error() string { return e.message }
@@ -9997,6 +10174,98 @@ var __tnWaitGroup tnLoopGroup`,
   bigint: `func TnBigInt(s string) *tnbig.Int {
 	v, _ := new(tnbig.Int).SetString(s, 10)
 	return v
+}`,
+  goMust: `// Go bridge: (T, error) results throw a *TnError carrying the Go error
+func tnGoError(err error) *TnError {
+	return &TnError{message: err.Error(), goErr: err}
+}
+
+func tnGoMust[T any](v T, err error) T {
+	if err != nil {
+		panic(tnGoError(err))
+	}
+	return v
+}
+
+func tnGoMust2[A any, B any](a A, b B, err error) (A, B) {
+	if err != nil {
+		panic(tnGoError(err))
+	}
+	return a, b
+}
+
+func tnGoCheck(err error) {
+	if err != nil {
+		panic(tnGoError(err))
+	}
+}`,
+  goNums: `// Go bridge: numeric slice conversion ([]int ↔ []float64)
+type tnGoNumber interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
+		~float32 | ~float64
+}
+
+func tnGoNums[T tnGoNumber](s []float64) []T {
+	out := make([]T, len(s))
+	for i, v := range s {
+		out[i] = T(v)
+	}
+	return out
+}
+
+func tnGoFromNums[T tnGoNumber](s []T) []float64 {
+	out := make([]float64, len(s))
+	for i, v := range s {
+		out[i] = float64(v)
+	}
+	return out
+}`,
+  goStrings: `// Go bridge: first rune of a string (unicode funcs take rune)
+func tnGoRune(s string) rune {
+	for _, r := range s {
+		return r
+	}
+	return 0
+}`,
+  goBlocking: `// Go bridge: blocking calls run on a goroutine while the baton holder
+// pumps pending loop tasks, so timers and handlers keep running
+func tnGoBlocking(fn func() interface{}) interface{} {
+	done := make(chan interface{}, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- r
+				return
+			}
+		}()
+		done <- fn()
+	}()
+	for {
+		select {
+		case v := <-done:
+			if err, ok := v.(*TnError); ok {
+				panic(err)
+			}
+			return v
+		default:
+		}
+		TnRunMicrotasks()
+		if TnLoopRunPending() {
+			continue
+		}
+		tnRelease()
+		select {
+		case v := <-done:
+			tnAcquire()
+			if err, ok := v.(*TnError); ok {
+				panic(err)
+			}
+			return v
+		case <-tnLoopSignal:
+			tnAcquire()
+		}
+	}
 }`,
   symbol: `// TnSymbol: JS symbol values (unique by identity)
 type TnSymbol struct {
@@ -10984,6 +11253,132 @@ function nodeTypeCall(nodes: AstNode[]): NodeCall {
 }
 
 // Go types of Node API expressions; undefined when the expression is not one
+// Property read on a Go package or Go value: consts, vars, fields.
+function visitGoProperty(node: AstNode): string | undefined {
+  const base = node.expression;
+  if (!isIdentifier(base)) return undefined;
+  // Package member: strings.ToUpper (as a value), math.Pi, os.Stdout.
+  const path = goPathOf(base.text);
+  if (path) {
+    const info = goPackage(path);
+    if (!info) return undefined;
+    const member = node.name.text;
+    const qualifier = goQualifier(path);
+    if (info.funcs[member]) return `${qualifier}.${member}`;
+    if (info.consts[member]) {
+      const kind = info.consts[member].kind;
+      // Untyped consts arrive as TS numbers; typed consts (time.Second)
+      // keep their Go type so arithmetic stays well-typed.
+      if (kind === 'typed') return `${qualifier}.${member}`;
+      if (kind === 'string') return `${qualifier}.${member}`;
+      if (kind === 'bool') return `${qualifier}.${member}`;
+      return `float64(${qualifier}.${member})`;
+    }
+    if (info.vars[member]) {
+      return `${qualifier}.${member}`;
+    }
+    if (info.types[member]) return `${qualifier}.${member}`;
+    return undefined;
+  }
+  // Field on a Go-typed value.
+  if (isCallee(node) || isAssignmentTarget(node)) return undefined;
+  const recvType = inferExpressionType(base);
+  if (!recvType) return undefined;
+  const field = goFieldType(recvType, node.name.text);
+  if (field) {
+    const recv = visit(base);
+    return fromGoType(`${recv}.${node.name.text}`, field);
+  }
+  // GoRef<T>.value dereferences the pointer cell (structs with a real
+  // `value` field take the branch above). Only when the receiver is
+  // declared as GoRef<...>, or points to a basic type (flag.String's
+  // *string has no fields to read).
+  if (node.name.text === 'value' && recvType.startsWith('*') && isIdentifier(base)) {
+    const base2 = recvType.slice(1);
+    const isBasic = base2 === 'string' || base2 === 'float64' || base2 === 'bool' || isGoBasicKind(base2);
+    if (isBasic) {
+      return `(*${visit(base)})`;
+    }
+    const typeNode = variableTypeNodes.get(base.text);
+    if (
+      typeNode &&
+      isTypeReferenceNode(typeNode) &&
+      isIdentifier(typeNode.typeName) &&
+      typeNode.typeName.text === 'GoRef'
+    ) {
+      return `(*${visit(base)})`;
+    }
+  }
+  return undefined;
+}
+
+// Channel method call: ch.send(v) → ch <- v, ch.recv() → <-ch,
+// ch.close() → close(ch).
+function visitGoChanCall(node: AstNode, recv: string): string | undefined {
+  if (!isPropertyAccessExpression(node.expression)) return undefined;
+  const method = node.expression.name.text;
+  const args = node.arguments ?? [];
+  if (method === 'send' && args.length === 1) {
+    return `${recv} <- ${visit(args[0])}`;
+  }
+  if (method === 'recv' && args.length === 0) {
+    return `<-${recv}`;
+  }
+  if (method === 'close' && args.length === 0) {
+    return `close(${recv})`;
+  }
+  return undefined;
+}
+
+// Package + type of a `new pkg.T(...)` expression, null when none.
+function goNewTarget(node: AstNode): { path: string; typeName: string; qualifier: string } | null {
+  const ctor = node.expression;
+  if (!ctor) return null;
+  if (isIdentifier(ctor)) {
+    const qualified = goMemberOf(ctor.text);
+    if (!qualified) return null;
+    const dot = qualified.indexOf('.');
+    if (dot < 0) return null;
+    const qualifier = qualified.slice(0, dot);
+    const typeName = qualified.slice(dot + 1);
+    for (const path of Object.keys(goStdlib)) {
+      if (goQualifier(path) === qualifier && goPackage(path)?.types[typeName]) {
+        return { path, typeName, qualifier };
+      }
+    }
+    return null;
+  }
+  if (isPropertyAccessExpression(ctor) && isIdentifier(ctor.expression)) {
+    const path = goPathOf(ctor.expression.text);
+    if (!path) return null;
+    const typeName = ctor.name.text;
+    if (!goPackage(path)?.types[typeName]) return null;
+    return { path, typeName, qualifier: goQualifier(path) };
+  }
+  return null;
+}
+
+function inferGoExpressionType(expr: AstNode): string | undefined {
+  if (isCallExpression(expr) || isIdentifier(expr) || isPropertyAccessExpression(expr)) {
+    return inferGoType(expr);
+  }
+  if (isNewExpression(expr)) {
+    const target = goNewTarget(expr);
+    if (target) {
+      const info = goPackage(target.path);
+      const type = info?.types[target.typeName];
+      if (type) {
+        for (const m of type.methods) {
+          if (m.ptr) return `*${target.path}.${target.typeName}`;
+        }
+        return `${target.path}.${target.typeName}`;
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 function inferNodeExpressionType(expr: AstNode): string | undefined {
   if (isCallExpression(expr)) {
     const callee = expr.expression;
@@ -11099,6 +11494,11 @@ function visitImportDeclaration(node: AstNode): string {
   // Go standard library: `import { Println } from 'go:fmt'` → import "fmt"
   if (moduleSpec.startsWith('go:')) {
     const goPkg = moduleSpec.slice(3);
+    // go:builtin is virtual (ref/chan/GoError): no Go import, just aliases.
+    if (goPkg === 'builtin') {
+      registerGoBuiltinAliases(node);
+      return '';
+    }
     importedPackages.add(goPkg);
     registerGoPackageAliases(node, goPkg);
     return '';
@@ -11128,16 +11528,10 @@ function visitImportDeclaration(node: AstNode): string {
 }
 
 // Go packages imported under a fixed alias to avoid collisions with user
-// variables (a variable named `big` would shadow the package name)
-const goImportAliases: Record<string, string> = {
-  'math/big': 'tnbig',
-  'net/url': 'tnurl',
-  'crypto/rand': 'cryptorand',
-  'golang.org/x/text/unicode/norm': 'tnnorm'
-};
-
+// variables (a variable named `big` would shadow the package name).
+// Table lives in src/go/overrides.ts (shared with the bridge qualifier).
 function goImportLine(pkg: string): string {
-  const alias = goImportAliases[pkg];
+  const alias = goPathAliases[pkg];
   return alias ? `import ${alias} "${pkg}"` : `import "${pkg}"`;
 }
 
@@ -11155,8 +11549,40 @@ function registerLocalVariable(name: string, goType: string | undefined): void {
 }
 
 // for...of over arrays and strings (a string yields one-character strings)
+// Whether a Go type is an iter.Seq / Seq2 (range-over-func).
+function isGoIterSeq(goType: string): boolean {
+  const base = goType.replace(/^\*/, '');
+  return base.startsWith('iter.Seq') || base.startsWith('import(\'go:iter\').Seq');
+}
+
+// Element type of an iter.Seq[V] (Seq2 yields its key type in for…of).
+function goIterElem(goType: string): string {
+  const start = goType.indexOf('[');
+  const end = goType.lastIndexOf(']');
+  if (start < 0 || end < 0) return 'interface{}';
+  const inner = goType.slice(start + 1, end);
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    if (inner[i] === '[' || inner[i] === '(') depth++;
+    else if (inner[i] === ']' || inner[i] === ')') depth--;
+    else if (inner[i] === ',' && depth === 0) return inner.slice(0, i).trim() || 'interface{}';
+  }
+  return inner.trim() || 'interface{}';
+}
+
 function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | undefined): string {
   if (iterType === 'interface{}') iterType = '[]interface{}';
+  // Go iter.Seq[V] / Seq2[K, V]: range the func directly.
+  if (iterType && isGoIterSeq(iterType)) {
+    const declaration = isVariableDeclarationList(node.initializer)
+      ? node.initializer.declarations[0]
+      : undefined;
+    if (declaration && isIdentifier(declaration.name)) {
+      registerLocalVariable(declaration.name.text, goIterElem(iterType));
+      return `for ${visit(declaration.name)} := range ${iterExpr}${visitLoopBody(node.statement)}`;
+    }
+    return `for _ = range ${iterExpr}${visitLoopBody(node.statement)}`;
+  }
   // An iterable class instance: range its Symbol_iterator channel
   if (iterType?.startsWith('*')) {
     const iterClass = iterType.slice(1).replace(/\[.*\]$/, '');

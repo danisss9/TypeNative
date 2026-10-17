@@ -10,6 +10,7 @@ import { platform } from 'node:os';
 // not reach them), so they're accessed through `any` casts for type-checking.
 import * as childProcess from 'node:child_process';
 import { transpileToNative } from './transpiler.js';
+import { VERSION } from './version.js';
 // Run a command and capture its output. Uses Node's spawnSync under Node and a
 // Go helper (os/exec) once transpiled — both synchronous, same result shape.
 // dist/go.mod + dist/tnvendor/x-text: golang.org/x/text's transform and unicode/norm
@@ -259,7 +260,7 @@ function getPackageJson(projectName) {
             build: `npx typenative --source main.ts --output bin/${exeName}`
         },
         devDependencies: {
-            typenative: '^0.1.3'
+            typenative: `^${VERSION}`
         }
     };
     return JSON.stringify(pckg, null, 2);

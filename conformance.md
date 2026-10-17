@@ -676,183 +676,204 @@ async function runs synchronously until its first `await`.
 
 ### Go bridges (`go:*`)
 
-| Module                              | Status | Probe                                                  | Notes                                                                         |
-| ----------------------------------- | :----: | ------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `go:fmt` (`Println`, `Sprintf`)     |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts) | Direct Go package access                                                      |
-| `go:strings` (`ToUpper`, `ToLower`) |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts) | Direct Go package access                                                      |
-| `go:strconv` (`FormatBool`)         |   ✅    | [syntax-import-go.ts](conformance/syntax-import-go.ts) | Direct Go package access                                                      |
-| `go:archive/tar`                    |   ❌    | —                                                      | tar archive read/write; not declared in types, no probe yet                   |
-| `go:archive/zip`                    |   ❌    | —                                                      | ZIP archive read/write; not declared in types, no probe yet                   |
-| `go:bufio`                          |   ❌    | —                                                      | Buffered I/O; not declared in types, no probe yet                             |
-| `go:bytes`                          |   ❌    | —                                                      | Byte-slice utilities; not declared in types, no probe yet                     |
-| `go:cmp`                            |   ❌    | —                                                      | Ordered comparison primitives; not declared in types, no probe yet            |
-| `go:compress/bzip2`                 |   ❌    | —                                                      | bzip2 decompression (read-only); not declared in types, no probe yet          |
-| `go:compress/flate`                 |   ❌    | —                                                      | DEFLATE compression; not declared in types, no probe yet                      |
-| `go:compress/gzip`                  |   ❌    | —                                                      | gzip read/write; not declared in types, no probe yet                          |
-| `go:compress/lzw`                   |   ❌    | —                                                      | LZW compression (GIF/PDF/TIFF); not declared in types, no probe yet           |
-| `go:compress/zlib`                  |   ❌    | —                                                      | zlib read/write; not declared in types, no probe yet                          |
-| `go:container/heap`                 |   ❌    | —                                                      | Heap / priority queue; not declared in types, no probe yet                    |
-| `go:container/list`                 |   ❌    | —                                                      | Doubly linked list; not declared in types, no probe yet                       |
-| `go:container/ring`                 |   ❌    | —                                                      | Circular list; not declared in types, no probe yet                            |
-| `go:context`                        |   ❌    | —                                                      | Cancellation and deadlines; not declared in types, no probe yet               |
-| `go:crypto`                         |   ❌    | —                                                      | Crypto constants and algorithm selection; not declared in types, no probe yet |
-| `go:crypto/aes`                     |   ❌    | —                                                      | AES encryption; not declared in types, no probe yet                           |
-| `go:crypto/cipher`                  |   ❌    | —                                                      | Block cipher modes (GCM, CBC, CTR); not declared in types, no probe yet       |
-| `go:crypto/des`                     |   ❌    | —                                                      | DES / triple DES (deprecated); not declared in types, no probe yet            |
-| `go:crypto/dsa`                     |   ❌    | —                                                      | DSA signatures (deprecated); not declared in types, no probe yet              |
-| `go:crypto/ecdh`                    |   ❌    | —                                                      | ECDH key exchange; not declared in types, no probe yet                        |
-| `go:crypto/ecdsa`                   |   ❌    | —                                                      | ECDSA signatures; not declared in types, no probe yet                         |
-| `go:crypto/ed25519`                 |   ❌    | —                                                      | Ed25519 signatures; not declared in types, no probe yet                       |
-| `go:crypto/elliptic`                |   ❌    | —                                                      | Elliptic curves (legacy; use ecdh/ecdsa); not declared in types, no probe yet |
-| `go:crypto/fips140`                 |   ❌    | —                                                      | FIPS 140-3 mode controls; not declared in types, no probe yet                 |
-| `go:crypto/hkdf`                    |   ❌    | —                                                      | HKDF key derivation; not declared in types, no probe yet                      |
-| `go:crypto/hmac`                    |   ❌    | —                                                      | HMAC keyed hashing; not declared in types, no probe yet                       |
-| `go:crypto/hpke`                    |   ❌    | —                                                      | HPKE encryption (RFC 9180); not declared in types, no probe yet               |
-| `go:crypto/md5`                     |   ❌    | —                                                      | MD5 hash; not declared in types, no probe yet                                 |
-| `go:crypto/mlkem`                   |   ❌    | —                                                      | ML-KEM post-quantum key encapsulation; not declared in types, no probe yet    |
-| `go:crypto/mlkem/mlkemtest`         |   ❌    | —                                                      | ML-KEM test vectors helper; not declared in types, no probe yet               |
-| `go:crypto/pbkdf2`                  |   ❌    | —                                                      | PBKDF2 key derivation; not declared in types, no probe yet                    |
-| `go:crypto/rand`                    |   ❌    | —                                                      | Cryptographically secure random bytes; not declared in types, no probe yet    |
-| `go:crypto/rc4`                     |   ❌    | —                                                      | RC4 stream cipher (deprecated); not declared in types, no probe yet           |
-| `go:crypto/rsa`                     |   ❌    | —                                                      | RSA signatures / encryption; not declared in types, no probe yet              |
-| `go:crypto/sha1`                    |   ❌    | —                                                      | SHA-1 hash; not declared in types, no probe yet                               |
-| `go:crypto/sha256`                  |   ❌    | —                                                      | SHA-224 / SHA-256 hashes; not declared in types, no probe yet                 |
-| `go:crypto/sha3`                    |   ❌    | —                                                      | SHA-3 / SHAKE hashes; not declared in types, no probe yet                     |
-| `go:crypto/sha512`                  |   ❌    | —                                                      | SHA-384 / SHA-512 family hashes; not declared in types, no probe yet          |
-| `go:crypto/subtle`                  |   ❌    | —                                                      | Constant-time comparison primitives; not declared in types, no probe yet      |
-| `go:crypto/tls`                     |   ❌    | —                                                      | TLS client / server; not declared in types, no probe yet                      |
-| `go:crypto/x509`                    |   ❌    | —                                                      | X.509 certificates and revocation; not declared in types, no probe yet        |
-| `go:crypto/x509/pkix`               |   ❌    | —                                                      | X.509 ASN.1/PKIX structures; not declared in types, no probe yet              |
-| `go:database/sql`                   |   ❌    | —                                                      | SQL database access; not declared in types, no probe yet                      |
-| `go:database/sql/driver`            |   ❌    | —                                                      | SQL driver interfaces; not declared in types, no probe yet                    |
-| `go:debug/buildinfo`                |   ❌    | —                                                      | Build info from executables; not declared in types, no probe yet              |
-| `go:debug/dwarf`                    |   ❌    | —                                                      | DWARF debug info parsing; not declared in types, no probe yet                 |
-| `go:debug/elf`                      |   ❌    | —                                                      | ELF object files; not declared in types, no probe yet                         |
-| `go:debug/gosym`                    |   ❌    | —                                                      | Go symbol tables; not declared in types, no probe yet                         |
-| `go:debug/macho`                    |   ❌    | —                                                      | Mach-O object files; not declared in types, no probe yet                      |
-| `go:debug/pe`                       |   ❌    | —                                                      | PE (Windows) object files; not declared in types, no probe yet                |
-| `go:debug/plan9obj`                 |   ❌    | —                                                      | Plan 9 object files; not declared in types, no probe yet                      |
-| `go:embed`                          |   ❌    | —                                                      | Files embedded via //go:embed; not declared in types, no probe yet            |
-| `go:encoding`                       |   ❌    | —                                                      | Shared encoding interfaces; not declared in types, no probe yet               |
-| `go:encoding/ascii85`               |   ❌    | —                                                      | ascii85 encoding; not declared in types, no probe yet                         |
-| `go:encoding/asn1`                  |   ❌    | —                                                      | ASN.1 DER encoding; not declared in types, no probe yet                       |
-| `go:encoding/base32`                |   ❌    | —                                                      | base32 encoding; not declared in types, no probe yet                          |
-| `go:encoding/base64`                |   ❌    | —                                                      | base64 encoding; not declared in types, no probe yet                          |
-| `go:encoding/binary`                |   ❌    | —                                                      | Binary packing / varints; not declared in types, no probe yet                 |
-| `go:encoding/csv`                   |   ❌    | —                                                      | CSV read/write; not declared in types, no probe yet                           |
-| `go:encoding/gob`                   |   ❌    | —                                                      | Go binary serialization; not declared in types, no probe yet                  |
-| `go:encoding/hex`                   |   ❌    | —                                                      | hex encoding; not declared in types, no probe yet                             |
-| `go:encoding/json`                  |   ❌    | —                                                      | JSON encode/decode; not declared in types, no probe yet                       |
-| `go:encoding/pem`                   |   ❌    | —                                                      | PEM encoding; not declared in types, no probe yet                             |
-| `go:encoding/xml`                   |   ❌    | —                                                      | XML read/write; not declared in types, no probe yet                           |
-| `go:errors`                         |   ❌    | —                                                      | Error creation / wrapping / inspection; not declared in types, no probe yet   |
-| `go:expvar`                         |   ❌    | —                                                      | Public process variables; not declared in types, no probe yet                 |
-| `go:flag`                           |   ❌    | —                                                      | Command-line flag parsing; not declared in types, no probe yet                |
-| `go:go/ast`                         |   ❌    | —                                                      | Go syntax tree; not declared in types, no probe yet                           |
-| `go:go/build`                       |   ❌    | —                                                      | Go package build metadata; not declared in types, no probe yet                |
-| `go:go/build/constraint`            |   ❌    | —                                                      | Build-tag constraint parsing; not declared in types, no probe yet             |
-| `go:go/constant`                    |   ❌    | —                                                      | Untyped constant values; not declared in types, no probe yet                  |
-| `go:go/doc`                         |   ❌    | —                                                      | Go doc extraction; not declared in types, no probe yet                        |
-| `go:go/doc/comment`                 |   ❌    | —                                                      | Doc comment parse/print; not declared in types, no probe yet                  |
-| `go:go/format`                      |   ❌    | —                                                      | Go source formatting; not declared in types, no probe yet                     |
-| `go:go/importer`                    |   ❌    | —                                                      | Export-data type importer; not declared in types, no probe yet                |
-| `go:go/parser`                      |   ❌    | —                                                      | Go source parser; not declared in types, no probe yet                         |
-| `go:go/printer`                     |   ❌    | —                                                      | Go AST printer; not declared in types, no probe yet                           |
-| `go:go/scanner`                     |   ❌    | —                                                      | Go tokenizer; not declared in types, no probe yet                             |
-| `go:go/token`                       |   ❌    | —                                                      | Go tokens / positions; not declared in types, no probe yet                    |
-| `go:go/types`                       |   ❌    | —                                                      | Go type checker; not declared in types, no probe yet                          |
-| `go:go/version`                     |   ❌    | —                                                      | Go version comparison; not declared in types, no probe yet                    |
-| `go:hash`                           |   ❌    | —                                                      | Hash function interface; not declared in types, no probe yet                  |
-| `go:hash/adler32`                   |   ❌    | —                                                      | Adler-32 checksum; not declared in types, no probe yet                        |
-| `go:hash/crc32`                     |   ❌    | —                                                      | CRC-32 checksum; not declared in types, no probe yet                          |
-| `go:hash/crc64`                     |   ❌    | —                                                      | CRC-64 checksum; not declared in types, no probe yet                          |
-| `go:hash/fnv`                       |   ❌    | —                                                      | FNV-1 / FNV-1a hash; not declared in types, no probe yet                      |
-| `go:hash/maphash`                   |   ❌    | —                                                      | Seeded string hashing; not declared in types, no probe yet                    |
-| `go:html`                           |   ❌    | —                                                      | HTML escaping; not declared in types, no probe yet                            |
-| `go:html/template`                  |   ❌    | —                                                      | HTML templating (auto-escaped); not declared in types, no probe yet           |
-| `go:image`                          |   ❌    | —                                                      | 2D image interface; not declared in types, no probe yet                       |
-| `go:image/color`                    |   ❌    | —                                                      | Color types; not declared in types, no probe yet                              |
-| `go:image/color/palette`            |   ❌    | —                                                      | Standard color palettes; not declared in types, no probe yet                  |
-| `go:image/draw`                     |   ❌    | —                                                      | Image compositing; not declared in types, no probe yet                        |
-| `go:image/gif`                      |   ❌    | —                                                      | GIF decode/encode; not declared in types, no probe yet                        |
-| `go:image/jpeg`                     |   ❌    | —                                                      | JPEG decode/encode; not declared in types, no probe yet                       |
-| `go:image/png`                      |   ❌    | —                                                      | PNG decode/encode; not declared in types, no probe yet                        |
-| `go:index/suffixarray`              |   ❌    | —                                                      | Suffix-array substring search; not declared in types, no probe yet            |
-| `go:io`                             |   ❌    | —                                                      | Core I/O interfaces (Reader/Writer); not declared in types, no probe yet      |
-| `go:io/fs`                          |   ❌    | —                                                      | Filesystem abstraction; not declared in types, no probe yet                   |
-| `go:io/ioutil`                      |   ❌    | —                                                      | Deprecated I/O helpers (Go 1.16); not declared in types, no probe yet         |
-| `go:iter`                           |   ❌    | —                                                      | Range-over-func iterator types; not declared in types, no probe yet           |
-| `go:log`                            |   ❌    | —                                                      | Leveled logging to stderr; not declared in types, no probe yet                |
-| `go:log/slog`                       |   ❌    | —                                                      | Structured logging; not declared in types, no probe yet                       |
-| `go:log/syslog`                     |   ❌    | —                                                      | syslog client (Unix only); not declared in types, no probe yet                |
-| `go:maps`                           |   ❌    | —                                                      | Generic map utilities; not declared in types, no probe yet                    |
-| `go:math`                           |   ❌    | —                                                      | Float math functions; not declared in types, no probe yet                     |
-| `go:math/big`                       |   ❌    | —                                                      | Arbitrary-precision arithmetic; not declared in types, no probe yet           |
-| `go:math/bits`                      |   ❌    | —                                                      | Bit counting / manipulation; not declared in types, no probe yet              |
-| `go:math/cmplx`                     |   ❌    | —                                                      | Complex-number math; not declared in types, no probe yet                      |
-| `go:math/rand`                      |   ❌    | —                                                      | Pseudo-random generator (legacy); not declared in types, no probe yet         |
-| `go:math/rand/v2`                   |   ❌    | —                                                      | Pseudo-random generator (v2); not declared in types, no probe yet             |
-| `go:mime`                           |   ❌    | —                                                      | MIME type lookup; not declared in types, no probe yet                         |
-| `go:mime/multipart`                 |   ❌    | —                                                      | multipart/form-data parsing; not declared in types, no probe yet              |
-| `go:mime/quotedprintable`           |   ❌    | —                                                      | quoted-printable encoding; not declared in types, no probe yet                |
-| `go:net`                            |   ❌    | —                                                      | Network I/O (TCP/UDP/Unix sockets); not declared in types, no probe yet       |
-| `go:net/http`                       |   ❌    | —                                                      | HTTP client / server; not declared in types, no probe yet                     |
-| `go:net/http/cgi`                   |   ❌    | —                                                      | CGI handler support; not declared in types, no probe yet                      |
-| `go:net/http/cookiejar`             |   ❌    | —                                                      | HTTP cookie storage; not declared in types, no probe yet                      |
-| `go:net/http/fcgi`                  |   ❌    | —                                                      | FastCGI server; not declared in types, no probe yet                           |
-| `go:net/http/httptest`              |   ❌    | —                                                      | HTTP test helpers; not declared in types, no probe yet                        |
-| `go:net/http/httptrace`             |   ❌    | —                                                      | HTTP request tracing; not declared in types, no probe yet                     |
-| `go:net/http/httputil`              |   ❌    | —                                                      | HTTP utilities (reverse proxy); not declared in types, no probe yet           |
-| `go:net/http/pprof`                 |   ❌    | —                                                      | Profiling endpoints over HTTP; not declared in types, no probe yet            |
-| `go:net/mail`                       |   ❌    | —                                                      | RFC 5322 address parsing; not declared in types, no probe yet                 |
-| `go:net/netip`                      |   ❌    | —                                                      | IP address / prefix types; not declared in types, no probe yet                |
-| `go:net/rpc`                        |   ❌    | —                                                      | Go RPC; not declared in types, no probe yet                                   |
-| `go:net/rpc/jsonrpc`                |   ❌    | —                                                      | JSON-RPC codec for net/rpc; not declared in types, no probe yet               |
-| `go:net/smtp`                       |   ❌    | —                                                      | SMTP client; not declared in types, no probe yet                              |
-| `go:net/textproto`                  |   ❌    | —                                                      | Text-based protocol helpers; not declared in types, no probe yet              |
-| `go:net/url`                        |   ❌    | —                                                      | URL parsing / building; not declared in types, no probe yet                   |
-| `go:os`                             |   ❌    | —                                                      | OS functions (files, env, process); not declared in types, no probe yet       |
-| `go:os/exec`                        |   ❌    | —                                                      | External command execution; not declared in types, no probe yet               |
-| `go:os/signal`                      |   ❌    | —                                                      | OS signal handling; not declared in types, no probe yet                       |
-| `go:os/user`                        |   ❌    | —                                                      | User / group lookup; not declared in types, no probe yet                      |
-| `go:path`                           |   ❌    | —                                                      | Slash-separated path utilities; not declared in types, no probe yet           |
-| `go:path/filepath`                  |   ❌    | —                                                      | OS-specific file paths; not declared in types, no probe yet                   |
-| `go:plugin`                         |   ❌    | —                                                      | Go plugin loading (cgo; Linux/macOS/BSD); not declared in types, no probe yet |
-| `go:reflect`                        |   ❌    | —                                                      | Runtime reflection; not declared in types, no probe yet                       |
-| `go:regexp`                         |   ❌    | —                                                      | Regular expressions (RE2); not declared in types, no probe yet                |
-| `go:regexp/syntax`                  |   ❌    | —                                                      | Regex syntax parsing; not declared in types, no probe yet                     |
-| `go:runtime`                        |   ❌    | —                                                      | Runtime introspection (GC, goroutines); not declared in types, no probe yet   |
-| `go:runtime/coverage`               |   ❌    | —                                                      | Coverage counter writing; not declared in types, no probe yet                 |
-| `go:runtime/debug`                  |   ❌    | —                                                      | Debug controls (stack dump, GC tuning); not declared in types, no probe yet   |
-| `go:runtime/metrics`                |   ❌    | —                                                      | Runtime metrics; not declared in types, no probe yet                          |
-| `go:runtime/pprof`                  |   ❌    | —                                                      | CPU / memory profiling; not declared in types, no probe yet                   |
-| `go:runtime/race`                   |   ❌    | —                                                      | Race detector interaction; not declared in types, no probe yet                |
-| `go:runtime/trace`                  |   ❌    | —                                                      | Execution tracing; not declared in types, no probe yet                        |
-| `go:slices`                         |   ❌    | —                                                      | Generic slice utilities; not declared in types, no probe yet                  |
-| `go:sort`                           |   ❌    | —                                                      | Sorting; not declared in types, no probe yet                                  |
-| `go:structs`                        |   ❌    | —                                                      | Struct layout annotations; not declared in types, no probe yet                |
-| `go:sync`                           |   ❌    | —                                                      | Sync primitives (Mutex, WaitGroup); not declared in types, no probe yet       |
-| `go:sync/atomic`                    |   ❌    | —                                                      | Atomic memory operations; not declared in types, no probe yet                 |
-| `go:syscall`                        |   ❌    | —                                                      | Raw system call interface; not declared in types, no probe yet                |
-| `go:testing`                        |   ❌    | —                                                      | Test / benchmark harness; not declared in types, no probe yet                 |
-| `go:testing/cryptotest`             |   ❌    | —                                                      | FIPS crypto test helpers; not declared in types, no probe yet                 |
-| `go:testing/fstest`                 |   ❌    | —                                                      | In-memory filesystem maps; not declared in types, no probe yet                |
-| `go:testing/iotest`                 |   ❌    | —                                                      | Reader / writer test shims; not declared in types, no probe yet               |
-| `go:testing/quick`                  |   ❌    | —                                                      | Property-based testing; not declared in types, no probe yet                   |
-| `go:testing/slogtest`               |   ❌    | —                                                      | slog handler testing; not declared in types, no probe yet                     |
-| `go:testing/synctest`               |   ❌    | —                                                      | Deterministic async testing; not declared in types, no probe yet              |
-| `go:text/scanner`                   |   ❌    | —                                                      | Generic token scanning; not declared in types, no probe yet                   |
-| `go:text/tabwriter`                 |   ❌    | —                                                      | Column-aligned text output; not declared in types, no probe yet               |
-| `go:text/template`                  |   ❌    | —                                                      | Data-driven text templating; not declared in types, no probe yet              |
-| `go:text/template/parse`            |   ❌    | —                                                      | Template parse tree; not declared in types, no probe yet                      |
-| `go:time`                           |   ❌    | —                                                      | Dates, durations, timers; not declared in types, no probe yet                 |
-| `go:time/tzdata`                    |   ❌    | —                                                      | Embedded timezone database; not declared in types, no probe yet               |
-| `go:unicode`                        |   ❌    | —                                                      | Unicode properties / tables; not declared in types, no probe yet              |
-| `go:unicode/utf16`                  |   ❌    | —                                                      | UTF-16 encoding; not declared in types, no probe yet                          |
-| `go:unicode/utf8`                   |   ❌    | —                                                      | UTF-8 encoding; not declared in types, no probe yet                           |
-| `go:unique`                         |   ❌    | —                                                      | Interned canonical values; not declared in types, no probe yet                |
-| `go:unsafe`                         |   ❌    | —                                                      | Unsafe pointers / memory layout; not declared in types, no probe yet          |
-| `go:weak`                           |   ❌    | —                                                      | Weak pointers; not declared in types, no probe yet                            |
+Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ excluded.
+
+<!-- go-bridges:start -->
+| Module | Status | Probe | Notes |
+| ------ | :----: | ----- | ----- |
+| `go:archive/tar` | ⚠️ | — | tar archive read/write |
+| `go:archive/zip` | ✅ | [lib-go-archive.ts](conformance/lib-go-archive.ts) | ZIP archive read/write |
+| `go:bufio` | ✅ | [lib-go-bufio.ts](conformance/lib-go-bufio.ts) | Buffered I/O |
+| `go:bytes` | ✅ | [lib-go-bytes.ts](conformance/lib-go-bytes.ts) | Byte-slice utilities |
+| `go:cmp` | ✅ | [lib-go-slices.ts](conformance/lib-go-slices.ts) | Ordered comparison primitives |
+| `go:compress/bzip2` | ⚠️ | — | bzip2 decompression (read-only) |
+| `go:compress/flate` | ⚠️ | — | DEFLATE compression |
+| `go:compress/gzip` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | gzip read/write |
+| `go:compress/lzw` | ⚠️ | — | LZW compression (GIF/PDF/TIFF) |
+| `go:compress/zlib` | ⚠️ | — | zlib read/write |
+| `go:container/heap` | ⚠️ | — | Heap / priority queue |
+| `go:container/list` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Doubly linked list |
+| `go:container/ring` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Circular list |
+| `go:context` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Cancellation and deadlines |
+| `go:crypto` | ⚠️ | — | Crypto constants and algorithm selection |
+| `go:crypto/aes` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | AES encryption |
+| `go:crypto/cipher` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Block cipher modes (GCM, CBC, CTR) |
+| `go:crypto/des` | ⚠️ | — | DES / triple DES (deprecated) |
+| `go:crypto/dsa` | ⚠️ | — | DSA signatures (deprecated) |
+| `go:crypto/ecdh` | ⚠️ | — | ECDH key exchange |
+| `go:crypto/ecdsa` | ⚠️ | — | ECDSA signatures |
+| `go:crypto/ed25519` | ✅ | [lib-go-ed25519.ts](conformance/lib-go-ed25519.ts) | Ed25519 signatures |
+| `go:crypto/elliptic` | ⚠️ | — | Elliptic curves (legacy; use ecdh/ecdsa) |
+| `go:crypto/fips140` | ⚠️ | — | FIPS 140-3 mode controls |
+| `go:crypto/hkdf` | ⚠️ | — | HKDF key derivation |
+| `go:crypto/hmac` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | HMAC keyed hashing |
+| `go:crypto/hpke` | ⚠️ | — | HPKE encryption (RFC 9180) |
+| `go:crypto/md5` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | MD5 hash |
+| `go:crypto/mlkem` | ⚠️ | — | ML-KEM post-quantum key encapsulation |
+| `go:crypto/mlkem/mlkemtest` | ⚠️ | — | ML-KEM test vectors helper |
+| `go:crypto/pbkdf2` | ⚠️ | — | PBKDF2 key derivation |
+| `go:crypto/rand` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Cryptographically secure random bytes |
+| `go:crypto/rc4` | ⚠️ | — | RC4 stream cipher (deprecated) |
+| `go:crypto/rsa` | ✅ | [lib-go-rsa.ts](conformance/lib-go-rsa.ts) | RSA signatures / encryption |
+| `go:crypto/sha1` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | SHA-1 hash |
+| `go:crypto/sha256` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | SHA-224 / SHA-256 hashes |
+| `go:crypto/sha3` | ⚠️ | — | SHA-3 / SHAKE hashes |
+| `go:crypto/sha512` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | SHA-384 / SHA-512 family hashes |
+| `go:crypto/subtle` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Constant-time comparison primitives |
+| `go:crypto/tls` | ⚠️ | — | TLS client/server; loopback probe is a later phase |
+| `go:crypto/x509` | ⚠️ | — | X.509 certificates and revocation |
+| `go:crypto/x509/pkix` | ⚠️ | — | X.509 ASN.1/PKIX structures |
+| `go:database/sql` | ⚠️ | — | No std driver; needs an external driver |
+| `go:database/sql/driver` | ⚠️ | — | Driver interfaces; no std driver |
+| `go:debug/buildinfo` | ⚠️ | — | Build info from executables |
+| `go:debug/dwarf` | ⚠️ | — | DWARF debug info parsing |
+| `go:debug/elf` | ⚠️ | — | ELF object files |
+| `go:debug/gosym` | ⚠️ | — | Go symbol tables |
+| `go:debug/macho` | ⚠️ | — | Mach-O object files |
+| `go:debug/pe` | ⚠️ | — | PE (Windows) object files |
+| `go:debug/plan9obj` | ⚠️ | — | Plan 9 object files |
+| `go:encoding` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | Shared encoding interfaces |
+| `go:encoding/ascii85` | ⚠️ | — | ascii85 encoding |
+| `go:encoding/asn1` | ⚠️ | — | ASN.1 DER encoding |
+| `go:encoding/base32` | ⚠️ | — | base32 encoding |
+| `go:encoding/base64` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | base64 encoding |
+| `go:encoding/binary` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Binary packing / varints |
+| `go:encoding/csv` | ✅ | [lib-go-csv.ts](conformance/lib-go-csv.ts) | CSV read/write |
+| `go:encoding/gob` | ✅ | [lib-go-gob.ts](conformance/lib-go-gob.ts) | Go binary serialization |
+| `go:encoding/hex` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | hex encoding |
+| `go:encoding/json` | ⚠️ | — | JSON encode/decode |
+| `go:encoding/pem` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | PEM encoding |
+| `go:encoding/xml` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | XML read/write |
+| `go:errors` | ✅ | [lib-go-errors.ts](conformance/lib-go-errors.ts) | Error creation / wrapping / inspection |
+| `go:expvar` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Public process variables |
+| `go:flag` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | Command-line flag parsing |
+| `go:fmt` | ⚠️ | — | Formatted I/O |
+| `go:go/ast` | ⚠️ | — | Go syntax tree |
+| `go:go/build` | ⚠️ | — | Go package build metadata |
+| `go:go/build/constraint` | ⚠️ | — | Build-tag constraint parsing |
+| `go:go/constant` | ⚠️ | — | Untyped constant values |
+| `go:go/doc` | ⚠️ | — | Go doc extraction |
+| `go:go/doc/comment` | ⚠️ | — | Doc comment parse/print |
+| `go:go/format` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go source formatting |
+| `go:go/importer` | ⚠️ | — | Export-data type importer |
+| `go:go/parser` | ⚠️ | — | Go source parser |
+| `go:go/printer` | ⚠️ | — | Go AST printer |
+| `go:go/scanner` | ⚠️ | — | Go tokenizer |
+| `go:go/token` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go tokens / positions |
+| `go:go/types` | ⚠️ | — | Go type checker |
+| `go:go/version` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go version comparison |
+| `go:hash` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | Hash function interface |
+| `go:hash/adler32` | ⚠️ | — | Adler-32 checksum |
+| `go:hash/crc32` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | CRC-32 checksum |
+| `go:hash/crc64` | ⚠️ | — | CRC-64 checksum |
+| `go:hash/fnv` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | FNV-1 / FNV-1a hash |
+| `go:hash/maphash` | ⚠️ | — | Seeded string hashing |
+| `go:html` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | HTML escaping |
+| `go:html/template` | ⚠️ | — | HTML templating (auto-escaped) |
+| `go:image` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | 2D image interface |
+| `go:image/color` | ⚠️ | — | Color types |
+| `go:image/color/palette` | ⚠️ | — | Standard color palettes |
+| `go:image/draw` | ⚠️ | — | Image compositing |
+| `go:image/gif` | ⚠️ | — | GIF decode/encode |
+| `go:image/jpeg` | ⚠️ | — | JPEG decode/encode |
+| `go:image/png` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | PNG decode/encode |
+| `go:index/suffixarray` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Suffix-array substring search |
+| `go:io` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | Core I/O interfaces (Reader/Writer) |
+| `go:io/fs` | ⚠️ | — | Filesystem abstraction |
+| `go:io/ioutil` | ⚠️ | — | Deprecated I/O helpers (Go 1.16) |
+| `go:iter` | ⚠️ | — | Range-over-func iterator types |
+| `go:log` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Logging to stderr |
+| `go:log/internal` | ⚠️ | — | Internal log support |
+| `go:log/slog` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Structured logging |
+| `go:log/slog/internal` | ⚠️ | — | Internal slog support |
+| `go:log/syslog` | ⚠️ | — | Unix syslog; no portable probe |
+| `go:maps` | ⚠️ | — | Generic map helpers |
+| `go:math` | ✅ | [lib-go-math.ts](conformance/lib-go-math.ts) | Math functions |
+| `go:math/big` | ⚠️ | — | Arbitrary-precision arithmetic |
+| `go:math/bits` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Bit operations |
+| `go:math/cmplx` | ⚠️ | — | Complex math |
+| `go:math/rand` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Pseudo-random numbers |
+| `go:math/rand/v2` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Pseudo-random numbers (v2 API) |
+| `go:mime` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | MIME media types |
+| `go:mime/multipart` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Multipart forms |
+| `go:mime/quotedprintable` | ⚠️ | — | Quoted-printable encoding |
+| `go:net` | ⚠️ | — | Sockets (loopback listener) |
+| `go:net/http` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP client/server (loopback) |
+| `go:net/http/cgi` | ⚠️ | — | CGI handler |
+| `go:net/http/cookiejar` | ⚠️ | — | Cookie jars (loopback) |
+| `go:net/http/fcgi` | ⚠️ | — | FastCGI handler |
+| `go:net/http/httptest` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP test servers (loopback) |
+| `go:net/http/httptrace` | ⚠️ | — | HTTP tracing hooks |
+| `go:net/http/httputil` | ⚠️ | — | HTTP utilities (loopback) |
+| `go:net/http/internal` | ⚠️ | — | Internal HTTP support |
+| `go:net/http/pprof` | ⚠️ | — | pprof HTTP handlers |
+| `go:net/mail` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Mail address parsing |
+| `go:net/netip` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | IP address types |
+| `go:net/rpc` | ⚠️ | — | RPC client/server |
+| `go:net/rpc/jsonrpc` | ⚠️ | — | JSON-RPC codec |
+| `go:net/smtp` | ⚠️ | — | SMTP client; needs a server |
+| `go:net/textproto` | ⚠️ | — | Text protocol I/O |
+| `go:net/url` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | URL parsing |
+| `go:os` | ✅ | [lib-go-os.ts](conformance/lib-go-os.ts) | OS files and processes |
+| `go:os/exec` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | External commands |
+| `go:os/signal` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Signal notification (`Notify` + `Stop`) |
+| `go:os/user` | ⚠️ | — | User lookup |
+| `go:path` | ⚠️ | — | Slash-separated paths |
+| `go:path/filepath` | ✅ | [lib-go-os.ts](conformance/lib-go-os.ts) | File paths |
+| `go:reflect` | ⚠️ | — | Runtime reflection |
+| `go:regexp` | ✅ | [lib-go-regexp.ts](conformance/lib-go-regexp.ts) | Regular expressions |
+| `go:regexp/syntax` | ⚠️ | — | Regexp parse trees |
+| `go:runtime` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Runtime introspection |
+| `go:runtime/debug` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Stack traces and GC stats |
+| `go:runtime/metrics` | ⚠️ | — | Runtime metrics sampling |
+| `go:runtime/pprof` | ⚠️ | — | Profiling data |
+| `go:runtime/trace` | ⚠️ | — | Execution tracing |
+| `go:slices` | ✅ | [lib-go-slices.ts](conformance/lib-go-slices.ts) | Generic slice helpers |
+| `go:sort` | ✅ | [lib-go-sort.ts](conformance/lib-go-sort.ts) | Sorting |
+| `go:strconv` | ✅ | [lib-go-strconv.ts](conformance/lib-go-strconv.ts) | String conversions |
+| `go:strings` | ✅ | [lib-go-strings.ts](conformance/lib-go-strings.ts) | String utilities |
+| `go:structs` | ⚠️ | — | Struct field helpers |
+| `go:sync` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Mutexes and wait groups |
+| `go:sync/atomic` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Atomic operations |
+| `go:syscall` | ⚠️ | — | Linux types; per-arch constants dropped |
+| `go:testing` | ⚠️ | — | No `go test` harness |
+| `go:testing/cryptotest` | ⚠️ | — | No `go test` harness |
+| `go:testing/fstest` | ⚠️ | — | No `go test` harness |
+| `go:testing/iotest` | ⚠️ | — | No `go test` harness |
+| `go:testing/quick` | ⚠️ | — | No `go test` harness |
+| `go:testing/slogtest` | ⚠️ | — | No `go test` harness |
+| `go:testing/synctest` | ⚠️ | — | No `go test` harness |
+| `go:text/scanner` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Text scanner |
+| `go:text/tabwriter` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Aligned text columns |
+| `go:text/template` | ✅ | [lib-go-template.ts](conformance/lib-go-template.ts) | Text templating |
+| `go:text/template/parse` | ⚠️ | — | Template parse trees |
+| `go:time` | ✅ | [lib-go-time.ts](conformance/lib-go-time.ts) | Time and durations |
+| `go:time/tzdata` | ⚠️ | — | Embedded timezone database |
+| `go:unicode` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | Unicode tables |
+| `go:unicode/utf16` | ⚠️ | — | UTF-16 encoding |
+| `go:unicode/utf8` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | UTF-8 encoding |
+| `go:unique` | ⚠️ | — | Canonical values |
+| `go:weak` | ⚠️ | — | Weak pointers |
+| `go:plugin` | ❌ | — | cgo, `-buildmode=plugin` |
+| `go:unsafe` | ❌ | — | raw pointers |
+| `go:runtime/race` | ❌ | — | needs `-race` |
+| `go:runtime/coverage` | ❌ | — | needs `-cover` |
+| `go:embed` | ❌ | — | needs a `//go:embed` directive; a later phase |
+<!-- go-bridges:end -->
+
+#### Go bridge semantics
+
+| Rule | Meaning |
+| ---- | ------- |
+| Number conversion | All Go ints/floats map to TS `number`; args convert via `T(x)`, results read back via `float64(x)`. `int64`/`uint64` beyond 2^53 lose precision. |
+| Throw on error | `(T, error)` results throw a `GoError` on failure; `error`-only calls throw as statements and yield the error value in value position. |
+| Tuples | Multi-value results pack into a slice (TS tuple). |
+| Structs | `new pkg.T({...})` builds a composite literal (pointer when any method needs it); fields read/write directly. Embedded structs promote their fields. |
+| Named numerics | `time.Duration` etc. stay typed in Go; arithmetic coerces the `number` side (`time.Second * 2`). |
+| Callbacks | Func-typed params become Go closures; sync callbacks (sort, slices, strings, ...) run inline. |
+| Channels | `chan<T>(size?)` / `GoChan<T>` with `send`, `recv`, `close`; `for…of` ranges channels and `iter.Seq`. |
+| Out-params | `ref<T>(init?)` makes a pointer cell; `.value` dereferences it. |
+| Byte slices | `[]byte` is `Uint8Array` (zero-copy); `number[]` converts per call (mutations of the copy are lost). |
 
 ### npm packages
 

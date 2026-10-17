@@ -11,6 +11,7 @@ import { platform } from 'node:os';
 // not reach them), so they're accessed through `any` casts for type-checking.
 import * as childProcess from 'node:child_process';
 import { transpileToNative, TranspileOptions } from './transpiler.js';
+import { VERSION } from './version.js';
 
 export interface RunOptions {
   source: string | null;
@@ -307,7 +308,7 @@ function getPackageJson(projectName: string): string {
       build: `npx typenative --source main.ts --output bin/${exeName}`
     },
     devDependencies: {
-      typenative: '^0.1.3'
+      typenative: `^${VERSION}`
     }
   };
   return JSON.stringify(pckg, null, 2);
