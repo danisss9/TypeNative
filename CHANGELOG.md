@@ -68,6 +68,9 @@ generated types say they do.
   `process.send` / `process.on('message')` in the child) and **`node:cluster`**: workers share
   listening ports through the primary, which relays connections round-robin; cluster and worker
   events, `disconnect`, `setupPrimary`
+- **`node:http2`** on `net/http`'s HTTP/2: h2c and TLS servers with the `'stream'` API
+  (`respond`, `respondWithFile`) and the compatibility `(req, res)` API; `connect()` client
+  sessions whose `request()` streams emit `'response'` with `:status`
 
 ### Fixed
 

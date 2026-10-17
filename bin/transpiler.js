@@ -32,6 +32,7 @@ import { registerAsyncHooks } from './node/async_hooks.js';
 import { registerTest } from './node/test.js';
 import { registerWorkerThreads } from './node/worker_threads.js';
 import { registerCluster } from './node/cluster.js';
+import { registerHttp2 } from './node/http2.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import { goPackage, goTypeInfo as goMetaTypeInfo, hasGoPackage, isGoNumeric as isGoNumericType } from './go/metadata.js';
 import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
@@ -8251,6 +8252,7 @@ registerAsyncHooks(nodeRegistry);
 registerTest(nodeRegistry);
 registerWorkerThreads(nodeRegistry);
 registerCluster(nodeRegistry);
+registerHttp2(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],

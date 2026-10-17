@@ -1129,6 +1129,135 @@ declare module 'node:stream/consumers' {
   export { text, json, buffer };
 }
 
+declare module 'node:http2' {
+  import { EventEmitter } from 'node:events';
+  import { Duplex } from 'node:stream';
+  import * as http from 'node:http';
+  import * as net from 'node:net';
+  namespace http2 {
+    interface IncomingHttpHeaders {
+      ':status'?: number;
+      ':method'?: string;
+      ':path'?: string;
+      ':authority'?: string;
+      ':scheme'?: string;
+      [header: string]: string | string[] | number | undefined;
+    }
+    type OutgoingHttpHeaders = Record<string, string | number | string[] | undefined>;
+    interface Http2Stream extends Duplex {
+      readonly id: number | undefined;
+      readonly rstCode: number;
+      readonly aborted: boolean;
+      readonly sentHeaders: OutgoingHttpHeaders;
+      close(code?: number, callback?: () => void): void;
+    }
+    interface ServerHttp2Stream extends Http2Stream {
+      readonly session: ServerHttp2Session;
+      readonly headersSent: boolean;
+      readonly pushAllowed: boolean;
+      respond(headers?: OutgoingHttpHeaders, options?: { endStream?: boolean }): void;
+      respondWithFile(path: string, headers?: OutgoingHttpHeaders, options?: object): void;
+      pushStream(headers: OutgoingHttpHeaders, callback?: (err: Error | null, pushStream: ServerHttp2Stream) => void): void;
+      additionalHeaders(headers: OutgoingHttpHeaders): void;
+    }
+    interface ClientHttp2Stream extends Http2Stream {
+      on(event: 'response', listener: (headers: IncomingHttpHeaders, flags: number) => void): this;
+      on(event: 'trailers', listener: (trailers: IncomingHttpHeaders, flags: number) => void): this;
+      on(event: 'data', listener: (chunk: any) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+      once(event: 'response', listener: (headers: IncomingHttpHeaders, flags: number) => void): this;
+      once(event: string, listener: (...args: any[]) => void): this;
+    }
+    interface Http2Session extends EventEmitter {
+      readonly closed: boolean;
+      readonly destroyed: boolean;
+      readonly encrypted: boolean | undefined;
+      readonly alpnProtocol: string | undefined;
+      readonly socket: net.Socket;
+      close(callback?: () => void): void;
+      destroy(error?: Error, code?: number): void;
+      ref(): void;
+      unref(): void;
+      setTimeout(msecs: number, callback?: () => void): void;
+    }
+    interface ClientHttp2Session extends Http2Session {
+      request(headers?: OutgoingHttpHeaders, options?: { endStream?: boolean }): ClientHttp2Stream;
+      on(event: 'connect', listener: (session: ClientHttp2Session, socket: net.Socket) => void): this;
+      on(event: 'error', listener: (err: Error) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+    }
+    interface ServerHttp2Session extends Http2Session {}
+    type Http2ServerRequest = http.IncomingMessage;
+    type Http2ServerResponse = http.ServerResponse;
+    interface Http2Server extends http.Server {
+      on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
+      on(event: 'request', listener: (request: Http2ServerRequest, response: Http2ServerResponse) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+    }
+    type Http2SecureServer = Http2Server;
+    interface SecureServerOptions {
+      key?: string | Buffer;
+      cert?: string | Buffer;
+      ca?: string | Buffer | (string | Buffer)[];
+      allowHTTP1?: boolean;
+    }
+    interface Settings {
+      headerTableSize?: number;
+      enablePush?: boolean;
+      initialWindowSize?: number;
+      maxFrameSize?: number;
+      maxConcurrentStreams?: number;
+      maxHeaderListSize?: number;
+      enableConnectProtocol?: boolean;
+    }
+    function createServer(onRequestHandler?: (request: Http2ServerRequest, response: Http2ServerResponse) => void): Http2Server;
+    function createServer(options: object, onRequestHandler?: (request: Http2ServerRequest, response: Http2ServerResponse) => void): Http2Server;
+    function createSecureServer(options: SecureServerOptions, onRequestHandler?: (request: Http2ServerRequest, response: Http2ServerResponse) => void): Http2SecureServer;
+    function connect(authority: string | URL, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
+    function connect(authority: string | URL, options?: { ca?: string | Buffer | (string | Buffer)[]; rejectUnauthorized?: boolean; servername?: string }, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
+    function getDefaultSettings(): Settings;
+    const constants: {
+      readonly HTTP2_HEADER_STATUS: ':status';
+      readonly HTTP2_HEADER_METHOD: ':method';
+      readonly HTTP2_HEADER_AUTHORITY: ':authority';
+      readonly HTTP2_HEADER_SCHEME: ':scheme';
+      readonly HTTP2_HEADER_PATH: ':path';
+      readonly HTTP2_HEADER_CONTENT_TYPE: 'content-type';
+      readonly HTTP2_HEADER_CONTENT_LENGTH: 'content-length';
+      readonly HTTP2_HEADER_ACCEPT: 'accept';
+      readonly HTTP2_HEADER_USER_AGENT: 'user-agent';
+      readonly HTTP2_HEADER_COOKIE: 'cookie';
+      readonly HTTP2_HEADER_SET_COOKIE: 'set-cookie';
+      readonly HTTP2_HEADER_LOCATION: 'location';
+      readonly HTTP2_METHOD_GET: 'GET';
+      readonly HTTP2_METHOD_POST: 'POST';
+      readonly HTTP2_METHOD_PUT: 'PUT';
+      readonly HTTP2_METHOD_DELETE: 'DELETE';
+      readonly HTTP2_METHOD_HEAD: 'HEAD';
+      readonly HTTP2_METHOD_PATCH: 'PATCH';
+      readonly HTTP2_METHOD_OPTIONS: 'OPTIONS';
+      readonly NGHTTP2_NO_ERROR: number;
+      readonly NGHTTP2_PROTOCOL_ERROR: number;
+      readonly NGHTTP2_INTERNAL_ERROR: number;
+      readonly NGHTTP2_CANCEL: number;
+      readonly HTTP_STATUS_OK: number;
+      readonly HTTP_STATUS_CREATED: number;
+      readonly HTTP_STATUS_NO_CONTENT: number;
+      readonly HTTP_STATUS_MOVED_PERMANENTLY: number;
+      readonly HTTP_STATUS_FOUND: number;
+      readonly HTTP_STATUS_NOT_MODIFIED: number;
+      readonly HTTP_STATUS_BAD_REQUEST: number;
+      readonly HTTP_STATUS_UNAUTHORIZED: number;
+      readonly HTTP_STATUS_FORBIDDEN: number;
+      readonly HTTP_STATUS_NOT_FOUND: number;
+      readonly HTTP_STATUS_METHOD_NOT_ALLOWED: number;
+      readonly HTTP_STATUS_INTERNAL_SERVER_ERROR: number;
+      readonly HTTP_STATUS_SERVICE_UNAVAILABLE: number;
+    };
+  }
+  export = http2;
+}
+
 declare module 'node:cluster' {
   import { EventEmitter } from 'node:events';
   import { ChildProcess } from 'node:child_process';
@@ -2064,3 +2193,4 @@ declare module 'async_hooks' { import m = require('node:async_hooks'); export = 
 // node:test has no bare alias in Node ('test' is not a builtin)
 declare module 'worker_threads' { import m = require('node:worker_threads'); export = m; }
 declare module 'cluster' { import m = require('node:cluster'); export = m; }
+declare module 'http2' { import m = require('node:http2'); export = m; }
