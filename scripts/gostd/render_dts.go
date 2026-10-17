@@ -179,8 +179,15 @@ func writeConst(b *strings.Builder, c *constInfo, tm *typeMapper, m *pkgModel) {
 	case "bool":
 		fmt.Fprintf(b, "  export const %s: boolean;\n", sanitizeName(c.name))
 	case "typed":
-		// Named-type constant: look up the type name.
-		fmt.Fprintf(b, "  export const %s: number;\n", sanitizeName(c.name))
+		// Named-type constant: keeps its type (and methods), since the
+		// bridge reads it without converting (crypto.SHA256.Size()).
+		ts := tm.mapType(c.goTy, "result")
+		if qpath, name := splitQual(c.goTy); qpath == "" || qpath == tm.path {
+			if _, ok := tm.numerics[name]; ok {
+				ts = sanitizeName(name)
+			}
+		}
+		fmt.Fprintf(b, "  export const %s: %s;\n", sanitizeName(c.name), ts)
 	default:
 		fmt.Fprintf(b, "  export const %s: number;\n", sanitizeName(c.name))
 	}

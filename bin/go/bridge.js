@@ -178,6 +178,10 @@ function goBuiltinName(callee) {
     }
     return '';
 }
+// Whether the node is a go:builtin ref<T>(init?) call.
+export function isGoRefCall(node) {
+    return !!node && node.kind === 'CallExpression' && goBuiltinName(node.expression) === 'ref';
+}
 // go:builtin calls: ref<T>(init?) → new(T), chan<T>(size?) → make(chan T).
 function visitGoBuiltinCall(node) {
     const name = goBuiltinName(node.expression);
@@ -312,7 +316,8 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         }
         const visited = services.visit(node);
         const fromType = services.typeOf(node) ?? '';
-        out.push(toGo(visited, fromType, goLocalType(paramType)));
+        ensureGoTypePackages(paramType);
+        out.push(toGo(visited, fromType, paramType));
     }
     // Trailing error params already thrown upstream (template.Must(t)):
     // pad with nil so Go's Must wrappers type-check.
@@ -347,7 +352,7 @@ function emitResults(call, results, asStatement = false) {
             return fromGo(wrapped, core[0]);
         // (A, B, error): pack the two values into a slice.
         const temps = core.map((_, i) => `__v${i}`);
-        return `func() []interface{} { ${temps.join(', ')} := ${wrapped}; return []interface{}{${temps.join(', ')}} }()`;
+        return `func() []interface{} { ${temps.join(', ')} := ${wrapped}; return []interface{}{${packTuple(temps, core)}} }()`;
     }
     if (results.length === 1) {
         if (asStatement)
@@ -359,7 +364,37 @@ function emitResults(call, results, asStatement = false) {
     if (asStatement)
         return call;
     const temps = results.map((_, i) => `__v${i}`);
-    return `func() []interface{} { ${temps.join(', ')} := ${call}; return []interface{}{${temps.join(', ')}} }()`;
+    return `func() []interface{} { ${temps.join(', ')} := ${call}; return []interface{}{${packTuple(temps, results)}} }()`;
+}
+// Tuple elements read as TS-facing values (ints → float64), matching
+// goTupleTypes so destructuring can assert them back.
+function packTuple(temps, types) {
+    return temps.map((t, i) => fromGo(t, types[i])).join(', ');
+}
+// TS-facing element types of a multi-value Go call ((A, B) or
+// (A, B, error)); undefined for anything else.
+export function goTupleTypes(node) {
+    if (!node || node.kind !== 'CallExpression')
+        return undefined;
+    let results;
+    const target = calleeTarget(node.expression);
+    if (target) {
+        const fn = goPackage(target.path)?.funcs[target.member];
+        if (fn)
+            results = instantiateResults(fn, node.arguments ?? []);
+    }
+    else if (services.isPropertyAccess(node.expression)) {
+        const recvType = services.typeOf(node.expression.expression);
+        const method = recvType ? goMethodInfo(recvType, node.expression.name.text) : null;
+        if (method)
+            results = method.results;
+    }
+    if (!results)
+        return undefined;
+    const core = results.length > 0 && results[results.length - 1] === 'error' ? results.slice(0, -1) : results;
+    if (core.length < 2)
+        return undefined;
+    return core.map((t) => goResultType([t]) ?? 'interface{}');
 }
 // Wrap a blocking call so it runs on a goroutine while the baton holder
 // pumps pending loop tasks.
@@ -539,8 +574,9 @@ export function inferGoType(node) {
         const recvType = services.typeOf(base);
         if (recvType) {
             const field = goFieldType(recvType, member);
+            // Reads convert like results (int fields read as float64).
             if (field)
-                return field;
+                return goResultType([field]);
             const method = goMethodInfo(recvType, member);
             if (method)
                 return goResultType(method.results);
@@ -560,6 +596,12 @@ function goResultType(results) {
         const t = core[0];
         if (isGoNumericKind(t) && t !== 'float64')
             return 'float64';
+        // Numeric slices read back as []float64 (fromGo); []byte stays.
+        if (t.startsWith('[]')) {
+            const elem = t.slice(2);
+            if (elem !== 'byte' && elem !== 'uint8' && elem !== 'float64' && isGoNumericKind(elem))
+                return '[]float64';
+        }
         return t;
     }
     return '[]interface{}';
@@ -632,9 +674,16 @@ export function visitGoNew(node, path, typeName) {
         for (const prop of first.properties ?? []) {
             const name = prop.name ? services.visit(prop.name) : '';
             const fieldType = fieldGoTypeOf(type, prop.name?.text ?? '');
-            const value = fieldType
-                ? toGo(services.visit(prop.initializer), services.typeOf(prop.initializer) ?? '', fieldType)
-                : services.visit(prop.initializer);
+            const fromType = services.typeOf(prop.initializer) ?? '';
+            let value = services.visit(prop.initializer);
+            if (fieldType && fromType === `*${fieldType}`) {
+                // new pkix.Name({...}) into a value field: dereference.
+                value = `*${value}`;
+            }
+            else if (fieldType) {
+                ensureGoTypePackages(fieldType);
+                value = toGo(value, fromType, fieldType);
+            }
             entries.push(`${name}: ${value}`);
         }
         const ptr = hasPtrReceiver(type);

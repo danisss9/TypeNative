@@ -14,12 +14,15 @@ export interface ConvertServices {
   pkg: (name: string) => void;
   helper: (id: string) => void;
   typeOf: (node: any) => string;
+  // Qualified Go type → the spelling emitted in code (crypto/x509.KeyUsage → x509.KeyUsage).
+  localType: (goType: string) => string;
 }
 
 let services: ConvertServices = {
   pkg: (_name: string) => {},
   helper: (_id: string) => {},
-  typeOf: (_node: any) => ''
+  typeOf: (_node: any) => '',
+  localType: (goType: string) => goType
 };
 
 let knownPaths: Record<string, boolean> = {};
@@ -93,7 +96,9 @@ export function isGoNumericKind(goType: string): boolean {
   return isGoNumeric(goType);
 }
 
-// Convert an already-visited expression to the target Go type.
+// Convert an already-visited expression to the target Go type. toType is
+// fully qualified (metadata lookups need the path); emitted type names are
+// localized.
 export function toGo(expr: string, fromType: string, toType: string): string {
   if (!toType || toType === 'interface{}' || toType === 'any' || fromType === toType) return expr;
   // Array references read as the slice they point to.
@@ -101,23 +106,23 @@ export function toGo(expr: string, fromType: string, toType: string): string {
   // Named numeric target: T(x).
   if (isGoNumeric(toType) && !isGoNumericKind(fromType)) {
     ensureTypePackage(toType);
-    return `${toType}(${expr})`;
+    return `${services.localType(toType)}(${expr})`;
   }
   if (isGoNumeric(toType) && isGoNumericKind(fromType) && fromType !== toType) {
     ensureTypePackage(toType);
-    return `${toType}(${expr})`;
+    return `${services.localType(toType)}(${expr})`;
   }
   // Plain int target from a TS number: T(x) with the exact kind.
   if (isGoIntKind(toType) && fromType === 'float64') {
     return `${goBaseName(toType)}(${expr})`;
   }
   if (isGoIntKind(toType) && isGoFloatKind(fromType)) {
-    return `${toType}(${expr})`;
+    return `${services.localType(toType)}(${expr})`;
   }
   // Named numeric from a plain int kind.
   if (isGoNumeric(toType) && (isGoIntKind(fromType) || isGoFloatKind(fromType))) {
     ensureTypePackage(toType);
-    return `${toType}(${expr})`;
+    return `${services.localType(toType)}(${expr})`;
   }
   // Fixed arrays [N]T → slice when the target is a slice. Call results
   // are unaddressable, so always go through a temp variable.
@@ -126,13 +131,13 @@ export function toGo(expr: string, fromType: string, toType: string): string {
     const fromElem = close >= 0 ? fromType.slice(close + 1) : '';
     const toElem = toType.slice(2);
     if (fromElem === toElem || ((fromElem === 'byte' || fromElem === 'uint8') && (toElem === 'byte' || toElem === 'uint8'))) {
-      return `func() ${toType} { __v := ${expr}; return __v[:] }()`;
+      return `func() ${services.localType(toType)} { __v := ${expr}; return __v[:] }()`;
     }
     if (isGoNumericKind(toElem)) {
       services.helper('goNums');
-      return `func() ${toType} { __v := ${expr}; return tnGoNums[${toElem}](__v[:]) }()`;
+      return `func() ${services.localType(toType)} { __v := ${expr}; return tnGoNums[${services.localType(toElem)}](__v[:]) }()`;
     }
-    return `func() ${toType} { __v := ${expr}; return __v[:] }()`;
+    return `func() ${services.localType(toType)} { __v := ${expr}; return __v[:] }()`;
   }
   // Slices of numbers: tnGoNums[T](x) / element conversion.
   // []byte ↔ []byte passes through (Uint8Array needs no conversion).
@@ -145,13 +150,13 @@ export function toGo(expr: string, fromType: string, toType: string): string {
     }
     if (isGoNumericKind(toElem)) {
       services.helper('goNums');
-      return `tnGoNums[${toElem}](${expr})`;
+      return `tnGoNums[${services.localType(toElem)}](${expr})`;
     }
   }
   // Untyped constants arrive as float64: convert to the target.
   if (fromType === 'float64' && isGoNumericKind(toType)) {
     ensureTypePackage(toType);
-    return `${toType}(${expr})`;
+    return `${services.localType(toType)}(${expr})`;
   }
   // String target.
   if (toType === 'string' && fromType !== 'string') {
@@ -162,7 +167,7 @@ export function toGo(expr: string, fromType: string, toType: string): string {
     const base = goBaseName(toType);
     if (base && base !== 'string' && base !== 'bool' && base !== 'float64' && !toType.startsWith('[]') && !toType.startsWith('map[') && !toType.startsWith('func(') && !toType.startsWith('chan ') && toType !== 'any' && toType !== 'interface{}') {
       ensureTypePackage(toType);
-      return `${expr}.(${toType})`;
+      return `${expr}.(${services.localType(toType)})`;
     }
   }
   // Struct value to pointer slot: take address. Never dereference into
