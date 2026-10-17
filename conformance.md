@@ -725,7 +725,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:crypto/x509/pkix` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | X.509 ASN.1/PKIX structures |
 | `go:database/sql` | ⚠️ | — | No std driver; needs an external driver |
 | `go:database/sql/driver` | ⚠️ | — | Driver interfaces; no std driver |
-| `go:debug/buildinfo` | ⚠️ | — | Build info from executables |
+| `go:debug/buildinfo` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Build info from executables |
 | `go:debug/dwarf` | ⚠️ | — | DWARF debug info parsing |
 | `go:debug/elf` | ⚠️ | — | ELF object files |
 | `go:debug/gosym` | ⚠️ | — | Go symbol tables |
@@ -748,17 +748,17 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:expvar` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Public process variables |
 | `go:flag` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | Command-line flag parsing |
 | `go:fmt` | ✅ | [lib-go-fmt.ts](conformance/lib-go-fmt.ts) | Formatted I/O; integer verbs take TS numbers |
-| `go:go/ast` | ⚠️ | — | Go syntax tree |
+| `go:go/ast` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go syntax tree |
 | `go:go/build` | ⚠️ | — | Go package build metadata |
-| `go:go/build/constraint` | ⚠️ | — | Build-tag constraint parsing |
-| `go:go/constant` | ⚠️ | — | Untyped constant values |
+| `go:go/build/constraint` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Build-tag constraint parsing |
+| `go:go/constant` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Untyped constant values |
 | `go:go/doc` | ⚠️ | — | Go doc extraction |
-| `go:go/doc/comment` | ⚠️ | — | Doc comment parse/print |
+| `go:go/doc/comment` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Doc comment parse/print |
 | `go:go/format` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go source formatting |
 | `go:go/importer` | ⚠️ | — | Export-data type importer |
-| `go:go/parser` | ⚠️ | — | Go source parser |
-| `go:go/printer` | ⚠️ | — | Go AST printer |
-| `go:go/scanner` | ⚠️ | — | Go tokenizer |
+| `go:go/parser` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go source parser |
+| `go:go/printer` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go AST printer |
+| `go:go/scanner` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go tokenizer |
 | `go:go/token` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go tokens / positions |
 | `go:go/types` | ⚠️ | — | Go type checker |
 | `go:go/version` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go version comparison |
@@ -769,13 +769,13 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:hash/fnv` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | FNV-1 / FNV-1a hash |
 | `go:hash/maphash` | ✅ | [lib-go-hash-extra.ts](conformance/lib-go-hash-extra.ts) | Seeded string hashing |
 | `go:html` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | HTML escaping |
-| `go:html/template` | ⚠️ | — | HTML templating (auto-escaped) |
+| `go:html/template` | ✅ | [lib-go-text-extra.ts](conformance/lib-go-text-extra.ts) | HTML templating (auto-escaped) |
 | `go:image` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | 2D image interface |
-| `go:image/color` | ⚠️ | — | Color types |
-| `go:image/color/palette` | ⚠️ | — | Standard color palettes |
-| `go:image/draw` | ⚠️ | — | Image compositing |
-| `go:image/gif` | ⚠️ | — | GIF decode/encode |
-| `go:image/jpeg` | ⚠️ | — | JPEG decode/encode |
+| `go:image/color` | ✅ | [lib-go-image-extra.ts](conformance/lib-go-image-extra.ts) | Color types |
+| `go:image/color/palette` | ✅ | [lib-go-image-extra.ts](conformance/lib-go-image-extra.ts) | Standard color palettes |
+| `go:image/draw` | ✅ | [lib-go-image-extra.ts](conformance/lib-go-image-extra.ts) | Image compositing |
+| `go:image/gif` | ✅ | [lib-go-image-extra.ts](conformance/lib-go-image-extra.ts) | GIF decode/encode |
+| `go:image/jpeg` | ✅ | [lib-go-image-extra.ts](conformance/lib-go-image-extra.ts) | JPEG decode/encode |
 | `go:image/png` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | PNG decode/encode |
 | `go:index/suffixarray` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Suffix-array substring search |
 | `go:io` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | Core I/O interfaces (Reader/Writer) |
@@ -795,36 +795,36 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:mime` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | MIME media types |
 | `go:mime/multipart` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Multipart forms |
 | `go:mime/quotedprintable` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | Quoted-printable encoding |
-| `go:net` | ⚠️ | — | Sockets (loopback listener) |
+| `go:net` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Sockets (loopback TCP), addresses |
 | `go:net/http` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP client/server (loopback) |
 | `go:net/http/cgi` | ⚠️ | — | CGI handler |
-| `go:net/http/cookiejar` | ⚠️ | — | Cookie jars (loopback) |
+| `go:net/http/cookiejar` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Cookie jars (loopback) |
 | `go:net/http/fcgi` | ⚠️ | — | FastCGI handler |
 | `go:net/http/httptest` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP test servers (loopback) |
-| `go:net/http/httptrace` | ⚠️ | — | HTTP tracing hooks |
-| `go:net/http/httputil` | ⚠️ | — | HTTP utilities (loopback) |
+| `go:net/http/httptrace` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | HTTP tracing hooks |
+| `go:net/http/httputil` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | HTTP utilities (loopback) |
 | `go:net/http/pprof` | ⚠️ | — | pprof HTTP handlers |
 | `go:net/mail` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Mail address parsing |
 | `go:net/netip` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | IP address types |
 | `go:net/rpc` | ⚠️ | — | RPC client/server |
 | `go:net/rpc/jsonrpc` | ⚠️ | — | JSON-RPC codec |
 | `go:net/smtp` | ⚠️ | — | SMTP client; needs a server |
-| `go:net/textproto` | ⚠️ | — | Text protocol I/O |
+| `go:net/textproto` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Text protocol I/O |
 | `go:net/url` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | URL parsing |
 | `go:os` | ✅ | [lib-go-os.ts](conformance/lib-go-os.ts) | OS files and processes |
 | `go:os/exec` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | External commands |
 | `go:os/signal` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Signal notification (`Notify` + `Stop`) |
-| `go:os/user` | ⚠️ | — | User lookup |
+| `go:os/user` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | User lookup |
 | `go:path` | ✅ | [lib-go-path-fs.ts](conformance/lib-go-path-fs.ts) | Slash-separated paths |
 | `go:path/filepath` | ✅ | [lib-go-os.ts](conformance/lib-go-os.ts) | File paths |
-| `go:reflect` | ⚠️ | — | Runtime reflection |
+| `go:reflect` | ✅ | [lib-go-text-extra.ts](conformance/lib-go-text-extra.ts) | Runtime reflection |
 | `go:regexp` | ✅ | [lib-go-regexp.ts](conformance/lib-go-regexp.ts) | Regular expressions |
-| `go:regexp/syntax` | ⚠️ | — | Regexp parse trees |
+| `go:regexp/syntax` | ✅ | [lib-go-text-extra.ts](conformance/lib-go-text-extra.ts) | Regexp parse trees |
 | `go:runtime` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Runtime introspection |
 | `go:runtime/debug` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Stack traces and GC stats |
-| `go:runtime/metrics` | ⚠️ | — | Runtime metrics sampling |
-| `go:runtime/pprof` | ⚠️ | — | Profiling data |
-| `go:runtime/trace` | ⚠️ | — | Execution tracing |
+| `go:runtime/metrics` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Runtime metrics sampling |
+| `go:runtime/pprof` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Profiling data |
+| `go:runtime/trace` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Execution tracing |
 | `go:slices` | ✅ | [lib-go-slices.ts](conformance/lib-go-slices.ts) | Generic slice helpers |
 | `go:sort` | ✅ | [lib-go-sort.ts](conformance/lib-go-sort.ts) | Sorting |
 | `go:strconv` | ✅ | [lib-go-strconv.ts](conformance/lib-go-strconv.ts) | String conversions |
@@ -843,9 +843,9 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:text/scanner` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Text scanner |
 | `go:text/tabwriter` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Aligned text columns |
 | `go:text/template` | ✅ | [lib-go-template.ts](conformance/lib-go-template.ts) | Text templating |
-| `go:text/template/parse` | ⚠️ | — | Template parse trees |
+| `go:text/template/parse` | ✅ | [lib-go-text-extra.ts](conformance/lib-go-text-extra.ts) | Template parse trees |
 | `go:time` | ✅ | [lib-go-time.ts](conformance/lib-go-time.ts) | Time and durations |
-| `go:time/tzdata` | ⚠️ | — | Embedded timezone database |
+| `go:time/tzdata` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Embedded timezone database (side-effect import) |
 | `go:unicode` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | Unicode tables |
 | `go:unicode/utf16` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | UTF-16 encoding |
 | `go:unicode/utf8` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | UTF-8 encoding |

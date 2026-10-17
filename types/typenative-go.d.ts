@@ -408,7 +408,9 @@ declare module 'go:cmp' {
 }
 
 declare module 'go:compress/bzip2' {
-  export type StructuralError = string;
+  export type StructuralError = string & {
+    Error(): string;
+  };
   export function NewReader(r: import('go:io').Reader | null): import('go:io').Reader;
 }
 
@@ -417,7 +419,9 @@ declare module 'go:compress/flate' {
     Error(): string;
   };
   export function CorruptInputError(v: number): CorruptInputError;
-  export type InternalError = string;
+  export type InternalError = string & {
+    Error(): string;
+  };
   export class ReadError {
     constructor(init?: Partial<ReadError>);
     Offset: number;
@@ -876,8 +880,15 @@ declare module 'go:crypto/ed25519' {
     Context: string;
     HashFunc(): import('go:crypto').Hash;
   }
-  export type PrivateKey = Uint8Array;
-  export type PublicKey = Uint8Array;
+  export type PrivateKey = Uint8Array & {
+    Equal(x: import('go:crypto').PrivateKey | null): boolean;
+    Public(): import('go:crypto').PublicKey;
+    Seed(): Uint8Array;
+    Sign(rand: import('go:io').Reader | null, message: Uint8Array | number[] | null, opts: import('go:crypto').SignerOpts | null): Uint8Array;
+  };
+  export type PublicKey = Uint8Array & {
+    Equal(x: import('go:crypto').PublicKey | null): boolean;
+  };
   export function GenerateKey(random: import('go:io').Reader | null): [PublicKey, PrivateKey];
   export function NewKeyFromSeed(seed: Uint8Array | number[] | null): PrivateKey;
   export function Sign(privateKey: PrivateKey | null, message: Uint8Array | number[] | null): Uint8Array;
@@ -1891,7 +1902,9 @@ declare module 'go:crypto/x509/pkix' {
     String(): string;
     ToRDNSequence(): RDNSequence;
   }
-  export type RDNSequence = RelativeDistinguishedNameSET[];
+  export type RDNSequence = RelativeDistinguishedNameSET[] & {
+    String(): string;
+  };
   export type RelativeDistinguishedNameSET = AttributeTypeAndValue[];
   export class RevokedCertificate {
     constructor(init?: Partial<RevokedCertificate>);
@@ -4858,7 +4871,9 @@ declare module 'go:debug/gosym' {
     PCToLine(pc: number): [string, number, Func];
     SymByAddr(addr: number): Sym;
   }
-  export type UnknownFileError = string;
+  export type UnknownFileError = string & {
+    Error(): string;
+  };
   export class UnknownLineError {
     constructor(init?: Partial<UnknownLineError>);
     File: string;
@@ -5048,7 +5063,9 @@ declare module 'go:debug/macho' {
   export interface Load {
     Raw(): Uint8Array;
   }
-  export type LoadBytes = Uint8Array;
+  export type LoadBytes = Uint8Array & {
+    Raw(): Uint8Array;
+  };
   export class Nlist32 {
     constructor(init?: Partial<Nlist32>);
     Name: number;
@@ -5568,7 +5585,9 @@ declare module 'go:debug/pe' {
     NumberOfLineNumbers: number;
     Characteristics: number;
   }
-  export type StringTable = Uint8Array;
+  export type StringTable = Uint8Array & {
+    String(start: number): string;
+  };
   export class Symbol {
     constructor(init?: Partial<Symbol>);
     Name: string;
@@ -5778,7 +5797,10 @@ declare module 'go:encoding/asn1' {
     RightAlign(): Uint8Array;
   }
   export type Flag = boolean;
-  export type ObjectIdentifier = number[];
+  export type ObjectIdentifier = number[] & {
+    Equal(other: ObjectIdentifier | null): boolean;
+    String(): string;
+  };
   export type RawContent = Uint8Array;
   export class RawValue {
     constructor(init?: Partial<RawValue>);
@@ -6050,8 +6072,15 @@ declare module 'go:encoding/json' {
     Error(): string;
     Unwrap(): import('go:builtin').GoError;
   }
-  export type Number = string;
-  export type RawMessage = Uint8Array;
+  export type Number = string & {
+    Float64(): number;
+    Int64(): number;
+    String(): string;
+  };
+  export type RawMessage = Uint8Array & {
+    MarshalJSON(): Uint8Array;
+    UnmarshalJSON(data: Uint8Array | number[] | null): import('go:builtin').GoError;
+  };
   export class SyntaxError {
     constructor(init?: Partial<SyntaxError>);
     Offset: number;
@@ -6118,8 +6147,12 @@ declare module 'go:encoding/xml' {
     Name: Name;
     Value: string;
   }
-  export type CharData = Uint8Array;
-  export type Comment = Uint8Array;
+  export type CharData = Uint8Array & {
+    Copy(): CharData;
+  };
+  export type Comment = Uint8Array & {
+    Copy(): Comment;
+  };
   export class Decoder {
     constructor(init?: Partial<Decoder>);
     Strict: boolean;
@@ -6135,7 +6168,9 @@ declare module 'go:encoding/xml' {
     Skip(): import('go:builtin').GoError;
     Token(): Token;
   }
-  export type Directive = Uint8Array;
+  export type Directive = Uint8Array & {
+    Copy(): Directive;
+  };
   export class Encoder {
     constructor(init?: Partial<Encoder>);
     Close(): import('go:builtin').GoError;
@@ -6193,7 +6228,9 @@ declare module 'go:encoding/xml' {
   export interface TokenReader {
     Token(): Token;
   }
-  export type UnmarshalError = string;
+  export type UnmarshalError = string & {
+    Error(): string;
+  };
   export interface Unmarshaler {
     UnmarshalXML(d: Decoder | null, start: StartElement): import('go:builtin').GoError;
   }
@@ -6565,7 +6602,12 @@ declare module 'go:go/ast' {
     Pos(): import('go:go/token').Pos;
     Text(): string;
   }
-  export type CommentMap = Record<string, CommentGroup[]>;
+  export type CommentMap = Record<string, CommentGroup[]> & {
+    Comments(): CommentGroup[];
+    Filter(node: Node | null): CommentMap;
+    String(): string;
+    Update(old: Node | null, new_: Node | null): Node;
+  };
   export class CompositeLit {
     constructor(init?: Partial<CompositeLit>);
     Type: Expr;
@@ -7461,7 +7503,17 @@ declare module 'go:go/scanner' {
     Error(): string;
   }
   export type ErrorHandler = ((pos: import('go:go/token').Position, msg: string) => void);
-  export type ErrorList = Error[];
+  export type ErrorList = Error[] & {
+    Add(pos: import('go:go/token').Position, msg: string): void;
+    Err(): import('go:builtin').GoError;
+    Error(): string;
+    Len(): number;
+    Less(i: number, j: number): boolean;
+    RemoveMultiples(): void;
+    Reset(): void;
+    Sort(): void;
+    Swap(i: number, j: number): void;
+  };
   export class Scanner {
     constructor(init?: Partial<Scanner>);
     ErrorCount: number;
@@ -8742,7 +8794,10 @@ declare module 'go:image/color' {
     Cr: number;
     RGBA(): [number, number, number, number];
   }
-  export type Palette = Color[];
+  export type Palette = Color[] & {
+    Convert(c: Color | null): Color;
+    Index(c: Color | null): number;
+  };
   export class RGBA {
     constructor(init?: Partial<RGBA>);
     R: number;
@@ -8852,7 +8907,9 @@ declare module 'go:image/gif' {
 }
 
 declare module 'go:image/jpeg' {
-  export type FormatError = string;
+  export type FormatError = string & {
+    Error(): string;
+  };
   export class Options {
     constructor(init?: Partial<Options>);
     Quality: number;
@@ -8861,7 +8918,9 @@ declare module 'go:image/jpeg' {
     Read(p: Uint8Array | number[] | null): number;
     ReadByte(): number;
   }
-  export type UnsupportedError = string;
+  export type UnsupportedError = string & {
+    Error(): string;
+  };
   export function Decode(r: import('go:io').Reader | null): import('go:image').Image;
   export function DecodeConfig(r: import('go:io').Reader | null): import('go:image').Config;
   export function Encode(w: import('go:io').Writer | null, m: import('go:image').Image | null, o: Options | null): import('go:builtin').GoError;
@@ -8884,8 +8943,12 @@ declare module 'go:image/png' {
     Get(): EncoderBuffer;
     Put(arg0: EncoderBuffer | null): void;
   }
-  export type FormatError = string;
-  export type UnsupportedError = string;
+  export type FormatError = string & {
+    Error(): string;
+  };
+  export type UnsupportedError = string & {
+    Error(): string;
+  };
   export function Decode(r: import('go:io').Reader | null): import('go:image').Image;
   export function DecodeConfig(r: import('go:io').Reader | null): import('go:image').Config;
   export function Encode(w: import('go:io').Writer | null, m: import('go:image').Image | null): import('go:builtin').GoError;
@@ -10068,7 +10131,10 @@ declare module 'go:net' {
     Temporary(): boolean;
     Timeout(): boolean;
   }
-  export type Buffers = Uint8Array[];
+  export type Buffers = Uint8Array[] & {
+    Read(p: Uint8Array | number[] | null): number;
+    WriteTo(w: import('go:io').Writer | null): number;
+  };
   export interface Conn {
     Close(): import('go:builtin').GoError;
     LocalAddr(): Addr;
@@ -10128,8 +10194,28 @@ declare module 'go:net' {
     Temporary(): boolean;
     Timeout(): boolean;
   }
-  export type HardwareAddr = Uint8Array;
-  export type IP = Uint8Array;
+  export type HardwareAddr = Uint8Array & {
+    String(): string;
+  };
+  export type IP = Uint8Array & {
+    AppendText(b: Uint8Array | number[] | null): Uint8Array;
+    DefaultMask(): IPMask;
+    Equal(x: IP | null): boolean;
+    IsGlobalUnicast(): boolean;
+    IsInterfaceLocalMulticast(): boolean;
+    IsLinkLocalMulticast(): boolean;
+    IsLinkLocalUnicast(): boolean;
+    IsLoopback(): boolean;
+    IsMulticast(): boolean;
+    IsPrivate(): boolean;
+    IsUnspecified(): boolean;
+    MarshalText(): Uint8Array;
+    Mask(mask: IPMask | null): IP;
+    String(): string;
+    To16(): IP;
+    To4(): IP;
+    UnmarshalText(text: Uint8Array | number[] | null): import('go:builtin').GoError;
+  };
   export class IPAddr {
     constructor(init?: Partial<IPAddr>);
     IP: IP;
@@ -10158,7 +10244,10 @@ declare module 'go:net' {
     WriteTo(b: Uint8Array | number[] | null, addr: Addr | null): number;
     WriteToIP(b: Uint8Array | number[] | null, addr: IPAddr | null): number;
   }
-  export type IPMask = Uint8Array;
+  export type IPMask = Uint8Array & {
+    Size(): [number, number];
+    String(): string;
+  };
   export class IPNet {
     constructor(init?: Partial<IPNet>);
     IP: IP;
@@ -10177,7 +10266,11 @@ declare module 'go:net' {
     Addrs(): Addr[];
     MulticastAddrs(): Addr[];
   }
-  export type InvalidAddrError = string;
+  export type InvalidAddrError = string & {
+    Error(): string;
+    Temporary(): boolean;
+    Timeout(): boolean;
+  };
   export class KeepAliveConfig {
     constructor(init?: Partial<KeepAliveConfig>);
     Enable: boolean;
@@ -10381,7 +10474,11 @@ declare module 'go:net' {
     SetUnlinkOnClose(unlink: boolean): void;
     SyscallConn(): import('go:syscall').RawConn;
   }
-  export type UnknownNetworkError = string;
+  export type UnknownNetworkError = string & {
+    Error(): string;
+    Temporary(): boolean;
+    Timeout(): boolean;
+  };
   export function CIDRMask(ones: number, bits: number): IPMask;
   export function Dial(network: string, address: string): Conn;
   export function DialIP(network: string, laddr: IPAddr | null, raddr: IPAddr | null): IPConn;
@@ -10515,7 +10612,9 @@ declare module 'go:net/http' {
     Handler(h: Handler | null): Handler;
     SetDenyHandler(h: Handler | null): void;
   }
-  export type Dir = string;
+  export type Dir = string & {
+    Open(name: string): File;
+  };
   export interface File {
     Close(): import('go:builtin').GoError;
     Read(p: Uint8Array | number[] | null): number;
@@ -10548,7 +10647,16 @@ declare module 'go:net/http' {
     ServeHTTP(arg0: ResponseWriter | null, arg1: Request | null): void;
   }
   export type HandlerFunc = ((arg0: ResponseWriter, arg1: Request) => void);
-  export type Header = Record<string, string[]>;
+  export type Header = Record<string, string[]> & {
+    Add(key: string, value: string): void;
+    Clone(): Header;
+    Del(key: string): void;
+    Get(key: string): string;
+    Set(key: string, value: string): void;
+    Values(key: string): string[];
+    Write(w: import('go:io').Writer | null): import('go:builtin').GoError;
+    WriteSubset(w: import('go:io').Writer | null, exclude: Record<string, boolean> | null): import('go:builtin').GoError;
+  };
   export interface Hijacker {
     Hijack(): [import('go:net').Conn, import('go:bufio').ReadWriter];
   }
@@ -11093,7 +11201,11 @@ declare module 'go:net/mail' {
     Parse(address: string): Address;
     ParseList(list: string): Address[];
   }
-  export type Header = Record<string, string[]>;
+  export type Header = Record<string, string[]> & {
+    AddressList(key: string): Address[];
+    Date(): import('go:time').Time;
+    Get(key: string): string;
+  };
   export class Message {
     constructor(init?: Partial<Message>);
     Header: Header;
@@ -11244,7 +11356,9 @@ declare module 'go:net/rpc' {
     ReadRequestHeader(arg0: Request | null): import('go:builtin').GoError;
     WriteResponse(arg0: Response | null, arg1: any): import('go:builtin').GoError;
   }
-  export type ServerError = string;
+  export type ServerError = string & {
+    Error(): string;
+  };
   export function Accept(lis: import('go:net').Listener | null): void;
   export function Dial(network: string, address: string): Client;
   export function DialHTTP(network: string, address: string): Client;
@@ -11341,7 +11455,13 @@ declare module 'go:net/textproto' {
     Msg: string;
     Error(): string;
   }
-  export type MIMEHeader = Record<string, string[]>;
+  export type MIMEHeader = Record<string, string[]> & {
+    Add(key: string, value: string): void;
+    Del(key: string): void;
+    Get(key: string): string;
+    Set(key: string, value: string): void;
+    Values(key: string): string[];
+  };
   export class Pipeline {
     constructor(init?: Partial<Pipeline>);
     EndRequest(id: number): void;
@@ -11350,7 +11470,9 @@ declare module 'go:net/textproto' {
     StartRequest(id: number): void;
     StartResponse(id: number): void;
   }
-  export type ProtocolError = string;
+  export type ProtocolError = string & {
+    Error(): string;
+  };
   export class Reader {
     constructor(init?: Partial<Reader>);
     R: import('go:bufio').Reader;
@@ -11391,8 +11513,12 @@ declare module 'go:net/url' {
     Timeout(): boolean;
     Unwrap(): import('go:builtin').GoError;
   }
-  export type EscapeError = string;
-  export type InvalidHostError = string;
+  export type EscapeError = string & {
+    Error(): string;
+  };
+  export type InvalidHostError = string & {
+    Error(): string;
+  };
   export class URL {
     constructor(init?: Partial<URL>);
     Scheme: string;
@@ -11429,7 +11555,14 @@ declare module 'go:net/url' {
     String(): string;
     Username(): string;
   }
-  export type Values = Record<string, string[]>;
+  export type Values = Record<string, string[]> & {
+    Add(key: string, value: string): void;
+    Del(key: string): void;
+    Encode(): string;
+    Get(key: string): string;
+    Has(key: string): boolean;
+    Set(key: string, value: string): void;
+  };
   export function JoinPath(base: string, ...elem: string[]): string;
   export function JoinPath(base: string, elem: string[]): string;
   export function Parse(rawURL: string): URL;
@@ -11742,9 +11875,15 @@ declare module 'go:os/user' {
     Gid: string;
     Name: string;
   }
-  export type UnknownGroupError = string;
-  export type UnknownGroupIdError = string;
-  export type UnknownUserError = string;
+  export type UnknownGroupError = string & {
+    Error(): string;
+  };
+  export type UnknownGroupIdError = string & {
+    Error(): string;
+  };
+  export type UnknownUserError = string & {
+    Error(): string;
+  };
   export class User {
     constructor(init?: Partial<User>);
     Uid: string;
@@ -11860,7 +11999,10 @@ declare module 'go:reflect' {
     Anonymous: boolean;
     IsExported(): boolean;
   }
-  export type StructTag = string;
+  export type StructTag = string & {
+    Get(key: string): string;
+    Lookup(key: string): [string, boolean];
+  };
   export interface Type {
     Align(): number;
     AssignableTo(u: Type | null): boolean;
@@ -12129,7 +12271,9 @@ declare module 'go:regexp/syntax' {
     Expr: string;
     Error(): string;
   }
-  export type ErrorCode = string;
+  export type ErrorCode = string & {
+    String(): string;
+  };
   export class Inst {
     constructor(init?: Partial<Inst>);
     Op: number;
@@ -12573,14 +12717,32 @@ declare module 'go:slices' {
 }
 
 declare module 'go:sort' {
-  export type Float64Slice = number[];
-  export type IntSlice = number[];
+  export type Float64Slice = number[] & {
+    Len(): number;
+    Less(i: number, j: number): boolean;
+    Search(x: number): number;
+    Sort(): void;
+    Swap(i: number, j: number): void;
+  };
+  export type IntSlice = number[] & {
+    Len(): number;
+    Less(i: number, j: number): boolean;
+    Search(x: number): number;
+    Sort(): void;
+    Swap(i: number, j: number): void;
+  };
   export interface Interface {
     Len(): number;
     Less(i: number, j: number): boolean;
     Swap(i: number, j: number): void;
   }
-  export type StringSlice = string[];
+  export type StringSlice = string[] & {
+    Len(): number;
+    Less(i: number, j: number): boolean;
+    Search(x: string): number;
+    Sort(): void;
+    Swap(i: number, j: number): void;
+  };
   export function Find(n: number, cmp: ((arg0: number) => number) | null): [number, boolean];
   export function Float64s(x: number[] | null): void;
   export function Float64sAreSorted(x: number[] | null): boolean;
@@ -13956,7 +14118,16 @@ declare module 'go:testing/cryptotest' {
 }
 
 declare module 'go:testing/fstest' {
-  export type MapFS = Record<string, MapFile>;
+  export type MapFS = Record<string, MapFile> & {
+    Glob(pattern: string): string[];
+    Lstat(name: string): import('go:io/fs').FileInfo;
+    Open(name: string): import('go:io/fs').File;
+    ReadDir(name: string): import('go:io/fs').DirEntry[];
+    ReadFile(name: string): Uint8Array;
+    ReadLink(name: string): string;
+    Stat(name: string): import('go:io/fs').FileInfo;
+    Sub(dir: string): import('go:io/fs').FS;
+  };
   export class MapFile {
     constructor(init?: Partial<MapFile>);
     Data: Uint8Array;
@@ -14007,7 +14178,9 @@ declare module 'go:testing/quick' {
   export interface Generator {
     Generate(rand: import('go:math/rand').Rand | null, size: number): import('go:reflect').Value;
   }
-  export type SetupError = string;
+  export type SetupError = string & {
+    Error(): string;
+  };
   export function Check(f: any, config: Config | null): import('go:builtin').GoError;
   export function CheckEqual(f: any, g: any, config: Config | null): import('go:builtin').GoError;
   export function Value(t: import('go:reflect').Type | null, rand: import('go:math/rand').Rand | null): [import('go:reflect').Value, boolean];
@@ -14650,7 +14823,11 @@ declare module 'go:unicode' {
     R32: Range32[];
     LatinOffset: number;
   }
-  export type SpecialCase = CaseRange[];
+  export type SpecialCase = CaseRange[] & {
+    ToLower(r: number | string): number;
+    ToTitle(r: number | string): number;
+    ToUpper(r: number | string): number;
+  };
   export function In(r: number | string, ...ranges: RangeTable[]): boolean;
   export function In(r: number | string, ranges: RangeTable[]): boolean;
   export function Is(rangeTab: RangeTable | null, r: number | string): boolean;

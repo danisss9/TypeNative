@@ -108,6 +108,19 @@ func writeNumeric(b *strings.Builder, ti *typeInfo, tm *typeMapper) {
 	fmt.Fprintf(b, "  export function %s(v: number): %s;\n", sanitizeName(ti.name), sanitizeName(ti.name))
 }
 
+// Methods of a named slice/map/string type (net.IP.String, http.Header.Get)
+// as an intersection with the underlying TS type.
+func methodsIntersection(ti *typeInfo, tm *typeMapper) string {
+	if len(ti.methods) == 0 {
+		return ""
+	}
+	var methods []string
+	for _, mt := range ti.methods {
+		methods = append(methods, "    "+renderMethodSig(mt.name, mt.params, mt.results, nil, tm)+";")
+	}
+	return " & {\n" + strings.Join(methods, "\n") + "\n  }"
+}
+
 func writeType(b *strings.Builder, ti *typeInfo, tm *typeMapper) {
 	tparams := ""
 	if len(ti.tparams) > 0 {
@@ -119,7 +132,7 @@ func writeType(b *strings.Builder, ti *typeInfo, tm *typeMapper) {
 		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
 	case "basic":
 		// Non-numeric basics (string, bool).
-		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
+		fmt.Fprintf(b, "  export type %s%s = %s%s;\n", name, tparams, tm.mapType(ti.under, "result"), methodsIntersection(ti, tm))
 	case "func":
 		// iter.Seq / Seq2 are also for…of iterables.
 		iterable := ""
@@ -130,11 +143,11 @@ func writeType(b *strings.Builder, ti *typeInfo, tm *typeMapper) {
 		}
 		fmt.Fprintf(b, "  export type %s%s = (%s)%s;\n", name, tparams, tm.mapType(ti.under, "result"), iterable)
 	case "slice":
-		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
+		fmt.Fprintf(b, "  export type %s%s = %s%s;\n", name, tparams, tm.mapType(ti.under, "result"), methodsIntersection(ti, tm))
 	case "map":
-		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
+		fmt.Fprintf(b, "  export type %s%s = %s%s;\n", name, tparams, tm.mapType(ti.under, "result"), methodsIntersection(ti, tm))
 	case "array":
-		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
+		fmt.Fprintf(b, "  export type %s%s = %s%s;\n", name, tparams, tm.mapType(ti.under, "result"), methodsIntersection(ti, tm))
 	case "chan":
 		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
 	case "other":

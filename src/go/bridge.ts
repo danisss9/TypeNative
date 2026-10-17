@@ -841,10 +841,11 @@ export function visitGoNew(node: AstNode, path: string, typeName: string): strin
     }
     const ptr = hasPtrReceiver(type);
     const lit = `${qualifier}.${typeName}{${entries.join(', ')}}`;
-    return ptr ? `&${lit}` : lit;
+    // Parenthesized so a method call binds to the pointer: (&T{}).M().
+    return ptr ? `(&${lit})` : lit;
   }
   const empty = `${qualifier}.${typeName}{}`;
-  return hasPtrReceiver(type) ? `&${empty}` : empty;
+  return hasPtrReceiver(type) ? `(&${empty})` : empty;
 }
 
 function fieldGoTypeOf(type: { fields: Array<{ name: string; goType: string }> }, field: string): string | undefined {
