@@ -27,6 +27,7 @@ import { registerTls } from './node/tls.js';
 import { registerDgram } from './node/dgram.js';
 import { registerFetch } from './node/fetch.js';
 import { registerAsyncHooks } from './node/async_hooks.js';
+import { registerTest } from './node/test.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import {
   goPackage,
@@ -1226,6 +1227,10 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
   } else if (isPropertyAccessExpression(node)) {
+    if (isMockAccess(node)) {
+      nodeRegistry.helper('nodeTest');
+      return `TnMockOf(${visit(node.expression)})`;
+    }
     if (isProcessEnv(node.expression) && !isCallee(node) && !isAssignmentTarget(node)) {
       useHelper('getenv');
       return `TnGetenv("${node.name.text}")`;
@@ -1949,11 +1954,10 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return '';
   } else if (isAwaitExpression(node)) {
-    if (inferExpressionType(node.expression)?.startsWith('chan ')) {
-      useHelper('promise');
-      return `TnAwait(${visit(node.expression)})`;
-    }
-    return `<-${visit(node.expression)}`;
+    // Promises are channels: TnAwait keeps the event loop running while it waits
+    // (a bare receive would block it, e.g. in async callbacks)
+    useHelper('promise');
+    return `TnAwait(${visit(node.expression)})`;
   } else if (isVariableDeclarationList(node)) {
     return (
       (node.declarations ?? []).map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
@@ -4354,7 +4358,14 @@ function inferArrowFunctionGoType(node: AstNode | AstNode): string {
   return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
 
+// fn.mock on a function value: the call record of a node:test mock (functions have no fields in Go)
+function isMockAccess(node: AstNode): boolean {
+  if (!isPropertyAccessExpression(node) || node.name.text !== 'mock' || !nodeRegistry.modules['test']) return false;
+  return !!inferExpressionType(node.expression)?.startsWith('func(');
+}
+
 function inferExpressionType(expr: AstNode): string | undefined {
+  if (isMockAccess(expr)) return '*TnMockFunctionContext';
   if (isAwaitExpression(expr)) {
     // await unwraps the promise channel
     const inner = inferExpressionType(expr.expression);
@@ -8391,6 +8402,7 @@ registerHttp(nodeRegistry);
 registerDgram(nodeRegistry);
 registerFetch(nodeRegistry);
 registerAsyncHooks(nodeRegistry);
+registerTest(nodeRegistry);
 
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
