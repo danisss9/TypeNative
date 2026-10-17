@@ -56,6 +56,14 @@ generated types say they do.
   (`response.body`, `ReadableStream` uploads), sends Blob / FormData bodies and reads
   `blob()` / `formData()`
 - `TextDecoder#decode(bytes, { stream: true })`
+- **`node:crypto`**: `scrypt` / `scryptSync`; callback forms of `pbkdf2`, `hkdf`,
+  `randomBytes`, `randomFill`; `KeyObject` with `createPrivateKey` / `createPublicKey` /
+  `createSecretKey` and PEM / DER / JWK import and export; `generateKeyPair(Sync)` (RSA, EC,
+  Ed25519, X25519) and `generateKey(Sync)`; `sign` / `verify`, `createSign` / `createVerify`
+  (PKCS#1 v1.5, PSS, ECDSA DER / P1363, Ed25519); `publicEncrypt` & co.; ECDH and classic
+  Diffie-Hellman (MODP groups); `generatePrime` / `checkPrime`; `X509Certificate`; and
+  `crypto.subtle` (digest, keys, sign / verify, AES-GCM / CBC / CTR, RSA-OAEP, PBKDF2 / HKDF /
+  ECDH / X25519 derivation, wrap / unwrap)
 
 ### Fixed
 
@@ -84,6 +92,9 @@ generated types say they do.
   accessors); `x as File` asserts dynamic values to Node classes
 - `Response#clone()` of a network body no longer blocks the event loop (both copies stream it)
 - The self-hosted compiler no longer crashes on `const [a, b] = call()`
+- Top-level variables named like an imported Go package (`rsa`, `pem`, `encoding`, `http`, …) are
+  renamed instead of clashing with it; `bigint.toString(radix)`; `ArrayBuffer` annotations and
+  `byteLength` on Buffers
 - `(c) => (body += c)` arrow bodies; `console.log(x?.y)` prints optional strings / numbers
   without quotes; the self-hosted compiler no longer crashes on `console.log` arguments of
   unknown type

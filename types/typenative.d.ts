@@ -797,6 +797,11 @@ interface ClassMethodDecoratorContext<
   addInitializer(initializer: (this: This) => void): void;
 }
 
+// bigint values (*big.Int): toString(radix)
+interface BigInt {
+  toString(radix?: number): string;
+}
+
 // --- Node.js globals (Buffer, URL, TextEncoder, AbortController, performance, …) ---
 
 type BufferEncoding =
@@ -1023,7 +1028,9 @@ declare var performance: Performance;
 declare var crypto: {
   randomUUID(): string;
   getRandomValues<T extends Uint8Array>(array: T): T;
+  readonly subtle: import('node:crypto').webcrypto.SubtleCrypto;
 };
+type CryptoKey = import('node:crypto').webcrypto.CryptoKey;
 
 // --- Web streams (node:stream/web globals) ---
 

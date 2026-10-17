@@ -15,6 +15,7 @@ import { registerPunycode } from './node/punycode.js';
 import { registerQuerystring } from './node/querystring.js';
 import { registerStringDecoder } from './node/string_decoder.js';
 import { registerCrypto } from './node/crypto.js';
+import { registerCryptoKeys } from './node/crypto_keys.js';
 import { registerZlib } from './node/zlib.js';
 import { registerTimers } from './node/timers.js';
 import { registerEvents } from './node/events.js';
@@ -5965,8 +5966,8 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'RegExpExecArray' || name === 'RegExpMatchArray') {
             return '[]string';
         }
-        // Uint8Array / Buffer annotations are Go []byte.
-        if (name === 'Uint8Array' || name === 'Buffer') {
+        // Uint8Array / Buffer / ArrayBuffer annotations are Go []byte.
+        if (name === 'Uint8Array' || name === 'Buffer' || name === 'ArrayBuffer') {
             return '[]byte';
         }
         if (name === 'TemplateStringsArray' || name === 'ReadonlyArray') {
@@ -6123,6 +6124,10 @@ function getAcessString(leftSide, rightSide, objectType) {
         return `float64(utf8.RuneCountInString(${leftSide}))`;
     }
     if (rightSide === 'length' && objectType !== 'class') {
+        return `float64(len(${leftSide}))`;
+    }
+    // Buffers / Uint8Arrays / ArrayBuffers are []byte
+    if (rightSide === 'byteLength' && objectType === 'Buffer') {
         return `float64(len(${leftSide}))`;
     }
     if (rightSide === 'size' && (objectType === 'Map' || objectType === 'Set')) {
@@ -6863,6 +6868,9 @@ function getDynamicCallHandler(caller, objectType) {
             return (c, args) => {
                 const obj = c.substring(0, dotIndex);
                 if (args.length > 0) {
+                    // bigint.toString(radix)
+                    if (currentReceiverGoType === '*tnbig.Int')
+                        return `${obj}.Text(int(${args[0]}))`;
                     importedPackages.add('strconv');
                     return `strconv.FormatInt(int64(${obj}), int(${args[0]}))`;
                 }
@@ -7738,7 +7746,10 @@ const goPackageIdentifiers = new Set([
     'flate', 'fmt', 'fs', 'gzip', 'hash', 'hex', 'hkdf', 'hmac', 'html', 'io', 'iter', 'json', 'math', 'md5',
     'net', 'os', 'pbkdf2', 'rand', 'reflect', 'regexp', 'runtime', 'sha1', 'sha256', 'sha3', 'sha512', 'signal',
     'slices', 'sort', 'strconv', 'strings', 'subtle', 'sync', 'syscall', 'time', 'unicode', 'unsafe', 'user',
-    'utf16', 'utf8', 'zlib',
+    'utf16', 'utf8', 'zlib', 'asn1', 'bits', 'context', 'ecdh', 'ecdsa', 'ed25519', 'elliptic', 'encoding', 'http',
+    'log', 'mime', 'multipart', 'pem', 'pkix', 'rsa', 'textproto', 'tls', 'x509',
+    // Aliased imports (math/big, crypto, net/url, crypto/rand)
+    'tnbig', 'tncrypto', 'tnurl', 'cryptorand',
     // Go builtins: a package-level `var copy` would shadow copy() in the helpers
     'append', 'cap', 'clear', 'close', 'complex', 'copy', 'imag', 'len', 'make', 'max', 'min', 'panic',
     'print', 'println', 'real', 'recover', 'any', 'byte', 'error', 'float64', 'int', 'int64', 'rune',
@@ -8219,6 +8230,7 @@ registerPunycode(nodeRegistry);
 registerQuerystring(nodeRegistry);
 registerStringDecoder(nodeRegistry);
 registerCrypto(nodeRegistry);
+registerCryptoKeys(nodeRegistry);
 registerZlib(nodeRegistry);
 registerTimers(nodeRegistry);
 registerEvents(nodeRegistry);

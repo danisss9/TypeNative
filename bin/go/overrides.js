@@ -39,6 +39,7 @@ export const goOverrides = {
 // truth: the transpiler's goImportLine and the bridge qualifier use it.
 export const goPathAliases = {
     'math/big': 'tnbig',
+    crypto: 'tncrypto',
     'net/url': 'tnurl',
     'crypto/rand': 'cryptorand',
     'math/rand/v2': 'randv2',
