@@ -33,6 +33,21 @@ generated types say they do.
   element; printf-style calls pass numbers to `%d %x %o %b %c %U` as `int64`
 - `String.indexOf(search, fromIndex)`
 - `npm run check:go-types` type-checks the `go:*` probes against `types/typenative-go.d.ts`
+- **Node networking**: `node:net` (TCP / Unix servers and sockets as duplex streams, Node's
+  `ECONNREFUSED`-style errors, `isIP`), `node:dns` (+ `dns/promises`), `node:http` /
+  `node:https` (servers on `net/http`, `request` / `get`, `STATUS_CODES`, `METHODS`),
+  `node:tls` (Node's certificate checks and error codes, `getPeerCertificate`), `node:dgram`,
+  and the global `fetch` with `Headers` / `Request` / `Response`
+- **`node:async_hooks`**: `AsyncLocalStorage` and `AsyncResource`; the event loop carries an
+  async context through timers, `nextTick`, microtasks, promise callbacks, awaits, fs / dns
+  callbacks, streams and servers
+- **`node:test`**: `test` / `describe` / `it` with hooks, subtests, skip / todo, timeouts and
+  `mock.fn`; Node's TAP (or, on a terminal, spec) report and exit code
+- **`node:worker_threads`**: workers re-run the program as child processes linked over
+  loopback TCP (structured-clone messages, `workerData`, `terminate`, errors), plus
+  `MessageChannel` / `MessagePort` / `BroadcastChannel`; globals `__filename` / `__dirname`
+- `new Promise((resolve) => setTimeout(resolve, ms))`: `resolve` / `reject` can be passed as
+  values
 
 ### Fixed
 
@@ -50,6 +65,15 @@ generated types say they do.
 - `npm run gen:go` runs from the repo root again
 - The self-hosted compiler (`npm run build:native`) builds again; the `src/go/*` modules are
   transpilable by TypeNative
+- Object literals whose keys aren't identifiers (`{ 'Content-Type': … }`) compile (as records)
+- `const { a, b } = f()` evaluates `f()` once
+- `await` inside async arrow callbacks no longer blocks the event loop (every `await` goes
+  through `TnAwait`)
+- `JSON.parse` assigned to an interface type converts into its struct (it was `nil`); typed
+  callback parameters accept decoded JSON-like values
+- `(c) => (body += c)` arrow bodies; `console.log(x?.y)` prints optional strings / numbers
+  without quotes; the self-hosted compiler no longer crashes on `console.log` arguments of
+  unknown type
 
 ## [0.1.3] - 2026-10-15
 
