@@ -49,7 +49,8 @@ import {
   isGoRefCall,
   goTupleTypes,
   goCallbackResultType,
-  ensureGoQualifier
+  ensureGoQualifier,
+  GoNamedImport
 } from './go/bridge.js';
 
 // Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
@@ -6605,7 +6606,9 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
   },
   indexOf: (obj, args) => {
     importedPackages.add('strings');
-    return `float64(strings.Index(${obj}, ${args[0]}))`;
+    if (args.length < 2) return `float64(strings.Index(${obj}, ${args[0]}))`;
+    // indexOf(x, from): search from the clamped position, index into the whole string
+    return `func() float64 { __s := ${obj}; __f := int(${args[1]}); if __f < 0 { __f = 0 }; if __f > len(__s) { __f = len(__s) }; __i := strings.Index(__s[__f:], ${args[0]}); if __i < 0 { return -1 }; return float64(__i + __f) }()`;
   },
   charCodeAt: (obj, args) => `float64(${obj}[int(${args[0]})])`,
   localeCompare: (obj, args) => {
@@ -6864,7 +6867,7 @@ function toGoRegexp(arg: string): string {
 // A JS slice index: negative values count from the end
 // A JS slice index: negative values count from the end; out-of-range values clamp
 function sliceIndex(obj: string, index: string | undefined): string {
-  if (index === undefined) return '0';
+  if (index === undefined || index === '') return '0';
   if (index.startsWith('-')) return `max(0, int(float64(len(${obj})) + ${index}))`;
   return `min(int(${index}), len(${obj}))`;
 }
@@ -8183,7 +8186,7 @@ function registerGoPackageAliases(node: AstNode, goPkg: string): void {
   const qualifier = goPathAliases[goPkg] ?? pkgName;
   goPackageLocalNames.add(pkgName);
   goPackageLocalNames.add(qualifier);
-  const named: Array<{ imported: string; local: string }> = [];
+  const named: GoNamedImport[] = [];
   let defaultName: string | null = null;
   let namespaceName: string | null = null;
   if (!node.importClause) {
@@ -8212,8 +8215,8 @@ function registerGoPackageAliases(node: AstNode, goPkg: string): void {
       // `import { Println, Sprintf as Spf } from 'go:fmt'`
       for (const el of clause.namedBindings.elements) {
         if (el.isTypeOnly) continue;
-        const localName = el.name.text;
-        const importedName = el.propertyName?.text ?? localName;
+        const localName: string = el.name.text;
+        const importedName: string = el.propertyName?.text ?? localName;
         importAliases.set(localName, `${qualifier}.${importedName}`);
         named.push({ imported: importedName, local: localName });
       }

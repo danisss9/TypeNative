@@ -302,7 +302,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `toUpperCase` / `toLowerCase`                             |   ✅    | [lib-string-basics.ts](conformance/lib-string-basics.ts)               | Via `strings` package                                                  |
 | `trim` / `trimStart` / `trimEnd`                          |   ✅    | [lib-string-basics.ts](conformance/lib-string-basics.ts)               | Via `strings` package                                                  |
 | `split` / `join`                                          |   ✅    | [lib-string-split-join.ts](conformance/lib-string-split-join.ts)       | Via `strings` package                                                  |
-| `includes` / `startsWith` / `endsWith` / `indexOf`        |   ✅    | [lib-string-search.ts](conformance/lib-string-search.ts)               | Via `strings` package                                                  |
+| `includes` / `startsWith` / `endsWith` / `indexOf` (with `fromIndex`)        |   ✅    | [lib-string-search.ts](conformance/lib-string-search.ts)               | Via `strings` package                                                  |
 | `replace` / `replaceAll` (string pattern)                 |   ✅    | [lib-string-replace.ts](conformance/lib-string-replace.ts)             | Via `strings` package                                                  |
 | `replace` / `replaceAll` (RegExp, `$1`/`$&`, fn replacer) |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)     | `/g` vs first match, `$1`/`$&` patterns, function replacers            |
 | `charAt` / `substring` / `slice`                          |   ✅    | [lib-string-slice.ts](conformance/lib-string-slice.ts)                 | Direct Go string indexing/slicing                                      |
@@ -691,7 +691,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:compress/gzip` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | gzip read/write |
 | `go:compress/lzw` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | LZW compression (GIF/PDF/TIFF) |
 | `go:compress/zlib` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | zlib read/write |
-| `go:container/heap` | ⚠️ | — | Heap / priority queue |
+| `go:container/heap` | ⚠️ | — | Needs a TS class satisfying `heap.Interface`; TS classes cannot implement Go interfaces yet |
 | `go:container/list` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Doubly linked list |
 | `go:container/ring` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Circular list |
 | `go:context` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Cancellation and deadlines |
@@ -699,7 +699,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:crypto/aes` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | AES encryption |
 | `go:crypto/cipher` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Block cipher modes (GCM, CBC, CTR) |
 | `go:crypto/des` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | DES / triple DES (deprecated) |
-| `go:crypto/dsa` | ⚠️ | — | DSA signatures (deprecated) |
+| `go:crypto/dsa` | ✅ | [lib-go-crypto-more.ts](conformance/lib-go-crypto-more.ts) | DSA signatures (deprecated) |
 | `go:crypto/ecdh` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ECDH key exchange |
 | `go:crypto/ecdsa` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ECDSA signatures |
 | `go:crypto/ed25519` | ✅ | [lib-go-ed25519.ts](conformance/lib-go-ed25519.ts) | Ed25519 signatures |
@@ -707,10 +707,10 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:crypto/fips140` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | FIPS 140-3 mode controls |
 | `go:crypto/hkdf` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | HKDF key derivation |
 | `go:crypto/hmac` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | HMAC keyed hashing |
-| `go:crypto/hpke` | ⚠️ | — | HPKE encryption (RFC 9180) |
+| `go:crypto/hpke` | ✅ | [lib-go-crypto-more.ts](conformance/lib-go-crypto-more.ts) | HPKE encryption (RFC 9180) |
 | `go:crypto/md5` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | MD5 hash |
 | `go:crypto/mlkem` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ML-KEM post-quantum key encapsulation |
-| `go:crypto/mlkem/mlkemtest` | ⚠️ | — | ML-KEM test vectors helper |
+| `go:crypto/mlkem/mlkemtest` | ✅ | [lib-go-crypto-more.ts](conformance/lib-go-crypto-more.ts) | Deterministic ML-KEM encapsulation |
 | `go:crypto/pbkdf2` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | PBKDF2 key derivation |
 | `go:crypto/rand` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Cryptographically secure random bytes |
 | `go:crypto/rc4` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | RC4 stream cipher (deprecated) |
@@ -723,8 +723,8 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:crypto/tls` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | TLS client/server; loopback probe is a later phase |
 | `go:crypto/x509` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | X.509 certificates and revocation |
 | `go:crypto/x509/pkix` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | X.509 ASN.1/PKIX structures |
-| `go:database/sql` | ⚠️ | — | No std driver; needs an external driver |
-| `go:database/sql/driver` | ⚠️ | — | Driver interfaces; no std driver |
+| `go:database/sql` | ✅ | [lib-go-sql.ts](conformance/lib-go-sql.ts) | No std driver: registry and errors probed |
+| `go:database/sql/driver` | ✅ | [lib-go-sql.ts](conformance/lib-go-sql.ts) | Driver interfaces and value converters |
 | `go:debug/buildinfo` | ✅ | [lib-go-runtime-extra.ts](conformance/lib-go-runtime-extra.ts) | Build info from executables |
 | `go:debug/dwarf` | ⚠️ | — | DWARF debug info parsing |
 | `go:debug/elf` | ⚠️ | — | ELF object files |
@@ -749,18 +749,18 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:flag` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | Command-line flag parsing |
 | `go:fmt` | ✅ | [lib-go-fmt.ts](conformance/lib-go-fmt.ts) | Formatted I/O; integer verbs take TS numbers |
 | `go:go/ast` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go syntax tree |
-| `go:go/build` | ⚠️ | — | Go package build metadata |
+| `go:go/build` | ✅ | [lib-go-gotypes.ts](conformance/lib-go-gotypes.ts) | Go package build metadata |
 | `go:go/build/constraint` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Build-tag constraint parsing |
 | `go:go/constant` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Untyped constant values |
-| `go:go/doc` | ⚠️ | — | Go doc extraction |
+| `go:go/doc` | ✅ | [lib-go-gotypes.ts](conformance/lib-go-gotypes.ts) | Go doc extraction |
 | `go:go/doc/comment` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Doc comment parse/print |
 | `go:go/format` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go source formatting |
-| `go:go/importer` | ⚠️ | — | Export-data type importer |
+| `go:go/importer` | ✅ | [lib-go-gotypes.ts](conformance/lib-go-gotypes.ts) | Export-data type importer |
 | `go:go/parser` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go source parser |
 | `go:go/printer` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go AST printer |
 | `go:go/scanner` | ✅ | [lib-go-gotools-extra.ts](conformance/lib-go-gotools-extra.ts) | Go tokenizer |
 | `go:go/token` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go tokens / positions |
-| `go:go/types` | ⚠️ | — | Go type checker |
+| `go:go/types` | ✅ | [lib-go-gotypes.ts](conformance/lib-go-gotypes.ts) | Go type checker |
 | `go:go/version` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go version comparison |
 | `go:hash` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | Hash function interface |
 | `go:hash/adler32` | ✅ | [lib-go-hash-extra.ts](conformance/lib-go-hash-extra.ts) | Adler-32 checksum |
@@ -787,9 +787,9 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:log/syslog` | ⚠️ | — | Unix syslog; no portable probe |
 | `go:maps` | ✅ | [lib-go-collections.ts](conformance/lib-go-collections.ts) | Generic map helpers |
 | `go:math` | ✅ | [lib-go-math.ts](conformance/lib-go-math.ts) | Math functions |
-| `go:math/big` | ⚠️ | — | Arbitrary-precision arithmetic |
+| `go:math/big` | ✅ | [lib-go-big.ts](conformance/lib-go-big.ts) | Arbitrary-precision arithmetic |
 | `go:math/bits` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Bit operations |
-| `go:math/cmplx` | ⚠️ | — | Complex math |
+| `go:math/cmplx` | ⚠️ | — | `complex128` has no TS mapping |
 | `go:math/rand` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Pseudo-random numbers |
 | `go:math/rand/v2` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Pseudo-random numbers (v2 API) |
 | `go:mime` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | MIME media types |
@@ -797,17 +797,17 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:mime/quotedprintable` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | Quoted-printable encoding |
 | `go:net` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Sockets (loopback TCP), addresses |
 | `go:net/http` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP client/server (loopback) |
-| `go:net/http/cgi` | ⚠️ | — | CGI handler |
+| `go:net/http/cgi` | ✅ | [lib-go-http-extra.ts](conformance/lib-go-http-extra.ts) | CGI request parsing |
 | `go:net/http/cookiejar` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Cookie jars (loopback) |
-| `go:net/http/fcgi` | ⚠️ | — | FastCGI handler |
+| `go:net/http/fcgi` | ⚠️ | — | FastCGI handler; needs a FastCGI web server |
 | `go:net/http/httptest` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP test servers (loopback) |
 | `go:net/http/httptrace` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | HTTP tracing hooks |
 | `go:net/http/httputil` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | HTTP utilities (loopback) |
-| `go:net/http/pprof` | ⚠️ | — | pprof HTTP handlers |
+| `go:net/http/pprof` | ✅ | [lib-go-http-extra.ts](conformance/lib-go-http-extra.ts) | pprof HTTP handlers |
 | `go:net/mail` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Mail address parsing |
 | `go:net/netip` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | IP address types |
-| `go:net/rpc` | ⚠️ | — | RPC client/server |
-| `go:net/rpc/jsonrpc` | ⚠️ | — | JSON-RPC codec |
+| `go:net/rpc` | ⚠️ | — | Needs Go method sets on registered receivers |
+| `go:net/rpc/jsonrpc` | ⚠️ | — | Needs Go method sets on registered receivers |
 | `go:net/smtp` | ⚠️ | — | SMTP client; needs a server |
 | `go:net/textproto` | ✅ | [lib-go-net.ts](conformance/lib-go-net.ts) | Text protocol I/O |
 | `go:net/url` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | URL parsing |
@@ -829,17 +829,17 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:sort` | ✅ | [lib-go-sort.ts](conformance/lib-go-sort.ts) | Sorting |
 | `go:strconv` | ✅ | [lib-go-strconv.ts](conformance/lib-go-strconv.ts) | String conversions |
 | `go:strings` | ✅ | [lib-go-strings.ts](conformance/lib-go-strings.ts) | String utilities |
-| `go:structs` | ⚠️ | — | Struct field helpers |
+| `go:structs` | ✅ | [lib-go-lowlevel.ts](conformance/lib-go-lowlevel.ts) | `HostLayout` marker |
 | `go:sync` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Mutexes and wait groups |
 | `go:sync/atomic` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Atomic operations |
-| `go:syscall` | ⚠️ | — | Linux types; per-arch constants dropped |
-| `go:testing` | ⚠️ | — | No `go test` harness |
-| `go:testing/cryptotest` | ⚠️ | — | No `go test` harness |
-| `go:testing/fstest` | ⚠️ | — | No `go test` harness |
-| `go:testing/iotest` | ⚠️ | — | No `go test` harness |
-| `go:testing/quick` | ⚠️ | — | No `go test` harness |
-| `go:testing/slogtest` | ⚠️ | — | No `go test` harness |
-| `go:testing/synctest` | ⚠️ | — | No `go test` harness |
+| `go:syscall` | ✅ | [lib-go-lowlevel.ts](conformance/lib-go-lowlevel.ts) | Portable subset probed; per-arch constants dropped |
+| `go:testing` | ✅ | [lib-go-testing.ts](conformance/lib-go-testing.ts) | Helpers usable outside `go test` |
+| `go:testing/cryptotest` | ⚠️ | — | Needs a `*testing.T` (no `go test` harness) |
+| `go:testing/fstest` | ✅ | [lib-go-testing.ts](conformance/lib-go-testing.ts) | `TestFS` over any `fs.FS` |
+| `go:testing/iotest` | ✅ | [lib-go-testing.ts](conformance/lib-go-testing.ts) | Reader/writer test wrappers |
+| `go:testing/quick` | ✅ | [lib-go-testing.ts](conformance/lib-go-testing.ts) | Property checks with TS callbacks |
+| `go:testing/slogtest` | ⚠️ | — | Needs a `*testing.T` (no `go test` harness) |
+| `go:testing/synctest` | ⚠️ | — | Needs a `*testing.T` (no `go test` harness) |
 | `go:text/scanner` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Text scanner |
 | `go:text/tabwriter` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Aligned text columns |
 | `go:text/template` | ✅ | [lib-go-template.ts](conformance/lib-go-template.ts) | Text templating |
@@ -850,7 +850,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:unicode/utf16` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | UTF-16 encoding |
 | `go:unicode/utf8` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | UTF-8 encoding |
 | `go:unique` | ✅ | [lib-go-collections.ts](conformance/lib-go-collections.ts) | Canonical values |
-| `go:weak` | ⚠️ | — | Weak pointers |
+| `go:weak` | ✅ | [lib-go-lowlevel.ts](conformance/lib-go-lowlevel.ts) | Weak pointers |
 | `go:plugin` | ❌ | — | cgo, `-buildmode=plugin` |
 | `go:unsafe` | ❌ | — | raw pointers |
 | `go:runtime/race` | ❌ | — | needs `-race` |
@@ -865,13 +865,17 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | ---- | ------- |
 | Number conversion | All Go ints/floats map to TS `number`; args convert via `T(x)`, results read back via `float64(x)`. `int64`/`uint64` beyond 2^53 lose precision. |
 | Throw on error | `(T, error)` results throw a `GoError` on failure; `error`-only calls throw as statements and yield the error value in value position. |
-| Tuples | Multi-value results pack into a slice (TS tuple). |
-| Structs | `new pkg.T({...})` builds a composite literal (pointer when any method needs it); fields read/write directly. Embedded structs promote their fields. |
-| Named numerics | `time.Duration` etc. stay typed in Go; arithmetic coerces the `number` side (`time.Second * 2`). |
-| Callbacks | Func-typed params become Go closures; sync callbacks (sort, slices, strings, ...) run inline. |
-| Channels | `chan<T>(size?)` / `GoChan<T>` with `send`, `recv`, `close`; `for…of` ranges channels and `iter.Seq`. |
+| Tuples | Multi-value results pack into a slice (TS tuple); `const [a, b] = f()` types each element (ints read as numbers). |
+| Structs | `new pkg.T({...})` builds a composite literal (pointer when any method needs it); fields read/write directly, converting numbers both ways (`h.Size += 1`). Embedded structs promote their fields. |
+| Named numerics | Typed constants (`time.Second`, `reflect.String`) stay typed in Go; arithmetic and `===` coerce the `number` side (`time.Second * 2`). Results read as numbers: `token.Token(n)` restores the methods. |
+| Callbacks | Func-typed params and struct fields become Go closures with the exact Go signature (int params read as numbers, returns convert to the result type); sync callbacks (sort, slices, strings, ...) run inline. |
+| Generics | Type args are inferred from the arguments, including through constraints (`maps.Keys(m)` with `Map ~map[K]V`); unresolved ones become `any`. |
+| printf verbs | With a literal format, numbers passed to `%d %x %o %b %c %U` convert to `int64`; scan into number refs with `%v`. |
+| nil | `null` passes as `nil`; `x === null` on nil-able Go values (slices, maps, interfaces, pointers) is a real nil check. |
+| Channels | `chan<T>(size?)` / `GoChan<T>` with `send`, `recv`, `close`; `for…of` ranges channels, `iter.Seq` and `iter.Seq2` (`for (const [k, v] of seq2)`). |
 | Out-params | `ref<T>(init?)` makes a pointer cell; `.value` dereferences it. |
 | Byte slices | `[]byte` is `Uint8Array` (zero-copy); `number[]` converts per call (mutations of the copy are lost). |
+| Side-effect imports | `import 'go:time/tzdata'` emits a blank `import _`. |
 
 ### npm packages
 

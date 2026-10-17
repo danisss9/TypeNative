@@ -41,8 +41,6 @@ export function resetGoBridge() {
     for (const key of Object.keys(pathToLocal))
         delete pathToLocal[key];
 }
-// Register a `go:` import's local names. qualifier is the emitted package
-// qualifier (real name or collision alias).
 export function registerGoImport(path, qualifier, defaultName, namespaceName, named) {
     pathToLocal[path] = qualifier;
     if (defaultName) {
@@ -79,11 +77,12 @@ export function ensureGoQualifier(path) {
 }
 // Package path of a local namespace name, '' when none.
 export function goPathOf(local) {
-    return localToPath[local] ?? '';
+    // Own keys only: a local named `constructor` must not hit Object.prototype.
+    return Object.hasOwn(localToPath, local) ? localToPath[local] : '';
 }
 // Qualified member of a local name ('Sprintf' → 'fmt.Sprintf'), '' when none.
 export function goMemberOf(local) {
-    return memberAliases[local] ?? '';
+    return Object.hasOwn(memberAliases, local) ? memberAliases[local] : '';
 }
 // Ensure the packages named by a Go type are imported (cross-package
 // result types like hash.Hash32 need their own import).
@@ -138,11 +137,11 @@ export function goLocalType(goType) {
 // Whether an identifier or property access refers to a Go bridge member.
 export function isGoMember(node) {
     if (services.isIdentifier(node)) {
-        return !!memberAliases[node.text];
+        return goMemberOf(node.text) !== '';
     }
     if (services.isPropertyAccess(node)) {
         const base = node.expression;
-        if (services.isIdentifier(base) && localToPath[base.text])
+        if (services.isIdentifier(base) && goPathOf(base.text))
             return true;
     }
     return false;
@@ -150,7 +149,7 @@ export function isGoMember(node) {
 // Emitted qualifier + member for a callee expression.
 function calleeTarget(callee) {
     if (services.isIdentifier(callee)) {
-        const qualified = memberAliases[callee.text];
+        const qualified = goMemberOf(callee.text);
         if (!qualified)
             return null;
         const split = splitGoMember(qualified);
@@ -162,7 +161,7 @@ function calleeTarget(callee) {
         const base = callee.expression;
         if (!services.isIdentifier(base))
             return null;
-        const path = localToPath[base.text];
+        const path = goPathOf(base.text);
         if (!path)
             return null;
         return { path, member: callee.name.text, qualifier: goQualifier(path) };
@@ -228,7 +227,10 @@ export function visitGoCall(node) {
     let params = fn.params;
     if (fn.tparams.length > 0) {
         const subst = inferTypeArgs(fn, argNodes);
-        params = fn.params.map((p) => ({ name: p.name, goType: substituteType(p.goType, subst) }));
+        const substituted = [];
+        for (const p of fn.params)
+            substituted.push({ name: p.name, goType: substituteType(p.goType, subst) });
+        params = substituted;
     }
     const args = emitGoArgs(argNodes, params, fn.variadic, target.path, target.member);
     let call = `${target.qualifier}.${target.member}(${args.join(', ')})`;
@@ -255,7 +257,7 @@ function instantiateResults(fn, argNodes) {
 function inferTypeArgs(fn, argNodes) {
     const cores = {};
     for (let i = 0; i < fn.tparams.length; i++) {
-        cores[fn.tparams[i]] = (fn.tcores ?? [])[i] ?? '';
+        cores[fn.tparams[i]] = fn.tcores[i] ?? '';
     }
     const subst = {};
     for (let i = 0; i < argNodes.length && fn.params.length > 0; i++) {
@@ -263,7 +265,7 @@ function inferTypeArgs(fn, argNodes) {
         unifyParam(param.goType.replace(/^\.\.\./, ''), services.typeOf(argNodes[i]) ?? '', subst, cores);
     }
     for (const tp of fn.tparams) {
-        if (subst[tp] === undefined)
+        if (!Object.hasOwn(subst, tp))
             subst[tp] = 'any';
     }
     return subst;
@@ -276,8 +278,9 @@ function unifyParam(paramType, argType, subst, cores) {
         argType = argType.slice(1);
     // A type param: bind it, then match its constraint's core type
     // (Map ~map[K]V binds K and V too).
-    if (cores[paramType] !== undefined) {
-        if (subst[paramType] === undefined)
+    // Object.hasOwn: a missing key reads as '' (not undefined) once self-hosted.
+    if (Object.hasOwn(cores, paramType)) {
+        if (!Object.hasOwn(subst, paramType))
             subst[paramType] = argType;
         if (cores[paramType])
             unifyParam(cores[paramType], argType, subst, cores);
@@ -339,7 +342,7 @@ function substituteType(goType, subst) {
             const prev = i > 0 ? goType[i - 1] : '';
             // A selector (pkg.Name) or path part, but `...S` is a variadic param.
             const selector = prev === '/' || (prev === '.' && !goType.slice(0, i).endsWith('...'));
-            out += !selector && subst[word] !== undefined ? subst[word] : word;
+            out += !selector && Object.hasOwn(subst, word) ? subst[word] : word;
             i = j;
         }
         else {
@@ -361,13 +364,13 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         const node = nodes[i];
         const param = params[i] ?? params[params.length - 1];
         // Callback arguments become Go closures with the exact signature.
-        if (param &&
+        if (param !== undefined &&
             (services.isArrowFunction(node) || services.isFunctionExpression(node)) &&
             isFuncType(param.goType)) {
             out.push(emitCallback(node, param.goType, path, funcName));
             continue;
         }
-        if (!param) {
+        if (param === undefined) {
             out.push(services.visit(node));
             continue;
         }
@@ -397,7 +400,7 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         }
         const visited = services.visit(node);
         const fromType = services.typeOf(node) ?? '';
-        if (intArgs[i] && fromType === 'float64') {
+        if (intArgs.includes(i) && fromType === 'float64') {
             out.push(`int64(${visited})`);
             continue;
         }
@@ -418,7 +421,7 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
     return out;
 }
 // printf-style calls (`format string, a ...any`) with a literal format:
-// which argument indexes feed an integer verb (%d %x %o %b %c %U). TS
+// the argument indexes that feed an integer verb (%d %x %o %b %c %U). TS
 // numbers are float64, which those verbs reject, so they pass as int64.
 function formatIntArgs(nodes, params, variadic) {
     const flags = [];
@@ -448,7 +451,7 @@ function formatIntArgs(nodes, params, variadic) {
         if (i >= format.length || format[i] === '%')
             continue;
         if ('dxXobcOU'.indexOf(format[i]) >= 0)
-            flags[arg] = true;
+            flags.push(arg);
         arg++;
     }
     return flags;
@@ -506,7 +509,7 @@ export function goTupleTypes(node) {
     }
     else if (services.isPropertyAccess(node.expression)) {
         const recvType = services.typeOf(node.expression.expression);
-        const method = recvType ? goMethodInfo(recvType, node.expression.name.text) : null;
+        const method = recvType !== '' ? goMethodInfo(recvType, node.expression.name.text) : null;
         if (method)
             results = method.results;
     }
@@ -527,11 +530,12 @@ function emitBlocking(call, results, asStatement = false) {
 function isFuncType(goType) {
     return goType.startsWith('func(') || goTypeInfo(goType) !== null && goTypeInfo(goType)?.kind === 'func';
 }
-// Go result type of each TS closure emitted as a Go callback; the
-// transpiler converts its `return` values to it.
-const callbackResults = new Map();
+// Go result type of a TS closure emitted as a Go callback; the transpiler
+// converts its `return` values to it. Stored on the node itself: the
+// self-hosted compiler's AST nodes are Go maps, which can't be map keys.
 export function goCallbackResultType(fn) {
-    return callbackResults.get(fn);
+    const result = fn.tnGoCallbackResult;
+    return typeof result === 'string' ? result : undefined;
 }
 // Emit a TS closure as a Go closure with the exact Go signature. Params
 // the TS body sees as numbers (Go ints) are re-declared as float64.
@@ -562,7 +566,7 @@ function emitCallback(node, goType, path, funcName) {
     const result = sig.results.length === 1 ? sig.results[0] : '';
     if (result) {
         ensureGoTypePackages(result);
-        callbackResults.set(node, result);
+        node.tnGoCallbackResult = result;
     }
     const resultDecl = sig.results.length > 0 ? ' ' + sig.results.map((r) => goLocalType(r)).join(', ') : '';
     const head = `func(${params.join(', ')})${resultDecl}`;
@@ -665,11 +669,14 @@ export function inferGoType(node) {
             const fn = info?.funcs[target.member];
             if (fn)
                 return goResultType(instantiateResults(fn, node.arguments ?? []));
+            // Conversion to a package type: token.Token(n) has its methods back.
+            if (info && Object.hasOwn(info.types, target.member))
+                return `${target.path}.${target.member}`;
         }
         // Method call on a Go-typed receiver.
         if (services.isPropertyAccess(node.expression)) {
             const recvType = services.typeOf(node.expression.expression);
-            if (recvType) {
+            if (recvType !== '') {
                 const method = goMethodInfo(recvType, node.expression.name.text);
                 if (method)
                     return goResultType(method.results);
@@ -678,7 +685,7 @@ export function inferGoType(node) {
         return undefined;
     }
     if (services.isIdentifier(node)) {
-        const qualified = memberAliases[node.text];
+        const qualified = goMemberOf(node.text);
         if (!qualified)
             return undefined;
         if (qualified.startsWith('go:builtin.'))
@@ -720,7 +727,7 @@ export function inferGoType(node) {
         const member = node.name.text;
         // Package member (pkg.Func, pkg.Const, pkg.Var, pkg.Type).
         if (services.isIdentifier(base)) {
-            const path = localToPath[base.text];
+            const path = goPathOf(base.text);
             if (path) {
                 const info = goPackage(path);
                 if (!info)
@@ -741,7 +748,7 @@ export function inferGoType(node) {
         }
         // Field or method on a Go-typed receiver (any base shape).
         const recvType = services.typeOf(base);
-        if (recvType) {
+        if (recvType !== '') {
             const field = goFieldType(recvType, member);
             // Reads convert like results (int fields read as float64).
             if (field)
@@ -825,12 +832,16 @@ export function goMethodInfo(recvType, method) {
     const subst = {};
     for (let i = 0; i < info.tparams.length && i < args.length; i++)
         subst[info.tparams[i]] = args[i];
-    return {
+    const params = [];
+    for (const p of found.params)
+        params.push({ name: p.name, goType: substituteType(p.goType, subst) });
+    const substituted = {
         name: found.name,
         ptr: found.ptr,
-        params: found.params.map((p) => ({ name: p.name, goType: substituteType(p.goType, subst) })),
+        params,
         results: found.results.map((r) => substituteType(r, subst))
     };
+    return substituted;
 }
 // Emit a method call on a Go value with conversion.
 export function visitGoMethod(node, recv, recvType) {
@@ -861,6 +872,12 @@ export function visitGoNew(node, path, typeName) {
         for (const prop of first.properties ?? []) {
             const name = prop.name ? services.visit(prop.name) : '';
             const fieldType = fieldGoTypeOf(type, prop.name?.text ?? '');
+            const isClosure = services.isArrowFunction(prop.initializer) || services.isFunctionExpression(prop.initializer);
+            if (fieldType && isClosure && isFuncType(fieldType)) {
+                // Func fields (httptrace.ClientTrace hooks) get the exact signature.
+                entries.push(`${name}: ${emitCallback(prop.initializer, fieldType, path, typeName)}`);
+                continue;
+            }
             const fromType = services.typeOf(prop.initializer) ?? '';
             let value = services.visit(prop.initializer);
             if (fieldType && fromType === `*${fieldType}`) {

@@ -180,7 +180,7 @@ import { ToUpper } from 'go:strings';
 Println(Sprintf('hi %s', ToUpper('bob')));
 ```
 
-Any Go package can be imported this way (`import { X } from 'go:pkg'` → `pkg.X` with numeric conversion and throw-on-error results). The full standard library is declared for typechecking (`npm run gen:go`), with 73 packages probed — see [conformance.md](conformance.md#go-bridges-gostar).
+Any Go package can be imported this way (`import { X } from 'go:pkg'` → `pkg.X` with numeric conversion and throw-on-error results). The full standard library is declared for typechecking (`npm run gen:go`), with 154 packages probed — see [conformance.md](conformance.md#go-bridges-gostar).
 
 **npm packages:**
 

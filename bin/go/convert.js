@@ -8,17 +8,17 @@
 // Kept in a plain style because this file is part of the self-hosted
 // compiler and must transpile with TypeNative.
 import { goTypeInfo, isGoNumeric, allGoPaths } from './metadata.js';
-let services = {
+let convertServices = {
     pkg: (_name) => { },
     helper: (_id) => { },
     typeOf: (_node) => '',
     localType: (goType) => goType
 };
-let knownPaths = {};
+let convertKnownPaths = {};
 export function initConvertPaths() {
-    knownPaths = {};
+    convertKnownPaths = {};
     for (const p of allGoPaths())
-        knownPaths[p] = true;
+        convertKnownPaths[p] = true;
 }
 // Import the package named by a Go type when it is emitted into code.
 function ensureTypePackage(goType) {
@@ -32,12 +32,12 @@ function ensureTypePackage(goType) {
         if (dot < 0)
             continue;
         const path = part.slice(0, dot);
-        if (knownPaths[path])
-            services.pkg(path);
+        if (convertKnownPaths[path])
+            convertServices.pkg(path);
     }
 }
 export function bindConvertServices(s) {
-    services = s;
+    convertServices = s;
 }
 // Base name of a Go type: strips pointers, qualifiers and generic args.
 export function goBaseName(goType) {
@@ -97,23 +97,23 @@ export function toGo(expr, fromType, toType) {
     // Named numeric target: T(x).
     if (isGoNumeric(toType) && !isGoNumericKind(fromType)) {
         ensureTypePackage(toType);
-        return `${services.localType(toType)}(${expr})`;
+        return `${convertServices.localType(toType)}(${expr})`;
     }
     if (isGoNumeric(toType) && isGoNumericKind(fromType) && fromType !== toType) {
         ensureTypePackage(toType);
-        return `${services.localType(toType)}(${expr})`;
+        return `${convertServices.localType(toType)}(${expr})`;
     }
     // Plain int target from a TS number: T(x) with the exact kind.
     if (isGoIntKind(toType) && fromType === 'float64') {
         return `${goBaseName(toType)}(${expr})`;
     }
     if (isGoIntKind(toType) && isGoFloatKind(fromType)) {
-        return `${services.localType(toType)}(${expr})`;
+        return `${convertServices.localType(toType)}(${expr})`;
     }
     // Named numeric from a plain int kind.
     if (isGoNumeric(toType) && (isGoIntKind(fromType) || isGoFloatKind(fromType))) {
         ensureTypePackage(toType);
-        return `${services.localType(toType)}(${expr})`;
+        return `${convertServices.localType(toType)}(${expr})`;
     }
     // Fixed arrays [N]T → slice when the target is a slice. Call results
     // are unaddressable, so always go through a temp variable.
@@ -122,13 +122,13 @@ export function toGo(expr, fromType, toType) {
         const fromElem = close >= 0 ? fromType.slice(close + 1) : '';
         const toElem = toType.slice(2);
         if (fromElem === toElem || ((fromElem === 'byte' || fromElem === 'uint8') && (toElem === 'byte' || toElem === 'uint8'))) {
-            return `func() ${services.localType(toType)} { __v := ${expr}; return __v[:] }()`;
+            return `func() ${convertServices.localType(toType)} { __v := ${expr}; return __v[:] }()`;
         }
         if (isGoNumericKind(toElem)) {
-            services.helper('goNums');
-            return `func() ${services.localType(toType)} { __v := ${expr}; return tnGoNums[${services.localType(toElem)}](__v[:]) }()`;
+            convertServices.helper('goNums');
+            return `func() ${convertServices.localType(toType)} { __v := ${expr}; return tnGoNums[${convertServices.localType(toElem)}](__v[:]) }()`;
         }
-        return `func() ${services.localType(toType)} { __v := ${expr}; return __v[:] }()`;
+        return `func() ${convertServices.localType(toType)} { __v := ${expr}; return __v[:] }()`;
     }
     // Slices of numbers: tnGoNums[T](x) / element conversion.
     // []byte ↔ []byte passes through (Uint8Array needs no conversion).
@@ -141,14 +141,14 @@ export function toGo(expr, fromType, toType) {
             return expr;
         }
         if (isGoNumericKind(toElem)) {
-            services.helper('goNums');
-            return `tnGoNums[${services.localType(toElem)}](${expr})`;
+            convertServices.helper('goNums');
+            return `tnGoNums[${convertServices.localType(toElem)}](${expr})`;
         }
     }
     // Untyped constants arrive as float64: convert to the target.
     if (fromType === 'float64' && isGoNumericKind(toType)) {
         ensureTypePackage(toType);
-        return `${services.localType(toType)}(${expr})`;
+        return `${convertServices.localType(toType)}(${expr})`;
     }
     // String target.
     if (toType === 'string' && fromType !== 'string') {
@@ -159,7 +159,7 @@ export function toGo(expr, fromType, toType) {
         const base = goBaseName(toType);
         if (base && base !== 'string' && base !== 'bool' && base !== 'float64' && !toType.startsWith('[]') && !toType.startsWith('map[') && !toType.startsWith('func(') && !toType.startsWith('chan ') && toType !== 'any' && toType !== 'interface{}') {
             ensureTypePackage(toType);
-            return `${expr}.(${services.localType(toType)})`;
+            return `${expr}.(${convertServices.localType(toType)})`;
         }
     }
     // Struct value to pointer slot: take address. Never dereference into
@@ -172,7 +172,7 @@ export function toGo(expr, fromType, toType) {
         return `${expr}[0]`;
     }
     if (toType === 'rune' && fromType === 'string') {
-        services.helper('goStrings');
+        convertServices.helper('goStrings');
         return `tnGoRune(${expr})`;
     }
     return expr;
@@ -197,7 +197,7 @@ export function fromGo(expr, goType) {
         if ((elem === 'byte' || elem === 'uint8'))
             return expr;
         if (isGoNumericKind(elem) && elem !== 'float64') {
-            services.helper('goNums');
+            convertServices.helper('goNums');
             return `tnGoFromNums[${elem}](${expr})`;
         }
     }
@@ -206,18 +206,18 @@ export function fromGo(expr, goType) {
 // Wrap a (T, error) or (A, B, error) call so it throws on error.
 export function mustCall(expr, resultCount) {
     if (resultCount === 1) {
-        services.helper('goMust');
+        convertServices.helper('goMust');
         return `tnGoMust(${expr})`;
     }
     if (resultCount === 2) {
-        services.helper('goMust');
+        convertServices.helper('goMust');
         return `tnGoMust2(${expr})`;
     }
     return expr;
 }
 // Wrap an error-only call so it throws on error.
 export function checkCall(expr) {
-    services.helper('goMust');
+    convertServices.helper('goMust');
     return `tnGoCheck(${expr})`;
 }
 // Whether the expression needs no conversion (already the target type).
