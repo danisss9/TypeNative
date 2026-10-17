@@ -875,10 +875,11 @@ export function visitGoNew(node, path, typeName) {
         }
         const ptr = hasPtrReceiver(type);
         const lit = `${qualifier}.${typeName}{${entries.join(', ')}}`;
-        return ptr ? `&${lit}` : lit;
+        // Parenthesized so a method call binds to the pointer: (&T{}).M().
+        return ptr ? `(&${lit})` : lit;
     }
     const empty = `${qualifier}.${typeName}{}`;
-    return hasPtrReceiver(type) ? `&${empty}` : empty;
+    return hasPtrReceiver(type) ? `(&${empty})` : empty;
 }
 function fieldGoTypeOf(type, field) {
     for (const f of type.fields) {

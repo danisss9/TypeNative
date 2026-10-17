@@ -48,7 +48,8 @@ import {
   goMethodInfo,
   isGoRefCall,
   goTupleTypes,
-  goCallbackResultType
+  goCallbackResultType,
+  ensureGoQualifier
 } from './go/bridge.js';
 
 // Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
@@ -987,10 +988,14 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   if (usedHelpers.has('nodeProcess')) drains.push('TnProcessExit()');
   const drainCode = drains.length > 0 ? `\n\t${drains.join('\n\t')}` : '';
 
+  // Go bridge types are qualified by path internally (net/http.Cookie)
+  const mainCode = localizeGoPaths(transpiledCode);
+  const outsideCode = localizeGoPaths(transpiledCodeOutside);
+  const packageVariables = mainPackageVariables.map((v) => localizeGoPaths(v));
   // Go bridge packages pulled in for a type that never got emitted
   // (a method's result type, a param type needing no conversion) would be
   // unused imports, which Go rejects.
-  const emitted = stripGoStrings(`${transpiledCode}\n${transpiledCodeOutside}\n${mainPackageVariables.join('\n')}`);
+  const emitted = stripGoStrings(`${mainCode}\n${outsideCode}\n${packageVariables.join('\n')}`);
   const helpersCode = emitGoHelpers();
   const mainImports = [...importedPackages].filter((pkg) => {
     if (!hasGoPackage(pkg)) return true;
@@ -1008,13 +1013,13 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
 
 ${mainImports.sort().map((pkg) => importLine(pkg)).join('\n')}
 
-${mainPackageVariables.join('\n')}
+${packageVariables.join('\n')}
 
 func main() {
-    ${transpiledCode.trim()}${drainCode}
+    ${mainCode.trim()}${drainCode}
 }
 
-${transpiledCodeOutside.trim()}
+${outsideCode.trim()}
 ${helpersCode}`.trimEnd();
   return { main, files: localImportFiles };
 }
@@ -1766,6 +1771,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (['<', '>', '<=', '>=', '-', '*', '/', '+', '+=', '-=', '*=', '/='].includes(op)) {
       const numericCoercion = visitGoNumericArithmetic(node, op);
       if (numericCoercion) return numericCoercion;
+    }
+    // x.Kind() === reflect.String: the method result reads as a number
+    if (op === '==' || op === '!=') {
+      const numericEquality = visitGoNumericArithmetic(node, op);
+      if (numericEquality) return numericEquality;
     }
     if (op === '**=') {
       importedPackages.add('math');
@@ -3064,7 +3074,7 @@ function visitGoNumericArithmetic(node: AstNode, op: string): string | undefined
   if (!numericType) return undefined;
   const left = leftNumeric ? visit(node.left) : `${numericType}(${visit(node.left)})`;
   const right = rightNumeric ? visit(node.right) : `${numericType}(${visit(node.right)})`;
-  if (op.endsWith('=')) {
+  if (['+=', '-=', '*=', '/='].includes(op)) {
     const target = visit(node.left);
     const baseOp = op.slice(0, -1);
     return `${target} = ${left} ${baseOp} ${right}`;
@@ -5309,14 +5319,20 @@ function getMapLookup(expr: AstNode): { map: string; key: string; mapNode: AstNo
 }
 
 function isNilableGoType(goType: string): boolean {
-  return (
+  if (
     goType.startsWith('*') ||
     goType.startsWith('[]') ||
     goType.startsWith('map[') ||
     goType.startsWith('func') ||
     goType.startsWith('chan ') ||
-    goType === 'interface{}'
-  );
+    goType === 'interface{}' ||
+    goType === 'error'
+  ) {
+    return true;
+  }
+  // Go bridge named types over nil-able kinds (net.IP, io.Reader, http.Header)
+  const kind = goMetaTypeInfo(goType)?.kind;
+  return kind === 'interface' || kind === 'slice' || kind === 'map' || kind === 'func' || kind === 'chan';
 }
 
 function visitOptionalPropertyAccess(node: AstNode): string {
@@ -8085,11 +8101,11 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   emittingModuleFile = true;
   for (const stmt of sf.statements) {
     const result = visit(stmt, { addFunctionOutside: true });
-    if (result.trim()) inlineLines.push(result);
+    if (result.trim()) inlineLines.push(localizeGoPaths(result));
   }
   emittingModuleFile = prevEmittingModuleFile;
 
-  const fileOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
+  const fileOutside = localizeGoPaths(outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n'));
   const isDeclarationLine = (line: string) => /^(var|const|type|func|import)\b/.test(line.trim());
   const declarationLines = inlineLines.filter(isDeclarationLine);
   const statementLines = inlineLines.filter((line) => !isDeclarationLine(line));
@@ -11660,6 +11676,56 @@ function visitImportDeclaration(node: AstNode): string {
 // Go packages imported under a fixed alias to avoid collisions with user
 // variables (a variable named `big` would shadow the package name).
 // Table lives in src/go/overrides.ts (shared with the bridge qualifier).
+// Go bridge types are fully qualified internally (net/http.Cookie,
+// *[]io/fs.DirEntry); emitted code spells them with the import qualifier.
+// Rewrites path-qualified names outside string literals and comments, and
+// imports their packages.
+function localizeGoPaths(code: string): string {
+  if (code.indexOf('/') < 0) return code;
+  let out = '';
+  let i = 0;
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      let j = i + 1;
+      while (j < code.length && code[j] !== ch) {
+        if (ch !== '`' && code[j] === '\\') j++;
+        j++;
+      }
+      out += code.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (ch === '/' && code[i + 1] === '/') {
+      const end = code.indexOf('\n', i);
+      const stop = end < 0 ? code.length : end;
+      out += code.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    if (/[a-z]/.test(ch) && (i === 0 || !/[A-Za-z0-9_.]/.test(code[i - 1]))) {
+      let j = i;
+      while (j < code.length && /[A-Za-z0-9_\/.]/.test(code[j])) j++;
+      const word = code.slice(i, j);
+      const slash = word.lastIndexOf('/');
+      const dot = slash > 0 ? word.indexOf('.', slash) : -1;
+      const path = dot > 0 ? word.slice(0, dot) : '';
+      if (path && hasGoPackage(path)) {
+        ensureGoQualifier(path);
+        importedPackages.add(path);
+        out += goQualifier(path) + word.slice(dot);
+      } else {
+        out += word;
+      }
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 // Whether Go code uses `name.` as a package qualifier (not the tail of a
 // longer identifier or selector: `ratio.` does not use `io`)
 function referencesQualifier(code: string, name: string): boolean {
