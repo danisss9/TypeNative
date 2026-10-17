@@ -11533,51 +11533,14 @@ function visitImportDeclaration(node) {
 function localizeGoPaths(code) {
     if (code.indexOf('/') < 0)
         return code;
-    let out = '';
-    let i = 0;
-    while (i < code.length) {
-        const ch = code[i];
-        if (ch === '"' || ch === "'" || ch === '`') {
-            let j = i + 1;
-            while (j < code.length && code[j] !== ch) {
-                if (ch !== '`' && code[j] === '\\')
-                    j++;
-                j++;
-            }
-            out += code.slice(i, j + 1);
-            i = j + 1;
-            continue;
-        }
-        if (ch === '/' && code[i + 1] === '/') {
-            const end = code.indexOf('\n', i);
-            const stop = end < 0 ? code.length : end;
-            out += code.slice(i, stop);
-            i = stop;
-            continue;
-        }
-        if (/[a-z]/.test(ch) && (i === 0 || !/[A-Za-z0-9_.]/.test(code[i - 1]))) {
-            let j = i;
-            while (j < code.length && /[A-Za-z0-9_\/.]/.test(code[j]))
-                j++;
-            const word = code.slice(i, j);
-            const slash = word.lastIndexOf('/');
-            const dot = slash > 0 ? word.indexOf('.', slash) : -1;
-            const path = dot > 0 ? word.slice(0, dot) : '';
-            if (path && hasGoPackage(path)) {
-                ensureGoQualifier(path);
-                importedPackages.add(path);
-                out += goQualifier(path) + word.slice(dot);
-            }
-            else {
-                out += word;
-            }
-            i = j;
-            continue;
-        }
-        out += ch;
-        i++;
-    }
-    return out;
+    // String/rune literals and line comments match first and pass through
+    return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`|'(?:[^'\\\n]|\\.)*'|\/\/[^\n]*|\b([a-z][a-z0-9_]*(?:\/[a-z0-9_]+)+)\./g, (match, path) => {
+        if (!path || !hasGoPackage(path))
+            return match;
+        ensureGoQualifier(path);
+        importedPackages.add(path);
+        return `${goQualifier(path)}.`;
+    });
 }
 // Whether Go code uses `name.` as a package qualifier (not the tail of a
 // longer identifier or selector: `ratio.` does not use `io`)
