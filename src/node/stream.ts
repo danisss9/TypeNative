@@ -54,6 +54,10 @@ type TnStream struct {
 	bytesWritten float64
 	path         string
 	fd           float64
+	// Releases an underlying handle (sockets) once the stream closes or is destroyed
+	onClose func()
+	// Defers 'close' past the end of both sides (client requests wait for their response)
+	closeHeld bool
 }
 
 type tnStreamLike interface {
@@ -242,11 +246,20 @@ func (s *TnStream) emitEnd() {
 	}
 }
 
+func (s *TnStream) releaseHandle() {
+	if s.onClose != nil {
+		release := s.onClose
+		s.onClose = nil
+		release()
+	}
+}
+
 func (s *TnStream) emitClose() {
-	if s.closed {
+	if s.closed || s.closeHeld {
 		return
 	}
 	s.closed = true
+	s.releaseHandle()
 	TnLoopPost(func() { s.emit("close") })
 }
 
@@ -316,11 +329,13 @@ func (s *TnStream) destroy(err ...interface{}) *TnStream {
 		return s
 	}
 	s.destroyed = true
+	s.closeHeld = false
 	var e interface{}
 	if len(err) > 0 {
 		e = err[0]
 	}
 	finish := func() {
+		s.releaseHandle()
 		if e != nil {
 			s.errored = e
 			TnLoopPost(func() {
@@ -1017,6 +1032,12 @@ func TnZlibStream(format string, decompress bool, options ...interface{}) *TnStr
 }`;
 
 // Go parameter types of option / override methods
+// Method and getter specs of TnStream, shared with classes that embed it (net.Socket, http messages)
+export const STREAM_METHODS =
+  'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
+export const STREAM_GETTERS =
+  'readable=bool; writable=bool; readableEnded=bool; writableEnded=bool; writableFinished=bool; destroyed=bool; closed=bool; errored=interface{}; readableLength=float64; writableLength=float64; readableObjectMode=bool; writableObjectMode=bool; readableFlowing=interface{}; bytesRead=float64; bytesWritten=float64; path=string';
+
 const STREAM_HOOK_PARAMS: Record<string, string[]> = {
   read: ['float64'],
   write: ['interface{}', 'string', 'TnCallback'],
@@ -1046,10 +1067,8 @@ func tnStdin() *bufio.Reader {
 	}
 	return tnStdinBuffered
 }`);
-  const methods =
-    'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
-  const getters =
-    'readable=bool; writable=bool; readableEnded=bool; writableEnded=bool; writableFinished=bool; destroyed=bool; closed=bool; errored=interface{}; readableLength=float64; writableLength=float64; readableObjectMode=bool; writableObjectMode=bool; readableFlowing=interface{}; bytesRead=float64; bytesWritten=float64; path=string';
+  const methods = STREAM_METHODS;
+  const getters = STREAM_GETTERS;
   const cls = defineClass(r, 'stream.Duplex', '*TnStream', 'class', methods, 'tnSelf=interface{}', getters, '');
   for (const name of ['Readable', 'Writable', 'Transform', 'PassThrough', 'Stream']) r.classes[`stream.${name}`] = cls;
   for (const name of ['ReadStream', 'WriteStream']) r.classes[`fs.${name}`] = cls;
@@ -1194,7 +1213,7 @@ func tnStdin() *bufio.Reader {
 }
 
 // Listener parameters of stream events
-function streamListenerTypes(nodes: any[]): string[] {
+export function streamListenerTypes(nodes: any[]): string[] {
   const event = nodes[0];
   const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
   if (name === 'data') return ['interface{}'];

@@ -954,6 +954,441 @@ declare module 'node:sys' {
 }
 
 // Bare specifiers ('fs') are the same builtins as 'node:fs'
+declare module 'node:net' {
+  import { EventEmitter } from 'node:events';
+  import { Duplex } from 'node:stream';
+  namespace net {
+    interface AddressInfo {
+      address: string;
+      family: string;
+      port: number;
+    }
+    interface SocketConstructorOpts {
+      allowHalfOpen?: boolean;
+    }
+    interface TcpSocketConnectOpts {
+      port: number;
+      host?: string;
+      family?: number;
+      timeout?: number;
+      allowHalfOpen?: boolean;
+    }
+    interface IpcSocketConnectOpts {
+      path: string;
+      timeout?: number;
+      allowHalfOpen?: boolean;
+    }
+    type SocketConnectOpts = TcpSocketConnectOpts | IpcSocketConnectOpts;
+    class Socket extends Duplex {
+      constructor(options?: SocketConstructorOpts);
+      connect(port: number, host?: string, connectionListener?: () => void): this;
+      connect(port: number, connectionListener?: () => void): this;
+      connect(path: string, connectionListener?: () => void): this;
+      connect(options: SocketConnectOpts, connectionListener?: () => void): this;
+      setTimeout(timeout: number, callback?: () => void): this;
+      setNoDelay(noDelay?: boolean): this;
+      setKeepAlive(enable?: boolean, initialDelay?: number): this;
+      address(): AddressInfo;
+      ref(): this;
+      unref(): this;
+      resetAndDestroy(): this;
+      destroySoon(): void;
+      readonly bytesRead: number;
+      readonly bytesWritten: number;
+      readonly connecting: boolean;
+      readonly pending: boolean;
+      readonly readyState: 'opening' | 'open' | 'readOnly' | 'writeOnly' | 'closed';
+      readonly remoteAddress?: string | undefined;
+      readonly remoteFamily?: string | undefined;
+      readonly remotePort?: number | undefined;
+      readonly localAddress?: string;
+      readonly localPort?: number;
+      readonly localFamily?: string;
+      readonly timeout?: number | undefined;
+    }
+    interface ServerOpts {
+      allowHalfOpen?: boolean;
+      pauseOnConnect?: boolean;
+    }
+    interface ListenOptions {
+      port?: number;
+      host?: string;
+      path?: string;
+      backlog?: number;
+    }
+    class Server extends EventEmitter {
+      constructor(connectionListener?: (socket: Socket) => void);
+      constructor(options?: ServerOpts, connectionListener?: (socket: Socket) => void);
+      listen(port?: number, hostname?: string, backlog?: number, listeningListener?: () => void): this;
+      listen(port?: number, hostname?: string, listeningListener?: () => void): this;
+      listen(port?: number, listeningListener?: () => void): this;
+      listen(path: string, listeningListener?: () => void): this;
+      listen(options: ListenOptions, listeningListener?: () => void): this;
+      close(callback?: (err?: Error) => void): this;
+      address(): AddressInfo | string | null;
+      getConnections(cb: (error: Error | null, count: number) => void): this;
+      ref(): this;
+      unref(): this;
+      maxConnections: number;
+      readonly listening: boolean;
+    }
+    function createServer(connectionListener?: (socket: Socket) => void): Server;
+    function createServer(options?: ServerOpts, connectionListener?: (socket: Socket) => void): Server;
+    function connect(options: SocketConnectOpts, connectionListener?: () => void): Socket;
+    function connect(port: number, host?: string, connectionListener?: () => void): Socket;
+    function connect(path: string, connectionListener?: () => void): Socket;
+    function createConnection(options: SocketConnectOpts, connectionListener?: () => void): Socket;
+    function createConnection(port: number, host?: string, connectionListener?: () => void): Socket;
+    function createConnection(path: string, connectionListener?: () => void): Socket;
+    function isIP(input: string): number;
+    function isIPv4(input: string): boolean;
+    function isIPv6(input: string): boolean;
+  }
+  export = net;
+}
+
+declare module 'node:dns' {
+  namespace dns {
+    interface LookupOptions {
+      family?: number | 'IPv4' | 'IPv6';
+      all?: boolean;
+    }
+    interface LookupAddress {
+      address: string;
+      family: number;
+    }
+    interface MxRecord {
+      exchange: string;
+      priority: number;
+    }
+    interface SrvRecord {
+      name: string;
+      port: number;
+      priority: number;
+      weight: number;
+    }
+    function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
+    function lookup(hostname: string, family: number, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
+    function lookup(hostname: string, options: LookupOptions & { all: true }, callback: (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void): void;
+    function lookup(hostname: string, options: LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
+    function resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolve(hostname: string, rrtype: 'A' | 'AAAA' | 'CNAME' | 'NS' | 'PTR', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
+    function resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
+    function resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+    function resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolveMx(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
+    function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
+    function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+    function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void;
+    function getServers(): string[];
+    function setDefaultResultOrder(order: 'ipv4first' | 'ipv6first' | 'verbatim'): void;
+    function getDefaultResultOrder(): 'ipv4first' | 'ipv6first' | 'verbatim';
+    const promises: typeof import('node:dns/promises');
+  }
+  export = dns;
+}
+
+declare module 'node:dns/promises' {
+  import { LookupOptions, LookupAddress, MxRecord, SrvRecord } from 'node:dns';
+  namespace dnsPromises {
+    function lookup(hostname: string, options: LookupOptions & { all: true }): Promise<LookupAddress[]>;
+    function lookup(hostname: string, options?: number | LookupOptions): Promise<LookupAddress>;
+    function resolve(hostname: string, rrtype?: 'A' | 'AAAA' | 'CNAME' | 'NS' | 'PTR'): Promise<string[]>;
+    function resolve(hostname: string, rrtype: 'MX'): Promise<MxRecord[]>;
+    function resolve(hostname: string, rrtype: 'TXT'): Promise<string[][]>;
+    function resolve(hostname: string, rrtype: 'SRV'): Promise<SrvRecord[]>;
+    function resolve4(hostname: string): Promise<string[]>;
+    function resolve6(hostname: string): Promise<string[]>;
+    function resolveCname(hostname: string): Promise<string[]>;
+    function resolveMx(hostname: string): Promise<MxRecord[]>;
+    function resolveTxt(hostname: string): Promise<string[][]>;
+    function resolveNs(hostname: string): Promise<string[]>;
+    function resolveSrv(hostname: string): Promise<SrvRecord[]>;
+    function reverse(ip: string): Promise<string[]>;
+    function getServers(): string[];
+    function setDefaultResultOrder(order: 'ipv4first' | 'ipv6first' | 'verbatim'): void;
+    function getDefaultResultOrder(): 'ipv4first' | 'ipv6first' | 'verbatim';
+  }
+  export = dnsPromises;
+}
+
+declare module 'node:http' {
+  import * as net from 'node:net';
+  import { Readable, Writable } from 'node:stream';
+  namespace http {
+    // Repeated headers are joined with ', ' (see headersDistinct for every value)
+    type IncomingHttpHeaders = Record<string, string>;
+    type OutgoingHttpHeader = number | string | string[];
+    type OutgoingHttpHeaders = Record<string, OutgoingHttpHeader>;
+    class IncomingMessage extends Readable {
+      readonly method?: string;
+      readonly url?: string;
+      readonly httpVersion: string;
+      readonly httpVersionMajor: number;
+      readonly httpVersionMinor: number;
+      readonly headers: IncomingHttpHeaders;
+      readonly headersDistinct: Record<string, string[]>;
+      readonly rawHeaders: string[];
+      readonly trailers: Record<string, string>;
+      readonly statusCode?: number;
+      readonly statusMessage?: string;
+      readonly complete: boolean;
+      readonly aborted: boolean;
+      // A TLSSocket (encrypted: true) for https requests
+      readonly socket: net.Socket & { readonly encrypted?: boolean };
+      readonly connection: net.Socket;
+      setTimeout(msecs: number, callback?: () => void): this;
+    }
+    class OutgoingMessage extends Writable {
+      readonly headersSent: boolean;
+      readonly socket: net.Socket | null;
+      setHeader(name: string, value: OutgoingHttpHeader): this;
+      getHeader(name: string): OutgoingHttpHeader | undefined;
+      getHeaders(): OutgoingHttpHeaders;
+      getHeaderNames(): string[];
+      hasHeader(name: string): boolean;
+      removeHeader(name: string): void;
+      flushHeaders(): void;
+    }
+    class ServerResponse extends OutgoingMessage {
+      statusCode: number;
+      statusMessage: string;
+      sendDate: boolean;
+      readonly req: IncomingMessage;
+      setHeaders(headers: Headers | Map<string, OutgoingHttpHeader> | OutgoingHttpHeaders): this;
+      appendHeader(name: string, value: string | string[]): this;
+      writeHead(statusCode: number, statusMessage?: string, headers?: OutgoingHttpHeaders | string[]): this;
+      writeHead(statusCode: number, headers?: OutgoingHttpHeaders | string[]): this;
+      writeContinue(): void;
+      setTimeout(msecs: number, callback?: () => void): this;
+    }
+    class ClientRequest extends OutgoingMessage {
+      readonly method: string;
+      readonly path: string;
+      readonly host: string;
+      readonly protocol: string;
+      readonly aborted: boolean;
+      readonly reusedSocket: boolean;
+      getRawHeaderNames(): string[];
+      setTimeout(timeout: number, callback?: () => void): this;
+      setNoDelay(noDelay?: boolean): void;
+      setSocketKeepAlive(enable?: boolean, initialDelay?: number): void;
+      abort(): void;
+    }
+    interface ServerOptions {
+      keepAlive?: boolean;
+      keepAliveTimeout?: number;
+      requestTimeout?: number;
+      headersTimeout?: number;
+    }
+    type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
+    class Server extends net.Server {
+      constructor(requestListener?: RequestListener);
+      constructor(options: ServerOptions, requestListener?: RequestListener);
+      setTimeout(msecs?: number, callback?: () => void): this;
+      closeAllConnections(): void;
+      closeIdleConnections(): void;
+      timeout: number;
+      keepAliveTimeout: number;
+      headersTimeout: number;
+      requestTimeout: number;
+      maxHeadersCount: number | null;
+    }
+    interface AgentOptions {
+      keepAlive?: boolean;
+      keepAliveMsecs?: number;
+      maxSockets?: number;
+      maxFreeSockets?: number;
+      timeout?: number;
+    }
+    class Agent {
+      constructor(options?: AgentOptions);
+      readonly keepAlive: boolean;
+      maxSockets: number;
+      destroy(): void;
+    }
+    interface RequestOptions {
+      protocol?: string | null;
+      host?: string | null;
+      hostname?: string | null;
+      port?: number | string | null;
+      path?: string | null;
+      method?: string;
+      headers?: OutgoingHttpHeaders;
+      auth?: string | null;
+      timeout?: number;
+      socketPath?: string;
+      signal?: AbortSignal;
+      agent?: Agent | boolean;
+      setHost?: boolean;
+      family?: number;
+      // https
+      ca?: string | Buffer | Array<string | Buffer>;
+      cert?: string | Buffer;
+      key?: string | Buffer;
+      rejectUnauthorized?: boolean;
+      servername?: string;
+    }
+    const METHODS: string[];
+    const STATUS_CODES: Record<number, string>;
+    const maxHeaderSize: number;
+    const globalAgent: Agent;
+    function createServer(requestListener?: RequestListener): Server;
+    function createServer(options: ServerOptions, requestListener?: RequestListener): Server;
+    function request(url: string | URL, callback?: (res: IncomingMessage) => void): ClientRequest;
+    function request(options: RequestOptions, callback?: (res: IncomingMessage) => void): ClientRequest;
+    function request(url: string | URL, options: RequestOptions, callback?: (res: IncomingMessage) => void): ClientRequest;
+    function get(url: string | URL, callback?: (res: IncomingMessage) => void): ClientRequest;
+    function get(options: RequestOptions, callback?: (res: IncomingMessage) => void): ClientRequest;
+    function get(url: string | URL, options: RequestOptions, callback?: (res: IncomingMessage) => void): ClientRequest;
+  }
+  export = http;
+}
+
+declare module 'node:https' {
+  import * as http from 'node:http';
+  import * as tls from 'node:tls';
+  namespace https {
+    type ServerOptions = tls.TlsOptions & http.ServerOptions;
+    type RequestOptions = http.RequestOptions;
+    class Server extends http.Server {}
+    class Agent extends http.Agent {}
+    const globalAgent: Agent;
+    function createServer(options: ServerOptions, requestListener?: http.RequestListener): Server;
+    function request(url: string | URL, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+    function request(options: RequestOptions, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+    function request(url: string | URL, options: RequestOptions, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+    function get(url: string | URL, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+    function get(options: RequestOptions, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+    function get(url: string | URL, options: RequestOptions, callback?: (res: http.IncomingMessage) => void): http.ClientRequest;
+  }
+  export = https;
+}
+
+declare module 'node:tls' {
+  import * as net from 'node:net';
+  namespace tls {
+    interface PeerCertificate {
+      subject: Record<string, string>;
+      issuer: Record<string, string>;
+      subjectaltname: string;
+      valid_from: string;
+      valid_to: string;
+      fingerprint: string;
+      fingerprint256: string;
+      fingerprint512: string;
+      serialNumber: string;
+      ca: boolean;
+      raw: Buffer;
+    }
+    interface CipherNameAndProtocol {
+      name: string;
+      standardName: string;
+      version: string;
+    }
+    interface SecureContextOptions {
+      key?: string | Buffer;
+      cert?: string | Buffer;
+      ca?: string | Buffer | Array<string | Buffer>;
+      minVersion?: 'TLSv1' | 'TLSv1.1' | 'TLSv1.2' | 'TLSv1.3';
+      maxVersion?: 'TLSv1' | 'TLSv1.1' | 'TLSv1.2' | 'TLSv1.3';
+    }
+    interface TlsOptions extends SecureContextOptions {
+      requestCert?: boolean;
+      rejectUnauthorized?: boolean;
+      ALPNProtocols?: string[];
+      allowHalfOpen?: boolean;
+    }
+    interface ConnectionOptions extends SecureContextOptions {
+      host?: string;
+      port?: number;
+      path?: string;
+      servername?: string;
+      rejectUnauthorized?: boolean;
+      ALPNProtocols?: string[];
+      timeout?: number;
+    }
+    interface SecureContext {
+      options: SecureContextOptions;
+    }
+    class TLSSocket extends net.Socket {
+      readonly authorized: boolean;
+      readonly authorizationError: string | null;
+      readonly encrypted: true;
+      readonly alpnProtocol: string | false | null;
+      readonly servername: string | false | null;
+      getPeerCertificate(detailed?: boolean): PeerCertificate;
+      getCertificate(): PeerCertificate | null;
+      getProtocol(): string | null;
+      getCipher(): CipherNameAndProtocol;
+    }
+    class Server extends net.Server {}
+    const DEFAULT_MIN_VERSION: string;
+    const DEFAULT_MAX_VERSION: string;
+    const DEFAULT_ECDH_CURVE: string;
+    function createServer(options: TlsOptions, secureConnectionListener?: (socket: TLSSocket) => void): Server;
+    function connect(options: ConnectionOptions, secureConnectListener?: () => void): TLSSocket;
+    function connect(port: number, host?: string, options?: ConnectionOptions, secureConnectListener?: () => void): TLSSocket;
+    function connect(port: number, options?: ConnectionOptions, secureConnectListener?: () => void): TLSSocket;
+    function createSecureContext(options?: SecureContextOptions): SecureContext;
+    function getCiphers(): string[];
+  }
+  export = tls;
+}
+
+declare module 'node:dgram' {
+  import { EventEmitter } from 'node:events';
+  import { AddressInfo } from 'node:net';
+  namespace dgram {
+    type SocketType = 'udp4' | 'udp6';
+    interface SocketOptions {
+      type: SocketType;
+      reuseAddr?: boolean;
+    }
+    interface RemoteInfo {
+      address: string;
+      family: 'IPv4' | 'IPv6';
+      port: number;
+      size: number;
+    }
+    interface BindOptions {
+      port?: number;
+      address?: string;
+    }
+    type SendCallback = (error: Error | null, bytes: number) => void;
+    class Socket extends EventEmitter {
+      bind(port?: number, address?: string, callback?: () => void): this;
+      bind(port?: number, callback?: () => void): this;
+      bind(callback?: () => void): this;
+      bind(options: BindOptions, callback?: () => void): this;
+      send(msg: string | Uint8Array | any[], port?: number, address?: string, callback?: SendCallback): void;
+      send(msg: string | Uint8Array | any[], port?: number, callback?: SendCallback): void;
+      send(msg: string | Uint8Array, offset: number, length: number, port?: number, address?: string, callback?: SendCallback): void;
+      send(msg: string | Uint8Array | any[], callback?: SendCallback): void;
+      connect(port: number, address?: string, callback?: () => void): void;
+      connect(port: number, callback: () => void): void;
+      disconnect(): void;
+      remoteAddress(): AddressInfo;
+      address(): AddressInfo;
+      close(callback?: () => void): this;
+      ref(): this;
+      unref(): this;
+      setBroadcast(flag: boolean): void;
+      setTTL(ttl: number): number;
+      setMulticastTTL(ttl: number): number;
+      setMulticastLoopback(flag: boolean): boolean;
+      setRecvBufferSize(size: number): void;
+      setSendBufferSize(size: number): void;
+    }
+    function createSocket(type: SocketType | SocketOptions, callback?: (msg: Buffer, rinfo: RemoteInfo) => void): Socket;
+  }
+  export = dgram;
+}
+
 declare module 'path' { import m = require('node:path'); export = m; }
 declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
 declare module 'path/win32' { import m = require('node:path/win32'); export = m; }
@@ -987,3 +1422,10 @@ declare module 'readline' { import m = require('node:readline'); export = m; }
 declare module 'readline/promises' { import m = require('node:readline/promises'); export = m; }
 declare module 'diagnostics_channel' { import m = require('node:diagnostics_channel'); export = m; }
 declare module 'sys' { import m = require('node:sys'); export = m; }
+declare module 'net' { import m = require('node:net'); export = m; }
+declare module 'dns' { import m = require('node:dns'); export = m; }
+declare module 'dns/promises' { import m = require('node:dns/promises'); export = m; }
+declare module 'http' { import m = require('node:http'); export = m; }
+declare module 'https' { import m = require('node:https'); export = m; }
+declare module 'tls' { import m = require('node:tls'); export = m; }
+declare module 'dgram' { import m = require('node:dgram'); export = m; }

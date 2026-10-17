@@ -20,6 +20,12 @@ import { registerTimers } from './node/timers.js';
 import { registerEvents } from './node/events.js';
 import { registerStream } from './node/stream.js';
 import { registerDiagnosticsChannel } from './node/diagnostics_channel.js';
+import { registerNet } from './node/net.js';
+import { registerDns } from './node/dns.js';
+import { registerHttp } from './node/http.js';
+import { registerTls } from './node/tls.js';
+import { registerDgram } from './node/dgram.js';
+import { registerFetch } from './node/fetch.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import { goPackage, goTypeInfo as goMetaTypeInfo, hasGoPackage, isGoNumeric as isGoNumericType } from './go/metadata.js';
 import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
@@ -2105,7 +2111,11 @@ function visit(node, options = {}) {
         if (!isBlock(node.body)) {
             // void-style calls (console.*, assert) emit statements, not values
             if (isVoidStatementCall(node.body) || !inferredRetType) {
-                return `func(${parameterInfo.signature})${returnType} { ${visit(node.body)}; }`;
+                // `(c) => (body += c)`: the parenthesized expression is a statement
+                let statement = node.body;
+                while (statement.kind === 'ParenthesizedExpression')
+                    statement = statement.expression;
+                return `func(${parameterInfo.signature})${returnType} { ${visit(statement)}; }`;
             }
             return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body)}; }`;
         }
@@ -3451,6 +3461,9 @@ function toFieldGoType(goType) {
     return !goType || goType === 'nil' ? 'interface{}' : goType;
 }
 function isDictionaryLiteral(node) {
+    // Keys that are not Go identifiers ('Content-Type') can't be struct fields
+    if (hasNonIdentifierKeys(node))
+        return true;
     const declaration = node.parent;
     if (!isVariableDeclaration(declaration) || !isIdentifier(declaration.name))
         return false;
@@ -3464,6 +3477,21 @@ function isDictionaryLiteral(node) {
         isIdentifier(n.expression) &&
         n.expression.text === name &&
         !isStringLiteral(n.argumentExpression));
+}
+function hasNonIdentifierKeys(node) {
+    if (!isObjectLiteralExpression(node))
+        return false;
+    let sawKey = false;
+    for (const p of node.properties ?? []) {
+        if (!isPropertyAssignment(p)) {
+            if (p.kind === 'SpreadAssignment' || isMethodDeclaration(p) || isGetAccessor(p) || isSetAccessor(p))
+                return false;
+            continue;
+        }
+        if (isStringLiteral(p.name) && !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(p.name.text))
+            sawKey = true;
+    }
+    return sawKey;
 }
 function containsNode(root, predicate) {
     for (const child of childNodes(root)) {
@@ -6407,10 +6435,18 @@ function consoleOut(stream, args, prefix = '', formatted = false) {
 // console.* arguments, printed like Node: strings as-is, numbers in JS
 // notation, everything else through util.inspect (and a format string first
 // argument through util.format)
+// The inferred type of call argument i ('' when unknown); a plain lookup keeps
+// the self-hosted build from dereferencing a missing (nil) entry
+function callArgType(i) {
+    if (i >= currentCallArgTypes.length)
+        return '';
+    const t = currentCallArgTypes[i];
+    return t ? t : '';
+}
 function consoleArgs(args) {
-    const types = currentCallArgTypes;
+    const types = args.map((_arg, i) => callArgType(i));
     const isFormatString = args.length > 1 && types[0] === 'string' && args[0].includes('%');
-    const needsInspect = args.some((_arg, i) => !['string', 'float64', 'bool', '[]byte'].includes(types[i] ?? ''));
+    const needsInspect = args.some((_arg, i) => !['string', 'float64', 'bool', '[]byte'].includes(types[i]));
     if (isFormatString || needsInspect) {
         useHelper('nodeUtil');
         return [`TnUtilFormat(${args.join(', ')})`];
@@ -8152,6 +8188,12 @@ registerDiagnosticsChannel(nodeRegistry);
 registerConstants(nodeRegistry);
 registerChildProcess(nodeRegistry);
 registerReadline(nodeRegistry);
+registerNet(nodeRegistry);
+registerDns(nodeRegistry);
+registerTls(nodeRegistry);
+registerHttp(nodeRegistry);
+registerDgram(nodeRegistry);
+registerFetch(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
