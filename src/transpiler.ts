@@ -26,6 +26,7 @@ import { registerHttp } from './node/http.js';
 import { registerTls } from './node/tls.js';
 import { registerDgram } from './node/dgram.js';
 import { registerFetch } from './node/fetch.js';
+import { registerAsyncHooks } from './node/async_hooks.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import {
   goPackage,
@@ -1086,6 +1087,16 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       return `func(__v ${elementType}) bool { return ${truthinessCheck('__v', elementType)} }`;
     }
     if (node.text === 'undefined') return 'nil';
+    // resolve / reject passed as values (setTimeout(resolve, ms)): closures over the channel
+    const isCallee = isCallExpression(node.parent) && node.parent.expression === node;
+    if (!isCallee && promiseResolveName && node.text === promiseResolveName) {
+      useHelper('promise');
+      return 'TnResolver(ch)';
+    }
+    if (!isCallee && promiseRejectName && node.text === promiseRejectName) {
+      useHelper('promise');
+      return 'TnRejecter(ch)';
+    }
     if (node.text === 'NaN' || node.text === 'Infinity') {
       importedPackages.add('math');
       return node.text === 'NaN' ? 'math.NaN()' : 'math.Inf(1)';
@@ -1612,7 +1623,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         const cbs = (node.arguments ?? []).map((a) => visit(a));
         const cbExpr = cbs[0] ?? 'func(interface{}) {}';
         useHelper('eventLoop');
-        return `__tnWaitGroup.Add(1)\n\t\tgo func() {\n\t\t\t__v := <-(${recv})\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\t(${cbExpr})(__v)\n\t\t\t})\n\t\t}()`;
+        return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext) {\n\t\t\t__v := <-(${recv})\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { (${cbExpr})(__v) })\n\t\t\t})\n\t\t}(TnAsyncSnapshot())`;
       }
     }
     // Array.from(arrayLike, mapFn) — array-likes are { length } structs
@@ -8379,6 +8390,7 @@ registerTls(nodeRegistry);
 registerHttp(nodeRegistry);
 registerDgram(nodeRegistry);
 registerFetch(nodeRegistry);
+registerAsyncHooks(nodeRegistry);
 
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
@@ -10433,6 +10445,7 @@ var __tnTimers tnLoopGroup
 
 func TnSetTimeout(ms float64, fn func()) *time.Timer {
 	__tnTimers.Add(1)
+	fn = TnAsyncWrap(fn)
 	return time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() {
 		TnLoopPost(func() {
 			defer __tnTimers.Done()
@@ -10450,6 +10463,7 @@ type TnInterval struct {
 
 func TnSetInterval(ms float64, fn func()) *TnInterval {
 	__tnTimers.Add(1)
+	fn = TnAsyncWrap(fn)
 	t := &TnInterval{stop: make(chan struct{})}
 	go func() {
 		ticker := time.NewTicker(max(time.Duration(ms*float64(time.Millisecond)), time.Millisecond))
@@ -10500,6 +10514,32 @@ var tnLoopRefs int64
 var tnBaton = make(chan struct{}, 1)
 var tnLendStack []chan struct{}
 
+// Async context (AsyncLocalStorage): the baton holder's current stores. Callbacks
+// scheduled by JS code capture it (TnAsyncWrap) and run with it restored; an await
+// resumes with the context it started with. Other loop tasks run without stores.
+type TnAsyncContext map[interface{}]interface{}
+
+var tnAsyncCtx TnAsyncContext
+
+func TnAsyncSnapshot() TnAsyncContext { return tnAsyncCtx }
+
+// Runs fn with ctx as the current context, restoring the previous one afterwards
+func TnAsyncRun(ctx TnAsyncContext, fn func()) {
+	saved := tnAsyncCtx
+	tnAsyncCtx = ctx
+	defer func() { tnAsyncCtx = saved }()
+	fn()
+}
+
+// fn bound to the current context (no-op when there is none to keep)
+func TnAsyncWrap(fn func()) func() {
+	ctx := tnAsyncCtx
+	if ctx == nil {
+		return fn
+	}
+	return func() { TnAsyncRun(ctx, fn) }
+}
+
 func tnAcquire() { <-tnBaton }
 
 func tnRelease() {
@@ -10517,11 +10557,14 @@ func tnRelease() {
 func TnStartAsync(body func()) {
 	yielded := make(chan struct{})
 	tnLendStack = append(tnLendStack, yielded)
+	ctx := tnAsyncCtx
 	go func() {
 		defer tnRelease()
+		tnAsyncCtx = ctx
 		body()
 	}()
 	<-yielded
+	tnAsyncCtx = ctx
 }
 
 func tnLoopNotify() {
@@ -10569,7 +10612,7 @@ func TnLoopRunPending() bool {
 		tnLoopTasks = tnLoopTasks[1:]
 		tnLoopMu.Unlock()
 		ran = true
-		fn()
+		TnAsyncRun(nil, fn)
 		TnRunMicrotasks()
 	}
 }
@@ -10599,6 +10642,8 @@ func TnRunLoop() {
 
 // (baton holder) Receives from a channel, running loop tasks while waiting
 func TnLoopReceive[T any](ch chan T) (T, bool) {
+	ctx := tnAsyncCtx
+	defer func() { tnAsyncCtx = ctx }()
 	for {
 		select {
 		case v, ok := <-ch:
@@ -10632,6 +10677,7 @@ var tnMicrotasks []func()
 var tnMicrotasksMu sync.Mutex
 
 func TnQueueMicrotask(fn func()) {
+	fn = TnAsyncWrap(fn)
 	tnMicrotasksMu.Lock()
 	tnMicrotasks = append(tnMicrotasks, fn)
 	tnMicrotasksMu.Unlock()
@@ -10647,7 +10693,7 @@ func TnRunMicrotasks() {
 		fn := tnMicrotasks[0]
 		tnMicrotasks = tnMicrotasks[1:]
 		tnMicrotasksMu.Unlock()
-		fn()
+		TnAsyncRun(nil, fn)
 	}
 }`,
   uri: `// encodeURIComponent: escapes everything except A-Z a-z 0-9 - _ . ! ~ * ' ( )
@@ -10901,6 +10947,35 @@ func TnResolveZero[T any](ch chan T) {
 	}
 }
 
+// resolve / reject of a Promise executor used as values
+func TnResolver[T any](ch chan T) func(...interface{}) {
+	return func(args ...interface{}) {
+		var v T
+		if len(args) > 0 {
+			if x, ok := args[0].(T); ok {
+				v = x
+			}
+		}
+		select {
+		case ch <- v:
+		default:
+		}
+	}
+}
+
+func TnRejecter[T any](ch chan T) func(...interface{}) {
+	return func(args ...interface{}) {
+		var reason interface{}
+		if len(args) > 0 {
+			reason = args[0]
+		}
+		if _, rejected := tnRejections.Load(ch); rejected || len(ch) > 0 {
+			return
+		}
+		TnReject(ch, reason)
+	}
+}
+
 func TnReject[T any](ch chan T, reason interface{}) {
 	tnRejections.Store(ch, reason)
 	close(ch)
@@ -10957,11 +11032,12 @@ func TnPromiseReject[T any](reason interface{}) chan T {
 
 func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 	out := make(chan T, 1)
+	ctx := TnAsyncSnapshot()
 	go func() {
 		v, reason, rejected := tnSettle(p)
 		if rejected {
 			e, _ := reason.(E)
-			TnLoopCall(func() { onRejected(e) })
+			TnLoopCall(func() { TnAsyncRun(ctx, func() { onRejected(e) }) })
 		}
 		out <- v
 		close(out)
@@ -10971,11 +11047,12 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 
 func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 	out := make(chan T, 1)
+	ctx := TnAsyncSnapshot()
 	go func() {
 		v, reason, rejected := tnSettle(p)
 		if rejected {
 			e, _ := reason.(E)
-			TnLoopCall(func() { v = onRejected(e) })
+			TnLoopCall(func() { TnAsyncRun(ctx, func() { v = onRejected(e) }) })
 		}
 		out <- v
 		close(out)
@@ -10985,6 +11062,7 @@ func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 
 func TnPromiseFinally[T any](p chan T, onFinally func()) chan T {
 	out := make(chan T, 1)
+	onFinally = TnAsyncWrap(onFinally)
 	go func() {
 		v, reason, rejected := tnSettle(p)
 		TnLoopCall(onFinally)

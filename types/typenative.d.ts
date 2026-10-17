@@ -640,10 +640,16 @@ interface Promise<T> {
   finally(onfinally?: () => void): Promise<T>;
 }
 
+// Thenables (needed by the compiler for async callbacks passed to generic APIs)
+interface PromiseLike<T> {
+  then(onfulfilled?: (value: T) => any): any;
+}
+
 interface PromiseConstructor {
   new <T>(
     executor: (resolve: (value: T) => void, reject?: (reason?: any) => void) => void
   ): Promise<T>;
+  resolve(): Promise<void>;
   resolve<T>(value: T): Promise<T>;
   reject(reason?: any): Promise<never>;
   all<T>(values: Promise<T>[]): Promise<T[]>;

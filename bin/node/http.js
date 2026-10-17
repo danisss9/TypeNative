@@ -531,26 +531,33 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	TnLoopRef()
 	defer TnLoopUnref()
 	http.NewResponseController(w).EnableFullDuplex()
-	req := tnNewIncoming()
-	req.method = r.Method
-	req.url = r.RequestURI
-	req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
-	req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
-	tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
 	var local net.Addr
 	if a, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
 		local = a
 	}
-	req.socket = tnInfoSocket(local, r.RemoteAddr)
-	if r.TLS != nil {
-		req.socket.encrypted = true
-	}
-	res := tnNewServerResponse(req)
+	// The messages are created on the loop (streams capture its async context)
+	created := make(chan *TnServerResponse, 1)
 	bodyDone := make(chan struct{})
 	TnLoopPost(func() {
-		hs.emit("request", req, res)
-		tnPumpBody(r.Body, req, func() { close(bodyDone) })
+		TnAsyncRun(hs.asyncCtx, func() {
+			req := tnNewIncoming()
+			req.method = r.Method
+			req.url = r.RequestURI
+			req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
+			req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
+			tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
+			req.socket = tnInfoSocket(local, r.RemoteAddr)
+			if r.TLS != nil {
+				req.socket.encrypted = true
+			}
+			res := tnNewServerResponse(req)
+			created <- res
+			hs.emit("request", req, res)
+			tnPumpBody(r.Body, req, func() { close(bodyDone) })
+		})
 	})
+	res := <-created
+	req := res.req
 	rc := http.NewResponseController(w)
 	for {
 		ended := false

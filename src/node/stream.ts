@@ -58,6 +58,18 @@ type TnStream struct {
 	onClose func()
 	// Defers 'close' past the end of both sides (client requests wait for their response)
 	closeHeld bool
+	// The async context the stream was created in (its events run in it)
+	asyncCtx TnAsyncContext
+}
+
+// Queues fn on the loop, in the stream's async context
+func (s *TnStream) post(fn func()) {
+	ctx := s.asyncCtx
+	if ctx == nil {
+		TnLoopPost(fn)
+		return
+	}
+	TnLoopPost(func() { TnAsyncRun(ctx, fn) })
 }
 
 type tnStreamLike interface {
@@ -74,7 +86,7 @@ func tnStreamOption(options interface{}, key string) interface{} {
 }
 
 func tnNewStreamBase(options []interface{}) *TnStream {
-	s := &TnStream{flowing: -1, decodeStrings: true, hooks: map[string]interface{}{}}
+	s := &TnStream{flowing: -1, decodeStrings: true, hooks: map[string]interface{}{}, asyncCtx: TnAsyncSnapshot()}
 	if len(options) > 0 && options[0] != nil {
 		s.options = options[0]
 		if b, ok := tnStreamOption(s.options, "objectMode").(bool); ok {
@@ -196,7 +208,7 @@ func (s *TnStream) scheduleFlow() {
 		return
 	}
 	s.flowScheduled = true
-	TnLoopPost(func() {
+	s.post(func() {
 		s.flowScheduled = false
 		s.flow()
 	})
@@ -260,11 +272,11 @@ func (s *TnStream) emitClose() {
 	}
 	s.closed = true
 	s.releaseHandle()
-	TnLoopPost(func() { s.emit("close") })
+	s.post(func() { s.emit("close") })
 }
 
 func (s *TnStream) errorLater(err interface{}) {
-	TnLoopPost(func() { s.destroy(err) })
+	s.post(func() { s.destroy(err) })
 }
 
 // on('data') starts the flow (as in Node)
@@ -338,7 +350,7 @@ func (s *TnStream) destroy(err ...interface{}) *TnStream {
 		s.releaseHandle()
 		if e != nil {
 			s.errored = e
-			TnLoopPost(func() {
+			s.post(func() {
 				s.emit("error", e)
 				s.closed = true
 				s.emit("close")
@@ -379,7 +391,7 @@ func (s *TnStream) write(chunk interface{}, args ...interface{}) bool {
 	if s.writeEnded || s.destroyed {
 		err := TnNodeError("Error", "ERR_STREAM_WRITE_AFTER_END", "write after end")
 		if cb != nil {
-			TnLoopPost(func() { TnInvoke(cb, err) })
+			s.post(func() { TnInvoke(cb, err) })
 		}
 		s.errorLater(err)
 		return false
@@ -435,9 +447,9 @@ func (s *TnStream) processWrites() {
 			return
 		}
 		if len(s.writeQueue) == 0 && !s.ending {
-			TnLoopPost(func() { s.emit("drain") })
+			s.post(func() { s.emit("drain") })
 		}
-		TnLoopPost(s.processWrites)
+		s.post(s.processWrites)
 	}
 	switch {
 	case s.sink != nil:
@@ -515,7 +527,7 @@ func (s *TnStream) finish() {
 			s.destroy(args[0])
 			return
 		}
-		TnLoopPost(func() {
+		s.post(func() {
 			s.finished = true
 			s.emit("finish")
 			if !s.readableSide || s.endEmitted {

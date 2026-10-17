@@ -349,7 +349,7 @@ func (s *TnSocket) attach(conn net.Conn) {
 			n, err := conn.Read(buf)
 			if n > 0 {
 				chunk := append([]byte{}, buf[:n]...)
-				TnLoopPost(func() {
+				s.post(func() {
 					if !s.destroyed {
 						s.touch()
 						s.push(chunk)
@@ -357,7 +357,7 @@ func (s *TnSocket) attach(conn net.Conn) {
 				})
 			}
 			if err != nil {
-				TnLoopPost(func() {
+				s.post(func() {
 					if s.destroyed || s.readEnded {
 						return
 					}
@@ -445,7 +445,7 @@ func (s *TnSocket) connect(args ...interface{}) *TnSocket {
 			wrapped, werr := s.dialWrap(conn)
 			if werr != nil {
 				conn.Close()
-				TnLoopPost(func() {
+				s.post(func() {
 					defer TnLoopUnref()
 					s.connecting = false
 					if te, ok := werr.(*TnError); ok {
@@ -458,7 +458,7 @@ func (s *TnSocket) connect(args ...interface{}) *TnSocket {
 			}
 			conn = wrapped
 		}
-		TnLoopPost(func() {
+		s.post(func() {
 			defer TnLoopUnref()
 			if err != nil {
 				s.connecting = false
@@ -523,7 +523,7 @@ func (s *TnSocket) touch() {
 	}
 	gen := s.timerGen
 	s.timer = time.AfterFunc(time.Duration(s.timeoutMs*float64(time.Millisecond)), func() {
-		TnLoopPost(func() {
+		s.post(func() {
 			if gen == s.timerGen && !s.destroyed {
 				s.emit("timeout")
 			}
@@ -608,6 +608,8 @@ type TnNetServer struct {
 	connectionEvent string
 	// Serves the listener instead of accepting sockets (http servers)
 	serve func(ln net.Listener)
+	// The async context of listen(): connections are handled in it
+	asyncCtx TnAsyncContext
 }
 
 func TnNewNetServer(args ...interface{}) *TnNetServer {
@@ -663,6 +665,7 @@ func (srv *TnNetServer) listen(args ...interface{}) *TnNetServer {
 			}
 		}
 	}
+	srv.asyncCtx = TnAsyncSnapshot()
 	address := path
 	if network != "unix" {
 		address = net.JoinHostPort(host, strconv.FormatFloat(port, 'f', -1, 64))
@@ -714,11 +717,11 @@ func (srv *TnNetServer) acceptLoop(ln net.Listener) {
 					TnLoopPost(func() { srv.emit("tlsClientError", err, nil) })
 					return
 				}
-				TnLoopPost(func() { srv.accept(wrapped) })
+				TnLoopPost(func() { TnAsyncRun(srv.asyncCtx, func() { srv.accept(wrapped) }) })
 			}()
 			continue
 		}
-		TnLoopPost(func() { srv.accept(conn) })
+		TnLoopPost(func() { TnAsyncRun(srv.asyncCtx, func() { srv.accept(conn) }) })
 	}
 }
 
