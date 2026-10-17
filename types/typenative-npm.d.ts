@@ -554,6 +554,302 @@ declare module 'node:crypto' {
     function createCipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Cipheriv;
     function createDecipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Decipheriv;
     const webcrypto: typeof crypto;
+
+    // scrypt, callback forms
+    interface ScryptOptions {
+      cost?: number;
+      blockSize?: number;
+      parallelization?: number;
+      N?: number;
+      r?: number;
+      p?: number;
+      maxmem?: number;
+    }
+    function scryptSync(password: BinaryLike, salt: BinaryLike, keylen: number, options?: ScryptOptions): Buffer;
+    function scrypt(password: BinaryLike, salt: BinaryLike, keylen: number, callback: (err: Error | null, derivedKey: Buffer) => void): void;
+    function scrypt(password: BinaryLike, salt: BinaryLike, keylen: number, options: ScryptOptions, callback: (err: Error | null, derivedKey: Buffer) => void): void;
+    function pbkdf2(password: BinaryLike, salt: BinaryLike, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Buffer) => void): void;
+    function hkdf(digest: string, ikm: BinaryLike, salt: BinaryLike, info: BinaryLike, keylen: number, callback: (err: Error | null, derivedKey: ArrayBuffer) => void): void;
+    function randomBytes(size: number, callback: (err: Error | null, buf: Buffer) => void): void;
+    function randomFillSync<T extends Uint8Array>(buffer: T, offset?: number, size?: number): T;
+    function randomFill<T extends Uint8Array>(buffer: T, callback: (err: Error | null, buf: T) => void): void;
+    function randomFill<T extends Uint8Array>(buffer: T, offset: number, callback: (err: Error | null, buf: T) => void): void;
+    function randomFill<T extends Uint8Array>(buffer: T, offset: number, size: number, callback: (err: Error | null, buf: T) => void): void;
+
+    // Keys
+    type KeyObjectType = 'secret' | 'public' | 'private';
+    type KeyType = 'rsa' | 'ec' | 'ed25519' | 'x25519';
+    type KeyFormat = 'pem' | 'der' | 'jwk';
+    interface JsonWebKey {
+      kty?: string;
+      crv?: string;
+      x?: string;
+      y?: string;
+      d?: string;
+      n?: string;
+      e?: string;
+      k?: string;
+      [key: string]: unknown;
+    }
+    interface AsymmetricKeyDetails {
+      modulusLength?: number;
+      publicExponent?: bigint;
+      namedCurve?: string;
+    }
+    interface KeyExportOptions<T extends KeyFormat> {
+      type?: 'pkcs1' | 'spki' | 'pkcs8' | 'sec1';
+      format: T;
+    }
+    interface JwkKeyExportOptions {
+      format: 'jwk';
+    }
+    class KeyObject {
+      private constructor();
+      static from(key: webcrypto.CryptoKey): KeyObject;
+      readonly type: KeyObjectType;
+      readonly asymmetricKeyType?: KeyType;
+      readonly asymmetricKeyDetails?: AsymmetricKeyDetails;
+      readonly symmetricKeySize?: number;
+      export(options: KeyExportOptions<'pem'>): string;
+      export(options: KeyExportOptions<'der'>): Buffer;
+      export(options: JwkKeyExportOptions): JsonWebKey;
+      export(options?: { format?: 'buffer' }): Buffer;
+      equals(otherKeyObject: KeyObject): boolean;
+    }
+    interface PrivateKeyInput {
+      key: string | Buffer;
+      format?: KeyFormat;
+      type?: 'pkcs1' | 'pkcs8' | 'sec1';
+      passphrase?: string | Buffer;
+      encoding?: string;
+    }
+    interface PublicKeyInput {
+      key: string | Buffer;
+      format?: KeyFormat;
+      type?: 'pkcs1' | 'spki';
+      encoding?: string;
+    }
+    interface JsonWebKeyInput {
+      key: JsonWebKey;
+      format: 'jwk';
+    }
+    type KeyLike = string | Buffer | KeyObject;
+    function createPrivateKey(key: PrivateKeyInput | string | Buffer | JsonWebKeyInput): KeyObject;
+    function createPublicKey(key: PublicKeyInput | string | Buffer | KeyObject | JsonWebKeyInput): KeyObject;
+    function createSecretKey(key: Uint8Array): KeyObject;
+    function createSecretKey(key: string, encoding: BufferEncoding): KeyObject;
+    interface BasePrivateKeyEncodingOptions<T extends KeyFormat> {
+      format: T;
+      cipher?: string;
+      passphrase?: string;
+    }
+    interface KeyPairKeyObjectResult {
+      publicKey: KeyObject;
+      privateKey: KeyObject;
+    }
+    interface KeyPairSyncResult<T1 extends string | Buffer, T2 extends string | Buffer> {
+      publicKey: T1;
+      privateKey: T2;
+    }
+    interface KeyPairOptions<PubF extends KeyFormat, PrivF extends KeyFormat> {
+      modulusLength?: number;
+      publicExponent?: number;
+      namedCurve?: string;
+      publicKeyEncoding: { type: 'pkcs1' | 'spki'; format: PubF };
+      privateKeyEncoding: BasePrivateKeyEncodingOptions<PrivF> & { type: 'pkcs1' | 'pkcs8' | 'sec1' };
+    }
+    interface KeyPairKeyObjectOptions {
+      modulusLength?: number;
+      publicExponent?: number;
+      namedCurve?: string;
+    }
+    function generateKeyPairSync(type: KeyType, options: KeyPairOptions<'pem', 'pem'>): KeyPairSyncResult<string, string>;
+    function generateKeyPairSync(type: KeyType, options: KeyPairOptions<'der', 'der'>): KeyPairSyncResult<Buffer, Buffer>;
+    function generateKeyPairSync(type: KeyType, options?: KeyPairKeyObjectOptions): KeyPairKeyObjectResult;
+    function generateKeyPair(type: KeyType, options: KeyPairOptions<'pem', 'pem'>, callback: (err: Error | null, publicKey: string, privateKey: string) => void): void;
+    function generateKeyPair(type: KeyType, options: KeyPairOptions<'der', 'der'>, callback: (err: Error | null, publicKey: Buffer, privateKey: Buffer) => void): void;
+    function generateKeyPair(type: KeyType, options: KeyPairKeyObjectOptions | undefined, callback: (err: Error | null, publicKey: KeyObject, privateKey: KeyObject) => void): void;
+    function generateKeyPair(type: KeyType, callback: (err: Error | null, publicKey: KeyObject, privateKey: KeyObject) => void): void;
+    function generateKeySync(type: 'hmac' | 'aes', options: { length: number }): KeyObject;
+    function generateKey(type: 'hmac' | 'aes', options: { length: number }, callback: (err: Error | null, key: KeyObject) => void): void;
+
+    // Signatures
+    interface SigningOptions {
+      padding?: number;
+      saltLength?: number;
+      dsaEncoding?: 'der' | 'ieee-p1363';
+    }
+    interface SignKeyObjectInput extends SigningOptions {
+      key: KeyLike;
+    }
+    interface SignPrivateKeyInput extends PrivateKeyInput, SigningOptions {}
+    interface VerifyKeyObjectInput extends SigningOptions {
+      key: KeyLike;
+    }
+    type SignKey = KeyLike | SignKeyObjectInput | SignPrivateKeyInput;
+    function sign(algorithm: string | null | undefined, data: Uint8Array, key: SignKey): Buffer;
+    function verify(algorithm: string | null | undefined, data: Uint8Array, key: SignKey | VerifyKeyObjectInput, signature: Uint8Array): boolean;
+    interface Sign {
+      update(data: BinaryLike, inputEncoding?: BufferEncoding): this;
+      sign(privateKey: SignKey): Buffer;
+      sign(privateKey: SignKey, outputFormat: BinaryToTextEncoding): string;
+    }
+    interface Verify {
+      update(data: BinaryLike, inputEncoding?: BufferEncoding): this;
+      verify(object: SignKey, signature: Uint8Array): boolean;
+      verify(object: SignKey, signature: string, signatureEncoding?: BinaryToTextEncoding): boolean;
+    }
+    function createSign(algorithm: string): Sign;
+    function createVerify(algorithm: string): Verify;
+
+    // RSA encryption
+    interface RsaKeyInput {
+      key: KeyLike;
+      padding?: number;
+      oaepHash?: string;
+      oaepLabel?: Uint8Array;
+    }
+    function publicEncrypt(key: RsaKeyInput | KeyLike, buffer: Uint8Array | string): Buffer;
+    function privateDecrypt(privateKey: RsaKeyInput | KeyLike, buffer: Uint8Array): Buffer;
+    function privateEncrypt(privateKey: RsaKeyInput | KeyLike, buffer: Uint8Array | string): Buffer;
+    function publicDecrypt(key: RsaKeyInput | KeyLike, buffer: Uint8Array): Buffer;
+    const constants: {
+      readonly RSA_PKCS1_PADDING: number;
+      readonly RSA_NO_PADDING: number;
+      readonly RSA_PKCS1_OAEP_PADDING: number;
+      readonly RSA_PKCS1_PSS_PADDING: number;
+      readonly RSA_PSS_SALTLEN_DIGEST: number;
+      readonly RSA_PSS_SALTLEN_MAX_SIGN: number;
+      readonly RSA_PSS_SALTLEN_AUTO: number;
+    };
+
+    // ECDH / Diffie-Hellman
+    type ECDHKeyFormat = 'compressed' | 'uncompressed';
+    interface ECDH {
+      generateKeys(): Buffer;
+      generateKeys(encoding: BinaryToTextEncoding, format?: ECDHKeyFormat): string;
+      computeSecret(otherPublicKey: Uint8Array): Buffer;
+      computeSecret(otherPublicKey: string, inputEncoding: BinaryToTextEncoding): Buffer;
+      computeSecret(otherPublicKey: string | Uint8Array, inputEncoding: BinaryToTextEncoding | undefined, outputEncoding: BinaryToTextEncoding): string;
+      getPrivateKey(): Buffer;
+      getPrivateKey(encoding: BinaryToTextEncoding): string;
+      getPublicKey(): Buffer;
+      getPublicKey(encoding: BinaryToTextEncoding, format?: ECDHKeyFormat): string;
+      setPrivateKey(privateKey: Uint8Array): void;
+      setPrivateKey(privateKey: string, encoding: BinaryToTextEncoding): void;
+    }
+    function createECDH(curveName: string): ECDH;
+    function getCurves(): string[];
+    function diffieHellman(options: { privateKey: KeyObject; publicKey: KeyObject }): Buffer;
+    interface DiffieHellman {
+      readonly verifyError: number;
+      generateKeys(): Buffer;
+      generateKeys(encoding: BinaryToTextEncoding): string;
+      computeSecret(otherPublicKey: Uint8Array): Buffer;
+      computeSecret(otherPublicKey: string, inputEncoding: BinaryToTextEncoding): Buffer;
+      computeSecret(otherPublicKey: string | Uint8Array, inputEncoding: BinaryToTextEncoding | undefined, outputEncoding: BinaryToTextEncoding): string;
+      getPrime(): Buffer;
+      getPrime(encoding: BinaryToTextEncoding): string;
+      getGenerator(): Buffer;
+      getGenerator(encoding: BinaryToTextEncoding): string;
+      getPublicKey(): Buffer;
+      getPublicKey(encoding: BinaryToTextEncoding): string;
+      getPrivateKey(): Buffer;
+      getPrivateKey(encoding: BinaryToTextEncoding): string;
+      setPublicKey(publicKey: Uint8Array): void;
+      setPublicKey(publicKey: string, encoding: BufferEncoding): void;
+      setPrivateKey(privateKey: Uint8Array): void;
+      setPrivateKey(privateKey: string, encoding: BufferEncoding): void;
+    }
+    type DiffieHellmanGroup = DiffieHellman;
+    function createDiffieHellman(primeLength: number, generator?: number): DiffieHellman;
+    function createDiffieHellman(prime: Uint8Array, generator?: number | Uint8Array): DiffieHellman;
+    function createDiffieHellman(prime: string, primeEncoding: BinaryToTextEncoding, generator?: number | string, generatorEncoding?: BinaryToTextEncoding): DiffieHellman;
+    function getDiffieHellman(groupName: string): DiffieHellmanGroup;
+    function createDiffieHellmanGroup(name: string): DiffieHellmanGroup;
+
+    // Primes
+    function generatePrimeSync(size: number, options: { bigint: true; safe?: boolean; add?: bigint | Uint8Array; rem?: bigint | Uint8Array }): bigint;
+    function generatePrimeSync(size: number, options?: { bigint?: false; safe?: boolean; add?: bigint | Uint8Array; rem?: bigint | Uint8Array }): ArrayBuffer;
+    function generatePrime(size: number, options: { bigint: true; safe?: boolean }, callback: (err: Error | null, prime: bigint) => void): void;
+    function generatePrime(size: number, callback: (err: Error | null, prime: ArrayBuffer) => void): void;
+    function generatePrime(size: number, options: { bigint?: false; safe?: boolean }, callback: (err: Error | null, prime: ArrayBuffer) => void): void;
+    function checkPrimeSync(candidate: bigint | Uint8Array, options?: { checks?: number }): boolean;
+    function checkPrime(candidate: bigint | Uint8Array, callback: (err: Error | null, result: boolean) => void): void;
+    function checkPrime(candidate: bigint | Uint8Array, options: { checks?: number }, callback: (err: Error | null, result: boolean) => void): void;
+
+    // X509Certificate
+    class X509Certificate {
+      constructor(buffer: string | Uint8Array);
+      readonly subject: string;
+      readonly issuer: string;
+      readonly subjectAltName: string | undefined;
+      readonly validFrom: string;
+      readonly validTo: string;
+      readonly validFromDate: Date;
+      readonly validToDate: Date;
+      readonly fingerprint: string;
+      readonly fingerprint256: string;
+      readonly fingerprint512: string;
+      readonly serialNumber: string;
+      readonly ca: boolean;
+      readonly raw: Buffer;
+      readonly publicKey: KeyObject;
+      readonly keyUsage: string[] | undefined;
+      checkHost(name: string, options?: object): string | undefined;
+      checkIP(ip: string): string | undefined;
+      checkEmail(email: string, options?: object): string | undefined;
+      checkIssued(otherCert: X509Certificate): boolean;
+      verify(publicKey: KeyObject): boolean;
+      toString(): string;
+      toJSON(): string;
+      toLegacyObject(): Record<string, any>;
+    }
+
+    // webcrypto
+    const subtle: webcrypto.SubtleCrypto;
+    namespace webcrypto {
+      type KeyUsage = 'decrypt' | 'deriveBits' | 'deriveKey' | 'encrypt' | 'sign' | 'unwrapKey' | 'verify' | 'wrapKey';
+      type KeyFormat = 'jwk' | 'pkcs8' | 'raw' | 'spki';
+      type AlgorithmIdentifier = string | { name: string; [key: string]: any };
+      type BufferSource = Uint8Array | ArrayBuffer;
+      interface CryptoKey {
+        readonly type: 'secret' | 'public' | 'private';
+        readonly extractable: boolean;
+        readonly algorithm: KeyAlgorithm;
+        readonly usages: KeyUsage[];
+      }
+      interface KeyAlgorithm {
+        name: string;
+        length?: number;
+        hash?: { name: string };
+        namedCurve?: string;
+        modulusLength?: number;
+        publicExponent?: Uint8Array;
+      }
+      interface CryptoKeyPair {
+        publicKey: CryptoKey;
+        privateKey: CryptoKey;
+      }
+      interface SubtleCrypto {
+        digest(algorithm: AlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer>;
+        generateKey(algorithm: { name: 'HMAC' | 'AES-GCM' | 'AES-CBC' | 'AES-CTR'; [key: string]: any }, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+        generateKey(algorithm: { name: 'RSASSA-PKCS1-v1_5' | 'RSA-PSS' | 'RSA-OAEP' | 'ECDSA' | 'ECDH'; [key: string]: any } | 'Ed25519' | 'X25519' | { name: 'Ed25519' | 'X25519' }, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKeyPair>;
+        generateKey(algorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKeyPair | CryptoKey>;
+        importKey(format: 'jwk', keyData: JsonWebKey, algorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+        importKey(format: 'pkcs8' | 'raw' | 'spki', keyData: BufferSource, algorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+        exportKey(format: 'jwk', key: CryptoKey): Promise<JsonWebKey>;
+        exportKey(format: 'pkcs8' | 'raw' | 'spki', key: CryptoKey): Promise<ArrayBuffer>;
+        sign(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+        verify(algorithm: AlgorithmIdentifier, key: CryptoKey, signature: BufferSource, data: BufferSource): Promise<boolean>;
+        encrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+        decrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+        deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length?: number | null): Promise<ArrayBuffer>;
+        deriveKey(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, derivedKeyAlgorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+        wrapKey(format: KeyFormat, key: CryptoKey, wrappingKey: CryptoKey, wrapAlgorithm: AlgorithmIdentifier): Promise<ArrayBuffer>;
+        unwrapKey(format: KeyFormat, wrappedKey: BufferSource, unwrappingKey: CryptoKey, unwrapAlgorithm: AlgorithmIdentifier, unwrappedKeyAlgorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+      }
+    }
   }
   export = crypto;
 }
@@ -783,7 +1079,9 @@ declare module 'node:stream' {
     }
     class Duplex extends Readable implements Writable {
       static toWeb(streamDuplex: Duplex): { readable: ReadableStream; writable: WritableStream };
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
       static fromWeb(pair: { readable: ReadableStream; writable: WritableStream }, options?: DuplexOptions): Duplex;
+      static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
       constructor(options?: DuplexOptions);
       readonly writable: boolean;
       readonly writableEnded: boolean;
