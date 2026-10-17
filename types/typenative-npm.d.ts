@@ -1536,6 +1536,70 @@ declare module 'node:test' {
   export = test;
 }
 
+declare module 'node:worker_threads' {
+  import { EventEmitter } from 'node:events';
+  namespace worker_threads {
+    interface WorkerOptions {
+      workerData?: any;
+      argv?: any[];
+      env?: Record<string, string> | typeof SHARE_ENV;
+      eval?: false;
+      stdout?: boolean;
+      stderr?: boolean;
+      name?: string;
+    }
+    // Runs this program again (pass __filename or new URL(import.meta.url))
+    class Worker extends EventEmitter {
+      constructor(filename: string | URL, options?: WorkerOptions);
+      readonly threadId: number;
+      postMessage(value: any, transferList?: readonly any[]): void;
+      terminate(): Promise<number>;
+      ref(): this;
+      unref(): this;
+    }
+    class MessagePort extends EventEmitter {
+      onmessage: ((event: MessageEvent) => void) | null;
+      postMessage(value: any, transferList?: readonly any[]): void;
+      start(): void;
+      close(): void;
+      ref(): this;
+      unref(): this;
+      hasRef(): boolean;
+    }
+    class MessageChannel {
+      readonly port1: MessagePort;
+      readonly port2: MessagePort;
+    }
+    interface MessageEvent {
+      readonly data: any;
+      readonly type: string;
+    }
+    // Instances with the same name in this process
+    class BroadcastChannel {
+      constructor(name: string);
+      readonly name: string;
+      onmessage: ((event: MessageEvent) => void) | null;
+      postMessage(message: unknown): void;
+      addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
+      close(): void;
+      ref(): this;
+      unref(): this;
+    }
+    const isMainThread: boolean;
+    const parentPort: MessagePort | null;
+    const workerData: any;
+    const threadId: number;
+    const resourceLimits: Record<string, number>;
+    const SHARE_ENV: unique symbol;
+    function receiveMessageOnPort(port: MessagePort): { message: any } | undefined;
+    function getEnvironmentData(key: string): any;
+    function setEnvironmentData(key: string, value: any): void;
+    function markAsUntransferable(object: object): void;
+    function isMarkedAsUntransferable(object: object): boolean;
+  }
+  export = worker_threads;
+}
+
 declare module 'path' { import m = require('node:path'); export = m; }
 declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
 declare module 'path/win32' { import m = require('node:path/win32'); export = m; }
@@ -1578,3 +1642,4 @@ declare module 'tls' { import m = require('node:tls'); export = m; }
 declare module 'dgram' { import m = require('node:dgram'); export = m; }
 declare module 'async_hooks' { import m = require('node:async_hooks'); export = m; }
 // node:test has no bare alias in Node ('test' is not a builtin)
+declare module 'worker_threads' { import m = require('node:worker_threads'); export = m; }

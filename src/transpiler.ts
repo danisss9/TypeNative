@@ -28,6 +28,7 @@ import { registerDgram } from './node/dgram.js';
 import { registerFetch } from './node/fetch.js';
 import { registerAsyncHooks } from './node/async_hooks.js';
 import { registerTest } from './node/test.js';
+import { registerWorkerThreads } from './node/worker_threads.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import {
   goPackage,
@@ -1332,9 +1333,15 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (nodeAlias !== undefined) return nodeAlias;
     // Object destructuring: const { x, y } = obj
     if (isObjectBindingPattern(node.name) && node.initializer) {
-      const initExpr = visit(node.initializer);
+      let initExpr = visit(node.initializer);
       const initType = inferExpressionType(node.initializer);
       const parts: string[] = [];
+      // Evaluate the initializer once (const { a, b } = new X())
+      if ((node.name.elements ?? []).length > 1 && !isIdentifier(node.initializer)) {
+        const source = getTempName('src');
+        parts.push(`${source} := ${initExpr}`);
+        initExpr = source;
+      }
       for (const el of node.name.elements ?? []) {
         const localName = visit(el.name);
         const rawProp = el.propertyName ?? el.name;
@@ -8403,6 +8410,7 @@ registerDgram(nodeRegistry);
 registerFetch(nodeRegistry);
 registerAsyncHooks(nodeRegistry);
 registerTest(nodeRegistry);
+registerWorkerThreads(nodeRegistry);
 
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
@@ -8876,6 +8884,10 @@ func TnAsPtr[T any](v interface{}) *T {
 	if t, ok := v.(T); ok {
 		return &t
 	}
+	var zero T
+	if converted, ok := TnConvertDynamic(v, reflect.TypeOf(&zero)); ok {
+		return converted.Interface().(*T)
+	}
 	return nil
 }
 
@@ -8883,8 +8895,82 @@ func TnAs[T any](v interface{}) T {
 	if p, ok := v.(*T); ok && p != nil {
 		return *p
 	}
-	t, _ := v.(T)
+	t, ok := v.(T)
+	if !ok && v != nil {
+		if converted, cok := TnConvertDynamic(v, reflect.TypeOf((*T)(nil)).Elem()); cok {
+			return converted.Interface().(T)
+		}
+	}
 	return t
+}
+
+// Converts a dynamic value (decoded JSON: maps, []interface{}, float64 …) to a
+// Go type: structs (and pointers to them) field by field, slices element by
+// element, numbers between kinds
+func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
+	if v == nil {
+		return reflect.Zero(t), true
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Type().AssignableTo(t) {
+		return rv, true
+	}
+	switch t.Kind() {
+	case reflect.Interface:
+		if rv.Type().Implements(t) {
+			return rv, true
+		}
+	case reflect.Pointer:
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return reflect.Zero(t), true
+		}
+		inner, ok := TnConvertDynamic(v, t.Elem())
+		if !ok {
+			return reflect.Value{}, false
+		}
+		p := reflect.New(t.Elem())
+		p.Elem().Set(inner)
+		return p, true
+	case reflect.Struct:
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			return reflect.Value{}, false
+		}
+		out := reflect.New(t).Elem()
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			name := strings.TrimSuffix(field.Name, "_")
+			value, present := m[name]
+			if !present {
+				continue
+			}
+			converted, ok := TnConvertDynamic(value, field.Type)
+			if !ok {
+				continue
+			}
+			f := out.Field(i)
+			reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(converted)
+		}
+		return out, true
+	case reflect.Slice:
+		if rv.Kind() != reflect.Slice {
+			return reflect.Value{}, false
+		}
+		out := reflect.MakeSlice(t, rv.Len(), rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			converted, ok := TnConvertDynamic(rv.Index(i).Interface(), t.Elem())
+			if !ok {
+				return reflect.Value{}, false
+			}
+			out.Index(i).Set(converted)
+		}
+		return out, true
+	case reflect.Float64, reflect.Float32, reflect.Int, reflect.Int64, reflect.Int32:
+		if rv.CanConvert(t) && rv.Kind() >= reflect.Int && rv.Kind() <= reflect.Float64 {
+			return rv.Convert(t), true
+		}
+	}
+	return reflect.Value{}, false
 }
 
 func TnTruthy(v interface{}) bool {
