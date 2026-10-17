@@ -1389,6 +1389,52 @@ declare module 'node:dgram' {
   export = dgram;
 }
 
+declare module 'node:async_hooks' {
+  namespace async_hooks {
+    class AsyncLocalStorage<T> {
+      constructor(options?: { name?: string });
+      static bind<Func extends (...args: any[]) => any>(fn: Func): Func;
+      static snapshot(): <R, TArgs extends any[]>(fn: (...args: TArgs) => R, ...args: TArgs) => R;
+      readonly name: string;
+      getStore(): T | undefined;
+      run<R>(store: T, callback: () => R): R;
+      run<R, TArgs extends any[]>(store: T, callback: (...args: TArgs) => R, ...args: TArgs): R;
+      exit<R, TArgs extends any[]>(callback: (...args: TArgs) => R, ...args: TArgs): R;
+      enterWith(store: T): void;
+      disable(): void;
+    }
+    interface AsyncResourceOptions {
+      triggerAsyncId?: number;
+      requireManualDestroy?: boolean;
+    }
+    class AsyncResource {
+      constructor(type: string, triggerAsyncId?: number | AsyncResourceOptions);
+      static bind<Func extends (...args: any[]) => any>(fn: Func, type?: string): Func;
+      bind<Func extends (...args: any[]) => any>(fn: Func): Func;
+      runInAsyncScope<This, Result>(fn: (this: This, ...args: any[]) => Result, thisArg?: This, ...args: any[]): Result;
+      emitDestroy(): this;
+      asyncId(): number;
+      triggerAsyncId(): number;
+    }
+    interface HookCallbacks {
+      init?(asyncId: number, type: string, triggerAsyncId: number, resource: object): void;
+      before?(asyncId: number): void;
+      after?(asyncId: number): void;
+      promiseResolve?(asyncId: number): void;
+      destroy?(asyncId: number): void;
+    }
+    interface AsyncHook {
+      enable(): this;
+      disable(): this;
+    }
+    function createHook(callbacks: HookCallbacks): AsyncHook;
+    function executionAsyncId(): number;
+    function triggerAsyncId(): number;
+    function executionAsyncResource(): object;
+  }
+  export = async_hooks;
+}
+
 declare module 'path' { import m = require('node:path'); export = m; }
 declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
 declare module 'path/win32' { import m = require('node:path/win32'); export = m; }
@@ -1429,3 +1475,4 @@ declare module 'http' { import m = require('node:http'); export = m; }
 declare module 'https' { import m = require('node:https'); export = m; }
 declare module 'tls' { import m = require('node:tls'); export = m; }
 declare module 'dgram' { import m = require('node:dgram'); export = m; }
+declare module 'async_hooks' { import m = require('node:async_hooks'); export = m; }

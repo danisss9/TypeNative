@@ -88,6 +88,7 @@ func tnLookupAll(hostname string, family float64) ([]*TnLookupAddress, error) {
 // Runs a query on a goroutine, then the callback on the loop
 func tnDnsCall(cb interface{}, work func() ([]interface{}, error)) {
 	TnLoopRef()
+	ctx := TnAsyncSnapshot()
 	go func() {
 		values, err := work()
 		TnLoopPost(func() {
@@ -95,11 +96,13 @@ func tnDnsCall(cb interface{}, work func() ([]interface{}, error)) {
 			if cb == nil {
 				return
 			}
-			if err != nil {
-				TnInvoke(cb, err)
-				return
-			}
-			TnInvoke(cb, append([]interface{}{nil}, values...)...)
+			TnAsyncRun(ctx, func() {
+				if err != nil {
+					TnInvoke(cb, err)
+					return
+				}
+				TnInvoke(cb, append([]interface{}{nil}, values...)...)
+			})
 		})
 	}()
 }

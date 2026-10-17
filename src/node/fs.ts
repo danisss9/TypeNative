@@ -799,15 +799,18 @@ func tnFsRun[T any](work func() T) (result T, err *TnError) {
 
 func TnFsCallback[T any](work func() T, cb interface{}) {
 	TnLoopRef()
+	ctx := TnAsyncSnapshot()
 	go func() {
 		result, err := tnFsRun(work)
 		TnLoopPost(func() {
 			defer TnLoopUnref()
-			if err != nil {
-				TnInvoke(cb, err)
-			} else {
-				TnInvoke(cb, nil, result)
-			}
+			TnAsyncRun(ctx, func() {
+				if err != nil {
+					TnInvoke(cb, err)
+				} else {
+					TnInvoke(cb, nil, result)
+				}
+			})
 		})
 	}()
 }
@@ -838,11 +841,12 @@ func TnFsPromiseVoid(work func()) chan struct{} {
 // fs.exists(path, cb(exists)) (deprecated): no error argument
 func TnFsExists(path string, cb interface{}) {
 	TnLoopRef()
+	ctx := TnAsyncSnapshot()
 	go func() {
 		exists := TnExists(path)
 		TnLoopPost(func() {
 			defer TnLoopUnref()
-			TnInvoke(cb, exists)
+			TnAsyncRun(ctx, func() { TnInvoke(cb, exists) })
 		})
 	}()
 }

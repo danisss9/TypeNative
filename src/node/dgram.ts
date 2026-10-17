@@ -14,6 +14,7 @@ type TnRemoteInfo struct {
 
 type TnDgramSocket struct {
 	TnEventEmitter
+	asyncCtx  TnAsyncContext
 	network   string
 	conn      *net.UDPConn
 	bound     bool
@@ -24,7 +25,7 @@ type TnDgramSocket struct {
 }
 
 func TnCreateDgramSocket(kind interface{}, listener ...interface{}) *TnDgramSocket {
-	s := &TnDgramSocket{network: "udp4"}
+	s := &TnDgramSocket{network: "udp4", asyncCtx: TnAsyncSnapshot()}
 	switch k := kind.(type) {
 	case string:
 		if k == "udp6" {
@@ -117,7 +118,7 @@ func (s *TnDgramSocket) listen(address string, port float64) *TnError {
 			info.family = tnFamily(info.address)
 			TnLoopPost(func() {
 				if !s.closed {
-					s.emit("message", msg, info)
+					TnAsyncRun(s.asyncCtx, func() { s.emit("message", msg, info) })
 				}
 			})
 		}
