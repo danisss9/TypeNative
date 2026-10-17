@@ -50,6 +50,7 @@ export const goExcluded = {
     unsafe: 'raw pointers',
     'runtime/race': 'needs `-race`',
     'runtime/coverage': 'needs `-cover`',
+    'runtime/cgo': 'needs cgo',
     embed: 'needs a `//go:embed` directive; a later phase'
 };
 // Whether a call taking a callback invokes it synchronously.

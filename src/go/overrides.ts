@@ -58,6 +58,7 @@ export const goExcluded: Record<string, string> = {
   unsafe: 'raw pointers',
   'runtime/race': 'needs `-race`',
   'runtime/coverage': 'needs `-cover`',
+  'runtime/cgo': 'needs cgo',
   embed: 'needs a `//go:embed` directive; a later phase'
 };
 

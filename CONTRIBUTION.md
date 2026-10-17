@@ -66,7 +66,7 @@ The `.d.ts` files are the type-checking contract for user code. If your feature 
 
 - `types/typenative.d.ts` — core JS subset (`Array`, `Map`, `Set`, `JSON`, `Math`, `RegExp`, …).
 - `types/typenative-npm.d.ts` — `node:*` shims (`fs`, `path`, `os`, `child_process`, …).
-- `types/typenative-go.d.ts` — `go:*` bridges (`fmt`, `strings`, `strconv`).
+- `types/typenative-go.d.ts` — `go:*` bridges. Generated from the Go standard library by `npm run gen:go` (`scripts/gostd`), which also rewrites the Go table in conformance.md; never edit it by hand. `npm run check:go-types` type-checks the `lib-go-*` probes against it.
 
 No signature → user code won't type-check → the feature doesn't exist.
 

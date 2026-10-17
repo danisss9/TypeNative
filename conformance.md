@@ -783,9 +783,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:io/ioutil` | ⚠️ | — | Deprecated I/O helpers (Go 1.16) |
 | `go:iter` | ⚠️ | — | Range-over-func iterator types |
 | `go:log` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Logging to stderr |
-| `go:log/internal` | ⚠️ | — | Internal log support |
 | `go:log/slog` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Structured logging |
-| `go:log/slog/internal` | ⚠️ | — | Internal slog support |
 | `go:log/syslog` | ⚠️ | — | Unix syslog; no portable probe |
 | `go:maps` | ⚠️ | — | Generic map helpers |
 | `go:math` | ✅ | [lib-go-math.ts](conformance/lib-go-math.ts) | Math functions |
@@ -805,7 +803,6 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:net/http/httptest` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP test servers (loopback) |
 | `go:net/http/httptrace` | ⚠️ | — | HTTP tracing hooks |
 | `go:net/http/httputil` | ⚠️ | — | HTTP utilities (loopback) |
-| `go:net/http/internal` | ⚠️ | — | Internal HTTP support |
 | `go:net/http/pprof` | ⚠️ | — | pprof HTTP handlers |
 | `go:net/mail` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Mail address parsing |
 | `go:net/netip` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | IP address types |
@@ -858,6 +855,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:unsafe` | ❌ | — | raw pointers |
 | `go:runtime/race` | ❌ | — | needs `-race` |
 | `go:runtime/coverage` | ❌ | — | needs `-cover` |
+| `go:runtime/cgo` | ❌ | — | needs cgo |
 | `go:embed` | ❌ | — | needs a `//go:embed` directive; a later phase |
 <!-- go-bridges:end -->
 
