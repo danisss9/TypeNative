@@ -1129,6 +1129,70 @@ declare module 'node:stream/consumers' {
   export { text, json, buffer };
 }
 
+declare module 'node:cluster' {
+  import { EventEmitter } from 'node:events';
+  import { ChildProcess } from 'node:child_process';
+  namespace cluster {
+    interface Address {
+      address: string;
+      port: number;
+      addressType: number | 'udp4' | 'udp6';
+    }
+    interface ClusterSettings {
+      args?: string[];
+      silent?: boolean;
+      exec?: string;
+      execArgv?: string[];
+      cwd?: string;
+    }
+    class Worker extends EventEmitter {
+      readonly id: number;
+      readonly process: ChildProcess;
+      exitedAfterDisconnect: boolean;
+      send(message: any, callback?: (error: Error | null) => void): boolean;
+      kill(signal?: string): void;
+      destroy(signal?: string): void;
+      disconnect(): this;
+      isConnected(): boolean;
+      isDead(): boolean;
+      on(event: 'message', listener: (message: any) => void): this;
+      on(event: 'exit', listener: (code: number, signal: string) => void): this;
+      on(event: 'listening', listener: (address: Address) => void): this;
+      on(event: 'online' | 'disconnect', listener: () => void): this;
+      on(event: 'error', listener: (error: Error) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+    }
+    const isPrimary: boolean;
+    /** @deprecated */
+    const isMaster: boolean;
+    const isWorker: boolean;
+    const workers: Record<string, Worker> | undefined;
+    const worker: Worker | undefined;
+    const settings: ClusterSettings;
+    const schedulingPolicy: number;
+    const SCHED_NONE: number;
+    const SCHED_RR: number;
+    function fork(env?: Record<string, string | undefined>): Worker;
+    function setupPrimary(settings?: ClusterSettings): void;
+    /** @deprecated */
+    function setupMaster(settings?: ClusterSettings): void;
+    function disconnect(callback?: () => void): void;
+    function on(event: 'fork' | 'online' | 'disconnect', listener: (worker: Worker) => void): EventEmitter;
+    function on(event: 'listening', listener: (worker: Worker, address: Address) => void): EventEmitter;
+    function on(event: 'message', listener: (worker: Worker, message: any) => void): EventEmitter;
+    function on(event: 'exit', listener: (worker: Worker, code: number, signal: string) => void): EventEmitter;
+    function once(event: 'fork' | 'online' | 'disconnect', listener: (worker: Worker) => void): EventEmitter;
+    function once(event: 'listening', listener: (worker: Worker, address: Address) => void): EventEmitter;
+    function once(event: 'message', listener: (worker: Worker, message: any) => void): EventEmitter;
+    function once(event: 'exit', listener: (worker: Worker, code: number, signal: string) => void): EventEmitter;
+    function off(event: string, listener: (...args: any[]) => void): EventEmitter;
+    function removeAllListeners(event?: string): EventEmitter;
+    function emit(event: string, ...args: any[]): boolean;
+    function listenerCount(event: string): number;
+  }
+  export = cluster;
+}
+
 declare module 'node:stream/web' {
   const ReadableStream: typeof globalThis.ReadableStream;
   type ReadableStream<R = any> = globalThis.ReadableStream<R>;
@@ -1201,8 +1265,20 @@ declare module 'node:child_process' {
       readonly signalCode: string | null;
       readonly killed: boolean;
       readonly spawnfile: string;
+      readonly connected: boolean;
       kill(signal?: string | number): boolean;
+      send(message: any, callback?: (error: Error | null) => void): boolean;
+      disconnect(): void;
     }
+    interface ForkOptions {
+      cwd?: string;
+      env?: Record<string, string | undefined>;
+      execArgv?: string[];
+      silent?: boolean;
+    }
+    // Runs this program again (a native binary holds one program) with an IPC channel
+    function fork(modulePath: string | URL, options?: ForkOptions): ChildProcess;
+    function fork(modulePath: string | URL, args?: readonly string[], options?: ForkOptions): ChildProcess;
     type ExecCallback = (error: ExecException | null, stdout: string, stderr: string) => void;
     function exec(command: string, callback?: ExecCallback): ChildProcess;
     function exec(command: string, options: CommonOptions & { encoding?: BufferEncoding | null }, callback?: ExecCallback): ChildProcess;
@@ -1987,3 +2063,4 @@ declare module 'dgram' { import m = require('node:dgram'); export = m; }
 declare module 'async_hooks' { import m = require('node:async_hooks'); export = m; }
 // node:test has no bare alias in Node ('test' is not a builtin)
 declare module 'worker_threads' { import m = require('node:worker_threads'); export = m; }
+declare module 'cluster' { import m = require('node:cluster'); export = m; }

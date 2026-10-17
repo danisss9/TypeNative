@@ -172,44 +172,6 @@ func tnCloneDecode(v interface{}) interface{} {
 }`;
 
 const workerHelper = `// node:worker_threads
-// Frames: 4-byte big-endian length, 1 kind byte, JSON payload
-func tnWriteFrame(w io.Writer, kind byte, payload []byte) error {
-	header := make([]byte, 5)
-	binary.BigEndian.PutUint32(header, uint32(len(payload)+1))
-	header[4] = kind
-	if _, err := w.Write(append(header, payload...)); err != nil {
-		return err
-	}
-	return nil
-}
-
-func tnReadFrame(r io.Reader) (byte, []byte, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, err
-	}
-	size := binary.BigEndian.Uint32(header)
-	body := make([]byte, size)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return 0, nil, err
-	}
-	return body[0], body[1:], nil
-}
-
-func tnEncodeMessage(v interface{}) []byte {
-	data, err := json.Marshal(tnCloneEncode(v))
-	if err != nil {
-		panic(TnNodeError("DataCloneError", "", err.Error()))
-	}
-	return data
-}
-
-func tnDecodeMessage(data []byte) interface{} {
-	var v interface{}
-	json.Unmarshal(data, &v)
-	return tnCloneDecode(v)
-}
-
 // MessagePort: in-process pairs (MessageChannel) or the link to the parent
 type TnMessagePort struct {
 	TnEventEmitter
@@ -706,8 +668,8 @@ export function registerWorkerThreads(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeWorker',
-    ['bufio', 'crypto/rand', 'encoding/binary', 'encoding/hex', 'encoding/json', 'fmt', 'io', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'],
-    ['nodeClone', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild'],
+    ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'],
+    ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild'],
     workerHelper
   );
   const use = () => r.helper('nodeWorker');

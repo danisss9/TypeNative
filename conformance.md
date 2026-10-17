@@ -449,6 +449,7 @@ async function runs synchronously until its first `await`.
 | `node:async_hooks`                          |   ✅    | [async_hooks](#nodeasync_hooks)                             |
 | `node:buffer` (+ globals `Buffer`, `Uint8Array`, `atob`, `btoa`, `Blob`, `File`) | ✅ | [buffer](#nodebuffer)                 |
 | `node:child_process`                        |   ✅    | [child_process](#nodechild_process)                         |
+| `node:cluster`                              |   ✅    | [cluster](#nodecluster)                                     |
 | `node:console`                              |   ✅    | [console](#nodeconsole)                                     |
 | `node:constants`                            |   ✅    | [constants](#nodeconstants--nodesys)                        |
 | `node:crypto` (+ global `crypto`)           |   ✅    | [crypto](#nodecrypto)                                       |
@@ -689,7 +690,17 @@ async function runs synchronously until its first `await`.
 | ------------------------------------------------------------------------------------------------ | :----: | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `execSync` / `execFileSync` / `spawnSync` (`encoding`, `input`, `cwd`, `env`, `shell`, `stdio: 'inherit'`) | ✅ | [lib-node-child-process-sync.ts](conformance/lib-node-child-process-sync.ts) | Buffers unless an encoding is given (as in Node); a non-zero exit throws with `status` / `stdout` / `stderr` |
 | `exec` / `execFile` (callbacks), `spawn` → `ChildProcess` (stdio streams, `'exit'` / `'close'`, `kill`); `promisify(exec)` | ✅ | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `'close'` follows the end of the stdio streams being read; exit codes on `err.code`     |
-| `fork` / IPC / `detached`, `stdio` arrays beyond stdout                                          |   ❌    | —                                                                          | Not implemented                                                                           |
+| `fork(modulePath, args, { env, cwd, silent })` → `send` / `'message'` / `disconnect` / `'disconnect'` / `connected`; in the child `process.send` / `process.on('message')` / `process.connected` / `process.disconnect` | ✅ | [lib-node-child-process-fork.ts](conformance/lib-node-child-process-fork.ts) | The child is this program run again (branch on `process.argv` / `process.send`), linked over loopback TCP; messages are structured clones (a superset of Node's default JSON) |
+| `detached`, `stdio` arrays beyond stdout, `serialization: 'advanced'` handle passing (`send(msg, socket)`), forking another file | ❌ | — | `detached` needs OS-specific process attributes; one binary holds one program |
+
+#### `node:cluster`
+
+| API                                                                                                   | Status | Probe                                                                | Notes                                                                 |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `isPrimary` / `isWorker` / `isMaster`, `fork(env)`, `workers`, `worker`, `setupPrimary` / `settings`, `disconnect(cb)`, `SCHED_RR` / `schedulingPolicy`; events `'fork'` / `'online'` / `'listening'` / `'message'` / `'disconnect'` / `'exit'` | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | Workers are this program run again with `NODE_UNIQUE_ID` set |
+| `Worker` (`id`, `process`, `send`, `'message'`, `disconnect`, `kill`, `isConnected`, `isDead`, `exitedAfterDisconnect`); `process.send` from workers | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | |
+| Shared ports: `net` / `http` / `https` / `tls` servers in workers listen on one port (also `listen(0)`), connections round-robin | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | The primary owns the listener and relays each connection to a worker's private loopback listener with the client's address (no handle passing) |
+| `SCHED_NONE` (OS-level balancing), `exclusive: true` listeners, dgram sockets in workers | ❌ | — | Everything goes through the primary |
 
 #### `node:diagnostics_channel`
 
@@ -789,7 +800,6 @@ async function runs synchronously until its first `await`.
 | Module                                                                               | Status | Probe | Notes                                                                                      |
 | ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
 | `node:http2`                                                                         |   ❌    | —     | Not implemented (see [http / https](#nodehttp--nodehttps))                                  |
-| `node:cluster`                                                                       |   ❌    | —     | Not implemented                                                                            |
 | `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
 | `node:test/reporters`                                                                |   ❌    | —     | Custom reporters are not implemented (see [test](#nodetest))                               |
 | `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
