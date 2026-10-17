@@ -1435,6 +1435,107 @@ declare module 'node:async_hooks' {
   export = async_hooks;
 }
 
+declare module 'node:test' {
+  function test(name?: string, fn?: test.TestFn): Promise<void>;
+  function test(name?: string, options?: test.TestOptions, fn?: test.TestFn): Promise<void>;
+  function test(fn?: test.TestFn): Promise<void>;
+  namespace test {
+    export { test };
+    export function skip(name?: string, fn?: TestFn): Promise<void>;
+    export function skip(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+    export function todo(name?: string, fn?: TestFn): Promise<void>;
+    export function todo(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+    export function only(name?: string, fn?: TestFn): Promise<void>;
+    export function only(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+    export interface TestOptions {
+      skip?: boolean | string;
+      todo?: boolean | string;
+      only?: boolean;
+      timeout?: number;
+      concurrency?: number | boolean;
+    }
+    export type TestFn = (t: TestContext, done: (result?: any) => void) => any;
+    export type SuiteFn = (s: SuiteContext) => any;
+    export type HookFn = (c: TestContext, done: (result?: any) => void) => any;
+    export interface MockFunctionCall<F extends (...args: any[]) => any> {
+      arguments: Parameters<F>;
+      result: ReturnType<F> | undefined;
+      error: unknown;
+      this: unknown;
+    }
+    export interface MockFunctionContext<F extends (...args: any[]) => any> {
+      readonly calls: MockFunctionCall<F>[];
+      callCount(): number;
+      resetCalls(): void;
+      mockImplementation(implementation: F): void;
+      mockImplementationOnce(implementation: F, onCall?: number): void;
+      restore(): void;
+    }
+    export type Mock<F extends (...args: any[]) => any> = F & { mock: MockFunctionContext<F> };
+    export interface MockTracker {
+      fn<F extends (...args: any[]) => any = (...args: any[]) => undefined>(original?: F): Mock<F>;
+      fn<F extends (...args: any[]) => any, Implementation extends (...args: any[]) => any = F>(original: F, implementation: Implementation): Mock<F | Implementation>;
+      reset(): void;
+      restoreAll(): void;
+    }
+    export interface TestContext {
+      readonly name: string;
+      readonly fullName: string;
+      readonly filePath: string | undefined;
+      readonly signal: AbortSignal;
+      readonly mock: MockTracker;
+      test(name?: string, fn?: TestFn): Promise<void>;
+      test(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+      test(fn?: TestFn): Promise<void>;
+      skip(message?: string): void;
+      todo(message?: string): void;
+      diagnostic(message: string): void;
+      plan(count: number): void;
+      runOnly(shouldRunOnlyTests: boolean): void;
+      before(fn?: HookFn): void;
+      after(fn?: HookFn): void;
+      beforeEach(fn?: HookFn): void;
+      afterEach(fn?: HookFn): void;
+    }
+    export interface SuiteContext {
+      readonly name: string;
+      readonly fullName: string;
+      readonly signal: AbortSignal;
+    }
+    export interface TestFunction {
+      (name?: string, fn?: TestFn): Promise<void>;
+      (name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+      (fn?: TestFn): Promise<void>;
+      skip(name?: string, fn?: TestFn): Promise<void>;
+      skip(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+      todo(name?: string, fn?: TestFn): Promise<void>;
+      todo(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+      only(name?: string, fn?: TestFn): Promise<void>;
+      only(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
+    }
+    export interface SuiteFunction {
+      (name?: string, fn?: SuiteFn): Promise<void>;
+      (name?: string, options?: TestOptions, fn?: SuiteFn): Promise<void>;
+      (fn?: SuiteFn): Promise<void>;
+      skip(name?: string, fn?: SuiteFn): Promise<void>;
+      skip(name?: string, options?: TestOptions, fn?: SuiteFn): Promise<void>;
+      todo(name?: string, fn?: SuiteFn): Promise<void>;
+      todo(name?: string, options?: TestOptions, fn?: SuiteFn): Promise<void>;
+      only(name?: string, fn?: SuiteFn): Promise<void>;
+      only(name?: string, options?: TestOptions, fn?: SuiteFn): Promise<void>;
+    }
+    export const it: TestFunction;
+    export const describe: SuiteFunction;
+    export const suite: SuiteFunction;
+    export const mock: MockTracker;
+    export function before(fn?: HookFn, options?: TestOptions): void;
+    export function after(fn?: HookFn, options?: TestOptions): void;
+    export function beforeEach(fn?: HookFn, options?: TestOptions): void;
+    export function afterEach(fn?: HookFn, options?: TestOptions): void;
+  }
+  export = test;
+}
+
 declare module 'path' { import m = require('node:path'); export = m; }
 declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
 declare module 'path/win32' { import m = require('node:path/win32'); export = m; }
@@ -1476,3 +1577,4 @@ declare module 'https' { import m = require('node:https'); export = m; }
 declare module 'tls' { import m = require('node:tls'); export = m; }
 declare module 'dgram' { import m = require('node:dgram'); export = m; }
 declare module 'async_hooks' { import m = require('node:async_hooks'); export = m; }
+// node:test has no bare alias in Node ('test' is not a builtin)

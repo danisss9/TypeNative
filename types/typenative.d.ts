@@ -115,6 +115,8 @@ type Pick<T, K extends keyof T> = { [P in K]: T[P] };
 type Omit<T, K extends keyof any> = { [P in keyof T as P extends K ? never : P]: T[P] };
 type NonNullable<T> = T & {};
 type Record<K extends keyof any, T> = { [P in K]: T };
+type Parameters<T extends (...args: any) => any> = T extends (...args: infer P) => any ? P : never;
+type ReturnType<T extends (...args: any) => any> = T extends (...args: any) => infer R ? R : any;
 
 // --- RegExp ---
 
@@ -483,9 +485,9 @@ interface ImportMeta {
 }
 
 // Timers and microtasks. Handles are opaque; pass them to the matching clear function.
-declare function setTimeout(callback: () => void, ms?: number): number;
+declare function setTimeout(callback: (...args: any[]) => void, ms?: number): number;
 declare function clearTimeout(id?: number): void;
-declare function setInterval(callback: () => void, ms?: number): number;
+declare function setInterval(callback: (...args: any[]) => void, ms?: number): number;
 declare function clearInterval(id?: number): void;
 declare function queueMicrotask(callback: () => void): void;
 
