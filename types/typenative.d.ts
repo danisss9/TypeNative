@@ -1009,6 +1009,73 @@ declare var crypto: {
   getRandomValues<T extends Uint8Array>(array: T): T;
 };
 
+// --- fetch (WHATWG Fetch API, as in Node) ---
+
+type HeadersInit = Headers | Record<string, string> | [string, string][];
+interface Headers {
+  get(name: string): string | null;
+  getSetCookie(): string[];
+  has(name: string): boolean;
+  set(name: string, value: string): void;
+  append(name: string, value: string): void;
+  delete(name: string): void;
+  entries(): [string, string][];
+  keys(): string[];
+  values(): string[];
+  forEach(callback: (value: string, key: string, parent: Headers) => void): void;
+  [Symbol.iterator](): Iterator<[string, string]>;
+}
+declare var Headers: { new (init?: HeadersInit): Headers };
+
+type BodyInit = string | Uint8Array | URLSearchParams;
+interface Body {
+  readonly bodyUsed: boolean;
+  text(): Promise<string>;
+  json(): Promise<any>;
+  bytes(): Promise<Uint8Array>;
+  arrayBuffer(): Promise<Uint8Array>;
+}
+interface RequestInit {
+  method?: string;
+  headers?: HeadersInit;
+  body?: BodyInit | null;
+  redirect?: 'follow' | 'manual' | 'error';
+  signal?: AbortSignal | null;
+}
+interface Request extends Body {
+  readonly url: string;
+  readonly method: string;
+  readonly headers: Headers;
+  readonly redirect: 'follow' | 'manual' | 'error';
+  readonly signal: AbortSignal;
+  clone(): Request;
+}
+declare var Request: { new (input: string | URL | Request, init?: RequestInit): Request };
+
+interface ResponseInit {
+  status?: number;
+  statusText?: string;
+  headers?: HeadersInit;
+}
+interface Response extends Body {
+  readonly status: number;
+  readonly statusText: string;
+  readonly ok: boolean;
+  readonly headers: Headers;
+  readonly url: string;
+  readonly redirected: boolean;
+  readonly type: 'basic' | 'default' | 'error';
+  clone(): Response;
+}
+declare var Response: {
+  new (body?: BodyInit | null, init?: ResponseInit): Response;
+  json(data: any, init?: ResponseInit): Response;
+  error(): Response;
+  redirect(url: string | URL, status?: number): Response;
+};
+
+declare function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+
 declare function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): number;
 declare function clearImmediate(immediate?: number): void;
 

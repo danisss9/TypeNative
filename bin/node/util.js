@@ -577,6 +577,29 @@ func TnUtilFormat(args ...interface{}) string {
 	if len(args) == 0 {
 		return ""
 	}
+	// Nullable primitives (optional chaining results) print as their value
+	for i, a := range args {
+		switch p := a.(type) {
+		case *string:
+			if p == nil {
+				args[i] = nil
+			} else {
+				args[i] = *p
+			}
+		case *float64:
+			if p == nil {
+				args[i] = nil
+			} else {
+				args[i] = *p
+			}
+		case *bool:
+			if p == nil {
+				args[i] = nil
+			} else {
+				args[i] = *p
+			}
+		}
+	}
 	first, isString := args[0].(string)
 	if isString && len(args) == 1 {
 		return first
