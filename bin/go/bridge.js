@@ -21,7 +21,8 @@ let services = {
     isPropertyAccess: (_node) => false,
     isArrowFunction: (_node) => false,
     isFunctionExpression: (_node) => false,
-    isObjectLiteral: (_node) => false
+    isObjectLiteral: (_node) => false,
+    declareLocal: (_name, _goType) => { }
 };
 export function bindBridgeServices(s) {
     services = s;
@@ -222,7 +223,14 @@ export function visitGoCall(node) {
         return undefined;
     services.pkg(target.path);
     const argNodes = node.arguments ?? [];
-    const args = emitGoArgs(argNodes, fn.params, fn.variadic, target.path, target.member);
+    // Generic functions: params with the inferred type args (callbacks get
+    // concrete signatures: maps.DeleteFunc's func(K, V) bool).
+    let params = fn.params;
+    if (fn.tparams.length > 0) {
+        const subst = inferTypeArgs(fn, argNodes);
+        params = fn.params.map((p) => ({ name: p.name, goType: substituteType(p.goType, subst) }));
+    }
+    const args = emitGoArgs(argNodes, params, fn.variadic, target.path, target.member);
     let call = `${target.qualifier}.${target.member}(${args.join(', ')})`;
     const results = instantiateResults(fn, argNodes);
     for (const r of results)
@@ -236,40 +244,110 @@ export function visitGoCall(node) {
     return call;
 }
 // Substitute a generic function's type params from the argument types
-// (slices.Clone[S ~[]E, E any](s S): S → []float64 for a []float64 arg).
+// (slices.Values[Slice ~[]E, E any](s Slice) iter.Seq[E] on a []float64
+// arg → iter.Seq[float64]). Type params nothing pins down become any.
 function instantiateResults(fn, argNodes) {
     if (fn.tparams.length === 0)
         return fn.results;
-    const subst = {};
-    for (let i = 0; i < fn.params.length && i < argNodes.length; i++) {
-        unifyParam(fn.params[i].goType.replace(/^\.\.\./, ''), services.typeOf(argNodes[i]) ?? '', subst);
-    }
+    const subst = inferTypeArgs(fn, argNodes);
     return fn.results.map((r) => substituteType(r, subst));
 }
-function unifyParam(paramType, argType, subst) {
+function inferTypeArgs(fn, argNodes) {
+    const cores = {};
+    for (let i = 0; i < fn.tparams.length; i++) {
+        cores[fn.tparams[i]] = (fn.tcores ?? [])[i] ?? '';
+    }
+    const subst = {};
+    for (let i = 0; i < argNodes.length && fn.params.length > 0; i++) {
+        const param = fn.params[Math.min(i, fn.params.length - 1)];
+        unifyParam(param.goType.replace(/^\.\.\./, ''), services.typeOf(argNodes[i]) ?? '', subst, cores);
+    }
+    for (const tp of fn.tparams) {
+        if (subst[tp] === undefined)
+            subst[tp] = 'any';
+    }
+    return subst;
+}
+function unifyParam(paramType, argType, subst, cores) {
     if (!paramType || !argType)
         return;
-    // Exact type param: S → []float64.
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(paramType)) {
-        if (!(paramType in subst))
+    // TS arrays are slice references.
+    if (argType.startsWith('*[]'))
+        argType = argType.slice(1);
+    // A type param: bind it, then match its constraint's core type
+    // (Map ~map[K]V binds K and V too).
+    if (cores[paramType] !== undefined) {
+        if (subst[paramType] === undefined)
             subst[paramType] = argType;
+        if (cores[paramType])
+            unifyParam(cores[paramType], argType, subst, cores);
         return;
     }
-    // One-level composite: []E, *E, map[K]V, chan E.
     if (paramType.startsWith('[]') && argType.startsWith('[]')) {
-        unifyParam(paramType.slice(2), argType.slice(2), subst);
+        unifyParam(paramType.slice(2), argType.slice(2), subst, cores);
         return;
     }
     if (paramType.startsWith('*') && argType.startsWith('*')) {
-        unifyParam(paramType.slice(1), argType.slice(1), subst);
+        unifyParam(paramType.slice(1), argType.slice(1), subst, cores);
         return;
     }
-}
-function substituteType(goType, subst) {
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(goType) && goType in subst) {
-        return subst[goType];
+    if (paramType.startsWith('map[') && argType.startsWith('map[')) {
+        const p = splitMapType(paramType);
+        const a = splitMapType(argType);
+        if (p && a) {
+            unifyParam(p[0], a[0], subst, cores);
+            unifyParam(p[1], a[1], subst, cores);
+        }
+        return;
     }
-    return goType;
+    // Generic named types: iter.Seq[E] against iter.Seq[float64].
+    const pOpen = paramType.indexOf('[');
+    const aOpen = argType.indexOf('[');
+    if (pOpen > 0 && aOpen > 0 && paramType.slice(0, pOpen) === argType.slice(0, aOpen) && paramType.endsWith(']') && argType.endsWith(']')) {
+        const pArgs = splitTopLevel(paramType.slice(pOpen + 1, -1));
+        const aArgs = splitTopLevel(argType.slice(aOpen + 1, -1));
+        for (let i = 0; i < pArgs.length && i < aArgs.length; i++)
+            unifyParam(pArgs[i], aArgs[i], subst, cores);
+    }
+}
+// 'map[K]V' → ['K', 'V'].
+function splitMapType(goType) {
+    let depth = 0;
+    for (let i = 4; i < goType.length; i++) {
+        const ch = goType[i];
+        if (ch === '[')
+            depth++;
+        else if (ch === ']') {
+            if (depth === 0)
+                return [goType.slice(4, i), goType.slice(i + 1)];
+            depth--;
+        }
+    }
+    return null;
+}
+// Replace type-param identifiers (not selector or path parts) in a Go type.
+function substituteType(goType, subst) {
+    let out = '';
+    let i = 0;
+    while (i < goType.length) {
+        const ch = goType[i];
+        if (/[A-Za-z_]/.test(ch)) {
+            let j = i + 1;
+            while (j < goType.length && /[A-Za-z0-9_]/.test(goType[j]))
+                j++;
+            const word = goType.slice(i, j);
+            const prev = i > 0 ? goType[i - 1] : '';
+            // A selector (pkg.Name) or path part, but `...S` is a variadic param.
+            const selector = prev === '/' || (prev === '.' && !goType.slice(0, i).endsWith('...'));
+            out += !selector && subst[word] !== undefined ? subst[word] : word;
+            i = j;
+        }
+        else {
+            out += ch;
+            i++;
+        }
+    }
+    return out;
 }
 // Whether the call node is used as a bare statement (its value discarded).
 function isStatement(node) {
@@ -278,6 +356,7 @@ function isStatement(node) {
 // Emit converted arguments.
 function emitGoArgs(nodes, params, variadic, path, funcName) {
     const out = [];
+    const intArgs = formatIntArgs(nodes, params, variadic);
     for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i];
         const param = params[i] ?? params[params.length - 1];
@@ -303,7 +382,9 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         // A slice filling a variadic slot spreads (f([a, b]) → f(a, b)).
         const fromTypeEarly = services.typeOf(node) ?? '';
         const fromSlice = fromTypeEarly.startsWith('*[]') ? fromTypeEarly.slice(1) : fromTypeEarly;
-        if (isVariadicSlot && fromSlice.startsWith('[]') && node.kind !== 'SpreadElement') {
+        // `...any` takes the array as one value (fmt.Sprintf('%v', arr)).
+        const anyVariadic = paramType === 'any' || paramType === 'interface{}';
+        if (isVariadicSlot && !anyVariadic && fromSlice.startsWith('[]') && node.kind !== 'SpreadElement') {
             out.push(`${services.visit(node)}...`);
             continue;
         }
@@ -316,6 +397,10 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         }
         const visited = services.visit(node);
         const fromType = services.typeOf(node) ?? '';
+        if (intArgs[i] && fromType === 'float64') {
+            out.push(`int64(${visited})`);
+            continue;
+        }
         ensureGoTypePackages(paramType);
         out.push(toGo(visited, fromType, paramType));
     }
@@ -331,6 +416,42 @@ function emitGoArgs(nodes, params, variadic, path, funcName) {
         }
     }
     return out;
+}
+// printf-style calls (`format string, a ...any`) with a literal format:
+// which argument indexes feed an integer verb (%d %x %o %b %c %U). TS
+// numbers are float64, which those verbs reject, so they pass as int64.
+function formatIntArgs(nodes, params, variadic) {
+    const flags = [];
+    if (!variadic || params.length < 2)
+        return flags;
+    const last = params[params.length - 1].goType;
+    if (last !== '...any' && last !== '...interface{}')
+        return flags;
+    const formatIndex = params.length - 2;
+    if (params[formatIndex].name !== 'format' || params[formatIndex].goType !== 'string')
+        return flags;
+    const formatNode = nodes[formatIndex];
+    if (!formatNode || (formatNode.kind !== 'StringLiteral' && formatNode.kind !== 'NoSubstitutionTemplateLiteral'))
+        return flags;
+    const format = formatNode.text ?? '';
+    let arg = formatIndex + 1;
+    for (let i = 0; i < format.length; i++) {
+        if (format[i] !== '%')
+            continue;
+        i++;
+        // Flags, width, precision; `*` consumes an argument.
+        while (i < format.length && '+-# 0123456789.*[]'.indexOf(format[i]) >= 0) {
+            if (format[i] === '*')
+                arg++;
+            i++;
+        }
+        if (i >= format.length || format[i] === '%')
+            continue;
+        if ('dxXobcOU'.indexOf(format[i]) >= 0)
+            flags[arg] = true;
+        arg++;
+    }
+    return flags;
 }
 // Wrap results: (T, error) throws, error-only throws as a statement and
 // yields the error value in value position, tuples pass through.
@@ -406,25 +527,73 @@ function emitBlocking(call, results, asStatement = false) {
 function isFuncType(goType) {
     return goType.startsWith('func(') || goTypeInfo(goType) !== null && goTypeInfo(goType)?.kind === 'func';
 }
-// Emit a TS closure as a Go closure with the exact Go signature.
+// Go result type of each TS closure emitted as a Go callback; the
+// transpiler converts its `return` values to it.
+const callbackResults = new Map();
+export function goCallbackResultType(fn) {
+    return callbackResults.get(fn);
+}
+// Emit a TS closure as a Go closure with the exact Go signature. Params
+// the TS body sees as numbers (Go ints) are re-declared as float64.
 function emitCallback(node, goType, path, funcName) {
     const sig = parseFuncSig(goType);
     if (!sig)
         return services.visit(node);
     const params = [];
+    const prelude = [];
     for (let i = 0; i < sig.params.length; i++) {
         const declared = (node.parameters ?? [])[i];
-        const name = declared && services.isIdentifier(declared.name) ? services.visit(declared.name) : `arg${i}`;
-        params.push(`${name} ${sig.params[i]}`);
+        const name = declared && services.isIdentifier(declared.name) ? services.visit(declared.name) : `_`;
+        const paramType = stripParamName(sig.params[i]);
+        ensureGoTypePackages(paramType);
+        const tsType = goResultType([paramType]) ?? paramType;
+        if (name !== '_' && tsType !== paramType) {
+            const raw = services.temp('p');
+            params.push(`${raw} ${goLocalType(paramType)}`);
+            prelude.push(`${name} := ${fromGo(raw, paramType)}; _ = ${name}`);
+        }
+        else {
+            params.push(`${name} ${goLocalType(paramType)}`);
+        }
+        if (name !== '_')
+            services.declareLocal(name, tsType);
     }
-    const sync = isSyncCallback(path, funcName);
-    // Body params convert back to TS-facing values where needed.
-    const savedVisit = services.visit;
-    void savedVisit;
-    void sync;
+    void isSyncCallback(path, funcName);
+    const result = sig.results.length === 1 ? sig.results[0] : '';
+    if (result) {
+        ensureGoTypePackages(result);
+        callbackResults.set(node, result);
+    }
+    const resultDecl = sig.results.length > 0 ? ' ' + sig.results.map((r) => goLocalType(r)).join(', ') : '';
+    const head = `func(${params.join(', ')})${resultDecl}`;
+    const pre = prelude.length > 0 ? prelude.join('; ') + '; ' : '';
+    if (node.body && node.body.kind === 'Block') {
+        return `${head} { ${pre}${services.visit(node.body)} }`;
+    }
     const body = services.visit(node.body);
-    const results = sig.results.length > 0 ? ' ' + sig.results.join(', ') : '';
-    return `func(${params.join(', ')})${results} { return ${body} }`;
+    if (!result)
+        return `${head} { ${pre}${body} }`;
+    return `${head} { ${pre}return ${toGo(body, services.typeOf(node.body) ?? '', result)} }`;
+}
+// "name T" → "T" (metadata signatures keep parameter names).
+function stripParamName(param) {
+    const p = param.trim();
+    let depth = 0;
+    for (let i = 0; i < p.length; i++) {
+        const ch = p[i];
+        if (ch === '[' || ch === '(' || ch === '{')
+            depth++;
+        else if (ch === ']' || ch === ')' || ch === '}')
+            depth--;
+        else if (ch === ' ' && depth === 0) {
+            const head = p.slice(0, i);
+            const rest = p.slice(i + 1).trim();
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(head) && rest && head !== 'func' && head !== 'chan' && head !== 'map')
+                return rest;
+            return p;
+        }
+    }
+    return p;
 }
 function parseFuncSig(goType) {
     if (!goType.startsWith('func(')) {
@@ -635,15 +804,33 @@ export function goMethodInfo(recvType, method) {
     const info = goTypeInfo(recvType);
     if (!info)
         return null;
+    let found = null;
     for (const m of info.methods) {
         if (m.name === method)
-            return m;
+            found = m;
     }
-    for (const m of info.ifaceMethods) {
-        if (m.name === method)
-            return m;
+    if (!found) {
+        for (const m of info.ifaceMethods) {
+            if (m.name === method)
+                found = m;
+        }
     }
-    return null;
+    if (!found || info.tparams.length === 0)
+        return found;
+    // Generic receiver (unique.Handle[string]): substitute its type args.
+    const open = recvType.indexOf('[');
+    if (open < 0 || !recvType.endsWith(']'))
+        return found;
+    const args = splitTopLevel(recvType.slice(open + 1, -1));
+    const subst = {};
+    for (let i = 0; i < info.tparams.length && i < args.length; i++)
+        subst[info.tparams[i]] = args[i];
+    return {
+        name: found.name,
+        ptr: found.ptr,
+        params: found.params.map((p) => ({ name: p.name, goType: substituteType(p.goType, subst) })),
+        results: found.results.map((r) => substituteType(r, subst))
+    };
 }
 // Emit a method call on a Go value with conversion.
 export function visitGoMethod(node, recv, recvType) {

@@ -17,6 +17,8 @@ export interface GoParam {
 export interface GoFunc {
   name: string;
   tparams: string[];
+  // Core type of each type param's constraint ('map[K]V'), '' when open.
+  tcores: string[];
   params: GoParam[];
   results: string[];
   variadic: boolean;
@@ -145,6 +147,7 @@ export function goPackage(path: string): GoPackageInfo | null {
       info.funcs[name] = {
         name,
         tparams: parts[1] ? unesc(parts[1]).split(',') : [],
+        tcores: parts[5] ? unesc(parts[5]).split(';') : [],
         params: parseParams(parts[2] ?? ''),
         results: parseResults(parts[3] ?? ''),
         variadic: (parts[4] ?? '') === 'true'
@@ -227,7 +230,13 @@ export function goTypeInfo(goType: string): GoType | null {
   if (bracket >= 0) name = name.slice(0, bracket);
   const info = goPackage(path);
   if (!info) return null;
-  return info.types[name] ?? null;
+  const type = info.types[name] ?? null;
+  // Aliases of named types resolve to the target (os.FileMode = fs.FileMode).
+  if (type && type.kind === 'alias' && type.under && type.under !== goType && type.under.indexOf('.') >= 0) {
+    const target = goTypeInfo(type.under);
+    if (target) return target;
+  }
+  return type;
 }
 
 // Whether the Go type is a named numeric (time.Duration, fs.FileMode).

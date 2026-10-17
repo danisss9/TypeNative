@@ -11,7 +11,7 @@ import (
 // package path. Line kinds:
 //
 //	P<name>            package name
-//	F<name>|<tparams>|<params>|<results>|<variadic>
+//	F<name>|<tparams>|<params>|<results>|<variadic>|<tparam cores, ;-separated>
 //	T<name>|<kind>|<under>|<tparams>|<numeric>
 //	f<type>|<field>|<goTy>
 //	M<type>|<method>|<ptr>|<params>|<results>
@@ -54,7 +54,8 @@ func renderGenTS(models []pkgModel) string {
 				ps = append(ps, esc(pr.name)+" "+esc(pr.typ))
 			}
 			lines = append(lines, "F"+esc(fn.name)+"|"+esc(strings.Join(fn.tparams, ","))+"|"+
-				strings.Join(ps, ",")+"|"+esc(strings.Join(fn.results, ","))+"|"+esc(strconv.FormatBool(fn.variadic)))
+				strings.Join(ps, ",")+"|"+esc(strings.Join(fn.results, ","))+"|"+esc(strconv.FormatBool(fn.variadic))+
+				"|"+esc(strings.Join(fn.tcores, ";")))
 		}
 		for _, ti := range m.typs {
 			lines = append(lines, "T"+esc(ti.name)+"|"+esc(ti.kind)+"|"+esc(ti.under)+"|"+

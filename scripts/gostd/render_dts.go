@@ -121,7 +121,14 @@ func writeType(b *strings.Builder, ti *typeInfo, tm *typeMapper) {
 		// Non-numeric basics (string, bool).
 		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
 	case "func":
-		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
+		// iter.Seq / Seq2 are also for…of iterables.
+		iterable := ""
+		if tm.path == "iter" && name == "Seq" {
+			iterable = " & Iterable<V>"
+		} else if tm.path == "iter" && name == "Seq2" {
+			iterable = " & Iterable<[K, V]>"
+		}
+		fmt.Fprintf(b, "  export type %s%s = (%s)%s;\n", name, tparams, tm.mapType(ti.under, "result"), iterable)
 	case "slice":
 		fmt.Fprintf(b, "  export type %s%s = %s;\n", name, tparams, tm.mapType(ti.under, "result"))
 	case "map":
@@ -170,7 +177,73 @@ func renderSigs(name string, params []paramInfo, results []string, tparams []str
 }
 
 func writeFunc(b *strings.Builder, fn *funcInfo, tm *typeMapper) {
-	fmt.Fprintf(b, "  export function %s;\n", renderSigs(sanitizeName(fn.name), fn.params, fn.results, fn.tparams, tm, ";\n  export function "))
+	params, results, tparams := inlineCoreTypes(fn)
+	fmt.Fprintf(b, "  export function %s;\n", renderSigs(sanitizeName(fn.name), params, results, tparams, tm, ";\n  export function "))
+}
+
+// Type params with a core type (Slice ~[]E, Map ~map[K]V) are replaced by
+// it, so TypeScript can infer the rest: Clone<S ~[]E, E>(s S) S renders as
+// Clone<E>(s: E[]): E[].
+func inlineCoreTypes(fn *funcInfo) ([]paramInfo, []string, []string) {
+	subst := map[string]string{}
+	for i, tp := range fn.tparams {
+		if i < len(fn.tcores) && fn.tcores[i] != "" {
+			subst[tp] = fn.tcores[i]
+		}
+	}
+	if len(subst) == 0 {
+		return fn.params, fn.results, fn.tparams
+	}
+	var tparams []string
+	for _, tp := range fn.tparams {
+		if _, ok := subst[tp]; !ok {
+			tparams = append(tparams, tp)
+		}
+	}
+	params := make([]paramInfo, len(fn.params))
+	for i, p := range fn.params {
+		params[i] = paramInfo{name: p.name, typ: substituteTypeParams(p.typ, subst)}
+	}
+	results := make([]string, len(fn.results))
+	for i, r := range fn.results {
+		results[i] = substituteTypeParams(r, subst)
+	}
+	return params, results, tparams
+}
+
+// Replace type-param identifiers (not selector or path parts) in a Go type.
+// Cores may name other params with cores, so substitute to a fixed point.
+func substituteTypeParams(goTy string, subst map[string]string) string {
+	for depth := 0; depth < 4; depth++ {
+		var b strings.Builder
+		changed := false
+		for i := 0; i < len(goTy); {
+			c := goTy[i]
+			if c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+				j := i + 1
+				for j < len(goTy) && (goTy[j] == '_' || (goTy[j] >= 'A' && goTy[j] <= 'Z') || (goTy[j] >= 'a' && goTy[j] <= 'z') || (goTy[j] >= '0' && goTy[j] <= '9')) {
+					j++
+				}
+				word := goTy[i:j]
+				selector := i > 0 && (goTy[i-1] == '/' || (goTy[i-1] == '.' && !strings.HasSuffix(goTy[:i], "...")))
+				if r, ok := subst[word]; ok && !selector {
+					b.WriteString(r)
+					changed = true
+				} else {
+					b.WriteString(word)
+				}
+				i = j
+				continue
+			}
+			b.WriteByte(c)
+			i++
+		}
+		goTy = b.String()
+		if !changed {
+			break
+		}
+	}
+	return goTy
 }
 
 func writeConst(b *strings.Builder, c *constInfo, tm *typeMapper, m *pkgModel) {	switch c.kind {

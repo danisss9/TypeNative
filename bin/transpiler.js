@@ -24,7 +24,7 @@ import { goStdlib } from './go/stdlib.generated.js';
 import { goPackage, goTypeInfo as goMetaTypeInfo, hasGoPackage, isGoNumeric as isGoNumericType } from './go/metadata.js';
 import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
 import { goPathAliases } from './go/overrides.js';
-import { bindBridgeServices, resetGoBridge, initKnownPaths, goLocalType, ensureGoTypePackages, registerGoBuiltin, registerGoImport, goQualifier, goPathOf, goMemberOf, visitGoCall, visitGoMethod, visitGoNew, inferGoType, goFieldType, isGoRefCall, goTupleTypes } from './go/bridge.js';
+import { bindBridgeServices, resetGoBridge, initKnownPaths, goLocalType, ensureGoTypePackages, registerGoBuiltin, registerGoImport, goQualifier, goPathOf, goMemberOf, visitGoCall, visitGoMethod, visitGoNew, inferGoType, goFieldType, isGoRefCall, goTupleTypes, goCallbackResultType } from './go/bridge.js';
 // Shim over the removed `typescript` import: predicates and kind names operate
 // on the normalized JSON AST ({kind: 'Xxx', ...} plain objects) produced by
 // src/parse-node.ts (Node) or the tsparser Go tool (self-hosted).
@@ -2032,7 +2032,13 @@ function visit(node, options = {}) {
         const enclosingFn = getEnclosingFunction(node);
         const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
         const returnGoType = enclosingFn && !isAsync ? inferFunctionBodyReturnType(enclosingFn) : undefined;
-        const value = node.expression ? toGoValueOfType(node.expression, returnGoType) : '';
+        // TS closures passed as Go callbacks return the Go result type
+        const goCallbackResult = enclosingFn ? goCallbackResultType(enclosingFn) : undefined;
+        const value = !node.expression
+            ? ''
+            : goCallbackResult !== undefined
+                ? toGoType(visit(node.expression), inferExpressionType(node.expression) ?? '', goCallbackResult)
+                : toGoValueOfType(node.expression, returnGoType);
         const terminator = options.inline ? '' : ';\n\t';
         if (tryReturn && enclosingFn === tryReturn.fn)
             return tryAwareReturn(value) + terminator;
@@ -2697,6 +2703,8 @@ function toGoValueOfType(expr, goType) {
     }
     // Array reference slots (*[]T): literals take an address, aliases pass through
     if (goType && goType.startsWith('*[]')) {
+        // Go bridge element types are qualified (*[]io/fs.DirEntry)
+        goType = goLocalType(goType);
         if (isIdentifier(expr) && referenceArrays.has(expr.text)) {
             return getSafeName(expr.text);
         }
@@ -8099,7 +8107,8 @@ function bindNodeRegistryServices() {
         isPropertyAccess: (node) => isPropertyAccessExpression(node),
         isArrowFunction: (node) => isArrowFunction(node),
         isFunctionExpression: (node) => isFunctionExpression(node),
-        isObjectLiteral: (node) => isObjectLiteralExpression(node)
+        isObjectLiteral: (node) => isObjectLiteralExpression(node),
+        declareLocal: (name, goType) => registerLocalVariable(name, goType)
     });
 }
 registerCore(nodeRegistry);
@@ -11554,6 +11563,29 @@ function goIterElem(goType) {
     }
     return inner.trim() || 'interface{}';
 }
+// Type args of an iter.Seq[V] / Seq2[K, V].
+function goIterElems(goType) {
+    const start = goType.indexOf('[');
+    const end = goType.lastIndexOf(']');
+    if (start < 0 || end < 0)
+        return [];
+    const inner = goType.slice(start + 1, end);
+    const out = [];
+    let depth = 0;
+    let from = 0;
+    for (let i = 0; i < inner.length; i++) {
+        if (inner[i] === '[' || inner[i] === '(')
+            depth++;
+        else if (inner[i] === ']' || inner[i] === ')')
+            depth--;
+        else if (inner[i] === ',' && depth === 0) {
+            out.push(inner.slice(from, i).trim());
+            from = i + 1;
+        }
+    }
+    out.push(inner.slice(from).trim());
+    return out;
+}
 function visitForOfSequence(node, iterExpr, iterType) {
     if (iterType === 'interface{}')
         iterType = '[]interface{}';
@@ -11562,9 +11594,32 @@ function visitForOfSequence(node, iterExpr, iterType) {
         const declaration = isVariableDeclarationList(node.initializer)
             ? node.initializer.declarations[0]
             : undefined;
+        // Go ints arrive under a temp and re-bind as TS numbers
+        let prefix = '';
+        const bindIterVar = (name, goType) => {
+            if (!name || isOmittedExpression(name) || !isIdentifier(name))
+                return '_';
+            const local = visit(name);
+            if (goType !== 'float64' && isGoNumericKind(goType)) {
+                const raw = getTempName('it');
+                prefix += `${local} := float64(${raw}); _ = ${local};\n\t\t`;
+                registerLocalVariable(name.text, 'float64');
+                return raw;
+            }
+            registerLocalVariable(name.text, goType);
+            return local;
+        };
+        // Seq2 destructures as [key, value]
+        if (declaration && isArrayBindingPattern(declaration.name) && goIterElems(iterType).length === 2) {
+            const elems = goIterElems(iterType);
+            const bound = declaration.name.elements.map((el, i) => bindIterVar(isOmittedExpression(el) ? undefined : el.name, elems[i] ?? 'interface{}'));
+            const key = bound[0] ?? '_';
+            const value = bound[1] ?? '_';
+            return `for ${key}, ${value} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
+        }
         if (declaration && isIdentifier(declaration.name)) {
-            registerLocalVariable(declaration.name.text, goIterElem(iterType));
-            return `for ${visit(declaration.name)} := range ${iterExpr}${visitLoopBody(node.statement)}`;
+            const loopVar = bindIterVar(declaration.name, goIterElem(iterType));
+            return `for ${loopVar} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
         }
         return `for _ = range ${iterExpr}${visitLoopBody(node.statement)}`;
     }

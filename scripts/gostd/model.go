@@ -19,8 +19,11 @@ type paramInfo struct {
 }
 
 type funcInfo struct {
-	name     string
-	tparams  []string
+	name    string
+	tparams []string
+	// Core type of each type param's constraint ("~map[K]V" → "map[K]V"),
+	// "" when it has none; the bridge infers type args through it.
+	tcores   []string
 	params   []paramInfo
 	results  []string
 	variadic bool
@@ -153,6 +156,36 @@ func mentionsUnexported(pkg *types.Package, t types.Type) bool {
 	return found
 }
 
+func sigTypeCores(pkg *types.Package, sig *types.Signature) []string {
+	var out []string
+	if tp := sig.TypeParams(); tp != nil {
+		for i := 0; i < tp.Len(); i++ {
+			out = append(out, coreTypeOf(pkg, tp.At(i).Constraint()))
+		}
+	}
+	return out
+}
+
+// The single type a constraint admits (~[]E, ~map[K]V, func(T) bool), or ""
+// for open constraints (any, comparable, cmp.Ordered).
+func coreTypeOf(pkg *types.Package, constraint types.Type) string {
+	iface, ok := constraint.Underlying().(*types.Interface)
+	if !ok || iface.NumEmbeddeds() != 1 || iface.NumExplicitMethods() != 0 {
+		return ""
+	}
+	emb := iface.EmbeddedType(0)
+	if u, ok := emb.(*types.Union); ok {
+		if u.Len() != 1 {
+			return ""
+		}
+		emb = u.Term(0).Type()
+	}
+	if _, isIface := emb.Underlying().(*types.Interface); isIface {
+		return ""
+	}
+	return goTypeString(pkg, emb)
+}
+
 func sigTypeParams(sig *types.Signature) []string {
 	var out []string
 	if tp := sig.TypeParams(); tp != nil {
@@ -245,7 +278,7 @@ func extractPackage(pkg *types.Package, path string) pkgModel {
 			}
 			params, variadic := sigParams(pkg, sig)
 			m.funcs = append(m.funcs, funcInfo{
-				name: o.Name(), tparams: sigTypeParams(sig),
+				name: o.Name(), tparams: sigTypeParams(sig), tcores: sigTypeCores(pkg, sig),
 				params: params, results: sigResults(pkg, sig), variadic: variadic,
 			})
 		case *types.Const:
@@ -395,12 +428,13 @@ func extractType(pkg *types.Package, tn *types.TypeName) (typeInfo, bool) {
 	// Type aliases resolve to their target. Self-referential aliases
 	// (BuildInfo = BuildInfo via dot-imports) degrade to any.
 	if tn.IsAlias() {
-		target := tn.Type()
+		target := types.Unalias(tn.Type())
 		if mentionsUnexported(pkg, target) {
 			return typeInfo{}, false
 		}
 		under := goTypeString(pkg, target)
-		if baseTypeName(under) == tn.Name() {
+		// Same name in another package is fine (os.FileMode = fs.FileMode).
+		if qp, _ := splitQual(under); (qp == "" || qp == pkg.Path()) && baseTypeName(under) == tn.Name() {
 			return typeInfo{name: tn.Name(), kind: "alias", under: "any"}, true
 		}
 		return typeInfo{name: tn.Name(), kind: "alias", under: under}, true
