@@ -513,7 +513,12 @@ type TnHttpServer struct {
 	headersTimeout float64
 	requestTimeout float64
 	maxHeadersCount interface{}
+	// node:http2 servers (pseudo-headers, the 'stream' API)
+	h2 bool
 }
+
+// Set by node:http2: serves an HTTP/2 request through the 'stream' API (false when not handled)
+var tnHttp2StreamHook func(hs *TnHttpServer, w http.ResponseWriter, r *http.Request) bool
 
 func (hs *TnHttpServer) Get_timeout() float64          { return hs.timeout }
 func (hs *TnHttpServer) Set_timeout(v float64)         { hs.timeout = v }
@@ -530,6 +535,9 @@ func (hs *TnHttpServer) setTimeout(ms float64, cb ...interface{}) *TnHttpServer 
 }
 
 func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if hs.h2 && tnHttp2StreamHook != nil && tnHttp2StreamHook(hs, w, r) {
+		return
+	}
 	TnLoopRef()
 	defer TnLoopUnref()
 	http.NewResponseController(w).EnableFullDuplex()
@@ -548,6 +556,9 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
 			req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
 			tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
+			if hs.h2 && r.ProtoMajor == 2 {
+				tnPseudoHeaders(req, r)
+			}
 			req.socket = tnInfoSocket(local, r.RemoteAddr)
 			if r.TLS != nil {
 				req.socket.encrypted = true
@@ -560,6 +571,36 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	res := <-created
 	req := res.req
+	tnServeOps(w, r, res, func() {
+		if !res.finished {
+			req.aborted = true
+			res.destroy()
+		}
+	}, bodyDone)
+}
+
+// HTTP/2 requests carry :method / :scheme / :authority / :path first, as in Node
+func tnPseudoHeaders(req *TnIncomingMessage, r *http.Request) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	headers := TnNewMap[string, string]()
+	headers.Set(":method", r.Method)
+	headers.Set(":scheme", scheme)
+	headers.Set(":authority", r.Host)
+	headers.Set(":path", r.RequestURI)
+	for k, v := range req.headers.All() {
+		if k != "host" {
+			headers.Set(k, v)
+		}
+	}
+	req.headers = headers
+}
+
+// Applies a response's queued operations on the handler goroutine until it ends
+// (or the client goes away: abort runs on the loop)
+func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, abort func(), bodyDone chan struct{}) {
 	rc := http.NewResponseController(w)
 	for {
 		ended := false
@@ -592,12 +633,7 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-res.signal:
 		case <-r.Context().Done():
-			TnLoopPost(func() {
-				if !res.finished {
-					req.aborted = true
-					res.destroy()
-				}
-			})
+			TnLoopPost(abort)
 			<-bodyDone
 			return
 		}
@@ -1259,6 +1295,7 @@ export function registerHttp(r: NodeRegistry): void {
   const serverListeners = (nodes: any[]): string[] => {
     const name = eventName(nodes);
     if (name === 'request') return ['*TnIncomingMessage', '*TnServerResponse'];
+    if (name === 'stream') return ['*TnHttp2Stream', '*TnMap[string, interface{}]', 'float64'];
     if (name === 'connection') return ['*TnSocket'];
     if (name === 'error' || name === 'clientError') return ['interface{}'];
     return [];

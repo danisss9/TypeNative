@@ -459,6 +459,7 @@ async function runs synchronously until its first `await`.
 | `node:events` (+ `EventTarget`, `AbortController`) | ✅ | [events](#nodeevents)                                      |
 | `node:fs` / `node:fs/promises`              |   ✅    | [fs](#nodefs)                                               |
 | `node:http` / `node:https`                  |   ✅    | [http / https](#nodehttp--nodehttps)                        |
+| `node:http2`                                |   ✅    | [http2](#nodehttp2)                                         |
 | `node:net`                                  |   ✅    | [net](#nodenet)                                             |
 | `node:os`                                   |   ✅    | [os](#nodeos)                                               |
 | `node:path` / `path/posix` / `path/win32`   |   ✅    | [path](#nodepath)                                           |
@@ -738,7 +739,16 @@ async function runs synchronously until its first `await`.
 | `https.createServer({ key, cert })` / `https.request` / `https.get` (`ca`, `rejectUnauthorized`, `servername`, client `key` / `cert`) | ✅ | [lib-node-https.ts](conformance/lib-node-https.ts) | Certificate checks as in [node:tls](#nodetls)                                               |
 | `headers` values                                                                                      |   ✅    | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | Repeated headers are joined with `, ` (`; ` for `cookie`) — including `set-cookie`, which Node keeps as an array: use `headersDistinct['set-cookie']` |
 | `statusMessage` on responses we send, `'upgrade'` / `'connect'` / `'checkContinue'`, `Agent` socket pooling control, trailers we send |   ❌    | —                              | Go's `ResponseWriter` sends its standard reason phrases; no protocol upgrades               |
-| `node:http2`                                                                                          |   ❌    | —                                                              | Not implemented                                                                              |
+
+#### `node:http2`
+
+| API                                                                                                   | Status | Probe                                                                | Notes                                                                 |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `createServer` (cleartext h2c) / `createSecureServer({ key, cert, allowHTTP1 })`; `'stream'` → `ServerHttp2Stream` (`respond`, `write` / `end`, `respondWithFile`, `close`, a Duplex over the request body) with `:method` / `:path` / `:scheme` / `:authority` headers | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts), [lib-node-http2-secure.ts](conformance/lib-node-http2-secure.ts) | On `net/http`'s HTTP/2 (`http.Protocols`) |
+| Compatibility API: `(req, res)` handlers get `Http2ServerRequest` / `Http2ServerResponse` (`httpVersion` `'2.0'`, pseudo-headers in `req.headers`) | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts) | The node:http objects |
+| `connect(authority, { ca, rejectUnauthorized, servername })` → `ClientHttp2Session` (`request`, `close`, `destroy`, `'connect'` / `'error'` / `'close'`, `alpnProtocol`, `encrypted`); `ClientHttp2Stream` (`'response'` with `:status`, body as a Readable, request bodies) | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts), [lib-node-http2-secure.ts](conformance/lib-node-http2-secure.ts) | Connection failures error the session and cancel its streams (`ERR_HTTP2_STREAM_CANCEL`); request bodies are sent once the writable side ends |
+| `constants`, `getDefaultSettings` | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts) | |
+| Server push, `ping`, `settings` / `goaway` / `altsvc`, `'session'` events, `getPackedSettings`, upgrades from HTTP/1 | ❌ | — | Go's standard library does not expose HTTP/2 frames |
 
 #### `node:tls`
 
@@ -799,7 +809,6 @@ async function runs synchronously until its first `await`.
 
 | Module                                                                               | Status | Probe | Notes                                                                                      |
 | ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
-| `node:http2`                                                                         |   ❌    | —     | Not implemented (see [http / https](#nodehttp--nodehttps))                                  |
 | `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
 | `node:test/reporters`                                                                |   ❌    | —     | Custom reporters are not implemented (see [test](#nodetest))                               |
 | `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
