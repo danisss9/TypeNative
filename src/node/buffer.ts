@@ -404,6 +404,8 @@ func TnIsBuffer(v interface{}) bool {
 // TextDecoder: utf-8 (default), utf-16le, latin1
 type TnTextDecoder struct {
 	encoding string
+	pending  []byte
+	started  bool
 }
 
 func TnNewTextDecoder(label string) *TnTextDecoder {
@@ -418,18 +420,79 @@ func TnNewTextDecoder(label string) *TnTextDecoder {
 	panic(TnNodeError("RangeError", "ERR_ENCODING_NOT_SUPPORTED", "The \\""+label+"\\" encoding is not supported"))
 }
 
-func (d *TnTextDecoder) decode(b ...[]byte) string {
-	if len(b) == 0 {
-		return ""
+// Length of an incomplete UTF-8 sequence at the end of b
+func tnUTF8Tail(b []byte) int {
+	for i := 1; i <= 3 && i <= len(b); i++ {
+		c := b[len(b)-i]
+		if c&0xC0 == 0x80 {
+			continue
+		}
+		need := 1
+		switch {
+		case c&0xE0 == 0xC0:
+			need = 2
+		case c&0xF0 == 0xE0:
+			need = 3
+		case c&0xF8 == 0xF0:
+			need = 4
+		}
+		if need > i {
+			return i
+		}
+		return 0
 	}
+	return 0
+}
+
+// decode(input?, { stream }): with stream, a character split across calls is
+// kept for the next one
+func (d *TnTextDecoder) decode(args ...interface{}) string {
+	var b []byte
+	if len(args) > 0 && args[0] != nil {
+		switch x := args[0].(type) {
+		case []byte:
+			b = x
+		case string:
+			b = []byte(x)
+		default:
+			b = TnAs[[]byte](x)
+		}
+	}
+	stream := false
+	if len(args) > 1 && args[1] != nil {
+		stream, _ = TnGet(args[1], "stream").(bool)
+	}
+	data := b
+	if len(d.pending) > 0 {
+		data = append(append([]byte{}, d.pending...), b...)
+		d.pending = nil
+	}
+	if stream {
+		keep := 0
+		switch d.encoding {
+		case "utf-8":
+			keep = tnUTF8Tail(data)
+		case "utf-16le":
+			keep = len(data) % 2
+		}
+		if keep > 0 {
+			d.pending = append([]byte{}, data[len(data)-keep:]...)
+			data = data[:len(data)-keep]
+		}
+	}
+	first := !d.started
+	d.started = stream
 	switch d.encoding {
 	case "utf-16le":
-		return TnBufferToString(b[0], "utf16le")
+		return TnBufferToString(data, "utf16le")
 	case "windows-1252":
-		return TnBufferToString(b[0], "latin1")
+		return TnBufferToString(data, "latin1")
 	}
 	// A leading BOM is dropped
-	return tnDecodeUTF8(bytes.TrimPrefix(b[0], []byte{0xEF, 0xBB, 0xBF}))
+	if first {
+		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	}
+	return tnDecodeUTF8(data)
 }
 
 type TnTextEncoder struct {

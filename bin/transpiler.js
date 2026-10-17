@@ -26,6 +26,7 @@ import { registerHttp } from './node/http.js';
 import { registerTls } from './node/tls.js';
 import { registerDgram } from './node/dgram.js';
 import { registerFetch } from './node/fetch.js';
+import { registerStreamWeb } from './node/stream_web.js';
 import { registerAsyncHooks } from './node/async_hooks.js';
 import { registerTest } from './node/test.js';
 import { registerWorkerThreads } from './node/worker_threads.js';
@@ -1264,11 +1265,16 @@ function visit(node, options = {}) {
                 const localName = visit(el.name);
                 const rawProp = el.propertyName ?? el.name;
                 const propName = isIdentifier(rawProp) ? rawProp.text : visit(rawProp);
+                const structName = initType ? initType.replace(/^\*/, '') : '';
+                // Struct literal fields, or the properties of a class (Node classes included)
                 const fieldType = initType
-                    ? getStructFieldGoType(initType.replace(/^\*/, ''), propName)
+                    ? (getStructFieldGoType(structName, propName) ?? classPropertyTypes.get(structName)?.get(propName))
                     : undefined;
                 const defaultVal = el.initializer;
-                if (defaultVal) {
+                if (!defaultVal && classGetterMethods.has(`${structName}.${propName}`)) {
+                    parts.push(`${localName} := (${initExpr}).Get_${goFieldName(propName)}()`);
+                }
+                else if (defaultVal) {
                     // Missing property (nil) takes the default
                     const defType = inferExpressionType(defaultVal) ?? fieldType ?? 'interface{}';
                     const tmp = getTempName('destructure');
@@ -3615,6 +3621,9 @@ function getAsExpressionType(node) {
         return inferExpressionType(node.expression) ?? 'interface{}';
     }
     const target = getType(node.type);
+    // (x as File): dynamic values holding Node class instances assert to them
+    if (nodeRegistry.classByGoType[target])
+        return target;
     if (isDynamicValue(node.expression) && (isStructGoType(target) || target.startsWith('*'))) {
         return 'interface{}';
     }
@@ -8224,6 +8233,7 @@ registerTls(nodeRegistry);
 registerHttp(nodeRegistry);
 registerDgram(nodeRegistry);
 registerFetch(nodeRegistry);
+registerStreamWeb(nodeRegistry);
 registerAsyncHooks(nodeRegistry);
 registerTest(nodeRegistry);
 registerWorkerThreads(nodeRegistry);
@@ -11905,7 +11915,9 @@ function visitForOfSequence(node, iterExpr, iterType) {
             const valueVar = declaration && isIdentifier(declaration.name) ? visit(declaration.name) : getTempName('item');
             if (declaration && isIdentifier(declaration.name))
                 registerLocalVariable(declaration.name.text, elemType);
-            let awaitPrefix = `${valueVar}, __ok := TnLoopReceive(${chanVar})\n\t\tif !__ok {\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
+            // A rejected iterator (a stream error) throws out of the loop
+            useHelper('promise');
+            let awaitPrefix = `${valueVar}, __ok := TnLoopReceive(${chanVar})\n\t\tif !__ok {\n\t\t\tif __reason, __rejected := tnRejections.Load(${chanVar}); __rejected {\n\t\t\t\tpanic(__reason)\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
             if (declaration && isArrayBindingPattern(declaration.name)) {
                 const memberType = elemType.startsWith('[]') ? elemType.slice(2) : undefined;
                 useHelper('dynamic');

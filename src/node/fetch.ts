@@ -137,21 +137,59 @@ func (h *TnHeaders) toGo(dst http.Header) {
 	}
 }
 
-// A request or response body: bytes, or a reader consumed once
+// A request or response body: bytes, a reader consumed once, or a ReadableStream
 type tnBody struct {
 	data     []byte
 	reader   io.ReadCloser
+	stream   *TnReadableStream
 	hasBody  bool
 	bodyUsed bool
 }
 
+func (b *tnBody) used() bool {
+	return b.bodyUsed || (b.stream != nil && b.stream.disturbed)
+}
+
+// The body as a ReadableStream (null without a body)
+func (b *tnBody) webStream() *TnReadableStream {
+	if !b.hasBody {
+		return nil
+	}
+	if b.stream == nil {
+		if b.reader != nil {
+			b.stream = tnWebFromReader(b.reader)
+			b.reader = nil
+		} else {
+			b.stream = tnWebFromBytes(b.data)
+		}
+		if b.bodyUsed {
+			b.stream.disturbed = true
+		}
+	}
+	return b.stream
+}
+
 func (b *tnBody) consume() chan []byte {
 	ch := make(chan []byte, 1)
-	if b.bodyUsed {
+	if b.used() || (b.stream != nil && b.stream.reader != nil) {
 		TnReject(ch, TnNodeError("TypeError", "", "Body is unusable: Body has already been read"))
 		return ch
 	}
 	b.bodyUsed = true
+	if b.stream != nil {
+		tnWebReadAll(b.stream, func(chunks []interface{}, reason interface{}, failed bool) {
+			if failed {
+				TnReject(ch, reason)
+				return
+			}
+			data := []byte{}
+			for _, c := range chunks {
+				data = append(data, tnWebChunkBytes(c)...)
+			}
+			ch <- data
+		})
+		return ch
+	}
 	if b.reader == nil {
 		ch <- b.data
 		return ch
@@ -204,7 +242,49 @@ func tnBodyJSON(b *tnBody) chan interface{} {
 	return out
 }
 
-// Body init values: strings, Buffers, URLSearchParams, anything with toString
+func tnBodyBlob(b *tnBody, headers *TnHeaders) chan *TnBlob {
+	out := make(chan *TnBlob, 1)
+	src := b.consume()
+	go func() {
+		data, reason, rejected := tnSettle(src)
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		blob := &TnBlob{data: data}
+		if ct := headers.get("content-type"); ct != nil {
+			blob.type_ = tnBlobType(map[string]interface{}{"type": *ct})
+		}
+		out <- blob
+	}()
+	return out
+}
+
+func tnBodyFormData(b *tnBody, headers *TnHeaders) chan *TnFormData {
+	out := make(chan *TnFormData, 1)
+	src := b.consume()
+	go func() {
+		data, reason, rejected := tnSettle(src)
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		ct := ""
+		if h := headers.get("content-type"); h != nil {
+			ct = *h
+		}
+		form, err := tnParseFormData(data, ct)
+		if err != nil {
+			TnReject(out, TnNodeError("TypeError", "", "Response.formData: Could not parse content as FormData."))
+			return
+		}
+		out <- form
+	}()
+	return out
+}
+
+// Body init values: strings, Buffers, URLSearchParams, Blobs, FormData,
+// ReadableStreams, anything with toString
 func tnBodyInit(body interface{}, headers *TnHeaders) *tnBody {
 	b := &tnBody{}
 	if body == nil || TnIsNil(body) {
@@ -219,6 +299,19 @@ func tnBodyInit(body interface{}, headers *TnHeaders) *tnBody {
 		}
 	case []byte:
 		b.data = x
+	case *TnReadableStream:
+		b.stream = x
+	case *TnBlob:
+		b.data = x.data
+		if x.type_ != "" && !headers.has("content-type") {
+			headers.set("content-type", x.type_)
+		}
+	case *TnFormData:
+		data, ct := x.encode()
+		b.data = data
+		if !headers.has("content-type") {
+			headers.set("content-type", ct)
+		}
 	case interface{ Get_size() float64; String() string }:
 		b.data = []byte(x.String())
 		if !headers.has("content-type") {
@@ -245,22 +338,36 @@ type TnResponse struct {
 
 func (r *TnResponse) Get_type_() string { return r.type_ }
 func (r *TnResponse) Get_ok() bool        { return r.status >= 200 && r.status <= 299 }
-func (r *TnResponse) Get_bodyUsed() bool  { return r.body.bodyUsed }
+func (r *TnResponse) Get_bodyUsed() bool  { return r.body.used() }
+func (r *TnResponse) Get_body() *TnReadableStream { return r.body.webStream() }
 func (r *TnResponse) text() chan string   { return tnBodyText(r.body) }
 func (r *TnResponse) json() chan interface{} { return tnBodyJSON(r.body) }
 func (r *TnResponse) bytes() chan []byte  { return r.body.consume() }
 func (r *TnResponse) arrayBuffer() chan []byte { return r.body.consume() }
+func (r *TnResponse) blob() chan *TnBlob  { return tnBodyBlob(r.body, r.headers) }
+func (r *TnResponse) formData() chan *TnFormData { return tnBodyFormData(r.body, r.headers) }
 
-// clone(): both copies can be read (the body is buffered)
+// Stream bodies split into two branches
+func (b *tnBody) cloneStream() *tnBody {
+	branches := b.stream.tee()
+	b.stream = branches[0]
+	return &tnBody{stream: branches[1], hasBody: true}
+}
+
+// clone(): both copies can be read
 func (r *TnResponse) clone() *TnResponse {
-	if r.body.bodyUsed {
+	if r.body.used() {
 		panic(TnNodeError("TypeError", "", "Response.clone: Body has already been consumed."))
 	}
+	// A network body is not read here: both copies stream it (tee)
 	if r.body.reader != nil {
-		data, _ := io.ReadAll(r.body.reader)
-		r.body.reader.Close()
-		r.body.reader = nil
-		r.body.data = data
+		r.body.webStream()
+	}
+	if r.body.stream != nil {
+		c := *r
+		c.headers = TnNewHeaders(r.headers)
+		c.body = r.body.cloneStream()
+		return &c
 	}
 	c := *r
 	c.headers = TnNewHeaders(r.headers)
@@ -321,15 +428,22 @@ type TnRequest struct {
 	body     *tnBody
 }
 
-func (r *TnRequest) Get_bodyUsed() bool    { return r.body.bodyUsed }
+func (r *TnRequest) Get_bodyUsed() bool    { return r.body.used() }
+func (r *TnRequest) Get_body() *TnReadableStream { return r.body.webStream() }
 func (r *TnRequest) text() chan string     { return tnBodyText(r.body) }
 func (r *TnRequest) json() chan interface{} { return tnBodyJSON(r.body) }
 func (r *TnRequest) bytes() chan []byte    { return r.body.consume() }
 func (r *TnRequest) arrayBuffer() chan []byte { return r.body.consume() }
+func (r *TnRequest) blob() chan *TnBlob    { return tnBodyBlob(r.body, r.headers) }
+func (r *TnRequest) formData() chan *TnFormData { return tnBodyFormData(r.body, r.headers) }
 
 func (r *TnRequest) clone() *TnRequest {
 	c := *r
 	c.headers = TnNewHeaders(r.headers)
+	if r.body.stream != nil {
+		c.body = r.body.cloneStream()
+		return &c
+	}
 	c.body = &tnBody{data: r.body.data, hasBody: r.body.hasBody}
 	return &c
 }
@@ -452,7 +566,9 @@ func TnFetch(input interface{}, init ...interface{}) chan *TnResponse {
 		})
 	}
 	var body io.Reader
-	if req.body.hasBody {
+	if req.body.stream != nil {
+		body = tnWebIOReader(req.body.stream)
+	} else if req.body.hasBody {
 		body = bytes.NewReader(req.body.data)
 	}
 	goReq, err := http.NewRequestWithContext(ctx, req.method, req.url, body)
@@ -557,7 +673,7 @@ export function registerFetch(r: NodeRegistry): void {
     r,
     'nodeFetch',
     ['bytes', 'context', 'encoding/json', 'errors', 'fmt', 'io', 'net', 'net/http', 'net/url', 'sort', 'strconv', 'strings', 'sync', 'sync/atomic', 'time'],
-    ['nodeHttp', 'nodeNet', 'netErrors', 'nodeEvents', 'promise', 'buffer', 'dynamic', 'nodeInvoke', 'jsonStringify'],
+    ['nodeHttp', 'nodeNet', 'netErrors', 'nodeEvents', 'promise', 'buffer', 'dynamic', 'nodeInvoke', 'jsonStringify', 'nodeStreamWeb'],
     fetchHelper
   );
   const use = () => r.helper('nodeFetch');
@@ -574,7 +690,8 @@ export function registerFetch(r: NodeRegistry): void {
   r.iterators['*TnHeaders'] = 'tnIterator';
   r.classes['globals.Headers'].methods['tnIterator'] = '[][]string';
   r.paramTypers['globals.Headers#forEach'] = (_n: any[]) => ['string', 'string', '*TnHeaders'];
-  const bodyMethods = 'text=chan string; json=chan interface{}; bytes=chan []byte; arrayBuffer=chan []byte';
+  const bodyMethods =
+    'text=chan string; json=chan interface{}; bytes=chan []byte; arrayBuffer=chan []byte; blob=chan *TnBlob; formData=chan *TnFormData';
   defineClass(
     r,
     'globals.Response',
@@ -582,7 +699,7 @@ export function registerFetch(r: NodeRegistry): void {
     'class',
     `${bodyMethods}; clone=*TnResponse`,
     'status=float64; statusText=string; headers=*TnHeaders; url=string; redirected=bool',
-    'ok=bool; bodyUsed=bool; type=string',
+    'ok=bool; bodyUsed=bool; type=string; body=*TnReadableStream',
     ''
   );
   defineClass(
@@ -592,7 +709,7 @@ export function registerFetch(r: NodeRegistry): void {
     'class',
     `${bodyMethods}; clone=*TnRequest`,
     'url=string; method=string; headers=*TnHeaders; redirect=string; signal=*TnAbortSignal',
-    'bodyUsed=bool',
+    'bodyUsed=bool; body=*TnReadableStream',
     ''
   );
   for (const name of ['Headers', 'Response', 'Request']) r.globals[name] = `globals.${name}`;

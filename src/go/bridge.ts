@@ -521,20 +521,27 @@ function packTuple(temps: string[], types: string[]): string {
 // (A, B, error)); undefined for anything else.
 export function goTupleTypes(node: AstNode): string[] | undefined {
   if (!node || node.kind !== 'CallExpression') return undefined;
-  let results: string[] | undefined;
-  const target = calleeTarget(node.expression);
-  if (target) {
-    const fn = goPackage(target.path)?.funcs[target.member];
-    if (fn) results = instantiateResults(fn, node.arguments ?? []);
-  } else if (services.isPropertyAccess(node.expression)) {
-    const recvType = services.typeOf(node.expression.expression);
-    const method = recvType !== '' ? goMethodInfo(recvType, node.expression.name.text) : null;
-    if (method) results = method.results;
-  }
-  if (!results) return undefined;
+  const results = goCallResults(node);
+  if (results === undefined) return undefined;
   const core = results.length > 0 && results[results.length - 1] === 'error' ? results.slice(0, -1) : results;
   if (core.length < 2) return undefined;
   return core.map((t) => goResultType([t]) ?? 'interface{}');
+}
+
+// Go result types of a call of a Go function or method, undefined when it is not one
+function goCallResults(node: AstNode): string[] | undefined {
+  const target = calleeTarget(node.expression);
+  if (target) {
+    const fn = goPackage(target.path)?.funcs[target.member];
+    if (fn) return instantiateResults(fn, node.arguments ?? []);
+    return undefined;
+  }
+  if (services.isPropertyAccess(node.expression)) {
+    const recvType = services.typeOf(node.expression.expression);
+    const method = recvType !== '' ? goMethodInfo(recvType, node.expression.name.text) : null;
+    if (method) return method.results;
+  }
+  return undefined;
 }
 
 // Wrap a blocking call so it runs on a goroutine while the baton holder

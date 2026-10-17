@@ -919,7 +919,7 @@ declare var TextEncoder: { new (): TextEncoder };
 
 interface TextDecoder {
   readonly encoding: string;
-  decode(input?: Uint8Array): string;
+  decode(input?: Uint8Array, options?: { stream?: boolean }): string;
 }
 declare var TextDecoder: { new (label?: string): TextDecoder };
 
@@ -1025,6 +1025,170 @@ declare var crypto: {
   getRandomValues<T extends Uint8Array>(array: T): T;
 };
 
+// --- Web streams (node:stream/web globals) ---
+
+interface ReadableStreamReadResult<R> {
+  done: boolean;
+  value: R;
+}
+interface ReadableStreamDefaultController<R = any> {
+  readonly desiredSize: number | null;
+  enqueue(chunk?: R): void;
+  close(): void;
+  error(e?: any): void;
+}
+interface UnderlyingSource<R = any> {
+  type?: 'bytes';
+  start?(controller: ReadableStreamDefaultController<R>): any;
+  pull?(controller: ReadableStreamDefaultController<R>): void | PromiseLike<void>;
+  cancel?(reason?: any): void | PromiseLike<void>;
+}
+interface QueuingStrategy<T = any> {
+  highWaterMark?: number;
+  size?(chunk: T): number;
+}
+interface ReadableStreamDefaultReader<R = any> {
+  readonly closed: Promise<void>;
+  read(): Promise<ReadableStreamReadResult<R>>;
+  releaseLock(): void;
+  cancel(reason?: any): Promise<void>;
+}
+interface StreamPipeOptions {
+  preventAbort?: boolean;
+  preventCancel?: boolean;
+  preventClose?: boolean;
+  signal?: AbortSignal;
+}
+interface ReadableWritablePair<R = any, W = any> {
+  readable: ReadableStream<R>;
+  writable: WritableStream<W>;
+}
+interface ReadableStream<R = any> extends AsyncIterable<R> {
+  readonly locked: boolean;
+  getReader(options?: { mode?: undefined }): ReadableStreamDefaultReader<R>;
+  cancel(reason?: any): Promise<void>;
+  tee(): [ReadableStream<R>, ReadableStream<R>];
+  pipeTo(destination: WritableStream<R>, options?: StreamPipeOptions): Promise<void>;
+  pipeThrough<T>(transform: ReadableWritablePair<T, R>, options?: StreamPipeOptions): ReadableStream<T>;
+  values(options?: { preventCancel?: boolean }): AsyncIterableIterator<R>;
+  [Symbol.asyncIterator](): AsyncIterableIterator<R>;
+}
+declare var ReadableStream: {
+  new <R = any>(underlyingSource?: UnderlyingSource<R>, strategy?: QueuingStrategy<R>): ReadableStream<R>;
+  from<T>(iterable: Iterable<T> | AsyncIterable<T>): ReadableStream<T>;
+};
+declare var ReadableStreamDefaultReader: { new <R = any>(stream: ReadableStream<R>): ReadableStreamDefaultReader<R> };
+
+interface WritableStreamDefaultController {
+  readonly signal: AbortSignal;
+  error(e?: any): void;
+}
+interface UnderlyingSink<W = any> {
+  start?(controller: WritableStreamDefaultController): any;
+  write?(chunk: W, controller: WritableStreamDefaultController): void | PromiseLike<void>;
+  close?(): void | PromiseLike<void>;
+  abort?(reason?: any): void | PromiseLike<void>;
+}
+interface WritableStreamDefaultWriter<W = any> {
+  readonly closed: Promise<void>;
+  readonly ready: Promise<void>;
+  readonly desiredSize: number | null;
+  write(chunk?: W): Promise<void>;
+  close(): Promise<void>;
+  abort(reason?: any): Promise<void>;
+  releaseLock(): void;
+}
+interface WritableStream<W = any> {
+  readonly locked: boolean;
+  getWriter(): WritableStreamDefaultWriter<W>;
+  close(): Promise<void>;
+  abort(reason?: any): Promise<void>;
+}
+declare var WritableStream: { new <W = any>(underlyingSink?: UnderlyingSink<W>, strategy?: QueuingStrategy<W>): WritableStream<W> };
+declare var WritableStreamDefaultWriter: { new <W = any>(stream: WritableStream<W>): WritableStreamDefaultWriter<W> };
+
+interface TransformStreamDefaultController<O = any> {
+  readonly desiredSize: number | null;
+  enqueue(chunk?: O): void;
+  error(reason?: any): void;
+  terminate(): void;
+}
+interface Transformer<I = any, O = any> {
+  start?(controller: TransformStreamDefaultController<O>): any;
+  transform?(chunk: I, controller: TransformStreamDefaultController<O>): void | PromiseLike<void>;
+  flush?(controller: TransformStreamDefaultController<O>): void | PromiseLike<void>;
+  cancel?(reason?: any): void | PromiseLike<void>;
+}
+interface TransformStream<I = any, O = any> {
+  readonly readable: ReadableStream<O>;
+  readonly writable: WritableStream<I>;
+}
+declare var TransformStream: {
+  new <I = any, O = any>(transformer?: Transformer<I, O>, writableStrategy?: QueuingStrategy<I>, readableStrategy?: QueuingStrategy<O>): TransformStream<I, O>;
+};
+
+interface TextEncoderStream extends TransformStream<string, Uint8Array> {
+  readonly encoding: 'utf-8';
+}
+declare var TextEncoderStream: { new (): TextEncoderStream };
+interface TextDecoderStream extends TransformStream<Uint8Array, string> {
+  readonly encoding: string;
+  readonly fatal: boolean;
+  readonly ignoreBOM: boolean;
+}
+declare var TextDecoderStream: { new (label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean }): TextDecoderStream };
+type CompressionFormat = 'deflate' | 'deflate-raw' | 'gzip';
+interface CompressionStream extends TransformStream<Uint8Array, Uint8Array> {}
+declare var CompressionStream: { new (format: CompressionFormat): CompressionStream };
+interface DecompressionStream extends TransformStream<Uint8Array, Uint8Array> {}
+declare var DecompressionStream: { new (format: CompressionFormat): DecompressionStream };
+
+interface CountQueuingStrategy extends QueuingStrategy {
+  readonly highWaterMark: number;
+  size(chunk?: any): 1;
+}
+declare var CountQueuingStrategy: { new (init: { highWaterMark: number }): CountQueuingStrategy };
+interface ByteLengthQueuingStrategy extends QueuingStrategy<Uint8Array> {
+  readonly highWaterMark: number;
+  size(chunk: Uint8Array): number;
+}
+declare var ByteLengthQueuingStrategy: { new (init: { highWaterMark: number }): ByteLengthQueuingStrategy };
+
+// --- Blob / File / FormData ---
+
+type BlobPart = string | Uint8Array | Blob;
+interface Blob {
+  readonly size: number;
+  readonly type: string;
+  text(): Promise<string>;
+  bytes(): Promise<Uint8Array>;
+  arrayBuffer(): Promise<Uint8Array>;
+  slice(start?: number, end?: number, contentType?: string): Blob;
+  stream(): ReadableStream<Uint8Array>;
+}
+declare var Blob: { new (blobParts?: BlobPart[], options?: { type?: string }): Blob };
+interface File extends Blob {
+  readonly name: string;
+  readonly lastModified: number;
+}
+declare var File: { new (fileBits: BlobPart[], fileName: string, options?: { type?: string; lastModified?: number }): File };
+
+type FormDataEntryValue = string | File;
+interface FormData extends Iterable<[string, FormDataEntryValue]> {
+  append(name: string, value: string | Blob, fileName?: string): void;
+  set(name: string, value: string | Blob, fileName?: string): void;
+  get(name: string): FormDataEntryValue | null;
+  getAll(name: string): FormDataEntryValue[];
+  has(name: string): boolean;
+  delete(name: string): void;
+  entries(): [string, FormDataEntryValue][];
+  keys(): string[];
+  values(): FormDataEntryValue[];
+  forEach(callback: (value: FormDataEntryValue, key: string, parent: FormData) => void): void;
+  [Symbol.iterator](): Iterator<[string, FormDataEntryValue]>;
+}
+declare var FormData: { new (): FormData };
+
 // --- fetch (WHATWG Fetch API, as in Node) ---
 
 type HeadersInit = Headers | Record<string, string> | [string, string][];
@@ -1043,13 +1207,16 @@ interface Headers {
 }
 declare var Headers: { new (init?: HeadersInit): Headers };
 
-type BodyInit = string | Uint8Array | URLSearchParams;
+type BodyInit = string | Uint8Array | URLSearchParams | Blob | FormData | ReadableStream<Uint8Array | string>;
 interface Body {
+  readonly body: ReadableStream<Uint8Array> | null;
   readonly bodyUsed: boolean;
   text(): Promise<string>;
   json(): Promise<any>;
   bytes(): Promise<Uint8Array>;
   arrayBuffer(): Promise<Uint8Array>;
+  blob(): Promise<Blob>;
+  formData(): Promise<FormData>;
 }
 interface RequestInit {
   method?: string;
@@ -1057,6 +1224,7 @@ interface RequestInit {
   body?: BodyInit | null;
   redirect?: 'follow' | 'manual' | 'error';
   signal?: AbortSignal | null;
+  duplex?: 'half';
 }
 interface Request extends Body {
   readonly url: string;
