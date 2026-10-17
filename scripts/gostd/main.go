@@ -104,7 +104,9 @@ func stdPackages() ([]string, error) {
 		if strings.HasPrefix(p, "cmd/") || strings.HasPrefix(p, "vendor/") || strings.HasPrefix(p, "internal/") {
 			continue
 		}
-		if strings.Contains(p, "/internal/") || strings.Contains(p, "/vendor/") {
+		// Internal packages (log/internal, net/http/internal, ...) can't be
+		// imported from user code.
+		if strings.Contains(p, "/internal/") || strings.HasSuffix(p, "/internal") || strings.Contains(p, "/vendor/") {
 			continue
 		}
 		pkgs = append(pkgs, p)
@@ -115,7 +117,7 @@ func stdPackages() ([]string, error) {
 
 func isExcluded(path string) bool {
 	switch path {
-	case "unsafe", "plugin", "embed", "runtime/race", "runtime/coverage":
+	case "unsafe", "plugin", "embed", "runtime/race", "runtime/coverage", "runtime/cgo":
 		return true
 	}
 	return false
@@ -133,6 +135,8 @@ func excludeReason(path string) string {
 		return "needs `-cover`"
 	case "embed":
 		return "needs a `//go:embed` directive; a later phase"
+	case "runtime/cgo":
+		return "needs cgo"
 	}
 	return ""
 }

@@ -195,7 +195,13 @@ func (tm *typeMapper) mapType(goTy string, pos string) string {
 	if strings.HasPrefix(goTy, "...") {
 		return "..." + tm.mapType(goTy[3:], pos)
 	}
-	// Pointers: transparent in TS.
+	// Pointers to plain basics are ref cells (flag.String → GoRef<string>).
+	if strings.HasPrefix(goTy, "*") && !strings.HasPrefix(goTy, "**") {
+		if ts, ok := basicToTS(goTy[1:]); ok && ts != "any" {
+			return "import('go:builtin').GoRef<" + ts + ">"
+		}
+	}
+	// Other pointers: transparent in TS.
 	for strings.HasPrefix(goTy, "*") {
 		goTy = strings.TrimPrefix(goTy, "*")
 	}
@@ -348,6 +354,89 @@ func basicToTS(goTy string) (string, bool) {
 		return "any", true
 	}
 	return "", false
+}
+
+// Top-level parameter type: what the bridge accepts at a call site, which is
+// wider than the Go type. []byte also takes number[] (copied per call),
+// byte/rune take a one-char string, and nil-able Go types take null.
+func (tm *typeMapper) argType(goTy string) string {
+	goTy = strings.TrimSpace(goTy)
+	ts := tm.mapType(goTy, "param")
+	switch goTy {
+	case "[]byte", "[]uint8":
+		return "Uint8Array | number[] | null"
+	case "byte", "uint8", "rune":
+		return "number | string"
+	}
+	if ts == "any" {
+		return ts
+	}
+	if tm.isNilable(goTy) {
+		if strings.Contains(ts, "=>") {
+			ts = "(" + ts + ")"
+		}
+		return ts + " | null"
+	}
+	return ts
+}
+
+// Whether a Go type has nil as a value (pointer, slice, map, func, chan,
+// interface, or a named type over one of those).
+func (tm *typeMapper) isNilable(goTy string) bool {
+	for _, prefix := range []string{"*", "[]", "map[", "func(", "chan ", "<-chan ", "chan<- "} {
+		if strings.HasPrefix(goTy, prefix) {
+			return true
+		}
+	}
+	if goTy == "error" {
+		return true
+	}
+	qpath, name := splitQual(goTy)
+	base := stripGeneric(name)
+	var ti *typeInfo
+	if qpath == "" || qpath == tm.path {
+		ti = tm.named[base]
+	} else {
+		_, ti = tm.resolve(qpath, base)
+	}
+	if ti == nil {
+		return false
+	}
+	switch ti.kind {
+	case "interface", "slice", "map", "func", "chan":
+		return true
+	}
+	return false
+}
+
+// Render a signature's parameter list. Trailing error params are optional
+// (template.Must(t): the error was already thrown). With arrayVariadic the
+// variadic slot takes a slice instead (exec.Command('go', ['version'])).
+func (tm *typeMapper) renderParams(params []paramInfo, arrayVariadic bool) string {
+	numbered := numberParams(params)
+	optionalFrom := len(numbered)
+	for optionalFrom > 0 && strings.TrimSpace(numbered[optionalFrom-1].typ) == "error" {
+		optionalFrom--
+	}
+	var ps []string
+	for i, p := range numbered {
+		switch {
+		case strings.HasPrefix(p.typ, "...") && arrayVariadic:
+			ps = append(ps, fmt.Sprintf("%s: %s[]", p.name, tm.mapType(p.typ[3:], "param")))
+		case strings.HasPrefix(p.typ, "..."):
+			ps = append(ps, fmt.Sprintf("...%s: %s[]", p.name, tm.mapType(p.typ[3:], "param")))
+		case i >= optionalFrom:
+			ps = append(ps, fmt.Sprintf("%s?: %s", p.name, tm.argType(p.typ)))
+		default:
+			ps = append(ps, fmt.Sprintf("%s: %s", p.name, tm.argType(p.typ)))
+		}
+	}
+	return strings.Join(ps, ", ")
+}
+
+// Whether the last parameter is variadic.
+func hasVariadic(params []paramInfo) bool {
+	return len(params) > 0 && strings.HasPrefix(params[len(params)-1].typ, "...")
 }
 
 // "func(a string, b ...int) (string, error)" → "(a: string, ...b: number[]) => [string]".
@@ -538,6 +627,9 @@ func (tm *typeMapper) mapResults(results []string) string {
 	if hasErr {
 		core = results[:n-1]
 	}
+	if n == 0 {
+		return "void"
+	}
 	if len(core) == 0 {
 		// Error alone: the error value (throws as a statement, captured
 		// as GoError in value position).
@@ -555,9 +647,6 @@ func (tm *typeMapper) mapResults(results []string) string {
 
 // Whether results end in error (for the bridge metadata).
 func resultsHaveError(results []string) bool {
-	for _, r := range results {
-		_ = r
-	}
 	return len(results) > 0 && baseTypeName(results[len(results)-1]) == "error"
 }
 

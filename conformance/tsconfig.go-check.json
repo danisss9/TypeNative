@@ -1,0 +1,7 @@
+{
+  // Type-checks the go:* probes against types/typenative-go.d.ts.
+  // (The other probes are global scripts and redeclare each other.)
+  "extends": "./tsconfig.json",
+  "include": ["lib-go-*.ts", "syntax-import-go.ts"],
+  "compilerOptions": { "noEmit": true }
+}

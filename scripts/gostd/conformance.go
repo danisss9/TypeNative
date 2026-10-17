@@ -56,9 +56,6 @@ var typedOnlyNotes = map[string]string{
 	"structs":                 "Struct field helpers",
 	"io/ioutil":               "Deprecated I/O helpers (Go 1.16)",
 	"text/template/parse":     "Template parse trees",
-	"log/internal":            "Internal log support",
-	"log/slog/internal":       "Internal slog support",
-	"net/http/internal":       "Internal HTTP support",
 	"reflect":                 "Runtime reflection",
 	"hash":                    "Hash function interface",
 	"crypto":                  "Crypto constants and algorithm selection",
@@ -307,7 +304,7 @@ func updateConformance(root string, models []pkgModel) error {
 		fmt.Fprintf(&b, "| `go:%s` | %s | %s | %s |\n", m.path, status, probeCell, notes)
 	}
 	// Excluded packages.
-	for _, p := range []string{"plugin", "unsafe", "runtime/race", "runtime/coverage", "embed"} {
+	for _, p := range []string{"plugin", "unsafe", "runtime/race", "runtime/coverage", "runtime/cgo", "embed"} {
 		fmt.Fprintf(&b, "| `go:%s` | ❌ | — | %s |\n", p, excludeReason(p))
 	}
 	block := b.String()
