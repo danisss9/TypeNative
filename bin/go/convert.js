@@ -89,6 +89,8 @@ export function isGoNumericKind(goType) {
 export function toGo(expr, fromType, toType) {
     if (!toType || toType === 'interface{}' || toType === 'any' || fromType === toType)
         return expr;
+    if (expr === 'nil')
+        return expr;
     // Array references read as the slice they point to.
     if (fromType.startsWith('*[]'))
         fromType = fromType.slice(1);

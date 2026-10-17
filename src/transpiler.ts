@@ -47,7 +47,8 @@ import {
   goFieldType,
   goMethodInfo,
   isGoRefCall,
-  goTupleTypes
+  goTupleTypes,
+  goCallbackResultType
 } from './go/bridge.js';
 
 // Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
@@ -2088,7 +2089,13 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
     const returnGoType =
       enclosingFn && !isAsync ? inferFunctionBodyReturnType(enclosingFn) : undefined;
-    const value = node.expression ? toGoValueOfType(node.expression, returnGoType) : '';
+    // TS closures passed as Go callbacks return the Go result type
+    const goCallbackResult = enclosingFn ? goCallbackResultType(enclosingFn) : undefined;
+    const value = !node.expression
+      ? ''
+      : goCallbackResult !== undefined
+        ? toGoType(visit(node.expression), inferExpressionType(node.expression) ?? '', goCallbackResult)
+        : toGoValueOfType(node.expression, returnGoType);
     const terminator = options.inline ? '' : ';\n\t';
     if (tryReturn && enclosingFn === tryReturn.fn) return tryAwareReturn(value) + terminator;
     return `return ${value}` + terminator;
@@ -2780,6 +2787,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   }
     // Array reference slots (*[]T): literals take an address, aliases pass through
     if (goType && goType.startsWith('*[]')) {
+      // Go bridge element types are qualified (*[]io/fs.DirEntry)
+      goType = goLocalType(goType);
       if (isIdentifier(expr) && referenceArrays.has(expr.text)) {
         return getSafeName(expr.text);
       }
@@ -8287,7 +8296,8 @@ function bindNodeRegistryServices(): void {
     isPropertyAccess: (node: AstNode) => isPropertyAccessExpression(node),
     isArrowFunction: (node: AstNode) => isArrowFunction(node),
     isFunctionExpression: (node: AstNode) => isFunctionExpression(node),
-    isObjectLiteral: (node: AstNode) => isObjectLiteralExpression(node)
+    isObjectLiteral: (node: AstNode) => isObjectLiteralExpression(node),
+    declareLocal: (name: string, goType: string) => registerLocalVariable(name, goType)
   });
 }
 registerCore(nodeRegistry);
@@ -11703,6 +11713,27 @@ function goIterElem(goType: string): string {
   return inner.trim() || 'interface{}';
 }
 
+// Type args of an iter.Seq[V] / Seq2[K, V].
+function goIterElems(goType: string): string[] {
+  const start = goType.indexOf('[');
+  const end = goType.lastIndexOf(']');
+  if (start < 0 || end < 0) return [];
+  const inner = goType.slice(start + 1, end);
+  const out: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < inner.length; i++) {
+    if (inner[i] === '[' || inner[i] === '(') depth++;
+    else if (inner[i] === ']' || inner[i] === ')') depth--;
+    else if (inner[i] === ',' && depth === 0) {
+      out.push(inner.slice(from, i).trim());
+      from = i + 1;
+    }
+  }
+  out.push(inner.slice(from).trim());
+  return out;
+}
+
 function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | undefined): string {
   if (iterType === 'interface{}') iterType = '[]interface{}';
   // Go iter.Seq[V] / Seq2[K, V]: range the func directly.
@@ -11710,9 +11741,33 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     const declaration = isVariableDeclarationList(node.initializer)
       ? node.initializer.declarations[0]
       : undefined;
+    // Go ints arrive under a temp and re-bind as TS numbers
+    let prefix = '';
+    const bindIterVar = (name: AstNode | undefined, goType: string): string => {
+      if (!name || isOmittedExpression(name) || !isIdentifier(name)) return '_';
+      const local = visit(name);
+      if (goType !== 'float64' && isGoNumericKind(goType)) {
+        const raw = getTempName('it');
+        prefix += `${local} := float64(${raw}); _ = ${local};\n\t\t`;
+        registerLocalVariable(name.text, 'float64');
+        return raw;
+      }
+      registerLocalVariable(name.text, goType);
+      return local;
+    };
+    // Seq2 destructures as [key, value]
+    if (declaration && isArrayBindingPattern(declaration.name) && goIterElems(iterType).length === 2) {
+      const elems = goIterElems(iterType);
+      const bound = declaration.name.elements.map((el: AstNode, i: number) =>
+        bindIterVar(isOmittedExpression(el) ? undefined : el.name, elems[i] ?? 'interface{}')
+      );
+      const key = bound[0] ?? '_';
+      const value = bound[1] ?? '_';
+      return `for ${key}, ${value} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
+    }
     if (declaration && isIdentifier(declaration.name)) {
-      registerLocalVariable(declaration.name.text, goIterElem(iterType));
-      return `for ${visit(declaration.name)} := range ${iterExpr}${visitLoopBody(node.statement)}`;
+      const loopVar = bindIterVar(declaration.name, goIterElem(iterType));
+      return `for ${loopVar} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
     }
     return `for _ = range ${iterExpr}${visitLoopBody(node.statement)}`;
   }

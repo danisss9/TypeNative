@@ -747,7 +747,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:errors` | ✅ | [lib-go-errors.ts](conformance/lib-go-errors.ts) | Error creation / wrapping / inspection |
 | `go:expvar` | ✅ | [lib-go-runtime.ts](conformance/lib-go-runtime.ts) | Public process variables |
 | `go:flag` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | Command-line flag parsing |
-| `go:fmt` | ⚠️ | — | Formatted I/O |
+| `go:fmt` | ✅ | [lib-go-fmt.ts](conformance/lib-go-fmt.ts) | Formatted I/O; integer verbs take TS numbers |
 | `go:go/ast` | ⚠️ | — | Go syntax tree |
 | `go:go/build` | ⚠️ | — | Go package build metadata |
 | `go:go/build/constraint` | ⚠️ | — | Build-tag constraint parsing |
@@ -779,13 +779,13 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:image/png` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | PNG decode/encode |
 | `go:index/suffixarray` | ✅ | [lib-go-text.ts](conformance/lib-go-text.ts) | Suffix-array substring search |
 | `go:io` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | Core I/O interfaces (Reader/Writer) |
-| `go:io/fs` | ⚠️ | — | Filesystem abstraction |
-| `go:io/ioutil` | ⚠️ | — | Deprecated I/O helpers (Go 1.16) |
-| `go:iter` | ⚠️ | — | Range-over-func iterator types |
+| `go:io/fs` | ✅ | [lib-go-path-fs.ts](conformance/lib-go-path-fs.ts) | Filesystem abstraction |
+| `go:io/ioutil` | ✅ | [lib-go-path-fs.ts](conformance/lib-go-path-fs.ts) | Deprecated I/O helpers (Go 1.16) |
+| `go:iter` | ✅ | [lib-go-collections.ts](conformance/lib-go-collections.ts) | Range-over-func iterators via `for…of`; `Pull` not bridged |
 | `go:log` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Logging to stderr |
 | `go:log/slog` | ✅ | [lib-go-log.ts](conformance/lib-go-log.ts) | Structured logging |
 | `go:log/syslog` | ⚠️ | — | Unix syslog; no portable probe |
-| `go:maps` | ⚠️ | — | Generic map helpers |
+| `go:maps` | ✅ | [lib-go-collections.ts](conformance/lib-go-collections.ts) | Generic map helpers |
 | `go:math` | ✅ | [lib-go-math.ts](conformance/lib-go-math.ts) | Math functions |
 | `go:math/big` | ⚠️ | — | Arbitrary-precision arithmetic |
 | `go:math/bits` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Bit operations |
@@ -815,7 +815,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:os/exec` | ✅ | [lib-go-exec.ts](conformance/lib-go-exec.ts) | External commands |
 | `go:os/signal` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Signal notification (`Notify` + `Stop`) |
 | `go:os/user` | ⚠️ | — | User lookup |
-| `go:path` | ⚠️ | — | Slash-separated paths |
+| `go:path` | ✅ | [lib-go-path-fs.ts](conformance/lib-go-path-fs.ts) | Slash-separated paths |
 | `go:path/filepath` | ✅ | [lib-go-os.ts](conformance/lib-go-os.ts) | File paths |
 | `go:reflect` | ⚠️ | — | Runtime reflection |
 | `go:regexp` | ✅ | [lib-go-regexp.ts](conformance/lib-go-regexp.ts) | Regular expressions |
@@ -849,7 +849,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:unicode` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | Unicode tables |
 | `go:unicode/utf16` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | UTF-16 encoding |
 | `go:unicode/utf8` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | UTF-8 encoding |
-| `go:unique` | ⚠️ | — | Canonical values |
+| `go:unique` | ✅ | [lib-go-collections.ts](conformance/lib-go-collections.ts) | Canonical values |
 | `go:weak` | ⚠️ | — | Weak pointers |
 | `go:plugin` | ❌ | — | cgo, `-buildmode=plugin` |
 | `go:unsafe` | ❌ | — | raw pointers |

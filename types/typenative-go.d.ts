@@ -103,8 +103,8 @@ declare module 'go:archive/tar' {
 }
 
 declare module 'go:archive/zip' {
-  export type Compressor = (w: import('go:io').Writer) => import('go:io').WriteCloser;
-  export type Decompressor = (r: import('go:io').Reader) => import('go:io').ReadCloser;
+  export type Compressor = ((w: import('go:io').Writer) => import('go:io').WriteCloser);
+  export type Decompressor = ((r: import('go:io').Reader) => import('go:io').ReadCloser);
   export class File {
     constructor(init?: Partial<File>);
     FileHeader: FileHeader;
@@ -255,7 +255,7 @@ declare module 'go:bufio' {
     Split(split: SplitFunc | null): void;
     Text(): string;
   }
-  export type SplitFunc = (data: Uint8Array, atEOF: boolean) => [number, Uint8Array];
+  export type SplitFunc = ((data: Uint8Array, atEOF: boolean) => [number, Uint8Array]);
   export class Writer {
     constructor(init?: Partial<Writer>);
     Available(): number;
@@ -608,8 +608,8 @@ declare module 'go:container/ring' {
 }
 
 declare module 'go:context' {
-  export type CancelCauseFunc = (cause: import('go:builtin').GoError) => void;
-  export type CancelFunc = () => void;
+  export type CancelCauseFunc = ((cause: import('go:builtin').GoError) => void);
+  export type CancelFunc = (() => void);
   export interface Context {
     Deadline(): [import('go:time').Time, boolean];
     Done(): import('go:builtin').GoChan<{  }>;
@@ -1325,8 +1325,8 @@ declare module 'go:crypto/tls' {
     GetCertificate: (arg0: ClientHelloInfo) => Certificate;
     GetClientCertificate: (arg0: CertificateRequestInfo) => Certificate;
     GetConfigForClient: (arg0: ClientHelloInfo) => Config;
-    VerifyPeerCertificate: (rawCerts: Uint8Array[], verifiedChains: import('go:crypto/x509').Certificate[][]) => import('go:builtin').GoError;
-    VerifyConnection: (arg0: ConnectionState) => import('go:builtin').GoError;
+    VerifyPeerCertificate: (rawCerts: Uint8Array[], verifiedChains: import('go:crypto/x509').Certificate[][]) => import('go:builtin').GoError | null;
+    VerifyConnection: (arg0: ConnectionState) => import('go:builtin').GoError | null;
     RootCAs: import('go:crypto/x509').CertPool;
     NextProtos: string[];
     ServerName: string;
@@ -1347,7 +1347,7 @@ declare module 'go:crypto/tls' {
     Renegotiation: number;
     KeyLogWriter: import('go:io').Writer;
     EncryptedClientHelloConfigList: Uint8Array;
-    EncryptedClientHelloRejectionVerify: (arg0: ConnectionState) => import('go:builtin').GoError;
+    EncryptedClientHelloRejectionVerify: (arg0: ConnectionState) => import('go:builtin').GoError | null;
     GetEncryptedClientHelloKeys: (arg0: ClientHelloInfo) => EncryptedClientHelloKey[];
     EncryptedClientHelloKeys: EncryptedClientHelloKey[];
     BuildNameToCertificate(): void;
@@ -1577,7 +1577,7 @@ declare module 'go:crypto/x509' {
   export class CertPool {
     constructor(init?: Partial<CertPool>);
     AddCert(cert: Certificate | null): void;
-    AddCertWithConstraint(cert: Certificate | null, constraint: ((arg0: Certificate[]) => import('go:builtin').GoError) | null): void;
+    AddCertWithConstraint(cert: Certificate | null, constraint: ((arg0: Certificate[]) => import('go:builtin').GoError | null) | null): void;
     AppendCertsFromPEM(pemCerts: Uint8Array | number[] | null): boolean;
     Clone(): CertPool;
     Equal(other: CertPool | null): boolean;
@@ -1931,14 +1931,11 @@ declare module 'go:database/sql' {
     BeginTx(ctx: import('go:context').Context | null, opts: TxOptions | null): Tx;
     Close(): import('go:builtin').GoError;
     ExecContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Result;
-    ExecContext(ctx: import('go:context').Context | null, query: string, args: any[]): Result;
     PingContext(ctx: import('go:context').Context | null): import('go:builtin').GoError;
     PrepareContext(ctx: import('go:context').Context | null, query: string): Stmt;
     QueryContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Rows;
-    QueryContext(ctx: import('go:context').Context | null, query: string, args: any[]): Rows;
     QueryRowContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Row;
-    QueryRowContext(ctx: import('go:context').Context | null, query: string, args: any[]): Row;
-    Raw(f: ((driverConn: any) => import('go:builtin').GoError) | null): import('go:builtin').GoError;
+    Raw(f: ((driverConn: any) => import('go:builtin').GoError | null) | null): import('go:builtin').GoError;
   }
   export class DB {
     constructor(init?: Partial<DB>);
@@ -1948,21 +1945,15 @@ declare module 'go:database/sql' {
     Conn(ctx: import('go:context').Context | null): Conn;
     Driver(): import('go:database/sql/driver').Driver;
     Exec(query: string, ...args: any[]): Result;
-    Exec(query: string, args: any[]): Result;
     ExecContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Result;
-    ExecContext(ctx: import('go:context').Context | null, query: string, args: any[]): Result;
     Ping(): import('go:builtin').GoError;
     PingContext(ctx: import('go:context').Context | null): import('go:builtin').GoError;
     Prepare(query: string): Stmt;
     PrepareContext(ctx: import('go:context').Context | null, query: string): Stmt;
     Query(query: string, ...args: any[]): Rows;
-    Query(query: string, args: any[]): Rows;
     QueryContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Rows;
-    QueryContext(ctx: import('go:context').Context | null, query: string, args: any[]): Rows;
     QueryRow(query: string, ...args: any[]): Row;
-    QueryRow(query: string, args: any[]): Row;
     QueryRowContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Row;
-    QueryRowContext(ctx: import('go:context').Context | null, query: string, args: any[]): Row;
     SetConnMaxIdleTime(d: number): void;
     SetConnMaxLifetime(d: number): void;
     SetMaxIdleConns(n: number): void;
@@ -2063,7 +2054,6 @@ declare module 'go:database/sql' {
     constructor(init?: Partial<Row>);
     Err(): import('go:builtin').GoError;
     Scan(...dest: any[]): import('go:builtin').GoError;
-    Scan(dest: any[]): import('go:builtin').GoError;
   }
   export class Rows {
     constructor(init?: Partial<Rows>);
@@ -2074,7 +2064,6 @@ declare module 'go:database/sql' {
     Next(): boolean;
     NextResultSet(): boolean;
     Scan(...dest: any[]): import('go:builtin').GoError;
-    Scan(dest: any[]): import('go:builtin').GoError;
   }
   export interface Scanner {
     Scan(src: any): import('go:builtin').GoError;
@@ -2083,35 +2072,23 @@ declare module 'go:database/sql' {
     constructor(init?: Partial<Stmt>);
     Close(): import('go:builtin').GoError;
     Exec(...args: any[]): Result;
-    Exec(args: any[]): Result;
     ExecContext(ctx: import('go:context').Context | null, ...args: any[]): Result;
-    ExecContext(ctx: import('go:context').Context | null, args: any[]): Result;
     Query(...args: any[]): Rows;
-    Query(args: any[]): Rows;
     QueryContext(ctx: import('go:context').Context | null, ...args: any[]): Rows;
-    QueryContext(ctx: import('go:context').Context | null, args: any[]): Rows;
     QueryRow(...args: any[]): Row;
-    QueryRow(args: any[]): Row;
     QueryRowContext(ctx: import('go:context').Context | null, ...args: any[]): Row;
-    QueryRowContext(ctx: import('go:context').Context | null, args: any[]): Row;
   }
   export class Tx {
     constructor(init?: Partial<Tx>);
     Commit(): import('go:builtin').GoError;
     Exec(query: string, ...args: any[]): Result;
-    Exec(query: string, args: any[]): Result;
     ExecContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Result;
-    ExecContext(ctx: import('go:context').Context | null, query: string, args: any[]): Result;
     Prepare(query: string): Stmt;
     PrepareContext(ctx: import('go:context').Context | null, query: string): Stmt;
     Query(query: string, ...args: any[]): Rows;
-    Query(query: string, args: any[]): Rows;
     QueryContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Rows;
-    QueryContext(ctx: import('go:context').Context | null, query: string, args: any[]): Rows;
     QueryRow(query: string, ...args: any[]): Row;
-    QueryRow(query: string, args: any[]): Row;
     QueryRowContext(ctx: import('go:context').Context | null, query: string, ...args: any[]): Row;
-    QueryRowContext(ctx: import('go:context').Context | null, query: string, args: any[]): Row;
     Rollback(): import('go:builtin').GoError;
     Stmt(stmt: Stmt | null): Stmt;
     StmtContext(ctx: import('go:context').Context | null, stmt: Stmt | null): Stmt;
@@ -2299,7 +2276,7 @@ declare module 'go:database/sql/driver' {
 }
 
 declare module 'go:debug/buildinfo' {
-  export type BuildInfo = any;
+  export type BuildInfo = import('go:runtime/debug').BuildInfo;
   export function Read(r: import('go:io').ReaderAt | null): BuildInfo;
   export function ReadFile(name: string): BuildInfo;
 }
@@ -6261,7 +6238,7 @@ declare module 'go:expvar' {
     String(): string;
     Value(): number;
   }
-  export type Func = () => any;
+  export type Func = (() => any);
   export class Int {
     constructor(init?: Partial<Int>);
     Add(delta: number): void;
@@ -6320,14 +6297,14 @@ declare module 'go:flag' {
     Arg(i: number): string;
     Args(): string[];
     Bool(name: string, value: boolean, usage: string): import('go:builtin').GoRef<boolean>;
-    BoolFunc(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError) | null): void;
+    BoolFunc(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError | null) | null): void;
     BoolVar(p: import('go:builtin').GoRef<boolean> | null, name: string, value: boolean, usage: string): void;
     Duration(name: string, value: number, usage: string): import('go:time').Duration;
     DurationVar(p: number | null, name: string, value: number, usage: string): void;
     ErrorHandling(): number;
     Float64(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
     Float64Var(p: import('go:builtin').GoRef<number> | null, name: string, value: number, usage: string): void;
-    Func(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError) | null): void;
+    Func(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError | null) | null): void;
     Init(name: string, errorHandling: number): void;
     Int(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
     Int64(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
@@ -6366,13 +6343,13 @@ declare module 'go:flag' {
   export function Arg(i: number): string;
   export function Args(): string[];
   export function Bool(name: string, value: boolean, usage: string): import('go:builtin').GoRef<boolean>;
-  export function BoolFunc(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError) | null): void;
+  export function BoolFunc(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError | null) | null): void;
   export function BoolVar(p: import('go:builtin').GoRef<boolean> | null, name: string, value: boolean, usage: string): void;
   export function Duration(name: string, value: number, usage: string): import('go:time').Duration;
   export function DurationVar(p: number | null, name: string, value: number, usage: string): void;
   export function Float64(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
   export function Float64Var(p: import('go:builtin').GoRef<number> | null, name: string, value: number, usage: string): void;
-  export function Func(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError) | null): void;
+  export function Func(name: string, usage: string, fn: ((arg0: string) => import('go:builtin').GoError | null) | null): void;
   export function Int(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
   export function Int64(name: string, value: number, usage: string): import('go:builtin').GoRef<number>;
   export function Int64Var(p: import('go:builtin').GoRef<number> | null, name: string, value: number, usage: string): void;
@@ -6432,50 +6409,28 @@ declare module 'go:fmt' {
     String(): string;
   }
   export function Append(b: Uint8Array | number[] | null, ...a: any[]): Uint8Array;
-  export function Append(b: Uint8Array | number[] | null, a: any[]): Uint8Array;
   export function Appendf(b: Uint8Array | number[] | null, format: string, ...a: any[]): Uint8Array;
-  export function Appendf(b: Uint8Array | number[] | null, format: string, a: any[]): Uint8Array;
   export function Appendln(b: Uint8Array | number[] | null, ...a: any[]): Uint8Array;
-  export function Appendln(b: Uint8Array | number[] | null, a: any[]): Uint8Array;
   export function Errorf(format: string, ...a: any[]): import('go:builtin').GoError;
-  export function Errorf(format: string, a: any[]): import('go:builtin').GoError;
   export function FormatString(state: State | null, verb: number | string): string;
   export function Fprint(w: import('go:io').Writer | null, ...a: any[]): number;
-  export function Fprint(w: import('go:io').Writer | null, a: any[]): number;
   export function Fprintf(w: import('go:io').Writer | null, format: string, ...a: any[]): number;
-  export function Fprintf(w: import('go:io').Writer | null, format: string, a: any[]): number;
   export function Fprintln(w: import('go:io').Writer | null, ...a: any[]): number;
-  export function Fprintln(w: import('go:io').Writer | null, a: any[]): number;
   export function Fscan(r: import('go:io').Reader | null, ...a: any[]): number;
-  export function Fscan(r: import('go:io').Reader | null, a: any[]): number;
   export function Fscanf(r: import('go:io').Reader | null, format: string, ...a: any[]): number;
-  export function Fscanf(r: import('go:io').Reader | null, format: string, a: any[]): number;
   export function Fscanln(r: import('go:io').Reader | null, ...a: any[]): number;
-  export function Fscanln(r: import('go:io').Reader | null, a: any[]): number;
   export function Print(...a: any[]): number;
-  export function Print(a: any[]): number;
   export function Printf(format: string, ...a: any[]): number;
-  export function Printf(format: string, a: any[]): number;
   export function Println(...a: any[]): number;
-  export function Println(a: any[]): number;
   export function Scan(...a: any[]): number;
-  export function Scan(a: any[]): number;
   export function Scanf(format: string, ...a: any[]): number;
-  export function Scanf(format: string, a: any[]): number;
   export function Scanln(...a: any[]): number;
-  export function Scanln(a: any[]): number;
   export function Sprint(...a: any[]): string;
-  export function Sprint(a: any[]): string;
   export function Sprintf(format: string, ...a: any[]): string;
-  export function Sprintf(format: string, a: any[]): string;
   export function Sprintln(...a: any[]): string;
-  export function Sprintln(a: any[]): string;
   export function Sscan(str: string, ...a: any[]): number;
-  export function Sscan(str: string, a: any[]): number;
   export function Sscanf(str: string, format: string, ...a: any[]): number;
-  export function Sscanf(str: string, format: string, a: any[]): number;
   export function Sscanln(str: string, ...a: any[]): number;
-  export function Sscanln(str: string, a: any[]): number;
 }
 
 declare module 'go:go/ast' {
@@ -6688,7 +6643,7 @@ declare module 'go:go/ast' {
     End(): import('go:go/token').Pos;
     Pos(): import('go:go/token').Pos;
   }
-  export type FieldFilter = (name: string, value: import('go:reflect').Value) => boolean;
+  export type FieldFilter = ((name: string, value: import('go:reflect').Value) => boolean);
   export class FieldList {
     constructor(init?: Partial<FieldList>);
     Opening: import('go:go/token').Pos;
@@ -6714,7 +6669,7 @@ declare module 'go:go/ast' {
     End(): import('go:go/token').Pos;
     Pos(): import('go:go/token').Pos;
   }
-  export type Filter = (arg0: string) => boolean;
+  export type Filter = ((arg0: string) => boolean);
   export class ForStmt {
     constructor(init?: Partial<ForStmt>);
     For: import('go:go/token').Pos;
@@ -6799,7 +6754,7 @@ declare module 'go:go/ast' {
     End(): import('go:go/token').Pos;
     Pos(): import('go:go/token').Pos;
   }
-  export type Importer = (imports: Record<string, Object>, path: string) => Object;
+  export type Importer = ((imports: Record<string, Object>, path: string) => Object);
   export class IncDecStmt {
     constructor(init?: Partial<IncDecStmt>);
     X: Expr;
@@ -7292,7 +7247,7 @@ declare module 'go:go/doc' {
     EmptyOutput: boolean;
     Order: number;
   }
-  export type Filter = (arg0: string) => boolean;
+  export type Filter = ((arg0: string) => boolean);
   export class Func {
     constructor(init?: Partial<Func>);
     Doc: string;
@@ -7354,7 +7309,6 @@ declare module 'go:go/doc' {
   export function IsPredeclared(s: string): boolean;
   export function New(pkg: import('go:go/ast').Package | null, importPath: string, mode: number): Package;
   export function NewFromFiles(fset: import('go:go/token').FileSet | null, files: import('go:go/ast').File[] | null, importPath: string, ...opts: any[]): Package;
-  export function NewFromFiles(fset: import('go:go/token').FileSet | null, files: import('go:go/ast').File[] | null, importPath: string, opts: any[]): Package;
   export function Synopsis(text: string): string;
   export function ToHTML(w: import('go:io').Writer | null, text: string, words: Record<string, string> | null): void;
   export function ToText(w: import('go:io').Writer | null, text: string, prefix: string, codePrefix: string, width: number): void;
@@ -7452,7 +7406,7 @@ declare module 'go:go/format' {
 }
 
 declare module 'go:go/importer' {
-  export type Lookup = (path: string) => import('go:io').ReadCloser;
+  export type Lookup = ((path: string) => import('go:io').ReadCloser);
   export function Default(): import('go:go/types').Importer;
   export function For(compiler: string, lookup: Lookup | null): import('go:go/types').Importer;
   export function ForCompiler(fset: import('go:go/token').FileSet | null, compiler: string, lookup: Lookup | null): import('go:go/types').Importer;
@@ -7506,7 +7460,7 @@ declare module 'go:go/scanner' {
     Msg: string;
     Error(): string;
   }
-  export type ErrorHandler = (pos: import('go:go/token').Position, msg: string) => void;
+  export type ErrorHandler = ((pos: import('go:go/token').Position, msg: string) => void);
   export type ErrorList = Error[];
   export class Scanner {
     constructor(init?: Partial<Scanner>);
@@ -7562,9 +7516,9 @@ declare module 'go:go/token' {
     Iterate(yield_: ((arg0: File) => boolean) | null): void;
     Position(p: number): Position;
     PositionFor(p: number, adjusted: boolean): Position;
-    Read(decode: ((arg0: any) => import('go:builtin').GoError) | null): import('go:builtin').GoError;
+    Read(decode: ((arg0: any) => import('go:builtin').GoError | null) | null): import('go:builtin').GoError;
     RemoveFile(file: File | null): void;
-    Write(encode: ((arg0: any) => import('go:builtin').GoError) | null): import('go:builtin').GoError;
+    Write(encode: ((arg0: any) => import('go:builtin').GoError | null) | null): import('go:builtin').GoError;
   }
   export class Position {
     constructor(init?: Partial<Position>);
@@ -7948,7 +7902,7 @@ declare module 'go:go/types' {
     String(): string;
     Underlying(): Type;
   }
-  export type Qualifier = (arg0: Package) => string;
+  export type Qualifier = ((arg0: Package) => string);
   export class Scope {
     constructor(init?: Partial<Scope>);
     Child(i: number): Scope;
@@ -8348,7 +8302,7 @@ declare module 'go:html/template' {
     Description: string;
     Error(): string;
   }
-  export type FuncMap = any;
+  export type FuncMap = import('go:text/template').FuncMap;
   export type HTML = string;
   export type HTMLAttr = string;
   export type JS = string;
@@ -8363,7 +8317,7 @@ declare module 'go:html/template' {
     Delims(left: string, right: string): Template;
     Execute(wr: import('go:io').Writer | null, data: any): import('go:builtin').GoError;
     ExecuteTemplate(wr: import('go:io').Writer | null, name: string, data: any): import('go:builtin').GoError;
-    Funcs(funcMap: FuncMap): Template;
+    Funcs(funcMap: import('go:text/template').FuncMap): Template;
     Lookup(name: string): Template;
     Name(): string;
     New(name: string): Template;
@@ -8381,12 +8335,10 @@ declare module 'go:html/template' {
   export function HTMLEscape(w: import('go:io').Writer | null, b: Uint8Array | number[] | null): void;
   export function HTMLEscapeString(s: string): string;
   export function HTMLEscaper(...args: any[]): string;
-  export function HTMLEscaper(args: any[]): string;
   export function IsTrue(val: any): [boolean, boolean];
   export function JSEscape(w: import('go:io').Writer | null, b: Uint8Array | number[] | null): void;
   export function JSEscapeString(s: string): string;
   export function JSEscaper(...args: any[]): string;
-  export function JSEscaper(args: any[]): string;
   export function Must(t: Template | null, err?: import('go:builtin').GoError | null): Template;
   export function New(name: string): Template;
   export function ParseFS(fs: import('go:io/fs').FS | null, ...patterns: string[]): Template;
@@ -8395,7 +8347,6 @@ declare module 'go:html/template' {
   export function ParseFiles(filenames: string[]): Template;
   export function ParseGlob(pattern: string): Template;
   export function URLQueryEscaper(...args: any[]): string;
-  export function URLQueryEscaper(args: any[]): string;
   export const ErrAmbigContext: ErrorCode;
   export const ErrBadHTML: ErrorCode;
   export const ErrBranchEnd: ErrorCode;
@@ -9168,7 +9119,7 @@ declare module 'go:io/fs' {
     Open(name: string): File;
     Sub(dir: string): FS;
   }
-  export type WalkDirFunc = (path: string, d: DirEntry, err: import('go:builtin').GoError) => import('go:builtin').GoError;
+  export type WalkDirFunc = ((path: string, d: DirEntry, err: import('go:builtin').GoError) => import('go:builtin').GoError | null);
   export function FileInfoToDirEntry(info: FileInfo | null): DirEntry;
   export function FormatDirEntry(dir: DirEntry | null): string;
   export function FormatFileInfo(info: FileInfo | null): string;
@@ -9217,8 +9168,8 @@ declare module 'go:io/ioutil' {
 }
 
 declare module 'go:iter' {
-  export type Seq<V> = (yield_: (arg0: V) => boolean) => void;
-  export type Seq2<K, V> = (yield_: (arg0: K, arg1: V) => boolean) => void;
+  export type Seq<V> = ((yield_: (arg0: V) => boolean) => void) & Iterable<V>;
+  export type Seq2<K, V> = ((yield_: (arg0: K, arg1: V) => boolean) => void) & Iterable<[K, V]>;
   export function Pull<V>(seq: Seq<V> | null): [() => [V, boolean], () => void];
   export function Pull2<K, V>(seq: Seq2<K, V> | null): [() => [K, V, boolean], () => void];
 }
@@ -9227,26 +9178,17 @@ declare module 'go:log' {
   export class Logger {
     constructor(init?: Partial<Logger>);
     Fatal(...v: any[]): void;
-    Fatal(v: any[]): void;
     Fatalf(format: string, ...v: any[]): void;
-    Fatalf(format: string, v: any[]): void;
     Fatalln(...v: any[]): void;
-    Fatalln(v: any[]): void;
     Flags(): number;
     Output(calldepth: number, s: string): import('go:builtin').GoError;
     Panic(...v: any[]): void;
-    Panic(v: any[]): void;
     Panicf(format: string, ...v: any[]): void;
-    Panicf(format: string, v: any[]): void;
     Panicln(...v: any[]): void;
-    Panicln(v: any[]): void;
     Prefix(): string;
     Print(...v: any[]): void;
-    Print(v: any[]): void;
     Printf(format: string, ...v: any[]): void;
-    Printf(format: string, v: any[]): void;
     Println(...v: any[]): void;
-    Println(v: any[]): void;
     SetFlags(flag: number): void;
     SetOutput(w: import('go:io').Writer | null): void;
     SetPrefix(prefix: string): void;
@@ -9254,27 +9196,18 @@ declare module 'go:log' {
   }
   export function Default(): Logger;
   export function Fatal(...v: any[]): void;
-  export function Fatal(v: any[]): void;
   export function Fatalf(format: string, ...v: any[]): void;
-  export function Fatalf(format: string, v: any[]): void;
   export function Fatalln(...v: any[]): void;
-  export function Fatalln(v: any[]): void;
   export function Flags(): number;
   export function New(out: import('go:io').Writer | null, prefix: string, flag: number): Logger;
   export function Output(calldepth: number, s: string): import('go:builtin').GoError;
   export function Panic(...v: any[]): void;
-  export function Panic(v: any[]): void;
   export function Panicf(format: string, ...v: any[]): void;
-  export function Panicf(format: string, v: any[]): void;
   export function Panicln(...v: any[]): void;
-  export function Panicln(v: any[]): void;
   export function Prefix(): string;
   export function Print(...v: any[]): void;
-  export function Print(v: any[]): void;
   export function Printf(format: string, ...v: any[]): void;
-  export function Printf(format: string, v: any[]): void;
   export function Println(...v: any[]): void;
-  export function Println(v: any[]): void;
   export function SetFlags(flag: number): void;
   export function SetOutput(w: import('go:io').Writer | null): void;
   export function SetPrefix(prefix: string): void;
@@ -9348,29 +9281,19 @@ declare module 'go:log/slog' {
   export class Logger {
     constructor(init?: Partial<Logger>);
     Debug(msg: string, ...args: any[]): void;
-    Debug(msg: string, args: any[]): void;
     DebugContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-    DebugContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
     Enabled(ctx: import('go:context').Context | null, level: number): boolean;
     Error(msg: string, ...args: any[]): void;
-    Error(msg: string, args: any[]): void;
     ErrorContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-    ErrorContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
     Handler(): Handler;
     Info(msg: string, ...args: any[]): void;
-    Info(msg: string, args: any[]): void;
     InfoContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-    InfoContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
     Log(ctx: import('go:context').Context | null, level: number, msg: string, ...args: any[]): void;
-    Log(ctx: import('go:context').Context | null, level: number, msg: string, args: any[]): void;
     LogAttrs(ctx: import('go:context').Context | null, level: number, msg: string, ...attrs: Attr[]): void;
     LogAttrs(ctx: import('go:context').Context | null, level: number, msg: string, attrs: Attr[]): void;
     Warn(msg: string, ...args: any[]): void;
-    Warn(msg: string, args: any[]): void;
     WarnContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-    WarnContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
     With(...args: any[]): Logger;
-    With(args: any[]): Logger;
     WithGroup(name: string): Logger;
   }
   export class MultiHandler {
@@ -9387,7 +9310,6 @@ declare module 'go:log/slog' {
     Level: number;
     PC: number;
     Add(...args: any[]): void;
-    Add(args: any[]): void;
     AddAttrs(...attrs: Attr[]): void;
     AddAttrs(attrs: Attr[]): void;
     Attrs(f: ((arg0: Attr) => boolean) | null): void;
@@ -9429,34 +9351,26 @@ declare module 'go:log/slog' {
   export function Bool(key: string, v: boolean): Attr;
   export function BoolValue(v: boolean): Value;
   export function Debug(msg: string, ...args: any[]): void;
-  export function Debug(msg: string, args: any[]): void;
   export function DebugContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-  export function DebugContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
   export function Default(): Logger;
   export function Duration(key: string, v: number): Attr;
   export function DurationValue(v: number): Value;
   export function Error(msg: string, ...args: any[]): void;
-  export function Error(msg: string, args: any[]): void;
   export function ErrorContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-  export function ErrorContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
   export function Float64(key: string, v: number): Attr;
   export function Float64Value(v: number): Value;
   export function Group(key: string, ...args: any[]): Attr;
-  export function Group(key: string, args: any[]): Attr;
   export function GroupAttrs(key: string, ...attrs: Attr[]): Attr;
   export function GroupAttrs(key: string, attrs: Attr[]): Attr;
   export function GroupValue(...as_: Attr[]): Value;
   export function GroupValue(as_: Attr[]): Value;
   export function Info(msg: string, ...args: any[]): void;
-  export function Info(msg: string, args: any[]): void;
   export function InfoContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-  export function InfoContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
   export function Int(key: string, value: number): Attr;
   export function Int64(key: string, value: number): Attr;
   export function Int64Value(v: number): Value;
   export function IntValue(v: number): Value;
   export function Log(ctx: import('go:context').Context | null, level: number, msg: string, ...args: any[]): void;
-  export function Log(ctx: import('go:context').Context | null, level: number, msg: string, args: any[]): void;
   export function LogAttrs(ctx: import('go:context').Context | null, level: number, msg: string, ...attrs: Attr[]): void;
   export function LogAttrs(ctx: import('go:context').Context | null, level: number, msg: string, attrs: Attr[]): void;
   export function New(h: Handler | null): Logger;
@@ -9475,11 +9389,8 @@ declare module 'go:log/slog' {
   export function Uint64(key: string, v: number): Attr;
   export function Uint64Value(v: number): Value;
   export function Warn(msg: string, ...args: any[]): void;
-  export function Warn(msg: string, args: any[]): void;
   export function WarnContext(ctx: import('go:context').Context | null, msg: string, ...args: any[]): void;
-  export function WarnContext(ctx: import('go:context').Context | null, msg: string, args: any[]): void;
   export function With(...args: any[]): Logger;
-  export function With(args: any[]): Logger;
   export const KindAny: Kind;
   export const KindBool: Kind;
   export const KindDuration: Kind;
@@ -9551,16 +9462,16 @@ declare module 'go:log/syslog' {
 }
 
 declare module 'go:maps' {
-  export function All<Map, K, V>(m: Map): import('go:iter').Seq2<K, V>;
-  export function Clone<M, K, V>(m: M): M;
+  export function All<K, V>(m: Record<string, V> | null): import('go:iter').Seq2<K, V>;
+  export function Clone<K, V>(m: Record<string, V> | null): Record<string, V>;
   export function Collect<K, V>(seq: import('go:iter').Seq2<K, V> | null): Record<string, V>;
-  export function Copy<M1, M2, K, V>(dst: M1, src: M2): void;
-  export function DeleteFunc<M, K, V>(m: M, del: ((arg0: K, arg1: V) => boolean) | null): void;
-  export function Equal<M1, M2, K, V>(m1: M1, m2: M2): boolean;
-  export function EqualFunc<M1, M2, K, V1, V2>(m1: M1, m2: M2, eq: ((arg0: V1, arg1: V2) => boolean) | null): boolean;
-  export function Insert<Map, K, V>(m: Map, seq: import('go:iter').Seq2<K, V> | null): void;
-  export function Keys<Map, K, V>(m: Map): import('go:iter').Seq<K>;
-  export function Values<Map, K, V>(m: Map): import('go:iter').Seq<V>;
+  export function Copy<K, V>(dst: Record<string, V> | null, src: Record<string, V> | null): void;
+  export function DeleteFunc<K, V>(m: Record<string, V> | null, del: ((arg0: K, arg1: V) => boolean) | null): void;
+  export function Equal<K, V>(m1: Record<string, V> | null, m2: Record<string, V> | null): boolean;
+  export function EqualFunc<K, V1, V2>(m1: Record<string, V1> | null, m2: Record<string, V2> | null, eq: ((arg0: V1, arg1: V2) => boolean) | null): boolean;
+  export function Insert<K, V>(m: Record<string, V> | null, seq: import('go:iter').Seq2<K, V> | null): void;
+  export function Keys<K, V>(m: Record<string, V> | null): import('go:iter').Seq<K>;
+  export function Values<K, V>(m: Record<string, V> | null): import('go:iter').Seq<V>;
 }
 
 declare module 'go:math' {
@@ -10201,8 +10112,8 @@ declare module 'go:net' {
     KeepAliveConfig: KeepAliveConfig;
     Resolver: Resolver;
     Cancel: import('go:builtin').GoChan<{  }>;
-    Control: (network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError;
-    ControlContext: (ctx: import('go:context').Context, network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError;
+    Control: (network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError | null;
+    ControlContext: (ctx: import('go:context').Context, network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError | null;
     Dial(network: string, address: string): Conn;
     DialContext(ctx: import('go:context').Context | null, network: string, address: string): Conn;
     DialIP(ctx: import('go:context').Context | null, network: string, laddr: import('go:net/netip').Addr, raddr: import('go:net/netip').Addr): IPConn;
@@ -10276,7 +10187,7 @@ declare module 'go:net' {
   }
   export class ListenConfig {
     constructor(init?: Partial<ListenConfig>);
-    Control: (network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError;
+    Control: (network: string, address: string, c: import('go:syscall').RawConn) => import('go:builtin').GoError | null;
     KeepAlive: import('go:time').Duration;
     KeepAliveConfig: KeepAliveConfig;
     Listen(ctx: import('go:context').Context | null, network: string, address: string): Listener;
@@ -10549,7 +10460,7 @@ declare module 'go:net/http' {
   export class Client {
     constructor(init?: Partial<Client>);
     Transport: RoundTripper;
-    CheckRedirect: (req: Request, via: Request[]) => import('go:builtin').GoError;
+    CheckRedirect: (req: Request, via: Request[]) => import('go:builtin').GoError | null;
     Jar: CookieJar;
     Timeout: import('go:time').Duration;
     CloseIdleConnections(): void;
@@ -10636,7 +10547,7 @@ declare module 'go:net/http' {
   export interface Handler {
     ServeHTTP(arg0: ResponseWriter | null, arg1: Request | null): void;
   }
-  export type HandlerFunc = (arg0: ResponseWriter, arg1: Request) => void;
+  export type HandlerFunc = ((arg0: ResponseWriter, arg1: Request) => void);
   export type Header = Record<string, string[]>;
   export interface Hijacker {
     Hijack(): [import('go:net').Conn, import('go:bufio').ReadWriter];
@@ -10791,7 +10702,7 @@ declare module 'go:net/http' {
   export class Transport {
     constructor(init?: Partial<Transport>);
     Proxy: (arg0: Request) => import('go:net/url').URL;
-    OnProxyConnectResponse: (ctx: import('go:context').Context, proxyURL: import('go:net/url').URL, connectReq: Request, connectRes: Response) => import('go:builtin').GoError;
+    OnProxyConnectResponse: (ctx: import('go:context').Context, proxyURL: import('go:net/url').URL, connectReq: Request, connectRes: Response) => import('go:builtin').GoError | null;
     DialContext: (ctx: import('go:context').Context, network: string, addr: string) => import('go:net').Conn;
     Dial: (network: string, addr: string) => import('go:net').Conn;
     DialTLSContext: (ctx: import('go:context').Context, network: string, addr: string) => import('go:net').Conn;
@@ -11067,7 +10978,7 @@ declare module 'go:net/http/httptrace' {
     PutIdleConn: (err: import('go:builtin').GoError) => void;
     GotFirstResponseByte: () => void;
     Got100Continue: () => void;
-    Got1xxResponse: (code: number, header: import('go:net/textproto').MIMEHeader) => import('go:builtin').GoError;
+    Got1xxResponse: (code: number, header: import('go:net/textproto').MIMEHeader) => import('go:builtin').GoError | null;
     DNSStart: (arg0: DNSStartInfo) => void;
     DNSDone: (arg0: DNSDoneInfo) => void;
     ConnectStart: (network: string, addr: string) => void;
@@ -11132,7 +11043,7 @@ declare module 'go:net/http/httputil' {
     FlushInterval: import('go:time').Duration;
     ErrorLog: import('go:log').Logger;
     BufferPool: BufferPool;
-    ModifyResponse: (arg0: import('go:net/http').Response) => import('go:builtin').GoError;
+    ModifyResponse: (arg0: import('go:net/http').Response) => import('go:builtin').GoError | null;
     ErrorHandler: (arg0: import('go:net/http').ResponseWriter, arg1: import('go:net/http').Request, arg2: import('go:builtin').GoError) => void;
     Director: (arg0: import('go:net/http').Request) => void;
     ServeHTTP(rw: import('go:net/http').ResponseWriter | null, req: import('go:net/http').Request | null): void;
@@ -11406,14 +11317,12 @@ declare module 'go:net/textproto' {
     W: import('go:bufio').Writer;
     Close(): import('go:builtin').GoError;
     Cmd(format: string, ...args: any[]): number;
-    Cmd(format: string, args: any[]): number;
     DotReader(): import('go:io').Reader;
     DotWriter(): import('go:io').WriteCloser;
     EndRequest(id: number): void;
     EndResponse(id: number): void;
     Next(): number;
     PrintfLine(format: string, ...args: any[]): import('go:builtin').GoError;
-    PrintfLine(format: string, args: any[]): import('go:builtin').GoError;
     ReadCodeLine(expectCode: number): [number, string];
     ReadContinuedLine(): string;
     ReadContinuedLineBytes(): Uint8Array;
@@ -11461,7 +11370,6 @@ declare module 'go:net/textproto' {
     W: import('go:bufio').Writer;
     DotWriter(): import('go:io').WriteCloser;
     PrintfLine(format: string, ...args: any[]): import('go:builtin').GoError;
-    PrintfLine(format: string, args: any[]): import('go:builtin').GoError;
   }
   export function CanonicalMIMEHeaderKey(s: string): string;
   export function Dial(network: string, addr: string): Conn;
@@ -11536,11 +11444,11 @@ declare module 'go:net/url' {
 }
 
 declare module 'go:os' {
-  export type DirEntry = any;
+  export type DirEntry = import('go:io/fs').DirEntry;
   export class File {
     constructor(init?: Partial<File>);
     Chdir(): import('go:builtin').GoError;
-    Chmod(mode: FileMode): import('go:builtin').GoError;
+    Chmod(mode: number): import('go:builtin').GoError;
     Chown(uid: number, gid: number): import('go:builtin').GoError;
     Close(): import('go:builtin').GoError;
     Fd(): number;
@@ -11564,8 +11472,8 @@ declare module 'go:os' {
     WriteString(s: string): number;
     WriteTo(w: import('go:io').Writer | null): number;
   }
-  export type FileInfo = any;
-  export type FileMode = any;
+  export type FileInfo = import('go:io/fs').FileInfo;
+  export type FileMode = import('go:io/fs').FileMode;
   export class LinkError {
     constructor(init?: Partial<LinkError>);
     Op: string;
@@ -11575,7 +11483,7 @@ declare module 'go:os' {
     Error(): string;
     Unwrap(): import('go:builtin').GoError;
   }
-  export type PathError = any;
+  export type PathError = import('go:io/fs').PathError;
   export class ProcAttr {
     constructor(init?: Partial<ProcAttr>);
     Dir: string;
@@ -11606,7 +11514,7 @@ declare module 'go:os' {
   }
   export class Root {
     constructor(init?: Partial<Root>);
-    Chmod(name: string, mode: FileMode): import('go:builtin').GoError;
+    Chmod(name: string, mode: number): import('go:builtin').GoError;
     Chown(name: string, uid: number, gid: number): import('go:builtin').GoError;
     Chtimes(name: string, atime: import('go:time').Time, mtime: import('go:time').Time): import('go:builtin').GoError;
     Close(): import('go:builtin').GoError;
@@ -11615,11 +11523,11 @@ declare module 'go:os' {
     Lchown(name: string, uid: number, gid: number): import('go:builtin').GoError;
     Link(oldname: string, newname: string): import('go:builtin').GoError;
     Lstat(name: string): FileInfo;
-    Mkdir(name: string, perm: FileMode): import('go:builtin').GoError;
-    MkdirAll(name: string, perm: FileMode): import('go:builtin').GoError;
+    Mkdir(name: string, perm: number): import('go:builtin').GoError;
+    MkdirAll(name: string, perm: number): import('go:builtin').GoError;
     Name(): string;
     Open(name: string): File;
-    OpenFile(name: string, flag: number, perm: FileMode): File;
+    OpenFile(name: string, flag: number, perm: number): File;
     OpenRoot(name: string): Root;
     ReadFile(name: string): Uint8Array;
     Readlink(name: string): string;
@@ -11628,7 +11536,7 @@ declare module 'go:os' {
     Rename(oldname: string, newname: string): import('go:builtin').GoError;
     Stat(name: string): FileInfo;
     Symlink(oldname: string, newname: string): import('go:builtin').GoError;
-    WriteFile(name: string, data: Uint8Array | number[] | null, perm: FileMode): import('go:builtin').GoError;
+    WriteFile(name: string, data: Uint8Array | number[] | null, perm: number): import('go:builtin').GoError;
   }
   export interface Signal {
     Signal(): void;
@@ -11643,7 +11551,7 @@ declare module 'go:os' {
     Unwrap(): import('go:builtin').GoError;
   }
   export function Chdir(dir: string): import('go:builtin').GoError;
-  export function Chmod(name: string, mode: FileMode): import('go:builtin').GoError;
+  export function Chmod(name: string, mode: number): import('go:builtin').GoError;
   export function Chown(name: string, uid: number, gid: number): import('go:builtin').GoError;
   export function Chtimes(name: string, atime: import('go:time').Time, mtime: import('go:time').Time): import('go:builtin').GoError;
   export function Clearenv(): void;
@@ -11677,13 +11585,13 @@ declare module 'go:os' {
   export function Link(oldname: string, newname: string): import('go:builtin').GoError;
   export function LookupEnv(key: string): [string, boolean];
   export function Lstat(name: string): FileInfo;
-  export function Mkdir(name: string, perm: FileMode): import('go:builtin').GoError;
-  export function MkdirAll(path: string, perm: FileMode): import('go:builtin').GoError;
+  export function Mkdir(name: string, perm: number): import('go:builtin').GoError;
+  export function MkdirAll(path: string, perm: number): import('go:builtin').GoError;
   export function MkdirTemp(dir: string, pattern: string): string;
   export function NewFile(fd: number, name: string): File;
   export function NewSyscallError(syscall: string, err?: import('go:builtin').GoError | null): import('go:builtin').GoError;
   export function Open(name: string): File;
-  export function OpenFile(name: string, flag: number, perm: FileMode): File;
+  export function OpenFile(name: string, flag: number, perm: number): File;
   export function OpenInRoot(dir: string, name: string): File;
   export function OpenRoot(name: string): Root;
   export function Pipe(): [File, File];
@@ -11693,7 +11601,7 @@ declare module 'go:os' {
   export function Remove(name: string): import('go:builtin').GoError;
   export function RemoveAll(path: string): import('go:builtin').GoError;
   export function Rename(oldpath: string, newpath: string): import('go:builtin').GoError;
-  export function SameFile(fi1: FileInfo, fi2: FileInfo): boolean;
+  export function SameFile(fi1: import('go:io/fs').FileInfo, fi2: import('go:io/fs').FileInfo): boolean;
   export function Setenv(key: string, value: string): import('go:builtin').GoError;
   export function StartProcess(name: string, argv: string[] | null, attr: ProcAttr | null): Process;
   export function Stat(name: string): FileInfo;
@@ -11704,7 +11612,7 @@ declare module 'go:os' {
   export function UserCacheDir(): string;
   export function UserConfigDir(): string;
   export function UserHomeDir(): string;
-  export function WriteFile(name: string, data: Uint8Array | number[] | null, perm: FileMode): import('go:builtin').GoError;
+  export function WriteFile(name: string, data: Uint8Array | number[] | null, perm: number): import('go:builtin').GoError;
   export const DevNull: string;
   export const ModeAppend: import('go:io/fs').FileMode;
   export const ModeCharDevice: import('go:io/fs').FileMode;
@@ -11766,7 +11674,7 @@ declare module 'go:os/exec' {
     Process: import('go:os').Process;
     ProcessState: import('go:os').ProcessState;
     Err: import('go:builtin').GoError;
-    Cancel: () => import('go:builtin').GoError;
+    Cancel: () => import('go:builtin').GoError | null;
     WaitDelay: import('go:time').Duration;
     CombinedOutput(): Uint8Array;
     Environ(): string[];
@@ -11867,7 +11775,7 @@ declare module 'go:path' {
 }
 
 declare module 'go:path/filepath' {
-  export type WalkFunc = (path: string, info: import('go:io/fs').FileInfo, err: import('go:builtin').GoError) => import('go:builtin').GoError;
+  export type WalkFunc = ((path: string, info: import('go:io/fs').FileInfo, err: import('go:builtin').GoError) => import('go:builtin').GoError | null);
   export function Abs(path: string): string;
   export function Base(path: string): string;
   export function Clean(path: string): string;
@@ -12610,7 +12518,6 @@ declare module 'go:runtime/trace' {
   export function IsEnabled(): boolean;
   export function Log(ctx: import('go:context').Context | null, category: string, message: string): void;
   export function Logf(ctx: import('go:context').Context | null, category: string, format: string, ...args: any[]): void;
-  export function Logf(ctx: import('go:context').Context | null, category: string, format: string, args: any[]): void;
   export function NewFlightRecorder(cfg: FlightRecorderConfig): FlightRecorder;
   export function NewTask(pctx: import('go:context').Context | null, taskType: string): [import('go:context').Context, Task];
   export function Start(w: import('go:io').Writer | null): import('go:builtin').GoError;
@@ -12620,49 +12527,49 @@ declare module 'go:runtime/trace' {
 }
 
 declare module 'go:slices' {
-  export function All<Slice, E>(s: Slice): import('go:iter').Seq2<number, E>;
-  export function AppendSeq<Slice, E>(s: Slice, seq: import('go:iter').Seq<E> | null): Slice;
-  export function Backward<Slice, E>(s: Slice): import('go:iter').Seq2<number, E>;
-  export function BinarySearch<S, E>(x: S, target: E): [number, boolean];
-  export function BinarySearchFunc<S, E, T>(x: S, target: T, cmp: ((arg0: E, arg1: T) => number) | null): [number, boolean];
-  export function Chunk<Slice, E>(s: Slice, n: number): import('go:iter').Seq<Slice>;
-  export function Clip<S, E>(s: S): S;
-  export function Clone<S, E>(s: S): S;
+  export function All<E>(s: E[] | null): import('go:iter').Seq2<number, E>;
+  export function AppendSeq<E>(s: E[] | null, seq: import('go:iter').Seq<E> | null): E[];
+  export function Backward<E>(s: E[] | null): import('go:iter').Seq2<number, E>;
+  export function BinarySearch<E>(x: E[] | null, target: E): [number, boolean];
+  export function BinarySearchFunc<E, T>(x: E[] | null, target: T, cmp: ((arg0: E, arg1: T) => number) | null): [number, boolean];
+  export function Chunk<E>(s: E[] | null, n: number): import('go:iter').Seq<E[]>;
+  export function Clip<E>(s: E[] | null): E[];
+  export function Clone<E>(s: E[] | null): E[];
   export function Collect<E>(seq: import('go:iter').Seq<E> | null): E[];
-  export function Compact<S, E>(s: S): S;
-  export function CompactFunc<S, E>(s: S, eq: ((arg0: E, arg1: E) => boolean) | null): S;
-  export function Compare<S, E>(s1: S, s2: S): number;
-  export function CompareFunc<S1, S2, E1, E2>(s1: S1, s2: S2, cmp: ((arg0: E1, arg1: E2) => number) | null): number;
-  export function Concat<S, E>(...slices: S[]): S;
-  export function Concat<S, E>(slices: S[]): S;
-  export function Contains<S, E>(s: S, v: E): boolean;
-  export function ContainsFunc<S, E>(s: S, f: ((arg0: E) => boolean) | null): boolean;
-  export function Delete<S, E>(s: S, i: number, j: number): S;
-  export function DeleteFunc<S, E>(s: S, del: ((arg0: E) => boolean) | null): S;
-  export function Equal<S, E>(s1: S, s2: S): boolean;
-  export function EqualFunc<S1, S2, E1, E2>(s1: S1, s2: S2, eq: ((arg0: E1, arg1: E2) => boolean) | null): boolean;
-  export function Grow<S, E>(s: S, n: number): S;
-  export function Index<S, E>(s: S, v: E): number;
-  export function IndexFunc<S, E>(s: S, f: ((arg0: E) => boolean) | null): number;
-  export function Insert<S, E>(s: S, i: number, ...v: E[]): S;
-  export function Insert<S, E>(s: S, i: number, v: E[]): S;
-  export function IsSorted<S, E>(x: S): boolean;
-  export function IsSortedFunc<S, E>(x: S, cmp: ((a: E, b: E) => number) | null): boolean;
-  export function Max<S, E>(x: S): E;
-  export function MaxFunc<S, E>(x: S, cmp: ((a: E, b: E) => number) | null): E;
-  export function Min<S, E>(x: S): E;
-  export function MinFunc<S, E>(x: S, cmp: ((a: E, b: E) => number) | null): E;
-  export function Repeat<S, E>(x: S, count: number): S;
-  export function Replace<S, E>(s: S, i: number, j: number, ...v: E[]): S;
-  export function Replace<S, E>(s: S, i: number, j: number, v: E[]): S;
-  export function Reverse<S, E>(s: S): void;
-  export function Sort<S, E>(x: S): void;
-  export function SortFunc<S, E>(x: S, cmp: ((a: E, b: E) => number) | null): void;
-  export function SortStableFunc<S, E>(x: S, cmp: ((a: E, b: E) => number) | null): void;
+  export function Compact<E>(s: E[] | null): E[];
+  export function CompactFunc<E>(s: E[] | null, eq: ((arg0: E, arg1: E) => boolean) | null): E[];
+  export function Compare<E>(s1: E[] | null, s2: E[] | null): number;
+  export function CompareFunc<E1, E2>(s1: E1[] | null, s2: E2[] | null, cmp: ((arg0: E1, arg1: E2) => number) | null): number;
+  export function Concat<E>(...slices: E[][]): E[];
+  export function Concat<E>(slices: E[][]): E[];
+  export function Contains<E>(s: E[] | null, v: E): boolean;
+  export function ContainsFunc<E>(s: E[] | null, f: ((arg0: E) => boolean) | null): boolean;
+  export function Delete<E>(s: E[] | null, i: number, j: number): E[];
+  export function DeleteFunc<E>(s: E[] | null, del: ((arg0: E) => boolean) | null): E[];
+  export function Equal<E>(s1: E[] | null, s2: E[] | null): boolean;
+  export function EqualFunc<E1, E2>(s1: E1[] | null, s2: E2[] | null, eq: ((arg0: E1, arg1: E2) => boolean) | null): boolean;
+  export function Grow<E>(s: E[] | null, n: number): E[];
+  export function Index<E>(s: E[] | null, v: E): number;
+  export function IndexFunc<E>(s: E[] | null, f: ((arg0: E) => boolean) | null): number;
+  export function Insert<E>(s: E[] | null, i: number, ...v: E[]): E[];
+  export function Insert<E>(s: E[] | null, i: number, v: E[]): E[];
+  export function IsSorted<E>(x: E[] | null): boolean;
+  export function IsSortedFunc<E>(x: E[] | null, cmp: ((a: E, b: E) => number) | null): boolean;
+  export function Max<E>(x: E[] | null): E;
+  export function MaxFunc<E>(x: E[] | null, cmp: ((a: E, b: E) => number) | null): E;
+  export function Min<E>(x: E[] | null): E;
+  export function MinFunc<E>(x: E[] | null, cmp: ((a: E, b: E) => number) | null): E;
+  export function Repeat<E>(x: E[] | null, count: number): E[];
+  export function Replace<E>(s: E[] | null, i: number, j: number, ...v: E[]): E[];
+  export function Replace<E>(s: E[] | null, i: number, j: number, v: E[]): E[];
+  export function Reverse<E>(s: E[] | null): void;
+  export function Sort<E>(x: E[] | null): void;
+  export function SortFunc<E>(x: E[] | null, cmp: ((a: E, b: E) => number) | null): void;
+  export function SortStableFunc<E>(x: E[] | null, cmp: ((a: E, b: E) => number) | null): void;
   export function Sorted<E>(seq: import('go:iter').Seq<E> | null): E[];
   export function SortedFunc<E>(seq: import('go:iter').Seq<E> | null, cmp: ((arg0: E, arg1: E) => number) | null): E[];
   export function SortedStableFunc<E>(seq: import('go:iter').Seq<E> | null, cmp: ((arg0: E, arg1: E) => number) | null): E[];
-  export function Values<Slice, E>(s: Slice): import('go:iter').Seq<E>;
+  export function Values<E>(s: E[] | null): import('go:iter').Seq<E>;
 }
 
 declare module 'go:sort' {
@@ -13860,21 +13767,15 @@ declare module 'go:testing' {
     Context(): import('go:context').Context;
     Elapsed(): import('go:time').Duration;
     Error(...args: any[]): void;
-    Error(args: any[]): void;
     Errorf(format: string, ...args: any[]): void;
-    Errorf(format: string, args: any[]): void;
     Fail(): void;
     FailNow(): void;
     Failed(): boolean;
     Fatal(...args: any[]): void;
-    Fatal(args: any[]): void;
     Fatalf(format: string, ...args: any[]): void;
-    Fatalf(format: string, args: any[]): void;
     Helper(): void;
     Log(...args: any[]): void;
-    Log(args: any[]): void;
     Logf(format: string, ...args: any[]): void;
-    Logf(format: string, args: any[]): void;
     Loop(): boolean;
     Name(): string;
     Output(): import('go:io').Writer;
@@ -13887,10 +13788,8 @@ declare module 'go:testing' {
     SetParallelism(p: number): void;
     Setenv(key: string, value: string): void;
     Skip(...args: any[]): void;
-    Skip(args: any[]): void;
     SkipNow(): void;
     Skipf(format: string, ...args: any[]): void;
-    Skipf(format: string, args: any[]): void;
     Skipped(): boolean;
     StartTimer(): void;
     StopTimer(): void;
@@ -13928,37 +13827,28 @@ declare module 'go:testing' {
   export class F {
     constructor(init?: Partial<F>);
     Add(...args: any[]): void;
-    Add(args: any[]): void;
     ArtifactDir(): string;
     Attr(key: string, value: string): void;
     Chdir(dir: string): void;
     Cleanup(f: (() => void) | null): void;
     Context(): import('go:context').Context;
     Error(...args: any[]): void;
-    Error(args: any[]): void;
     Errorf(format: string, ...args: any[]): void;
-    Errorf(format: string, args: any[]): void;
     Fail(): void;
     FailNow(): void;
     Failed(): boolean;
     Fatal(...args: any[]): void;
-    Fatal(args: any[]): void;
     Fatalf(format: string, ...args: any[]): void;
-    Fatalf(format: string, args: any[]): void;
     Fuzz(ff: any): void;
     Helper(): void;
     Log(...args: any[]): void;
-    Log(args: any[]): void;
     Logf(format: string, ...args: any[]): void;
-    Logf(format: string, args: any[]): void;
     Name(): string;
     Output(): import('go:io').Writer;
     Setenv(key: string, value: string): void;
     Skip(...args: any[]): void;
-    Skip(args: any[]): void;
     SkipNow(): void;
     Skipf(format: string, ...args: any[]): void;
-    Skipf(format: string, args: any[]): void;
     Skipped(): boolean;
     TempDir(): string;
   }
@@ -14001,31 +13891,23 @@ declare module 'go:testing' {
     Context(): import('go:context').Context;
     Deadline(): [import('go:time').Time, boolean];
     Error(...args: any[]): void;
-    Error(args: any[]): void;
     Errorf(format: string, ...args: any[]): void;
-    Errorf(format: string, args: any[]): void;
     Fail(): void;
     FailNow(): void;
     Failed(): boolean;
     Fatal(...args: any[]): void;
-    Fatal(args: any[]): void;
     Fatalf(format: string, ...args: any[]): void;
-    Fatalf(format: string, args: any[]): void;
     Helper(): void;
     Log(...args: any[]): void;
-    Log(args: any[]): void;
     Logf(format: string, ...args: any[]): void;
-    Logf(format: string, args: any[]): void;
     Name(): string;
     Output(): import('go:io').Writer;
     Parallel(): void;
     Run(name: string, f: ((t: T) => void) | null): boolean;
     Setenv(key: string, value: string): void;
     Skip(...args: any[]): void;
-    Skip(args: any[]): void;
     SkipNow(): void;
     Skipf(format: string, ...args: any[]): void;
-    Skipf(format: string, args: any[]): void;
     Skipped(): boolean;
     TempDir(): string;
   }
@@ -14036,29 +13918,21 @@ declare module 'go:testing' {
     Cleanup(arg0: (() => void) | null): void;
     Context(): import('go:context').Context;
     Error(...args: any[]): void;
-    Error(args: any[]): void;
     Errorf(format: string, ...args: any[]): void;
-    Errorf(format: string, args: any[]): void;
     Fail(): void;
     FailNow(): void;
     Failed(): boolean;
     Fatal(...args: any[]): void;
-    Fatal(args: any[]): void;
     Fatalf(format: string, ...args: any[]): void;
-    Fatalf(format: string, args: any[]): void;
     Helper(): void;
     Log(...args: any[]): void;
-    Log(args: any[]): void;
     Logf(format: string, ...args: any[]): void;
-    Logf(format: string, args: any[]): void;
     Name(): string;
     Output(): import('go:io').Writer;
     Setenv(key: string, value: string): void;
     Skip(...args: any[]): void;
-    Skip(args: any[]): void;
     SkipNow(): void;
     Skipf(format: string, ...args: any[]): void;
-    Skipf(format: string, args: any[]): void;
     Skipped(): boolean;
     TempDir(): string;
   }
@@ -14258,12 +14132,10 @@ declare module 'go:text/template' {
   export function HTMLEscape(w: import('go:io').Writer | null, b: Uint8Array | number[] | null): void;
   export function HTMLEscapeString(s: string): string;
   export function HTMLEscaper(...args: any[]): string;
-  export function HTMLEscaper(args: any[]): string;
   export function IsTrue(val: any): [boolean, boolean];
   export function JSEscape(w: import('go:io').Writer | null, b: Uint8Array | number[] | null): void;
   export function JSEscapeString(s: string): string;
   export function JSEscaper(...args: any[]): string;
-  export function JSEscaper(args: any[]): string;
   export function Must(t: Template | null, err?: import('go:builtin').GoError | null): Template;
   export function New(name: string): Template;
   export function ParseFS(fsys: import('go:io/fs').FS | null, ...patterns: string[]): Template;
@@ -14272,7 +14144,6 @@ declare module 'go:text/template' {
   export function ParseFiles(filenames: string[]): Template;
   export function ParseGlob(pattern: string): Template;
   export function URLQueryEscaper(...args: any[]): string;
-  export function URLQueryEscaper(args: any[]): string;
 }
 
 declare module 'go:text/template/parse' {

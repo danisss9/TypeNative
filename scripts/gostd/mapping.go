@@ -293,6 +293,11 @@ func (tm *typeMapper) mapType(goTy string, pos string) string {
 		if _, ok := tm.numerics[base]; ok {
 			return "number"
 		}
+		// Local alias of another package's type (os.FileMode = fs.FileMode):
+		// params take what the target takes (a plain number).
+		if ti := tm.named[base]; ti != nil && ti.kind == "alias" && pos == "param" && len(args) == 0 {
+			return tm.mapType(ti.under, pos)
+		}
 		if len(args) > 0 {
 			var mapped []string
 			for _, a := range args {
@@ -434,9 +439,14 @@ func (tm *typeMapper) renderParams(params []paramInfo, arrayVariadic bool) strin
 	return strings.Join(ps, ", ")
 }
 
-// Whether the last parameter is variadic.
+// Whether the last parameter is variadic over a concrete type (`...any`
+// takes an array as a single value, so it gets no slice overload).
 func hasVariadic(params []paramInfo) bool {
-	return len(params) > 0 && strings.HasPrefix(params[len(params)-1].typ, "...")
+	if len(params) == 0 {
+		return false
+	}
+	last := params[len(params)-1].typ
+	return strings.HasPrefix(last, "...") && last != "...any" && last != "...interface{}"
 }
 
 // "func(a string, b ...int) (string, error)" → "(a: string, ...b: number[]) => [string]".
@@ -454,6 +464,10 @@ func (tm *typeMapper) mapFunc(goTy string, pos string) string {
 	ret := tm.mapResults(splitTopLevel(results))
 	if ret == "void" {
 		return fmt.Sprintf("(%s) => void", strings.Join(ps, ", "))
+	}
+	// A TS callback returning a Go error returns null for nil.
+	if ret == "import('go:builtin').GoError" {
+		ret = "import('go:builtin').GoError | null"
 	}
 	return fmt.Sprintf("(%s) => %s", strings.Join(ps, ", "), ret)
 }

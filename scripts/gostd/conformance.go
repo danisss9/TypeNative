@@ -72,7 +72,7 @@ var typedOnlyNotes = map[string]string{
 	"unique":                  "Canonical values",
 	"weak":                    "Weak pointers",
 	"cmp":                     "Ordered comparison primitives",
-	"iter":                    "Range-over-func iterator types",
+	"iter":                    "Range-over-func iterators via `for…of`; `Pull` not bridged",
 	"maps":                    "Generic map helpers",
 	"slices":                  "Generic slice helpers",
 	"expvar":                  "Public process variables",
@@ -80,7 +80,7 @@ var typedOnlyNotes = map[string]string{
 	"log":                     "Logging to stderr",
 	"context":                 "Cancellation and deadlines",
 	"errors":                  "Error creation / wrapping / inspection",
-	"fmt":                     "Formatted I/O",
+	"fmt":                     "Formatted I/O; integer verbs take TS numbers",
 	"io":                      "Core I/O interfaces (Reader/Writer)",
 	"io/fs":                   "Filesystem abstraction",
 	"sync":                    "Mutexes and wait groups",
@@ -291,6 +291,13 @@ var probeMap = map[string][]string{
 	"crypto/x509": {"lib-go-crypto-keys.ts"},
 	"crypto/x509/pkix": {"lib-go-crypto-keys.ts"},
 	"crypto/tls": {"lib-go-crypto-keys.ts"},
+	"fmt": {"lib-go-fmt.ts"},
+	"path": {"lib-go-path-fs.ts"},
+	"io/fs": {"lib-go-path-fs.ts"},
+	"io/ioutil": {"lib-go-path-fs.ts"},
+	"maps": {"lib-go-collections.ts"},
+	"iter": {"lib-go-collections.ts"},
+	"unique": {"lib-go-collections.ts"},
 }
 
 func updateConformance(root string, models []pkgModel) error {
