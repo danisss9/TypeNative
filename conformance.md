@@ -489,7 +489,7 @@ async function runs synchronously until its first `await`.
 | `join` / `dirname` / `basename` / `extname` / `resolve`             |   ✅    | [lib-node-path.ts](conformance/lib-node-path.ts)                         | Ports of Node's algorithms (not Go's `filepath`): same results as Node |
 | `normalize` / `relative` / `isAbsolute` / `parse` / `format` / `sep` / `delimiter` | ✅ | [lib-node-path-more.ts](conformance/lib-node-path-more.ts) | Trailing separators, `.bashrc`-style extensions, `''` for same paths   |
 | `path.posix` / `path.win32` / `node:path/posix` / `toNamespacedPath` |   ✅    | [lib-node-path-posix-win32.ts](conformance/lib-node-path-posix-win32.ts) | Both flavours on every OS (drive letters, UNC roots); `path` is the platform's |
-| `matchesGlob`                                                       |   ❌    | —                                                                        | Not implemented                                                       |
+| `matchesGlob` (`*`, `**`, `?`, `[...]`, `{a,b}`; no leading-dot matches) |   ✅    | [lib-node-path-glob.ts](conformance/lib-node-path-glob.ts) | minimatch-style patterns compiled to regular expressions |
 
 #### `node:buffer`
 
@@ -501,7 +501,8 @@ async function runs synchronously until its first `await`.
 | `TextEncoder` / `TextDecoder` (`decode(bytes, { stream: true })`), minimal `Uint8Array` |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | `Uint8Array` is `[]byte` too: `length`, indexing, `subarray`, `slice`, `set`            |
 | `read*` / `write*` (U)Int8/16/32 LE/BE, Float, Double                                    |   ✅    | [lib-node-buffer-binary.ts](conformance/lib-node-buffer-binary.ts)             | Out-of-range offsets throw `ERR_OUT_OF_RANGE`                                           |
 | `Blob` / `File` (`size`, `type`, `name`, `lastModified`, `text()` / `bytes()` / `arrayBuffer()`, `slice`, `stream()`); parts of strings, Buffers and Blobs | ✅ | [lib-node-blob.ts](conformance/lib-node-blob.ts) | Also globals; bytes held in memory |
-| BigInt64 reads / writes, `swap16/32/64`, other typed arrays                             |   ❌    | —                                                                              | Not implemented                                                                        |
+| `read/writeBigInt64LE/BE`, `read/writeBigUInt64LE/BE`, `swap16/32/64`; `isUtf8` / `isAscii` / `transcode` / `kMaxLength` | ✅ | [lib-node-buffer-bigint.ts](conformance/lib-node-buffer-bigint.ts) | bigints are `*big.Int` |
+| Typed arrays other than `Uint8Array` (`Int32Array`, `Float64Array`, `DataView`, …) | ❌ | — | Buffers and `Uint8Array`s are `[]byte`; other views are not implemented |
 
 #### `node:fs`
 
@@ -553,7 +554,8 @@ async function runs synchronously until its first `await`.
 | `inspect` (`depth`, `breakLength`, `compact`)                                          |   ✅    | [lib-node-util-inspect.ts](conformance/lib-node-util-inspect.ts) | Node's layout rules: single line up to 80 columns, number arrays grouped in columns, `Map(1) {…}`, `ClassName {…}`, `[Circular *1]` |
 | `isDeepStrictEqual` / `types.*` (`node:util/types`) / `deprecate` / `stripVTControlCharacters` / `styleText` | ✅ | [lib-node-util-misc.ts](conformance/lib-node-util-misc.ts) | `styleText` colours only TTYs unless `validateStream: false`                               |
 | `promisify` / `callbackify`                                                           |   ✅    | [lib-node-util-promisify.ts](conformance/lib-node-util-promisify.ts) | Node functions map to their promise versions at compile time (`fs.readFile`, `setTimeout`, `exec`); other functions are wrapped |
-| `parseArgs` / `inherits` / `inspect.custom` / `getSystemErrorName`                     |   ❌    | —                                                                | Not implemented                                                                           |
+| `parseArgs` (short / long / grouped flags, `multiple`, `default`, `strict`, `allowPositionals`, `allowNegative`, `tokens`, Node's errors), `getSystemErrorName` / `getSystemErrorMessage` / `getSystemErrorMap`, `MIMEType` / `MIMEParams`, `parseEnv` (+ `process.loadEnvFile`), `aborted`, `debuglog` (`NODE_DEBUG`), `toUSVString` | ✅ | [lib-node-util-parse-args.ts](conformance/lib-node-util-parse-args.ts) | |
+| `inherits` (legacy), `inspect.custom` (symbols), `getCallSites` (V8 stack frames) | ❌ | — | Legacy or engine-specific |
 
 #### `node:assert`
 

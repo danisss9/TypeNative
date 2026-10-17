@@ -361,6 +361,61 @@ func TnBufferWriteInt(b []byte, value float64, offset float64, size int, little 
 	return float64(o + size)
 }
 
+// readBigInt64LE & co.: bigints
+func TnBufferReadBigInt64(b []byte, offset float64, little bool, signed bool) *tnbig.Int {
+	o := tnBufferCheck(b, offset, 8)
+	v := tnByteOrder(little).Uint64(b[o:])
+	if signed {
+		return tnbig.NewInt(int64(v))
+	}
+	return new(tnbig.Int).SetUint64(v)
+}
+
+func TnBufferWriteBigInt64(b []byte, value *tnbig.Int, offset float64, little bool, signed bool) float64 {
+	o := tnBufferCheck(b, offset, 8)
+	var v uint64
+	if signed {
+		if !value.IsInt64() {
+			panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"value\\" is out of range. It must be >= -(2n ** 63n) and < 2n ** 63n. Received "+value.String()+"n"))
+		}
+		v = uint64(value.Int64())
+	} else {
+		if !value.IsUint64() {
+			panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"value\\" is out of range. It must be >= 0n and < 2n ** 64n. Received "+value.String()+"n"))
+		}
+		v = value.Uint64()
+	}
+	tnByteOrder(little).PutUint64(b[o:], v)
+	return float64(o + 8)
+}
+
+// swap16 / swap32 / swap64: byte order reversed in place
+func TnBufferSwap(b []byte, size int) []byte {
+	if len(b)%size != 0 {
+		panic(TnNodeError("RangeError", "ERR_INVALID_BUFFER_SIZE", "Buffer size must be a multiple of "+strconv.Itoa(size*8)+"-bits"))
+	}
+	for i := 0; i < len(b); i += size {
+		for j := 0; j < size/2; j++ {
+			b[i+j], b[i+size-1-j] = b[i+size-1-j], b[i+j]
+		}
+	}
+	return b
+}
+
+func TnIsAscii(b []byte) bool {
+	for _, c := range b {
+		if c > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+// buffer.transcode(source, fromEnc, toEnc)
+func TnBufferTranscode(b []byte, from string, to string) []byte {
+	return TnBufferFromString(TnBufferToString(b, from), to)
+}
+
 func TnBufferWriteFloat(b []byte, value float64, offset float64, size int, little bool) float64 {
 	o := tnBufferCheck(b, offset, size)
 	order := tnByteOrder(little)
@@ -539,7 +594,7 @@ export function registerBuffer(r: NodeRegistry): void {
   defineHelper(
     r,
     'buffer',
-    ['bytes', 'encoding/base64', 'encoding/binary', 'encoding/hex', 'fmt', 'math', 'strings', 'unicode/utf16', 'unicode/utf8'],
+    ['bytes', 'encoding/base64', 'encoding/binary', 'encoding/hex', 'fmt', 'math', 'math/big', 'strconv', 'strings', 'unicode/utf16', 'unicode/utf8'],
     ['error', 'dynamic'],
     bufferHelper
   );
@@ -610,6 +665,34 @@ export function registerBuffer(r: NodeRegistry): void {
     return `TnBtoa(${call.args[0]})`;
   };
   setResults(r, 'buffer', 'atob=string; btoa=string');
+  for (const size of [16, 32, 64]) {
+    r.methods[`buffer.Buffer#swap${size}`] = (call: NodeCall) => {
+      use();
+      return `TnBufferSwap(${call.recv}, ${size / 8})`;
+    };
+    r.results[`buffer.Buffer#swap${size}`] = '[]byte';
+  }
+  r.functions['buffer.isUtf8'] = (call: NodeCall) => {
+    r.pkg('unicode/utf8');
+    return `utf8.Valid(${call.args[0]})`;
+  };
+  r.functions['buffer.isAscii'] = (call: NodeCall) => {
+    use();
+    return `TnIsAscii(${call.args[0]})`;
+  };
+  r.functions['buffer.transcode'] = (call: NodeCall) => {
+    use();
+    return `TnBufferTranscode(${call.args.join(', ')})`;
+  };
+  setResults(r, 'buffer', 'isUtf8=bool; isAscii=bool; transcode=[]byte');
+  for (const name of ['kMaxLength', 'constants.MAX_LENGTH']) {
+    r.values[`buffer.${name}`] = (_c: NodeCall) => 'float64(9007199254740991)';
+    r.valueTypes[`buffer.${name}`] = 'float64';
+  }
+  for (const name of ['kStringMaxLength', 'constants.MAX_STRING_LENGTH']) {
+    r.values[`buffer.${name}`] = (_c: NodeCall) => 'float64(536870888)';
+    r.valueTypes[`buffer.${name}`] = 'float64';
+  }
   r.values['buffer.constants.MAX_LENGTH'] = (_c: NodeCall) => 'float64(9007199254740991)';
   r.valueTypes['buffer.constants.MAX_LENGTH'] = 'float64';
 
@@ -676,6 +759,11 @@ export function registerBuffer(r: NodeRegistry): void {
   }
   for (const endian of ['LE', 'BE']) {
     const little = endian === 'LE' ? 'true' : 'false';
+    for (const kind of ['Int', 'UInt', 'Uint']) {
+      const signed = kind === 'Int' ? 'true' : 'false';
+      method(`readBig${kind}64${endian}`, '*tnbig.Int', (c: NodeCall) => `TnBufferReadBigInt64(${c.recv}, ${c.args[0] ?? '0'}, ${little}, ${signed})`);
+      method(`writeBig${kind}64${endian}`, 'float64', (c: NodeCall) => `TnBufferWriteBigInt64(${c.recv}, ${c.args[0]}, ${c.args[1] ?? '0'}, ${little}, ${signed})`);
+    }
     method(`readFloat${endian}`, 'float64', (c: NodeCall) => `TnBufferReadFloat(${c.recv}, ${c.args[0] ?? '0'}, 4, ${little})`);
     method(`readDouble${endian}`, 'float64', (c: NodeCall) => `TnBufferReadFloat(${c.recv}, ${c.args[0] ?? '0'}, 8, ${little})`);
     method(`writeFloat${endian}`, 'float64', (c: NodeCall) => `TnBufferWriteFloat(${c.recv}, ${c.args[0]}, ${c.args[1] ?? '0'}, 4, ${little})`);
