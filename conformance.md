@@ -28,7 +28,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | --------------------------------------- | :----: | -------------------------------------------------------------------------------- | ---------------------------------------------------                      |
 | Variable declarations (`let` / `const`) |   ✅    | [syntax-variables.ts](conformance/syntax-variables.ts)                           |                                                                          |
 | Array destructuring                     |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads           |
-| Object destructuring                    |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads           |
+| Object destructuring                    |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads; the initializer is evaluated once ([lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts)) |
 | Destructuring with defaults             |   ✅    | [syntax-destructuring-defaults.ts](conformance/syntax-destructuring-defaults.ts) | Missing elements/properties take defaults (nil- and bounds-checked)      |
 | Destructured parameters                 |   ✅    | [syntax-destructuring-params.ts](conformance/syntax-destructuring-params.ts)     | `function f({ a, b }: T)`, `([x, y]: number[])`                          |
 | Object shorthand                        |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads           |
@@ -36,7 +36,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Array spread                            |   ✅    | [syntax-array-spread.ts](conformance/syntax-array-spread.ts)                     | `[...arr]`, `fn(...args)`                                                |
 | `delete` operator                       |   ✅    | [syntax-delete.ts](conformance/syntax-delete.ts)                                 | `delete o.key` on records                                                |
 | Computed keys                           |   ✅    | [syntax-computed-keys.ts](conformance/syntax-computed-keys.ts)                   | Computed keys become map entries; `o.name` reads lower to `.Get("name")` |
-| Records / dictionaries                  |   ✅    | [syntax-in-operator.ts](conformance/syntax-in-operator.ts)                       | `Record<K, V>` and objects indexed by key → Go maps                      |
+| Records / dictionaries                  |   ✅    | [syntax-in-operator.ts](conformance/syntax-in-operator.ts)                       | `Record<K, V>` and objects indexed by key → Go maps; so are literals with keys that aren't identifiers (`{ 'Content-Type': … }`, [lib-node-http-server.ts](conformance/lib-node-http-server.ts)) |
 | Tuples                                  |   ✅    | [syntax-tuples.ts](conformance/syntax-tuples.ts)                                 | `[string, number]` fixed-length arrays                                   |
 | Top-level / module-scope variables      |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)               | Functions see main-file top-level variables                              |
 | Numeric separators                      |   ✅    | [syntax-numeric-separators.ts](conformance/syntax-numeric-separators.ts)         | `1_000_000`                                                              |
@@ -215,6 +215,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Feature                                              | Status | Probe                                                        | Notes                                                                                          |
 | ---------------------------------------------------- | :----: | ------------------------------------------------------------ | --------------------------------------                                                         |
 | `async` / `await`                                    |   ✅    | [syntax-async-await.ts](conformance/syntax-async-await.ts)   | The body runs synchronously until its first `await`; `await` runs pending event-loop tasks while it waits; the loop drains before exit |
+| Async arrow callbacks (`emitter.on('x', async () => { await … })`, `test('t', async () => …)`) | ✅ | [lib-node-test.ts](conformance/lib-node-test.ts) | Run to completion when called (their awaits keep the event loop running), so the caller sees them finish before it continues |
 | `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | The executor runs synchronously; promises are buffered channels; `.then` callbacks run on the event loop |
 | `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | `TnPromiseAll` drains every promise channel into a slice                                       |
 | `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                                             |
@@ -280,7 +281,7 @@ Every standard-library API TypeNative ports, split by module. Per
 
 | API              | Status | Probe                                                      | Notes                                                   |
 | ---------------- | :----: | ---------------------------------------------------------- | -------------------------------------                   |
-| `JSON.parse`     |   ✅    | [lib-json-parse.ts](conformance/lib-json-parse.ts)         | Mapped to `encoding/json` `Unmarshal`                   |
+| `JSON.parse`     |   ✅    | [lib-json-parse.ts](conformance/lib-json-parse.ts)         | Mapped to `encoding/json` `Unmarshal`; assigned to an interface type, the result converts into its struct |
 | `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields |
 
 ### `Object`
@@ -398,6 +399,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | API                                                  | Status | Probe                                                        | Notes                                                               |
 | ---------------------------------------------------- | :----: | ------------------------------------------------------------ | ------------------------------------------------------------------- |
 | `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | Channel lowering works (see [Async & timing](#async--timing))       |
+| `resolve` / `reject` passed as values                |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | `new Promise((resolve) => setTimeout(resolve, ms))`                 |
 | `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | Channel lowering works (see [Async & timing](#async--timing))       |
 | `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                  |
 | `Promise.reject` / `.catch` / `.finally`             |   ✅    | [lib-promise-catch.ts](conformance/lib-promise-catch.ts)     | Rejected promises are closed channels with a reason; `await` rethrows |
@@ -425,6 +427,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | Global `isNaN` / `isFinite`                 |   ✅    | [lib-globals.ts](conformance/lib-globals.ts)                       | `math.IsNaN` / `math.IsInf`              |
 | `encodeURIComponent` / `decodeURIComponent` |   ✅    | [lib-uri.ts](conformance/lib-uri.ts)                               | `TnEncodeURIComponent` / `url.PathUnescape` |
 | `structuredClone`                           |   ✅    | [lib-structured-clone.ts](conformance/lib-structured-clone.ts)     | Reflection deep copy                     |
+| `fetch` / `Headers` / `Request` / `Response` |   ✅    | [lib-node-fetch.ts](conformance/lib-node-fetch.ts)                 | See [fetch](#fetch)                      |
+| `MessageChannel` / `MessagePort` / `BroadcastChannel` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | See [worker_threads](#nodeworker_threads) |
+| `__filename` / `__dirname`                  |   ✅    | —                                                                  | The running executable (a native binary has no script file) |
 | `globalThis`                                |   ✅    | [lib-global-this.ts](conformance/lib-global-this.ts)               | `globalThis.x` is the global `x`; `(globalThis as any)` is a dynamic object |
 
 ### Node builtins (`node:*`)
@@ -439,14 +444,19 @@ async function runs synchronously until its first `await`.
 | Module                                      | Status | Section                                                    |
 | ------------------------------------------- | :----: | ---------------------------------------------------------- |
 | `node:assert` / `node:assert/strict`        |   ✅    | [assert](#nodeassert)                                       |
+| `node:async_hooks`                          |   ✅    | [async_hooks](#nodeasync_hooks)                             |
 | `node:buffer` (+ globals `Buffer`, `Uint8Array`, `atob`, `btoa`) | ✅ | [buffer](#nodebuffer)                                 |
 | `node:child_process`                        |   ✅    | [child_process](#nodechild_process)                         |
 | `node:console`                              |   ✅    | [console](#nodeconsole)                                     |
 | `node:constants`                            |   ✅    | [constants](#nodeconstants--nodesys)                        |
 | `node:crypto` (+ global `crypto`)           |   ✅    | [crypto](#nodecrypto)                                       |
+| `node:dgram`                                |   ✅    | [dgram](#nodedgram)                                         |
 | `node:diagnostics_channel`                  |   ✅    | [diagnostics_channel](#nodediagnostics_channel)             |
+| `node:dns` / `node:dns/promises`            |   ✅    | [dns](#nodedns)                                             |
 | `node:events` (+ `EventTarget`, `AbortController`) | ✅ | [events](#nodeevents)                                      |
 | `node:fs` / `node:fs/promises`              |   ✅    | [fs](#nodefs)                                               |
+| `node:http` / `node:https`                  |   ✅    | [http / https](#nodehttp--nodehttps)                        |
+| `node:net`                                  |   ✅    | [net](#nodenet)                                             |
 | `node:os`                                   |   ✅    | [os](#nodeos)                                               |
 | `node:path` / `path/posix` / `path/win32`   |   ✅    | [path](#nodepath)                                           |
 | `node:perf_hooks` (+ global `performance`)  |   ✅    | [perf_hooks](#nodeperf_hooks)                               |
@@ -457,11 +467,15 @@ async function runs synchronously until its first `await`.
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
 | `node:string_decoder`                       |   ✅    | [string_decoder](#nodestring_decoder)                       |
 | `node:sys`                                  |   ✅    | [constants / sys](#nodeconstants--nodesys)                  |
+| `node:test`                                 |   ✅    | [test](#nodetest)                                           |
 | `node:timers` / `node:timers/promises`      |   ✅    | [timers](#nodetimers)                                       |
+| `node:tls`                                  |   ✅    | [tls](#nodetls)                                             |
 | `node:tty`                                  |   ✅    | [tty](#nodetty)                                             |
 | `node:url` (+ globals `URL`, `URLSearchParams`) | ✅  | [url](#nodeurl)                                             |
 | `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
+| `node:worker_threads` (+ globals `MessageChannel`, `MessagePort`, `BroadcastChannel`) | ✅ | [worker_threads](#nodeworker_threads) |
 | `node:zlib`                                 |   ✅    | [zlib](#nodezlib)                                           |
+| Global `fetch` (+ `Headers`, `Request`, `Response`) | ✅ | [fetch](#fetch)                                            |
 
 #### `node:path`
 
@@ -660,16 +674,98 @@ async function runs synchronously until its first `await`.
 | `channel` / `publish` / `subscribe` / `unsubscribe` / `hasSubscribers`               |   ✅    | [lib-node-diagnostics-channel.ts](conformance/lib-node-diagnostics-channel.ts) | Synchronous; shared by name   |
 | `tracingChannel`                                                                     |   ❌    | —                                                                            | Not implemented               |
 
+#### `node:net`
+
+| API                                                                                                   | Status | Probe                                        | Notes                                                                                     |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `createServer` / `Server` (`listen` forms incl. `{ port, host }` and Unix paths, `address()`, `close(cb)`, `getConnections`, `maxConnections`, `ref` / `unref`; `'listening'` / `'connection'` / `'close'` / `'error'`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) | A listening server keeps the process alive; `close()` emits `'close'` once its connections end |
+| `connect` / `createConnection` / `Socket` (a duplex stream: `write` / `end` / `'data'` / `'end'`, `setEncoding`, `remoteAddress` / `remotePort` / `localPort`, `setTimeout` + `'timeout'`, `setNoDelay`, `setKeepAlive`, `destroy`, `'close'(hadError)`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) | One goroutine reads the `net.Conn`; `allowHalfOpen: false` ends the socket after `'end'`, as in Node |
+| Node's errors (`connect ECONNREFUSED 127.0.0.1:80`, `EADDRINUSE`, `ECONNRESET`; `code` / `errno` / `syscall` / `address` / `port`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                           |
+| `isIP` / `isIPv4` / `isIPv6`                                                                           |   ✅    | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                         |
+| `BlockList` / `SocketAddress` / `net.Stream` / `autoSelectFamily` / IPC handle passing                 |   ❌    | —                                            | Not implemented                                                                           |
+
+#### `node:dns`
+
+| API                                                                                    | Status | Probe                                        | Notes                                                                 |
+| -------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | --------------------------------------------------------------------- |
+| `lookup` (`family`, `all`) and `dns/promises` / `dns.promises` `lookup`                 |   ✅    | [lib-node-dns.ts](conformance/lib-node-dns.ts) | Go's resolver; `getaddrinfo ENOTFOUND host` errors with `hostname`   |
+| `resolve` (rrtype) / `resolve4` / `resolve6` / `resolveCname` / `resolveMx` / `resolveTxt` / `resolveNs` / `resolveSrv` / `reverse` (callback and promise forms), `getServers` | ✅ | — | Implemented, not probed (needs a network); `getServers` reads `/etc/resolv.conf` |
+| `Resolver` class / `setServers` / `lookupService` / `resolveAny` / `ttl` option         |   ❌    | —                                            | Go's resolver has no per-query server selection                       |
+
+#### `node:http` / `node:https`
+
+| API                                                                                                   | Status | Probe                                                          | Notes                                                                                        |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `createServer((req, res) => …)` / `'request'`; `IncomingMessage` (a Readable: `method`, `url`, `headers`, `headersDistinct`, `rawHeaders`, `httpVersion`, `socket.remoteAddress`) | ✅ | [lib-node-http-server.ts](conformance/lib-node-http-server.ts) | Go's `net/http` serves the connections; bodies stream into the request                       |
+| `ServerResponse` (a Writable: `statusCode`, `setHeader` / `getHeader` / `getHeaders` / `hasHeader` / `removeHeader` / `appendHeader`, `writeHead`, `write`, `end`, `headersSent`, `'finish'`) | ✅ | [lib-node-http-server.ts](conformance/lib-node-http-server.ts) | `end(data)` without earlier writes sends a `Content-Length`; `write()` streams a chunked body |
+| `request` / `get` (URL strings, `URL` objects, options: `hostname` / `port` / `path` / `method` / `headers` / `auth` / `timeout` / `signal` / `socketPath`); `ClientRequest` (`setHeader`, `write`, `end`, `destroy`, `'response'`, `'error'`, `'timeout'`) | ✅ | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | No redirects are followed and bodies are not decompressed, as in Node; `destroy()` before a response fails with `socket hang up` |
+| `STATUS_CODES` / `METHODS` / `maxHeaderSize` / `Agent` / `globalAgent`                                |   ✅    | [lib-node-http-server.ts](conformance/lib-node-http-server.ts) | `Agent` options are accepted; Go's transport pools connections                               |
+| `https.createServer({ key, cert })` / `https.request` / `https.get` (`ca`, `rejectUnauthorized`, `servername`, client `key` / `cert`) | ✅ | [lib-node-https.ts](conformance/lib-node-https.ts) | Certificate checks as in [node:tls](#nodetls)                                               |
+| `headers` values                                                                                      |   ✅    | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | Repeated headers are joined with `, ` (`; ` for `cookie`) — including `set-cookie`, which Node keeps as an array: use `headersDistinct['set-cookie']` |
+| `statusMessage` on responses we send, `'upgrade'` / `'connect'` / `'checkContinue'`, `Agent` socket pooling control, trailers we send |   ❌    | —                              | Go's `ResponseWriter` sends its standard reason phrases; no protocol upgrades               |
+| `node:http2`                                                                                          |   ❌    | —                                                              | Not implemented                                                                              |
+
+#### `node:tls`
+
+| API                                                                                                   | Status | Probe                                        | Notes                                                                                       |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `createServer({ key, cert, ca, requestCert, ALPNProtocols, minVersion, maxVersion }, cb)` / `'secureConnection'` | ✅ | [lib-node-tls.ts](conformance/lib-node-tls.ts) | Handshakes run on the accept goroutine                                                    |
+| `connect` (`host`, `port`, `ca`, `servername`, `rejectUnauthorized`, client `key` / `cert`) / `'secureConnect'`; `TLSSocket` (`authorized`, `authorizationError`, `encrypted`, `alpnProtocol`, `getPeerCertificate`, `getProtocol`, `getCipher`) | ✅ | [lib-node-tls.ts](conformance/lib-node-tls.ts) | Node's verification codes: `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID` |
+| `createSecureContext` / `getCiphers` / `DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`                   |   ✅    | —                                            | Implemented, not probed; cipher names are Go's                                              |
+| PFX / passphrase-protected keys, `checkServerIdentity`, session resumption, `renegotiate`, `rootCertificates` |   ❌    | —                                     | Not implemented                                                                             |
+
+#### `node:dgram`
+
+| API                                                                                       | Status | Probe                                          | Notes                                         |
+| ----------------------------------------------------------------------------------------- | :----: | ---------------------------------------------- | --------------------------------------------- |
+| `createSocket('udp4' \| 'udp6' \| { type })`, `bind`, `send` (offset / length forms, callback), `'message'(msg, rinfo)`, `address`, `close`, `connect` / `disconnect` / `remoteAddress`, `ref` / `unref` | ✅ | [lib-node-dgram.ts](conformance/lib-node-dgram.ts) | `send` binds an unbound socket first, as in Node |
+| Multicast membership, `setBroadcast` / `setTTL` effects                                   |   ❌    | —                                              | Accepted without effect                       |
+
+#### `fetch`
+
+| API                                                                                                   | Status | Probe                                            | Notes                                                                                      |
+| ----------------------------------------------------------------------------------------------------- | :----: | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `fetch(url \| Request, { method, headers, body, redirect, signal })`; `Response` (`status`, `ok`, `statusText`, `headers`, `url`, `redirected`, `text()` / `json()` / `bytes()` / `arrayBuffer()`, `clone()`, `Response.json` / `error` / `redirect`) | ✅ | [lib-node-fetch.ts](conformance/lib-node-fetch.ts) | Follows redirects (`manual` / `error` too); gzip bodies are decompressed; failures reject with `TypeError('fetch failed')` whose `cause` is the system error; aborts reject with `AbortError` |
+| `Headers` (`get` / `set` / `append` / `has` / `delete` / `forEach` / `entries` / `getSetCookie`, `for...of`) / `Request` |   ✅    | [lib-node-fetch.ts](conformance/lib-node-fetch.ts) | Names are lower-cased and iterated in sorted order                                         |
+| Streaming bodies (`response.body` as a `ReadableStream`), `FormData`, `Blob`, the fetch bad-port list |   ❌    | —                                                | Web streams are not implemented                                                            |
+
+#### `node:async_hooks`
+
+| API                                                                                                  | Status | Probe                                                      | Notes                                                                                                   |
+| ---------------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `AsyncLocalStorage` (`run`, `getStore`, `enterWith`, `exit`, `disable`, static `bind` / `snapshot`)    |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | The store follows timers, `setImmediate`, `nextTick`, microtasks, promise callbacks, `await`, async function bodies, fs / dns callbacks; streams, sockets and servers emit in the context they were created / listened in |
+| `AsyncResource` (`runInAsyncScope`, `bind`, `asyncId`, static `bind`)                                 |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | Captures the context it is created in                                                                   |
+| `createHook` callbacks (`init` / `before` / `after` / `destroy`), real `executionAsyncId` / `triggerAsyncId` |   ❌    | —                                                  | `createHook` is accepted but never calls back; ids are always `1` / `0`                                 |
+
+#### `node:test`
+
+| API                                                                                                  | Status | Probe                                                   | Notes                                                                                                   |
+| ---------------------------------------------------------------------------------------------------- | :----: | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `test` / `it` / `describe` / `suite` (+ `.skip` / `.todo` / `.only`; `skip` / `todo` / `timeout` options); sync, async and `done`-callback tests | ✅ | [lib-node-test.ts](conformance/lib-node-test.ts) | Tests run one after another once the main module has finished, as in Node |
+| `before` / `after` / `beforeEach` / `afterEach` (file and suite level, `t.before` & co.)              |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts)        | Node's order: outer `beforeEach` first, inner `afterEach` first                                          |
+| `TestContext`: `t.test` subtests, `t.skip`, `t.todo`, `t.diagnostic`, `t.plan`, `t.name`, `t.fullName`, `t.signal`, `t.mock` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) |                                                                                       |
+| Reporting: TAP (Node's default when stdout is not a terminal) / spec (on a terminal); `tests` / `suites` / `pass` / `fail` / `cancelled` / `skipped` / `todo` counters; exit code 1 on failure | ✅ | [lib-node-test-fail.ts](conformance/lib-node-test-fail.ts) | Same layout as Node, without `location` / `stack` (a native binary has no source positions); timeouts count as cancelled |
+| `mock.fn(original?, implementation?)`; `fn.mock.calls` / `callCount()` / `mockImplementation(Once)` / `resetCalls()` / `restore()` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) | The mock has the original's Go function type                                                          |
+| `t.assert`, `mock.method` / `mock.getter` / `mock.timers`, snapshots, coverage, `--test` / `--test-reporter` / `--test-only` flags, `run()` |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`)                               |
+
+#### `node:worker_threads`
+
+| API                                                                                                  | Status | Probe                                                              | Notes                                                                                                   |
+| ---------------------------------------------------------------------------------------------------- | :----: | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `Worker` (`workerData`, `argv`, `env` / `SHARE_ENV`; `postMessage`, `'online'` / `'message'` / `'error'` / `'exit'`, `terminate()`, `threadId`, `ref` / `unref`); `isMainThread`, `parentPort`, `workerData`, `threadId` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | A worker re-runs the current program as a child process (an isolate of its own, as in Node) linked over loopback TCP; branch on `isMainThread` |
+| Messages: structured clone of JSON-like values, Buffers (arriving as `Uint8Array`s), `Map`, `Set`, `Date`, `bigint`, errors |   ✅    | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Functions throw `DataCloneError`                                                                    |
+| Uncaught exceptions in a worker / `terminate()`                                                        |   ✅    | [lib-node-worker-errors.ts](conformance/lib-node-worker-errors.ts) | `'error'` with the message, then exit code `1`                                                          |
+| `MessageChannel` / `MessagePort` (`postMessage`, `on('message')`, `onmessage`, `start`, `close`, `ref` / `unref`), `receiveMessageOnPort`, `BroadcastChannel`, `get/setEnvironmentData` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Channels and broadcast channels work within one process (ports can't be transferred to workers)     |
+| Workers for another file / `eval: true`, transferring ports, `SharedArrayBuffer` / `Atomics`, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | One binary holds one program; memory is not shared between processes                                  |
+
 #### Not supported yet
 
 | Module                                                                               | Status | Probe | Notes                                                                                      |
 | ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
-| `node:async_hooks` (`AsyncLocalStorage`, `createHook`)                               |   ❌    | —     | Async function bodies resume on their own goroutines; context can't follow them reliably    |
-| `node:http` / `node:https` / `node:http2`                                            |   ❌    | —     | Networking: a later phase                                                                  |
-| `node:net` / `node:tls` / `node:dgram` / `node:dns` / `node:dns/promises`            |   ❌    | —     | Networking: a later phase                                                                  |
-| `node:worker_threads` / `node:cluster`                                               |   ❌    | —     | A later phase (one Go binary, no JS isolates)                                              |
+| `node:http2`                                                                         |   ❌    | —     | Not implemented (see [http / https](#nodehttp--nodehttps))                                  |
+| `node:cluster`                                                                       |   ❌    | —     | Not implemented                                                                            |
 | `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
-| `node:test` / `node:test/reporters`                                                  |   ❌    | —     | Not implemented                                                                            |
+| `node:test/reporters`                                                                |   ❌    | —     | Custom reporters are not implemented (see [test](#nodetest))                               |
 | `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
 | `node:domain`                                                                        |   ❌    | —     | Deprecated upstream                                                                        |
 | `node:stream/web`                                                                    |   ❌    | —     | Web streams are not implemented                                                            |
