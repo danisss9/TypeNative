@@ -61,6 +61,10 @@ declare module 'node:buffer' {
     function atob(data: string): string;
     function btoa(data: string): string;
     const constants: { readonly MAX_LENGTH: number };
+    const Blob: typeof globalThis.Blob;
+    type Blob = globalThis.Blob;
+    const File: typeof globalThis.File;
+    type File = globalThis.File;
   }
   export = buffer;
 }
@@ -749,8 +753,12 @@ declare module 'node:stream' {
       pipe<T extends Writable>(destination: T, options?: { end?: boolean }): T;
       destroy(error?: Error): this;
       [Symbol.asyncIterator](): AsyncIterator<any>;
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
+      static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
     }
     class Writable extends Stream {
+      static toWeb(streamWritable: Writable): WritableStream;
+      static fromWeb(writableStream: WritableStream, options?: WritableOptions): Writable;
       constructor(options?: WritableOptions);
       readonly writable: boolean;
       readonly writableEnded: boolean;
@@ -774,6 +782,8 @@ declare module 'node:stream' {
       destroy(error?: Error): this;
     }
     class Duplex extends Readable implements Writable {
+      static toWeb(streamDuplex: Duplex): { readable: ReadableStream; writable: WritableStream };
+      static fromWeb(pair: { readable: ReadableStream; writable: WritableStream }, options?: DuplexOptions): Duplex;
       constructor(options?: DuplexOptions);
       readonly writable: boolean;
       readonly writableEnded: boolean;
@@ -799,7 +809,9 @@ declare module 'node:stream' {
     class PassThrough extends Transform {}
     function pipeline<T extends Writable | Duplex>(...args: [...streams: (Readable | Writable | Duplex)[], callback: (err: NodeJS.ErrnoException | null) => void]): T;
     function finished(stream: Readable | Writable, callback: (err?: NodeJS.ErrnoException | null) => void): void;
+    function compose(...streams: (Readable | Writable | Duplex | ReadableStream | WritableStream | TransformStream)[]): Duplex;
     const promises: typeof import('node:stream/promises');
+    const web: typeof import('node:stream/web');
   }
   export = Stream;
 }
@@ -817,6 +829,39 @@ declare module 'node:stream/consumers' {
   function json(stream: Readable | AsyncIterable<any>): Promise<unknown>;
   function buffer(stream: Readable | AsyncIterable<any>): Promise<Buffer>;
   export { text, json, buffer };
+}
+
+declare module 'node:stream/web' {
+  const ReadableStream: typeof globalThis.ReadableStream;
+  type ReadableStream<R = any> = globalThis.ReadableStream<R>;
+  const ReadableStreamDefaultReader: typeof globalThis.ReadableStreamDefaultReader;
+  type ReadableStreamDefaultReader<R = any> = globalThis.ReadableStreamDefaultReader<R>;
+  type ReadableStreamDefaultController<R = any> = globalThis.ReadableStreamDefaultController<R>;
+  type ReadableStreamReadResult<R> = globalThis.ReadableStreamReadResult<R>;
+  const WritableStream: typeof globalThis.WritableStream;
+  type WritableStream<W = any> = globalThis.WritableStream<W>;
+  const WritableStreamDefaultWriter: typeof globalThis.WritableStreamDefaultWriter;
+  type WritableStreamDefaultWriter<W = any> = globalThis.WritableStreamDefaultWriter<W>;
+  type WritableStreamDefaultController = globalThis.WritableStreamDefaultController;
+  const TransformStream: typeof globalThis.TransformStream;
+  type TransformStream<I = any, O = any> = globalThis.TransformStream<I, O>;
+  type TransformStreamDefaultController<O = any> = globalThis.TransformStreamDefaultController<O>;
+  const TextEncoderStream: typeof globalThis.TextEncoderStream;
+  type TextEncoderStream = globalThis.TextEncoderStream;
+  const TextDecoderStream: typeof globalThis.TextDecoderStream;
+  type TextDecoderStream = globalThis.TextDecoderStream;
+  const CompressionStream: typeof globalThis.CompressionStream;
+  type CompressionStream = globalThis.CompressionStream;
+  const DecompressionStream: typeof globalThis.DecompressionStream;
+  type DecompressionStream = globalThis.DecompressionStream;
+  const CountQueuingStrategy: typeof globalThis.CountQueuingStrategy;
+  type CountQueuingStrategy = globalThis.CountQueuingStrategy;
+  const ByteLengthQueuingStrategy: typeof globalThis.ByteLengthQueuingStrategy;
+  type ByteLengthQueuingStrategy = globalThis.ByteLengthQueuingStrategy;
+  type QueuingStrategy<T = any> = globalThis.QueuingStrategy<T>;
+  type UnderlyingSource<R = any> = globalThis.UnderlyingSource<R>;
+  type UnderlyingSink<W = any> = globalThis.UnderlyingSink<W>;
+  type Transformer<I = any, O = any> = globalThis.Transformer<I, O>;
 }
 
 declare module 'node:child_process' {
@@ -1628,6 +1673,7 @@ declare module 'events' { import m = require('node:events'); export = m; }
 declare module 'stream' { import m = require('node:stream'); export = m; }
 declare module 'stream/promises' { export * from 'node:stream/promises'; }
 declare module 'stream/consumers' { export * from 'node:stream/consumers'; }
+declare module 'stream/web' { export * from 'node:stream/web'; }
 declare module 'child_process' { import m = require('node:child_process'); export = m; }
 declare module 'readline' { import m = require('node:readline'); export = m; }
 declare module 'readline/promises' { import m = require('node:readline/promises'); export = m; }

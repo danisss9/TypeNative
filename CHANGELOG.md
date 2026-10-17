@@ -48,6 +48,14 @@ generated types say they do.
   `MessageChannel` / `MessagePort` / `BroadcastChannel`; globals `__filename` / `__dirname`
 - `new Promise((resolve) => setTimeout(resolve, ms))`: `resolve` / `reject` can be passed as
   values
+- **`node:stream/web`**: `ReadableStream` / `WritableStream` / `TransformStream` with readers,
+  writers, controllers, queuing strategies, `tee` / `pipeTo` / `pipeThrough` and `for await`;
+  `TextEncoderStream` / `TextDecoderStream`, `CompressionStream` / `DecompressionStream` (also
+  globals); `Readable.toWeb` / `fromWeb` & co. and `stream.compose`
+- `Blob` / `File` (`node:buffer` and globals) and `FormData`; fetch streams bodies
+  (`response.body`, `ReadableStream` uploads), sends Blob / FormData bodies and reads
+  `blob()` / `formData()`
+- `TextDecoder#decode(bytes, { stream: true })`
 
 ### Fixed
 
@@ -71,6 +79,11 @@ generated types say they do.
   through `TnAwait`)
 - `JSON.parse` assigned to an interface type converts into its struct (it was `nil`); typed
   callback parameters accept decoded JSON-like values
+- `for await` over a stream that errors throws the error (it ended the loop silently)
+- `const { value, done } = obj` on Node class instances types the bindings (and reads
+  accessors); `x as File` asserts dynamic values to Node classes
+- `Response#clone()` of a network body no longer blocks the event loop (both copies stream it)
+- The self-hosted compiler no longer crashes on `const [a, b] = call()`
 - `(c) => (body += c)` arrow bodies; `console.log(x?.y)` prints optional strings / numbers
   without quotes; the self-hosted compiler no longer crashes on `console.log` arguments of
   unknown type

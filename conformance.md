@@ -428,6 +428,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | `encodeURIComponent` / `decodeURIComponent` |   ✅    | [lib-uri.ts](conformance/lib-uri.ts)                               | `TnEncodeURIComponent` / `url.PathUnescape` |
 | `structuredClone`                           |   ✅    | [lib-structured-clone.ts](conformance/lib-structured-clone.ts)     | Reflection deep copy                     |
 | `fetch` / `Headers` / `Request` / `Response` |   ✅    | [lib-node-fetch.ts](conformance/lib-node-fetch.ts)                 | See [fetch](#fetch)                      |
+| `ReadableStream` / `WritableStream` / `TransformStream` & co., `TextEncoderStream` / `TextDecoderStream`, `CompressionStream` / `DecompressionStream` | ✅ | [lib-node-stream-web.ts](conformance/lib-node-stream-web.ts) | See [stream/web](#nodestreamweb) |
+| `Blob` / `File` / `FormData`                 |   ✅    | [lib-node-blob.ts](conformance/lib-node-blob.ts)                   | See [buffer](#nodebuffer) and [fetch](#fetch) |
 | `MessageChannel` / `MessagePort` / `BroadcastChannel` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | See [worker_threads](#nodeworker_threads) |
 | `__filename` / `__dirname`                  |   ✅    | —                                                                  | The running executable (a native binary has no script file) |
 | `globalThis`                                |   ✅    | [lib-global-this.ts](conformance/lib-global-this.ts)               | `globalThis.x` is the global `x`; `(globalThis as any)` is a dynamic object |
@@ -445,7 +447,7 @@ async function runs synchronously until its first `await`.
 | ------------------------------------------- | :----: | ---------------------------------------------------------- |
 | `node:assert` / `node:assert/strict`        |   ✅    | [assert](#nodeassert)                                       |
 | `node:async_hooks`                          |   ✅    | [async_hooks](#nodeasync_hooks)                             |
-| `node:buffer` (+ globals `Buffer`, `Uint8Array`, `atob`, `btoa`) | ✅ | [buffer](#nodebuffer)                                 |
+| `node:buffer` (+ globals `Buffer`, `Uint8Array`, `atob`, `btoa`, `Blob`, `File`) | ✅ | [buffer](#nodebuffer)                 |
 | `node:child_process`                        |   ✅    | [child_process](#nodechild_process)                         |
 | `node:console`                              |   ✅    | [console](#nodeconsole)                                     |
 | `node:constants`                            |   ✅    | [constants](#nodeconstants--nodesys)                        |
@@ -465,6 +467,7 @@ async function runs synchronously until its first `await`.
 | `node:querystring`                          |   ✅    | [querystring](#nodequerystring)                             |
 | `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
+| `node:stream/web` (+ globals `ReadableStream`, `WritableStream`, `TransformStream`, …) | ✅ | [stream/web](#nodestreamweb)                 |
 | `node:string_decoder`                       |   ✅    | [string_decoder](#nodestring_decoder)                       |
 | `node:sys`                                  |   ✅    | [constants / sys](#nodeconstants--nodesys)                  |
 | `node:test`                                 |   ✅    | [test](#nodetest)                                           |
@@ -475,7 +478,7 @@ async function runs synchronously until its first `await`.
 | `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
 | `node:worker_threads` (+ globals `MessageChannel`, `MessagePort`, `BroadcastChannel`) | ✅ | [worker_threads](#nodeworker_threads) |
 | `node:zlib`                                 |   ✅    | [zlib](#nodezlib)                                           |
-| Global `fetch` (+ `Headers`, `Request`, `Response`) | ✅ | [fetch](#fetch)                                            |
+| Global `fetch` (+ `Headers`, `Request`, `Response`, `FormData`) | ✅ | [fetch](#fetch)                                |
 
 #### `node:path`
 
@@ -493,8 +496,9 @@ async function runs synchronously until its first `await`.
 | `Buffer.from` / `alloc` / `concat` / `byteLength` / `isBuffer` / `compare`; `buf[i]`, `length` | ✅ | [lib-node-buffer.ts](conformance/lib-node-buffer.ts)                          | Buffers are Go `[]byte`; `subarray` / `slice` share memory; writes wrap modulo 256      |
 | `toString` / `equals` / `indexOf` / `includes` / `fill` / `write` / `copy`              |   ✅    | [lib-node-buffer.ts](conformance/lib-node-buffer.ts)                           | `` `${buf}` `` decodes UTF-8; `console.log(buf)` prints `<Buffer 68 69>`                |
 | Encodings (utf8, hex, base64, base64url, latin1, ascii, utf16le); `atob` / `btoa`        |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | Invalid UTF-8 bytes decode to U+FFFD, as in Node                                        |
-| `TextEncoder` / `TextDecoder`, minimal `Uint8Array`                                     |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | `Uint8Array` is `[]byte` too: `length`, indexing, `subarray`, `slice`, `set`            |
+| `TextEncoder` / `TextDecoder` (`decode(bytes, { stream: true })`), minimal `Uint8Array` |   ✅    | [lib-node-buffer-encodings.ts](conformance/lib-node-buffer-encodings.ts)       | `Uint8Array` is `[]byte` too: `length`, indexing, `subarray`, `slice`, `set`            |
 | `read*` / `write*` (U)Int8/16/32 LE/BE, Float, Double                                    |   ✅    | [lib-node-buffer-binary.ts](conformance/lib-node-buffer-binary.ts)             | Out-of-range offsets throw `ERR_OUT_OF_RANGE`                                           |
+| `Blob` / `File` (`size`, `type`, `name`, `lastModified`, `text()` / `bytes()` / `arrayBuffer()`, `slice`, `stream()`); parts of strings, Buffers and Blobs | ✅ | [lib-node-blob.ts](conformance/lib-node-blob.ts) | Also globals; bytes held in memory |
 | BigInt64 reads / writes, `swap16/32/64`, other typed arrays                             |   ❌    | —                                                                              | Not implemented                                                                        |
 
 #### `node:fs`
@@ -648,7 +652,19 @@ async function runs synchronously until its first `await`.
 | `Writable` (`write` / `end` / callbacks, `final`, `'finish'`, write after end)                         |   ✅    | [lib-node-stream-writable.ts](conformance/lib-node-stream-writable.ts) | Strings become Buffers unless `decodeStrings: false` or `objectMode`                          |
 | `Transform` / `PassThrough` / `Duplex`, `pipe` chains, subclasses overriding `_transform` & co.        |   ✅    | [lib-node-stream-transform.ts](conformance/lib-node-stream-transform.ts) | Option methods (`transform`, `flush`, `write`, `final`, `read`) and `_`-overrides both work; `this` inside option methods is not the stream (use the callback) |
 | `pipeline` / `finished` / `stream/promises` / `stream/consumers` (`text`, `json`, `buffer`)           |   ✅    | [lib-node-stream-pipeline.ts](conformance/lib-node-stream-pipeline.ts) | Errors destroy the pipeline and reach the callback / rejection                               |
-| Backpressure (`highWaterMark` beyond `write()`'s return value), `stream/web`, `compose`, `Readable.toWeb` | ❌  | —                                                                    | Not implemented                                                                              |
+| `Readable.toWeb` / `fromWeb`, `Writable.toWeb` / `fromWeb`, `Duplex.toWeb` / `fromWeb`, `compose` (Node and web streams) | ✅ | [lib-node-stream-web-bridge.ts](conformance/lib-node-stream-web-bridge.ts) | `toWeb` pauses the Node stream while the web queue is full |
+| Backpressure (`highWaterMark` beyond `write()`'s return value), `compose` with generator functions | ❌  | —                                                                    | Not implemented                                                                              |
+
+#### `node:stream/web`
+
+| API                                                                                                   | Status | Probe                                                                | Notes                                                                 |
+| ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `ReadableStream` (underlying source `start` / `pull` / `cancel`, sync or async), `getReader()` → `read` / `releaseLock` / `cancel` / `closed`, `locked`, `cancel`, `tee`, `for await` / `values()`, `ReadableStream.from` | ✅ | [lib-node-stream-web.ts](conformance/lib-node-stream-web.ts) | Promise reactions run as microtasks on the event loop; an error ends `for await` with a throw |
+| `WritableStream` (sink `start` / `write` / `close` / `abort`), `getWriter()` → `write` / `close` / `abort` / `ready` / `closed` / `desiredSize` / `releaseLock`; controller `error` / `signal` | ✅ | [lib-node-stream-web.ts](conformance/lib-node-stream-web.ts) | Writes run one at a time; `ready` follows the queue's backpressure |
+| `TransformStream` (`transform` / `flush` / `start`, controller `enqueue` / `error` / `terminate`), `pipeThrough` / `pipeTo` (`preventClose` / `preventAbort` / `preventCancel` / `signal`) | ✅ | [lib-node-stream-web.ts](conformance/lib-node-stream-web.ts) | A transform waits until its readable side wants more |
+| `CountQueuingStrategy` / `ByteLengthQueuingStrategy`, `{ highWaterMark, size }` strategies             |   ✅    | [lib-node-stream-web.ts](conformance/lib-node-stream-web.ts)         |                                                                       |
+| `TextEncoderStream` / `TextDecoderStream` (characters split across chunks), `CompressionStream` / `DecompressionStream` (`gzip`, `deflate`, `deflate-raw`) | ✅ | [lib-node-stream-web-bridge.ts](conformance/lib-node-stream-web-bridge.ts) | Decompression decodes once the input ends |
+| BYOB readers (`getReader({ mode: 'byob' })` reads into a view), byte-stream controllers' `byobRequest`, transferring streams | ❌ | — | `getReader({ mode: 'byob' })` returns a default reader |
 
 #### `node:readline`
 
@@ -727,7 +743,9 @@ async function runs synchronously until its first `await`.
 | ----------------------------------------------------------------------------------------------------- | :----: | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
 | `fetch(url \| Request, { method, headers, body, redirect, signal })`; `Response` (`status`, `ok`, `statusText`, `headers`, `url`, `redirected`, `text()` / `json()` / `bytes()` / `arrayBuffer()`, `clone()`, `Response.json` / `error` / `redirect`) | ✅ | [lib-node-fetch.ts](conformance/lib-node-fetch.ts) | Follows redirects (`manual` / `error` too); gzip bodies are decompressed; failures reject with `TypeError('fetch failed')` whose `cause` is the system error; aborts reject with `AbortError` |
 | `Headers` (`get` / `set` / `append` / `has` / `delete` / `forEach` / `entries` / `getSetCookie`, `for...of`) / `Request` |   ✅    | [lib-node-fetch.ts](conformance/lib-node-fetch.ts) | Names are lower-cased and iterated in sorted order                                         |
-| Streaming bodies (`response.body` as a `ReadableStream`), `FormData`, `Blob`, the fetch bad-port list |   ❌    | —                                                | Web streams are not implemented                                                            |
+| Streaming bodies: `response.body` / `request.body` as `ReadableStream`s, `ReadableStream` request bodies (`duplex: 'half'`), `clone()` tees the body | ✅ | [lib-node-fetch-stream.ts](conformance/lib-node-fetch-stream.ts) | Network bodies are read a chunk per pull |
+| `Blob` / `FormData` bodies (multipart encoding), `blob()` / `formData()` (multipart and urlencoded) |   ✅    | [lib-node-blob.ts](conformance/lib-node-blob.ts), [lib-node-fetch-stream.ts](conformance/lib-node-fetch-stream.ts) | |
+| The fetch bad-port list                                                                               |   ❌    | —                                                | Not implemented                                                                            |
 
 #### `node:async_hooks`
 
@@ -768,7 +786,6 @@ async function runs synchronously until its first `await`.
 | `node:test/reporters`                                                                |   ❌    | —     | Custom reporters are not implemented (see [test](#nodetest))                               |
 | `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
 | `node:domain`                                                                        |   ❌    | —     | Deprecated upstream                                                                        |
-| `node:stream/web`                                                                    |   ❌    | —     | Web streams are not implemented                                                            |
 
 ### Go bridges (`go:*`)
 
