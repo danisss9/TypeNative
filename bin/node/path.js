@@ -29,6 +29,139 @@ func (s *tnPathStyle) isSep(c byte) bool { return c == '/' || (s.win && c == '\\
 
 func tnIsDriveLetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 
+// matchesGlob(path, pattern): minimatch-style *, **, ?, [...], {a,b}; wildcards
+// don't cross separators or match a leading dot (win32: both slashes separate)
+func (s *tnPathStyle) matchesGlob(p string, pattern string) bool {
+	if s.win {
+		p = strings.ReplaceAll(p, "\\\\", "/")
+		pattern = strings.ReplaceAll(pattern, "\\\\", "/")
+	}
+	for _, alt := range tnExpandBraces(pattern) {
+		if re, err := regexp.Compile(tnGlobRegexp(alt, !s.win)); err == nil && re.MatchString(p) {
+			return true
+		}
+	}
+	return false
+}
+
+func tnExpandBraces(p string) []string {
+	depth, start := 0, -1
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '\\\\':
+			i++
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				inner := p[start+1 : i]
+				parts := []string{}
+				level, last := 0, 0
+				for j := 0; j < len(inner); j++ {
+					switch inner[j] {
+					case '{':
+						level++
+					case '}':
+						level--
+					case ',':
+						if level == 0 {
+							parts = append(parts, inner[last:j])
+							last = j + 1
+						}
+					}
+				}
+				parts = append(parts, inner[last:])
+				if len(parts) > 1 {
+					out := []string{}
+					for _, part := range parts {
+						out = append(out, tnExpandBraces(p[:start]+part+p[i+1:])...)
+					}
+					return out
+				}
+				start = -1
+			}
+		}
+	}
+	return []string{p}
+}
+
+func tnGlobRegexp(g string, escapes bool) string {
+	var b strings.Builder
+	b.WriteString("^")
+	segStart := true
+	for i := 0; i < len(g); i++ {
+		c := g[i]
+		wasStart := segStart
+		segStart = false
+		switch {
+		case c == '*' && i+1 < len(g) && g[i+1] == '*' && wasStart && (i+2 == len(g) || g[i+2] == '/'):
+			if i+2 == len(g) {
+				b.WriteString("(?:[^/.][^/]*(?:/[^/.][^/]*)*)?")
+				i++
+			} else {
+				b.WriteString("(?:[^/.][^/]*/)*")
+				i += 2
+				segStart = true
+			}
+		case c == '*':
+			for i+1 < len(g) && g[i+1] == '*' {
+				i++
+			}
+			if wasStart {
+				b.WriteString("(?:[^/.][^/]*)?")
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case c == '?':
+			if wasStart {
+				b.WriteString("[^/.]")
+			} else {
+				b.WriteString("[^/]")
+			}
+		case c == '[':
+			end := strings.IndexByte(g[i+1:], ']')
+			if end < 0 {
+				b.WriteString("\\\\[")
+				continue
+			}
+			class := g[i+1 : i+1+end]
+			if end == 0 {
+				end = strings.IndexByte(g[i+2:], ']') + 1
+				if end <= 0 {
+					b.WriteString("\\\\[")
+					continue
+				}
+				class = g[i+1 : i+1+end]
+			}
+			negate := strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^")
+			if negate {
+				class = class[1:]
+			}
+			class = strings.ReplaceAll(class, "\\\\", "\\\\\\\\")
+			if negate {
+				b.WriteString("[^/" + class + "]")
+			} else {
+				b.WriteString("[" + class + "]")
+			}
+			i += end + 1
+		case c == '\\\\' && escapes && i+1 < len(g):
+			i++
+			b.WriteString(regexp.QuoteMeta(string(g[i])))
+		case c == '/':
+			b.WriteString("/")
+			segStart = true
+		default:
+			b.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	b.WriteString("$")
+	return b.String()
+}
+
 // Length of the path's root ("/", "C:\\\\", "C:", "\\\\\\\\server\\\\share\\\\") and whether it is absolute
 func (s *tnPathStyle) rootOf(p string) (int, bool) {
 	if p == "" {
@@ -580,7 +713,7 @@ const PATH_STYLES = {
     'path/win32': 'TnPathWin32'
 };
 export function registerPath(r) {
-    defineHelper(r, 'nodePath', ['os', 'runtime', 'strings'], ['dynamic'], pathHelper);
+    defineHelper(r, 'nodePath', ['os', 'regexp', 'runtime', 'strings'], ['dynamic'], pathHelper);
     defineClass(r, 'path.ParsedPath', '*TnParsedPath', 'class', '', 'root=string; dir=string; base=string; ext=string; name=string', '', '');
     for (const mod of Object.keys(PATH_STYLES)) {
         const style = PATH_STYLES[mod];
@@ -589,7 +722,7 @@ export function registerPath(r) {
             r.helper('nodePath');
             return `${style}.${name}(${call.args.join(', ')})`;
         };
-        for (const name of ['join', 'resolve', 'normalize', 'relative', 'dirname', 'basename', 'extname', 'isAbsolute', 'parse', 'toNamespacedPath']) {
+        for (const name of ['join', 'resolve', 'normalize', 'relative', 'dirname', 'basename', 'extname', 'isAbsolute', 'parse', 'toNamespacedPath', 'matchesGlob']) {
             r.functions[`${mod}.${name}`] = fn(name);
         }
         r.functions[`${mod}.format`] = (call) => {
@@ -618,7 +751,7 @@ export function registerPath(r) {
         };
         r.valueTypes[`${mod}.sep`] = 'string';
         r.valueTypes[`${mod}.delimiter`] = 'string';
-        setResults(r, mod, 'join=string; resolve=string; normalize=string; relative=string; dirname=string; basename=string; extname=string; isAbsolute=bool; parse=*TnParsedPath; format=string; toNamespacedPath=string');
+        setResults(r, mod, 'join=string; resolve=string; normalize=string; relative=string; dirname=string; basename=string; extname=string; isAbsolute=bool; parse=*TnParsedPath; format=string; toNamespacedPath=string; matchesGlob=bool');
         r.namespaces[`${mod}.posix`] = 'path/posix';
         r.namespaces[`${mod}.win32`] = 'path/win32';
     }

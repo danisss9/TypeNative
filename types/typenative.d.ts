@@ -559,6 +559,7 @@ interface Process {
   getgid(): number;
   geteuid(): number;
   getegid(): number;
+  loadEnvFile(path?: string): void;
   readonly stdout: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 1 };
   readonly stderr: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 2 };
   readonly stdin: import('node:stream').Readable & { readonly isTTY?: boolean; readonly fd: 0 };
@@ -900,6 +901,21 @@ interface Buffer extends Uint8Array {
   writeFloatBE(value: number, offset?: number): number;
   writeDoubleLE(value: number, offset?: number): number;
   writeDoubleBE(value: number, offset?: number): number;
+  readBigInt64LE(offset?: number): bigint;
+  readBigInt64BE(offset?: number): bigint;
+  readBigUInt64LE(offset?: number): bigint;
+  readBigUInt64BE(offset?: number): bigint;
+  readBigUint64LE(offset?: number): bigint;
+  readBigUint64BE(offset?: number): bigint;
+  writeBigInt64LE(value: bigint, offset?: number): number;
+  writeBigInt64BE(value: bigint, offset?: number): number;
+  writeBigUInt64LE(value: bigint, offset?: number): number;
+  writeBigUInt64BE(value: bigint, offset?: number): number;
+  writeBigUint64LE(value: bigint, offset?: number): number;
+  writeBigUint64BE(value: bigint, offset?: number): number;
+  swap16(): Buffer;
+  swap32(): Buffer;
+  swap64(): Buffer;
 }
 
 interface BufferConstructor {

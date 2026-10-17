@@ -9,6 +9,7 @@ import { registerCore, registerConstants } from './node/core.js';
 import { registerBuffer } from './node/buffer.js';
 import { registerProcess } from './node/process.js';
 import { registerUtil } from './node/util.js';
+import { registerUtilExtra } from './node/util_extra.js';
 import { registerConsole } from './node/console.js';
 import { registerAssert } from './node/assert.js';
 import { registerPunycode } from './node/punycode.js';
@@ -1559,7 +1560,11 @@ function visit(node, options = {}) {
                 const cbs = (node.arguments ?? []).map((a) => visit(a));
                 const cbExpr = cbs[0] ?? 'func(interface{}) {}';
                 useHelper('eventLoop');
-                return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext) {\n\t\t\t__v := <-(${recv})\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { (${cbExpr})(__v) })\n\t\t\t})\n\t\t}(TnAsyncSnapshot())`;
+                // A callback without parameters (then(() => …)) takes no value
+                const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
+                const receive = takesValue ? `__v := <-(${recv})` : `<-(${recv})`;
+                const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
+                return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${invoke} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot())`;
             }
         }
         // Array.from(arrayLike, mapFn) — array-likes are { length } structs
@@ -1624,6 +1629,14 @@ function visit(node, options = {}) {
         if (node.operator === 'TildeToken') {
             useHelper('dynamic');
             return `float64(^TnInt32(${visit(node.operand)}))`;
+        }
+        // -10n / -x on bigints (*big.Int)
+        if (node.operator === 'MinusToken' && node.operand.kind === 'BigIntLiteral') {
+            useHelper('bigint');
+            return `TnBigInt("-${String(node.operand.text).replace(/n$/, '')}")`;
+        }
+        if (node.operator === 'MinusToken' && inferExpressionType(node.operand) === '*tnbig.Int') {
+            return `new(tnbig.Int).Neg(${visit(node.operand)})`;
         }
         // -0: Go constant arithmetic has no negative zero
         if (node.operator === 'MinusToken' && isNumericLiteral(node.operand) && Number(node.operand.text) === 0) {
@@ -3182,6 +3195,10 @@ function jsStringOf(code, goType) {
         useHelper('error');
         return `TnJSString(${code})`;
     }
+    // Node classes with a toString() (MIMEType, X509Certificate, …)
+    const nodeKey = goType ? nodeRegistry.classByGoType[goType] : undefined;
+    if (nodeKey && 'toString' in nodeRegistry.classes[nodeKey].methods)
+        return `${code}.toString()`;
     importedPackages.add('fmt');
     return `fmt.Sprintf("%v", ${code})`;
 }
@@ -8226,6 +8243,7 @@ registerUrl(nodeRegistry);
 registerOs(nodeRegistry);
 registerProcess(nodeRegistry);
 registerUtil(nodeRegistry);
+registerUtilExtra(nodeRegistry);
 registerConsole(nodeRegistry);
 registerAssert(nodeRegistry);
 registerPunycode(nodeRegistry);
@@ -8458,6 +8476,8 @@ func TnJSString(v interface{}) string {
 		return x.Get_name() + ": " + x.message
 	case fmt.Stringer:
 		return x.String()
+	case interface{ toString() string }:
+		return x.toString()
 	}
 	return fmt.Sprintf("%v", v)
 }
@@ -8952,6 +8972,31 @@ func tnJSONWrite(buf *bytes.Buffer, rv reflect.Value, indent string, depth int) 
 		}
 		buf.WriteByte('}')
 	case reflect.Struct:
+		// Records (TnMap) keep their key order; reached through a pointer, the
+		// struct value needs Addr() for pointer-receiver methods
+		if rv.CanAddr() {
+			if m, ok := rv.Addr().Interface().(interface{ Entries() [][]interface{} }); ok {
+				buf.WriteByte('{')
+				for i, e := range m.Entries() {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					tnJSONNewline(buf, indent, depth+1)
+					kd, _ := tnJSONMarshal(fmt.Sprint(e[0]))
+					buf.Write(kd)
+					buf.WriteByte(':')
+					if indent != "" {
+						buf.WriteByte(' ')
+					}
+					tnJSONWrite(buf, reflect.ValueOf(e[1]), indent, depth+1)
+				}
+				if len(m.Entries()) > 0 {
+					tnJSONNewline(buf, indent, depth)
+				}
+				buf.WriteByte('}')
+				return
+			}
+		}
 		if m, ok := rv.Interface().(json.Marshaler); ok {
 			data, err := m.MarshalJSON()
 			if err == nil {
@@ -10274,8 +10319,12 @@ func (e *TnError) Get_generatedMessage() bool {
     asyncWait: `// Pending async work (promise callbacks, detached async calls) keeps the
 // event loop alive until it settles
 var __tnWaitGroup tnLoopGroup`,
-    bigint: `func TnBigInt(s string) *tnbig.Int {
-	v, _ := new(tnbig.Int).SetString(s, 10)
+    bigint: `// Base from the literal's prefix (0x / 0o / 0b), decimal otherwise
+func TnBigInt(s string) *tnbig.Int {
+	v, ok := new(tnbig.Int).SetString(s, 0)
+	if !ok {
+		v, _ = new(tnbig.Int).SetString(s, 10)
+	}
 	return v
 }`,
     goMust: `// Go bridge: (T, error) results throw a *TnError carrying the Go error

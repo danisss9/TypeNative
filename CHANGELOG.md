@@ -71,6 +71,9 @@ generated types say they do.
 - **`node:http2`** on `net/http`'s HTTP/2: h2c and TLS servers with the `'stream'` API
   (`respond`, `respondWithFile`) and the compatibility `(req, res)` API; `connect()` client
   sessions whose `request()` streams emit `'response'` with `:status`
+- `path.matchesGlob`; Buffer `read/writeBig(U)Int64LE/BE`, `swap16/32/64`, `buffer.isUtf8` /
+  `isAscii` / `transcode`; `util.parseArgs`, `getSystemErrorName` / `Message` / `Map`,
+  `MIMEType`, `parseEnv`, `aborted`, `debuglog`, `toUSVString`; `process.loadEnvFile`
 
 ### Fixed
 
@@ -99,6 +102,9 @@ generated types say they do.
   accessors); `x as File` asserts dynamic values to Node classes
 - `Response#clone()` of a network body no longer blocks the event loop (both copies stream it)
 - The self-hosted compiler no longer crashes on `const [a, b] = call()`
+- Negative bigint literals and `-x` on bigints; hex / octal / binary bigint literals;
+  `p.then(() => …)` on a `Promise<void>`; `JSON.stringify` of records keeps their keys (it
+  printed the map's internals); `String(x)` / template literals use a Node class's `toString()`
 - Top-level variables named like an imported Go package (`rsa`, `pem`, `encoding`, `http`, …) are
   renamed instead of clashing with it; `bigint.toString(radix)`; `ArrayBuffer` annotations and
   `byteLength` on Buffers

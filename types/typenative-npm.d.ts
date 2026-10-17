@@ -36,6 +36,7 @@ declare module 'node:path' {
       parse(path: string): ParsedPath;
       format(pathObject: FormatInputPathObject): string;
       toNamespacedPath(path: string): string;
+      matchesGlob(path: string, pattern: string): boolean;
       readonly posix: PlatformPath;
       readonly win32: PlatformPath;
     }
@@ -60,7 +61,12 @@ declare module 'node:buffer' {
     type Buffer = globalThis.Buffer;
     function atob(data: string): string;
     function btoa(data: string): string;
-    const constants: { readonly MAX_LENGTH: number };
+    const constants: { readonly MAX_LENGTH: number; readonly MAX_STRING_LENGTH: number };
+    const kMaxLength: number;
+    const kStringMaxLength: number;
+    function isUtf8(input: Uint8Array): boolean;
+    function isAscii(input: Uint8Array): boolean;
+    function transcode(source: Uint8Array, fromEnc: BufferEncoding, toEnc: BufferEncoding): Buffer;
     const Blob: typeof globalThis.Blob;
     type Blob = globalThis.Blob;
     const File: typeof globalThis.File;
@@ -443,6 +449,61 @@ declare module 'node:util' {
     function promisify(fn: Function): (...args: any[]) => Promise<any>;
     function callbackify<T, A extends any[]>(fn: (...args: A) => Promise<T>): (...args: [...A, (err: unknown, result: T) => void]) => void;
     const types: typeof import('node:util/types');
+    interface ParseArgsOptionConfig {
+      type: 'string' | 'boolean';
+      short?: string;
+      multiple?: boolean;
+      default?: string | boolean | string[] | boolean[];
+    }
+    interface ParseArgsConfig {
+      args?: string[];
+      options?: Record<string, ParseArgsOptionConfig>;
+      strict?: boolean;
+      allowPositionals?: boolean;
+      allowNegative?: boolean;
+      tokens?: boolean;
+    }
+    interface ParseArgsToken {
+      kind: 'option' | 'positional' | 'option-terminator';
+      index: number;
+      name?: string;
+      rawName?: string;
+      value?: string;
+      inlineValue?: boolean;
+    }
+    function parseArgs(config?: ParseArgsConfig): {
+      values: Record<string, string | boolean | (string | boolean)[] | undefined>;
+      positionals: string[];
+      tokens?: ParseArgsToken[];
+    };
+    function getSystemErrorName(err: number): string;
+    function getSystemErrorMessage(err: number): string;
+    function getSystemErrorMap(): Map<number, [string, string]>;
+    function parseEnv(content: string): Record<string, string>;
+    function aborted(signal: AbortSignal, resource: any): Promise<void>;
+    function debuglog(section: string, callback?: (fn: (msg: string, ...param: any[]) => void) => void): (msg: string, ...param: any[]) => void;
+    const debug: typeof debuglog;
+    function toUSVString(string: string): string;
+    class MIMEType {
+      constructor(input: string | { toString: () => string });
+      type: string;
+      subtype: string;
+      readonly essence: string;
+      readonly params: MIMEParams;
+      toString(): string;
+      toJSON(): string;
+    }
+    class MIMEParams {
+      get(name: string): string | null;
+      has(name: string): boolean;
+      set(name: string, value: string): void;
+      delete(name: string): void;
+      keys(): IterableIterator<string>;
+      values(): IterableIterator<string>;
+      entries(): IterableIterator<[string, string]>;
+      toString(): string;
+      [Symbol.iterator](): Iterator<[string, string]>;
+    }
     const TextEncoder: typeof globalThis.TextEncoder;
     const TextDecoder: typeof globalThis.TextDecoder;
   }
