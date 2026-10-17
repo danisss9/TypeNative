@@ -6460,7 +6460,10 @@ const stringMethodHandlers = {
     },
     indexOf: (obj, args) => {
         importedPackages.add('strings');
-        return `float64(strings.Index(${obj}, ${args[0]}))`;
+        if (args.length < 2)
+            return `float64(strings.Index(${obj}, ${args[0]}))`;
+        // indexOf(x, from): search from the clamped position, index into the whole string
+        return `func() float64 { __s := ${obj}; __f := int(${args[1]}); if __f < 0 { __f = 0 }; if __f > len(__s) { __f = len(__s) }; __i := strings.Index(__s[__f:], ${args[0]}); if __i < 0 { return -1 }; return float64(__i + __f) }()`;
     },
     charCodeAt: (obj, args) => `float64(${obj}[int(${args[0]})])`,
     localeCompare: (obj, args) => {
@@ -6715,7 +6718,7 @@ function toGoRegexp(arg) {
 // A JS slice index: negative values count from the end
 // A JS slice index: negative values count from the end; out-of-range values clamp
 function sliceIndex(obj, index) {
-    if (index === undefined)
+    if (index === undefined || index === '')
         return '0';
     if (index.startsWith('-'))
         return `max(0, int(float64(len(${obj})) + ${index}))`;

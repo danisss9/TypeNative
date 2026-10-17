@@ -5,6 +5,52 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The Go standard-library bridge (`go:*` imports) goes from 73 to 154 probed packages, with 16
+left typed-only and 6 excluded. Most of the new coverage came with bridge fixes found by the
+probes: callbacks, generics, tuples, struct fields and constants now behave the way the
+generated types say they do.
+
+### Added
+
+- **Go probes**: compress (flate, zlib, lzw, bzip2), archive/tar, encoding (json, base32,
+  ascii85, asn1), mime/quotedprintable, unicode/utf16, hash (adler32, crc64, maphash), crypto
+  (sha3, hkdf, pbkdf2, des, rc4, fips140, ecdh, ecdsa, elliptic, mlkem, mlkemtest, x509, pkix,
+  tls metadata, dsa, hpke), fmt, path, io/fs, io/ioutil, maps, iter, unique, weak, structs,
+  image (color, palette, draw, gif, jpeg), go/* (parser, ast, scanner, printer, constant,
+  build, build/constraint, doc, doc/comment, types, importer), html/template,
+  text/template/parse, regexp/syntax, reflect, net (loopback TCP, textproto, cookiejar,
+  httputil, httptrace, pprof, cgi), runtime (metrics, pprof, trace), time/tzdata, os/user,
+  debug/buildinfo, math/big, testing (testing, fstest, iotest, quick), database/sql (+driver),
+  syscall
+- **Go generics**: type args are inferred recursively from the arguments and through constraint
+  core types (`Map ~map[K]V`); callback params of generic functions and methods on generic
+  receivers (`unique.Handle[T].Value`) are concrete
+- **Go callbacks**: TS closures passed to Go (params or struct fields) get the exact Go
+  signature — int params read as numbers, block bodies work, returns convert to the result type
+- `for (const [k, v] of seq2)` over `iter.Seq2`; destructuring multi-value Go calls types each
+  element; printf-style calls pass numbers to `%d %x %o %b %c %U` as `int64`
+- `String.indexOf(search, fromIndex)`
+- `npm run check:go-types` type-checks the `go:*` probes against `types/typenative-go.d.ts`
+
+### Fixed
+
+- **Go types**: void functions were typed as returning `GoError`; params now accept what the
+  bridge converts (`number[]` for `[]byte`, one-char strings for `byte`/`rune`, `null` for
+  nil-able types, an array for variadics, an optional trailing `error`); pointers to basics are
+  `GoRef<T>`; typed constants keep their named type; aliases resolve (`os.FileMode`); named
+  slice/map types keep their methods (`net.IP`); `iter.Seq` is iterable; unimportable
+  `*/internal` packages are dropped and `runtime/cgo` is excluded
+- **Go bridge**: path-qualified types (`net/http.Cookie`) are localized and imported; unused
+  type-only imports are dropped and `import 'go:pkg'` emits `import _`; field reads/writes
+  convert numbers on any receiver; `null` comparisons on nil-able Go values are real nil checks;
+  `===` with typed constants coerces; `ref<T>().value` dereferences; `json.Unmarshal` fills a
+  `Record` ref
+- `npm run gen:go` runs from the repo root again
+- The self-hosted compiler (`npm run build:native`) builds again; the `src/go/*` modules are
+  transpilable by TypeNative
+
 ## [0.1.3] - 2026-10-15
 
 Decorators and JSX arrive alongside a broad language-surface expansion (`using`, `new.target`,

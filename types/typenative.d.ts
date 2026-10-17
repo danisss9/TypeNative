@@ -320,7 +320,7 @@ interface String {
   /** Returns the Unicode code point at the specified index. */
   charCodeAt(pos: number): number;
   /** Returns the position of the first occurrence of a substring. */
-  indexOf(searchString: string): number;
+  indexOf(searchString: string, position?: number): number;
   /** Returns the position of the last occurrence of a substring. */
   lastIndexOf(searchString: string): number;
   /** Determines whether a string contains the specified substring. */
