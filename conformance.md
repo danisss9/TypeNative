@@ -681,48 +681,48 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 <!-- go-bridges:start -->
 | Module | Status | Probe | Notes |
 | ------ | :----: | ----- | ----- |
-| `go:archive/tar` | ⚠️ | — | tar archive read/write |
+| `go:archive/tar` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | tar archive read/write |
 | `go:archive/zip` | ✅ | [lib-go-archive.ts](conformance/lib-go-archive.ts) | ZIP archive read/write |
 | `go:bufio` | ✅ | [lib-go-bufio.ts](conformance/lib-go-bufio.ts) | Buffered I/O |
 | `go:bytes` | ✅ | [lib-go-bytes.ts](conformance/lib-go-bytes.ts) | Byte-slice utilities |
 | `go:cmp` | ✅ | [lib-go-slices.ts](conformance/lib-go-slices.ts) | Ordered comparison primitives |
-| `go:compress/bzip2` | ⚠️ | — | bzip2 decompression (read-only) |
-| `go:compress/flate` | ⚠️ | — | DEFLATE compression |
+| `go:compress/bzip2` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | bzip2 decompression (read-only) |
+| `go:compress/flate` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | DEFLATE compression |
 | `go:compress/gzip` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | gzip read/write |
-| `go:compress/lzw` | ⚠️ | — | LZW compression (GIF/PDF/TIFF) |
-| `go:compress/zlib` | ⚠️ | — | zlib read/write |
+| `go:compress/lzw` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | LZW compression (GIF/PDF/TIFF) |
+| `go:compress/zlib` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | zlib read/write |
 | `go:container/heap` | ⚠️ | — | Heap / priority queue |
 | `go:container/list` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Doubly linked list |
 | `go:container/ring` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Circular list |
 | `go:context` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Cancellation and deadlines |
-| `go:crypto` | ⚠️ | — | Crypto constants and algorithm selection |
+| `go:crypto` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | Crypto constants and algorithm selection |
 | `go:crypto/aes` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | AES encryption |
 | `go:crypto/cipher` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Block cipher modes (GCM, CBC, CTR) |
-| `go:crypto/des` | ⚠️ | — | DES / triple DES (deprecated) |
+| `go:crypto/des` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | DES / triple DES (deprecated) |
 | `go:crypto/dsa` | ⚠️ | — | DSA signatures (deprecated) |
-| `go:crypto/ecdh` | ⚠️ | — | ECDH key exchange |
-| `go:crypto/ecdsa` | ⚠️ | — | ECDSA signatures |
+| `go:crypto/ecdh` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ECDH key exchange |
+| `go:crypto/ecdsa` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ECDSA signatures |
 | `go:crypto/ed25519` | ✅ | [lib-go-ed25519.ts](conformance/lib-go-ed25519.ts) | Ed25519 signatures |
-| `go:crypto/elliptic` | ⚠️ | — | Elliptic curves (legacy; use ecdh/ecdsa) |
-| `go:crypto/fips140` | ⚠️ | — | FIPS 140-3 mode controls |
-| `go:crypto/hkdf` | ⚠️ | — | HKDF key derivation |
+| `go:crypto/elliptic` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | Elliptic curves (legacy; use ecdh/ecdsa) |
+| `go:crypto/fips140` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | FIPS 140-3 mode controls |
+| `go:crypto/hkdf` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | HKDF key derivation |
 | `go:crypto/hmac` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | HMAC keyed hashing |
 | `go:crypto/hpke` | ⚠️ | — | HPKE encryption (RFC 9180) |
 | `go:crypto/md5` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | MD5 hash |
-| `go:crypto/mlkem` | ⚠️ | — | ML-KEM post-quantum key encapsulation |
+| `go:crypto/mlkem` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | ML-KEM post-quantum key encapsulation |
 | `go:crypto/mlkem/mlkemtest` | ⚠️ | — | ML-KEM test vectors helper |
-| `go:crypto/pbkdf2` | ⚠️ | — | PBKDF2 key derivation |
+| `go:crypto/pbkdf2` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | PBKDF2 key derivation |
 | `go:crypto/rand` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Cryptographically secure random bytes |
-| `go:crypto/rc4` | ⚠️ | — | RC4 stream cipher (deprecated) |
+| `go:crypto/rc4` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | RC4 stream cipher (deprecated) |
 | `go:crypto/rsa` | ✅ | [lib-go-rsa.ts](conformance/lib-go-rsa.ts) | RSA signatures / encryption |
 | `go:crypto/sha1` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | SHA-1 hash |
 | `go:crypto/sha256` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | SHA-224 / SHA-256 hashes |
-| `go:crypto/sha3` | ⚠️ | — | SHA-3 / SHAKE hashes |
+| `go:crypto/sha3` | ✅ | [lib-go-crypto-extra.ts](conformance/lib-go-crypto-extra.ts) | SHA-3 / SHAKE hashes |
 | `go:crypto/sha512` | ✅ | [lib-go-crypto-hash.ts](conformance/lib-go-crypto-hash.ts) | SHA-384 / SHA-512 family hashes |
 | `go:crypto/subtle` | ✅ | [lib-go-crypto-aes.ts](conformance/lib-go-crypto-aes.ts) | Constant-time comparison primitives |
-| `go:crypto/tls` | ⚠️ | — | TLS client/server; loopback probe is a later phase |
-| `go:crypto/x509` | ⚠️ | — | X.509 certificates and revocation |
-| `go:crypto/x509/pkix` | ⚠️ | — | X.509 ASN.1/PKIX structures |
+| `go:crypto/tls` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | TLS client/server; loopback probe is a later phase |
+| `go:crypto/x509` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | X.509 certificates and revocation |
+| `go:crypto/x509/pkix` | ✅ | [lib-go-crypto-keys.ts](conformance/lib-go-crypto-keys.ts) | X.509 ASN.1/PKIX structures |
 | `go:database/sql` | ⚠️ | — | No std driver; needs an external driver |
 | `go:database/sql/driver` | ⚠️ | — | Driver interfaces; no std driver |
 | `go:debug/buildinfo` | ⚠️ | — | Build info from executables |
@@ -733,15 +733,15 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:debug/pe` | ⚠️ | — | PE (Windows) object files |
 | `go:debug/plan9obj` | ⚠️ | — | Plan 9 object files |
 | `go:encoding` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | Shared encoding interfaces |
-| `go:encoding/ascii85` | ⚠️ | — | ascii85 encoding |
-| `go:encoding/asn1` | ⚠️ | — | ASN.1 DER encoding |
-| `go:encoding/base32` | ⚠️ | — | base32 encoding |
+| `go:encoding/ascii85` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | ascii85 encoding |
+| `go:encoding/asn1` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | ASN.1 DER encoding |
+| `go:encoding/base32` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | base32 encoding |
 | `go:encoding/base64` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | base64 encoding |
 | `go:encoding/binary` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | Binary packing / varints |
 | `go:encoding/csv` | ✅ | [lib-go-csv.ts](conformance/lib-go-csv.ts) | CSV read/write |
 | `go:encoding/gob` | ✅ | [lib-go-gob.ts](conformance/lib-go-gob.ts) | Go binary serialization |
 | `go:encoding/hex` | ✅ | [lib-go-encoding.ts](conformance/lib-go-encoding.ts) | hex encoding |
-| `go:encoding/json` | ⚠️ | — | JSON encode/decode |
+| `go:encoding/json` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | JSON encode/decode |
 | `go:encoding/pem` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | PEM encoding |
 | `go:encoding/xml` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | XML read/write |
 | `go:errors` | ✅ | [lib-go-errors.ts](conformance/lib-go-errors.ts) | Error creation / wrapping / inspection |
@@ -763,11 +763,11 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:go/types` | ⚠️ | — | Go type checker |
 | `go:go/version` | ✅ | [lib-go-gotools.ts](conformance/lib-go-gotools.ts) | Go version comparison |
 | `go:hash` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | Hash function interface |
-| `go:hash/adler32` | ⚠️ | — | Adler-32 checksum |
+| `go:hash/adler32` | ✅ | [lib-go-hash-extra.ts](conformance/lib-go-hash-extra.ts) | Adler-32 checksum |
 | `go:hash/crc32` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | CRC-32 checksum |
-| `go:hash/crc64` | ⚠️ | — | CRC-64 checksum |
+| `go:hash/crc64` | ✅ | [lib-go-hash-extra.ts](conformance/lib-go-hash-extra.ts) | CRC-64 checksum |
 | `go:hash/fnv` | ✅ | [lib-go-hash.ts](conformance/lib-go-hash.ts) | FNV-1 / FNV-1a hash |
-| `go:hash/maphash` | ⚠️ | — | Seeded string hashing |
+| `go:hash/maphash` | ✅ | [lib-go-hash-extra.ts](conformance/lib-go-hash-extra.ts) | Seeded string hashing |
 | `go:html` | ✅ | [lib-go-url.ts](conformance/lib-go-url.ts) | HTML escaping |
 | `go:html/template` | ⚠️ | — | HTML templating (auto-escaped) |
 | `go:image` | ✅ | [lib-go-image.ts](conformance/lib-go-image.ts) | 2D image interface |
@@ -794,7 +794,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:math/rand/v2` | ✅ | [lib-go-math-extra.ts](conformance/lib-go-math-extra.ts) | Pseudo-random numbers (v2 API) |
 | `go:mime` | ✅ | [lib-go-encoding-extra.ts](conformance/lib-go-encoding-extra.ts) | MIME media types |
 | `go:mime/multipart` | ✅ | [lib-go-misc.ts](conformance/lib-go-misc.ts) | Multipart forms |
-| `go:mime/quotedprintable` | ⚠️ | — | Quoted-printable encoding |
+| `go:mime/quotedprintable` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | Quoted-printable encoding |
 | `go:net` | ⚠️ | — | Sockets (loopback listener) |
 | `go:net/http` | ✅ | [lib-go-http.ts](conformance/lib-go-http.ts) | HTTP client/server (loopback) |
 | `go:net/http/cgi` | ⚠️ | — | CGI handler |
@@ -847,7 +847,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:time` | ✅ | [lib-go-time.ts](conformance/lib-go-time.ts) | Time and durations |
 | `go:time/tzdata` | ⚠️ | — | Embedded timezone database |
 | `go:unicode` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | Unicode tables |
-| `go:unicode/utf16` | ⚠️ | — | UTF-16 encoding |
+| `go:unicode/utf16` | ✅ | [lib-go-encoding-more.ts](conformance/lib-go-encoding-more.ts) | UTF-16 encoding |
 | `go:unicode/utf8` | ✅ | [lib-go-unicode.ts](conformance/lib-go-unicode.ts) | UTF-8 encoding |
 | `go:unique` | ⚠️ | — | Canonical values |
 | `go:weak` | ⚠️ | — | Weak pointers |

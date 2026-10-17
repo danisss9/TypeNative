@@ -27,7 +27,7 @@ import {
   hasGoPackage,
   isGoNumeric as isGoNumericType
 } from './go/metadata.js';
-import { bindConvertServices, initConvertPaths, isGoBasicKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
+import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
 import { goPathAliases } from './go/overrides.js';
 import {
   bindBridgeServices,
@@ -45,7 +45,9 @@ import {
   visitGoNew,
   inferGoType,
   goFieldType,
-  goMethodInfo
+  goMethodInfo,
+  isGoRefCall,
+  goTupleTypes
 } from './go/bridge.js';
 
 // Normalized JSON AST node (see src/parse-node.ts and tsparser/main.go)
@@ -391,6 +393,8 @@ const mainPackageVariables: string[] = [];
 // True while emitting a separate Go file, whose top-level statements sit at package scope
 let emittingModuleFile = false;
 const importedPackages = new Set<string>();
+// Side-effect `import 'go:time/tzdata'` packages, imported as `_`
+const goSideEffectImports = new Set<string>();
 let outsideNodes: AstNode[] = [];
 const classNames = new Set<string>();
 let promiseResolveName: string = '';
@@ -927,6 +931,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   declaredInterfaces.clear();
   declaredTypeAliases.clear();
   variableTypeNodes.clear();
+  goRefVariables.clear();
   narrowedVariables.clear();
   bindNodeRegistryServices();
   nodeLocalNames.clear();
@@ -940,6 +945,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   currentFileDir = null;
   const sourceFile = parseSource(code);
   importedPackages.clear();
+  goSideEffectImports.clear();
   outsideNodes = [];
   classNames.clear();
   promiseResolveName = '';
@@ -980,9 +986,26 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   if (usedHelpers.has('nodeProcess')) drains.push('TnProcessExit()');
   const drainCode = drains.length > 0 ? `\n\t${drains.join('\n\t')}` : '';
 
+  // Go bridge packages pulled in for a type that never got emitted
+  // (a method's result type, a param type needing no conversion) would be
+  // unused imports, which Go rejects.
+  const emitted = stripGoStrings(`${transpiledCode}\n${transpiledCodeOutside}\n${mainPackageVariables.join('\n')}`);
+  const helpersCode = emitGoHelpers();
+  const mainImports = [...importedPackages].filter((pkg) => {
+    if (!hasGoPackage(pkg)) return true;
+    const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop()!;
+    return referencesQualifier(emitted, pkgName) || referencesQualifier(helpersCode, pkgName);
+  });
+  for (const pkg of goSideEffectImports) {
+    if (!mainImports.includes(pkg)) mainImports.push(pkg);
+  }
+  const importLine = (pkg: string): string =>
+    goSideEffectImports.has(pkg) && !importedPackages.has(pkg)
+      ? `import _ "${pkg}"`
+      : goImportLine(pkg);
   const main = `package main
 
-${[...importedPackages].sort().map((pkg) => goImportLine(pkg)).join('\n')}
+${mainImports.sort().map((pkg) => importLine(pkg)).join('\n')}
 
 ${mainPackageVariables.join('\n')}
 
@@ -991,7 +1014,7 @@ func main() {
 }
 
 ${transpiledCodeOutside.trim()}
-${emitGoHelpers()}`.trimEnd();
+${helpersCode}`.trimEnd();
   return { main, files: localImportFiles };
 }
 
@@ -1317,8 +1340,22 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         : visit(node.initializer);
       const tmpVar = getTempName('arr');
       const elemType = initGoType?.startsWith('[]') ? initGoType.slice(2) : undefined;
+      // Multi-value Go calls: each element asserts back to its own type
+      const tupleTypes = goTupleTypes(unwrapParentheses(node.initializer));
       const parts = [`${tmpVar} := ${initExpr}`];
       node.name.elements.forEach((el, idx) => {
+        const tupleType = tupleTypes?.[idx];
+        if (tupleType && !isOmittedExpression(el) && isIdentifier((el as AstNode).name) && !(el as AstNode).initializer) {
+          const localName = visit((el as AstNode).name);
+          if (localName === '_' || localName.startsWith('_')) {
+            parts.push(`_ = ${tmpVar}`);
+            return;
+          }
+          ensureGoTypePackages(tupleType);
+          parts.push(`${localName} := ${tmpVar}[${idx}].(${goLocalType(tupleType)})`);
+          registerLocalVariable(localName, tupleType);
+          return;
+        }
         if (isOmittedExpression(el)) return;
         const bindEl = el as AstNode;
         const localName = visit(bindEl.name);
@@ -1379,6 +1416,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       narrowedVariables.delete(node.name.text);
       if (node.type && !isInferredAny) variableTypeNodes.set(node.name.text, node.type);
       else variableTypeNodes.delete(node.name.text);
+      if (node.initializer && isGoRefCall(node.initializer)) goRefVariables.add(node.name.text);
+      else goRefVariables.delete(node.name.text);
       if (node.type && !isInferredAny) {
         variableGoTypes.set(node.name.text, getType(node.type));
       } else if (inferredType) {
@@ -1794,6 +1833,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const nodeAssignment = visitNodeAssignment(node);
     if (nodeAssignment !== undefined) return nodeAssignment;
+    const goFieldAssignment = visitGoFieldAssignment(node, op);
+    if (goFieldAssignment !== undefined) return goFieldAssignment;
     // buf[i] = v on a Buffer / Uint8Array: bytes wrap modulo 256
     if (op === '=' && isElementAccessExpression(node.left) && inferExpressionType(node.left.expression) === '[]byte') {
       useHelper('buffer');
@@ -3159,6 +3200,14 @@ function jsStringOf(code: string, goType: string | undefined): string {
 }
 
 // JS bitwise operators work on 32-bit integers (ToInt32 / ToUint32)
+// Go-typed numeric operands (typed constants like x509.KeyUsageCertSign,
+// int fields) read as float64 so the TnInt32 helpers accept them
+function asFloatOperand(node: AstNode, code: string): string {
+  const goType = inferExpressionType(node);
+  if (goType && goType !== 'float64' && isGoNumericKind(goType)) return `float64(${code})`;
+  return code;
+}
+
 function visitBitwise(node: AstNode, op: string): string | undefined {
   const kind = node.operatorToken.kind;
   const base: Record<string, string> = {
@@ -3178,8 +3227,8 @@ function visitBitwise(node: AstNode, op: string): string | undefined {
   const bitOp = base[kind];
   if (!bitOp) return undefined;
   useHelper('dynamic');
-  const left = visit(node.left);
-  const right = visit(node.right);
+  const left = asFloatOperand(node.left, visit(node.left));
+  const right = asFloatOperand(node.right, visit(node.right));
   let value: string;
   if (bitOp === '>>>') value = `float64(TnUint32(${left}) >> (TnUint32(${right}) & 31))`;
   else if (bitOp === '<<' || bitOp === '>>') {
@@ -3865,6 +3914,8 @@ function getMemberTypeNode(typeNode: AstNode, name: string): AstNode | undefined
 // (TypeScript's "contextual type"), derived syntactically from declarations
 // Declared type nodes of variables/parameters in scope (latest declaration wins)
 const variableTypeNodes = new Map<string, AstNode>();
+// Variables initialized by go:builtin ref<T>() (their `.value` dereferences)
+const goRefVariables = new Set<string>();
 
 // Declared type (as a type node) of an assignable expression, when known
 function getExpressionTypeNode(expr: AstNode): AstNode | undefined {
@@ -8221,7 +8272,8 @@ function bindNodeRegistryServices(): void {
   bindConvertServices({
     pkg: needPkg,
     helper: useHelper,
-    typeOf: (node: AstNode) => inferExpressionType(node) ?? ''
+    typeOf: (node: AstNode) => inferExpressionType(node) ?? '',
+    localType: goLocalType
   });
   bindBridgeServices({
     pkg: needPkg,
@@ -9085,6 +9137,40 @@ func (m *TnMap[K, V]) All() iter.Seq2[K, V] {
 			}
 		}
 	}
+}
+
+// JSON objects decode in document order (json.Unmarshal into a ref)
+func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("json: cannot unmarshal %v into an object", tok)
+	}
+	m.keys = nil
+	m.values = map[K]V{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, _ := tok.(string)
+		var key K
+		if p, ok := any(&key).(*string); ok {
+			*p = name
+		} else if err := json.Unmarshal([]byte(name), &key); err != nil {
+			return err
+		}
+		var value V
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		m.Set(key, value)
+	}
+	_, err = dec.Token()
+	return err
 }
 
 // JSON objects keep insertion order
@@ -11236,6 +11322,26 @@ function visitNodeAssignment(node: AstNode): string | undefined {
   return assignment;
 }
 
+// Writes of Go struct fields convert to the field type: h.Size = 5 →
+// h.Size = int64(5); h.Size += 1 → h.Size = int64(float64(h.Size) + 1)
+function visitGoFieldAssignment(node: AstNode, op: string): string | undefined {
+  if (!isPropertyAccessExpression(node.left)) return undefined;
+  const recvType = inferExpressionType(node.left.expression);
+  if (!recvType) return undefined;
+  const field = goFieldType(recvType, node.left.name.text);
+  if (!field) return undefined;
+  const target = `${visit(node.left.expression)}.${node.left.name.text}`;
+  ensureGoTypePackages(field);
+  if (op === '=') {
+    return `${target} = ${toGoType(visit(node.right), inferExpressionType(node.right) ?? '', field)}`;
+  }
+  if (['+=', '-=', '*=', '/='].includes(op) && isGoNumericKind(field)) {
+    const value = `${fromGoType(target, field)} ${op[0]} (${visit(node.right)})`;
+    return `${target} = ${toGoType(value, 'float64', field)}`;
+  }
+  return undefined;
+}
+
 // new X(…) of a Node class
 function visitNodeNew(node: AstNode): string | undefined {
   const key = resolveNodeKey(node.expression);
@@ -11256,9 +11362,8 @@ function nodeTypeCall(nodes: AstNode[]): NodeCall {
 // Property read on a Go package or Go value: consts, vars, fields.
 function visitGoProperty(node: AstNode): string | undefined {
   const base = node.expression;
-  if (!isIdentifier(base)) return undefined;
   // Package member: strings.ToUpper (as a value), math.Pi, os.Stdout.
-  const path = goPathOf(base.text);
+  const path = isIdentifier(base) ? goPathOf(base.text) : undefined;
   if (path) {
     const info = goPackage(path);
     if (!info) return undefined;
@@ -11291,12 +11396,12 @@ function visitGoProperty(node: AstNode): string | undefined {
   }
   // GoRef<T>.value dereferences the pointer cell (structs with a real
   // `value` field take the branch above). Only when the receiver is
-  // declared as GoRef<...>, or points to a basic type (flag.String's
-  // *string has no fields to read).
+  // declared as GoRef<...> or initialized by ref<T>(), or points to a
+  // basic type (flag.String's *string has no fields to read).
   if (node.name.text === 'value' && recvType.startsWith('*') && isIdentifier(base)) {
     const base2 = recvType.slice(1);
     const isBasic = base2 === 'string' || base2 === 'float64' || base2 === 'bool' || isGoBasicKind(base2);
-    if (isBasic) {
+    if (isBasic || goRefVariables.has(base.text)) {
       return `(*${visit(base)})`;
     }
     const typeNode = variableTypeNodes.get(base.text);
@@ -11359,6 +11464,16 @@ function goNewTarget(node: AstNode): { path: string; typeName: string; qualifier
 }
 
 function inferGoExpressionType(expr: AstNode): string | undefined {
+  // ref<T>().value reads as the cell's element type.
+  if (
+    isPropertyAccessExpression(expr) &&
+    expr.name.text === 'value' &&
+    isIdentifier(expr.expression) &&
+    goRefVariables.has(expr.expression.text)
+  ) {
+    const refType = variableGoTypes.get(expr.expression.text);
+    if (refType && refType.startsWith('*')) return refType.slice(1);
+  }
   if (isCallExpression(expr) || isIdentifier(expr) || isPropertyAccessExpression(expr)) {
     return inferGoType(expr);
   }
@@ -11499,6 +11614,11 @@ function visitImportDeclaration(node: AstNode): string {
       registerGoBuiltinAliases(node);
       return '';
     }
+    // Side-effect import (`import 'go:time/tzdata'`): blank Go import
+    if (!node.importClause) {
+      goSideEffectImports.add(goPkg);
+      return '';
+    }
     importedPackages.add(goPkg);
     registerGoPackageAliases(node, goPkg);
     return '';
@@ -11530,6 +11650,19 @@ function visitImportDeclaration(node: AstNode): string {
 // Go packages imported under a fixed alias to avoid collisions with user
 // variables (a variable named `big` would shadow the package name).
 // Table lives in src/go/overrides.ts (shared with the bridge qualifier).
+// Whether Go code uses `name.` as a package qualifier (not the tail of a
+// longer identifier or selector: `ratio.` does not use `io`)
+function referencesQualifier(code: string, name: string): boolean {
+  const needle = `${name}.`;
+  let at = code.indexOf(needle);
+  while (at >= 0) {
+    const prev = at > 0 ? code[at - 1] : ' ';
+    if (!/[A-Za-z0-9_.]/.test(prev)) return true;
+    at = code.indexOf(needle, at + 1);
+  }
+  return false;
+}
+
 function goImportLine(pkg: string): string {
   const alias = goPathAliases[pkg];
   return alias ? `import ${alias} "${pkg}"` : `import "${pkg}"`;
