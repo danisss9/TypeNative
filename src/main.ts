@@ -2,6 +2,7 @@
 // the native compiler binary. Interactive prompts use the transpilable
 // prompt module (sync stdin) instead of inquirer.
 
+import path from 'node:path';
 import { run, createProject } from './index.js';
 import { ask, askMultiline, confirm } from './prompt.js';
 import { parseAstJsonNative } from './parse-native.js';
@@ -35,5 +36,7 @@ import { parseAstJsonNative } from './parse-native.js';
     tsCode = askMultiline('Write your typescript code here:');
   }
 
-  run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative });
+  // The native compiler lives in native/, next to the package's govendor/
+  const vendorDir = path.join(path.dirname(path.resolve(process.argv[0])), '..', 'govendor');
+  run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative, vendorDir });
 })();

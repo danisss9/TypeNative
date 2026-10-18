@@ -474,7 +474,7 @@ async function runs synchronously until its first `await`.
 | `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
 | `node:repl`                                 |   ❌    | [repl](#noderepl)                                           |
 | `node:sea`                                  |   ❌    | [sea](#nodesea)                                             |
-| `node:sqlite`                               |   ❌    | [sqlite](#nodesqlite)                                       |
+| `node:sqlite`                               |   ✅    | [sqlite](#nodesqlite)                                       |
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
 | `node:stream/web` (+ globals `ReadableStream`, `WritableStream`, `TransformStream`, …) | ✅ | [stream/web](#nodestreamweb)                 |
 | `node:string_decoder`                       |   ✅    | [string_decoder](#nodestring_decoder)                       |
@@ -830,6 +830,32 @@ async function runs synchronously until its first `await`.
 | `MessageChannel` / `MessagePort` (`postMessage`, `on('message')`, `onmessage`, `start`, `close`, `ref` / `unref`), `receiveMessageOnPort`, `BroadcastChannel`, `get/setEnvironmentData` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Channels and broadcast channels work within one process (ports can't be transferred to workers)     |
 | Workers for another file / `eval: true`, transferring ports, `SharedArrayBuffer` / `Atomics`, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | One binary holds one program; memory is not shared between processes                                  |
 
+#### `node:sqlite`
+
+SQLite comes from [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3): SQLite compiled
+to Wasm and translated to Go, so programs need no cgo and still cross-compile. The npm package
+ships the driver in [govendor/](govendor/) (`npm run vendor:go` updates it), so builds need no
+network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as Row` and
+`rows as Row[]` all work.
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `new DatabaseSync(path, options)` (`:memory:`, files, `file:` URIs), `open` / `close` / `isOpen` / `isTransaction` / `location()`, `exec` | ✅ | [lib-node-sqlite.ts](conformance/lib-node-sqlite.ts) | `open: false` defers to `open()` |
+| `prepare(sql, options)`; `StatementSync#run` (`{ changes, lastInsertRowid }`) / `get` / `all` / `iterate` (`for…of`, `next()`) | ✅ | [lib-node-sqlite.ts](conformance/lib-node-sqlite.ts) | Rows are objects keyed by column name; `get()` without a row is `undefined` |
+| Parameters: anonymous `?`, named `:x` / `$x` / `@x`, bare names (`{ x }`); values `null`, number (REAL), bigint (INTEGER), string, boolean (1 / 0), `Uint8Array` / Buffer | ✅ | [lib-node-sqlite.ts](conformance/lib-node-sqlite.ts) | Results: INTEGER → number (bigint with `readBigInts`), REAL → number, TEXT → string, BLOB → `Uint8Array`, NULL → `null` |
+| Options `readOnly`, `enableForeignKeyConstraints` (on by default), `enableDoubleQuotedStringLiterals`, `timeout`, `readBigInts`, `returnArrays`, `allowBareNamedParameters`, `allowUnknownNamedParameters`, `defensive`, `limits` | ✅ | [lib-node-sqlite-options.ts](conformance/lib-node-sqlite-options.ts) | `db.limits.x = n` sets a limit; `Infinity` restores the maximum |
+| `columns()`, `sourceSQL`, `expandedSQL`, `setReadBigInts` / `setReturnArrays` / `setAllowBareNamedParameters` / `setAllowUnknownNamedParameters`, `enableDefensive` | ✅ | [lib-node-sqlite-options.ts](conformance/lib-node-sqlite-options.ts) | |
+| `createTagStore()` (`` sql.get`… ${x}` `` / `all` / `run` / `iterate`, `size`, `capacity`, `clear`) | ✅ | [lib-node-sqlite-options.ts](conformance/lib-node-sqlite-options.ts) | One cached statement per template, least recently used out first |
+| `function(name, options, fn)` (`deterministic`, `directOnly`, `varargs`, `useBigIntArguments`), `aggregate(name, { start, step, result, inverse })` (window functions) | ✅ | [lib-node-sqlite-functions.ts](conformance/lib-node-sqlite-functions.ts) | A throw inside the callback is rethrown by the statement |
+| `setAuthorizer(callback)`, `constants` (`SQLITE_OK` / `DENY` / `IGNORE`, action codes, `SQLITE_CHANGESET_*`) | ✅ | [lib-node-sqlite-functions.ts](conformance/lib-node-sqlite-functions.ts) | |
+| Errors: SQLite's message with `code: 'ERR_SQLITE_ERROR'`, `errcode` (extended result code), `errstr`; `ERR_INVALID_STATE` / `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_VALUE` | ✅ | [lib-node-sqlite-errors.ts](conformance/lib-node-sqlite-errors.ts) | Same messages as Node 24 |
+| `backup(db, path, { source, rate, progress })` | ✅ | [lib-node-sqlite-errors.ts](conformance/lib-node-sqlite-errors.ts) | Copies `rate` pages per event-loop turn; resolves with the page count |
+| `loadExtension` / `enableLoadExtension` | ❌ | — | SQLite runs as Wasm inside the program; native extensions can't load |
+| `createSession` / `applyChangeset` | ❌ | — | The bundled SQLite build has no session extension |
+| `serialize` / `deserialize` | ❌ | — | The driver has no `sqlite3_serialize` binding |
+| `undefined` as a parameter value, `[Object: null prototype]` rows | ❌ | — | `undefined` and `null` are both `nil` (binds NULL instead of throwing); rows print as plain objects |
+| Finalizing a statement when it is garbage-collected | ❌ | — | Statements live until `db.close()` (Go has no hook that is safe here): re-preparing in a loop holds every copy until then; reuse statements or `createTagStore()` |
+
 #### `node:inspector`
 
 | API | Status | Probe | Notes |
@@ -883,12 +909,6 @@ async function runs synchronously until its first `await`.
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
 | `tap` / `spec` / `dot` / `junit` / `lcov` | ❌ | — | Reporters consume `run()`'s event stream, and `run()` runs test files as separate processes; one binary holds one program (see [test](#nodetest)) |
-
-#### `node:sqlite`
-
-| API | Status | Probe | Notes |
-| --- | :----: | ----- | ----- |
-| `DatabaseSync` / `StatementSync` / `backup` / `constants` | ❌ | — | Needs a SQLite engine, which Go's standard library lacks; planned on a vendored pure-Go driver (ncruces/go-sqlite3, no cgo) |
 
 #### `node:domain`
 

@@ -44,7 +44,9 @@ export const goPathAliases = {
     'crypto/rand': 'cryptorand',
     'math/rand/v2': 'randv2',
     'html/template': 'htmltemplate',
-    'golang.org/x/text/unicode/norm': 'tnnorm'
+    'golang.org/x/text/unicode/norm': 'tnnorm',
+    // node:sqlite's driver: the package name differs from the last path element
+    'github.com/ncruces/go-sqlite3': 'sqlite3'
 };
 export const goExcluded = {
     plugin: 'cgo, `-buildmode=plugin`',

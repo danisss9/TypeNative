@@ -169,7 +169,7 @@ fs.readFileSync('file.txt', 'utf-8');
 childProcess.spawnSync('go', ['version'], { encoding: 'utf-8' });
 ```
 
-Supported: `path`, `fs` (sync, callbacks, `fs/promises`, streams), `os`, `process`, `buffer`, `url` (`URL`, `URLSearchParams`), `util`, `assert`, `crypto` (hashes, ciphers, keys, signatures, `X509Certificate`, `crypto.subtle`), `zlib`, `events`, `stream` (+ `stream/web`: `ReadableStream` & co.), `readline`, `child_process` (with `fork` / IPC), `cluster`, `timers`, `perf_hooks`, `querystring`, `string_decoder`, networking (`net`, `dns`, `http`, `https`, `http2`, `tls`, `dgram`, global `fetch` with `Blob` / `FormData`), `async_hooks` (`AsyncLocalStorage`), `diagnostics_channel` (with `tracingChannel`), `test` (the `node:test` runner, with `mock.timers`) and `worker_threads` (workers as child processes) and more, with Node's signatures (import as `node:x` or `x`). Callbacks, timers and I/O run on one event loop, as in Node. `node:readline.question()` exists as a TypeNative sync extension for self-hosted prompts. Per-API status: [conformance.md](conformance.md#node-builtins-node).
+Supported: `path`, `fs` (sync, callbacks, `fs/promises`, streams), `os`, `process`, `buffer`, `url` (`URL`, `URLSearchParams`), `util`, `assert`, `crypto` (hashes, ciphers, keys, signatures, `X509Certificate`, `crypto.subtle`), `zlib`, `events`, `stream` (+ `stream/web`: `ReadableStream` & co.), `readline`, `child_process` (with `fork` / IPC), `cluster`, `timers`, `perf_hooks`, `querystring`, `string_decoder`, networking (`net`, `dns`, `http`, `https`, `http2`, `tls`, `dgram`, global `fetch` with `Blob` / `FormData`), `async_hooks` (`AsyncLocalStorage`), `diagnostics_channel` (with `tracingChannel`), `test` (the `node:test` runner, with `mock.timers`), `worker_threads` (workers as child processes) and `sqlite` (`DatabaseSync` on a bundled pure-Go SQLite: no cgo, no network at build time) and more, with Node's signatures (import as `node:x` or `x`). Callbacks, timers and I/O run on one event loop, as in Node. `node:readline.question()` exists as a TypeNative sync extension for self-hosted prompts. Per-API status: [conformance.md](conformance.md#node-builtins-node).
 
 **Direct Go access (import with the `go:` prefix):**
 
@@ -240,7 +240,7 @@ main.ts --(parse)--> normalized JSON AST --(transpileToNative)--> dist/code.go -
 
 - **Parse:** Node CLI uses the `typescript` npm package (`src/parse-node.ts`); the self-hosted binary spawns the Go `tsparser` tool (`src/parse-native.ts`). Both emit the same `{ kind: "Xxx", ... }` JSON shape so one transpiler consumes either.
 - **Transpile:** `transpileToNative(code, { parse, readFile })` in `src/transpiler.ts` lowers the AST to Go, resolving relative and npm imports into additional Go files (`TranspileResult { main, files }`).
-- **Build:** `run()` in `src/index.ts` writes `dist/code.go` (+ one Go file per module), cleans stale `dist/*.go`, shells out to `go build -o dist/native(.exe)`, then either executes it (`--script`, stdio inherited) or copies it to `--output`.
+- **Build:** `run()` in `src/index.ts` writes `dist/code.go` (+ one Go file per module), cleans stale `dist/*.go`, shells out to `go build -o dist/native(.exe)`, then either executes it (`--script`, stdio inherited) or copies it to `--output`. Third-party Go modules a program needs (`node:sqlite`'s driver, shipped in `govendor/`; `golang.org/x/text`, copied from GOROOT) are copied under `dist/tnvendor` and wired in with `replace` directives in `dist/go.mod`, so builds stay offline.
 
 ## Testing and conformance
 

@@ -27,6 +27,7 @@ import { registerDns } from './node/dns.js';
 import { registerHttp } from './node/http.js';
 import { registerTls } from './node/tls.js';
 import { registerDgram } from './node/dgram.js';
+import { registerSqlite } from './node/sqlite.js';
 import { registerFetch } from './node/fetch.js';
 import { registerStreamWeb } from './node/stream_web.js';
 import { registerAsyncHooks } from './node/async_hooks.js';
@@ -1731,8 +1732,22 @@ function visit(node, options = {}) {
         const bigRight = inferExpressionType(node.right);
         if (bigLeft === '*tnbig.Int' || bigRight === '*tnbig.Int') {
             useHelper('bigint');
-            const bl = visit(node.left);
-            const br = visit(node.right);
+            let bl = visit(node.left);
+            let br = visit(node.right);
+            // number | bigint values (node:sqlite's changes): === is true only for an
+            // equal bigint; other operators convert the dynamic side
+            const dynamicSide = bigLeft === 'interface{}' ? bl : bigRight === 'interface{}' ? br : '';
+            if (dynamicSide) {
+                const bigSide = dynamicSide === bl ? br : bl;
+                if (op === '==')
+                    return `TnBigSame(${dynamicSide}, ${bigSide})`;
+                if (op === '!=')
+                    return `!TnBigSame(${dynamicSide}, ${bigSide})`;
+                if (dynamicSide === bl)
+                    bl = `TnToBigInt(${bl})`;
+                else
+                    br = `TnToBigInt(${br})`;
+            }
             if (op === '==')
                 return `${bl}.Cmp(${br}) == 0`;
             if (op === '!=')
@@ -2784,9 +2799,11 @@ function toGoValueOfType(expr, goType) {
                 ? `&${code}`
                 : `func() ${goType} { __v := ${code}; return &__v }()`;
         }
-        // (x as string[]) on an any value: convert, then box
+        // (x as string[]) on an any value, or (rows as Row[]) on an array of any
+        // values (node:sqlite's all()): convert, then box
         const castSource = isAsExpression(expr) ? expr.expression : expr;
-        if (isDynamicValue(castSource)) {
+        const dynamicElements = goType !== '*[]interface{}' && inferExpressionType(castSource) === '[]interface{}';
+        if (isDynamicValue(castSource) || dynamicElements) {
             useHelper('dynamic');
             return `func() ${goType} { __v := TnAs[${goType.slice(1)}](${visit(castSource)}); return &__v }()`;
         }
@@ -3541,7 +3558,10 @@ function hasNonIdentifierKeys(node) {
                 return false;
             continue;
         }
-        if (isStringLiteral(p.name) && !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(p.name.text))
+        // Go identifiers have no `$` ({ $id: 1 }, node:sqlite's named parameters)
+        if (isStringLiteral(p.name) && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(p.name.text))
+            sawKey = true;
+        if (isIdentifier(p.name) && p.name.text.includes('$'))
             sawKey = true;
     }
     return sawKey;
@@ -4308,6 +4328,26 @@ function inferFunctionBodyReturnType(node) {
     }
     return undefined;
 }
+function getEnclosingParameterType(expr) {
+    const primitives = ['NumberKeyword', 'StringKeyword', 'BooleanKeyword', 'BigIntKeyword'];
+    for (let node = expr.parent; node; node = node.parent) {
+        if (!isArrowFunction(node) && !isFunctionExpression(node) && node.kind !== 'FunctionDeclaration' && !isMethodDeclaration(node)) {
+            continue;
+        }
+        const param = (node.parameters ?? []).find((p) => isIdentifier(p.name) && p.name.text === expr.text);
+        if (!param)
+            continue;
+        if (!param.type || param.questionToken || param.initializer)
+            return undefined;
+        // ...values: number[] reads as []float64 in the body
+        if (param.dotDotDotToken) {
+            const elem = param.type.kind === 'ArrayType' ? param.type.elementType : undefined;
+            return elem && primitives.includes(elem.kind) ? `[]${getType(elem)}` : undefined;
+        }
+        return primitives.includes(param.type.kind) ? getParameterGoType(param) : undefined;
+    }
+    return undefined;
+}
 function inferArrowFunctionGoType(node) {
     // Mirrors getFunctionParametersInfo: trailing defaulted parameters become
     // a variadic `...interface{}`
@@ -4373,6 +4413,14 @@ function inferExpressionType(expr) {
         return 'TnJsxNode';
     if (expr.kind === 'TaggedTemplateExpression' && isStringRawTag(expr.tag))
         return 'string';
+    // sql`…` with a Node class method as the tag (node:sqlite's tag store)
+    if (expr.kind === 'TaggedTemplateExpression' && isPropertyAccessExpression(expr.tag)) {
+        const recvType = inferExpressionType(expr.tag.expression);
+        const cls = recvType ? nodeRegistry.classes[nodeRegistry.classByGoType[recvType]] : undefined;
+        const result = cls?.methods[expr.tag.name.text];
+        if (result)
+            return result;
+    }
     if (isRegularExpressionLiteral(expr)) {
         const lastSlash = expr.text.lastIndexOf('/');
         if (needsStatefulRegex(expr.text.substring(1, lastSlash), expr.text.substring(lastSlash + 1))) {
@@ -4390,6 +4438,12 @@ function inferExpressionType(expr) {
     if (isIdentifier(expr) && expr.text === 'undefined')
         return 'nil';
     if (isIdentifier(expr)) {
+        // A primitive-typed parameter of an enclosing function: its annotation,
+        // not a same-named variable registered earlier (inferring the return type
+        // of an arrow before it is visited)
+        const enclosingParamType = getEnclosingParameterType(expr);
+        if (enclosingParamType)
+            return enclosingParamType;
         let varType = variableGoTypes.get(expr.text);
         // Array references are read as the slice they point to
         if (varType?.startsWith('*[]'))
@@ -4717,6 +4771,10 @@ function inferExpressionType(expr) {
                 return ownerType;
             if (methodName === 'reduceRight' && expr.arguments?.[1])
                 return inferExpressionType(expr.arguments[1]);
+            // the accumulator: the initial value's type, else the element type
+            if (methodName === 'reduce') {
+                return (expr.arguments?.[1] ? inferExpressionType(expr.arguments[1]) : undefined) ?? elementType;
+            }
             if (methodName === 'flat' && elementType.startsWith('[]'))
                 return elementType;
             if (methodName === 'flat' || methodName === 'flatMap')
@@ -8189,6 +8247,7 @@ const helperRequires = {
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
     promise: ['error', 'eventLoop', 'asyncWait'],
     goMust: ['error'],
+    bigint: ['error'],
     goBlocking: ['error', 'eventLoop'],
     decorators: [],
     jsx: [],
@@ -8282,6 +8341,7 @@ registerDns(nodeRegistry);
 registerTls(nodeRegistry);
 registerHttp(nodeRegistry);
 registerDgram(nodeRegistry);
+registerSqlite(nodeRegistry);
 registerFetch(nodeRegistry);
 registerStreamWeb(nodeRegistry);
 registerAsyncHooks(nodeRegistry);
@@ -8302,7 +8362,7 @@ const helperPackages = {
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
     error: [],
-    bigint: ['math/big'],
+    bigint: ['math/big', 'math'],
     symbol: [],
     fancyRegex: ['regexp', 'strings', 'strconv', 'fmt'],
     namedGroups: ['regexp'],
@@ -8342,6 +8402,10 @@ func TnGet(obj interface{}, key string) interface{} {
 	case string:
 		if key == "length" {
 			return float64(len(o))
+		}
+	case interface{ TnProp(string) (interface{}, bool) }:
+		if v, ok := o.TnProp(key); ok || key != "length" {
+			return v
 		}
 	case *TnError:
 		if key == "message" {
@@ -8434,6 +8498,15 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 	case string:
 		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
 			return string(o[int(i)])
+		}
+	case []byte:
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
+			return float64(o[int(i)])
+		}
+	case interface{ TnProp(string) (interface{}, bool) }:
+		if k, ok := key.(string); ok {
+			v, _ := o.TnProp(k)
+			return v
 		}
 	}
 	return nil
@@ -8698,6 +8771,9 @@ func TnHas(obj interface{}, key interface{}) bool {
 }
 
 func TnKeys(obj interface{}) []string {
+	if record, ok := obj.(interface{ Keys() []string }); ok {
+		return append([]string{}, record.Keys()...)
+	}
 	o, _ := obj.(map[string]interface{})
 	keys := make([]string, 0, len(o))
 	for k := range o {
@@ -8834,6 +8910,15 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		return p, true
 	case reflect.Struct:
 		m, ok := v.(map[string]interface{})
+		if props, isRecord := v.(interface{ Entries() [][]interface{} }); !ok && isRecord {
+			// A string-keyed TnMap (a Record, a node:sqlite row)
+			m, ok = map[string]interface{}{}, true
+			for _, e := range props.Entries() {
+				if k, isString := e[0].(string); isString {
+					m[k] = e[1]
+				}
+			}
+		}
 		if !ok {
 			return reflect.Value{}, false
 		}
@@ -9116,6 +9201,17 @@ func (m *TnMap[K, V]) Get(k K) V {
 		return zero
 	}
 	return m.values[k]
+}
+
+// A string key's value when the map is held in a dynamic value (a Record or a
+// node:sqlite row read as \`row.name\`): TnGet finds it through this method
+func (m *TnMap[K, V]) TnProp(key string) (interface{}, bool) {
+	k, ok := any(key).(K)
+	if !ok || m == nil {
+		return nil, false
+	}
+	v, present := m.values[k]
+	return v, present
 }
 
 func (m *TnMap[K, V]) Lookup(k K) (V, bool) {
@@ -10385,6 +10481,28 @@ func TnBigInt(s string) *tnbig.Int {
 		v, _ = new(tnbig.Int).SetString(s, 10)
 	}
 	return v
+}
+
+// x === 1n where x is a dynamic (number | bigint) value
+func TnBigSame(v interface{}, b *tnbig.Int) bool {
+	x, ok := v.(*tnbig.Int)
+	return ok && x != nil && b != nil && x.Cmp(b) == 0
+}
+
+// A dynamic value as a bigint operand: a bigint, or an integral number
+func TnToBigInt(v interface{}) *tnbig.Int {
+	switch x := v.(type) {
+	case *tnbig.Int:
+		if x != nil {
+			return x
+		}
+	case float64:
+		if x == math.Trunc(x) && !math.IsInf(x, 0) {
+			b, _ := new(tnbig.Float).SetFloat64(x).Int(nil)
+			return b
+		}
+	}
+	panic(TnNodeError("TypeError", "", "Cannot mix BigInt and other types, use explicit conversions"))
 }`,
     goMust: `// Go bridge: (T, error) results throw a *TnError carrying the Go error
 func tnGoError(err error) *TnError {
