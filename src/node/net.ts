@@ -1089,6 +1089,18 @@ export function registerNet(r: NodeRegistry): void {
     use();
     return `TnNewSocket(${c.args.join(', ')})`;
   };
+  // net.Stream: the legacy name of Socket
+  r.classes['net.Stream'] = r.classes['net.Socket'];
+  r.constructors['net.Stream'] = r.constructors['net.Socket'];
+  // Go's dialer always races IPv4 / IPv6 (Happy Eyeballs): the defaults are reported, not used
+  r.functions['net.getDefaultAutoSelectFamily'] = (_c: NodeCall) => 'true';
+  r.results['net.getDefaultAutoSelectFamily'] = 'bool';
+  r.functions['net.setDefaultAutoSelectFamily'] = (_c: NodeCall) => '_ = 0';
+  r.results['net.setDefaultAutoSelectFamily'] = '';
+  r.functions['net.getDefaultAutoSelectFamilyAttemptTimeout'] = (_c: NodeCall) => 'float64(250)';
+  r.results['net.getDefaultAutoSelectFamilyAttemptTimeout'] = 'float64';
+  r.functions['net.setDefaultAutoSelectFamilyAttemptTimeout'] = (_c: NodeCall) => '_ = 0';
+  r.results['net.setDefaultAutoSelectFamilyAttemptTimeout'] = '';
   r.constructors['net.Server'] = (c: NodeCall) => {
     use();
     return `TnNewNetServer(${c.args.join(', ')})`;

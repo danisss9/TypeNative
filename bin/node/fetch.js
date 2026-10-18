@@ -504,6 +504,22 @@ func TnNewRequest(input interface{}, init ...interface{}) *TnRequest {
 
 var tnFetchClients sync.Map
 
+// The Fetch standard's blocked ports: fetch fails with cause "bad port"
+var tnFetchBadPorts = map[string]bool{}
+
+func init() {
+	for _, p := range []int{1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080} {
+		tnFetchBadPorts[strconv.Itoa(p)] = true
+	}
+}
+
+func tnFetchBadPort(u *tnurl.URL) *TnError {
+	if (u.Scheme == "http" || u.Scheme == "https") && tnFetchBadPorts[u.Port()] {
+		return TnNodeError("Error", "", "bad port")
+	}
+	return nil
+}
+
 func tnFetchClient(redirect string) *http.Client {
 	if c, ok := tnFetchClients.Load(redirect); ok {
 		return c.(*http.Client)
@@ -520,6 +536,9 @@ func tnFetchClient(redirect string) *http.Client {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 20 {
 				return TnNodeError("TypeError", "", "redirect count exceeded")
+			}
+			if bad := tnFetchBadPort(req.URL); bad != nil {
+				return bad
 			}
 			return nil
 		}
@@ -573,6 +592,13 @@ func TnFetch(input interface{}, init ...interface{}) chan *TnResponse {
 	if err != nil {
 		cancel()
 		TnReject(ch, TnNodeError("TypeError", "", "fetch failed"))
+		return ch
+	}
+	if bad := tnFetchBadPort(goReq.URL); bad != nil {
+		cancel()
+		e := TnNodeError("TypeError", "", "fetch failed")
+		e.props["cause"] = bad
+		TnReject(ch, e)
 		return ch
 	}
 	req.headers.toGo(goReq.Header)

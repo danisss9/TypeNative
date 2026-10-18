@@ -87,6 +87,8 @@ generated types say they do.
   servers, `timeout`, `cancel`), `setServers`, `lookupService`; `tls.checkServerIdentity` (and
   the `connect` option); HTTP `'upgrade'` / `'connect'` on servers and clients; node:test
   `t.assert` and `mock.timers`; `console.table`
+- `new Error(message, { cause })` / `err.cause`; fetch refuses the Fetch standard's bad ports;
+  `net.Stream` and the `autoSelectFamily` defaults
 
 ### Fixed
 
@@ -118,6 +120,8 @@ generated types say they do.
 - A detached top-level async call with arguments (`run(a, b);`) passes them (they were dropped)
 - A function that only returns `undefined` compiles (its result type was `nil`)
 - `gunzip` of data without a gzip header fails with `incorrect header check`, as in Node
+- Error properties declared by both `NodeJS.ErrnoException` and `AssertionError` no longer hide
+  each other (`(e.cause as Error).message` typed the cause as unknown)
 - Negative bigint literals and `-x` on bigints; hex / octal / binary bigint literals;
   `p.then(() => …)` on a `Promise<void>`; `JSON.stringify` of records keeps their keys (it
   printed the map's internals); `String(x)` / template literals use a Node class's `toString()`

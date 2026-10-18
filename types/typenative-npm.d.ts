@@ -1754,6 +1754,11 @@ declare module 'node:net' {
     function isIP(input: string): number;
     function isIPv4(input: string): boolean;
     function isIPv6(input: string): boolean;
+    const Stream: typeof Socket;
+    function getDefaultAutoSelectFamily(): boolean;
+    function setDefaultAutoSelectFamily(value: boolean): void;
+    function getDefaultAutoSelectFamilyAttemptTimeout(): number;
+    function setDefaultAutoSelectFamilyAttemptTimeout(value: number): void;
     type IPVersion = 'ipv4' | 'ipv6';
     interface SocketAddressInitOptions {
       address?: string;

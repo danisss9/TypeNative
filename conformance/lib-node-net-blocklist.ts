@@ -45,3 +45,9 @@ try {
   code = (e as NodeJS.ErrnoException).code ?? '';
 }
 assert(code === 'ERR_INVALID_ADDRESS', 'SocketAddress validates the address');
+
+// net.Stream is Socket's legacy name; Go always races IPv4 and IPv6
+const legacy = new net.Stream();
+assert(legacy.destroyed === false, 'net.Stream constructs a Socket');
+legacy.destroy();
+assert(net.getDefaultAutoSelectFamily() && net.getDefaultAutoSelectFamilyAttemptTimeout() === 250, 'autoSelectFamily defaults');

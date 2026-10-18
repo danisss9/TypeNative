@@ -95,7 +95,7 @@ export function registerCore(r: NodeRegistry): void {
     'class',
     '',
     'message=string; code=string',
-    'name=string; stack=string; syscall=string; path=string; errno=float64; hostname=string; address=string; port=float64; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool',
+    'name=string; stack=string; cause=interface{}; syscall=string; path=string; errno=float64; hostname=string; address=string; port=float64; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool',
     ''
   );
   r.globals['NodeJS'] = 'NodeJS';
