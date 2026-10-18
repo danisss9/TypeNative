@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
 Errors now point at your TypeScript. Programs are type-checked before they're transpiled, code
 TypeNative can't compile stops the build with its position, and Go build errors and panics
-report `.ts` lines. CI runs the suite on Linux, Windows and macOS.
+report `.ts` lines. CI runs the suite on Linux, Windows and macOS, and all 398 probes pass on
+Windows (four failed there before), through both the Node CLI and the self-hosted compiler.
 
 ### Added
 
@@ -21,8 +24,8 @@ report `.ts` lines. CI runs the suite on Linux, Windows and macOS.
   `go build` errors and panic stack traces report TypeScript files and lines; runtime helpers
   keep their own `dist/code.go` positions. Both parsers emit `line` / `column` on AST nodes
 - `TranspileResult.diagnostics`, and `fileName` / `goFile` / `goos` transpile options
-- `npm run bootstrap:check`: the self-hosted compiler must emit the same Go for `src/main.ts`
-  as the Node CLI; `conformance-parallel.mjs --native`
+- `npm run bootstrap:check`: the self-hosted compiler must emit byte-identical Go for
+  `src/main.ts` to the Node CLI's; `conformance-parallel.mjs --native`
 - CI on Ubuntu, Windows and macOS, `check:go-types` in CI, and a self-hosted compiler job
   (bootstrap fixpoint + the suite through it)
 
@@ -31,12 +34,18 @@ report `.ts` lines. CI runs the suite on Linux, Windows and macOS.
 - Unsupported syntax and unsupported `node:` modules are errors with a position
   (`main.ts:2:1: error: Unsupported syntax: WithStatement`) instead of warnings followed by
   broken Go; `;` and `debugger` statements compile to nothing
+- Generated Go is deterministic: temp and renamed identifiers come from a generator seeded per
+  transpilation instead of `Math.random`, so the same source always gives the same Go
 - Code typed into `--script`'s prompt is saved as `dist/script.ts` (type-checked, and named in
   errors)
 - Scaffolded `tsconfig.json` sets `skipLibCheck`
 - `node:sqlite` `function()` / `aggregate()` callbacks are typed `(...args: any[])`: arguments
   convert to the types the callback declares
-- The release workflow builds `bin/` before testing and publishing
+- The release workflow builds `bin/` before testing and publishing; `conformance-parallel.mjs`
+  sizes its worker pool to the machine
+- Probes that depend on the OS (`lib-node-dns-resolver`, `lib-node-util-parse-args`) hold on
+  Windows, and the conformance probes type-check (`conformance/tsconfig.json` sets
+  `skipLibCheck`)
 
 ### Fixed
 
