@@ -382,6 +382,12 @@ declare module 'node:os' {
     function cpus(): CpuInfo[];
     function availableParallelism(): number;
     function networkInterfaces(): Record<string, NetworkInterfaceInfo[]>;
+    function totalmem(): number;
+    function freemem(): number;
+    function uptime(): number;
+    function loadavg(): number[];
+    function release(): string;
+    function version(): string;
   }
   export = os;
 }
@@ -956,12 +962,14 @@ declare module 'node:zlib' {
 
 declare module 'node:timers' {
   namespace timers {
-    function setTimeout<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): number;
-    function clearTimeout(timeout?: number): void;
-    function setInterval<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): number;
-    function clearInterval(interval?: number): void;
-    function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): number;
-    function clearImmediate(immediate?: number): void;
+    type Timeout = NodeJS.Timeout;
+    type Immediate = NodeJS.Immediate;
+    function setTimeout<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): NodeJS.Timeout;
+    function clearTimeout(timeout?: NodeJS.Timeout | number): void;
+    function setInterval<A extends any[]>(callback: (...args: A) => void, ms?: number, ...args: A): NodeJS.Timeout;
+    function clearInterval(interval?: NodeJS.Timeout | number): void;
+    function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): NodeJS.Immediate;
+    function clearImmediate(immediate?: NodeJS.Immediate | number): void;
     function queueMicrotask(callback: () => void): void;
     const promises: typeof import('node:timers/promises');
   }
@@ -988,6 +996,30 @@ declare module 'node:perf_hooks' {
   namespace perf_hooks {
     const performance: Performance;
     type PerformanceEntry = globalThis.PerformanceEntry;
+    const PerformanceObserver: typeof globalThis.PerformanceObserver;
+    type PerformanceObserver = globalThis.PerformanceObserver;
+    type PerformanceObserverEntryList = globalThis.PerformanceObserverEntryList;
+    interface Histogram {
+      readonly count: number;
+      readonly min: number;
+      readonly max: number;
+      readonly mean: number;
+      readonly stddev: number;
+      readonly exceeds: number;
+      readonly percentiles: Map<number, number>;
+      percentile(percentile: number): number;
+      reset(): void;
+    }
+    interface RecordableHistogram extends Histogram {
+      record(val: number | bigint): void;
+      recordDelta(): void;
+    }
+    interface IntervalHistogram extends Histogram {
+      enable(): boolean;
+      disable(): boolean;
+    }
+    function createHistogram(options?: { lowest?: number | bigint; highest?: number | bigint; figures?: number }): RecordableHistogram;
+    function monitorEventLoopDelay(options?: { resolution?: number }): IntervalHistogram;
   }
   export = perf_hooks;
 }
@@ -1046,6 +1078,11 @@ declare module 'node:events' {
     static on(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): AsyncIterableIterator<any[]>;
     static getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     static listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
+    static readonly errorMonitor: unique symbol;
+    static captureRejections: boolean;
+    static getMaxListeners(emitter: EventEmitter | EventTarget): number;
+    static setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
+    static addAbortListener(signal: AbortSignal, resource: (event: Event) => void): Disposable;
   }
   namespace EventEmitter {
     export { EventEmitter };
@@ -1054,6 +1091,11 @@ declare module 'node:events' {
     function on(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): AsyncIterableIterator<any[]>;
     function getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     function listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
+    const errorMonitor: typeof EventEmitter.errorMonitor;
+    let captureRejections: boolean;
+    function getMaxListeners(emitter: EventEmitter | EventTarget): number;
+    function setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
+    function addAbortListener(signal: AbortSignal, resource: (event: Event) => void): Disposable;
     const EventTarget: typeof globalThis.EventTarget;
     const Event: typeof globalThis.Event;
     const AbortController: typeof globalThis.AbortController;

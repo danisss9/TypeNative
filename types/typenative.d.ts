@@ -493,10 +493,10 @@ interface ImportMeta {
 }
 
 // Timers and microtasks. Handles are opaque; pass them to the matching clear function.
-declare function setTimeout(callback: (...args: any[]) => void, ms?: number): number;
-declare function clearTimeout(id?: number): void;
-declare function setInterval(callback: (...args: any[]) => void, ms?: number): number;
-declare function clearInterval(id?: number): void;
+declare function setTimeout(callback: (...args: any[]) => void, ms?: number): NodeJS.Timeout;
+declare function clearTimeout(id?: NodeJS.Timeout | number): void;
+declare function setInterval(callback: (...args: any[]) => void, ms?: number): NodeJS.Timeout;
+declare function clearInterval(id?: NodeJS.Timeout | number): void;
 declare function queueMicrotask(callback: () => void): void;
 
 // --- JSON / Object / process ---
@@ -560,6 +560,30 @@ interface Process {
   geteuid(): number;
   getegid(): number;
   loadEnvFile(path?: string): void;
+  cpuUsage(previousValue?: { user: number; system: number }): { user: number; system: number };
+  resourceUsage(): {
+    userCPUTime: number;
+    systemCPUTime: number;
+    maxRSS: number;
+    sharedMemorySize: number;
+    unsharedDataSize: number;
+    unsharedStackSize: number;
+    minorPageFault: number;
+    majorPageFault: number;
+    swappedOut: number;
+    fsRead: number;
+    fsWrite: number;
+    ipcSent: number;
+    ipcReceived: number;
+    signalsCount: number;
+    voluntaryContextSwitches: number;
+    involuntaryContextSwitches: number;
+  };
+  availableMemory(): number;
+  constrainedMemory(): number;
+  on(event: 'uncaughtException' | 'uncaughtExceptionMonitor', listener: (error: Error, origin: 'uncaughtException' | 'unhandledRejection') => void): this;
+  on(event: 'unhandledRejection', listener: (reason: unknown, promise: Promise<unknown>) => void): this;
+  on(event: 'beforeExit', listener: (code: number) => void): this;
   readonly stdout: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 1 };
   readonly stderr: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 2 };
   readonly stdin: import('node:stream').Readable & { readonly isTTY?: boolean; readonly fd: 0 };
@@ -1031,7 +1055,23 @@ interface PerformanceEntry {
   readonly duration: number;
   readonly detail?: any;
 }
+interface PerformanceObserverEntryList {
+  getEntries(): PerformanceEntry[];
+  getEntriesByName(name: string, type?: string): PerformanceEntry[];
+  getEntriesByType(type: string): PerformanceEntry[];
+}
+interface PerformanceObserver {
+  observe(options: { entryTypes: readonly string[] } | { type: string; buffered?: boolean }): void;
+  disconnect(): void;
+  takeRecords(): PerformanceEntry[];
+}
+declare var PerformanceObserver: {
+  new (callback: (list: PerformanceObserverEntryList, observer: PerformanceObserver) => void): PerformanceObserver;
+  readonly supportedEntryTypes: readonly string[];
+};
 interface Performance {
+  timerify<T extends (...params: any[]) => any>(fn: T): T;
+  eventLoopUtilization(previous?: { idle: number; active: number; utilization: number }): { idle: number; active: number; utilization: number };
   readonly timeOrigin: number;
   now(): number;
   mark(name: string, options?: { startTime?: number; detail?: any }): PerformanceEntry;
@@ -1287,10 +1327,23 @@ declare var Response: {
 
 declare function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 
-declare function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): number;
-declare function clearImmediate(immediate?: number): void;
+declare function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): NodeJS.Immediate;
+declare function clearImmediate(immediate?: NodeJS.Immediate | number): void;
 
 declare namespace NodeJS {
+  // Timer handles: an unref'ed timer does not keep the process alive
+  interface Timeout {
+    ref(): this;
+    unref(): this;
+    hasRef(): boolean;
+    refresh(): this;
+    close(): this;
+  }
+  interface Immediate {
+    ref(): this;
+    unref(): this;
+    hasRef(): boolean;
+  }
   // Errors thrown by Node APIs: err.code ('ENOENT', 'ERR_INVALID_URL', …)
   interface ErrnoException extends Error {
     errno?: number;

@@ -525,7 +525,7 @@ async function runs synchronously until its first `await`.
 | -------------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | ----------------------------------------------------------------------- |
 | `platform` / `arch` / `type` / `machine` / `EOL` / `devNull` / `endianness`                  |   ✅    | [lib-node-os.ts](conformance/lib-node-os.ts) | Node's names (`win32`, `x64`, `Windows_NT`, `x86_64`)                    |
 | `hostname` / `homedir` / `tmpdir` / `userInfo` / `cpus` / `availableParallelism` / `networkInterfaces` / `constants.signals` | ✅ | [lib-node-os.ts](conformance/lib-node-os.ts) | `cpus()` has one entry per logical CPU (model / speed / times are zero) |
-| `totalmem` / `freemem` / `uptime` / `loadavg` / `release` / `version`                         |   ❌    | —                                            | Not portable in Go's standard library                                   |
+| `totalmem` / `freemem` / `uptime` / `loadavg` / `release` / `version` | ✅ | [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | `/proc` on Linux, `sysctl` on macOS / BSD; zeros where neither exists |
 
 #### `node:process`
 
@@ -537,7 +537,8 @@ async function runs synchronously until its first `await`.
 | `process.on('exit' \| 'SIGINT' \| 'SIGTERM' \| 'SIGHUP')` / `once` / `off` / `emit`                   |   ✅    | [lib-node-process-events.ts](conformance/lib-node-process-events.ts) | `'exit'` runs after the event loop with the exit code; signals arrive on the loop |
 | `process.stdin` / `stdout` / `stderr` as streams                                                     |   ✅    | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `stdin` keeps the process alive only while flowing                           |
 | `kill` / `emitWarning` / `getuid` / `getgid`                                                         |   ✅    | —                                                              | Implemented, not probed                                                     |
-| `on('uncaughtException')` / `on('beforeExit')` / `cpuUsage` / `umask` / `stdout.columns`              |   ❌    | —                                                              | Not implemented                                                             |
+| `on('uncaughtException')` / `'uncaughtExceptionMonitor'` / `'unhandledRejection'` / `'beforeExit'` (per drain, can schedule more work); `cpuUsage` / `resourceUsage` / `availableMemory` / `loadEnvFile` | ✅ | [lib-node-process-uncaught.ts](conformance/lib-node-process-uncaught.ts), [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | Throws in the top-level code, loop callbacks and detached async calls reach the handlers; CPU times from `/proc` (Linux) or Go's runtime metrics |
+| `umask` / `stdout.columns` / `setRawMode` | ❌ | — | Need OS-specific syscalls a single portable binary can't contain |
 
 #### `node:console`
 
@@ -623,14 +624,14 @@ async function runs synchronously until its first `await`.
 | -------------------------------------------------------------------------------- | :----: | ------------------------------------------------------------------ | -------------------------------------------------------------------------- |
 | `setTimeout` / `setInterval` / `setImmediate` (+ extra arguments) / `clear*`; global `setImmediate` | ✅ | [lib-node-timers.ts](conformance/lib-node-timers.ts) | Callbacks run on the event loop                                             |
 | `node:timers/promises` (`setTimeout`, `setImmediate`, `setInterval`, `scheduler`) |   ✅    | [lib-node-timers-promises.ts](conformance/lib-node-timers-promises.ts) | `{ signal }` aborts; `setInterval` is an async iterator                      |
-| `Timeout#ref` / `unref` / `refresh`                                              |   ❌    | —                                                                  | Timers are Go timers without those methods                                 |
+| `Timeout` / `Immediate` handles: `ref` / `unref` / `hasRef` / `refresh` / `close` (also on intervals) | ✅ | [lib-node-timers-ref.ts](conformance/lib-node-timers-ref.ts) | Unref'ed timers don't keep the process alive |
 
 #### `node:perf_hooks`
 
 | API                                                                                    | Status | Probe                                                      | Notes                                       |
 | -------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------- |
 | `performance.now` / `timeOrigin` / `mark` / `measure` / `getEntries*` / `clearMarks`; global `performance` | ✅ | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Monotonic milliseconds since process start |
-| `PerformanceObserver` / `monitorEventLoopDelay` / `timerify`                            |   ❌    | —                                                          | Not implemented                             |
+| `PerformanceObserver` (`entryTypes` / `type` + `buffered`, batched, sorted by `startTime`), `timerify`, `createHistogram`, `monitorEventLoopDelay`, `eventLoopUtilization` | ✅ | [lib-node-perf-observer.ts](conformance/lib-node-perf-observer.ts) | `eventLoopUtilization` is estimated from CPU time |
 
 #### `node:tty`
 
@@ -654,7 +655,8 @@ async function runs synchronously until its first `await`.
 | `class X extends EventEmitter`                                                                       |   ✅    | [lib-node-events-extends.ts](conformance/lib-node-events-extends.ts) | The emitter is embedded; `this.emit` and inherited methods work           |
 | `events.once` (→ promise) / `events.on` (async iterator)                                             |   ✅    | [lib-node-events-once.ts](conformance/lib-node-events-once.ts) | `'error'` rejects `once`                                                   |
 | `EventTarget` / `Event` / `AbortController` / `AbortSignal` (`abort`, `timeout`, `any`, `throwIfAborted`) | ✅ | [lib-node-abort.ts](conformance/lib-node-abort.ts)            | Globals (also exported by `node:events`)                                   |
-| `captureRejections` / `errorMonitor` / symbol event names                                            |   ❌    | —                                                              | Not implemented                                                            |
+| `errorMonitor`, `captureRejections` (option and global), `getMaxListeners` / `setMaxListeners` (static), `addAbortListener` | ✅ | [lib-node-events-extra.ts](conformance/lib-node-events-extra.ts) | Captures rejections of listeners that return a promise; async arrow listeners run inline (their `await`s don't yield to `emit`) |
+| Symbol event names other than `errorMonitor`, `EventEmitterAsyncResource`, `Symbol.for('nodejs.rejection')` | ❌ | — | Event names are strings |
 
 #### `node:stream`
 

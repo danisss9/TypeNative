@@ -34,6 +34,7 @@ import { registerTest } from './node/test.js';
 import { registerWorkerThreads } from './node/worker_threads.js';
 import { registerCluster } from './node/cluster.js';
 import { registerHttp2 } from './node/http2.js';
+import { registerSystemExtra } from './node/system_extra.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import { goPackage, goTypeInfo as goMetaTypeInfo, hasGoPackage, isGoNumeric as isGoNumericType } from './go/metadata.js';
 import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
@@ -920,6 +921,8 @@ export function transpileToNative(code, options) {
     const importLine = (pkg) => goSideEffectImports.has(pkg) && !importedPackages.has(pkg)
         ? `import _ "${pkg}"`
         : goImportLine(pkg);
+    // process.on('uncaughtException'): a throw in the top-level code is handed to it too
+    const body = usedHelpers.has('nodeUncaught') ? `func() {\n\tdefer TnMainRecover()\n\t${mainCode.trim()}\n\t}()` : mainCode.trim();
     const main = `package main
 
 ${mainImports.sort().map((pkg) => importLine(pkg)).join('\n')}
@@ -927,7 +930,7 @@ ${mainImports.sort().map((pkg) => importLine(pkg)).join('\n')}
 ${packageVariables.join('\n')}
 
 func main() {
-    ${mainCode.trim()}${drainCode}
+    ${body}${drainCode}
 }
 
 ${outsideCode.trim()}
@@ -4975,7 +4978,7 @@ const BUILTIN_FUNCTION_TYPES = {
     parseInt: 'float64',
     Number: 'float64',
     String: 'string',
-    setTimeout: '*time.Timer',
+    setTimeout: '*TnTimeout',
     setInterval: '*TnInterval'
 };
 const STRING_METHOD_RETURN_TYPES = {
@@ -8271,6 +8274,7 @@ registerTest(nodeRegistry);
 registerWorkerThreads(nodeRegistry);
 registerCluster(nodeRegistry);
 registerHttp2(nodeRegistry);
+registerSystemExtra(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
@@ -10427,48 +10431,117 @@ type TnSymbol struct {
 func TnNewSymbol(description string) *TnSymbol {
 	return &TnSymbol{description: description}
 }`,
-    timerWait: `// Timers: callbacks run on the event loop; pending timers keep the process alive
+    timerWait: `// Timers: callbacks run on the event loop; pending (ref'ed) timers keep the process alive
 var __tnTimers tnLoopGroup
 
-func TnSetTimeout(ms float64, fn func()) *time.Timer {
+// A setTimeout / setImmediate handle (Node's Timeout: ref / unref / hasRef / refresh / close)
+type TnTimeout struct {
+	timer  *time.Timer
+	ms     float64
+	fn     func()
+	refd   bool
+	active bool
+	gen    int
+}
+
+func TnSetTimeout(ms float64, fn func()) *TnTimeout {
 	__tnTimers.Add(1)
-	fn = TnAsyncWrap(fn)
-	return time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() {
+	t := &TnTimeout{ms: ms, fn: TnAsyncWrap(fn), refd: true, active: true}
+	t.arm()
+	return t
+}
+
+func (t *TnTimeout) arm() {
+	t.gen++
+	gen := t.gen
+	t.timer = time.AfterFunc(time.Duration(t.ms*float64(time.Millisecond)), func() {
 		TnLoopPost(func() {
-			defer __tnTimers.Done()
-			fn()
+			if !t.active || gen != t.gen {
+				return
+			}
+			t.active = false
+			if t.refd {
+				t.refd = false
+				__tnTimers.Done()
+			}
+			t.fn()
 		})
 	})
 }
 
-// setInterval: fn every ms until cleared (the process lives until then)
+func (t *TnTimeout) ref() *TnTimeout {
+	if !t.refd && t.active {
+		t.refd = true
+		__tnTimers.Add(1)
+	}
+	return t
+}
+
+func (t *TnTimeout) unref() *TnTimeout {
+	if t.refd {
+		t.refd = false
+		__tnTimers.Done()
+	}
+	return t
+}
+
+func (t *TnTimeout) hasRef() bool { return t.refd }
+
+// refresh(): restarts the countdown (a fired timeout runs again)
+func (t *TnTimeout) refresh() *TnTimeout {
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	if !t.active {
+		t.active = true
+		if !t.refd {
+			t.refd = true
+			__tnTimers.Add(1)
+		}
+	}
+	t.arm()
+	return t
+}
+
+func (t *TnTimeout) close() *TnTimeout {
+	TnClearTimeout(t)
+	return t
+}
+
+// setInterval: fn every ms until cleared (the process lives until then, unless unref'ed)
 type TnInterval struct {
 	stop    chan struct{}
 	once    sync.Once
 	stopped int32
+	refd    bool
+	ms      float64
+	fn      func()
 }
 
 func TnSetInterval(ms float64, fn func()) *TnInterval {
 	__tnTimers.Add(1)
-	fn = TnAsyncWrap(fn)
-	t := &TnInterval{stop: make(chan struct{})}
+	t := &TnInterval{stop: make(chan struct{}), refd: true, ms: ms, fn: TnAsyncWrap(fn)}
+	t.start(t.stop)
+	return t
+}
+
+func (t *TnInterval) start(stop chan struct{}) {
 	go func() {
-		ticker := time.NewTicker(max(time.Duration(ms*float64(time.Millisecond)), time.Millisecond))
+		ticker := time.NewTicker(max(time.Duration(t.ms*float64(time.Millisecond)), time.Millisecond))
 		defer ticker.Stop()
 		for {
 			select {
-			case <-t.stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				TnLoopPost(func() {
 					if atomic.LoadInt32(&t.stopped) == 0 {
-						fn()
+						t.fn()
 					}
 				})
 			}
 		}
 	}()
-	return t
 }
 
 func TnClearInterval(t *TnInterval) {
@@ -10476,14 +10549,54 @@ func TnClearInterval(t *TnInterval) {
 		t.once.Do(func() {
 			atomic.StoreInt32(&t.stopped, 1)
 			close(t.stop)
-			__tnTimers.Done()
+			if t.refd {
+				t.refd = false
+				__tnTimers.Done()
+			}
 		})
 	}
 }
 
-func TnClearTimeout(t *time.Timer) {
-	if t != nil && t.Stop() {
+func (t *TnInterval) ref() *TnInterval {
+	if !t.refd && atomic.LoadInt32(&t.stopped) == 0 {
+		t.refd = true
+		__tnTimers.Add(1)
+	}
+	return t
+}
+
+func (t *TnInterval) unref() *TnInterval {
+	if t.refd {
+		t.refd = false
 		__tnTimers.Done()
+	}
+	return t
+}
+
+func (t *TnInterval) hasRef() bool { return t.refd }
+
+func (t *TnInterval) refresh() *TnInterval {
+	if atomic.LoadInt32(&t.stopped) == 0 {
+		close(t.stop)
+		t.stop = make(chan struct{})
+		t.start(t.stop)
+	}
+	return t
+}
+
+func (t *TnInterval) close() *TnInterval {
+	TnClearInterval(t)
+	return t
+}
+
+func TnClearTimeout(t *TnTimeout) {
+	if t != nil && t.active {
+		t.active = false
+		t.timer.Stop()
+		if t.refd {
+			t.refd = false
+			__tnTimers.Done()
+		}
 	}
 }`,
     eventLoop: `// The event loop. JS runs one thing at a time: whoever holds the
@@ -10599,9 +10712,27 @@ func TnLoopRunPending() bool {
 		tnLoopTasks = tnLoopTasks[1:]
 		tnLoopMu.Unlock()
 		ran = true
-		TnAsyncRun(nil, fn)
+		tnRunTask(fn)
 		TnRunMicrotasks()
 	}
+}
+
+// Set by process.on('uncaughtException'): handles a throw escaping a loop task
+// (true when handled); 'beforeExit' runs when the loop drains (true when it emitted)
+var tnUncaughtHook func(err interface{}) bool
+var tnBeforeExitHook func() bool
+
+func tnRunTask(fn func()) {
+	if tnUncaughtHook != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				if !tnUncaughtHook(r) {
+					panic(r)
+				}
+			}
+		}()
+	}
+	TnAsyncRun(nil, fn)
 }
 
 func tnLoopIdle() bool {
@@ -10616,7 +10747,15 @@ func TnRunLoop() {
 		TnRunMicrotasks()
 		TnLoopRunPending()
 		if tnLoopIdle() {
-			return
+			if tnBeforeExitHook == nil || !tnBeforeExitHook() {
+				return
+			}
+			TnRunMicrotasks()
+			TnLoopRunPending()
+			if tnLoopIdle() {
+				return
+			}
+			continue
 		}
 		tnRelease()
 		select {
@@ -10969,12 +11108,20 @@ func TnReject[T any](ch chan T, reason interface{}) {
 }
 
 // A detached call (\`main();\`): the process waits for it; a rejection is fatal
+// unless process.on('unhandledRejection') takes it
+var tnUnhandledHook func(reason interface{}) bool
+
 func TnDetach[T any](ch chan T) {
 	go func() {
 		defer __tnWaitGroup.Done()
 		_, reason, rejected := tnSettle(ch)
 		if rejected {
-			TnLoopCall(func() { panic(reason) })
+			TnLoopCall(func() {
+				if tnUnhandledHook != nil && tnUnhandledHook(reason) {
+					return
+				}
+				panic(reason)
+			})
 		}
 	}()
 }

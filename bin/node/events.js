@@ -9,12 +9,19 @@ type tnListener struct {
 }
 
 type tnEmitterState struct {
-	events       map[string][]*tnListener
-	order        []string
-	maxListeners float64
-	warned       map[string]bool
-	mu           sync.Mutex
+	events            map[string][]*tnListener
+	order             []string
+	maxListeners      float64
+	warned            map[string]bool
+	mu                sync.Mutex
+	captureRejections bool
 }
+
+// events.errorMonitor: listeners see 'error' events before the error listeners
+const TnErrorMonitor = "Symbol(events.errorMonitor)"
+
+// events.captureRejections: the default for new emitters
+var TnCaptureRejections = false
 
 // EventEmitter: embeddable (class X extends EventEmitter), state allocated lazily
 type TnEventEmitter struct {
@@ -29,14 +36,20 @@ type tnEmitterLike interface {
 var TnDefaultMaxListeners = 10.0
 
 func TnNewEventEmitter(options ...interface{}) *TnEventEmitter {
-	return &TnEventEmitter{state: &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}}}
+	e := &TnEventEmitter{state: &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}, captureRejections: TnCaptureRejections}}
+	if len(options) > 0 && options[0] != nil {
+		if b, ok := TnGet(options[0], "captureRejections").(bool); ok {
+			e.state.captureRejections = b
+		}
+	}
+	return e
 }
 
 func (e *TnEventEmitter) tnEmitter() *TnEventEmitter { return e }
 
 func (e *TnEventEmitter) st() *tnEmitterState {
 	if e.state == nil {
-		e.state = &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}}
+		e.state = &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}, captureRejections: TnCaptureRejections}
 	}
 	return e.state
 }
@@ -170,7 +183,15 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 	if len(kept) != len(s.events[event]) {
 		e.setListeners(event, kept)
 	}
+	monitors := []*tnListener{}
+	if event == "error" {
+		monitors = append(monitors, s.events[TnErrorMonitor]...)
+	}
+	capture := s.captureRejections
 	s.mu.Unlock()
+	for _, l := range monitors {
+		TnInvoke(l.fn, args...)
+	}
 	if len(list) == 0 {
 		if event == "error" {
 			if len(args) > 0 {
@@ -184,9 +205,81 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 		return false
 	}
 	for _, l := range list {
-		TnInvoke(l.fn, args...)
+		result := TnInvoke(l.fn, args...)
+		// captureRejections: an async listener's rejection becomes an 'error' event
+		if capture && event != "error" {
+			tnCaptureRejection(e, result)
+		}
 	}
 	return true
+}
+
+func tnCaptureRejection(e *TnEventEmitter, result interface{}) {
+	rv := reflect.ValueOf(result)
+	if !rv.IsValid() || rv.Kind() != reflect.Chan || rv.IsNil() {
+		return
+	}
+	TnLoopRef()
+	go func() {
+		_, ok := rv.Recv()
+		var reason interface{}
+		rejected := false
+		if !ok {
+			reason, rejected = tnRejections.Load(result)
+		}
+		TnLoopPost(func() {
+			defer TnLoopUnref()
+			if rejected {
+				e.emit("error", reason)
+			}
+		})
+	}()
+}
+
+// events.getMaxListeners(emitter) / events.setMaxListeners(n, ...emitters)
+func TnEventsGetMaxListeners(target interface{}) float64 {
+	if em, ok := target.(tnEmitterLike); ok {
+		return em.tnEmitter().getMaxListeners()
+	}
+	return TnDefaultMaxListeners
+}
+
+func TnEventsSetMaxListeners(n float64, targets ...interface{}) {
+	if len(targets) == 0 {
+		TnDefaultMaxListeners = n
+		return
+	}
+	for _, t := range targets {
+		if em, ok := t.(tnEmitterLike); ok {
+			em.tnEmitter().setMaxListeners(n)
+		}
+	}
+}
+
+// events.addAbortListener(signal, listener): a Disposable that removes it
+type TnDisposable struct {
+	dispose func()
+}
+
+func (d *TnDisposable) __dispose() {
+	if d.dispose != nil {
+		d.dispose()
+		d.dispose = nil
+	}
+}
+
+func TnAddAbortListener(signal *TnAbortSignal, listener interface{}) *TnDisposable {
+	removed := false
+	if signal.aborted {
+		TnLoopPost(func() { TnInvoke(listener, TnNewEvent("abort")) })
+		return &TnDisposable{}
+	}
+	signal.addEventListener("abort", func(ev *TnEvent) {
+		if !removed {
+			TnInvoke(listener, ev)
+		}
+	}, map[string]interface{}{"once": true})
+	return &TnDisposable{dispose: func() { removed = true }}
 }
 
 func (e *TnEventEmitter) listeners(event string) []interface{} {
@@ -499,7 +592,7 @@ func init() { tnBeforeExit = TnProcessEmitExit }`;
 export function registerEvents(r) {
     defineModule(r, 'events');
     r.namespaces['events.default'] = 'events.EventEmitter';
-    defineHelper(r, 'nodeEvents', ['fmt', 'os', 'os/signal', 'sync', 'syscall', 'time', 'unsafe'], ['error', 'dynamic', 'nodeInvoke', 'promise', 'eventLoop', 'nodeProcess'], eventsHelper);
+    defineHelper(r, 'nodeEvents', ['fmt', 'os', 'os/signal', 'reflect', 'sync', 'syscall', 'time', 'unsafe'], ['error', 'dynamic', 'nodeInvoke', 'promise', 'eventLoop', 'nodeProcess'], eventsHelper);
     const emitterMethods = 'on=*TnEventEmitter; addListener=*TnEventEmitter; once=*TnEventEmitter; prependListener=*TnEventEmitter; prependOnceListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listeners=[]interface{}; rawListeners=[]interface{}; listenerCount=float64; eventNames=[]string; setMaxListeners=*TnEventEmitter; getMaxListeners=float64';
     defineClass(r, 'events.EventEmitter', '*TnEventEmitter', 'class', emitterMethods, '', '', '');
     r.classes['events.default'] = r.classes['events.EventEmitter'];
@@ -541,6 +634,37 @@ export function registerEvents(r) {
     };
     statics('events');
     statics('events.EventEmitter');
+    for (const prefix of ['events', 'events.EventEmitter']) {
+        r.values[`${prefix}.errorMonitor`] = (_c) => {
+            use();
+            return 'TnErrorMonitor';
+        };
+        r.valueTypes[`${prefix}.errorMonitor`] = 'string';
+        r.values[`${prefix}.captureRejections`] = (_c) => {
+            use();
+            return 'TnCaptureRejections';
+        };
+        r.valueTypes[`${prefix}.captureRejections`] = 'bool';
+        r.functions[`${prefix}.captureRejections=`] = (call) => {
+            use();
+            return `TnCaptureRejections = ${call.args[0]}`;
+        };
+        r.functions[`${prefix}.getMaxListeners`] = (call) => {
+            use();
+            return `TnEventsGetMaxListeners(${call.args[0]})`;
+        };
+        r.results[`${prefix}.getMaxListeners`] = 'float64';
+        r.functions[`${prefix}.setMaxListeners`] = (call) => {
+            use();
+            return `TnEventsSetMaxListeners(${call.args.join(', ')})`;
+        };
+        r.functions[`${prefix}.addAbortListener`] = (call) => {
+            use();
+            return `TnAddAbortListener(${call.args.join(', ')})`;
+        };
+        r.results[`${prefix}.addAbortListener`] = '*TnDisposable';
+    }
+    defineClass(r, 'events.Disposable', '*TnDisposable', 'class', '__dispose=', '', '', '');
     // EventTarget / Event / AbortController / AbortSignal (globals, also exported by node:events)
     defineClass(r, 'globals.Event', '*TnEvent', 'class', 'preventDefault=', '', 'type=string; defaultPrevented=bool; target=interface{}; timeStamp=float64', '');
     defineClass(r, 'globals.EventTarget', '*TnEventTarget', 'class', 'addEventListener=; removeEventListener=; dispatchEvent=bool', '', '', '');

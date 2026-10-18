@@ -15,6 +15,9 @@ type TnPerformanceEntry struct {
 var tnPerfEntries []*TnPerformanceEntry
 var tnPerfMu sync.Mutex
 
+// Set by PerformanceObserver: new entries reach the observers
+var tnPerfHook func(e *TnPerformanceEntry)
+
 func TnPerfNow() float64 {
 	return float64(time.Since(tnPerfStart).Nanoseconds()) / 1e6
 }
@@ -34,6 +37,9 @@ func TnPerfMark(name string, options ...interface{}) *TnPerformanceEntry {
 	tnPerfMu.Lock()
 	tnPerfEntries = append(tnPerfEntries, entry)
 	tnPerfMu.Unlock()
+	if tnPerfHook != nil {
+		tnPerfHook(entry)
+	}
 	return entry
 }
 
@@ -72,6 +78,9 @@ func TnPerfMeasure(name string, marks ...interface{}) *TnPerformanceEntry {
 	tnPerfMu.Lock()
 	tnPerfEntries = append(tnPerfEntries, entry)
 	tnPerfMu.Unlock()
+	if tnPerfHook != nil {
+		tnPerfHook(entry)
+	}
 	return entry
 }
 
@@ -117,7 +126,7 @@ func TnTimeoutPromise[T any](ms float64, value T, options ...interface{}) chan T
 		TnReject(ch, signal.reason)
 		return ch
 	}
-	var timer *time.Timer
+	var timer *TnTimeout
 	settled := false
 	timer = TnSetTimeout(ms, func() {
 		if !settled {
@@ -194,11 +203,15 @@ export function registerTimers(r) {
         };
         r.results[`timers.${name}`] = result;
     };
-    timer('setTimeout', (c) => `TnSetTimeout(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*time.Timer');
+    timer('setTimeout', (c) => `TnSetTimeout(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*TnTimeout');
     timer('clearTimeout', (c) => `TnClearTimeout(${c.args[0]})`, '');
     timer('setInterval', (c) => `TnSetInterval(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*TnInterval');
     timer('clearInterval', (c) => `TnClearInterval(${c.args[0]})`, '');
-    timer('setImmediate', (c) => `TnSetTimeout(0, ${callback(c, 1)})`, '*time.Timer');
+    timer('setImmediate', (c) => `TnSetTimeout(0, ${callback(c, 1)})`, '*TnTimeout');
+    // Timeout / Immediate / interval handles
+    defineClass(r, 'timers.Timeout', '*TnTimeout', 'class', 'ref=*TnTimeout; unref=*TnTimeout; hasRef=bool; refresh=*TnTimeout; close=*TnTimeout', '', '', '');
+    r.classes['timers.Immediate'] = r.classes['timers.Timeout'];
+    defineClass(r, 'timers.Interval', '*TnInterval', 'class', 'ref=*TnInterval; unref=*TnInterval; hasRef=bool; refresh=*TnInterval; close=*TnInterval', '', '', '');
     timer('clearImmediate', (c) => `TnClearTimeout(${c.args[0]})`, '');
     timer('queueMicrotask', (c) => `TnQueueMicrotask(${c.args[0]})`, '');
     r.globals['setImmediate'] = 'timers.setImmediate';
