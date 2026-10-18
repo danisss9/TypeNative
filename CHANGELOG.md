@@ -74,6 +74,12 @@ generated types say they do.
 - `path.matchesGlob`; Buffer `read/writeBig(U)Int64LE/BE`, `swap16/32/64`, `buffer.isUtf8` /
   `isAscii` / `transcode`; `util.parseArgs`, `getSystemErrorName` / `Message` / `Map`,
   `MIMEType`, `parseEnv`, `aborted`, `debuglog`, `toUSVString`; `process.loadEnvFile`
+- `process.on('uncaughtException' | 'uncaughtExceptionMonitor' | 'unhandledRejection' |
+  'beforeExit')`, `process.cpuUsage` / `resourceUsage` / `availableMemory`; `os.totalmem` /
+  `freemem` / `uptime` / `loadavg` / `release` / `version`; timer handles with `ref` / `unref` /
+  `hasRef` / `refresh` / `close`; `PerformanceObserver`, `performance.timerify` /
+  `eventLoopUtilization`, `createHistogram`, `monitorEventLoopDelay`; `events.errorMonitor`,
+  `captureRejections`, static `getMaxListeners` / `setMaxListeners`, `addAbortListener`
 
 ### Fixed
 
