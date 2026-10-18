@@ -200,59 +200,6 @@ func tnVerifyPeer(certs []*x509.Certificate, roots *x509.CertPool, host string) 
 	return nil
 }
 
-// Client options: servername / rejectUnauthorized / ca / key / cert / ALPNProtocols / min/maxVersion.
-// verified receives the result of Node's verification ('' when authorized)
-func tnTLSClientConfig(options interface{}, host string, verified func(err *TnError)) (*tls.Config, error) {
-	cfg := &tls.Config{InsecureSkipVerify: true}
-	reject := true
-	servername := host
-	var roots *x509.CertPool
-	if options != nil {
-		certs, err := tnKeyPair(options)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Certificates = certs
-		roots = tnCertPool(tnPemStrings(TnGet(options, "ca")))
-		if b, ok := TnGet(options, "rejectUnauthorized").(bool); ok {
-			reject = b
-		}
-		if sn := tnNetString(TnGet(options, "servername")); sn != "" {
-			servername = sn
-		}
-		cfg.NextProtos = tnALPN(options)
-		if v := tnTLSVersion(tnNetString(TnGet(options, "minVersion"))); v != 0 {
-			cfg.MinVersion = v
-		}
-		if v := tnTLSVersion(tnNetString(TnGet(options, "maxVersion"))); v != 0 {
-			cfg.MaxVersion = v
-		}
-	}
-	if net.ParseIP(servername) == nil {
-		cfg.ServerName = servername
-	}
-	cfg.VerifyConnection = func(state tls.ConnectionState) error {
-		err := tnVerifyPeer(state.PeerCertificates, roots, servername)
-		if verified != nil {
-			verified(err)
-		}
-		if err != nil && reject {
-			return err
-		}
-		return nil
-	}
-	return cfg, nil
-}
-
-// The *TnError inside a wrapped Go error (verification failures through net/http)
-func tnUnwrapTnError(err error) *TnError {
-	var te *TnError
-	if errors.As(err, &te) {
-		return te
-	}
-	return nil
-}`;
-const tlsHelper = `// node:tls
 // Certificate details (getPeerCertificate)
 type TnPeerCertificate struct {
 	subject        *TnMap[string, string]
@@ -268,11 +215,6 @@ type TnPeerCertificate struct {
 	raw            []byte
 }
 
-type TnCipherInfo struct {
-	name         string
-	standardName string
-	version      string
-}
 
 func tnCertName(name pkix.Name) *TnMap[string, string] {
 	m := TnNewMap[string, string]()
@@ -332,6 +274,204 @@ func tnPeerCertificate(c *x509.Certificate) *TnPeerCertificate {
 		ca:             c.IsCA,
 		raw:            c.Raw,
 	}
+}
+
+// tls.checkServerIdentity(hostname, cert): Node's matching of DNS / IP altnames
+// (one leftmost wildcard label) and, without DNS altnames, the subject CN
+func tnHostParts(host string) []string {
+	return strings.Split(strings.ToLower(host), ".")
+}
+
+func tnHostMatches(hostParts []string, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	patternParts := tnHostParts(pattern)
+	if len(hostParts) != len(patternParts) {
+		return false
+	}
+	for _, part := range patternParts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < 0x21 || r > 0x7f {
+				return false
+			}
+		}
+	}
+	for i := len(hostParts) - 1; i > 0; i-- {
+		if hostParts[i] != patternParts[i] {
+			return false
+		}
+	}
+	host, pat := hostParts[0], patternParts[0]
+	pieces := strings.SplitN(pat, "*", 3)
+	if len(pieces) == 1 || strings.Contains(pat, "xn--") {
+		return host == pat
+	}
+	if len(pieces) > 2 || len(patternParts) <= 2 {
+		return false
+	}
+	prefix, suffix := pieces[0], pieces[1]
+	return len(prefix)+len(suffix) <= len(host) && strings.HasPrefix(host, prefix) && strings.HasSuffix(host, suffix)
+}
+
+func tnCanonicalIP(s string) string {
+	if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+		return ip.String()
+	}
+	return s
+}
+
+func TnCheckServerIdentity(hostname string, cert interface{}) *TnError {
+	var altNames string
+	var cns []string
+	if pc, ok := cert.(*TnPeerCertificate); ok {
+		altNames = pc.subjectaltname
+		if pc.subject != nil && pc.subject.Has("CN") {
+			cns = []string{pc.subject.Get("CN")}
+		}
+	} else {
+		altNames = tnNetString(TnGet(cert, "subjectaltname"))
+		subject := TnGet(cert, "subject")
+		switch cn := TnGet(subject, "CN").(type) {
+		case string:
+			cns = []string{cn}
+		case []interface{}:
+			for _, c := range cn {
+				cns = append(cns, tnNetString(c))
+			}
+		case []string:
+			cns = cn
+		}
+	}
+	dnsNames := []string{}
+	ips := []string{}
+	if altNames != "" {
+		for _, name := range strings.Split(altNames, ", ") {
+			if strings.HasPrefix(name, "DNS:") {
+				dnsNames = append(dnsNames, name[4:])
+			} else if strings.HasPrefix(name, "IP Address:") {
+				ips = append(ips, tnCanonicalIP(name[11:]))
+			}
+		}
+	}
+	host := strings.TrimSuffix(hostname, ".")
+	valid := false
+	reason := "Unknown reason"
+	if net.ParseIP(host) != nil {
+		for _, ip := range ips {
+			if ip == tnCanonicalIP(host) {
+				valid = true
+			}
+		}
+		if !valid {
+			reason = "IP: " + host + " is not in the cert's list: " + strings.Join(ips, ", ")
+		}
+	} else if len(dnsNames) > 0 || len(cns) > 0 {
+		parts := tnHostParts(host)
+		if len(dnsNames) > 0 {
+			for _, name := range dnsNames {
+				if tnHostMatches(parts, name) {
+					valid = true
+				}
+			}
+			if !valid {
+				reason = "Host: " + host + ". is not in the cert's altnames: " + altNames
+			}
+		} else {
+			for _, cn := range cns {
+				if tnHostMatches(parts, cn) {
+					valid = true
+				}
+			}
+			if !valid {
+				reason = "Host: " + host + ". is not cert's CN: " + strings.Join(cns, ",")
+			}
+		}
+	} else {
+		reason = "Cert does not contain a DNS name"
+	}
+	if valid {
+		return nil
+	}
+	e := TnNodeError("Error", "ERR_TLS_CERT_ALTNAME_INVALID", "Hostname/IP does not match certificate's altnames: "+reason)
+	e.props["reason"] = reason
+	e.props["host"] = host
+	e.props["cert"] = cert
+	return e
+}
+
+// Client options: servername / rejectUnauthorized / ca / key / cert / ALPNProtocols / min/maxVersion.
+// verified receives the result of Node's verification ('' when authorized)
+func tnTLSClientConfig(options interface{}, host string, verified func(err *TnError)) (*tls.Config, error) {
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	reject := true
+	servername := host
+	var roots *x509.CertPool
+	if options != nil {
+		certs, err := tnKeyPair(options)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Certificates = certs
+		roots = tnCertPool(tnPemStrings(TnGet(options, "ca")))
+		if b, ok := TnGet(options, "rejectUnauthorized").(bool); ok {
+			reject = b
+		}
+		if sn := tnNetString(TnGet(options, "servername")); sn != "" {
+			servername = sn
+		}
+		cfg.NextProtos = tnALPN(options)
+		if v := tnTLSVersion(tnNetString(TnGet(options, "minVersion"))); v != 0 {
+			cfg.MinVersion = v
+		}
+		if v := tnTLSVersion(tnNetString(TnGet(options, "maxVersion"))); v != 0 {
+			cfg.MaxVersion = v
+		}
+	}
+	if net.ParseIP(servername) == nil {
+		cfg.ServerName = servername
+	}
+	// options.checkServerIdentity(servername, cert) replaces the hostname check; it runs on the loop
+	check := TnGet(options, "checkServerIdentity")
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		var err *TnError
+		if check == nil || TnIsNil(check) {
+			err = tnVerifyPeer(state.PeerCertificates, roots, servername)
+		} else if err = tnVerifyPeer(state.PeerCertificates, roots, ""); err == nil {
+			cert := tnPeerCertificate(state.PeerCertificates[0])
+			TnLoopCall(func() {
+				if e, ok := TnInvoke(check, servername, cert).(*TnError); ok && e != nil {
+					err = e
+				}
+			})
+		}
+		if verified != nil {
+			verified(err)
+		}
+		if err != nil && reject {
+			return err
+		}
+		return nil
+	}
+	return cfg, nil
+}
+
+// The *TnError inside a wrapped Go error (verification failures through net/http)
+func tnUnwrapTnError(err error) *TnError {
+	var te *TnError
+	if errors.As(err, &te) {
+		return te
+	}
+	return nil
+}`;
+const tlsHelper = `// node:tls
+type TnCipherInfo struct {
+	name         string
+	standardName string
+	version      string
 }
 
 func (s *TnSocket) tlsConnState() *tls.ConnectionState {
@@ -527,8 +667,8 @@ func TnTLSGetCiphers() []string {
 }`;
 export function registerTls(r) {
     defineModule(r, 'tls');
-    defineHelper(r, 'tlsConfig', ['bytes', 'crypto/tls', 'crypto/x509', 'errors', 'net', 'strings', 'time'], ['dynamic', 'nodeNet', 'netErrors'], tlsConfigHelper);
-    defineHelper(r, 'nodeTls', ['context', 'crypto/sha1', 'crypto/sha256', 'crypto/sha512', 'crypto/tls', 'crypto/x509', 'crypto/x509/pkix', 'fmt', 'net', 'strings', 'time'], ['tlsConfig', 'nodeNet', 'orderedMap'], tlsHelper);
+    defineHelper(r, 'tlsConfig', ['bytes', 'crypto/sha1', 'crypto/sha256', 'crypto/sha512', 'crypto/tls', 'crypto/x509', 'crypto/x509/pkix', 'errors', 'fmt', 'net', 'strings', 'time'], ['dynamic', 'nodeNet', 'netErrors', 'orderedMap', 'eventLoop', 'nodeInvoke'], tlsConfigHelper);
+    defineHelper(r, 'nodeTls', ['context', 'crypto/tls', 'crypto/x509', 'net', 'strings', 'time'], ['tlsConfig', 'nodeNet', 'orderedMap'], tlsHelper);
     const use = () => r.helper('nodeTls');
     defineClass(r, 'tls.TLSSocket', '*TnSocket', 'class', SOCKET_METHODS + '; getPeerCertificate=*TnPeerCertificate; getCertificate=*TnPeerCertificate; getProtocol=interface{}; getCipher=*TnCipherInfo', '', SOCKET_GETTERS + '; alpnProtocol=interface{}; servername=interface{}', '');
     // net.Socket instances share the Go type; TLS methods are available on both
@@ -560,6 +700,11 @@ export function registerTls(r) {
         use();
         return `TnCreateSecureContext(${c.args.join(', ')})`;
     };
+    r.functions['tls.checkServerIdentity'] = (c) => {
+        use();
+        return `TnCheckServerIdentity(${c.args.join(', ')})`;
+    };
+    r.results['tls.checkServerIdentity'] = '*TnError';
     r.functions['tls.getCiphers'] = (_c) => {
         use();
         return 'TnTLSGetCiphers()';

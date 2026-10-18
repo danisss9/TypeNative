@@ -540,25 +540,20 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	TnLoopRef()
 	defer TnLoopUnref()
-	http.NewResponseController(w).EnableFullDuplex()
 	var local net.Addr
 	if a, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
 		local = a
 	}
+	if r.ProtoMajor == 1 && hs.serveUpgrade(w, r, local) {
+		return
+	}
+	http.NewResponseController(w).EnableFullDuplex()
 	// The messages are created on the loop (streams capture its async context)
 	created := make(chan *TnServerResponse, 1)
 	bodyDone := make(chan struct{})
 	TnLoopPost(func() {
 		TnAsyncRun(hs.asyncCtx, func() {
-			req := tnNewIncoming()
-			req.method = r.Method
-			req.url = r.RequestURI
-			req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
-			req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
-			tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
-			if hs.h2 && r.ProtoMajor == 2 {
-				tnPseudoHeaders(req, r)
-			}
+			req := hs.incoming(r, local)
 			req.socket = tnInfoSocket(local, r.RemoteAddr)
 			if r.TLS != nil {
 				req.socket.encrypted = true
@@ -577,6 +572,81 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			res.destroy()
 		}
 	}, bodyDone)
+}
+
+// The IncomingMessage of a request (on the loop)
+func (hs *TnHttpServer) incoming(r *http.Request, local net.Addr) *TnIncomingMessage {
+	req := tnNewIncoming()
+	req.method = r.Method
+	req.url = r.RequestURI
+	req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
+	req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
+	tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
+	if hs.h2 && r.ProtoMajor == 2 {
+		tnPseudoHeaders(req, r)
+	}
+	return req
+}
+
+func tnHeaderHasToken(h http.Header, name string, token string) bool {
+	for _, v := range h.Values(name) {
+		for _, part := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// 'connect' (CONNECT requests) and 'upgrade' (Connection: Upgrade) take over the
+// connection: (req, socket, head). An upgrade nobody listens for is a normal request;
+// a CONNECT nobody listens for closes the connection.
+func (hs *TnHttpServer) serveUpgrade(w http.ResponseWriter, r *http.Request, local net.Addr) bool {
+	event := ""
+	if r.Method == http.MethodConnect {
+		event = "connect"
+	} else if r.Header.Get("Upgrade") != "" && tnHeaderHasToken(r.Header, "Connection", "upgrade") {
+		event = "upgrade"
+	}
+	if event == "" {
+		return false
+	}
+	listening := false
+	TnLoopCall(func() { listening = hs.listenerCount(event) > 0 })
+	if !listening {
+		if event == "upgrade" {
+			return false
+		}
+		if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+			conn.Close()
+		}
+		return true
+	}
+	conn, rw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return false
+	}
+	head := []byte{}
+	if n := rw.Reader.Buffered(); n > 0 {
+		peeked, _ := rw.Reader.Peek(n)
+		head = append(head, peeked...)
+	}
+	TnLoopCall(func() {
+		TnAsyncRun(hs.asyncCtx, func() {
+			req := hs.incoming(r, local)
+			req.complete = true
+			req.push(nil)
+			socket := TnNewSocket()
+			socket.attach(conn)
+			if r.TLS != nil {
+				socket.encrypted = true
+			}
+			req.socket = socket
+			hs.emit(event, req, socket, head)
+		})
+	})
+	return true
 }
 
 // HTTP/2 requests carry :method / :scheme / :authority / :path first, as in Node
@@ -896,11 +966,119 @@ func (cr *TnClientRequest) end(args ...interface{}) *TnClientRequest {
 }
 
 // Sends the request: a complete body (end before any write) or a streamed one
+// The body of a 101 response as a net.Conn (it reads and writes the connection)
+type tnRWConn struct {
+	io.ReadWriteCloser
+	remote net.Addr
+}
+
+func (c *tnRWConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (c *tnRWConn) RemoteAddr() net.Addr               { return c.remote }
+func (c *tnRWConn) SetDeadline(t time.Time) error      { return nil }
+func (c *tnRWConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *tnRWConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func tnUpgradedConn(rwc io.ReadWriteCloser, remote string) net.Conn {
+	if conn, ok := rwc.(net.Conn); ok {
+		return conn
+	}
+	addr, err := net.ResolveTCPAddr("tcp", remote)
+	if err != nil {
+		addr = &net.TCPAddr{}
+	}
+	return &tnRWConn{ReadWriteCloser: rwc, remote: addr}
+}
+
+// CONNECT requests: dialed and written by hand; any response is 'connect' (res, socket, head)
+func (cr *TnClientRequest) startConnect() {
+	address := net.JoinHostPort(cr.host, cr.port)
+	header := http.Header{}
+	cr.store.toGo(header)
+	host := header.Get("Host")
+	if host == "" {
+		host = address
+	}
+	header.Del("Host")
+	cfg := cr.tlsConfig
+	TnLoopRef()
+	cr.armTimer()
+	go func() {
+		var conn net.Conn
+		var err error
+		if cfg != nil {
+			conn, err = tls.Dial("tcp", address, cfg)
+		} else {
+			conn, err = net.Dial("tcp", address)
+		}
+		var resp *http.Response
+		var br *bufio.Reader
+		if err == nil {
+			var buf bytes.Buffer
+			buf.WriteString("CONNECT " + cr.path + " HTTP/1.1\\r\\nHost: " + host + "\\r\\n")
+			header.Write(&buf)
+			buf.WriteString("\\r\\n")
+			if _, err = conn.Write(buf.Bytes()); err == nil {
+				br = bufio.NewReader(conn)
+				resp, err = http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+			}
+		}
+		TnLoopPost(func() {
+			defer TnLoopUnref()
+			if cr.timer != nil {
+				cr.timer.Stop()
+			}
+			if err != nil {
+				if conn != nil {
+					conn.Close()
+				}
+				if !cr.destroyed {
+					p, _ := strconv.ParseFloat(cr.port, 64)
+					if _, ok := err.(*net.OpError); ok {
+						cr.destroy(TnNetError(err, "connect", cr.host, p))
+					} else {
+						cr.destroy(TnNodeError("Error", "ECONNRESET", "socket hang up"))
+					}
+				}
+				return
+			}
+			cr.gotResponse = true
+			res := tnNewIncoming()
+			cr.res = res
+			res.statusCode = float64(resp.StatusCode)
+			res.statusMessage = strings.TrimSpace(strings.TrimPrefix(resp.Status, strconv.Itoa(resp.StatusCode)))
+			res.httpVersion = strconv.Itoa(resp.ProtoMajor) + "." + strconv.Itoa(resp.ProtoMinor)
+			res.httpVersionMajor, res.httpVersionMinor = float64(resp.ProtoMajor), float64(resp.ProtoMinor)
+			tnIncomingHeaders(res, resp.Header, "", false)
+			res.complete = true
+			res.push(nil)
+			head := []byte{}
+			if n := br.Buffered(); n > 0 {
+				peeked, _ := br.Peek(n)
+				head = append(head, peeked...)
+			}
+			if cr.listenerCount("connect") == 0 {
+				conn.Close()
+			} else {
+				socket := TnNewSocket()
+				socket.attach(conn)
+				res.socket = socket
+				cr.emit("connect", res, socket, head)
+			}
+			cr.closeHeld = false
+			cr.emitClose()
+		})
+	}()
+}
+
 func (cr *TnClientRequest) start(body []byte, complete bool) {
 	if cr.started {
 		return
 	}
 	cr.started = true
+	if cr.method == http.MethodConnect {
+		cr.startConnect()
+		return
+	}
 	scheme := strings.TrimSuffix(cr.protocol, ":")
 	target := scheme + "://" + net.JoinHostPort(cr.host, cr.port) + cr.path
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1017,6 +1195,22 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 			if resp.TLS != nil {
 				res.socket.encrypted = true
 				res.socket.authorized = true
+			}
+			if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
+				// 'upgrade' (res, socket, head): the connection belongs to the listener
+				defer TnLoopUnref()
+				res.complete = true
+				res.push(nil)
+				if cr.listenerCount("upgrade") == 0 {
+					rwc.Close()
+				} else {
+					socket := TnNewSocket()
+					socket.attach(tnUpgradedConn(rwc, net.JoinHostPort(host, port)))
+					cr.emit("upgrade", res, socket, []byte{})
+				}
+				cr.closeHeld = false
+				cr.emitClose()
+				return
 			}
 			if cr.listenerCount("response") > 0 {
 				cr.emit("response", res)
@@ -1222,7 +1416,7 @@ export function registerHttp(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeHttp',
-    ['bytes', 'context', 'crypto/tls', 'errors', 'fmt', 'io', 'log', 'math', 'net', 'net/http', 'net/url', 'reflect', 'sort', 'strconv', 'strings', 'sync', 'time', 'unsafe'],
+    ['bufio', 'bytes', 'context', 'crypto/tls', 'errors', 'fmt', 'io', 'log', 'math', 'net', 'net/http', 'net/url', 'reflect', 'sort', 'strconv', 'strings', 'sync', 'time', 'unsafe'],
     ['nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'buffer', 'tlsConfig'],
     httpHelper
   );
@@ -1288,6 +1482,7 @@ export function registerHttp(r: NodeRegistry): void {
     const name = eventName(nodes);
     if (name === 'response') return ['*TnIncomingMessage'];
     if (name === 'socket') return ['*TnSocket'];
+    if (name === 'upgrade' || name === 'connect') return ['*TnIncomingMessage', '*TnSocket', '[]byte'];
     return streamListenerTypes(nodes);
   };
   r.paramTypers['http.ClientRequest#on'] = requestListeners;
@@ -1297,6 +1492,7 @@ export function registerHttp(r: NodeRegistry): void {
     if (name === 'request') return ['*TnIncomingMessage', '*TnServerResponse'];
     if (name === 'stream') return ['*TnHttp2Stream', '*TnMap[string, interface{}]', 'float64'];
     if (name === 'connection') return ['*TnSocket'];
+    if (name === 'upgrade' || name === 'connect') return ['*TnIncomingMessage', '*TnSocket', '[]byte'];
     if (name === 'error' || name === 'clientError') return ['interface{}'];
     return [];
   };

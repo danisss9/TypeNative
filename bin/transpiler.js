@@ -1945,7 +1945,7 @@ function visit(node, options = {}) {
             !emittingModuleFile) {
             useHelper('asyncWait');
             useHelper('promise');
-            return `__tnWaitGroup.Add(1)\n\t\tTnDetach(${getSafeName(exprStmt.expression.text)}());\n\t`;
+            return `__tnWaitGroup.Add(1)\n\t\tTnDetach(${visit(exprStmt)});\n\t`;
         }
         return visit(node.expression) + (options.inline ? '' : ';\n\t');
     }
@@ -2635,8 +2635,10 @@ function visit(node, options = {}) {
         // new Date() / new Date(ms) → Go time
         if (className === 'Date') {
             importedPackages.add('time');
-            if ((node.arguments ?? []).length === 0)
-                return 'time.Now()';
+            if ((node.arguments ?? []).length === 0) {
+                useHelper('clock');
+                return 'TnTimeNow()';
+            }
             return `time.UnixMilli(int64(${visit(node.arguments[0])})).UTC()`;
         }
         // new Array<number>(3) → make([]float64, 3)
@@ -4286,16 +4288,23 @@ function inferFunctionBodyReturnType(node) {
     if (contextualFn?.type)
         return getType(contextualFn.type);
     if (isArrowFunction(node) && !isBlock(node.body)) {
-        return inferExpressionType(node.body);
+        const bodyType = inferExpressionType(node.body);
+        // `() => undefined`: nil is not a Go type
+        return bodyType === 'nil' ? 'interface{}' : bodyType;
     }
     if (node.body && isBlock(node.body)) {
+        let returnsNil = false;
         for (const stmt of node.body.statements ?? []) {
             if (isReturnStatement(stmt) && stmt.expression) {
                 const exprType = inferExpressionType(stmt.expression);
-                if (exprType)
+                if (exprType === 'nil')
+                    returnsNil = true;
+                else if (exprType)
                     return exprType;
             }
         }
+        if (returnsNil)
+            return 'interface{}';
     }
     return undefined;
 }
@@ -6228,6 +6237,10 @@ const callHandlers = {
         const message = consoleOut('Stderr', args.slice(1), args.length > 1 ? 'Assertion failed:' : 'Assertion failed');
         return `if !(${condition}) {\n\t\t${message}\n\t}`;
     },
+    'console.table': (_caller, args) => {
+        useHelper('nodeUtil');
+        return consoleOut('Stdout', [`TnConsoleTableString(${args.join(', ')})`], '', true);
+    },
     'console.count': (_caller, args) => {
         useHelper('console');
         return `TnConsoleCount(${args.join(', ')})`;
@@ -6439,7 +6452,8 @@ const callHandlers = {
     },
     'Date.now': () => {
         importedPackages.add('time');
-        return 'float64(time.Now().UnixMilli())';
+        useHelper('clock');
+        return 'float64(TnTimeNow().UnixMilli())';
     },
     'console.error': (_caller, args) => consoleOut('Stderr', args),
     'console.warn': (_caller, args) => consoleOut('Stderr', args),
@@ -7769,7 +7783,7 @@ const goPackageIdentifiers = new Set([
     'net', 'os', 'pbkdf2', 'rand', 'reflect', 'regexp', 'runtime', 'sha1', 'sha256', 'sha3', 'sha512', 'signal',
     'slices', 'sort', 'strconv', 'strings', 'subtle', 'sync', 'syscall', 'time', 'unicode', 'unsafe', 'user',
     'utf16', 'utf8', 'zlib', 'asn1', 'bits', 'context', 'ecdh', 'ecdsa', 'ed25519', 'elliptic', 'encoding', 'http',
-    'log', 'mime', 'multipart', 'pem', 'pkix', 'rsa', 'textproto', 'tls', 'x509',
+    'log', 'mime', 'multipart', 'netip', 'pem', 'pkix', 'rsa', 'textproto', 'tls', 'x509',
     // Aliased imports (math/big, crypto, net/url, crypto/rand)
     'tnbig', 'tncrypto', 'tnurl', 'cryptorand',
     // Go builtins: a package-level `var copy` would shadow copy() in the helpers
@@ -8186,6 +8200,7 @@ const helperRequires = {
     dynamic: ['error'],
     moduleUrl: ['pathToFileURL'],
     timerWait: ['eventLoop'],
+    clock: [],
     asyncWait: ['eventLoop'],
     eventLoop: []
 };
@@ -8294,6 +8309,7 @@ const helperPackages = {
     moduleUrl: ['os'],
     asyncWait: [],
     timerWait: ['sync', 'sync/atomic', 'time'],
+    clock: ['time'],
     eventLoop: ['sync', 'sync/atomic', 'time'],
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
@@ -10306,6 +10322,21 @@ func (e *TnError) Get_errno() float64 {
 	return n
 }
 
+func (e *TnError) Get_hostname() string {
+	s, _ := e.prop("hostname").(string)
+	return s
+}
+
+func (e *TnError) Get_address() string {
+	s, _ := e.prop("address").(string)
+	return s
+}
+
+func (e *TnError) Get_port() float64 {
+	n, _ := e.prop("port").(float64)
+	return n
+}
+
 // AssertionError fields
 func (e *TnError) Get_actual() interface{} { return e.prop("actual") }
 
@@ -10444,9 +10475,27 @@ type TnTimeout struct {
 	gen    int
 }
 
-func TnSetTimeout(ms float64, fn func()) *TnTimeout {
+// node:test mock timers: when set (and the API is mocked) it takes over a timer;
+// run calls the callback and reports whether the timer repeats
+var tnMockTimerHook func(kind string, ms float64, run func() bool) bool
+
+func TnSetTimeout(ms float64, fn func()) *TnTimeout { return tnSetTimeout("setTimeout", ms, fn) }
+
+func TnSetImmediate(fn func()) *TnTimeout { return tnSetTimeout("setImmediate", 0, fn) }
+
+func tnSetTimeout(kind string, ms float64, fn func()) *TnTimeout {
+	t := &TnTimeout{ms: ms, fn: TnAsyncWrap(fn), active: true}
+	if tnMockTimerHook != nil && tnMockTimerHook(kind, ms, func() bool {
+		if t.active {
+			t.active = false
+			t.fn()
+		}
+		return false
+	}) {
+		return t
+	}
 	__tnTimers.Add(1)
-	t := &TnTimeout{ms: ms, fn: TnAsyncWrap(fn), refd: true, active: true}
+	t.refd = true
 	t.arm()
 	return t
 }
@@ -10489,6 +10538,10 @@ func (t *TnTimeout) hasRef() bool { return t.refd }
 
 // refresh(): restarts the countdown (a fired timeout runs again)
 func (t *TnTimeout) refresh() *TnTimeout {
+	if t.timer == nil && t.active && !t.refd {
+		// A mocked timer: node:test's clock owns it
+		return t
+	}
 	if t.timer != nil {
 		t.timer.Stop()
 	}
@@ -10519,8 +10572,18 @@ type TnInterval struct {
 }
 
 func TnSetInterval(ms float64, fn func()) *TnInterval {
+	t := &TnInterval{stop: make(chan struct{}), ms: ms, fn: TnAsyncWrap(fn)}
+	if tnMockTimerHook != nil && tnMockTimerHook("setInterval", ms, func() bool {
+		if atomic.LoadInt32(&t.stopped) != 0 {
+			return false
+		}
+		t.fn()
+		return atomic.LoadInt32(&t.stopped) == 0
+	}) {
+		return t
+	}
 	__tnTimers.Add(1)
-	t := &TnInterval{stop: make(chan struct{}), refd: true, ms: ms, fn: TnAsyncWrap(fn)}
+	t.refd = true
 	t.start(t.stop)
 	return t
 }
@@ -10592,12 +10655,23 @@ func (t *TnInterval) close() *TnInterval {
 func TnClearTimeout(t *TnTimeout) {
 	if t != nil && t.active {
 		t.active = false
-		t.timer.Stop()
+		if t.timer != nil {
+			t.timer.Stop()
+		}
 		if t.refd {
 			t.refd = false
 			__tnTimers.Done()
 		}
 	}
+}`,
+    clock: `// The current time; node:test mock timers can replace it (Date.now / new Date())
+var tnClockHook func() time.Time
+
+func TnTimeNow() time.Time {
+	if tnClockHook != nil {
+		return tnClockHook()
+	}
+	return time.Now()
 }`,
     eventLoop: `// The event loop. JS runs one thing at a time: whoever holds the
 // baton (main, a loop task, a running async function body) runs JS code; the

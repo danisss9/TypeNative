@@ -451,6 +451,7 @@ declare module 'node:util' {
     function promisify(fn: typeof globalThis.setTimeout): <T = void>(ms?: number, value?: T) => Promise<T>;
     function promisify(fn: typeof import('node:fs').readFile): typeof import('node:fs/promises').readFile;
     function promisify(fn: typeof import('node:fs').writeFile): typeof import('node:fs/promises').writeFile;
+    function promisify<TCustom extends Function>(fn: { __promisify__: TCustom }): TCustom;
     function promisify<T, A extends any[]>(fn: (...args: [...A, (err: any, result?: T) => void]) => void): (...args: A) => Promise<T>;
     function promisify(fn: Function): (...args: any[]) => Promise<any>;
     function callbackify<T, A extends any[]>(fn: (...args: A) => Promise<T>): (...args: [...A, (err: unknown, result: T) => void]) => void;
@@ -935,6 +936,28 @@ declare module 'node:zlib' {
     function inflateRawSync(buf: InputType, options?: ZlibOptions): Buffer;
     function unzipSync(buf: InputType, options?: ZlibOptions): Buffer;
     function crc32(data: string | Uint8Array, value?: number): number;
+    type CompressCallback = (error: Error | null, result: Buffer) => void;
+    function gzip(buf: InputType, callback: CompressCallback): void;
+    function gzip(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function gunzip(buf: InputType, callback: CompressCallback): void;
+    function gunzip(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function deflate(buf: InputType, callback: CompressCallback): void;
+    function deflate(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function inflate(buf: InputType, callback: CompressCallback): void;
+    function inflate(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function deflateRaw(buf: InputType, callback: CompressCallback): void;
+    function deflateRaw(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function inflateRaw(buf: InputType, callback: CompressCallback): void;
+    function inflateRaw(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    function unzip(buf: InputType, callback: CompressCallback): void;
+    function unzip(buf: InputType, options: ZlibOptions, callback: CompressCallback): void;
+    namespace gzip { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace gunzip { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace deflate { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace inflate { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace deflateRaw { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace inflateRaw { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
+    namespace unzip { function __promisify__(buf: InputType, options?: ZlibOptions): Promise<Buffer>; }
     function createGzip(options?: ZlibOptions): import('node:stream').Transform;
     function createGunzip(options?: ZlibOptions): import('node:stream').Transform;
     function createDeflate(options?: ZlibOptions): import('node:stream').Transform;
@@ -1555,6 +1578,12 @@ declare module 'node:readline' {
     function createInterface(input: Readable, output?: Writable): Interface;
     /** TypeNative extension: prints the prompt and reads one line from stdin, synchronously */
     function question(prompt: string): string;
+    type Direction = -1 | 0 | 1;
+    function cursorTo(stream: Writable, x: number, callback?: () => void): boolean;
+    function cursorTo(stream: Writable, x: number, y?: number, callback?: () => void): boolean;
+    function moveCursor(stream: Writable, dx: number, dy: number, callback?: () => void): boolean;
+    function clearLine(stream: Writable, dir: Direction, callback?: () => void): boolean;
+    function clearScreenDown(stream: Writable, callback?: () => void): boolean;
     const promises: typeof import('node:readline/promises');
   }
   export = readline;
@@ -1590,7 +1619,38 @@ declare module 'node:diagnostics_channel' {
       publish(message: unknown): void;
       subscribe(onMessage: ChannelListener): void;
       unsubscribe(onMessage: ChannelListener): boolean;
+      bindStore<T>(store: import('node:async_hooks').AsyncLocalStorage<T>, transform?: (message: any) => T): void;
+      unbindStore(store: import('node:async_hooks').AsyncLocalStorage<any>): boolean;
+      runStores<R, A extends any[]>(data: unknown, fn: (...args: A) => R, thisArg?: unknown, ...args: A): R;
     }
+    interface TracingChannelSubscribers {
+      start?: (message: any) => void;
+      end?: (message: any) => void;
+      asyncStart?: (message: any) => void;
+      asyncEnd?: (message: any) => void;
+      error?: (message: any) => void;
+    }
+    interface TracingChannelCollection {
+      start: Channel;
+      end: Channel;
+      asyncStart: Channel;
+      asyncEnd: Channel;
+      error: Channel;
+    }
+    class TracingChannel implements TracingChannelCollection {
+      readonly start: Channel;
+      readonly end: Channel;
+      readonly asyncStart: Channel;
+      readonly asyncEnd: Channel;
+      readonly error: Channel;
+      readonly hasSubscribers: boolean;
+      subscribe(subscribers: TracingChannelSubscribers): void;
+      unsubscribe(subscribers: TracingChannelSubscribers): boolean;
+      traceSync<R, A extends any[]>(fn: (...args: A) => R, context?: object, thisArg?: unknown, ...args: A): R;
+      tracePromise<R, A extends any[]>(fn: (...args: A) => Promise<R>, context?: object, thisArg?: unknown, ...args: A): Promise<R>;
+      traceCallback<R, A extends any[]>(fn: (...args: A) => R, position?: number, context?: object, thisArg?: unknown, ...args: A): R;
+    }
+    function tracingChannel(nameOrChannels: string | TracingChannelCollection): TracingChannel;
     function channel(name: string | symbol): Channel;
     function subscribe(name: string | symbol, onMessage: ChannelListener): void;
     function unsubscribe(name: string | symbol, onMessage: ChannelListener): boolean;
@@ -1694,6 +1754,34 @@ declare module 'node:net' {
     function isIP(input: string): number;
     function isIPv4(input: string): boolean;
     function isIPv6(input: string): boolean;
+    type IPVersion = 'ipv4' | 'ipv6';
+    interface SocketAddressInitOptions {
+      address?: string;
+      family?: IPVersion;
+      flowlabel?: number;
+      port?: number;
+    }
+    class SocketAddress {
+      constructor(options?: SocketAddressInitOptions);
+      readonly address: string;
+      readonly family: IPVersion;
+      readonly port: number;
+      readonly flowlabel: number;
+      toJSON(): { address: string; port: number; family: IPVersion; flowlabel: number };
+      static parse(input: string): SocketAddress | undefined;
+    }
+    class BlockList {
+      addAddress(address: string, type?: IPVersion): void;
+      addAddress(address: SocketAddress): void;
+      addRange(start: string, end: string, type?: IPVersion): void;
+      addRange(start: SocketAddress, end: SocketAddress): void;
+      addSubnet(net: string, prefix: number, type?: IPVersion): void;
+      addSubnet(net: SocketAddress, prefix: number): void;
+      check(address: string, type?: IPVersion): boolean;
+      check(address: SocketAddress): boolean;
+      readonly rules: readonly string[];
+      static isBlockList(value: unknown): value is BlockList;
+    }
   }
   export = net;
 }
@@ -1736,6 +1824,32 @@ declare module 'node:dns' {
     function resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
     function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void;
     function getServers(): string[];
+    function setServers(servers: readonly string[]): void;
+    function lookupService(address: string, port: number, callback: (err: NodeJS.ErrnoException | null, hostname: string, service: string) => void): void;
+    interface ResolverOptions {
+      timeout?: number;
+      tries?: number;
+    }
+    class Resolver {
+      constructor(options?: ResolverOptions);
+      cancel(): void;
+      getServers(): string[];
+      setServers(servers: readonly string[]): void;
+      setLocalAddress(ipv4?: string, ipv6?: string): void;
+      resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolve(hostname: string, rrtype: 'A' | 'AAAA' | 'CNAME' | 'NS' | 'PTR', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
+      resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
+      resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+      resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolveMx(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
+      resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
+      resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+      reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void;
+    }
     function setDefaultResultOrder(order: 'ipv4first' | 'ipv6first' | 'verbatim'): void;
     function getDefaultResultOrder(): 'ipv4first' | 'ipv6first' | 'verbatim';
     const promises: typeof import('node:dns/promises');
@@ -1744,7 +1858,7 @@ declare module 'node:dns' {
 }
 
 declare module 'node:dns/promises' {
-  import { LookupOptions, LookupAddress, MxRecord, SrvRecord } from 'node:dns';
+  import { LookupOptions, LookupAddress, MxRecord, SrvRecord, ResolverOptions } from 'node:dns';
   namespace dnsPromises {
     function lookup(hostname: string, options: LookupOptions & { all: true }): Promise<LookupAddress[]>;
     function lookup(hostname: string, options?: number | LookupOptions): Promise<LookupAddress>;
@@ -1761,6 +1875,27 @@ declare module 'node:dns/promises' {
     function resolveSrv(hostname: string): Promise<SrvRecord[]>;
     function reverse(ip: string): Promise<string[]>;
     function getServers(): string[];
+    function setServers(servers: readonly string[]): void;
+    function lookupService(address: string, port: number): Promise<{ hostname: string; service: string }>;
+    class Resolver {
+      constructor(options?: ResolverOptions);
+      cancel(): void;
+      getServers(): string[];
+      setServers(servers: readonly string[]): void;
+      setLocalAddress(ipv4?: string, ipv6?: string): void;
+      resolve(hostname: string, rrtype?: 'A' | 'AAAA' | 'CNAME' | 'NS' | 'PTR'): Promise<string[]>;
+      resolve(hostname: string, rrtype: 'MX'): Promise<MxRecord[]>;
+      resolve(hostname: string, rrtype: 'TXT'): Promise<string[][]>;
+      resolve(hostname: string, rrtype: 'SRV'): Promise<SrvRecord[]>;
+      resolve4(hostname: string): Promise<string[]>;
+      resolve6(hostname: string): Promise<string[]>;
+      resolveCname(hostname: string): Promise<string[]>;
+      resolveMx(hostname: string): Promise<MxRecord[]>;
+      resolveTxt(hostname: string): Promise<string[][]>;
+      resolveNs(hostname: string): Promise<string[]>;
+      resolveSrv(hostname: string): Promise<SrvRecord[]>;
+      reverse(ip: string): Promise<string[]>;
+    }
     function setDefaultResultOrder(order: 'ipv4first' | 'ipv6first' | 'verbatim'): void;
     function getDefaultResultOrder(): 'ipv4first' | 'ipv6first' | 'verbatim';
   }
@@ -1962,7 +2097,9 @@ declare module 'node:tls' {
       rejectUnauthorized?: boolean;
       ALPNProtocols?: string[];
       timeout?: number;
+      checkServerIdentity?: (hostname: string, cert: PeerCertificate) => Error | undefined;
     }
+    function checkServerIdentity(hostname: string, cert: PeerCertificate | { subject?: Record<string, string>; subjectaltname?: string }): Error | undefined;
     interface SecureContext {
       options: SecureContextOptions;
     }
@@ -2128,6 +2265,38 @@ declare module 'node:test' {
       fn<F extends (...args: any[]) => any, Implementation extends (...args: any[]) => any = F>(original: F, implementation: Implementation): Mock<F | Implementation>;
       reset(): void;
       restoreAll(): void;
+      readonly timers: MockTimers;
+    }
+    export type Timer = 'setInterval' | 'setTimeout' | 'setImmediate' | 'Date';
+    export interface MockTimersOptions {
+      apis?: Timer[];
+      now?: number | Date;
+    }
+    export interface MockTimers {
+      enable(options?: MockTimersOptions): void;
+      tick(milliseconds?: number): void;
+      runAll(): void;
+      setTime(milliseconds: number): void;
+      reset(): void;
+    }
+    export interface TestContextAssert {
+      ok(value: unknown, message?: string | Error): void;
+      equal(actual: unknown, expected: unknown, message?: string | Error): void;
+      notEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+      strictEqual<T>(actual: unknown, expected: T, message?: string | Error): void;
+      notStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+      deepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+      notDeepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+      deepStrictEqual<T>(actual: unknown, expected: T, message?: string | Error): void;
+      notDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
+      throws(block: () => unknown, error?: unknown, message?: string | Error): void;
+      doesNotThrow(block: () => unknown, message?: string | Error): void;
+      rejects(block: (() => Promise<unknown>) | Promise<unknown>, error?: unknown, message?: string | Error): Promise<void>;
+      doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
+      match(value: string, regExp: RegExp, message?: string | Error): void;
+      doesNotMatch(value: string, regExp: RegExp, message?: string | Error): void;
+      fail(message?: string | Error): never;
+      ifError(value: unknown): void;
     }
     export interface TestContext {
       readonly name: string;
@@ -2135,6 +2304,7 @@ declare module 'node:test' {
       readonly filePath: string | undefined;
       readonly signal: AbortSignal;
       readonly mock: MockTracker;
+      readonly assert: TestContextAssert;
       test(name?: string, fn?: TestFn): Promise<void>;
       test(name?: string, options?: TestOptions, fn?: TestFn): Promise<void>;
       test(fn?: TestFn): Promise<void>;

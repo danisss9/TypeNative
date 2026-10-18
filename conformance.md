@@ -260,7 +260,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `console.warn`                     |   ✅    | [lib-console-error.ts](conformance/lib-console-error.ts) | Mapped to stderr like `console.error`                  |
 | `console.time` / `console.timeEnd` / `console.timeLog` |   ✅    | [lib-console-time.ts](conformance/lib-console-time.ts) | Node's format: `label: 1.234ms`                         |
 | `console.info` / `debug` / `dir` / `count` / `countReset` / `group` / `groupEnd` / `assert` / `trace` | ✅ | [lib-console-more.ts](conformance/lib-console-more.ts) | `group` indents every later console line; `assert` prints `Assertion failed` |
-| `console.table`                    |   ❌    | —                                                      | Not implemented                                        |
+| `console.table` (arrays, objects, `Map`, `Set`, a `properties` filter) | ✅ | [lib-node-console-table.ts](conformance/lib-node-console-table.ts) | Node's box-drawn layout (left-aligned cells); other values are logged as is |
 
 ### `Math`
 
@@ -616,7 +616,8 @@ async function runs synchronously until its first `await`.
 | ---------------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | -------------------------------------------------------- |
 | `gzipSync` / `gunzipSync` / `deflateSync` / `inflateSync` / `deflateRawSync` / `inflateRawSync` / `unzipSync` / `crc32` / `constants` | ✅ | [lib-node-zlib.ts](conformance/lib-node-zlib.ts) | `{ level }`; invalid input throws `Z_DATA_ERROR` |
 | `createGzip` / `createGunzip` / `createDeflate` / `createInflate` / `createDeflateRaw` / `createInflateRaw` / `createUnzip` | ✅ | [lib-node-zlib-streams.ts](conformance/lib-node-zlib-streams.ts) | Transforms that (de)compress when the input ends |
-| Brotli (`brotliCompressSync` & co.) and callback forms                                                |   ❌    | —                                                          | Go's standard library has no Brotli codec                 |
+| Callback forms `gzip` / `gunzip` / `deflate` / `inflate` / `deflateRaw` / `inflateRaw` / `unzip` (`buf, [options], cb`) and `util.promisify` of them | ✅ | [lib-node-zlib-async.ts](conformance/lib-node-zlib-async.ts) | The codec runs on a goroutine; the callback runs on the event loop |
+| Brotli (`brotliCompressSync` & co.)                                                                   |   ❌    | —                                                          | Go's standard library has no Brotli codec                 |
 
 #### `node:timers`
 
@@ -687,7 +688,8 @@ async function runs synchronously until its first `await`.
 | `createInterface` (`'line'` / `'close'`, `question(q, cb)`, `prompt`, `close`, `for await`) |   ✅    | [lib-node-readline.ts](conformance/lib-node-readline.ts)                 | Any readable stream as input (`process.stdin` included)                  |
 | `node:readline/promises` (`await rl.question(q)`)                                        |   ✅    | [lib-node-readline-promises.ts](conformance/lib-node-readline-promises.ts) |                                                                         |
 | `question(prompt)` (synchronous)                                                        |   ✅    | [lib-node-readline-question.ts](conformance/lib-node-readline-question.ts) | TypeNative extension (not in Node): used by the self-hosted compiler     |
-| Terminal features (`cursorTo`, `emitKeypressEvents`, history, completer)                |   ❌    | —                                                                        | Not implemented                                                         |
+| `cursorTo` / `moveCursor` / `clearLine` / `clearScreenDown`                              |   ✅    | [lib-node-readline-cursor.ts](conformance/lib-node-readline-cursor.ts)   | ANSI escape sequences written to the stream; optional callback           |
+| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Need raw terminal mode (OS-specific syscalls)                            |
 
 #### `node:child_process`
 
@@ -712,7 +714,7 @@ async function runs synchronously until its first `await`.
 | API                                                                                  | Status | Probe                                                                        | Notes                         |
 | ------------------------------------------------------------------------------------ | :----: | ---------------------------------------------------------------------------- | ----------------------------- |
 | `channel` / `publish` / `subscribe` / `unsubscribe` / `hasSubscribers`               |   ✅    | [lib-node-diagnostics-channel.ts](conformance/lib-node-diagnostics-channel.ts) | Synchronous; shared by name   |
-| `tracingChannel`                                                                     |   ❌    | —                                                                            | Not implemented               |
+| `tracingChannel` (`start` / `end` / `asyncStart` / `asyncEnd` / `error` channels, `subscribe` / `unsubscribe`, `traceSync` / `tracePromise` / `traceCallback`); `channel.bindStore` / `unbindStore` / `runStores` | ✅ | [lib-node-diagnostics-tracing.ts](conformance/lib-node-diagnostics-tracing.ts) | The context gets `result` / `error`; a struct context without those fields is copied into a record |
 
 #### `node:net`
 
@@ -722,7 +724,8 @@ async function runs synchronously until its first `await`.
 | `connect` / `createConnection` / `Socket` (a duplex stream: `write` / `end` / `'data'` / `'end'`, `setEncoding`, `remoteAddress` / `remotePort` / `localPort`, `setTimeout` + `'timeout'`, `setNoDelay`, `setKeepAlive`, `destroy`, `'close'(hadError)`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) | One goroutine reads the `net.Conn`; `allowHalfOpen: false` ends the socket after `'end'`, as in Node |
 | Node's errors (`connect ECONNREFUSED 127.0.0.1:80`, `EADDRINUSE`, `ECONNRESET`; `code` / `errno` / `syscall` / `address` / `port`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                           |
 | `isIP` / `isIPv4` / `isIPv6`                                                                           |   ✅    | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                         |
-| `BlockList` / `SocketAddress` / `net.Stream` / `autoSelectFamily` / IPC handle passing                 |   ❌    | —                                            | Not implemented                                                                           |
+| `BlockList` (`addAddress` / `addRange` / `addSubnet` / `check` / `rules` / `isBlockList`) / `SocketAddress` (`parse`, `toJSON`) | ✅ | [lib-node-net-blocklist.ts](conformance/lib-node-net-blocklist.ts) | `net/netip`; IPv4-mapped IPv6 addresses match IPv4 rules, as in Node |
+| `net.Stream` / `autoSelectFamily` / IPC handle passing                                                 |   ❌    | —                                            | Not implemented                                                                           |
 
 #### `node:dns`
 
@@ -730,7 +733,8 @@ async function runs synchronously until its first `await`.
 | -------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | --------------------------------------------------------------------- |
 | `lookup` (`family`, `all`) and `dns/promises` / `dns.promises` `lookup`                 |   ✅    | [lib-node-dns.ts](conformance/lib-node-dns.ts) | Go's resolver; `getaddrinfo ENOTFOUND host` errors with `hostname`   |
 | `resolve` (rrtype) / `resolve4` / `resolve6` / `resolveCname` / `resolveMx` / `resolveTxt` / `resolveNs` / `resolveSrv` / `reverse` (callback and promise forms), `getServers` | ✅ | — | Implemented, not probed (needs a network); `getServers` reads `/etc/resolv.conf` |
-| `Resolver` class / `setServers` / `lookupService` / `resolveAny` / `ttl` option         |   ❌    | —                                            | Go's resolver has no per-query server selection                       |
+| `Resolver` class (callback and `dns/promises` forms: `setServers` / `getServers` / `setLocalAddress` / `cancel`, `timeout` option), module `setServers`, `lookupService` | ✅ | [lib-node-dns-resolver.ts](conformance/lib-node-dns-resolver.ts) | Go's pure resolver dialing the configured servers in turn; `ETIMEOUT` / `ECANCELLED`; services from `/etc/services` |
+| `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`, the `ttl` option, `tries` |   ❌    | —                                            | Go's resolver does not expose these records or TTLs                   |
 
 #### `node:http` / `node:https`
 
@@ -742,7 +746,8 @@ async function runs synchronously until its first `await`.
 | `STATUS_CODES` / `METHODS` / `maxHeaderSize` / `Agent` / `globalAgent`                                |   ✅    | [lib-node-http-server.ts](conformance/lib-node-http-server.ts) | `Agent` options are accepted; Go's transport pools connections                               |
 | `https.createServer({ key, cert })` / `https.request` / `https.get` (`ca`, `rejectUnauthorized`, `servername`, client `key` / `cert`) | ✅ | [lib-node-https.ts](conformance/lib-node-https.ts) | Certificate checks as in [node:tls](#nodetls)                                               |
 | `headers` values                                                                                      |   ✅    | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | Repeated headers are joined with `, ` (`; ` for `cookie`) — including `set-cookie`, which Node keeps as an array: use `headersDistinct['set-cookie']` |
-| `statusMessage` on responses we send, `'upgrade'` / `'connect'` / `'checkContinue'`, `Agent` socket pooling control, trailers we send |   ❌    | —                              | Go's `ResponseWriter` sends its standard reason phrases; no protocol upgrades               |
+| Server `'upgrade'` / `'connect'` (`req, socket, head`) and client `'upgrade'` / `'connect'` events | ✅ | [lib-node-http-upgrade.ts](conformance/lib-node-http-upgrade.ts) | The server hijacks the connection; an upgrade nobody listens for is an ordinary request, an unhandled CONNECT closes the connection, as in Node |
+| `statusMessage` on responses we send, `'checkContinue'`, `Agent` socket pooling control, trailers we send |   ❌    | —                              | Go's `ResponseWriter` sends its standard reason phrases                                      |
 
 #### `node:http2`
 
@@ -761,7 +766,8 @@ async function runs synchronously until its first `await`.
 | `createServer({ key, cert, ca, requestCert, ALPNProtocols, minVersion, maxVersion }, cb)` / `'secureConnection'` | ✅ | [lib-node-tls.ts](conformance/lib-node-tls.ts) | Handshakes run on the accept goroutine                                                    |
 | `connect` (`host`, `port`, `ca`, `servername`, `rejectUnauthorized`, client `key` / `cert`) / `'secureConnect'`; `TLSSocket` (`authorized`, `authorizationError`, `encrypted`, `alpnProtocol`, `getPeerCertificate`, `getProtocol`, `getCipher`) | ✅ | [lib-node-tls.ts](conformance/lib-node-tls.ts) | Node's verification codes: `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID` |
 | `createSecureContext` / `getCiphers` / `DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`                   |   ✅    | —                                            | Implemented, not probed; cipher names are Go's                                              |
-| PFX / passphrase-protected keys, `checkServerIdentity`, session resumption, `renegotiate`, `rootCertificates` |   ❌    | —                                     | Not implemented                                                                             |
+| `checkServerIdentity` (function and `connect` option)                                                  |   ✅    | [lib-node-tls-identity.ts](conformance/lib-node-tls-identity.ts) | Node's rules: one leftmost wildcard label, IP altnames, CN only without DNS altnames |
+| PFX / passphrase-protected keys, session resumption, `renegotiate`, `rootCertificates`                 |   ❌    | —                                     | Not implemented                                                                             |
 
 #### `node:dgram`
 
@@ -797,7 +803,9 @@ async function runs synchronously until its first `await`.
 | `TestContext`: `t.test` subtests, `t.skip`, `t.todo`, `t.diagnostic`, `t.plan`, `t.name`, `t.fullName`, `t.signal`, `t.mock` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) |                                                                                       |
 | Reporting: TAP (Node's default when stdout is not a terminal) / spec (on a terminal); `tests` / `suites` / `pass` / `fail` / `cancelled` / `skipped` / `todo` counters; exit code 1 on failure | ✅ | [lib-node-test-fail.ts](conformance/lib-node-test-fail.ts) | Same layout as Node, without `location` / `stack` (a native binary has no source positions); timeouts count as cancelled |
 | `mock.fn(original?, implementation?)`; `fn.mock.calls` / `callCount()` / `mockImplementation(Once)` / `resetCalls()` / `restore()` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) | The mock has the original's Go function type                                                          |
-| `t.assert`, `mock.method` / `mock.getter` / `mock.timers`, snapshots, coverage, `--test` / `--test-reporter` / `--test-only` flags, `run()` |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`)                               |
+| `t.assert` (`node:assert`'s functions, counted by `t.plan`) and `mock.timers` (`enable({ apis, now })`, `tick`, `runAll`, `setTime`, `reset`; `setTimeout` / `setInterval` / `setImmediate` / `Date`) | ✅ | [lib-node-test-mock-timers.ts](conformance/lib-node-test-mock-timers.ts) | Mocked timers do not keep the process alive; `t.mock` timers reset after each test |
+| `mock.method` / `mock.getter` / `mock.setter`                                                         |   ❌    | —                                   | Go methods cannot be replaced at runtime                                                                 |
+| Snapshots, coverage, `--test` / `--test-reporter` / `--test-only` flags, `run()`                      |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`)                               |
 
 #### `node:worker_threads`
 

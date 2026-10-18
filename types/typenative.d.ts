@@ -415,6 +415,7 @@ interface Console {
   assert(condition?: boolean, ...data: any[]): void;
   count(label?: string): void;
   countReset(label?: string): void;
+  table(tabularData: unknown, properties?: readonly string[]): void;
   group(...label: any[]): void;
   groupCollapsed(...label: any[]): void;
   groupEnd(): void;
@@ -1350,6 +1351,11 @@ declare namespace NodeJS {
     code?: string;
     path?: string;
     syscall?: string;
+    /** dns errors: the queried name */
+    hostname?: string;
+    /** net errors: the remote address and port */
+    address?: string;
+    port?: number;
   }
 }
 

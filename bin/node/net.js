@@ -843,6 +843,207 @@ export function socketListenerTypes(nodes) {
         return ['*TnError', 'string', 'interface{}', 'string'];
     return streamListenerTypes(nodes);
 }
+// net.SocketAddress / net.BlockList on net/netip
+const blockListHelper = `// node:net SocketAddress, BlockList
+type TnSocketAddress struct {
+	address   string
+	port      float64
+	family    string
+	flowlabel float64
+}
+
+func tnInvalidAddress() *TnError {
+	return TnNodeError("Error", "ERR_INVALID_ADDRESS", "Invalid socket address")
+}
+
+func TnNewSocketAddress(options ...interface{}) *TnSocketAddress {
+	sa := &TnSocketAddress{family: "ipv4"}
+	var opts interface{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if f, ok := TnGet(opts, "family").(string); ok {
+		sa.family = strings.ToLower(f)
+	}
+	if sa.family != "ipv4" && sa.family != "ipv6" {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.family' must be one of: 'ipv4', 'ipv6'. Received '"+sa.family+"'"))
+	}
+	sa.address = "127.0.0.1"
+	if sa.family == "ipv6" {
+		sa.address = "::"
+	}
+	if a, ok := TnGet(opts, "address").(string); ok {
+		sa.address = a
+	}
+	if p, ok := TnGet(opts, "port").(float64); ok {
+		sa.port = p
+	}
+	if fl, ok := TnGet(opts, "flowlabel").(float64); ok {
+		sa.flowlabel = fl
+	}
+	addr, err := netip.ParseAddr(sa.address)
+	if err != nil || (sa.family == "ipv4") != addr.Is4() {
+		panic(tnInvalidAddress())
+	}
+	sa.address = addr.String()
+	return sa
+}
+
+// SocketAddress.parse('1.2.3.4:80' | '[::1]:80'): undefined when invalid
+func TnParseSocketAddress(input string) *TnSocketAddress {
+	host, port := input, "0"
+	if ap, err := netip.ParseAddrPort(input); err == nil {
+		host, port = ap.Addr().String(), strconv.Itoa(int(ap.Port()))
+	} else if _, err := netip.ParseAddr(strings.Trim(input, "[]")); err == nil {
+		host = strings.Trim(input, "[]")
+	} else {
+		return nil
+	}
+	addr, _ := netip.ParseAddr(host)
+	family := "ipv4"
+	if !addr.Is4() {
+		family = "ipv6"
+	}
+	p, _ := strconv.Atoi(port)
+	return &TnSocketAddress{address: addr.String(), port: float64(p), family: family}
+}
+
+func (sa *TnSocketAddress) Get_address() string     { return sa.address }
+func (sa *TnSocketAddress) Get_port() float64       { return sa.port }
+func (sa *TnSocketAddress) Get_family() string      { return sa.family }
+func (sa *TnSocketAddress) Get_flowlabel() float64  { return sa.flowlabel }
+func (sa *TnSocketAddress) toJSON() map[string]interface{} {
+	return map[string]interface{}{"address": sa.address, "port": sa.port, "family": sa.family, "flowlabel": sa.flowlabel}
+}
+
+type tnBlockRule struct {
+	kind   string
+	from   netip.Addr
+	to     netip.Addr
+	prefix netip.Prefix
+	text   string
+}
+
+type TnBlockList struct {
+	rules []tnBlockRule
+}
+
+func TnNewBlockList() *TnBlockList { return &TnBlockList{} }
+
+func TnIsBlockList(v interface{}) bool {
+	_, ok := v.(*TnBlockList)
+	return ok
+}
+
+// An address argument (string + family, or a SocketAddress) as a netip.Addr
+func tnBlockAddr(v interface{}, family []interface{}) (netip.Addr, bool) {
+	fam := "ipv4"
+	if sa, ok := v.(*TnSocketAddress); ok {
+		v, fam = sa.address, sa.family
+	} else if len(family) > 0 {
+		if f, ok := family[0].(string); ok {
+			fam = strings.ToLower(f)
+		}
+	}
+	str, ok := v.(string)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	addr, err := netip.ParseAddr(str)
+	if err != nil || (fam == "ipv4") != addr.Is4() {
+		return netip.Addr{}, false
+	}
+	return addr, true
+}
+
+func tnBlockFamily(a netip.Addr) string {
+	if a.Is4() {
+		return "IPv4"
+	}
+	return "IPv6"
+}
+
+func (b *TnBlockList) add(rule tnBlockRule) {
+	b.rules = append([]tnBlockRule{rule}, b.rules...)
+}
+
+func (b *TnBlockList) addAddress(address interface{}, family ...interface{}) {
+	addr, ok := tnBlockAddr(address, family)
+	if !ok {
+		panic(tnInvalidAddress())
+	}
+	b.add(tnBlockRule{kind: "address", from: addr, text: "Address: " + tnBlockFamily(addr) + " " + addr.String()})
+}
+
+func (b *TnBlockList) addRange(start interface{}, end interface{}, family ...interface{}) {
+	from, ok1 := tnBlockAddr(start, family)
+	to, ok2 := tnBlockAddr(end, family)
+	if !ok1 || !ok2 {
+		panic(tnInvalidAddress())
+	}
+	if to.Less(from) {
+		panic(TnNodeError("RangeError", "ERR_INVALID_ARG_VALUE", "The argument 'start' must be less than or equal to 'end'"))
+	}
+	b.add(tnBlockRule{kind: "range", from: from, to: to, text: "Range: " + tnBlockFamily(from) + " " + from.String() + "-" + to.String()})
+}
+
+func (b *TnBlockList) addSubnet(network interface{}, prefix float64, family ...interface{}) {
+	addr, ok := tnBlockAddr(network, family)
+	if !ok {
+		panic(tnInvalidAddress())
+	}
+	pfx, err := addr.Prefix(int(prefix))
+	if err != nil {
+		panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"prefix\\" is out of range. Received "+TnNumStr(prefix)))
+	}
+	b.add(tnBlockRule{kind: "subnet", prefix: pfx, text: "Subnet: " + tnBlockFamily(addr) + " " + addr.String() + "/" + strconv.Itoa(int(prefix))})
+}
+
+// The address in the rule's family (IPv4-mapped IPv6 addresses match IPv4 rules)
+func tnBlockAs(addr netip.Addr, like netip.Addr) (netip.Addr, bool) {
+	if addr.Is4() == like.Is4() {
+		return addr, true
+	}
+	if like.Is4() && addr.Is4In6() {
+		return addr.Unmap(), true
+	}
+	if !like.Is4() && addr.Is4() {
+		return netip.AddrFrom16(addr.As16()), true
+	}
+	return addr, false
+}
+
+func (b *TnBlockList) check(address interface{}, family ...interface{}) bool {
+	addr, ok := tnBlockAddr(address, family)
+	if !ok {
+		return false
+	}
+	for _, rule := range b.rules {
+		switch rule.kind {
+		case "address":
+			if a, ok := tnBlockAs(addr, rule.from); ok && a == rule.from {
+				return true
+			}
+		case "range":
+			if a, ok := tnBlockAs(addr, rule.from); ok && !a.Less(rule.from) && !rule.to.Less(a) {
+				return true
+			}
+		case "subnet":
+			if a, ok := tnBlockAs(addr, rule.prefix.Addr()); ok && rule.prefix.Contains(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *TnBlockList) Get_rules() []string {
+	out := []string{}
+	for _, rule := range b.rules {
+		out = append(out, rule.text)
+	}
+	return out
+}`;
 export function registerNet(r) {
     defineModule(r, 'net');
     defineHelper(r, 'netErrors', ['errors', 'net', 'os', 'reflect', 'strconv', 'strings', 'syscall'], ['error', 'dynamic'], netErrorsHelper);
@@ -905,4 +1106,26 @@ export function registerNet(r) {
         use();
         return `TnIsIPv6(${c.args[0]})`;
     };
+    defineHelper(r, 'nodeBlockList', ['net/netip', 'strconv', 'strings'], ['error', 'dynamic'], blockListHelper);
+    const block = () => r.helper('nodeBlockList');
+    defineClass(r, 'net.SocketAddress', '*TnSocketAddress', 'class', 'toJSON=map[string]interface{}', '', 'address=string; port=float64; family=string; flowlabel=float64', '');
+    defineClass(r, 'net.BlockList', '*TnBlockList', 'class', 'addAddress=; addRange=; addSubnet=; check=bool', '', 'rules=[]string', '');
+    r.constructors['net.SocketAddress'] = (c) => {
+        block();
+        return `TnNewSocketAddress(${c.args.join(', ')})`;
+    };
+    r.constructors['net.BlockList'] = (_c) => {
+        block();
+        return 'TnNewBlockList()';
+    };
+    r.functions['net.SocketAddress.parse'] = (c) => {
+        block();
+        return `TnParseSocketAddress(${c.args[0]})`;
+    };
+    r.results['net.SocketAddress.parse'] = '*TnSocketAddress';
+    r.functions['net.BlockList.isBlockList'] = (c) => {
+        block();
+        return `TnIsBlockList(${c.args[0]})`;
+    };
+    r.results['net.BlockList.isBlockList'] = 'bool';
 }

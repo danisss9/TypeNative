@@ -722,7 +722,167 @@ func (m *TnMockFunctionContext) restore() { m.impl = m.original }
 var tnMocks = map[uintptr]*TnMockFunctionContext{}
 
 type TnMockTracker struct {
-	mocks []*TnMockFunctionContext
+	mocks  []*TnMockFunctionContext
+	timers *TnMockTimers
+}
+
+// mock.timers: fake setTimeout / setInterval / setImmediate / Date driven by tick()
+type TnMockTimers struct {
+	enabled bool
+	now     float64
+	seq     int
+	queue   []*tnFakeTimer
+}
+
+type tnFakeTimer struct {
+	runAt    float64
+	interval float64
+	seq      int
+	run      func() bool
+}
+
+func (t *TnMockTracker) Get_timers() *TnMockTimers {
+	if t.timers == nil {
+		t.timers = &TnMockTimers{}
+	}
+	return t.timers
+}
+
+func tnMockTimersState(msg string) *TnError {
+	return TnNodeError("Error", "ERR_INVALID_STATE", "Invalid state: "+msg)
+}
+
+func (m *TnMockTimers) enable(options ...interface{}) {
+	if m.enabled {
+		panic(tnMockTimersState("MockTimers is already enabled!"))
+	}
+	apis := map[string]bool{"setTimeout": true, "setInterval": true, "setImmediate": true, "Date": true}
+	m.now = 0
+	if len(options) > 0 && options[0] != nil {
+		switch list := TnGet(options[0], "apis").(type) {
+		case []string:
+			apis = map[string]bool{}
+			for _, a := range list {
+				apis[a] = true
+			}
+		case []interface{}:
+			apis = map[string]bool{}
+			for _, a := range list {
+				apis[fmt.Sprint(a)] = true
+			}
+		}
+		switch now := TnGet(options[0], "now").(type) {
+		case float64:
+			m.now = now
+		case time.Time:
+			m.now = float64(now.UnixMilli())
+		}
+	}
+	m.enabled = true
+	m.queue = nil
+	tnMockTimerHook = func(kind string, ms float64, run func() bool) bool {
+		if !m.enabled || !apis[kind] {
+			return false
+		}
+		if ms < 0 || kind == "setImmediate" {
+			ms = 0
+		}
+		interval := 0.0
+		if kind == "setInterval" {
+			interval = math.Max(ms, 1)
+		}
+		m.seq++
+		m.queue = append(m.queue, &tnFakeTimer{runAt: m.now + ms, interval: interval, seq: m.seq, run: run})
+		return true
+	}
+	if apis["Date"] {
+		tnClockHook = func() time.Time { return time.UnixMilli(int64(m.now)) }
+	}
+}
+
+func (m *TnMockTimers) check() {
+	if !m.enabled {
+		panic(tnMockTimersState("You should enable MockTimers first by calling the .enable function"))
+	}
+}
+
+// The next timer to fire: earliest first, then in scheduling order
+func (m *TnMockTimers) next() (*tnFakeTimer, int) {
+	best := -1
+	for i, t := range m.queue {
+		if best < 0 || t.runAt < m.queue[best].runAt || (t.runAt == m.queue[best].runAt && t.seq < m.queue[best].seq) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return nil, -1
+	}
+	return m.queue[best], best
+}
+
+// tick(ms): advances the clock, then runs the timers that are due
+func (m *TnMockTimers) tick(ms ...float64) {
+	m.check()
+	d := 1.0
+	if len(ms) > 0 {
+		d = ms[0]
+	}
+	if d < 0 {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'time' must be a positive number. Received "+TnNumStr(d)))
+	}
+	m.now += d
+	for {
+		t, i := m.next()
+		if t == nil || t.runAt > m.now {
+			return
+		}
+		m.queue = append(m.queue[:i:i], m.queue[i+1:]...)
+		if t.run() && t.interval > 0 {
+			t.runAt += t.interval
+			m.queue = append(m.queue, t)
+		}
+	}
+}
+
+// runAll(): ticks up to the last pending timer
+func (m *TnMockTimers) runAll() {
+	m.check()
+	last := m.now
+	for _, t := range m.queue {
+		last = math.Max(last, t.runAt)
+	}
+	m.tick(last - m.now)
+}
+
+func (m *TnMockTimers) setTime(ms float64) {
+	m.check()
+	m.now = ms
+}
+
+func (m *TnMockTimers) reset() {
+	if m.enabled {
+		tnMockTimerHook = nil
+		tnClockHook = nil
+	}
+	m.enabled = false
+	m.queue = nil
+}
+
+// t.assert: node:assert's functions, counted towards t.plan()
+type TnTestAssert struct {
+	ctx *TnTestContext
+}
+
+func (t *TnTestContext) Get_assert() *TnTestAssert { return &TnTestAssert{ctx: t} }
+
+func (a *TnTestAssert) count(run func()) {
+	a.ctx.asserts++
+	run()
+}
+
+func tnTestCounted[T any](a *TnTestAssert, v T) T {
+	a.ctx.asserts++
+	return v
 }
 
 func TnNewMockTracker() *TnMockTracker { return &TnMockTracker{} }
@@ -795,6 +955,9 @@ func (t *TnMockTracker) reset() {
 	for _, m := range t.mocks {
 		m.resetCalls()
 	}
+	if t.timers != nil {
+		t.timers.reset()
+	}
 	t.restoreAll()
 }
 
@@ -809,11 +972,28 @@ function eventFn(nodes) {
 }
 export function registerTest(r) {
     defineModule(r, 'test');
-    defineHelper(r, 'nodeTest', ['fmt', 'math', 'os', 'reflect', 'strconv', 'strings', 'time'], ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error'], testHelper);
+    defineHelper(r, 'nodeTest', ['fmt', 'math', 'os', 'reflect', 'strconv', 'strings', 'time'], ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error', 'timerWait', 'clock'], testHelper);
     const use = () => r.helper('nodeTest');
-    defineClass(r, 'test.TestContext', '*TnTestContext', 'class', 'skip=; todo=; diagnostic=; plan=; runOnly=; test=chan struct{}; before=; after=; beforeEach=; afterEach=', '', 'name=string; fullName=string; mock=*TnMockTracker; signal=*TnAbortSignal; filePath=string', '');
+    defineClass(r, 'test.TestContext', '*TnTestContext', 'class', 'skip=; todo=; diagnostic=; plan=; runOnly=; test=chan struct{}; before=; after=; beforeEach=; afterEach=', '', 'name=string; fullName=string; mock=*TnMockTracker; signal=*TnAbortSignal; filePath=string; assert=*TnTestAssert', '');
     r.classes['test.SuiteContext'] = r.classes['test.TestContext'];
-    defineClass(r, 'test.MockTracker', '*TnMockTracker', 'class', 'reset=; restoreAll=', '', '', '');
+    defineClass(r, 'test.MockTracker', '*TnMockTracker', 'class', 'reset=; restoreAll=', '', 'timers=*TnMockTimers', '');
+    defineClass(r, 'test.MockTimers', '*TnMockTimers', 'class', 'enable=; tick=; runAll=; setTime=; reset=', '', '', '');
+    // t.assert.x(...): node:assert's x, counted for t.plan()
+    defineClass(r, 'test.TestContextAssert', '*TnTestAssert', 'class', '', '', '', '');
+    const assertNames = ['ok', 'equal', 'notEqual', 'strictEqual', 'notStrictEqual', 'deepEqual', 'notDeepEqual', 'deepStrictEqual', 'notDeepStrictEqual', 'throws', 'doesNotThrow', 'rejects', 'doesNotReject', 'match', 'doesNotMatch', 'fail', 'ifError'];
+    for (const name of assertNames) {
+        const key = `test.TestContextAssert#${name}`;
+        r.methods[key] = (c) => {
+            use();
+            // node:assert's emitters ignore the receiver
+            const expr = r.functions[`assert.${name}`](c);
+            if (name === 'rejects' || name === 'doesNotReject')
+                return `tnTestCounted(${c.recv}, ${expr})`;
+            return `${c.recv}.count(func() { ${expr} })`;
+        };
+        r.typers[key] = (_c) => (name === 'rejects' || name === 'doesNotReject' ? 'chan struct{}' : '');
+        r.paramTypers[key] = (nodes) => (r.paramTypers[`assert.${name}`] ? r.paramTypers[`assert.${name}`](nodes) : []);
+    }
     defineClass(r, 'test.MockFunctionContext', '*TnMockFunctionContext', 'class', 'callCount=float64; resetCalls=; mockImplementation=; mockImplementationOnce=; restore=', '', 'calls=[]*TnMockCall', '');
     defineClass(r, 'test.MockCall', '*TnMockCall', 'class', '', 'arguments=[]interface{}; result=interface{}; this=interface{}', 'error=interface{}', '');
     r.paramTypers['test.TestContext#test'] = eventFn;
@@ -875,6 +1055,13 @@ export function registerTest(r) {
             use();
             return `TnMock.${method}()`;
         };
+    }
+    for (const method of ['enable', 'tick', 'runAll', 'setTime', 'reset']) {
+        r.functions[`test.mock.timers.${method}`] = (c) => {
+            use();
+            return `TnMock.Get_timers().${method}(${c.args.join(', ')})`;
+        };
+        r.results[`test.mock.timers.${method}`] = '';
     }
     r.typers['test.MockTracker#fn'] = (c) => (c.nodes.length === 0 || !c.types[0] ? 'func(...interface{}) interface{}' : c.types[0]);
     setResults(r, 'test', 'before=; after=; beforeEach=; afterEach=');

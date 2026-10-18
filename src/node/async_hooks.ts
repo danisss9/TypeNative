@@ -195,7 +195,7 @@ export function goFuncResult(goType: string): string {
 }
 
 // Calls fn with the extra arguments inside a zero-argument closure
-function closure(fn: string, fnType: string, extra: string[]): string {
+export function closure(fn: string, fnType: string, extra: string[]): string {
   if (extra.length === 0 && fnType.startsWith('func()')) return fn;
   const result = goFuncResult(fnType);
   const call = `(${fn})(${extra.join(', ')})`;
