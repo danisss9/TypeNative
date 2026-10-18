@@ -2,6 +2,7 @@
 // Node CLI entry point (npm `bin`). Interactive prompts use inquirer here;
 // the actual compiler logic lives in the transpilable src/index.ts.
 import inquirer from 'inquirer';
+import { fileURLToPath } from 'node:url';
 import { run, createProject } from './index.js';
 import { parseAstJson } from './parse-node.js';
 (async function main() {
@@ -57,6 +58,7 @@ import { parseAstJson } from './parse-node.js';
         output: output ?? answers.output ?? null,
         scriptMode,
         tsCode: answers.tsCode ?? null,
-        parse: parseAstJson
+        parse: parseAstJson,
+        vendorDir: fileURLToPath(new URL('../govendor', import.meta.url))
     });
 })();

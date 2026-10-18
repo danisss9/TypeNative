@@ -89,6 +89,13 @@ generated types say they do.
   `t.assert` and `mock.timers`; `console.table`
 - `new Error(message, { cause })` / `err.cause`; fetch refuses the Fetch standard's bad ports;
   `net.Stream` and the `autoSelectFamily` defaults
+- **`node:sqlite`**: `DatabaseSync` / `StatementSync` (`run` / `get` / `all` / `iterate`, named
+  and bare parameters, `readBigInts`, `returnArrays`, `columns()`, `expandedSQL`), `function()`,
+  `aggregate()` (window functions), `setAuthorizer`, `limits`, `createTagStore()`, `backup()`,
+  and Node 24's error codes and messages. SQLite comes from github.com/ncruces/go-sqlite3 (Wasm
+  translated to Go: no cgo), vendored in `govendor/` by `npm run vendor:go` so builds need no
+  network. `loadExtension`, sessions and `serialize` are not available
+- conformance.md gives each unsupported Node module (`vm`, `repl`, `inspector`, …) its own section
 
 ### Fixed
 
@@ -128,6 +135,12 @@ generated types say they do.
 - Top-level variables named like an imported Go package (`rsa`, `pem`, `encoding`, `http`, …) are
   renamed instead of clashing with it; `bigint.toString(radix)`; `ArrayBuffer` annotations and
   `byteLength` on Buffers
+- Object literals with `$` in a key (`{ $id: 1 }`) compile (as records); `rows as Row[]` on an
+  array of dynamic values converts each element; records held in dynamic values read their keys
+  (`row.name`, `row['name']`, `Object.keys(row)`, `row as Row`); `bytes[i]` on a dynamic
+  `Uint8Array`; `x === 1n` when `x` is `number | bigint`
+- `arr.reduce(…)` has a result type (functions returning it compiled without a return value); a
+  typed arrow parameter is no longer mistaken for an earlier variable of the same name
 - `(c) => (body += c)` arrow bodies; `console.log(x?.y)` prints optional strings / numbers
   without quotes; the self-hosted compiler no longer crashes on `console.log` arguments of
   unknown type

@@ -2426,6 +2426,188 @@ declare module 'node:worker_threads' {
   export = worker_threads;
 }
 
+declare module 'node:sqlite' {
+  namespace sqlite {
+    type SQLInputValue = null | number | bigint | string | Uint8Array;
+    type SQLOutputValue = null | number | bigint | string | Uint8Array;
+    interface DatabaseSyncOptions {
+      open?: boolean;
+      enableForeignKeyConstraints?: boolean;
+      enableDoubleQuotedStringLiterals?: boolean;
+      readOnly?: boolean;
+      allowExtension?: boolean;
+      timeout?: number;
+      readBigInts?: boolean;
+      returnArrays?: boolean;
+      allowBareNamedParameters?: boolean;
+      allowUnknownNamedParameters?: boolean;
+      defensive?: boolean;
+      limits?: Partial<DatabaseLimits>;
+    }
+    interface DatabaseLimits {
+      length: number;
+      sqlLength: number;
+      column: number;
+      exprDepth: number;
+      compoundSelect: number;
+      vdbeOp: number;
+      functionArg: number;
+      attach: number;
+      likePatternLength: number;
+      variableNumber: number;
+      triggerDepth: number;
+    }
+    interface FunctionOptions {
+      deterministic?: boolean;
+      directOnly?: boolean;
+      useBigIntArguments?: boolean;
+      varargs?: boolean;
+    }
+    interface AggregateOptions<T extends SQLInputValue = SQLInputValue> extends FunctionOptions {
+      start: T | (() => T);
+      step: (accumulator: T, ...args: SQLOutputValue[]) => T;
+      result?: (accumulator: T) => SQLInputValue;
+      inverse?: (accumulator: T, ...args: SQLOutputValue[]) => T;
+    }
+    interface PrepareOptions {
+      readBigInts?: boolean;
+      returnArrays?: boolean;
+      allowBareNamedParameters?: boolean;
+      allowUnknownNamedParameters?: boolean;
+    }
+    // SQLite runs as Wasm inside the program (github.com/ncruces/go-sqlite3):
+    // loadExtension, createSession / applyChangeset and serialize / deserialize
+    // throw
+    class DatabaseSync {
+      constructor(path: string | Uint8Array | URL, options?: DatabaseSyncOptions);
+      readonly isOpen: boolean;
+      readonly isTransaction: boolean;
+      readonly limits: DatabaseLimits;
+      open(): void;
+      close(): void;
+      exec(sql: string): void;
+      prepare(sql: string, options?: PrepareOptions): StatementSync;
+      location(dbName?: string): string | null;
+      function(name: string, options: FunctionOptions, fn: (...args: SQLOutputValue[]) => SQLInputValue): void;
+      function(name: string, fn: (...args: SQLOutputValue[]) => SQLInputValue): void;
+      aggregate(name: string, options: AggregateOptions): void;
+      aggregate<T extends SQLInputValue>(name: string, options: AggregateOptions<T>): void;
+      setAuthorizer(
+        callback:
+          | ((actionCode: number, arg1: string | null, arg2: string | null, dbName: string | null, triggerOrView: string | null) => number)
+          | null
+      ): void;
+      enableDefensive(active: boolean): void;
+      createTagStore(maxSize?: number): SQLTagStore;
+      enableLoadExtension(allow: boolean): void;
+      loadExtension(path: string, entryPoint?: string): void;
+      createSession(options?: { table?: string; db?: string }): never;
+      applyChangeset(changeset: Uint8Array, options?: object): boolean;
+      serialize(dbName?: string): Uint8Array;
+      deserialize(buffer: Uint8Array, options?: { dbName?: string }): void;
+    }
+    interface StatementColumnMetadata {
+      column: string | null;
+      database: string | null;
+      name: string;
+      table: string | null;
+      type: string | null;
+    }
+    interface StatementResultingChanges {
+      changes: number | bigint;
+      lastInsertRowid: number | bigint;
+    }
+    interface StatementIterator extends IterableIterator<Record<string, SQLOutputValue>> {}
+    class StatementSync {
+      private constructor();
+      readonly sourceSQL: string;
+      readonly expandedSQL: string;
+      all(...anonymousParameters: SQLInputValue[]): Record<string, SQLOutputValue>[];
+      all(namedParameters: Record<string, SQLInputValue>, ...anonymousParameters: SQLInputValue[]): Record<string, SQLOutputValue>[];
+      get(...anonymousParameters: SQLInputValue[]): Record<string, SQLOutputValue> | undefined;
+      get(namedParameters: Record<string, SQLInputValue>, ...anonymousParameters: SQLInputValue[]): Record<string, SQLOutputValue> | undefined;
+      iterate(...anonymousParameters: SQLInputValue[]): StatementIterator;
+      iterate(namedParameters: Record<string, SQLInputValue>, ...anonymousParameters: SQLInputValue[]): StatementIterator;
+      run(...anonymousParameters: SQLInputValue[]): StatementResultingChanges;
+      run(namedParameters: Record<string, SQLInputValue>, ...anonymousParameters: SQLInputValue[]): StatementResultingChanges;
+      columns(): StatementColumnMetadata[];
+      setAllowBareNamedParameters(enabled: boolean): void;
+      setAllowUnknownNamedParameters(enabled: boolean): void;
+      setReadBigInts(enabled: boolean): void;
+      setReturnArrays(enabled: boolean): void;
+    }
+    interface SQLTagStore {
+      readonly size: number;
+      readonly capacity: number;
+      readonly db: DatabaseSync;
+      all(strings: TemplateStringsArray, ...params: SQLInputValue[]): Record<string, SQLOutputValue>[];
+      get(strings: TemplateStringsArray, ...params: SQLInputValue[]): Record<string, SQLOutputValue> | undefined;
+      iterate(strings: TemplateStringsArray, ...params: SQLInputValue[]): StatementIterator;
+      run(strings: TemplateStringsArray, ...params: SQLInputValue[]): StatementResultingChanges;
+      clear(): void;
+    }
+    interface BackupOptions {
+      source?: string;
+      target?: string;
+      rate?: number;
+      progress?: (progressInfo: BackupProgressInfo) => void;
+    }
+    interface BackupProgressInfo {
+      totalPages: number;
+      remainingPages: number;
+    }
+    function backup(sourceDb: DatabaseSync, path: string, options?: BackupOptions): Promise<number>;
+    namespace constants {
+      const SQLITE_CHANGESET_OMIT: number;
+      const SQLITE_CHANGESET_REPLACE: number;
+      const SQLITE_CHANGESET_ABORT: number;
+      const SQLITE_CHANGESET_DATA: number;
+      const SQLITE_CHANGESET_NOTFOUND: number;
+      const SQLITE_CHANGESET_CONFLICT: number;
+      const SQLITE_CHANGESET_CONSTRAINT: number;
+      const SQLITE_CHANGESET_FOREIGN_KEY: number;
+      const SQLITE_OK: number;
+      const SQLITE_DENY: number;
+      const SQLITE_IGNORE: number;
+      const SQLITE_COPY: number;
+      const SQLITE_CREATE_INDEX: number;
+      const SQLITE_CREATE_TABLE: number;
+      const SQLITE_CREATE_TEMP_INDEX: number;
+      const SQLITE_CREATE_TEMP_TABLE: number;
+      const SQLITE_CREATE_TEMP_TRIGGER: number;
+      const SQLITE_CREATE_TEMP_VIEW: number;
+      const SQLITE_CREATE_TRIGGER: number;
+      const SQLITE_CREATE_VIEW: number;
+      const SQLITE_DELETE: number;
+      const SQLITE_DROP_INDEX: number;
+      const SQLITE_DROP_TABLE: number;
+      const SQLITE_DROP_TEMP_INDEX: number;
+      const SQLITE_DROP_TEMP_TABLE: number;
+      const SQLITE_DROP_TEMP_TRIGGER: number;
+      const SQLITE_DROP_TEMP_VIEW: number;
+      const SQLITE_DROP_TRIGGER: number;
+      const SQLITE_DROP_VIEW: number;
+      const SQLITE_INSERT: number;
+      const SQLITE_PRAGMA: number;
+      const SQLITE_READ: number;
+      const SQLITE_SELECT: number;
+      const SQLITE_TRANSACTION: number;
+      const SQLITE_UPDATE: number;
+      const SQLITE_ATTACH: number;
+      const SQLITE_DETACH: number;
+      const SQLITE_ALTER_TABLE: number;
+      const SQLITE_REINDEX: number;
+      const SQLITE_ANALYZE: number;
+      const SQLITE_CREATE_VTABLE: number;
+      const SQLITE_DROP_VTABLE: number;
+      const SQLITE_FUNCTION: number;
+      const SQLITE_SAVEPOINT: number;
+      const SQLITE_RECURSIVE: number;
+    }
+  }
+  export = sqlite;
+}
+
 declare module 'path' { import m = require('node:path'); export = m; }
 declare module 'path/posix' { import m = require('node:path/posix'); export = m; }
 declare module 'path/win32' { import m = require('node:path/win32'); export = m; }

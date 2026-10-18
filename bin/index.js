@@ -11,10 +11,8 @@ import { platform } from 'node:os';
 import * as childProcess from 'node:child_process';
 import { transpileToNative } from './transpiler.js';
 import { VERSION } from './version.js';
-// Run a command and capture its output. Uses Node's spawnSync under Node and a
-// Go helper (os/exec) once transpiled — both synchronous, same result shape.
-// dist/go.mod + dist/tnvendor/x-text: golang.org/x/text's transform and unicode/norm
-// packages, copied from GOROOT/src/vendor (no network needed)
+// golang.org/x/text's transform and unicode/norm packages (String.normalize),
+// copied from GOROOT/src/vendor
 function vendorXText() {
     const goroot = runCommand('go', ['env', 'GOROOT']).stdout.trim();
     const source = path.join(goroot, 'src', 'vendor', 'golang.org', 'x', 'text');
@@ -28,8 +26,50 @@ function vendorXText() {
         }
     }
     fs.writeFileSync(path.join('dist', 'tnvendor', 'x-text', 'go.mod'), 'module golang.org/x/text\n\ngo 1.23\n');
-    fs.writeFileSync(path.join('dist', 'go.mod'), 'module tnapp\n\ngo 1.23\n\nrequire golang.org/x/text v0.0.0\n\nreplace golang.org/x/text => ./tnvendor/x-text\n');
+    return { path: 'golang.org/x/text', version: 'v0.0.0', dir: './tnvendor/x-text' };
 }
+// node:sqlite's driver and its dependencies, copied from the package's
+// govendor/ (listed in govendor/manifest.txt); the copy is skipped while
+// dist/tnvendor already holds the same version. Returns the modules and the
+// Go version their go.mod files declare.
+function vendorGoModules(vendorDir) {
+    const manifest = fs.readFileSync(path.join(vendorDir, 'manifest.txt'), 'utf-8');
+    let version = '';
+    let goVersion = '1.23';
+    const modules = [];
+    for (const line of manifest.split('\n')) {
+        const parts = line.trim().split(' ');
+        if (parts[0] === 'version')
+            version = parts[1];
+        if (parts[0] === 'go')
+            goVersion = parts[1];
+        if (parts[0] === 'module') {
+            modules.push({ path: parts[1], version: parts[2], dir: './tnvendor/' + parts[1] });
+        }
+    }
+    const stamp = path.join('dist', 'tnvendor', 'govendor.version');
+    const current = fs.existsSync(stamp) ? fs.readFileSync(stamp, 'utf-8') : '';
+    if (current !== version) {
+        for (const mod of modules) {
+            const target = path.join('dist', 'tnvendor', mod.path);
+            fs.rmSync(target, { recursive: true, force: true });
+            fs.cpSync(path.join(vendorDir, mod.path), target, { recursive: true });
+        }
+        fs.writeFileSync(stamp, version);
+    }
+    return { modules: modules, goVersion: goVersion };
+}
+function writeGoMod(modules, goVersion) {
+    let requires = '';
+    let replaces = '';
+    for (const mod of modules) {
+        requires += `\t${mod.path} ${mod.version}\n`;
+        replaces += `\t${mod.path} => ${mod.dir}\n`;
+    }
+    fs.writeFileSync(path.join('dist', 'go.mod'), `module tnapp\n\ngo ${goVersion}\n\nrequire (\n${requires})\n\nreplace (\n${replaces})\n`);
+}
+// Run a command and capture its output. Uses Node's spawnSync under Node and a
+// Go helper (os/exec) once transpiled — both synchronous, same result shape.
 export function runCommand(name, args) {
     const result = childProcess.spawnSync(name, args, { encoding: 'utf-8' });
     return { stdout: result.stdout, stderr: result.stderr, status: result.status };
@@ -128,16 +168,25 @@ export function run(opts) {
         fs.writeFileSync(`dist/${filename}`, content);
         goFiles.push(`dist/${filename}`);
     }
-    // golang.org/x/text (String.normalize) comes from the copy vendored in GOROOT
+    // Third-party Go modules the program imports (see vendorXText / vendorGoModules)
+    const generated = [transpileResult.main];
+    for (const content of transpileResult.files.values())
+        generated.push(content);
     const xTextImport = /^import (\w+ )?"golang\.org\/x\/text\//m;
-    let usesXText = xTextImport.test(transpileResult.main);
-    for (const content of transpileResult.files.values()) {
-        if (xTextImport.test(content))
-            usesXText = true;
+    const sqliteImport = /^import (\w+ )?"github\.com\/ncruces\/go-sqlite3"/m;
+    const modules = [];
+    let goVersion = '1.23';
+    if (generated.some((content) => xTextImport.test(content)))
+        modules.push(vendorXText());
+    if (generated.some((content) => sqliteImport.test(content))) {
+        const vendored = vendorGoModules(opts.vendorDir);
+        for (const mod of vendored.modules)
+            modules.push(mod);
+        goVersion = vendored.goVersion;
     }
-    if (usesXText)
-        vendorXText();
-    const buildResult = usesXText
+    if (modules.length > 0)
+        writeGoMod(modules, goVersion);
+    const buildResult = modules.length > 0
         ? runCommand('go', [
             'build',
             '-C',
