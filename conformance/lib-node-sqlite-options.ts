@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -133,7 +133,8 @@ disk.open();
 disk.exec('CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)');
 disk.prepare('INSERT INTO kv VALUES (?, ?)').run('greeting', 'hello');
 console.log(path.basename(disk.location() ?? ''));
-assert(disk.location() === file, 'location()');
+// The VFS canonicalizes the path (symlinks, Windows 8.3 short names like RUNNER~1)
+assert(realpathSync(disk.location() ?? '') === realpathSync(file), 'location()');
 disk.close();
 assert(existsSync(file), 'file written');
 
