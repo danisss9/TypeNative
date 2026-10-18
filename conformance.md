@@ -457,10 +457,13 @@ async function runs synchronously until its first `await`.
 | `node:dgram`                                |   ✅    | [dgram](#nodedgram)                                         |
 | `node:diagnostics_channel`                  |   ✅    | [diagnostics_channel](#nodediagnostics_channel)             |
 | `node:dns` / `node:dns/promises`            |   ✅    | [dns](#nodedns)                                             |
+| `node:domain`                               |   ❌    | [domain](#nodedomain)                                       |
 | `node:events` (+ `EventTarget`, `AbortController`) | ✅ | [events](#nodeevents)                                      |
 | `node:fs` / `node:fs/promises`              |   ✅    | [fs](#nodefs)                                               |
 | `node:http` / `node:https`                  |   ✅    | [http / https](#nodehttp--nodehttps)                        |
 | `node:http2`                                |   ✅    | [http2](#nodehttp2)                                         |
+| `node:inspector`                            |   ❌    | [inspector](#nodeinspector)                                 |
+| `node:module`                               |   ❌    | [module](#nodemodule)                                       |
 | `node:net`                                  |   ✅    | [net](#nodenet)                                             |
 | `node:os`                                   |   ✅    | [os](#nodeos)                                               |
 | `node:path` / `path/posix` / `path/win32`   |   ✅    | [path](#nodepath)                                           |
@@ -469,16 +472,24 @@ async function runs synchronously until its first `await`.
 | `node:punycode`                             |   ✅    | [punycode](#nodepunycode)                                   |
 | `node:querystring`                          |   ✅    | [querystring](#nodequerystring)                             |
 | `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
+| `node:repl`                                 |   ❌    | [repl](#noderepl)                                           |
+| `node:sea`                                  |   ❌    | [sea](#nodesea)                                             |
+| `node:sqlite`                               |   ❌    | [sqlite](#nodesqlite)                                       |
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
 | `node:stream/web` (+ globals `ReadableStream`, `WritableStream`, `TransformStream`, …) | ✅ | [stream/web](#nodestreamweb)                 |
 | `node:string_decoder`                       |   ✅    | [string_decoder](#nodestring_decoder)                       |
 | `node:sys`                                  |   ✅    | [constants / sys](#nodeconstants--nodesys)                  |
 | `node:test`                                 |   ✅    | [test](#nodetest)                                           |
+| `node:test/reporters`                       |   ❌    | [test/reporters](#nodetestreporters)                        |
 | `node:timers` / `node:timers/promises`      |   ✅    | [timers](#nodetimers)                                       |
 | `node:tls`                                  |   ✅    | [tls](#nodetls)                                             |
+| `node:trace_events`                         |   ❌    | [trace_events](#nodetrace_events)                           |
 | `node:tty`                                  |   ✅    | [tty](#nodetty)                                             |
 | `node:url` (+ globals `URL`, `URLSearchParams`) | ✅  | [url](#nodeurl)                                             |
 | `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
+| `node:v8`                                   |   ❌    | [v8](#nodev8)                                               |
+| `node:vm`                                   |   ❌    | [vm](#nodevm)                                               |
+| `node:wasi`                                 |   ❌    | [wasi](#nodewasi)                                           |
 | `node:worker_threads` (+ globals `MessageChannel`, `MessagePort`, `BroadcastChannel`) | ✅ | [worker_threads](#nodeworker_threads) |
 | `node:zlib`                                 |   ✅    | [zlib](#nodezlib)                                           |
 | Global `fetch` (+ `Headers`, `Request`, `Response`, `FormData`) | ✅ | [fetch](#fetch)                                |
@@ -819,14 +830,71 @@ async function runs synchronously until its first `await`.
 | `MessageChannel` / `MessagePort` (`postMessage`, `on('message')`, `onmessage`, `start`, `close`, `ref` / `unref`), `receiveMessageOnPort`, `BroadcastChannel`, `get/setEnvironmentData` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Channels and broadcast channels work within one process (ports can't be transferred to workers)     |
 | Workers for another file / `eval: true`, transferring ports, `SharedArrayBuffer` / `Atomics`, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | One binary holds one program; memory is not shared between processes                                  |
 
-#### Not supported yet
+#### `node:inspector`
 
-| Module                                                                               | Status | Probe | Notes                                                                                      |
-| ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
-| `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
-| `node:test/reporters`                                                                |   ❌    | —     | Reporters consume `run()`'s event stream, and `run()` runs test files as separate processes; one binary holds one program (see [test](#nodetest)) |
-| `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
-| `node:domain`                                                                        |   ❌    | —     | Deprecated upstream                                                                        |
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| Debugger / profiler sessions (`Session`, `open`, `url`) | ❌ | — | Speaks the inspector protocol of a JavaScript engine; a native binary has none |
+
+#### `node:repl`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `start` / `REPLServer` | ❌ | — | Evaluates JavaScript at runtime; needs a JavaScript engine |
+
+#### `node:vm`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `Script` / `runInContext` / `createContext` / `compileFunction` & co. | ❌ | — | Compiles and runs JavaScript code at runtime; needs a JavaScript engine |
+
+#### `node:v8`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| Heap statistics / snapshots, `serialize` / `deserialize`, flags | ❌ | — | V8 internals; there is no V8 in a native binary |
+
+#### `node:wasi`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `WASI` | ❌ | — | Runs WebAssembly modules; the generated program has no Wasm runtime |
+
+#### `node:sea`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `isSea` / `getAsset` / `getRawAsset` | ❌ | — | Single-executable-application assets; TypeNative already produces a native binary |
+
+#### `node:trace_events`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `createTracing` / `getEnabledCategories` | ❌ | — | V8 / Node trace categories; no native equivalent |
+
+#### `node:module`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `createRequire` / `register` / `builtinModules` / `findPackageJSON` & co. | ❌ | — | Loader hooks for a JavaScript runtime; imports are resolved at compile time |
+
+#### `node:test/reporters`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `tap` / `spec` / `dot` / `junit` / `lcov` | ❌ | — | Reporters consume `run()`'s event stream, and `run()` runs test files as separate processes; one binary holds one program (see [test](#nodetest)) |
+
+#### `node:sqlite`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `DatabaseSync` / `StatementSync` / `backup` / `constants` | ❌ | — | Needs a SQLite engine, which Go's standard library lacks; planned on a vendored pure-Go driver (ncruces/go-sqlite3, no cgo) |
+
+#### `node:domain`
+
+| API | Status | Probe | Notes |
+| --- | :----: | ----- | ----- |
+| `create` / `Domain` | ❌ | — | Deprecated upstream |
 
 ### Go bridges (`go:*`)
 
