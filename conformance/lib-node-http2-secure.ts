@@ -27,7 +27,8 @@ server.on('stream', (stream, headers) => {
   stream.respond({ ':status': 200 });
   stream.end(`secure ${headers[':path']} ${headers[':scheme']}`);
 });
-server.listen(0, '127.0.0.1', () => {
+// All interfaces: `localhost` may resolve to ::1 only (as on CI runners)
+server.listen(0, () => {
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
   // An untrusted certificate fails the session; its stream is canceled...
