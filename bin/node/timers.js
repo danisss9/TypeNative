@@ -18,8 +18,21 @@ var tnPerfMu sync.Mutex
 // Set by PerformanceObserver: new entries reach the observers
 var tnPerfHook func(e *TnPerformanceEntry)
 
+// Go's monotonic clock on Windows advances only at the timer interrupt, so
+// back-to-back readings repeat; each reading is kept later than the last
+// (by 1ns) so marks taken in a row stay in call order, as with Node's clock
+var tnPerfLast float64
+var tnPerfClockMu sync.Mutex
+
 func TnPerfNow() float64 {
-	return float64(time.Since(tnPerfStart).Nanoseconds()) / 1e6
+	now := float64(time.Since(tnPerfStart).Nanoseconds()) / 1e6
+	tnPerfClockMu.Lock()
+	defer tnPerfClockMu.Unlock()
+	if now <= tnPerfLast {
+		now = tnPerfLast + 1e-6
+	}
+	tnPerfLast = now
+	return now
 }
 
 func TnPerfTimeOrigin() float64 {

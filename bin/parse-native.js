@@ -13,6 +13,16 @@ export function parseAstJsonNative(code, tsx) {
     }
     return JSON.parse(result.stdout);
 }
+// Type-checks the program rooted at fileName with typescript-go
+// (tsparser --check); typesDir holds the bundled declarations
+export function typeCheckNative(fileName, typesDir) {
+    const exe = findTsparser();
+    const result = childProcess.spawnSync(exe, ['--check', fileName, typesDir], { encoding: 'utf-8' });
+    if (result.status !== 0) {
+        throw new Error('tsparser --check failed: ' + result.stderr);
+    }
+    return JSON.parse(result.stdout);
+}
 // Locates the tsparser binary: TYPENATIVE_TSPARSER env var, next to this
 // executable, or in a sibling tsparser/ directory (dev checkout layout).
 function findTsparser() {

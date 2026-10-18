@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Errors now point at your TypeScript. Programs are type-checked before they're transpiled, code
+TypeNative can't compile stops the build with its position, and Go build errors and panics
+report `.ts` lines. CI runs the suite on Linux, Windows and macOS.
+
+### Added
+
+- **Type-checking**: the CLI type-checks the entry file and its imports before transpiling,
+  using the nearest `tsconfig.json` (or `lib: []` plus the bundled `typenative` declarations),
+  and stops on errors (`main.ts:4:7: error TS2322: …`); `--no-typecheck` skips it. The
+  self-hosted compiler runs the same check on typescript-go (`tsparser --check`)
+- **Line directives**: generated Go carries `/*line file.ts:line:col*/` directives, so
+  `go build` errors and panic stack traces report TypeScript files and lines; runtime helpers
+  keep their own `dist/code.go` positions. Both parsers emit `line` / `column` on AST nodes
+- `TranspileResult.diagnostics`, and `fileName` / `goFile` / `goos` transpile options
+- `npm run bootstrap:check`: the self-hosted compiler must emit the same Go for `src/main.ts`
+  as the Node CLI; `conformance-parallel.mjs --native`
+- CI on Ubuntu, Windows and macOS, `check:go-types` in CI, and a self-hosted compiler job
+  (bootstrap fixpoint + the suite through it)
+
+### Changed
+
+- Unsupported syntax and unsupported `node:` modules are errors with a position
+  (`main.ts:2:1: error: Unsupported syntax: WithStatement`) instead of warnings followed by
+  broken Go; `;` and `debugger` statements compile to nothing
+- Code typed into `--script`'s prompt is saved as `dist/script.ts` (type-checked, and named in
+  errors)
+- Scaffolded `tsconfig.json` sets `skipLibCheck`
+- `node:sqlite` `function()` / `aggregate()` callbacks are typed `(...args: any[])`: arguments
+  convert to the types the callback declares
+- The release workflow builds `bin/` before testing and publishing
+
+### Fixed
+
+- Windows: `os.totalmem()` / `os.freemem()` / `os.uptime()` read the OS (they returned the
+  process's own memory, `0` and `0`); `performance.now()` keeps increasing between calls, so
+  marks taken in a row keep their order (Go's Windows clock repeats readings)
+
 ## [0.2.0] - 2026-10-18
 
 The Go standard-library bridge (`go:*` imports) goes from 73 to 154 probed packages, with 16

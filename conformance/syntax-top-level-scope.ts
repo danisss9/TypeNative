@@ -48,6 +48,7 @@ assert(known!.length === 3, 'non-null assertion failed');
 // Dictionary-style object literal (indexed with a variable key)
 const symbols = { plus: '+', minus: '-' };
 function symbolFor(op: string): string {
+  // @ts-ignore TS7053: the literal is indexed like a Record on purpose
   return symbols[op] ?? '?';
 }
 assert(symbolFor('plus') === '+' && symbolFor('times') === '?', 'dictionary literal failed');

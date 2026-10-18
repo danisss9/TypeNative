@@ -1,5 +1,5 @@
 import { parseArgs, getSystemErrorName, getSystemErrorMessage, getSystemErrorMap, MIMEType, parseEnv, aborted, debuglog } from 'node:util';
-import { writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync, rmSync, readFileSync } from 'node:fs';
 
 // parseArgs
 const options = {
@@ -30,9 +30,20 @@ for (const args of [['--nope'], ['--port'], ['--verbose=1'], ['x']]) {
 console.log(failures.join('\n'));
 assert(failures.length === 4 && failures[1].includes("Option '-p, --port <value>' argument missing"), 'parseArgs errors');
 
-// System errors
-console.log(getSystemErrorName(-2), getSystemErrorName(-13), getSystemErrorMessage(-2));
-assert(getSystemErrorName(-2) === 'ENOENT' && getSystemErrorMap().get(-13)![0] === 'EACCES', 'system error names');
+// System errors: a failed call's errno names its error on every platform
+let missingErrno = 0;
+try {
+  readFileSync('does-not-exist.txt');
+} catch (err) {
+  missingErrno = (err as NodeJS.ErrnoException).errno ?? 0;
+}
+assert(getSystemErrorName(missingErrno) === 'ENOENT', 'errno of a failed call');
+// The numbers are the OS's: Linux and macOS share these with Node (Windows
+// differs, see conformance.md#nodeutil)
+if (process.platform !== 'win32') {
+  console.log(getSystemErrorName(-2), getSystemErrorName(-13), getSystemErrorMessage(-2));
+  assert(getSystemErrorName(-2) === 'ENOENT' && getSystemErrorMap().get(-13)![0] === 'EACCES', 'system error names');
+}
 
 // MIMEType
 const mime = new MIMEType('Text/HTML; Charset="utf-8"; foo=bar');

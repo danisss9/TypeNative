@@ -29,9 +29,11 @@ jobs:
         with:
           go-version: '1.26'
       - run: npm ci
+      # Test what gets published: bin/ rebuilt from src/, not the committed copy
+      - run: npm run build
       - run: npm ci
         working-directory: conformance
-      - run: npm run conformance
+      - run: npm run conformance:parallel
 
   release:
     needs: test
@@ -77,6 +79,9 @@ jobs:
         run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version --allow-same-version
 
       - run: npm ci
+
+      # Publish bin/ built from this commit (prebuild also stamps the tag's version)
+      - run: npm run build
 
       # Authenticates via OIDC (id-token: write) — no NODE_AUTH_TOKEN needed.
       # Provenance is included automatically; the flag is kept for explicitness.

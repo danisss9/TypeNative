@@ -166,6 +166,9 @@ func tnSysctl(name string) string {
 }
 
 func TnOsTotalmem() float64 {
+	if total, _, ok := tnPlatformMemory(); ok {
+		return total
+	}
 	if n := tnMemInfo("MemTotal"); n >= 0 {
 		return n
 	}
@@ -183,6 +186,9 @@ func TnOsTotalmem() float64 {
 }
 
 func TnOsFreemem() float64 {
+	if _, free, ok := tnPlatformMemory(); ok {
+		return free
+	}
 	if n := tnMemInfo("MemAvailable"); n >= 0 {
 		return n
 	}
@@ -196,6 +202,9 @@ func TnOsFreemem() float64 {
 
 // Seconds since boot
 func TnOsUptime() float64 {
+	if n, ok := tnPlatformUptime(); ok {
+		return n
+	}
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
 		if f := strings.Fields(string(data)); len(f) > 0 {
 			n, _ := strconv.ParseFloat(f[0], 64)
@@ -577,9 +586,55 @@ func TnEventLoopUtilization(previous ...*TnLoopUtilization) *TnLoopUtilization {
 	return u
 }`;
 
+// Memory and uptime from the OS API where there's no /proc or sysctl
+// (Windows); the helper is picked per target OS (nodeSystemOS@os)
+const windowsSystemHelper = `// GlobalMemoryStatusEx's MEMORYSTATUSEX
+type tnMemoryStatusEx struct {
+	length               uint32
+	memoryLoad           uint32
+	totalPhys            uint64
+	availPhys            uint64
+	totalPageFile        uint64
+	availPageFile        uint64
+	totalVirtual         uint64
+	availVirtual         uint64
+	availExtendedVirtual uint64
+}
+
+var tnKernel32 = syscall.NewLazyDLL("kernel32.dll")
+var tnGlobalMemoryStatusEx = tnKernel32.NewProc("GlobalMemoryStatusEx")
+var tnGetTickCount64 = tnKernel32.NewProc("GetTickCount64")
+
+// Total and available physical memory in bytes
+func tnPlatformMemory() (float64, float64, bool) {
+	status := tnMemoryStatusEx{}
+	status.length = uint32(unsafe.Sizeof(status))
+	if ok, _, _ := tnGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&status))); ok == 0 {
+		return 0, 0, false
+	}
+	return float64(status.totalPhys), float64(status.availPhys), true
+}
+
+// Seconds since boot
+func tnPlatformUptime() (float64, bool) {
+	ms, _, _ := tnGetTickCount64.Call()
+	return float64(ms) / 1000, true
+}`;
+
+const otherSystemHelper = `// /proc or sysctl answer instead (TnOsTotalmem / TnOsFreemem / TnOsUptime)
+func tnPlatformMemory() (float64, float64, bool) {
+	return 0, 0, false
+}
+
+func tnPlatformUptime() (float64, bool) {
+	return 0, false
+}`;
+
 export function registerSystemExtra(r: NodeRegistry): void {
   defineHelper(r, 'nodeUncaught', [], ['nodeEvents', 'nodeProcess', 'eventLoop', 'promise'], uncaughtHelper);
-  defineHelper(r, 'nodeSystem', ['math', 'os', 'os/exec', 'runtime', 'runtime/metrics', 'strconv', 'strings', 'time'], [], systemHelper);
+  defineHelper(r, 'nodeSystemOS@windows', ['syscall', 'unsafe'], [], windowsSystemHelper);
+  defineHelper(r, 'nodeSystemOS@other', [], [], otherSystemHelper);
+  defineHelper(r, 'nodeSystem', ['math', 'os', 'os/exec', 'runtime', 'runtime/metrics', 'strconv', 'strings', 'time'], ['nodeSystemOS@os'], systemHelper);
   defineHelper(r, 'nodePerfExtra', ['math', 'math/big', 'reflect', 'sort', 'time'], ['nodePerf', 'nodeSystem', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap'], perfExtraHelper);
 
   // process events handled by the loop

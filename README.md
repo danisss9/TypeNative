@@ -122,8 +122,11 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 | `--output <path>` | build          | Where to copy the compiled binary. If omitted with `--script`, the temp binary in `dist/` is executed and kept there.                                |
 | `--script`        | run            | Build to `dist/native(.exe)` and execute immediately with inherited stdio. Combine with `--source`, or omit `--source` to type code into the prompt. |
 | `--new`           | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`).                                              |
+| `--no-typecheck`  | build / script | Skip the type-check that runs before transpiling.                                                                                                    |
 
-Exit codes from `--script` are the exit code of your program. A non-zero `go build` prints `go build failed:` plus the compiler output and exits `1`.
+Exit codes from `--script` are the exit code of your program. Before anything is built, the entry file and its imports are type-checked with the nearest `tsconfig.json` (or TypeNative's defaults: `lib: []` plus the `typenative` declarations); type errors print as `main.ts:4:7: error TS2322: …` and exit `1`. TypeScript TypeNative can't compile yet is an error too (`main.ts:2:1: error: Unsupported syntax: WithStatement`), not a guess. A non-zero `go build` prints `go build failed:` plus the compiler output and exits `1`.
+
+Errors point at your TypeScript, not the generated Go: `dist/code.go` carries Go line directives, so `go build` errors and panic stack traces report `.ts` files and lines (`main.ts:12`).
 
 ## Writing TypeNative-compatible TypeScript
 
@@ -235,18 +238,19 @@ console.log(`count=${c.count} seen=${seen.get('a')}`);
 ## How it works
 
 ```text
-main.ts --(parse)--> normalized JSON AST --(transpileToNative)--> dist/code.go --(go build)--> dist/native(.exe) --run/copy--> your binary
+main.ts --(type-check)--(parse)--> normalized JSON AST --(transpileToNative)--> dist/code.go --(go build)--> dist/native(.exe) --run/copy--> your binary
 ```
 
-- **Parse:** Node CLI uses the `typescript` npm package (`src/parse-node.ts`); the self-hosted binary spawns the Go `tsparser` tool (`src/parse-native.ts`). Both emit the same `{ kind: "Xxx", ... }` JSON shape so one transpiler consumes either.
-- **Transpile:** `transpileToNative(code, { parse, readFile })` in `src/transpiler.ts` lowers the AST to Go, resolving relative and npm imports into additional Go files (`TranspileResult { main, files }`).
+- **Type-check:** Node CLI builds a program with the `typescript` package (`src/typecheck-node.ts`); the self-hosted binary runs `tsparser --check`, the same check on typescript-go (`tsparser/check.go`).
+- **Parse:** Node CLI uses the `typescript` npm package (`src/parse-node.ts`); the self-hosted binary spawns the Go `tsparser` tool (`src/parse-native.ts`). Both emit the same `{ kind: "Xxx", line, column, ... }` JSON shape so one transpiler consumes either.
+- **Transpile:** `transpileToNative(code, { parse, readFile })` in `src/transpiler.ts` lowers the AST to Go, resolving relative and npm imports into additional Go files (`TranspileResult { main, files, diagnostics }`). Generated statements carry `/*line file.ts:line:col*/` directives; `diagnostics` lists source the transpiler can't compile.
 - **Build:** `run()` in `src/index.ts` writes `dist/code.go` (+ one Go file per module), cleans stale `dist/*.go`, shells out to `go build -o dist/native(.exe)`, then either executes it (`--script`, stdio inherited) or copies it to `--output`. Third-party Go modules a program needs (`node:sqlite`'s driver, shipped in `govendor/`; `golang.org/x/text`, copied from GOROOT) are copied under `dist/tnvendor` and wired in with `replace` directives in `dist/go.mod`, so builds stay offline.
 
 ## Testing and conformance
 
-`npm test` is `npm run conformance`: every `conformance/*.ts` probe is transpiled, built with `go`, executed, and must exit `0`. Results print per category (`syntax` / `semantics` / `lib`) plus a total pass rate; any failure exits non-zero and lists the first diagnostic line (`*.go:line`, `panic:`, `Unsupported syntax`, `Error`).
+`npm test` is `npm run conformance`: every `conformance/*.ts` probe is type-checked, transpiled, built with `go`, executed, and must exit `0` (`npm run conformance:parallel` runs them concurrently). Results print per category (`syntax` / `semantics` / `lib`) plus a total pass rate; any failure exits non-zero and lists the first diagnostic line (`*.go:line`, `panic:`, `Unsupported syntax`, `Error`).
 
-CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build`, and `npm run conformance` on Ubuntu with Node 24 and Go. Releases are cut from `TypeNative_*` tags via trusted publishing.
+CI (`.github/workflows/ci.yml`) runs `npm run build`, `npm run check:go-types` and the conformance suite on Ubuntu, Windows and macOS with Node 24 and Go 1.26, and a Linux job that builds the self-hosted compiler, checks the bootstrap fixpoint (`npm run bootstrap:check`) and runs the suite through it. Releases are cut from `TypeNative_*` tags via trusted publishing, from a fresh `npm run build`.
 
 When adding a feature: add a probe, link it from [conformance.md](conformance.md), and keep the ✅/❌ matrix honest — gaps are documented, not hidden.
 
@@ -260,7 +264,7 @@ npm run build:native   # builds native/tsparser + native/typenative side by side
 native/typenative --source app.ts --script
 ```
 
-`TYPENATIVE_TSPARSER` overrides parser discovery if you move the binaries apart. Verify parity with `node scripts/conformance.mjs --native`.
+`TYPENATIVE_TSPARSER` overrides parser discovery if you move the binaries apart. Verify parity with `node scripts/conformance.mjs --native`, and that the binary reproduces its own Go with `npm run bootstrap:check`.
 
 ## License
 

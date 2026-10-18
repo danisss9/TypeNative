@@ -85,8 +85,18 @@ function isNode(v: any): boolean {
   return typeof v === 'object' && v !== null && typeof v.kind === 'number' && typeof v.pos === 'number';
 }
 
+// The file being converted, for node positions
+let currentSourceFile: ts.SourceFile;
+
 function convertNode(node: ts.Node): any {
   const obj: any = { kind: KIND_NAMES[node.kind] ?? String(node.kind) };
+  // 1-based line and column of the node's first token (columns count UTF-16
+  // units, as in the Go producer); the transpiler maps Go positions back to them
+  if (node.kind !== ts.SyntaxKind.SourceFile && node.pos >= 0) {
+    const start = currentSourceFile.getLineAndCharacterOfPosition(node.getStart(currentSourceFile));
+    obj.line = start.line + 1;
+    obj.column = start.character + 1;
+  }
   if (TEXT_KINDS.has(node.kind)) {
     obj.text = (node as any).text ?? (node as any).escapedText;
   }
@@ -116,5 +126,6 @@ export function parseAstJson(code: string, tsx: boolean): any {
   const sourceFile = tsx
     ? ts.createSourceFile('main.tsx', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TSX)
     : ts.createSourceFile('main.ts', code, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+  currentSourceFile = sourceFile;
   return convertNode(sourceFile);
 }

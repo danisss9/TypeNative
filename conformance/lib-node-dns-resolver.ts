@@ -1,5 +1,6 @@
 import dgram from 'node:dgram';
 import dns from 'node:dns';
+import os from 'node:os';
 import { Resolver as PromiseResolver } from 'node:dns/promises';
 
 // A tiny DNS server: A and TXT records for svc.example.test, NXDOMAIN otherwise
@@ -111,7 +112,9 @@ async function promises(port: number, silentPort: number) {
   cancelled.resolve4('svc.example.test', (err, _addresses) => {
     assert(err !== null && err.code === 'ECANCELLED', 'cancel() fails outstanding queries');
     dns.lookupService('127.0.0.1', 22, (err2, hostname, service) => {
-      assert(err2 === null && hostname === 'localhost' && service === 'ssh', 'lookupService');
+      // getnameinfo names 127.0.0.1 after the machine on Windows
+      const host = process.platform === 'win32' ? os.hostname().toLowerCase() : 'localhost';
+      assert(err2 === null && hostname.toLowerCase() === host && service === 'ssh', 'lookupService');
       server.close();
       silent.close();
     });

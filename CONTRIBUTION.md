@@ -44,7 +44,7 @@ Probe conventions:
 
 - Self-contained — no imports except the module under test, no external files.
 - Exercise the feature with `console.log` **and** verify with `assert(condition, 'message')`.
-- A passing probe transpiles, compiles with `go build`, runs, and exits `0`. Anything else is a failure.
+- A passing probe type-checks (against `conformance/tsconfig.json`), transpiles, compiles with `go build`, runs, and exits `0`. Anything else is a failure.
 
 ```ts
 // conformance/lib-map.ts
@@ -73,7 +73,8 @@ No signature → user code won't type-check → the feature doesn't exist.
 ### 3. Implement in `src/transpiler.ts`
 
 - Match on `node.kind === 'Xxx'` strings (never the `typescript` enum) so the same code consumes Node- and Go-produced ASTs.
-- Emit a warning, not a crash, for anything still unsupported: `console.warn('[TypeNative] Unsupported syntax: …')`.
+- Report anything still unsupported with `reportError(node, 'Unsupported …')`, not a crash or a guess: it becomes a `file.ts:line:col: error:` diagnostic and the CLI stops before `go build`.
+- New statement-like output goes through `withLineMarker(node, code)` (statement lists already do), so Go errors and stack traces point at the `.ts` line.
 - Keep the transpiler free of Node-only dependencies (see below).
 
 ### 4. Document in `conformance.md`
@@ -85,7 +86,7 @@ Add or flip the matrix row and link your probe. Keep ✅/❌ honest — known ga
 This is the one rule that breaks the build if ignored: **`src/index.ts`, `src/transpiler.ts`, `src/main.ts`, `src/prompt.ts`, and `src/parse-native.ts` must transpile with TypeNative itself.** That means:
 
 - ❌ No `inquirer`, no async Node-only APIs, no unmapped modules in those files.
-- ✅ Node-only code lives in `src/cli.ts` (prompts) and `src/parse-node.ts` (`typescript` package) and is injected at the boundary — e.g. `run({ ..., parse: parseAstJson })`.
+- ✅ Node-only code lives in `src/cli.ts` (prompts), `src/parse-node.ts` and `src/typecheck-node.ts` (`typescript` package) and is injected at the boundary — e.g. `run({ ..., parse: parseAstJson, typeCheck })`. The self-hosted binary injects `tsparser`-backed versions (`src/parse-native.ts`).
 - ✅ Prompts in transpilable code go through `src/prompt.ts` (`node:readline` → Go helper).
 
 If you need a new capability in transpilable code, add the mapping (transpiler + `types/` shim) first, then use it.
@@ -109,10 +110,11 @@ If you touched anything transpilable, also verify self-hosting:
 
 ```sh
 npm run build:native            # builds native/tsparser + native/typenative
-node scripts/conformance.mjs --native  # full suite through your new binary
+npm run bootstrap:check         # native/typenative must emit the same Go for src/main.ts
+node scripts/conformance-parallel.mjs --native  # full suite through your new binary
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm ci` → `npm run build` → `npm run conformance` on Ubuntu (Node 24 + Go). Match it locally before pushing.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm run build`, `npm run check:go-types` and `npm run conformance:parallel` on Ubuntu, Windows and macOS (Node 24 + Go 1.26), plus a Linux job that builds the native compiler, runs `npm run bootstrap:check` and the suite through it. Probes that depend on the OS should hold on all three (branch on `process.platform` where Node itself differs).
 
 ## Pull requests
 

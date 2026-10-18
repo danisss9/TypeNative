@@ -285,10 +285,16 @@ const SyntaxKind = {
 // Local replacement for nanoid's customAlphabet — must stay transpilable by
 // TypeNative itself (no dependencies), only using mapped String methods.
 const GO_SAFE_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+// Ids come from a Park–Miller generator reset for every transpilation, so the
+// same source always gives the same Go (reproducible builds; the self-hosted
+// compiler's output can be compared with the Node CLI's). The products stay
+// below 2^46, exact in a float64 in both runtimes.
+let goSafeIdSeed = 1;
 function goSafeId() {
     let id = '';
     for (let i = 0; i < 8; i++) {
-        id += GO_SAFE_ALPHABET.charAt(Math.floor(Math.random() * GO_SAFE_ALPHABET.length));
+        goSafeIdSeed = (goSafeIdSeed * 16807) % 2147483647;
+        id += GO_SAFE_ALPHABET.charAt(goSafeIdSeed % GO_SAFE_ALPHABET.length);
     }
     return id;
 }
@@ -398,6 +404,13 @@ const classStaticProps = new Set();
 let fileResolver = null;
 // Directory of the file currently being processed (null = main entry file)
 let currentFileDir = null;
+// Name of the file currently being parsed, as diagnostics and line directives show it
+let currentFileName = '';
+// Names of the parsed source files, indexed by the fileIndex stamped on each
+// SourceFile node (line markers and diagnostics refer to them)
+const sourceFileNames = [];
+// Errors found while transpiling (unsupported syntax, unresolved imports)
+const diagnostics = [];
 // Tracks already-included files by a stable key to prevent duplicates/cycles
 const includedLocalImports = new Set();
 // Collects Go source files generated from local TS imports (filename → content)
@@ -454,6 +467,8 @@ function parseSource(code) {
     lowerWeakCollections(sourceFile);
     lowerGlobalThis(sourceFile);
     linkParents(sourceFile, undefined);
+    sourceFile.fileIndex = sourceFileNames.length;
+    sourceFileNames.push(currentFileName);
     for (const stmt of sourceFile.statements ?? []) {
         if (!stmt.name || !isIdentifier(stmt.name))
             continue;
@@ -471,6 +486,115 @@ function parseSource(code) {
             declaredTypeAliases.set(stmt.name.text, stmt.type);
     }
     return sourceFile;
+}
+// Index (into sourceFileNames) of the file a node was parsed from, or -1
+function sourceFileIndexOf(node) {
+    let current = node;
+    while (current && current.kind !== 'SourceFile')
+        current = current.parent;
+    return current && typeof current.fileIndex === 'number' ? current.fileIndex : -1;
+}
+// Line markers: generated statements and declarations start with
+// /*tn@<file>:<line>:<column>*/, which applyLineDirectives turns into Go
+// /*line file.ts:line:column*/ directives once the code is complete, so Go
+// compile errors and stack traces point at the TypeScript source. The marker
+// carries no file name until then: names like strings.ts would otherwise look
+// like uses of a Go package to the import pruning.
+// A line holding only this sentinel becomes //line <go file>:<next line>,
+// which returns the following generated code (helpers) to its real Go position
+const LINE_RESET = '/*tn@' + 'reset*/';
+function lineMarker(node) {
+    if (!node?.line)
+        return '';
+    const fileIndex = sourceFileIndexOf(node);
+    if (fileIndex < 0)
+        return '';
+    return `/*tn@${fileIndex}:${node.line}:${node.column}*/`;
+}
+// Prefixes generated code with its node's line marker (after any leading
+// whitespace, so the position applies to the code's first token)
+function withLineMarker(node, code) {
+    if (!code.trim())
+        return code;
+    const marker = lineMarker(node);
+    if (!marker)
+        return code;
+    const indent = code.length - code.trimStart().length;
+    return code.slice(0, indent) + marker + code.slice(indent);
+}
+// Replaces line markers with Go line directives and resets with //line
+// directives back to the generated file (goFile, as Go should report it).
+// One statement often spans several Go lines (assert → if + panic): every
+// unmarked line after a marker repeats its directive, so those lines report
+// the statement's line instead of counting on from it.
+function applyLineDirectives(code, goFile) {
+    const lines = code.split('\n');
+    let pin = '';
+    // Inside a multi-line raw string or block comment, where nothing may be inserted
+    let state = '';
+    for (let index = 0; index < lines.length; index++) {
+        const text = lines[index];
+        if (text === LINE_RESET) {
+            lines[index] = `//line ${goFile}:${index + 2}`;
+            pin = '';
+            continue;
+        }
+        const startState = state;
+        if (text.includes('`') || text.includes('/*') || text.includes('*/'))
+            state = goLineEndState(text, state);
+        if (text.includes('/*tn@')) {
+            // (regex literals inline: a /g regex held in a variable compiles to a
+            // replace-first in the self-hosted compiler). Later lines repeat the
+            // line's last directive; text like "/*tn@" in a string matches nothing
+            lines[index] = text.replace(/\/\*tn@(\d+):(\d+):(\d+)\*\//g, (_match, file, line, column) => {
+                pin = `/*line ${sourceFileNames[Number(file)]}:${line}:${column}*/`;
+                return pin;
+            });
+        }
+        else if (pin && startState === '' && text.trim()) {
+            const indent = text.length - text.trimStart().length;
+            lines[index] = text.slice(0, indent) + pin + text.slice(indent);
+        }
+    }
+    return lines.join('\n');
+}
+// The multi-line context after a Go line that starts in state: '' (code),
+// '`' (inside a raw string) or '*' (inside a block comment)
+function goLineEndState(line, state) {
+    let rest = line;
+    if (state !== '') {
+        const close = state === '`' ? '`' : '*/';
+        const end = rest.indexOf(close);
+        if (end < 0)
+            return state;
+        rest = rest.slice(end + close.length);
+    }
+    // Go literals and comments that end on this line, matched leftmost-first
+    // like Go's scanner (a quote inside a raw string is not a string): what's
+    // left after them is an unclosed raw string or comment
+    rest = rest.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`|\/\*.*?\*\/|\/\/.*/g, ' ');
+    const rawString = rest.indexOf('`');
+    const comment = rest.indexOf('/*');
+    if (rawString < 0 && comment < 0)
+        return '';
+    if (comment < 0 || (rawString >= 0 && rawString < comment))
+        return '`';
+    return '*';
+}
+// Records a transpile error at the node (or its nearest positioned ancestor)
+function reportError(node, message) {
+    let positioned = node;
+    while (positioned && !positioned.line)
+        positioned = positioned.parent;
+    const fileIndex = sourceFileIndexOf(node);
+    const line = positioned ? positioned.line : 0;
+    const column = positioned ? positioned.column : 0;
+    diagnostics.push({
+        file: fileIndex >= 0 ? sourceFileNames[fileIndex] : currentFileName,
+        line: line,
+        column: column,
+        message: message
+    });
 }
 // `this: T` parameters only type `this`; they are not real parameters
 function stripThisParameters(node) {
@@ -834,12 +958,20 @@ const usedHelpers = new Set();
 // per-file import lists can exclude them (helpers are emitted once, in the
 // main file, which carries these imports instead).
 const helperProvidedPackages = new Set();
+// GOOS of the current transpilation (see platformHelper)
+let targetGoos = 'linux';
 // Whether the file being parsed is .tsx
 let currentFileIsTsx = false;
 export function transpileToNative(code, options) {
     fileResolver = options?.readFile ?? null;
     parseFunction = options?.parse ?? defaultParseFunction;
     currentFileIsTsx = !!options?.tsx;
+    currentFileName = options?.fileName ?? (currentFileIsTsx ? 'main.tsx' : 'main.ts');
+    const goFile = options?.goFile ?? 'code.go';
+    targetGoos = options?.goos ?? 'linux';
+    sourceFileNames.length = 0;
+    diagnostics.length = 0;
+    goSafeIdSeed = 1;
     consoleGroupsUsed = code.includes('console.group');
     declaredFunctions.clear();
     declaredInterfaces.clear();
@@ -890,7 +1022,7 @@ export function transpileToNative(code, options) {
     helperProvidedPackages.clear();
     mainPackageVariables.length = 0;
     const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
-    const transpiledCodeOutside = outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n');
+    const transpiledCodeOutside = outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n');
     // Keep the process alive until detached async work and timers settle
     const drains = [];
     // The event loop runs until no timers, async work or open handles remain
@@ -899,7 +1031,7 @@ export function transpileToNative(code, options) {
     // process.exitCode
     if (usedHelpers.has('nodeProcess'))
         drains.push('TnProcessExit()');
-    const drainCode = drains.length > 0 ? `\n\t${drains.join('\n\t')}` : '';
+    const drainCode = drains.length > 0 ? `\n${LINE_RESET}\n\t${drains.join('\n\t')}` : '';
     // Go bridge types are qualified by path internally (net/http.Cookie)
     const mainCode = localizeGoPaths(transpiledCode);
     const outsideCode = localizeGoPaths(transpiledCodeOutside);
@@ -929,14 +1061,19 @@ export function transpileToNative(code, options) {
 ${mainImports.sort().map((pkg) => importLine(pkg)).join('\n')}
 
 ${packageVariables.join('\n')}
-
+${LINE_RESET}
 func main() {
     ${body}${drainCode}
 }
 
 ${outsideCode.trim()}
+${LINE_RESET}
 ${helpersCode}`.trimEnd();
-    return { main, files: localImportFiles };
+    return {
+        main: applyLineDirectives(main, goFile),
+        files: localImportFiles,
+        diagnostics: diagnostics.slice()
+    };
 }
 export // Property map of an interface, including inherited properties (flattened —
  function collectInterfaceProperties(iface, into, seen = new Set()) {
@@ -975,7 +1112,7 @@ function visit(node, options = {}) {
     }
     if (isSourceFile(node)) {
         return (node.statements ?? [])
-            .map((n) => visit(n, { addFunctionOutside: true }))
+            .map((n) => withLineMarker(n, visit(n, { addFunctionOutside: true })))
             .filter((n) => !!n)
             .join(options.inline ? '' : '\n\t');
     }
@@ -2038,13 +2175,13 @@ function visit(node, options = {}) {
         const thenTerm = node.elseStatement ? '' : ';';
         const thenCode = withNarrowing(getNarrowedNames(node.expression, true), () => isBlock(node.thenStatement)
             ? visit(node.thenStatement, { inline: !!node.elseStatement })
-            : `{\n${visit(node.thenStatement)}\n}${thenTerm}`);
+            : `{\n${withLineMarker(node.thenStatement, visit(node.thenStatement))}\n}${thenTerm}`);
         const condition = `if ${toGoCondition(node.expression)} ${thenCode}`;
         if (node.elseStatement) {
             // else-if chains stay chained; other single statements get a block
             const elseCode = withNarrowing(getNarrowedNames(node.expression, false), () => isBlock(node.elseStatement) || isIfStatement(node.elseStatement)
                 ? visit(node.elseStatement)
-                : `{\n${visit(node.elseStatement)}\n};\n\t`);
+                : `{\n${withLineMarker(node.elseStatement, visit(node.elseStatement))}\n};\n\t`);
             return `${condition} else ${elseCode}`;
         }
         return condition;
@@ -2512,7 +2649,7 @@ function visit(node, options = {}) {
                     }
                     const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
                     const returnType = member.type ? ` ${getType(member.type)}` : '';
-                    copiedMethods.push(`func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n`);
+                    copiedMethods.push(`${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n`);
                 }
                 ancestorIndex--;
             }
@@ -2543,7 +2680,7 @@ function visit(node, options = {}) {
                     const genBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
                     asyncChannelVar = prevChannel;
                     asyncFunctionNode = prevFn;
-                    result += `func (self *${name}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
+                    result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
                 }
                 continue;
             }
@@ -2561,23 +2698,23 @@ function visit(node, options = {}) {
                 }
                 else if (isStatic) {
                     // Static methods become package-level functions named ClassName_methodName
-                    result += `func ${name}_${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
+                    result += `${lineMarker(member)}func ${name}_${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
                 }
                 else {
-                    result += `func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
+                    result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
                 }
             }
             else if (isGetAccessor(member)) {
                 // Getter: get prop() { ... } → func (self *T) Get_prop() RetType { ... }
                 const getterName = visit(member.name);
                 const returnType = member.type ? ` ${getType(member.type)}` : ' interface{}';
-                result += `func (self *${name}${typeParamNames}) Get_${getterName}()${returnType} ${visit(member.body)}\n\n`;
+                result += `${lineMarker(member)}func (self *${name}${typeParamNames}) Get_${getterName}()${returnType} ${visit(member.body)}\n\n`;
             }
             else if (isSetAccessor(member)) {
                 // Setter: set prop(val) { ... } → func (self *T) Set_prop(val ValType) { ... }
                 const setterName = visit(member.name);
                 const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-                result += `func (self *${name}${typeParamNames}) Set_${setterName}(${parameterInfo.signature}) ${visit(member.body, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
+                result += `${lineMarker(member)}func (self *${name}${typeParamNames}) Set_${setterName}(${parameterInfo.signature}) ${visit(member.body, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
             }
         }
         result += copiedMethods.join('\n');
@@ -2760,10 +2897,16 @@ function visit(node, options = {}) {
     else if (isExportDeclaration(node) || isExportAssignment(node)) {
         return '';
     }
+    else if (node.kind === 'EmptyStatement' || node.kind === 'DebuggerStatement') {
+        // `;` and `debugger` do nothing in a native binary
+        return '';
+    }
     const syntaxKind = node.kind;
     if (!['VariableStatement', 'EndOfFileToken'].includes(syntaxKind)) {
-        const snippet = String(node.text ?? node.kind).substring(0, 60).replace(/\n/g, ' ');
-        console.warn(`[TypeNative] Unsupported syntax: ${syntaxKind} — "${snippet}"`);
+        // The Go output would be incomplete: an error, not a guess (its children
+        // are not visited, which would only report follow-on errors)
+        reportError(node, `Unsupported syntax: ${syntaxKind}`);
+        return '';
     }
     for (const child of childNodes(node)) {
         code += visit(child);
@@ -3006,10 +3149,10 @@ function visitBlockStatements(statements) {
     for (let index = 0; index < statements.length; index++) {
         const statement = statements[index];
         if (isUsingDeclaration(statement)) {
-            parts.push(visitUsingDeclaration(statement, statements.slice(index + 1)));
+            parts.push(withLineMarker(statement, visitUsingDeclaration(statement, statements.slice(index + 1))));
             break;
         }
-        parts.push(visit(statement));
+        parts.push(withLineMarker(statement, visit(statement)));
         if (isIfStatement(statement) && !statement.elseStatement && alwaysExits(statement.thenStatement)) {
             for (const name of getNarrowedNames(statement.expression, false)) {
                 if (!narrowedVariables.has(name)) {
@@ -8057,11 +8200,13 @@ function normalizeCjsToEsm(code) {
     code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
     return code;
 }
-function includeLocalImport(code, dir, goFileName, tsx = false) {
+function includeLocalImport(code, dir, goFileName, tsx = false, fileName = '') {
     const prevDir = currentFileDir;
     const prevTsx = currentFileIsTsx;
+    const prevFileName = currentFileName;
     currentFileDir = dir;
     currentFileIsTsx = tsx;
+    currentFileName = fileName;
     // Normalize CommonJS modules to ES module syntax before parsing
     if (!code.includes('export ') && (code.includes('module.exports') || code.includes('exports.'))) {
         code = normalizeCjsToEsm(code);
@@ -8074,6 +8219,7 @@ function includeLocalImport(code, dir, goFileName, tsx = false) {
         }
         currentFileDir = prevDir;
         currentFileIsTsx = prevTsx;
+        currentFileName = prevFileName;
         return;
     }
     // Separate-file mode (local TS imports): transpile to its own Go file.
@@ -8088,19 +8234,23 @@ function includeLocalImport(code, dir, goFileName, tsx = false) {
     importedPackages.clear();
     helperProvidedPackages.clear();
     const sf = parseSource(code);
-    const inlineLines = [];
+    const isDeclarationLine = (line) => /^(var|const|type|func|import)\b/.test(line.trim());
+    const declarationLines = [];
+    const statementLines = [];
     const prevEmittingModuleFile = emittingModuleFile;
     emittingModuleFile = true;
     for (const stmt of sf.statements) {
         const result = visit(stmt, { addFunctionOutside: true });
-        if (result.trim())
-            inlineLines.push(localizeGoPaths(result));
+        if (!result.trim())
+            continue;
+        const line = withLineMarker(stmt, localizeGoPaths(result));
+        if (isDeclarationLine(result))
+            declarationLines.push(line);
+        else
+            statementLines.push(line);
     }
     emittingModuleFile = prevEmittingModuleFile;
-    const fileOutside = localizeGoPaths(outsideNodes.map((n) => visit(n, { isOutside: true })).join('\n'));
-    const isDeclarationLine = (line) => /^(var|const|type|func|import)\b/.test(line.trim());
-    const declarationLines = inlineLines.filter(isDeclarationLine);
-    const statementLines = inlineLines.filter((line) => !isDeclarationLine(line));
+    const fileOutside = localizeGoPaths(outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n'));
     const fileInline = [
         ...declarationLines,
         ...(statementLines.length > 0 ? [`func init() {\n\t${statementLines.join('\n\t')}\n}`] : [])
@@ -8128,7 +8278,7 @@ function includeLocalImport(code, dir, goFileName, tsx = false) {
         parts.push(fileInline.trim());
     if (fileOutside.trim())
         parts.push(fileOutside.trim());
-    localImportFiles.set(goFileName, parts.join('\n\n'));
+    localImportFiles.set(goFileName, applyLineDirectives(parts.join('\n\n'), goFileName));
     // Restore main-file state; helper-provided packages carry over so the main
     // file (which carries the helper sources) imports them.
     outsideNodes = savedOutsideNodes;
@@ -8141,6 +8291,7 @@ function includeLocalImport(code, dir, goFileName, tsx = false) {
     for (const p of helperProvidedPackages)
         importedPackages.add(p);
     currentFileDir = prevDir;
+    currentFileName = prevFileName;
 }
 // Go source without its string literals (for detecting real package use)
 function stripGoStrings(code) {
@@ -8263,6 +8414,16 @@ const helperRequires = {
     asyncWait: ['eventLoop'],
     eventLoop: []
 };
+// Helpers with OS-specific variants (Windows APIs that would not compile
+// elsewhere) are required as '<id>@os': the target OS's variant
+// ('<id>@windows') when there is one, else '<id>@other'
+function platformHelper(id) {
+    if (!id.endsWith('@os'))
+        return id;
+    const base = id.slice(0, id.length - 3);
+    const specific = `${base}@${targetGoos}`;
+    return goHelpers[specific] !== undefined || nodeRegistry.goHelpers[specific] !== undefined ? specific : `${base}@other`;
+}
 function useHelper(id) {
     if (usedHelpers.has(id))
         return;
@@ -8272,7 +8433,7 @@ function useHelper(id) {
         interfacePropertyTypes.set('TnMatch', new Map([['groups', '*TnMap[string, string]']]));
     }
     for (const dep of helperRequires[id] ?? nodeRegistry.helperRequires[id] ?? [])
-        useHelper(dep);
+        useHelper(platformHelper(dep));
     for (const pkg of helperPackages[id] ?? nodeRegistry.helperPackages[id] ?? []) {
         importedPackages.add(pkg);
         helperProvidedPackages.add(pkg);
@@ -11547,8 +11708,6 @@ function nodeModuleName(spec) {
         name = nodeRegistry.aliases[name];
     if (nodeRegistry.modules[name])
         return name;
-    if (prefixed)
-        console.warn(`[TypeNative] Unsupported Node.js module: ${spec}`);
     return '';
 }
 // Binds the import's local names to registry keys
@@ -12117,7 +12276,7 @@ function visitImportDeclaration(node) {
             if (resolved && !includedLocalImports.has(fileKey)) {
                 includedLocalImports.add(fileKey);
                 const goFileName = specifierToGoFileName(moduleSpec);
-                includeLocalImport(resolved.content, resolved.dir, goFileName, !!resolved.tsx);
+                includeLocalImport(resolved.content, resolved.dir, goFileName, !!resolved.tsx, resolved.path ?? moduleSpec);
             }
         }
         // Renamed bindings refer to the original declaration (one Go package)
@@ -12143,11 +12302,13 @@ function visitImportDeclaration(node) {
         setupNodeModuleImport(node, nodeModule);
         return '';
     }
-    if (moduleSpec.startsWith('node:'))
-        return '';
     // Type-only imports contribute nothing to runtime
     if (node.importClause?.isTypeOnly)
         return '';
+    if (moduleSpec.startsWith('node:')) {
+        reportError(node, `Unsupported Node.js module: ${moduleSpec} (see conformance.md#node-builtins-node)`);
+        return '';
+    }
     // Go standard library: `import { Println } from 'go:fmt'` → import "fmt"
     if (moduleSpec.startsWith('go:')) {
         const goPkg = moduleSpec.slice(3);
@@ -12172,7 +12333,7 @@ function visitImportDeclaration(node) {
         const resolved = fileResolver(moduleSpec, currentFileDir);
         if (resolved) {
             const goFileName = specifierToGoFileName(moduleSpec);
-            includeLocalImport(resolved.content, resolved.dir, goFileName);
+            includeLocalImport(resolved.content, resolved.dir, goFileName, !!resolved.tsx, resolved.path ?? moduleSpec);
         }
     }
     // Register default/namespace import name as a "stripped" namespace

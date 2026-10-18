@@ -6,6 +6,8 @@
 // the same transpiler code can consume ASTs from either source.
 //
 // Usage: tsparser < file.ts > ast.json
+//
+//	tsparser --check <file.ts> <types dir>   type-checks a program (see check.go)
 package main
 
 import (
@@ -25,7 +27,18 @@ import (
 // The parsed source, for template raw text
 var sourceText string
 
+// The parsed file, for node positions
+var parsedFile *ast.SourceFile
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--check" {
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: tsparser --check <file.ts> <types dir>")
+			os.Exit(2)
+		}
+		runCheck(os.Args[2], os.Args[3])
+		return
+	}
 	sourceBytes, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "read stdin:", err)
@@ -44,6 +57,7 @@ func main() {
 		string(sourceBytes),
 		scriptKind,
 	)
+	parsedFile = sourceFile
 	out := serializeNode(sourceFile.AsNode())
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -126,6 +140,7 @@ func serializeNode(n *ast.Node) any {
 	inProgress[n] = true
 	defer delete(inProgress, n)
 	obj := map[string]any{"kind": strings.TrimPrefix(n.Kind.String(), "Kind")}
+	setPosition(n, obj)
 	// SourceFile bookkeeping fields are not part of the language AST
 	if n.Kind == ast.KindSourceFile {
 		statements := []any{}
@@ -166,7 +181,9 @@ func serializeNode(n *ast.Node) any {
 	// BindingElement; the TypeScript API exposes them as OmittedExpression
 	if n.Kind == ast.KindBindingElement {
 		if be := n.AsBindingElement(); be != nil && be.Name() == nil && be.DotDotDotToken == nil {
-			return map[string]any{"kind": "OmittedExpression"}
+			hole := map[string]any{"kind": "OmittedExpression"}
+			setPosition(n, hole)
+			return hole
 		}
 	}
 
@@ -192,6 +209,18 @@ func serializeNode(n *ast.Node) any {
 		}
 	}
 	return obj
+}
+
+// setPosition records the 1-based line and column of the node's first token
+// (columns count UTF-16 units, as in the TypeScript API); the transpiler maps
+// Go positions back to them
+func setPosition(n *ast.Node, obj map[string]any) {
+	if n.Kind == ast.KindSourceFile || n.Pos() < 0 || parsedFile == nil {
+		return
+	}
+	line, character := scanner.GetECMALineAndUTF16CharacterOfPosition(parsedFile, scanner.GetTokenPosOfNode(n, parsedFile, false))
+	obj["line"] = line + 1
+	obj["column"] = int(character) + 1
 }
 
 // collectFields serializes a typed data struct's fields into obj, recursing

@@ -5,7 +5,39 @@ on:
   pull_request:
 
 jobs:
+  # Every probe through the Node CLI, on each OS a generated binary can target
   conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: tsparser/go.sum
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm ci
+        working-directory: conformance
+
+      - run: npm run check:go-types
+
+      - run: npm run conformance:parallel
+
+  # The self-hosted compiler: same probes, and it must reproduce its own Go
+  native:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +50,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          cache-dependency-path: tsparser/go.sum
 
       - run: npm ci
 
@@ -26,4 +59,8 @@ jobs:
       - run: npm ci
         working-directory: conformance
 
-      - run: npm run conformance
+      - run: npm run build:native
+
+      - run: npm run bootstrap:check
+
+      - run: node scripts/conformance-parallel.mjs --native

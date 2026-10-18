@@ -2463,11 +2463,14 @@ declare module 'node:sqlite' {
       useBigIntArguments?: boolean;
       varargs?: boolean;
     }
+    // Callbacks get each SQL argument converted to the type their parameter
+    // declares ((x: number) => …), so their arguments are typed `any` here
+    // rather than SQLOutputValue as in @types/node
     interface AggregateOptions<T extends SQLInputValue = SQLInputValue> extends FunctionOptions {
       start: T | (() => T);
-      step: (accumulator: T, ...args: SQLOutputValue[]) => T;
+      step: (accumulator: T, ...args: any[]) => T;
       result?: (accumulator: T) => SQLInputValue;
-      inverse?: (accumulator: T, ...args: SQLOutputValue[]) => T;
+      inverse?: (accumulator: T, ...args: any[]) => T;
     }
     interface PrepareOptions {
       readBigInts?: boolean;
@@ -2488,8 +2491,8 @@ declare module 'node:sqlite' {
       exec(sql: string): void;
       prepare(sql: string, options?: PrepareOptions): StatementSync;
       location(dbName?: string): string | null;
-      function(name: string, options: FunctionOptions, fn: (...args: SQLOutputValue[]) => SQLInputValue): void;
-      function(name: string, fn: (...args: SQLOutputValue[]) => SQLInputValue): void;
+      function(name: string, options: FunctionOptions, fn: (...args: any[]) => SQLInputValue): void;
+      function(name: string, fn: (...args: any[]) => SQLInputValue): void;
       aggregate(name: string, options: AggregateOptions): void;
       aggregate<T extends SQLInputValue>(name: string, options: AggregateOptions<T>): void;
       setAuthorizer(

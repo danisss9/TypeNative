@@ -5,6 +5,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as childProcess from 'node:child_process';
+import type { TypeCheckDiagnostic } from './index.js';
 
 export function parseAstJsonNative(code: string, tsx: boolean): any {
   const exe = findTsparser();
@@ -14,6 +15,17 @@ export function parseAstJsonNative(code: string, tsx: boolean): any {
     throw new Error('tsparser failed: ' + result.stderr);
   }
   return JSON.parse(result.stdout);
+}
+
+// Type-checks the program rooted at fileName with typescript-go
+// (tsparser --check); typesDir holds the bundled declarations
+export function typeCheckNative(fileName: string, typesDir: string): TypeCheckDiagnostic[] {
+  const exe = findTsparser();
+  const result = (childProcess as any).spawnSync(exe, ['--check', fileName, typesDir], { encoding: 'utf-8' });
+  if (result.status !== 0) {
+    throw new Error('tsparser --check failed: ' + result.stderr);
+  }
+  return JSON.parse(result.stdout) as TypeCheckDiagnostic[];
 }
 
 // Locates the tsparser binary: TYPENATIVE_TSPARSER env var, next to this

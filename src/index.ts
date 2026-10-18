@@ -13,6 +13,16 @@ import * as childProcess from 'node:child_process';
 import { transpileToNative, TranspileOptions } from './transpiler.js';
 import { VERSION } from './version.js';
 
+// A type error; file is absolute or relative to the working directory, line
+// and column are 1-based (0 for errors without a position)
+export interface TypeCheckDiagnostic {
+  file: string;
+  line: number;
+  column: number;
+  code: number;
+  message: string;
+}
+
 export interface RunOptions {
   source: string | null;
   output: string | null;
@@ -21,9 +31,31 @@ export interface RunOptions {
   // Parses TypeScript source into the normalized JSON AST
   // (src/parse-node.ts under Node, src/parse-native.ts self-hosted)
   parse: (code: string, tsx: boolean) => any;
+  // Type-checks the program rooted at a file (src/typecheck-node.ts under
+  // Node, `tsparser --check` self-hosted); null skips it (--no-typecheck)
+  typeCheck: ((fileName: string) => TypeCheckDiagnostic[]) | null;
   // The package's govendor/ directory: third-party Go modules generated
   // programs may import (node:sqlite's driver), see scripts/vendor-go.mjs
   vendorDir: string;
+}
+
+// A source path as diagnostics and Go line directives show it: relative to
+// the working directory when inside it, else absolute; forward slashes
+function displayPath(file: string): string {
+  const absolute = path.resolve(file);
+  const relative = path.relative(process.cwd(), absolute);
+  const inside = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+  return (inside ? relative : absolute).split('\\').join('/');
+}
+
+// file:line:column: <label>: message (the position Go's own errors use)
+function printDiagnostic(file: string, line: number, column: number, label: string, message: string): void {
+  const position = line > 0 ? `${displayPath(file)}:${line}:${column}` : displayPath(file);
+  console.error(`${file ? position + ': ' : ''}${label}: ${message.split('\n').join('\n    ')}`);
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
 export interface CommandResult {
@@ -152,10 +184,30 @@ export function run(opts: RunOptions): void {
   const sourcePath: string | null = opts.tsCode ? null : opts.source;
   const tsCode: string = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath!, 'utf-8');
 
+  fs.mkdirSync('dist', { recursive: true });
+  // Code typed into the prompt is saved as dist/script.ts, so it is
+  // type-checked and errors point at a real file
+  const entryPath = sourcePath ?? 'dist/script.ts';
+  if (!sourcePath) fs.writeFileSync(entryPath, tsCode);
+
+  if (opts.typeCheck) {
+    const typeErrors = opts.typeCheck(entryPath);
+    if (typeErrors.length > 0) {
+      for (const d of typeErrors) printDiagnostic(d.file, d.line, d.column, `error TS${d.code}`, d.message);
+      console.error(`\n${plural(typeErrors.length, 'type error')} (--no-typecheck skips the check)`);
+      process.exit(1);
+    }
+  }
+
   const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
+  // Node's platform names are GOOS names, except win32
+  const goos: string = platform() === 'win32' ? 'windows' : platform();
   const transpileOptions: TranspileOptions = {
     parse: opts.parse,
-    tsx: !!sourcePath && sourcePath.endsWith('.tsx')
+    tsx: !!sourcePath && sourcePath.endsWith('.tsx'),
+    fileName: displayPath(entryPath),
+    goFile: 'dist/code.go',
+    goos: goos
   };
   if (sourceDir) {
     transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
@@ -176,7 +228,8 @@ export function run(opts: RunOptions): void {
             return {
               content: fs.readFileSync(fullPath, 'utf-8'),
               dir: path.dirname(fullPath),
-              tsx: fullPath.endsWith('.tsx')
+              tsx: fullPath.endsWith('.tsx'),
+              path: displayPath(fullPath)
             };
           } catch {
             /* not found */
@@ -199,15 +252,19 @@ export function run(opts: RunOptions): void {
       // Inject types from a local ambient .d.ts if available
       const typed = tryInjectDtsTypes(content, specifier, sourceDir);
       if (typed) content = typed;
-      return { content, dir };
+      return { content, dir, path: displayPath(resolved.path) };
     };
   }
   const transpileResult = transpileToNative(tsCode, transpileOptions);
+  if (transpileResult.diagnostics.length > 0) {
+    for (const d of transpileResult.diagnostics) printDiagnostic(d.file, d.line, d.column, 'error', d.message);
+    console.error(`\n${plural(transpileResult.diagnostics.length, 'error')}: TypeNative can't compile this yet`);
+    process.exit(1);
+  }
 
   const exeName = platform() === 'win32' ? 'native.exe' : 'native';
   const exePath = `dist/${exeName}`;
 
-  fs.mkdirSync('dist', { recursive: true });
   // Clean up stale Go files from previous runs before writing new ones
   for (const existing of fs.readdirSync('dist')) {
     if (existing.endsWith('.go') || existing === 'go.mod' || existing === 'go.sum')
@@ -247,6 +304,7 @@ export function run(opts: RunOptions): void {
         ])
       : runCommand('go', ['build', '-o', exePath, ...goFiles]);
   if (buildResult.status !== 0) {
+    // Positions in .ts files come from line directives in the generated Go
     console.error('go build failed:');
     if (buildResult.stderr) console.error(buildResult.stderr.trim());
     process.exit(1);
@@ -314,7 +372,7 @@ function tryInjectDtsTypes(
 function resolveNpmPackage(
   fromDir: string,
   packageName: string
-): { content: string; dir: string } | null {
+): { content: string; dir: string; path: string } | null {
   // Walk up the directory tree looking for node_modules/<packageName>
   let searchDir = fromDir;
   while (true) {
@@ -342,7 +400,7 @@ function resolveNpmPackage(
       for (const candidate of candidates) {
         const fullPath = path.resolve(pkgDir, candidate);
         try {
-          return { content: fs.readFileSync(fullPath, 'utf-8'), dir: path.dirname(fullPath) };
+          return { content: fs.readFileSync(fullPath, 'utf-8'), dir: path.dirname(fullPath), path: fullPath };
         } catch {
           /* try next candidate */
         }
@@ -384,7 +442,8 @@ function getTsConfig(): string {
       rootDir: '.',
       strict: true,
       noImplicitAny: true,
-      allowSyntheticDefaultImports: true
+      allowSyntheticDefaultImports: true,
+      skipLibCheck: true
     }
   };
   return JSON.stringify(tsConfig, null, 2);

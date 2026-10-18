@@ -18,6 +18,7 @@
     "check:go-types": "tsc -p conformance/tsconfig.go-check.json",
     "conformance": "node scripts/conformance.mjs",
     "conformance:parallel": "node scripts/conformance-parallel.mjs",
+    "bootstrap:check": "node scripts/bootstrap-check.mjs",
     "test": "npm run conformance",
     "release": "npm publish"
   },

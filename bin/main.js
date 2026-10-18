@@ -4,10 +4,11 @@
 import path from 'node:path';
 import { run, createProject } from './index.js';
 import { ask, askMultiline, confirm } from './prompt.js';
-import { parseAstJsonNative } from './parse-native.js';
+import { parseAstJsonNative, typeCheckNative } from './parse-native.js';
 (function main() {
     const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
     const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
+    const noTypeCheck = process.argv.includes('--no-typecheck');
     const sourceIndex = process.argv.findIndex((a) => a === '--source');
     let source = sourceIndex > -1 ? process.argv[sourceIndex + 1] : null;
     const outputIndex = process.argv.findIndex((a) => a === '--output');
@@ -28,7 +29,10 @@ import { parseAstJsonNative } from './parse-native.js';
     if (!newCommand && scriptMode && !source) {
         tsCode = askMultiline('Write your typescript code here:');
     }
-    // The native compiler lives in native/, next to the package's govendor/
-    const vendorDir = path.join(path.dirname(path.resolve(process.argv[0])), '..', 'govendor');
-    run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative, vendorDir });
+    // The native compiler lives in native/, next to the package's govendor/ and types/
+    const packageDir = path.join(path.dirname(path.resolve(process.argv[0])), '..');
+    const vendorDir = path.join(packageDir, 'govendor');
+    const typesDir = path.join(packageDir, 'types');
+    const typeCheck = noTypeCheck ? null : (fileName) => typeCheckNative(fileName, typesDir);
+    run({ source, output, scriptMode, tsCode, parse: parseAstJsonNative, typeCheck, vendorDir });
 })();

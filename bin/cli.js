@@ -5,9 +5,11 @@ import inquirer from 'inquirer';
 import { fileURLToPath } from 'node:url';
 import { run, createProject } from './index.js';
 import { parseAstJson } from './parse-node.js';
+import { typeCheckNode } from './typecheck-node.js';
 (async function main() {
     const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
     const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
+    const noTypeCheck = process.argv.includes('--no-typecheck');
     const sourceIndex = process.argv.findIndex((a) => a === '--source');
     const source = sourceIndex > -1 ? process.argv[sourceIndex + 1] : null;
     const outputIndex = process.argv.findIndex((a) => a === '--output');
@@ -53,12 +55,14 @@ import { parseAstJson } from './parse-node.js';
         return;
     }
     const sourcePath = answers.tsCode ? null : (source ?? answers.path ?? null);
+    const typesDir = fileURLToPath(new URL('../types', import.meta.url));
     run({
         source: sourcePath,
         output: output ?? answers.output ?? null,
         scriptMode,
         tsCode: answers.tsCode ?? null,
         parse: parseAstJson,
+        typeCheck: noTypeCheck ? null : (fileName) => typeCheckNode(fileName, typesDir),
         vendorDir: fileURLToPath(new URL('../govendor', import.meta.url))
     });
 })();

@@ -537,7 +537,7 @@ async function runs synchronously until its first `await`.
 | -------------------------------------------------------------------------------------------- | :----: | -------------------------------------------- | ----------------------------------------------------------------------- |
 | `platform` / `arch` / `type` / `machine` / `EOL` / `devNull` / `endianness`                  |   ✅    | [lib-node-os.ts](conformance/lib-node-os.ts) | Node's names (`win32`, `x64`, `Windows_NT`, `x86_64`)                    |
 | `hostname` / `homedir` / `tmpdir` / `userInfo` / `cpus` / `availableParallelism` / `networkInterfaces` / `constants.signals` | ✅ | [lib-node-os.ts](conformance/lib-node-os.ts) | `cpus()` has one entry per logical CPU (model / speed / times are zero) |
-| `totalmem` / `freemem` / `uptime` / `loadavg` / `release` / `version` | ✅ | [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | `/proc` on Linux, `sysctl` on macOS / BSD; zeros where neither exists |
+| `totalmem` / `freemem` / `uptime` / `loadavg` / `release` / `version` | ✅ | [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | `/proc` on Linux, `sysctl` on macOS / BSD, `GlobalMemoryStatusEx` / `GetTickCount64` on Windows (`loadavg` is zeros there, as in Node) |
 
 #### `node:process`
 
@@ -569,6 +569,7 @@ async function runs synchronously until its first `await`.
 | `promisify` / `callbackify`                                                           |   ✅    | [lib-node-util-promisify.ts](conformance/lib-node-util-promisify.ts) | Node functions map to their promise versions at compile time (`fs.readFile`, `setTimeout`, `exec`); other functions are wrapped |
 | `parseArgs` (short / long / grouped flags, `multiple`, `default`, `strict`, `allowPositionals`, `allowNegative`, `tokens`, Node's errors), `getSystemErrorName` / `getSystemErrorMessage` / `getSystemErrorMap`, `MIMEType` / `MIMEParams`, `parseEnv` (+ `process.loadEnvFile`), `aborted`, `debuglog` (`NODE_DEBUG`), `toUSVString` | ✅ | [lib-node-util-parse-args.ts](conformance/lib-node-util-parse-args.ts) | |
 | `inherits` (legacy), `inspect.custom` (symbols), `getCallSites` (V8 stack frames) | ❌ | — | Legacy or engine-specific |
+| Node's errno numbers on Windows (libuv's: `ENOENT` is `-4058`) | ❌ | — | errno values are the OS's (Go's `syscall` numbers): the same as Node's on Linux and macOS, but `ENOENT` is `-2` on Windows. `getSystemErrorName(err.errno)` still names any error TypeNative raises |
 
 #### `node:assert`
 
