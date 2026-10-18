@@ -8529,7 +8529,7 @@ const helperPackages = {
     namedGroups: ['regexp'],
     moduleUrl: ['os'],
     asyncWait: [],
-    timerWait: ['sync', 'sync/atomic', 'time'],
+    timerWait: ['sort', 'sync', 'sync/atomic', 'time'],
     clock: ['time'],
     eventLoop: ['sync', 'sync/atomic', 'time'],
     uri: ['strings', 'fmt', 'net/url'],
@@ -10775,7 +10775,46 @@ type TnTimeout struct {
 	fn     func()
 	refd   bool
 	active bool
-	gen    int
+	due    time.Time
+	seq    int
+}
+
+// Armed timers, owned by the baton holder. An expired timer's goroutine only
+// wakes the loop, which then runs every due timer in deadline order: timer
+// goroutines that expire together (a starved loop, a coarse OS clock) may post
+// in any order, but Node fires timers in deadline order.
+var __tnPendingTimers = map[*TnTimeout]struct{}{}
+var __tnTimerSeq int
+
+func tnRunDueTimers() {
+	now := time.Now()
+	var due []*TnTimeout
+	for t := range __tnPendingTimers {
+		if !t.active {
+			delete(__tnPendingTimers, t)
+		} else if !t.due.After(now) {
+			due = append(due, t)
+		}
+	}
+	sort.Slice(due, func(i, j int) bool {
+		if !due[i].due.Equal(due[j].due) {
+			return due[i].due.Before(due[j].due)
+		}
+		return due[i].seq < due[j].seq
+	})
+	for _, t := range due {
+		// An earlier callback may have cleared or refreshed it
+		if !t.active || t.due.After(now) {
+			continue
+		}
+		delete(__tnPendingTimers, t)
+		t.active = false
+		if t.refd {
+			t.refd = false
+			__tnTimers.Done()
+		}
+		t.fn()
+	}
 }
 
 // node:test mock timers: when set (and the API is mocked) it takes over a timer;
@@ -10804,21 +10843,12 @@ func tnSetTimeout(kind string, ms float64, fn func()) *TnTimeout {
 }
 
 func (t *TnTimeout) arm() {
-	t.gen++
-	gen := t.gen
-	t.timer = time.AfterFunc(time.Duration(t.ms*float64(time.Millisecond)), func() {
-		TnLoopPost(func() {
-			if !t.active || gen != t.gen {
-				return
-			}
-			t.active = false
-			if t.refd {
-				t.refd = false
-				__tnTimers.Done()
-			}
-			t.fn()
-		})
-	})
+	__tnTimerSeq++
+	t.seq = __tnTimerSeq
+	d := time.Duration(t.ms * float64(time.Millisecond))
+	t.due = time.Now().Add(d)
+	__tnPendingTimers[t] = struct{}{}
+	t.timer = time.AfterFunc(d, func() { TnLoopPost(tnRunDueTimers) })
 }
 
 func (t *TnTimeout) ref() *TnTimeout {
@@ -10958,6 +10988,7 @@ func (t *TnInterval) close() *TnInterval {
 func TnClearTimeout(t *TnTimeout) {
 	if t != nil && t.active {
 		t.active = false
+		delete(__tnPendingTimers, t)
 		if t.timer != nil {
 			t.timer.Stop()
 		}
