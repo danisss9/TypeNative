@@ -8601,7 +8601,7 @@ function platformHelper(id: string): string {
   if (!id.endsWith('@os')) return id;
   const base = id.slice(0, id.length - 3);
   const specific = `${base}@${targetGoos}`;
-  return goHelpers[specific] !== undefined || nodeRegistry.goHelpers[specific] !== undefined ? specific : `${base}@other`;
+  return specific in goHelpers || specific in nodeRegistry.goHelpers ? specific : `${base}@other`;
 }
 
 function useHelper(id: string): void {

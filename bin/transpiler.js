@@ -8422,7 +8422,7 @@ function platformHelper(id) {
         return id;
     const base = id.slice(0, id.length - 3);
     const specific = `${base}@${targetGoos}`;
-    return goHelpers[specific] !== undefined || nodeRegistry.goHelpers[specific] !== undefined ? specific : `${base}@other`;
+    return specific in goHelpers || specific in nodeRegistry.goHelpers ? specific : `${base}@other`;
 }
 function useHelper(id) {
     if (usedHelpers.has(id))
