@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-18
+
 The Go standard-library bridge (`go:*` imports) goes from 73 to 154 probed packages, with 16
 left typed-only and 6 excluded. Most of the new coverage came with bridge fixes found by the
 probes: callbacks, generics, tuples, struct fields and constants now behave the way the
