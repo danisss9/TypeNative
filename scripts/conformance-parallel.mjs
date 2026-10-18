@@ -59,6 +59,16 @@ async function worker() {
   }
 }
 
+// Build one sqlite probe alone first: the vendored driver is ~5 MB of Go, and
+// with a cold cache every sqlite probe would compile it at once (timing out
+// on small runners); afterwards the rest reuse the cached build
+const warm = probes.find((f) => f.includes('sqlite'));
+if (warm) {
+  probes.splice(probes.indexOf(warm), 1);
+  probes.unshift(warm);
+  idx = 1;
+  await runOne(warm);
+}
 await Promise.all(Array.from({ length: N }, worker));
 console.log('');
 failures.sort((a, b) => (a.name < b.name ? -1 : 1));

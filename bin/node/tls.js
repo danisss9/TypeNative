@@ -167,7 +167,9 @@ func tnVerifyPeer(certs []*x509.Certificate, roots *x509.CertPool, host string) 
 				return TnNodeError("Error", "CERT_NOT_YET_VALID", "certificate is not yet valid")
 			}
 			return TnNodeError("Error", "CERT_HAS_EXPIRED", "certificate has expired")
-		case errors.As(err, &unknown):
+		// macOS's platform verifier (nil roots) reports an untrusted chain as a
+		// plain error, not UnknownAuthorityError
+		case errors.As(err, &unknown) || roots == nil:
 			if len(certs) == 1 && bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
 				return TnNodeError("Error", "DEPTH_ZERO_SELF_SIGNED_CERT", "self-signed certificate")
 			}

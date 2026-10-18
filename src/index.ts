@@ -298,6 +298,9 @@ export function run(opts: RunOptions): void {
           'build',
           '-C',
           'dist',
+          // Path-independent cache keys: the vendored packages (sqlite is ~5 MB
+          // of Go) compile once, not again for every project directory
+          '-trimpath',
           '-o',
           exeName,
           ...goFiles.map((f) => f.slice('dist/'.length))
