@@ -90,6 +90,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Optional catch binding (`catch {}`) |   ✅    | [syntax-try-catch-finally.ts](conformance/syntax-try-catch-finally.ts)                                         |                                                                            |
 | Custom error classes                |   ✅    | [syntax-custom-errors.ts](conformance/syntax-custom-errors.ts)                                                 | `extends Error` → embedded `TnError`; constructors take the message        |
 | `Error.message`                     |   ✅    | [syntax-error-message.ts](conformance/syntax-error-message.ts)                                                 | `throw new Error` panics with a `*TnError`; `.message` on caught values    |
+| `Error` `cause` (`new Error(message, { cause })`, `err.cause`) |   ✅    | [lib-node-fetch-bad-port.ts](conformance/lib-node-fetch-bad-port.ts) | Built-in error classes too |
 | Narrowing                           |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                                                               | `T \| undefined` narrowed after `if (x)`, `x !== undefined`, early returns |
 
 ## Functions
@@ -725,7 +726,8 @@ async function runs synchronously until its first `await`.
 | Node's errors (`connect ECONNREFUSED 127.0.0.1:80`, `EADDRINUSE`, `ECONNRESET`; `code` / `errno` / `syscall` / `address` / `port`) | ✅ | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                           |
 | `isIP` / `isIPv4` / `isIPv6`                                                                           |   ✅    | [lib-node-net.ts](conformance/lib-node-net.ts) |                                                                                         |
 | `BlockList` (`addAddress` / `addRange` / `addSubnet` / `check` / `rules` / `isBlockList`) / `SocketAddress` (`parse`, `toJSON`) | ✅ | [lib-node-net-blocklist.ts](conformance/lib-node-net-blocklist.ts) | `net/netip`; IPv4-mapped IPv6 addresses match IPv4 rules, as in Node |
-| `net.Stream` / `autoSelectFamily` / IPC handle passing                                                 |   ❌    | —                                            | Not implemented                                                                           |
+| `net.Stream`, `get/setDefaultAutoSelectFamily(AttemptTimeout)`                                          |   ✅    | [lib-node-net-blocklist.ts](conformance/lib-node-net-blocklist.ts) | Go's dialer always races IPv4 / IPv6, so the settings are reported but not used |
+| IPC handle passing (`send(msg, socket)`)                                                               |   ❌    | —                                            | Needs file-descriptor passing over the IPC channel                                        |
 
 #### `node:dns`
 
@@ -784,7 +786,7 @@ async function runs synchronously until its first `await`.
 | `Headers` (`get` / `set` / `append` / `has` / `delete` / `forEach` / `entries` / `getSetCookie`, `for...of`) / `Request` |   ✅    | [lib-node-fetch.ts](conformance/lib-node-fetch.ts) | Names are lower-cased and iterated in sorted order                                         |
 | Streaming bodies: `response.body` / `request.body` as `ReadableStream`s, `ReadableStream` request bodies (`duplex: 'half'`), `clone()` tees the body | ✅ | [lib-node-fetch-stream.ts](conformance/lib-node-fetch-stream.ts) | Network bodies are read a chunk per pull |
 | `Blob` / `FormData` bodies (multipart encoding), `blob()` / `formData()` (multipart and urlencoded) |   ✅    | [lib-node-blob.ts](conformance/lib-node-blob.ts), [lib-node-fetch-stream.ts](conformance/lib-node-fetch-stream.ts) | |
-| The fetch bad-port list                                                                               |   ❌    | —                                                | Not implemented                                                                            |
+| The Fetch standard's bad-port list (also on redirects)                                                |   ✅    | [lib-node-fetch-bad-port.ts](conformance/lib-node-fetch-bad-port.ts) | `TypeError: fetch failed` with cause `bad port`                                            |
 
 #### `node:async_hooks`
 
@@ -822,7 +824,7 @@ async function runs synchronously until its first `await`.
 | Module                                                                               | Status | Probe | Notes                                                                                      |
 | ------------------------------------------------------------------------------------ | :----: | ----- | ------------------------------------------------------------------------------------------ |
 | `node:inspector` / `node:repl` / `node:vm` / `node:v8` / `node:wasi` / `node:sea` / `node:trace_events` / `node:module` | ❌ | — | Need a JavaScript engine at runtime; no native equivalent                                  |
-| `node:test/reporters`                                                                |   ❌    | —     | Custom reporters are not implemented (see [test](#nodetest))                               |
+| `node:test/reporters`                                                                |   ❌    | —     | Reporters consume `run()`'s event stream, and `run()` runs test files as separate processes; one binary holds one program (see [test](#nodetest)) |
 | `node:sqlite`                                                                        |   ❌    | —     | Needs a non-standard-library SQLite driver                                                 |
 | `node:domain`                                                                        |   ❌    | —     | Deprecated upstream                                                                        |
 

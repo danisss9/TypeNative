@@ -610,11 +610,16 @@ interface Error {
   name: string;
   message: string;
   stack?: string;
+  cause?: unknown;
+}
+
+interface ErrorOptions {
+  cause?: unknown;
 }
 
 interface ErrorConstructor {
-  new (message?: string): Error;
-  (message?: string): Error;
+  new (message?: string, options?: ErrorOptions): Error;
+  (message?: string, options?: ErrorOptions): Error;
 }
 
 declare var Error: ErrorConstructor;

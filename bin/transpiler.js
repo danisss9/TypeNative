@@ -2624,13 +2624,13 @@ function visit(node, options = {}) {
         if (BUILTIN_ERROR_NAMES.has(className) && !classNames.has(className)) {
             useHelper('error');
             const msg = (node.arguments ?? [])[0] ? visit(node.arguments[0]) : '""';
-            return `TnNodeError(${toGoStringLiteral(className)}, "", ${msg})`;
+            return withErrorOptions(`TnNodeError(${toGoStringLiteral(className)}, "", ${msg})`, (node.arguments ?? [])[1]);
         }
         // new Error(message) → a TnError value with a .message
         if (className === 'Error') {
             useHelper('error');
             const msg = (node.arguments ?? [])[0] ? visit(node.arguments[0]) : '""';
-            return `TnNewError(${msg})`;
+            return withErrorOptions(`TnNewError(${msg})`, (node.arguments ?? [])[1]);
         }
         // new Date() / new Date(ms) → Go time
         if (className === 'Date') {
@@ -8376,6 +8376,27 @@ func TnGet(obj interface{}, key string) interface{} {
 	return nil
 }
 
+// new Error(message, { cause })
+func TnErrorWithOptions(e *TnError, options interface{}) *TnError {
+	if options == nil {
+		return e
+	}
+	if e.props == nil {
+		e.props = map[string]interface{}{}
+	}
+	if m, ok := options.(map[string]interface{}); ok {
+		if cause, present := m["cause"]; present {
+			e.props["cause"] = cause
+		}
+		return e
+	}
+	rv := reflect.ValueOf(options)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct && rv.Elem().FieldByName("cause").IsValid() {
+		e.props["cause"] = TnGet(options, "cause")
+	}
+	return e
+}
+
 func TnSet(obj interface{}, key string, value interface{}) {
 	if o, ok := obj.(map[string]interface{}); ok {
 		o[key] = value
@@ -10276,6 +10297,7 @@ func TnNewError(message string) *TnError {
 	return &TnError{message: message}
 }
 
+
 // x instanceof Error / TypeError / …
 func TnIsErrorOf(v interface{}, name string) bool {
 	if name == "Error" {
@@ -10321,6 +10343,8 @@ func (e *TnError) Get_errno() float64 {
 	n, _ := e.prop("errno").(float64)
 	return n
 }
+
+func (e *TnError) Get_cause() interface{} { return e.prop("cause") }
 
 func (e *TnError) Get_hostname() string {
 	s, _ := e.prop("hostname").(string)
@@ -11522,6 +11546,13 @@ function nodeClassKeyOfName(name) {
     const key = nodeLocalNames.has(name) ? (nodeLocalNames.get(name) ?? '') : nodeGlobalKey(name);
     return key && nodeRegistry.classes[key] ? key : '';
 }
+// new Error(message, { cause }): the options set error.cause
+function withErrorOptions(errorExpr, options) {
+    if (!options)
+        return errorExpr;
+    useHelper('dynamic');
+    return `TnErrorWithOptions(${errorExpr}, ${visit(options)})`;
+}
 // The Node class key of a (qualified) type reference: `Stats`, `fs.Stats`, `NodeJS.ErrnoException`
 function nodeClassKeyOfTypeName(typeName) {
     if (isIdentifier(typeName))
@@ -11933,11 +11964,12 @@ function seedNodeClassTables() {
         if (!cls.goType.startsWith('*'))
             continue;
         const goName = cls.goType.slice(1);
-        const methods = new Map();
+        // Classes sharing a Go type (ErrnoException / AssertionError on *TnError) merge their tables
+        const methods = classMethodReturnTypes.get(goName) ?? new Map();
         for (const name of Object.keys(cls.methods))
             methods.set(name, cls.methods[name]);
         classMethodReturnTypes.set(goName, methods);
-        const props = new Map();
+        const props = classPropertyTypes.get(goName) ?? new Map();
         for (const name of Object.keys(cls.props))
             props.set(name, cls.props[name]);
         for (const name of Object.keys(cls.getters)) {
