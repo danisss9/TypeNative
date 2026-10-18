@@ -165,6 +165,69 @@ func (rl *TnReadline) tnIterator() chan string {
 	}
 	return rl.lines
 }`;
+// readline.cursorTo / moveCursor / clearLine / clearScreenDown: ANSI writes
+const cursorHelper = `// node:readline cursor helpers
+func tnCursorWrite(stream interface{}, data string, cb interface{}) bool {
+	s, ok := stream.(tnStreamLike)
+	if !ok || TnIsNil(stream) || data == "" {
+		if cb != nil {
+			TnQueueMicrotask(func() { TnInvoke(cb, nil) })
+		}
+		return true
+	}
+	if cb != nil {
+		return s.tnStream().write(data, cb)
+	}
+	return s.tnStream().write(data)
+}
+
+func tnCursorCallback(args []interface{}) interface{} {
+	for _, a := range args {
+		if _, ok := a.(float64); !ok && a != nil {
+			return a
+		}
+	}
+	return nil
+}
+
+func TnCursorTo(stream interface{}, x float64, rest ...interface{}) bool {
+	data := "\\x1b[" + TnJSString(x+1) + "G"
+	if len(rest) > 0 {
+		if y, ok := rest[0].(float64); ok {
+			data = "\\x1b[" + TnJSString(y+1) + ";" + TnJSString(x+1) + "H"
+		}
+	}
+	return tnCursorWrite(stream, data, tnCursorCallback(rest))
+}
+
+func TnMoveCursor(stream interface{}, dx float64, dy float64, rest ...interface{}) bool {
+	data := ""
+	if dx < 0 {
+		data += "\\x1b[" + TnJSString(-dx) + "D"
+	} else if dx > 0 {
+		data += "\\x1b[" + TnJSString(dx) + "C"
+	}
+	if dy < 0 {
+		data += "\\x1b[" + TnJSString(-dy) + "A"
+	} else if dy > 0 {
+		data += "\\x1b[" + TnJSString(dy) + "B"
+	}
+	return tnCursorWrite(stream, data, tnCursorCallback(rest))
+}
+
+func TnClearLine(stream interface{}, dir float64, rest ...interface{}) bool {
+	data := "\\x1b[2K"
+	if dir < 0 {
+		data = "\\x1b[1K"
+	} else if dir > 0 {
+		data = "\\x1b[0K"
+	}
+	return tnCursorWrite(stream, data, tnCursorCallback(rest))
+}
+
+func TnClearScreenDown(stream interface{}, rest ...interface{}) bool {
+	return tnCursorWrite(stream, "\\x1b[0J", tnCursorCallback(rest))
+}`;
 export function registerReadline(r) {
     defineModule(r, 'readline');
     defineModule(r, 'readline/promises');
@@ -217,4 +280,20 @@ export function registerReadline(r) {
         return event && event.kind === 'StringLiteral' && event.text === 'line' ? ['string'] : [];
     };
     r.paramTypers['readline.Interface#once'] = r.paramTypers['readline.Interface#on'];
+    defineHelper(r, 'nodeReadlineCursor', [], ['nodeStream', 'nodeInvoke', 'eventLoop'], cursorHelper);
+    const cursorFns = {
+        cursorTo: 'TnCursorTo',
+        moveCursor: 'TnMoveCursor',
+        clearLine: 'TnClearLine',
+        clearScreenDown: 'TnClearScreenDown'
+    };
+    for (const name of Object.keys(cursorFns)) {
+        const goFn = cursorFns[name];
+        r.functions[`readline.${name}`] = (call) => {
+            r.helper('nodeReadlineCursor');
+            return `${goFn}(${call.args.join(', ')})`;
+        };
+        r.results[`readline.${name}`] = 'bool';
+        r.paramTypers[`readline.${name}`] = (_n) => ['*TnError'];
+    }
 }

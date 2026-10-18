@@ -71,6 +71,9 @@ func tnDecompress(format string, data []byte) []byte {
 	}
 	switch format {
 	case "gunzip":
+		if len(data) >= 2 && (data[0] != 0x1f || data[1] != 0x8b) {
+			panic(tnZlibError(gzip.ErrHeader))
+		}
 		var zr *gzip.Reader
 		zr, err = gzip.NewReader(bytes.NewReader(data))
 		if err == nil {
@@ -99,6 +102,75 @@ func TnZlibDecompress(format string, data interface{}, options ...interface{}) [
 	return tnDecompress(format, tnZlibInput(data))
 }
 
+// zlib.gzip(buf[, options], cb): the codec runs off the loop; cb(err, result) on it
+func TnZlibAsync(compress bool, format string, data interface{}, rest ...interface{}) {
+	cb := rest[len(rest)-1]
+	options := rest[:len(rest)-1]
+	input := tnZlibInput(data)
+	level := tnZlibLevel(options)
+	ctx := TnAsyncSnapshot()
+	TnLoopRef()
+	go func() {
+		var result []byte
+		var failure interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					failure = r
+				}
+			}()
+			if compress {
+				result = tnCompress(format, input, level)
+			} else {
+				result = tnDecompress(format, input)
+			}
+		}()
+		TnLoopPost(func() {
+			defer TnLoopUnref()
+			TnAsyncRun(ctx, func() {
+				if failure != nil {
+					TnInvoke(cb, failure)
+					return
+				}
+				TnInvoke(cb, nil, result)
+			})
+		})
+	}()
+}
+
+// util.promisify(zlib.gzip)(buf[, options])
+func TnZlibPromise(compress bool, format string, data interface{}, options ...interface{}) chan []byte {
+	ch := make(chan []byte, 1)
+	input := tnZlibInput(data)
+	level := tnZlibLevel(options)
+	TnLoopRef()
+	go func() {
+		var result []byte
+		var failure interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					failure = r
+				}
+			}()
+			if compress {
+				result = tnCompress(format, input, level)
+			} else {
+				result = tnDecompress(format, input)
+			}
+		}()
+		TnLoopPost(func() {
+			defer TnLoopUnref()
+			if failure != nil {
+				TnReject(ch, failure)
+				return
+			}
+			ch <- result
+		})
+	}()
+	return ch
+}
+
 func TnCrc32(data interface{}, value ...float64) float64 {
 	crc := uint32(0)
 	if len(value) > 0 {
@@ -122,7 +194,7 @@ const ZLIB_CONSTANTS = {
 };
 export function registerZlib(r) {
     defineModule(r, 'zlib');
-    defineHelper(r, 'nodeZlib', ['bytes', 'compress/flate', 'compress/gzip', 'compress/zlib', 'hash/crc32', 'io', 'strings'], ['error', 'buffer', 'dynamic'], zlibHelper);
+    defineHelper(r, 'nodeZlib', ['bytes', 'compress/flate', 'compress/gzip', 'compress/zlib', 'hash/crc32', 'io', 'strings'], ['error', 'buffer', 'dynamic', 'eventLoop', 'promise', 'nodeInvoke'], zlibHelper);
     const formats = {
         gzipSync: 'gzip',
         deflateSync: 'deflate',
@@ -149,6 +221,31 @@ export function registerZlib(r) {
             return `TnZlibDecompress(${JSON.stringify(format)}, ${call.args.join(', ')})`;
         };
         r.results[`zlib.${name}`] = '[]byte';
+    }
+    // Callback forms (zlib.gzip(buf[, options], cb)) and their promisified variants
+    const asyncForms = {
+        gzip: 'gzip',
+        deflate: 'deflate',
+        deflateRaw: 'deflateRaw',
+        gunzip: 'gunzip',
+        inflate: 'inflate',
+        inflateRaw: 'inflateRaw',
+        unzip: 'unzip'
+    };
+    for (const name of Object.keys(asyncForms)) {
+        const format = asyncForms[name];
+        const compress = name === 'gzip' || name === 'deflate' || name === 'deflateRaw' ? 'true' : 'false';
+        r.functions[`zlib.${name}`] = (call) => {
+            r.helper('nodeZlib');
+            return `TnZlibAsync(${compress}, ${JSON.stringify(format)}, ${call.args.join(', ')})`;
+        };
+        r.results[`zlib.${name}`] = '';
+        r.paramTypers[`zlib.${name}`] = (_n) => ['*TnError', '[]byte'];
+        r.functions[`zlib.${name}.__promisify__`] = (call) => {
+            r.helper('nodeZlib');
+            return `TnZlibPromise(${compress}, ${JSON.stringify(format)}, ${call.args.join(', ')})`;
+        };
+        r.results[`zlib.${name}.__promisify__`] = 'chan []byte';
     }
     r.functions['zlib.crc32'] = (call) => {
         r.helper('nodeZlib');

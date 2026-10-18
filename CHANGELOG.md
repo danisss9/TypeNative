@@ -80,6 +80,13 @@ generated types say they do.
   `hasRef` / `refresh` / `close`; `PerformanceObserver`, `performance.timerify` /
   `eventLoopUtilization`, `createHistogram`, `monitorEventLoopDelay`; `events.errorMonitor`,
   `captureRejections`, static `getMaxListeners` / `setMaxListeners`, `addAbortListener`
+- zlib callback forms (`gzip(buf, [options], cb)` & co.) and `util.promisify` of them;
+  `readline.cursorTo` / `moveCursor` / `clearLine` / `clearScreenDown`;
+  `diagnostics_channel.tracingChannel` (`traceSync` / `tracePromise` / `traceCallback`) and
+  `channel.bindStore` / `runStores`; `net.BlockList` / `SocketAddress`; `dns.Resolver` (own
+  servers, `timeout`, `cancel`), `setServers`, `lookupService`; `tls.checkServerIdentity` (and
+  the `connect` option); HTTP `'upgrade'` / `'connect'` on servers and clients; node:test
+  `t.assert` and `mock.timers`; `console.table`
 
 ### Fixed
 
@@ -108,6 +115,9 @@ generated types say they do.
   accessors); `x as File` asserts dynamic values to Node classes
 - `Response#clone()` of a network body no longer blocks the event loop (both copies stream it)
 - The self-hosted compiler no longer crashes on `const [a, b] = call()`
+- A detached top-level async call with arguments (`run(a, b);`) passes them (they were dropped)
+- A function that only returns `undefined` compiles (its result type was `nil`)
+- `gunzip` of data without a gzip header fails with `incorrect header check`, as in Node
 - Negative bigint literals and `-x` on bigints; hex / octal / binary bigint literals;
   `p.then(() => …)` on a `Promise<void>`; `JSON.stringify` of records keeps their keys (it
   printed the map's internals); `String(x)` / template literals use a Node class's `toString()`

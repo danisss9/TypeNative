@@ -572,6 +572,167 @@ func tnFormatArg(v interface{}) string {
 	return TnInspect(v)
 }
 
+// console.table(data, [properties]): a box-drawn table of an array / object / Map / Set;
+// anything else is logged as is
+func TnConsoleTableString(data interface{}, properties ...interface{}) string {
+	rv := reflect.ValueOf(data)
+	var filter []string
+	hasFilter := false
+	if len(properties) > 0 && properties[0] != nil {
+		hasFilter = true
+		switch p := properties[0].(type) {
+		case []string:
+			filter = p
+		case []interface{}:
+			for _, x := range p {
+				filter = append(filter, fmt.Sprint(x))
+			}
+		}
+	}
+	type row struct {
+		index string
+		value interface{}
+	}
+	rows := []row{}
+	indexHeader := "(index)"
+	var mapKeys []string
+	isMap, isSet := TnIsMapValue(data), TnIsSetValue(data)
+	if entries, ok := tnEntriesOf(rv); ok && (isMap || isSet) {
+		indexHeader = "(iteration index)"
+		for i, e := range entries {
+			value := e[1]
+			if isSet {
+				value = e[0]
+			}
+			rows = append(rows, row{index: strconv.Itoa(i), value: value})
+			if isMap {
+				mapKeys = append(mapKeys, TnInspect(e[0]))
+			}
+		}
+	} else if rv.Kind() == reflect.Slice && !tnIsBytes(rv) {
+		for i := 0; i < rv.Len(); i++ {
+			rows = append(rows, row{index: strconv.Itoa(i), value: rv.Index(i).Interface()})
+		}
+	} else if fields, _, ok := tnObjectFields(rv); ok && data != nil {
+		if rv.Kind() == reflect.Map {
+			sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+		}
+		for _, f := range fields {
+			rows = append(rows, row{index: f.name, value: f.value})
+		}
+	} else {
+		return TnUtilFormat(data)
+	}
+	columns := []string{}
+	cells := map[string]map[int]string{}
+	addColumn := func(name string) {
+		if _, ok := cells[name]; !ok {
+			cells[name] = map[int]string{}
+			columns = append(columns, name)
+		}
+	}
+	for _, name := range filter {
+		addColumn(name)
+	}
+	values := map[int]string{}
+	hasValues := false
+	for i, r := range rows {
+		if mapKeys != nil {
+			values[i] = TnInspect(r.value)
+			hasValues = true
+			continue
+		}
+		vv := reflect.ValueOf(r.value)
+		var fields []tnField
+		object := false
+		if vv.Kind() == reflect.Slice && !tnIsBytes(vv) {
+			object = true
+			for j := 0; j < vv.Len(); j++ {
+				fields = append(fields, tnField{name: strconv.Itoa(j), value: vv.Index(j).Interface()})
+			}
+		} else if fs, _, ok := tnObjectFields(vv); ok && r.value != nil && !isSet {
+			object = true
+			fields = fs
+			if vv.Kind() == reflect.Map {
+				sort.Slice(fields, func(a, b int) bool { return fields[a].name < fields[b].name })
+			}
+		}
+		if !object {
+			if !hasFilter {
+				values[i] = TnInspect(r.value)
+				hasValues = true
+			}
+			continue
+		}
+		for _, f := range fields {
+			if hasFilter {
+				if _, wanted := cells[f.name]; !wanted {
+					continue
+				}
+			} else {
+				addColumn(f.name)
+			}
+			cells[f.name][i] = TnInspect(f.value)
+		}
+	}
+	header := []string{indexHeader}
+	if mapKeys != nil {
+		header = append(header, "Key")
+	}
+	header = append(header, columns...)
+	if hasValues {
+		header = append(header, "Values")
+	}
+	table := [][]string{}
+	for i, r := range rows {
+		line := []string{r.index}
+		if mapKeys != nil {
+			line = append(line, mapKeys[i])
+		}
+		for _, c := range columns {
+			line = append(line, cells[c][i])
+		}
+		if hasValues {
+			line = append(line, values[i])
+		}
+		table = append(table, line)
+	}
+	width := func(s string) int { return utf8.RuneCountInString(TnStripVTControlCharacters(s)) }
+	widths := make([]int, len(header))
+	for i, h := range header {
+		widths[i] = width(h) + 2
+		for _, line := range table {
+			if w := width(line[i]) + 2; w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	divider := func(left, mid, right string) string {
+		parts := make([]string, len(widths))
+		for i, w := range widths {
+			parts[i] = strings.Repeat("─", w)
+		}
+		return left + strings.Join(parts, mid) + right
+	}
+	render := func(line []string) string {
+		out := "│"
+		for i, cell := range line {
+			out += " " + cell + strings.Repeat(" ", widths[i]-1-width(cell)) + "│"
+		}
+		return out
+	}
+	out := []string{divider("┌", "┬", "┐"), render(header), divider("├", "┼", "┤")}
+	for _, line := range table {
+		out = append(out, render(line))
+	}
+	out = append(out, divider("└", "┴", "┘"))
+	return strings.Join(out, "\\n")
+}
+
+func tnIsBytes(v reflect.Value) bool {
+	return v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8
+}
+
 // util.format(format, ...args) — also console.log's formatting
 func TnUtilFormat(args ...interface{}) string {
 	if len(args) == 0 {

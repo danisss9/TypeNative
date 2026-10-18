@@ -212,7 +212,7 @@ export function registerTimers(r: NodeRegistry): void {
   timer('clearTimeout', (c: NodeCall) => `TnClearTimeout(${c.args[0]})`, '');
   timer('setInterval', (c: NodeCall) => `TnSetInterval(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*TnInterval');
   timer('clearInterval', (c: NodeCall) => `TnClearInterval(${c.args[0]})`, '');
-  timer('setImmediate', (c: NodeCall) => `TnSetTimeout(0, ${callback(c, 1)})`, '*TnTimeout');
+  timer('setImmediate', (c: NodeCall) => `TnSetImmediate(${callback(c, 1)})`, '*TnTimeout');
   // Timeout / Immediate / interval handles
   defineClass(r, 'timers.Timeout', '*TnTimeout', 'class', 'ref=*TnTimeout; unref=*TnTimeout; hasRef=bool; refresh=*TnTimeout; close=*TnTimeout', '', '', '');
   r.classes['timers.Immediate'] = r.classes['timers.Timeout'];
