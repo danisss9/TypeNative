@@ -238,6 +238,36 @@ declare module 'node:fs' {
     function createReadStream(path: PathLike, options?: BufferEncoding | { encoding?: BufferEncoding; start?: number; end?: number; highWaterMark?: number }): ReadStream;
     function createWriteStream(path: PathLike, options?: BufferEncoding | { flags?: string; encoding?: BufferEncoding }): WriteStream;
 
+    // --- watching: fs.watch on the OS's notifications (fsnotify), watchFile polls stat() ---
+    type WatchEventType = 'rename' | 'change';
+    type WatchListener = (event: WatchEventType, filename: string) => void;
+    interface WatchOptions {
+      persistent?: boolean;
+      recursive?: boolean;
+      encoding?: BufferEncoding;
+      signal?: AbortSignal;
+    }
+    interface FSWatcher extends import('node:events').EventEmitter {
+      close(): void;
+      ref(): this;
+      unref(): this;
+      on(event: 'change', listener: WatchListener): this;
+      on(event: 'error', listener: (error: Error) => void): this;
+      on(event: 'close', listener: () => void): this;
+      once(event: 'change', listener: WatchListener): this;
+      once(event: 'error', listener: (error: Error) => void): this;
+      once(event: 'close', listener: () => void): this;
+    }
+    interface StatWatcher extends import('node:events').EventEmitter {
+      ref(): this;
+      unref(): this;
+    }
+    function watch(filename: PathLike, listener?: WatchListener): FSWatcher;
+    function watch(filename: PathLike, options: WatchOptions | BufferEncoding, listener?: WatchListener): FSWatcher;
+    function watchFile(filename: PathLike, listener: (curr: Stats, prev: Stats) => void): StatWatcher;
+    function watchFile(filename: PathLike, options: { persistent?: boolean; interval?: number }, listener: (curr: Stats, prev: Stats) => void): StatWatcher;
+    function unwatchFile(filename: PathLike, listener?: (curr: Stats, prev: Stats) => void): void;
+
     const promises: typeof import('node:fs/promises');
   }
   export = fs;
@@ -285,6 +315,11 @@ declare module 'node:fs/promises' {
     function readlink(path: fs.PathLike): Promise<string>;
     function link(existingPath: fs.PathLike, newPath: fs.PathLike): Promise<void>;
     function open(path: fs.PathLike, flags?: string, mode?: number | string): Promise<FileHandle>;
+    interface FileChangeInfo<T extends string> {
+      eventType: fs.WatchEventType;
+      filename: T;
+    }
+    function watch(filename: fs.PathLike, options?: { recursive?: boolean; signal?: AbortSignal; persistent?: boolean }): AsyncIterable<FileChangeInfo<string>>;
   }
   export = promises;
 }
@@ -965,6 +1000,20 @@ declare module 'node:zlib' {
     function createDeflateRaw(options?: ZlibOptions): import('node:stream').Transform;
     function createInflateRaw(options?: ZlibOptions): import('node:stream').Transform;
     function createUnzip(options?: ZlibOptions): import('node:stream').Transform;
+    // Brotli: params keyed by constants.BROTLI_PARAM_QUALITY / BROTLI_PARAM_LGWIN
+    interface BrotliOptions {
+      params?: { [key: number]: number };
+    }
+    function brotliCompressSync(buf: InputType, options?: BrotliOptions): Buffer;
+    function brotliDecompressSync(buf: InputType, options?: BrotliOptions): Buffer;
+    function brotliCompress(buf: InputType, callback: CompressCallback): void;
+    function brotliCompress(buf: InputType, options: BrotliOptions, callback: CompressCallback): void;
+    function brotliDecompress(buf: InputType, callback: CompressCallback): void;
+    function brotliDecompress(buf: InputType, options: BrotliOptions, callback: CompressCallback): void;
+    namespace brotliCompress { function __promisify__(buf: InputType, options?: BrotliOptions): Promise<Buffer>; }
+    namespace brotliDecompress { function __promisify__(buf: InputType, options?: BrotliOptions): Promise<Buffer>; }
+    function createBrotliCompress(options?: BrotliOptions): import('node:stream').Transform;
+    function createBrotliDecompress(options?: BrotliOptions): import('node:stream').Transform;
     const constants: {
       readonly Z_NO_FLUSH: number;
       readonly Z_SYNC_FLUSH: number;
@@ -978,6 +1027,29 @@ declare module 'node:zlib' {
       readonly Z_BEST_SPEED: number;
       readonly Z_BEST_COMPRESSION: number;
       readonly Z_DEFAULT_COMPRESSION: number;
+      readonly BROTLI_DECODE: number;
+      readonly BROTLI_ENCODE: number;
+      readonly BROTLI_OPERATION_PROCESS: number;
+      readonly BROTLI_OPERATION_FLUSH: number;
+      readonly BROTLI_OPERATION_FINISH: number;
+      readonly BROTLI_OPERATION_EMIT_METADATA: number;
+      readonly BROTLI_PARAM_MODE: number;
+      readonly BROTLI_MODE_GENERIC: number;
+      readonly BROTLI_MODE_TEXT: number;
+      readonly BROTLI_MODE_FONT: number;
+      readonly BROTLI_DEFAULT_MODE: number;
+      readonly BROTLI_PARAM_QUALITY: number;
+      readonly BROTLI_MIN_QUALITY: number;
+      readonly BROTLI_MAX_QUALITY: number;
+      readonly BROTLI_DEFAULT_QUALITY: number;
+      readonly BROTLI_PARAM_LGWIN: number;
+      readonly BROTLI_MIN_WINDOW_BITS: number;
+      readonly BROTLI_MAX_WINDOW_BITS: number;
+      readonly BROTLI_DEFAULT_WINDOW: number;
+      readonly BROTLI_PARAM_LGBLOCK: number;
+      readonly BROTLI_PARAM_SIZE_HINT: number;
+      readonly BROTLI_DECODER_RESULT_ERROR: number;
+      readonly BROTLI_DECODER_RESULT_SUCCESS: number;
     };
   }
   export = zlib;

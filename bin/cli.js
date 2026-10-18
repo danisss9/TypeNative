@@ -3,17 +3,28 @@
 // the actual compiler logic lives in the transpilable src/index.ts.
 import inquirer from 'inquirer';
 import { fileURLToPath } from 'node:url';
-import { run, createProject } from './index.js';
+import { run, createProject, parseCliArgs, usage } from './index.js';
 import { parseAstJson } from './parse-node.js';
 import { typeCheckNode } from './typecheck-node.js';
+import { VERSION } from './version.js';
 (async function main() {
-    const scriptMode = process.argv.findIndex((a) => a === '--script') > -1;
-    const newCommand = process.argv.findIndex((a) => a === '--new') > -1;
-    const noTypeCheck = process.argv.includes('--no-typecheck');
-    const sourceIndex = process.argv.findIndex((a) => a === '--source');
-    const source = sourceIndex > -1 ? process.argv[sourceIndex + 1] : null;
-    const outputIndex = process.argv.findIndex((a) => a === '--output');
-    const output = outputIndex > -1 ? process.argv[outputIndex + 1] : null;
+    const args = parseCliArgs(process.argv.slice(2));
+    if (args.error) {
+        console.error(`error: ${args.error}\nRun 'typenative --help' for the options.`);
+        process.exit(2);
+    }
+    if (args.help) {
+        console.log(usage());
+        return;
+    }
+    if (args.version) {
+        console.log(VERSION);
+        return;
+    }
+    const scriptMode = args.script;
+    const newCommand = args.newProject;
+    const source = args.source;
+    const output = args.output;
     const answers = await inquirer.prompt([
         {
             type: 'input',
@@ -39,7 +50,7 @@ import { typeCheckNode } from './typecheck-node.js';
             type: 'input',
             name: 'output',
             message: 'Enter Output Path:',
-            when: !newCommand && !scriptMode && !output,
+            when: !newCommand && !scriptMode && !output && !args.emitGo,
             validate: (input) => input.trim() !== ''
         },
         {
@@ -62,7 +73,10 @@ import { typeCheckNode } from './typecheck-node.js';
         scriptMode,
         tsCode: answers.tsCode ?? null,
         parse: parseAstJson,
-        typeCheck: noTypeCheck ? null : (fileName) => typeCheckNode(fileName, typesDir),
-        vendorDir: fileURLToPath(new URL('../govendor', import.meta.url))
+        typeCheck: args.noTypeCheck ? null : (fileName) => typeCheckNode(fileName, typesDir),
+        vendorDir: fileURLToPath(new URL('../govendor', import.meta.url)),
+        target: args.target,
+        release: args.release,
+        emitGo: args.emitGo
     });
 })();

@@ -12,7 +12,8 @@ let convertServices = {
     pkg: (_name) => { },
     helper: (_id) => { },
     typeOf: (_node) => '',
-    localType: (goType) => goType
+    localType: (goType) => goType,
+    adapt: (_expr, _fromType, _toType, _iface) => ''
 };
 let convertKnownPaths = {};
 export function initConvertPaths() {
@@ -91,6 +92,15 @@ export function toGo(expr, fromType, toType) {
         return expr;
     if (expr === 'nil')
         return expr;
+    // A TS class implementing a Go interface (heap.Interface, sort.Interface)
+    if (fromType.startsWith('*')) {
+        const iface = goTypeInfo(toType);
+        if (iface !== null && iface.kind === 'interface' && iface.ifaceMethods.length > 0) {
+            const adapted = convertServices.adapt(expr, fromType, toType, iface);
+            if (adapted !== '')
+                return adapted;
+        }
+    }
     // Array references read as the slice they point to.
     if (fromType.startsWith('*[]'))
         fromType = fromType.slice(1);

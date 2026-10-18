@@ -16,13 +16,18 @@ export interface ConvertServices {
   typeOf: (node: any) => string;
   // Qualified Go type → the spelling emitted in code (crypto/x509.KeyUsage → x509.KeyUsage).
   localType: (goType: string) => string;
+  // A user class value passed where a Go interface is expected: an adapter
+  // value with the interface's exact method signatures ('' when fromType is
+  // not a user class)
+  adapt: (expr: string, fromType: string, toType: string, iface: GoType) => string;
 }
 
 let convertServices: ConvertServices = {
   pkg: (_name: string) => {},
   helper: (_id: string) => {},
   typeOf: (_node: any) => '',
-  localType: (goType: string) => goType
+  localType: (goType: string) => goType,
+  adapt: (_expr: string, _fromType: string, _toType: string, _iface: GoType) => ''
 };
 
 let convertKnownPaths: Record<string, boolean> = {};
@@ -102,6 +107,14 @@ export function isGoNumericKind(goType: string): boolean {
 export function toGo(expr: string, fromType: string, toType: string): string {
   if (!toType || toType === 'interface{}' || toType === 'any' || fromType === toType) return expr;
   if (expr === 'nil') return expr;
+  // A TS class implementing a Go interface (heap.Interface, sort.Interface)
+  if (fromType.startsWith('*')) {
+    const iface = goTypeInfo(toType);
+    if (iface !== null && iface.kind === 'interface' && iface.ifaceMethods.length > 0) {
+      const adapted = convertServices.adapt(expr, fromType, toType, iface);
+      if (adapted !== '') return adapted;
+    }
+  }
   // Array references read as the slice they point to.
   if (fromType.startsWith('*[]')) fromType = fromType.slice(1);
   // Named numeric target: T(x).

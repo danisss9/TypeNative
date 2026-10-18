@@ -123,6 +123,18 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 | `--script`        | run            | Build to `dist/native(.exe)` and execute immediately with inherited stdio. Combine with `--source`, or omit `--source` to type code into the prompt. |
 | `--new`           | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`).                                              |
 | `--no-typecheck`  | build / script | Skip the type-check that runs before transpiling.                                                                                                    |
+| `--target <os/arch>` | build       | Cross-compile for another platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, … — `go tool dist list` shows every pair). `--script` only runs host builds. |
+| `--release`       | build / script | Smaller binary: strips symbols and file paths (`-trimpath -ldflags="-s -w"`).                                                                        |
+| `--emit-go <dir>` | build          | Write the generated Go (`code.go`, `go.mod`, vendored modules) to `<dir>` instead of building; `go build -C <dir>` builds it.                       |
+| `-h`, `--help`    |                | Print the options.                                                                                                                                   |
+| `-v`, `--version` |                | Print the TypeNative version.                                                                                                                        |
+
+The entry file can also be the last argument (`typenative main.ts --script`), and every option accepts `--flag=value`. Unknown options are an error (exit code `2`). Before building, the CLI checks that Go 1.26 or newer is on the `PATH`.
+
+```sh
+# A stripped Linux ARM64 binary, built on any OS
+npx typenative --source main.ts --output bin/app-linux-arm64 --target linux/arm64 --release
+```
 
 Exit codes from `--script` are the exit code of your program. Before anything is built, the entry file and its imports are type-checked with the nearest `tsconfig.json` (or TypeNative's defaults: `lib: []` plus the `typenative` declarations); type errors print as `main.ts:4:7: error TS2322: …` and exit `1`. TypeScript TypeNative can't compile yet is an error too (`main.ts:2:1: error: Unsupported syntax: WithStatement`), not a guess. A non-zero `go build` prints `go build failed:` plus the compiler output and exits `1`.
 
@@ -244,7 +256,7 @@ main.ts --(type-check)--(parse)--> normalized JSON AST --(transpileToNative)--> 
 - **Type-check:** Node CLI builds a program with the `typescript` package (`src/typecheck-node.ts`); the self-hosted binary runs `tsparser --check`, the same check on typescript-go (`tsparser/check.go`).
 - **Parse:** Node CLI uses the `typescript` npm package (`src/parse-node.ts`); the self-hosted binary spawns the Go `tsparser` tool (`src/parse-native.ts`). Both emit the same `{ kind: "Xxx", line, column, ... }` JSON shape so one transpiler consumes either.
 - **Transpile:** `transpileToNative(code, { parse, readFile })` in `src/transpiler.ts` lowers the AST to Go, resolving relative and npm imports into additional Go files (`TranspileResult { main, files, diagnostics }`). Generated statements carry `/*line file.ts:line:col*/` directives; `diagnostics` lists source the transpiler can't compile.
-- **Build:** `run()` in `src/index.ts` writes `dist/code.go` (+ one Go file per module), cleans stale `dist/*.go`, shells out to `go build -o dist/native(.exe)`, then either executes it (`--script`, stdio inherited) or copies it to `--output`. Third-party Go modules a program needs (`node:sqlite`'s driver, shipped in `govendor/`; `golang.org/x/text`, copied from GOROOT) are copied under `dist/tnvendor` and wired in with `replace` directives in `dist/go.mod`, so builds stay offline.
+- **Build:** `run()` in `src/index.ts` writes `dist/code.go` (+ one Go file per module) and `dist/go.mod`, cleans stale `dist/*.go`, shells out to `go build -C dist` (with `GOOS` / `GOARCH` for `--target`), then either executes it (`--script`, stdio inherited) or copies it to `--output`. Third-party Go modules a program needs (`node:sqlite`'s driver, zlib's Brotli codec and `fs.watch`'s fsnotify, shipped in `govendor/`; `golang.org/x/text`, copied from GOROOT) are copied under `dist/tnvendor` and wired in with `replace` directives in `dist/go.mod`, so builds stay offline.
 
 ## Testing and conformance
 

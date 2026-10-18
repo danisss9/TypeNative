@@ -857,6 +857,8 @@ type BufferEncoding =
 interface Uint8Array {
   readonly length: number;
   readonly byteLength: number;
+  readonly byteOffset: number;
+  readonly buffer: ArrayBuffer;
   [index: number]: number;
   subarray(start?: number, end?: number): Uint8Array;
   slice(start?: number, end?: number): Uint8Array;
@@ -868,15 +870,129 @@ interface Uint8Array {
 interface Uint8ArrayConstructor {
   new (length: number): Uint8Array;
   new (array: ArrayLike<number> | Uint8Array): Uint8Array;
+  // A view sharing the buffer's memory
+  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
   from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
 }
 
 declare var Uint8Array: Uint8ArrayConstructor;
 
-// hkdfSync returns key bytes (an ArrayBuffer in Node); wrap with Buffer.from
+// An ArrayBuffer is Go []byte too; .buffer of a view is its own bytes
+// (byteOffset 0), so new Float32Array(u8.buffer, u8.byteOffset, n) works
 interface ArrayBuffer {
   readonly byteLength: number;
+  slice(begin?: number, end?: number): ArrayBuffer;
 }
+
+interface ArrayBufferConstructor {
+  new (byteLength: number): ArrayBuffer;
+  isView(arg: any): boolean;
+}
+
+declare var ArrayBuffer: ArrayBufferConstructor;
+
+// Typed arrays other than Uint8Array: Go slices of the element type; views
+// made on an ArrayBuffer share its memory
+interface TypedArray<Self> {
+  readonly length: number;
+  readonly byteLength: number;
+  readonly byteOffset: number;
+  readonly BYTES_PER_ELEMENT: number;
+  readonly buffer: ArrayBuffer;
+  [index: number]: number;
+  fill(value: number, start?: number, end?: number): Self;
+  set(array: ArrayLike<number> | TypedArray<any>, offset?: number): void;
+  subarray(begin?: number, end?: number): Self;
+  slice(start?: number, end?: number): Self;
+  at(index: number): number | undefined;
+  indexOf(searchElement: number, fromIndex?: number): number;
+  lastIndexOf(searchElement: number, fromIndex?: number): number;
+  includes(searchElement: number, fromIndex?: number): boolean;
+  join(separator?: string): string;
+  reverse(): Self;
+  toReversed(): Self;
+  sort(compareFn?: (a: number, b: number) => number): Self;
+  toSorted(compareFn?: (a: number, b: number) => number): Self;
+  with(index: number, value: number): Self;
+  copyWithin(target: number, start: number, end?: number): Self;
+  map(callbackfn: (value: number, index: number, array: Self) => number): Self;
+  filter(predicate: (value: number, index: number, array: Self) => unknown): Self;
+  forEach(callbackfn: (value: number, index: number, array: Self) => void): void;
+  some(predicate: (value: number, index: number, array: Self) => unknown): boolean;
+  every(predicate: (value: number, index: number, array: Self) => unknown): boolean;
+  find(predicate: (value: number, index: number, array: Self) => unknown): number | undefined;
+  findIndex(predicate: (value: number, index: number, array: Self) => unknown): number;
+  findLast(predicate: (value: number, index: number, array: Self) => unknown): number | undefined;
+  findLastIndex(predicate: (value: number, index: number, array: Self) => unknown): number;
+  reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Self) => number): number;
+  reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Self) => U, initialValue: U): U;
+  reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Self) => number): number;
+  reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Self) => U, initialValue: U): U;
+  keys(): IterableIterator<number>;
+  values(): IterableIterator<number>;
+  entries(): IterableIterator<[number, number]>;
+  toString(): string;
+  toLocaleString(): string;
+  [Symbol.iterator](): IterableIterator<number>;
+}
+
+interface TypedArrayConstructor<T> {
+  new (length?: number): T;
+  new (array: ArrayLike<number> | Iterable<number> | TypedArray<any>): T;
+  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): T;
+  from(arrayLike: ArrayLike<number> | Iterable<number> | TypedArray<any>, mapfn?: (v: number, k: number) => number): T;
+  of(...items: number[]): T;
+  readonly BYTES_PER_ELEMENT: number;
+}
+
+interface Int8Array extends TypedArray<Int8Array> {}
+declare var Int8Array: TypedArrayConstructor<Int8Array>;
+interface Uint8ClampedArray extends TypedArray<Uint8ClampedArray> {}
+declare var Uint8ClampedArray: TypedArrayConstructor<Uint8ClampedArray>;
+interface Int16Array extends TypedArray<Int16Array> {}
+declare var Int16Array: TypedArrayConstructor<Int16Array>;
+interface Uint16Array extends TypedArray<Uint16Array> {}
+declare var Uint16Array: TypedArrayConstructor<Uint16Array>;
+interface Int32Array extends TypedArray<Int32Array> {}
+declare var Int32Array: TypedArrayConstructor<Int32Array>;
+interface Uint32Array extends TypedArray<Uint32Array> {}
+declare var Uint32Array: TypedArrayConstructor<Uint32Array>;
+interface Float32Array extends TypedArray<Float32Array> {}
+declare var Float32Array: TypedArrayConstructor<Float32Array>;
+interface Float64Array extends TypedArray<Float64Array> {}
+declare var Float64Array: TypedArrayConstructor<Float64Array>;
+
+// Typed reads and writes at byte offsets of an ArrayBuffer (big-endian
+// unless littleEndian is true)
+interface DataView {
+  readonly buffer: ArrayBuffer;
+  readonly byteOffset: number;
+  readonly byteLength: number;
+  getInt8(byteOffset: number): number;
+  getUint8(byteOffset: number): number;
+  getInt16(byteOffset: number, littleEndian?: boolean): number;
+  getUint16(byteOffset: number, littleEndian?: boolean): number;
+  getInt32(byteOffset: number, littleEndian?: boolean): number;
+  getUint32(byteOffset: number, littleEndian?: boolean): number;
+  getFloat32(byteOffset: number, littleEndian?: boolean): number;
+  getFloat64(byteOffset: number, littleEndian?: boolean): number;
+  getBigInt64(byteOffset: number, littleEndian?: boolean): bigint;
+  getBigUint64(byteOffset: number, littleEndian?: boolean): bigint;
+  setInt8(byteOffset: number, value: number): void;
+  setUint8(byteOffset: number, value: number): void;
+  setInt16(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setUint16(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setInt32(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setUint32(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setFloat32(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setFloat64(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setBigInt64(byteOffset: number, value: bigint, littleEndian?: boolean): void;
+  setBigUint64(byteOffset: number, value: bigint, littleEndian?: boolean): void;
+}
+
+declare var DataView: {
+  new (buffer: ArrayBuffer, byteOffset?: number, byteLength?: number): DataView;
+};
 
 interface Buffer extends Uint8Array {
   toString(encoding?: BufferEncoding, start?: number, end?: number): string;

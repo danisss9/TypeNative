@@ -39,7 +39,8 @@ export function createNodeRegistry() {
         temp: (prefix) => prefix,
         typeOf: (_node) => '',
         visit: (_node) => '',
-        categoryOf: (_node) => ''
+        categoryOf: (_node) => '',
+        isArrayBuffer: (_node) => false
     };
     return registry;
 }

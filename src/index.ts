@@ -10,7 +10,7 @@ import { platform } from 'node:os';
 // from Node's; under Node these functions are never called (the CLI wrapper does
 // not reach them), so they're accessed through `any` casts for type-checking.
 import * as childProcess from 'node:child_process';
-import { transpileToNative, TranspileOptions } from './transpiler.js';
+import { transpileToNative, TranspileOptions, GENERATED_HEADER } from './transpiler.js';
 import { VERSION } from './version.js';
 
 // A type error; file is absolute or relative to the working directory, line
@@ -37,6 +37,148 @@ export interface RunOptions {
   // The package's govendor/ directory: third-party Go modules generated
   // programs may import (node:sqlite's driver), see scripts/vendor-go.mjs
   vendorDir: string;
+  // --target os/arch: cross-compile (GOOS / GOARCH); null builds for this machine
+  target: string | null;
+  // --release: strip symbols and file paths (-trimpath -ldflags="-s -w")
+  release: boolean;
+  // --emit-go <dir>: write the Go sources and go.mod there instead of building
+  emitGo: string | null;
+}
+
+// The minimum Go toolchain generated code needs
+const MIN_GO_MAJOR = 1;
+const MIN_GO_MINOR = 26;
+
+// Parsed command line, shared by the Node CLI (src/cli.ts) and the
+// self-hosted one (src/main.ts)
+export interface CliArgs {
+  help: boolean;
+  version: boolean;
+  newProject: boolean;
+  script: boolean;
+  noTypeCheck: boolean;
+  release: boolean;
+  source: string | null;
+  output: string | null;
+  target: string | null;
+  emitGo: string | null;
+  // '' when the command line is valid
+  error: string;
+}
+
+export function usage(): string {
+  return `Usage: typenative [options] [file.ts]
+
+Compiles a TypeScript program to a native executable (through Go).
+
+Options:
+  --source <file>      The program's entry file (or pass it as the last argument)
+  --output <file>      Where to write the executable
+  --script             Build and run the program (prompts for code without --source)
+  --new                Create a new TypeNative project
+  --target <os/arch>   Cross-compile, e.g. linux/amd64, linux/arm64, darwin/arm64,
+                       windows/amd64 ('go tool dist list' shows every pair)
+  --release            Smaller binary: drop symbols and file paths
+  --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
+  --no-typecheck       Skip type-checking
+  -h, --help           Show this help
+  -v, --version        Show the TypeNative version
+
+Examples:
+  typenative --source main.ts --output bin/app
+  typenative main.ts --script
+  typenative --source main.ts --output app-linux --target linux/arm64 --release`;
+}
+
+// Parses argv (without the executable and script): --flag value and
+// --flag=value; one bare argument is the entry file
+export function parseCliArgs(argv: string[]): CliArgs {
+  const args: CliArgs = {
+    help: false,
+    version: false,
+    newProject: false,
+    script: false,
+    noTypeCheck: false,
+    release: false,
+    source: null,
+    output: null,
+    target: null,
+    emitGo: null,
+    error: ''
+  };
+  for (let i = 0; i < argv.length; i++) {
+    let arg = argv[i];
+    let value: string | null = null;
+    const eq = arg.indexOf('=');
+    if (arg.startsWith('--') && eq > 0) {
+      value = arg.substring(eq + 1);
+      arg = arg.substring(0, eq);
+    }
+    if (arg === '-h' || arg === '--help') args.help = true;
+    else if (arg === '-v' || arg === '--version') args.version = true;
+    else if (arg === '--new') args.newProject = true;
+    else if (arg === '--script') args.script = true;
+    else if (arg === '--no-typecheck') args.noTypeCheck = true;
+    else if (arg === '--release') args.release = true;
+    else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
+      if (value === null) {
+        if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
+          args.error = `${arg} needs a value`;
+          return args;
+        }
+        i++;
+        value = argv[i];
+      }
+      if (arg === '--source') args.source = value;
+      else if (arg === '--output') args.output = value;
+      else if (arg === '--target') args.target = value;
+      else args.emitGo = value;
+    } else if (arg.startsWith('-')) {
+      args.error = `Unknown option: ${arg}`;
+      return args;
+    } else if (args.source === null) {
+      // (a typed local: the self-hosted build boxes it into the string | null field)
+      const entry: string | null = arg;
+      args.source = entry;
+    } else {
+      args.error = `Unexpected argument: ${arg}`;
+      return args;
+    }
+  }
+  if (args.target !== null && !/^[a-z0-9]+\/[a-z0-9]+$/.test(args.target)) {
+    args.error = `--target expects os/arch (like linux/arm64), got '${args.target}'`;
+  }
+  return args;
+}
+
+// This machine's os/arch, as Go names them
+function hostTarget(): string {
+  const result = runCommand('go', ['env', 'GOHOSTOS', 'GOHOSTARCH']);
+  const lines = (result.stdout ?? '').trim().split('\n');
+  return lines.length === 2 ? `${lines[0].trim()}/${lines[1].trim()}` : '';
+}
+
+// Checks the Go toolchain on the PATH (and a --target against the pairs it
+// supports); returns an error message, '' when usable
+export function checkGo(target: string | null): string {
+  const version = runCommand('go', ['version']);
+  const found = (version.stdout ?? '').match(/go(\d+)\.(\d+)/);
+  if (version.status !== 0 || !found) {
+    return `TypeNative needs Go ${MIN_GO_MAJOR}.${MIN_GO_MINOR} or newer on the PATH (https://go.dev/dl/)`;
+  }
+  const major = Number(found[1]);
+  const minor = Number(found[2]);
+  if (major < MIN_GO_MAJOR || (major === MIN_GO_MAJOR && minor < MIN_GO_MINOR)) {
+    return `TypeNative needs Go ${MIN_GO_MAJOR}.${MIN_GO_MINOR} or newer; found go${major}.${minor} (https://go.dev/dl/)`;
+  }
+  if (target !== null) {
+    const list = runCommand('go', ['tool', 'dist', 'list']);
+    const targets = (list.stdout ?? '').split('\n').map((line: string) => line.trim());
+    if (!targets.includes(target)) {
+      return `Go can't build for '${target}' ('go tool dist list' shows the os/arch pairs it supports)`;
+    }
+  }
+  return '';
 }
 
 // A source path as diagnostics and Go line directives show it: relative to
@@ -75,11 +217,11 @@ interface GoModule {
 
 // golang.org/x/text's transform and unicode/norm packages (String.normalize),
 // copied from GOROOT/src/vendor
-function vendorXText(): GoModule {
+function vendorXText(outDir: string): GoModule {
   const goroot = runCommand('go', ['env', 'GOROOT']).stdout.trim();
   const source = path.join(goroot, 'src', 'vendor', 'golang.org', 'x', 'text');
   for (const pkg of ['transform', path.join('unicode', 'norm')]) {
-    const target = path.join('dist', 'tnvendor', 'x-text', pkg);
+    const target = path.join(outDir, 'tnvendor', 'x-text', pkg);
     fs.mkdirSync(target, { recursive: true });
     for (const file of fs.readdirSync(path.join(source, pkg))) {
       if (file.endsWith('.go') && !file.endsWith('_test.go')) {
@@ -91,20 +233,20 @@ function vendorXText(): GoModule {
     }
   }
   fs.writeFileSync(
-    path.join('dist', 'tnvendor', 'x-text', 'go.mod'),
+    path.join(outDir, 'tnvendor', 'x-text', 'go.mod'),
     'module golang.org/x/text\n\ngo 1.23\n'
   );
   return { path: 'golang.org/x/text', version: 'v0.0.0', dir: './tnvendor/x-text' };
 }
 
-// node:sqlite's driver and its dependencies, copied from the package's
-// govendor/ (listed in govendor/manifest.txt); the copy is skipped while
-// dist/tnvendor already holds the same version. Returns the modules and the
-// Go version their go.mod files declare.
-function vendorGoModules(vendorDir: string): { modules: GoModule[]; goVersion: string } {
+// node:sqlite's driver, the Brotli codec, fsnotify and their dependencies,
+// copied from the package's govendor/ (listed in govendor/manifest.txt); the
+// copy is skipped while dist/tnvendor already holds the same version. Returns
+// the modules and the Go version their go.mod files declare.
+function vendorGoModules(vendorDir: string, outDir: string): { modules: GoModule[]; goVersion: string } {
   const manifest = fs.readFileSync(path.join(vendorDir, 'manifest.txt'), 'utf-8');
   let version = '';
-  let goVersion = '1.23';
+  let goVersion = `${MIN_GO_MAJOR}.${MIN_GO_MINOR}`;
   const modules: GoModule[] = [];
   for (const line of manifest.split('\n')) {
     const parts = line.trim().split(' ');
@@ -114,11 +256,11 @@ function vendorGoModules(vendorDir: string): { modules: GoModule[]; goVersion: s
       modules.push({ path: parts[1], version: parts[2], dir: './tnvendor/' + parts[1] });
     }
   }
-  const stamp = path.join('dist', 'tnvendor', 'govendor.version');
+  const stamp = path.join(outDir, 'tnvendor', 'govendor.version');
   const current = fs.existsSync(stamp) ? fs.readFileSync(stamp, 'utf-8') : '';
   if (current !== version) {
     for (const mod of modules) {
-      const target = path.join('dist', 'tnvendor', mod.path);
+      const target = path.join(outDir, 'tnvendor', mod.path);
       fs.rmSync(target, { recursive: true, force: true });
       fs.cpSync(path.join(vendorDir, mod.path), target, { recursive: true });
     }
@@ -127,17 +269,27 @@ function vendorGoModules(vendorDir: string): { modules: GoModule[]; goVersion: s
   return { modules: modules, goVersion: goVersion };
 }
 
-function writeGoMod(modules: GoModule[], goVersion: string): void {
+// Whether generated Go imports a package of a module in govendor/ (node:sqlite's
+// driver, zlib's Brotli codec, fs.watch's fsnotify)
+function importsVendoredModule(content: string, vendorDir: string): boolean {
+  const manifest = fs.readFileSync(path.join(vendorDir, 'manifest.txt'), 'utf-8');
+  for (const line of manifest.split('\n')) {
+    const parts = line.trim().split(' ');
+    if (parts[0] !== 'module') continue;
+    if (content.includes(`"${parts[1]}"`) || content.includes(`"${parts[1]}/`)) return true;
+  }
+  return false;
+}
+
+function writeGoMod(modules: GoModule[], goVersion: string, outDir: string): void {
   let requires = '';
   let replaces = '';
   for (const mod of modules) {
     requires += `\t${mod.path} ${mod.version}\n`;
     replaces += `\t${mod.path} => ${mod.dir}\n`;
   }
-  fs.writeFileSync(
-    path.join('dist', 'go.mod'),
-    `module tnapp\n\ngo ${goVersion}\n\nrequire (\n${requires})\n\nreplace (\n${replaces})\n`
-  );
+  const deps = modules.length > 0 ? `\nrequire (\n${requires})\n\nreplace (\n${replaces})\n` : '';
+  fs.writeFileSync(path.join(outDir, 'go.mod'), `module tnapp\n\ngo ${goVersion}\n${deps}`);
 }
 
 // Run a command and capture its output. Uses Node's spawnSync under Node and a
@@ -146,6 +298,7 @@ export function runCommand(name: string, args: string[]): CommandResult {
   const result = (childProcess as any).spawnSync(name, args, { encoding: 'utf-8' });
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
 }
+
 
 // Run a command with the parent's stdio, returns the exit code.
 export function runInherit(name: string, args: string[] = []): number {
@@ -181,6 +334,15 @@ export function createProject(projectName: string, installDependencies: boolean)
 }
 
 export function run(opts: RunOptions): void {
+  const goError = checkGo(opts.target);
+  if (goError) {
+    console.error(`error: ${goError}`);
+    process.exit(1);
+  }
+  if (opts.target && opts.scriptMode && opts.target !== hostTarget()) {
+    console.error(`error: --script can't run a program built for ${opts.target} on ${hostTarget()}; use --output`);
+    process.exit(1);
+  }
   const sourcePath: string | null = opts.tsCode ? null : opts.source;
   const tsCode: string = opts.tsCode ? opts.tsCode : fs.readFileSync(sourcePath!, 'utf-8');
 
@@ -200,14 +362,18 @@ export function run(opts: RunOptions): void {
   }
 
   const sourceDir = sourcePath ? path.dirname(path.resolve(sourcePath)) : null;
-  // Node's platform names are GOOS names, except win32
+  // Node's platform names are GOOS names, except win32; OS-specific runtime
+  // helpers follow the --target
   const goos: string = platform() === 'win32' ? 'windows' : platform();
+  // (typed locals: the self-hosted build boxes them into the optional fields)
+  const goFile: string = displayPath(path.join(opts.emitGo ?? 'dist', 'code.go'));
+  const targetOs: string = opts.target ? opts.target.split('/')[0] : goos;
   const transpileOptions: TranspileOptions = {
     parse: opts.parse,
     tsx: !!sourcePath && sourcePath.endsWith('.tsx'),
     fileName: displayPath(entryPath),
-    goFile: 'dist/code.go',
-    goos: goos
+    goFile: goFile,
+    goos: targetOs
   };
   if (sourceDir) {
     transpileOptions.readFile = (specifier: string, fromDir: string | null) => {
@@ -262,50 +428,68 @@ export function run(opts: RunOptions): void {
     process.exit(1);
   }
 
-  const exeName = platform() === 'win32' ? 'native.exe' : 'native';
-  const exePath = `dist/${exeName}`;
-
-  // Clean up stale Go files from previous runs before writing new ones
-  for (const existing of fs.readdirSync('dist')) {
-    if (existing.endsWith('.go') || existing === 'go.mod' || existing === 'go.sum')
-      fs.rmSync(`dist/${existing}`);
+  // --emit-go writes to its own directory; builds happen in dist/
+  const outDir = opts.emitGo ?? 'dist';
+  fs.mkdirSync(outDir, { recursive: true });
+  if (opts.emitGo && fs.existsSync(path.join(outDir, 'go.mod'))) {
+    const existingMod = fs.readFileSync(path.join(outDir, 'go.mod'), 'utf-8');
+    if (!existingMod.startsWith('module tnapp')) {
+      console.error(`error: ${outDir}/go.mod belongs to another Go module; --emit-go needs a directory of its own`);
+      process.exit(1);
+    }
   }
-  fs.writeFileSync('dist/code.go', transpileResult.main);
 
-  const goFiles: string[] = ['dist/code.go'];
+  // Clean up stale Go files from previous runs before writing new ones (in an
+  // --emit-go directory, only files TypeNative generated)
+  for (const existing of fs.readdirSync(outDir)) {
+    const file = path.join(outDir, existing);
+    if (existing === 'go.mod' || existing === 'go.sum') fs.rmSync(file);
+    else if (existing.endsWith('.go') && (!opts.emitGo || fs.readFileSync(file, 'utf-8').startsWith(GENERATED_HEADER)))
+      fs.rmSync(file);
+  }
+  fs.writeFileSync(path.join(outDir, 'code.go'), transpileResult.main);
+
+  const goFiles: string[] = ['code.go'];
   for (const [filename, content] of transpileResult.files) {
-    fs.writeFileSync(`dist/${filename}`, content);
-    goFiles.push(`dist/${filename}`);
+    fs.writeFileSync(path.join(outDir, filename), content);
+    goFiles.push(filename);
   }
 
   // Third-party Go modules the program imports (see vendorXText / vendorGoModules)
   const generated: string[] = [transpileResult.main];
   for (const content of transpileResult.files.values()) generated.push(content);
   const xTextImport = /^import (\w+ )?"golang\.org\/x\/text\//m;
-  const sqliteImport = /^import (\w+ )?"github\.com\/ncruces\/go-sqlite3"/m;
   const modules: GoModule[] = [];
-  let goVersion = '1.23';
-  if (generated.some((content) => xTextImport.test(content))) modules.push(vendorXText());
-  if (generated.some((content) => sqliteImport.test(content))) {
-    const vendored = vendorGoModules(opts.vendorDir);
+  let goVersion = `${MIN_GO_MAJOR}.${MIN_GO_MINOR}`;
+  if (generated.some((content) => xTextImport.test(content))) modules.push(vendorXText(outDir));
+  if (generated.some((content) => importsVendoredModule(content, opts.vendorDir))) {
+    const vendored = vendorGoModules(opts.vendorDir, outDir);
     for (const mod of vendored.modules) modules.push(mod);
     goVersion = vendored.goVersion;
   }
-  if (modules.length > 0) writeGoMod(modules, goVersion);
-  const buildResult =
-    modules.length > 0
-      ? runCommand('go', [
-          'build',
-          '-C',
-          'dist',
-          // Path-independent cache keys: the vendored packages (sqlite is ~5 MB
-          // of Go) compile once, not again for every project directory
-          '-trimpath',
-          '-o',
-          exeName,
-          ...goFiles.map((f) => f.slice('dist/'.length))
-        ])
-      : runCommand('go', ['build', '-o', exePath, ...goFiles]);
+  writeGoMod(modules, goVersion, outDir);
+
+  if (opts.emitGo) {
+    console.log(`Wrote the Go sources to ${outDir} (build them with: go build -C ${outDir})`);
+    return;
+  }
+
+  // GOOS / GOARCH for --target: set on this process, which go build inherits
+  // (--script only runs host builds, so the program never sees them changed)
+  if (opts.target) {
+    const pair = opts.target.split('/');
+    process.env.GOOS = pair[0];
+    process.env.GOARCH = pair[1];
+  }
+  const exeName = targetOs === 'windows' ? 'native.exe' : 'native';
+  const exePath = `dist/${exeName}`;
+  const buildArgs: string[] = ['build', '-C', 'dist', '-o', exeName];
+  // -trimpath gives path-independent cache keys: the vendored packages (sqlite
+  // is ~5 MB of Go) compile once, not again for every project directory
+  if (opts.release || modules.length > 0) buildArgs.push('-trimpath');
+  if (opts.release) buildArgs.push('-ldflags=-s -w');
+  for (const file of goFiles) buildArgs.push(file);
+  const buildResult = runCommand('go', buildArgs);
   if (buildResult.status !== 0) {
     // Positions in .ts files come from line directives in the generated Go
     console.error('go build failed:');

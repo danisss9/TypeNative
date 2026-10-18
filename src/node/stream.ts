@@ -1031,14 +1031,13 @@ func TnCreateWriteStream(path string, options ...interface{}) *TnStream {
 const zlibStreamHelper = `// zlib streams: Transforms buffering the input, (de)compressed at the end
 func TnZlibStream(format string, decompress bool, options ...interface{}) *TnStream {
 	s := TnNewTransform()
-	level := tnZlibLevel(options)
 	input := []byte{}
 	s.goTransform = func(chunk []byte) { input = append(input, chunk...) }
 	s.goFlush = func() []byte {
 		if decompress {
 			return tnDecompress(format, input)
 		}
-		return tnCompress(format, input, level)
+		return tnCompress(format, input, options)
 	}
 	return s
 }`;
@@ -1200,12 +1199,15 @@ func tnStdin() *bufio.Reader {
     createInflate: 'inflate:true',
     createDeflateRaw: 'deflateRaw:false',
     createInflateRaw: 'inflateRaw:true',
-    createUnzip: 'unzip:true'
+    createUnzip: 'unzip:true',
+    createBrotliCompress: 'brotli:false',
+    createBrotliDecompress: 'brotli:true'
   };
   for (const name of Object.keys(zlibStreams)) {
     const parts = zlibStreams[name].split(':');
     r.functions[`zlib.${name}`] = (call: NodeCall) => {
       r.helper('zlibStreams');
+      if (parts[0] === 'brotli') r.helper('nodeBrotli');
       const options = call.args.length > 0 ? `, ${call.args[0]}` : '';
       return `TnZlibStream(${JSON.stringify(parts[0])}, ${parts[1]}${options})`;
     };

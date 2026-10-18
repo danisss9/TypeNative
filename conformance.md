@@ -246,6 +246,16 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Loop closures capture per-iteration `let` |   ✅    | [semantics-loop-closures.ts](conformance/semantics-loop-closures.ts)               |                                                                                                             |
 | Functions stored in Records               |   ✅    | [semantics-record-functions.ts](conformance/semantics-record-functions.ts)         | `rec.fn()` → `rec.Get("fn")()`, also for names like `get` / `sort`                                          |
 
+## Sample apps
+
+End-to-end programs that combine many features the way real code does (they run in the suite like any probe).
+
+| App | Probe | Covers |
+| --- | ----- | ------ |
+| `wc`-style CLI | [app-cli-wordcount.ts](conformance/app-cli-wordcount.ts) | `util.parseArgs`, `fs`, `path`, `os.EOL`, a class with a `Map` field, tuples sorted with a `\|\|` comparator, `reduce` into an object, `crypto` |
+| JSON API on HTTP + SQLite | [app-http-sqlite.ts](conformance/app-http-sqlite.ts) | `http.createServer` routing, `URL`, `node:sqlite` prepared statements, `fetch` (POST / GET / DELETE), JSON bodies, status codes |
+| Stream pipeline | [app-stream-pipeline.ts](conformance/app-stream-pipeline.ts) | A generator through `Readable.from`, a CSV-aggregating `Transform`, `Float64Array` series, `stream/promises` `pipeline` to files, gzip and Brotli streams, SHA-256 |
+
 ## Standard library
 
 Every standard-library API TypeNative ports, split by module. Per
@@ -514,7 +524,7 @@ async function runs synchronously until its first `await`.
 | `read*` / `write*` (U)Int8/16/32 LE/BE, Float, Double                                    |   ✅    | [lib-node-buffer-binary.ts](conformance/lib-node-buffer-binary.ts)             | Out-of-range offsets throw `ERR_OUT_OF_RANGE`                                           |
 | `Blob` / `File` (`size`, `type`, `name`, `lastModified`, `text()` / `bytes()` / `arrayBuffer()`, `slice`, `stream()`); parts of strings, Buffers and Blobs | ✅ | [lib-node-blob.ts](conformance/lib-node-blob.ts) | Also globals; bytes held in memory |
 | `read/writeBigInt64LE/BE`, `read/writeBigUInt64LE/BE`, `swap16/32/64`; `isUtf8` / `isAscii` / `transcode` / `kMaxLength` | ✅ | [lib-node-buffer-bigint.ts](conformance/lib-node-buffer-bigint.ts) | bigints are `*big.Int` |
-| Typed arrays other than `Uint8Array` (`Int32Array`, `Float64Array`, `DataView`, …) | ❌ | — | Buffers and `Uint8Array`s are `[]byte`; other views are not implemented |
+| Typed arrays (`Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`): indexing, `length` / `byteLength` / `buffer`, `from` / `of`, `fill` / `set` / `subarray` / `slice` / `copyWithin`, `map` / `filter` / `reduce` / `forEach` & co., `sort` / `toSorted`, `join`, `for…of`, spread; `ArrayBuffer` (`slice`, `isView`); `DataView` (all getters / setters incl. BigInt64) | ✅ | [lib-typed-arrays.ts](conformance/lib-typed-arrays.ts) | One Go slice per element type; views on an `ArrayBuffer` share its memory. Writes convert like JS (wrapping, clamping). A view's `.buffer` is its own bytes (`byteOffset` 0). Out-of-range reads give `0`, not `undefined`. `BigInt64Array` / `BigUint64Array` are not implemented |
 
 #### `node:fs`
 
@@ -529,7 +539,7 @@ async function runs synchronously until its first `await`.
 | `fs/promises` / `fs.promises` (incl. `FileHandle` from `open`)                          |   ✅    | [lib-node-fs-promises.ts](conformance/lib-node-fs-promises.ts)         | Rejections carry the error code                                                            |
 | `createReadStream` / `createWriteStream`                                                |   ✅    | [lib-node-fs-streams.ts](conformance/lib-node-fs-streams.ts)           | `encoding`, `start` / `end`, `highWaterMark`, `flags`                                      |
 | `chmodSync` / `utimesSync` / `symlinkSync` / `readlinkSync` / `linkSync`                |   ✅    | —                                                                      | Implemented, not probed (symlinks need privileges on Windows)                             |
-| `watch` / `watchFile`                                                                   |   ❌    | —                                                                      | Go's standard library has no file-system notifications                                    |
+| `watch` (`recursive`, `persistent`, `signal`, `ref` / `unref`, `'change'` / `'error'` / `'close'`) / `watchFile` / `unwatchFile`; `fs/promises` `watch` | ✅ | [lib-node-fs-watch.ts](conformance/lib-node-fs-watch.ts) | `watch` uses the OS's notifications through the vendored `fsnotify` (only linked into programs that call it); recursive watches add subdirectories as they appear. `watchFile` polls `stat()` |
 
 #### `node:os`
 
@@ -630,7 +640,7 @@ async function runs synchronously until its first `await`.
 | `gzipSync` / `gunzipSync` / `deflateSync` / `inflateSync` / `deflateRawSync` / `inflateRawSync` / `unzipSync` / `crc32` / `constants` | ✅ | [lib-node-zlib.ts](conformance/lib-node-zlib.ts) | `{ level }`; invalid input throws `Z_DATA_ERROR` |
 | `createGzip` / `createGunzip` / `createDeflate` / `createInflate` / `createDeflateRaw` / `createInflateRaw` / `createUnzip` | ✅ | [lib-node-zlib-streams.ts](conformance/lib-node-zlib-streams.ts) | Transforms that (de)compress when the input ends |
 | Callback forms `gzip` / `gunzip` / `deflate` / `inflate` / `deflateRaw` / `inflateRaw` / `unzip` (`buf, [options], cb`) and `util.promisify` of them | ✅ | [lib-node-zlib-async.ts](conformance/lib-node-zlib-async.ts) | The codec runs on a goroutine; the callback runs on the event loop |
-| Brotli (`brotliCompressSync` & co.)                                                                   |   ❌    | —                                                          | Go's standard library has no Brotli codec                 |
+| Brotli: `brotliCompressSync` / `brotliDecompressSync`, callback and promisified `brotliCompress` / `brotliDecompress`, `createBrotliCompress` / `createBrotliDecompress`, `constants.BROTLI_*` | ✅ | [lib-node-zlib-brotli.ts](conformance/lib-node-zlib-brotli.ts) | The vendored `andybalholm/brotli` (pure Go, only linked into programs that use it); `params` quality / window. Output matches Node's; decoder errors carry Node's codes |
 
 #### `node:timers`
 
@@ -934,7 +944,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | `go:compress/gzip` | ✅ | [lib-go-compress-gzip.ts](conformance/lib-go-compress-gzip.ts) | gzip read/write |
 | `go:compress/lzw` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | LZW compression (GIF/PDF/TIFF) |
 | `go:compress/zlib` | ✅ | [lib-go-compress-extra.ts](conformance/lib-go-compress-extra.ts) | zlib read/write |
-| `go:container/heap` | ⚠️ | — | Needs a TS class satisfying `heap.Interface`; TS classes cannot implement Go interfaces yet |
+| `go:container/heap` | ✅ | [lib-go-container-heap.ts](conformance/lib-go-container-heap.ts) | A TS class implementing `heap.Interface` (see Go interfaces below) |
 | `go:container/list` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Doubly linked list |
 | `go:container/ring` | ✅ | [lib-go-containers.ts](conformance/lib-go-containers.ts) | Circular list |
 | `go:context` | ✅ | [lib-go-sync.ts](conformance/lib-go-sync.ts) | Cancellation and deadlines |
@@ -1119,9 +1129,11 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | Out-params | `ref<T>(init?)` makes a pointer cell; `.value` dereferences it. |
 | Byte slices | `[]byte` is `Uint8Array` (zero-copy); `number[]` converts per call (mutations of the copy are lost). |
 | Side-effect imports | `import 'go:time/tzdata'` emits a blank `import _`. |
+| Go interfaces | A TS class instance passed where Go expects an interface (`heap.Interface`, `sort.Interface`) is wrapped in a generated adapter with the exact Go method signatures (`Len() int` calls the class's `Len(): number`); the class needs every method, inherited ones count. Values typed as the interface itself are not adapted. |
 
 ### npm packages
 
 | Pattern                   | Status | Probe                                                    | Notes                                                                                             |
 | ------------------------- | :----: | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `import { x } from 'pkg'` |   ✅    | [syntax-import-npm.ts](conformance/syntax-import-npm.ts) | Mapped to Go module imports (fixture dep in [conformance/package.json](conformance/package.json)) |
+| Packages published as plain JavaScript / CommonJS (tried: `ms`, `escape-html`, `tiny-invariant`) | ❌ | — | Without TypeScript sources there are no types to compile from: untyped packages stop at the type check (TS7016), and typed ones whose code is CommonJS (`module.exports`, union-typed callbacks) don't lower. Packages that ship `.ts` sources work |

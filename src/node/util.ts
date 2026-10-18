@@ -194,6 +194,9 @@ func (ins *tnInspector) format(v interface{}, depth int) string {
 		return x.String() + "n"
 	case []byte:
 		return TnBufferInspect(x)
+	case interface{ TnTypedInspect() (string, []float64) }:
+		name, values := x.TnTypedInspect()
+		return name + " " + ins.format(values, depth)
 	case time.Time:
 		return x.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	case *regexp.Regexp:

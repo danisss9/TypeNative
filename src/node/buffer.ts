@@ -700,6 +700,13 @@ export function registerBuffer(r: NodeRegistry): void {
   r.constructors['globals.Uint8Array'] = (call: NodeCall) => {
     const type = call.types[0];
     if (call.args.length === 0) return '[]byte{}';
+    // new Uint8Array(arrayBuffer, byteOffset?, length?): a view sharing its memory
+    if (r.isArrayBuffer(call.nodes[0])) {
+      if (call.args.length === 1) return call.args[0];
+      const start = `int(${call.args[1]})`;
+      if (call.args.length === 2) return `${call.args[0]}[${start}:]`;
+      return `${call.args[0]}[${start}:${start}+int(${call.args[2]})]`;
+    }
     if (type === 'float64') return `make([]byte, int(${call.args[0]}))`;
     use();
     if (type === '[]byte') return `append([]byte{}, ${call.args[0]}...)`;

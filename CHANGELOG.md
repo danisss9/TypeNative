@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-19
+
+A fuller CLI (`--target` cross-compilation, `--release`, `--emit-go`), typed arrays, Brotli and
+`fs.watch`, and TS classes that satisfy Go interfaces such as `heap.Interface`. Three sample apps
+now run as tests.
+
+### Added
+
+- **CLI**: `--help`, `--version`, `--target <os/arch>` (cross-compiles through `GOOS` /
+  `GOARCH`; `--script` refuses foreign targets), `--release` (`-trimpath -ldflags="-s -w"`),
+  `--emit-go <dir>` (writes the Go sources and `go.mod` and stops), the entry file as a bare
+  argument, and `--flag=value`. Unknown options exit with code `2`, and a missing or older Go
+  toolchain (below 1.26) is reported before anything is built
+- **Typed arrays**: `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`,
+  `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array` (indexing, `from` / `of`,
+  `fill` / `set` / `subarray` / `slice`, the callback methods, `sort`, `join`, iteration),
+  `ArrayBuffer` (`slice`, `isView`) and `DataView`. Views made on an `ArrayBuffer` share its
+  memory, and writes convert like JS; `new Uint8Array(arrayBuffer)` is a view too
+- **Go interfaces**: a TS class passed where Go expects an interface (`heap.Interface`,
+  `sort.Interface`) gets an adapter with the exact Go method signatures, so `go:container/heap`
+  works and `sort.Sort` takes classes
+- **Brotli** in `node:zlib`: `brotliCompressSync` / `brotliDecompressSync`, the callback and
+  promisified forms, `createBrotliCompress` / `createBrotliDecompress` and `constants.BROTLI_*`,
+  on the vendored `github.com/andybalholm/brotli` (byte-identical to Node's output)
+- **`fs.watch`** (`recursive`, `persistent`, `signal`, `ref` / `unref`), `fs.watchFile` /
+  `unwatchFile` and `fs/promises` `watch`, on the vendored `github.com/fsnotify/fsnotify`
+- `x instanceof Int32Array` / `URL` / any Node global class
+- Three sample apps run as tests (`conformance/app-*.ts`): a `wc`-style CLI, a JSON API on
+  `node:http` + `node:sqlite`, and a stream pipeline with gzip / Brotli
+
+### Changed
+
+- Every build goes through `dist/go.mod` (`go build -C dist`), and generated Go files start
+  with Go's `// Code generated … DO NOT EDIT.` header
+- Vendored Go modules are linked only into programs that import them (`npm run vendor:go`
+  now vendors sqlite, Brotli and fsnotify)
+
+### Fixed
+
+- A subclass without a constructor takes its parent's constructor arguments (it compiled to a
+  constructor with no parameters)
+- `new C([1, 2])` passes array literals to constructors whose array parameter is a shared
+  reference
+- `this.field` has the field's type inside class bodies, so `Map` / `Set` fields dispatch their
+  methods (`this.counts.set(k, v)` called a Go method `set` that doesn't exist)
+- Tuple elements read with their declared types (`pair[0]` of a `[string, number]` is a
+  string), including in the callbacks of `sort` / `map` / … on tuple arrays
+- `rows.map((r) => ({ … }))` and `reduce` accumulators take the contextual type (a function
+  returning `Note[]` builds `Note`s, not anonymous structs)
+- Object literals with computed keys (`{ [constants.BROTLI_PARAM_QUALITY]: 4 }`) are objects keyed
+  by the computed value (they compiled to a struct field named `undefined`)
+- `(x as T)` on a Go `any` result (`heap.Pop(h) as Task`) asserts the type, and so does
+  `this.items.push(x as T)`
+- Timers fire in deadline order (then creation order) when several expire together, as in
+  Node; timer goroutines that woke at once on a busy loop or coarse OS clock could run out of
+  order
+
 ## [0.3.1] - 2026-10-18
 
 ### Fixed

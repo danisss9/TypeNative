@@ -85,6 +85,9 @@ export interface NodeRegistry {
   visit: (node: AstNode) => string;
   // Method-dispatch category of an expression ('Map', 'Record', 'class', …)
   categoryOf: (node: AstNode) => string;
+  // Whether a []byte expression is an ArrayBuffer (typed-array constructors
+  // view it) rather than a Uint8Array / Buffer (they copy it)
+  isArrayBuffer: (node: AstNode) => boolean;
 }
 
 // Services start as no-ops; the transpiler binds them before each run
@@ -117,7 +120,8 @@ export function createNodeRegistry(): NodeRegistry {
     temp: (prefix: string) => prefix,
     typeOf: (_node: AstNode) => '',
     visit: (_node: AstNode) => '',
-    categoryOf: (_node: AstNode) => ''
+    categoryOf: (_node: AstNode) => '',
+    isArrayBuffer: (_node: AstNode) => false
   };
   return registry;
 }
