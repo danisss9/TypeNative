@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-18
+
+### Fixed
+
+- `node:tls` on macOS: an untrusted certificate chain reports Node's codes
+  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`,
+  `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`) like on other platforms; the platform verifier returns
+  a plain error, not `UnknownAuthorityError`
+- `go build` runs with `-trimpath`, so vendored packages (the ~5 MB sqlite driver) are cached
+  once instead of recompiled for every project directory, and builds are reproducible
+- `conformance-parallel.mjs` builds one sqlite probe first so a cold cache doesn't time out
+  every sqlite probe at once on small runners; the `node:sqlite` `location()` probe compares
+  canonical paths (symlinks, Windows 8.3 short names)
+
 ## [0.3.0] - 2026-10-18
 
 Errors now point at your TypeScript. Programs are type-checked before they're transpiled, code
