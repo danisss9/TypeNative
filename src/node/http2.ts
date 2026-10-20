@@ -27,6 +27,8 @@ type TnHttp2Session struct {
 	active       int
 	nextID       float64
 	socket       *TnSocket
+
+	connectEmitted bool
 }
 
 func (s *TnHttp2Session) Get_closed() bool        { return s.closed }
@@ -52,6 +54,21 @@ func (s *TnHttp2Session) unref() *TnHttp2Session {
 }
 
 func (s *TnHttp2Session) setTimeout(ms float64, cb ...interface{}) *TnHttp2Session { return s }
+
+// 'connect' fires once, when the session's first connection is up; guarded on
+// the loop so the eager probe dial and the transport's own dials can both call
+// it without racing
+func (s *TnHttp2Session) emitConnect(conn net.Conn) {
+	TnLoopPost(func() {
+		if s.connectEmitted || s.destroyed {
+			return
+		}
+		s.connectEmitted = true
+		s.socket = tnInfoSocket(conn.LocalAddr(), conn.RemoteAddr().String())
+		s.socket.encrypted = s.encrypted
+		s.emit("connect", s, s.socket)
+	})
+}
 
 func (s *TnHttp2Session) maybeFinish() {
 	if !s.closed || s.active > 0 || s.finished {
@@ -142,6 +159,17 @@ func TnHttp2Connect(authority interface{}, args ...interface{}) *TnHttp2Session 
 	t.Protocols = protocols
 	s.transport = t
 	s.client = &http.Client{Transport: t, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	// The transport dials through here (https too, there is no custom DialTLS),
+	// so 'connect' is posted before that request's response can be
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		s.emitConnect(conn)
+		return conn, nil
+	}
 	if listener != nil {
 		s.TnEventEmitter.once("connect", listener)
 	}
@@ -151,6 +179,9 @@ func TnHttp2Connect(authority interface{}, args ...interface{}) *TnHttp2Session 
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
 		TnLoopPost(func() {
 			if err != nil {
+				if s.connectEmitted || s.destroyed {
+					return
+				}
 				p, _ := strconv.ParseFloat(port, 64)
 				target := host
 				if ip := tnDialedIP(err); ip != "" {
@@ -159,12 +190,8 @@ func TnHttp2Connect(authority interface{}, args ...interface{}) *TnHttp2Session 
 				s.destroy(TnNetError(err, "connect", target, p))
 				return
 			}
-			s.socket = tnInfoSocket(conn.LocalAddr(), conn.RemoteAddr().String())
-			s.socket.encrypted = s.encrypted
+			s.emitConnect(conn)
 			conn.Close()
-			if !s.destroyed {
-				s.emit("connect", s, s.socket)
-			}
 		})
 	}()
 	return s
@@ -625,7 +652,7 @@ export function registerHttp2(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeHttp2',
-    ['bytes', 'crypto/tls', 'fmt', 'io', 'net', 'net/http', 'net/url', 'os', 'sort', 'strconv', 'strings', 'time'],
+    ['bytes', 'context', 'crypto/tls', 'fmt', 'io', 'net', 'net/http', 'net/url', 'os', 'sort', 'strconv', 'strings', 'time'],
     ['nodeHttp', 'nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'tlsConfig', 'fsErrors'],
     http2Helper
   );
