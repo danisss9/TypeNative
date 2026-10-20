@@ -106,7 +106,7 @@ func (rl *TnReadline) questionAsync(query string, options ...interface{}) chan s
 	rl.writeOut(query)
 	rl.pendingQuestion = func(answer string) {
 		TnLoopUnref()
-		ch <- answer
+		TnAsyncSend(ch, answer)
 	}
 	return ch
 }

@@ -787,7 +787,7 @@ func TnFsPromise[T any](work func() T) chan T {
 			TnReject(ch, err)
 			return
 		}
-		ch <- result
+		TnAsyncSend(ch, result)
 	}()
 	return ch
 }

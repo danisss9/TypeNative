@@ -201,7 +201,7 @@ func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...inter
 		if check != nil && !check(reason) {
 			panic(reason)
 		}
-		out <- struct{}{}
+		TnAsyncSend(out, struct{}{})
 	}()
 	return out
 }
@@ -215,7 +215,7 @@ func TnAssertDoesNotReject[T any](p chan T, msg ...interface{}) chan struct{} {
 		if rejected {
 			panic(tnAssertionError(tnAssertMessage(msg), "Got unwanted rejection.\\nActual message: \\""+TnErrorText(reason)+"\\"", reason, nil, "doesNotReject"))
 		}
-		out <- struct{}{}
+		TnAsyncSend(out, struct{}{})
 	}()
 	return out
 }

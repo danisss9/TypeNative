@@ -462,6 +462,9 @@ const generatorFunctionNames = new Set<string>();
 // While emitting an async/generator function body: `return`/`yield` send here
 let asyncChannelVar: string | undefined;
 let asyncFunctionNode: AstNode | undefined;
+// True while emitting the body of an async function (not a generator): its
+// return settles the promise (ordered wake); a generator's sends stay raw
+let asyncChannelIsAsync = false;
 // Variables holding JS arrays: stored as *[]T so aliasing shares the slice
 // header (push/splice through any alias are visible everywhere)
 const referenceArrays = new Set<string>();
@@ -2186,10 +2189,18 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return '';
   } else if (isAwaitExpression(node)) {
-    // Promises are channels: TnAwait keeps the event loop running while it waits
-    // (a bare receive would block it, e.g. in async callbacks)
+    // Promises are channels: the await keeps the event loop running while it
+    // waits (a bare receive would block it). Inside an async function body —
+    // a goroutine of its own — TnAwait parks for the ordered wake (promise
+    // continuations resume in settlement order); an await in code running
+    // inline on the loop goroutine (an async callback) must keep draining the
+    // loop itself
     useHelper('promise');
-    return `TnAwait(${visit(node.expression)})`;
+    const awaitFn =
+      asyncChannelVar && asyncChannelIsAsync && getEnclosingFunction(node) === asyncFunctionNode
+        ? 'TnAwait'
+        : 'TnAwaitInline';
+    return `${awaitFn}(${visit(node.expression)})`;
   } else if (isVariableDeclarationList(node)) {
     return (
       (node.declarations ?? []).map((n) => visit(n)).join(options.inline ? ';' : ';\n\t') +
@@ -2347,6 +2358,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     // Inside an async function or generator the channel carries the result
     if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
       if (!node.expression) return 'return';
+      // An async return settles its promise (ordered wake); a generator's
+      // sends stay raw (their consumers receive raw)
+      if (asyncChannelIsAsync) {
+        return `TnAsyncSend(${asyncChannelVar}, ${visit(node.expression)}); return` + (options.inline ? '' : ';\n\t');
+      }
       return `${asyncChannelVar} <- ${visit(node.expression)}; return` + (options.inline ? '' : ';\n\t');
     }
     const enclosingFn = getEnclosingFunction(node);
@@ -2804,12 +2820,15 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
           const yieldType = getGeneratorYieldType(member);
           const prevChannel = asyncChannelVar;
           const prevFn = asyncFunctionNode;
+          const prevIsAsync = asyncChannelIsAsync;
           asyncChannelVar = '__ch';
           asyncFunctionNode = member;
+          asyncChannelIsAsync = false;
           const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
           const genBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
           asyncChannelVar = prevChannel;
           asyncFunctionNode = prevFn;
+          asyncChannelIsAsync = prevIsAsync;
           result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
         }
         continue;
@@ -3331,7 +3350,12 @@ function visitUsingDeclaration(statement: AstNode, rest: AstNode[]): string {
       const classNode = declaredClasses.get(className);
       const hasAsync = (classNode?.members ?? []).some((m: AstNode) => m.name?.text === '__asyncDispose');
       if (isAwait && hasAsync) useHelper('promise');
-      const call = isAwait && hasAsync ? `TnAwait(${name}.__asyncDispose())` : `${name}.__dispose()`;
+      // The disposal may run on an async fn's goroutine or inline in a callback
+      const awaitFn =
+        asyncChannelVar && asyncChannelIsAsync && getEnclosingFunction(statement) === asyncFunctionNode
+          ? 'TnAwait'
+          : 'TnAwaitInline';
+      const call = isAwait && hasAsync ? `${awaitFn}(${name}.__asyncDispose())` : `${name}.__dispose()`;
       return `defer func() { if ${name} != nil { ${call} } }()`;
     })
     .reverse();
@@ -8603,16 +8627,19 @@ function emitChannelFunction(node: AstNode, isAsync: boolean): string {
   const rejectOnPanic = isAsync ? `\n\t\tdefer TnRejectOnPanic(${channelVar})` : '';
   const prevChannel = asyncChannelVar;
   const prevFn = asyncFunctionNode;
+  const prevIsAsync = asyncChannelIsAsync;
   asyncChannelVar = channelVar;
   asyncFunctionNode = node;
+  asyncChannelIsAsync = isAsync;
   const body = visit(node.body!, { prefixBlockContent: parameterInfo.prefixBlockContent });
   asyncChannelVar = prevChannel;
   asyncFunctionNode = prevFn;
+  asyncChannelIsAsync = prevIsAsync;
   if (isAsync) {
     // The body runs synchronously until its first await, holding the JS baton
     useHelper('eventLoop');
     return (
-      `func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
+      `func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
     );
   }
   return (
@@ -11401,6 +11428,9 @@ func tnRunDueTimers() {
 			__tnTimers.Done()
 		}
 		t.fn()
+		// Microtasks (promise continuations) run after each timer callback,
+		// before the next one fires — as Node does
+		TnRunMicrotasks()
 	}
 }
 
@@ -11733,7 +11763,9 @@ func tnRunTask(fn func()) {
 func tnLoopIdle() bool {
 	tnLoopMu.Lock()
 	defer tnLoopMu.Unlock()
-	return len(tnLoopTasks) == 0 && atomic.LoadInt64(&tnLoopRefs) <= 0
+	tnMicrotasksMu.Lock()
+	defer tnMicrotasksMu.Unlock()
+	return len(tnLoopTasks) == 0 && len(tnMicrotasks) == 0 && atomic.LoadInt64(&tnLoopRefs) <= 0
 }
 
 // The end of main: run until nothing is pending
@@ -11761,8 +11793,86 @@ func TnRunLoop() {
 	}
 }
 
-// (baton holder) Receives from a channel, running loop tasks while waiting
+// Parked awaits, keyed by promise channel. A promise resolution (TnAsyncSend /
+// TnAsyncClose) delivers under tnWakeMu and queues an ordered wakeup instead of
+// waking the awaiter directly: continuations must resume in the order their
+// promises settled, like Node's microtasks — awaiters racing for the baton
+// would resume out of order on a starved machine.
+var tnWakeMu sync.Mutex
+var tnAwaiting = map[any]chan struct{}{}
+
+// (baton holder) hands the baton to a parked awaiter and waits for it to park
+// again (or finish): JS keeps running one thing at a time
+func tnDeliver(tok chan struct{}) {
+	back := make(chan struct{})
+	tnLendStack = append(tnLendStack, back)
+	close(tok)
+	<-back
+}
+
+// Queues the ordered wakeup of a parked awaiter (nil tok: nobody parked)
+func tnWakeQueue(tok chan struct{}) {
+	if tok == nil {
+		return
+	}
+	tnMicrotasksMu.Lock()
+	tnMicrotasks = append(tnMicrotasks, func() { tnDeliver(tok) })
+	tnMicrotasksMu.Unlock()
+	tnLoopNotify()
+}
+
+// (baton holder) Receives from a channel, running loop tasks while waiting;
+// once nothing is left it parks. A promise wake resumes in settlement order
+// with the baton handed over; a raw send (a generator yield) resumes the old
+// way, racing for the baton
 func TnLoopReceive[T any](ch chan T) (T, bool) {
+	ctx := tnAsyncCtx
+	defer func() { tnAsyncCtx = ctx }()
+	for {
+		select {
+		case v, ok := <-ch:
+			return v, ok
+		default:
+		}
+		TnRunMicrotasks()
+		if TnLoopRunPending() {
+			continue
+		}
+		tok := make(chan struct{})
+		tnWakeMu.Lock()
+		select {
+		case v, ok := <-ch:
+			tnWakeMu.Unlock()
+			return v, ok
+		default:
+			tnAwaiting[any(ch)] = tok
+		}
+		tnWakeMu.Unlock()
+		tnRelease()
+		select {
+		case v, ok := <-ch:
+			// The value is taken; when a promise wake was queued (the token
+			// is gone) it hands the baton over, else take the baton ourselves
+			tnWakeMu.Lock()
+			_, raw := tnAwaiting[any(ch)]
+			if raw {
+				delete(tnAwaiting, any(ch))
+			}
+			tnWakeMu.Unlock()
+			if raw {
+				tnAcquire()
+			} else {
+				<-tok
+			}
+			return v, ok
+		case <-tok:
+		}
+	}
+}
+
+// (baton holder) Receives from a channel of raw sends (generator yields),
+// running loop tasks while waiting
+func tnRawReceive[T any](ch chan T) (T, bool) {
 	ctx := tnAsyncCtx
 	defer func() { tnAsyncCtx = ctx }()
 	for {
@@ -12060,12 +12170,48 @@ func TnRejectExecutor[T any](ch chan T) {
 	}
 }
 
-func TnResolveZero[T any](ch chan T) {
-	var zero T
+// Promise resolution: the value (or rejection) is sent and the parked awaiter
+// woken in settlement order — Node runs promise continuations as ordered
+// microtasks; a bare channel wake would race for the baton and resume out of
+// order on a starved machine
+func TnAsyncSend[T any](ch chan T, v T) {
+	tok := make(chan struct{})
+	handoff := false
+	tnWakeMu.Lock()
 	select {
-	case ch <- zero:
+	case ch <- v:
 	default:
 	}
+	if t, parked := tnAwaiting[any(ch)]; parked {
+		delete(tnAwaiting, any(ch))
+		tok = t
+		handoff = true
+	}
+	tnWakeMu.Unlock()
+	if handoff {
+		tnWakeQueue(tok)
+	}
+}
+
+func TnAsyncClose[T any](ch chan T) {
+	tok := make(chan struct{})
+	handoff := false
+	tnWakeMu.Lock()
+	close(ch)
+	if t, parked := tnAwaiting[any(ch)]; parked {
+		delete(tnAwaiting, any(ch))
+		tok = t
+		handoff = true
+	}
+	tnWakeMu.Unlock()
+	if handoff {
+		tnWakeQueue(tok)
+	}
+}
+
+func TnResolveZero[T any](ch chan T) {
+	var zero T
+	TnAsyncSend(ch, zero)
 }
 
 // resolve / reject of a Promise executor used as values
@@ -12077,10 +12223,7 @@ func TnResolver[T any](ch chan T) func(...interface{}) {
 				v = x
 			}
 		}
-		select {
-		case ch <- v:
-		default:
-		}
+		TnAsyncSend(ch, v)
 	}
 }
 
@@ -12099,7 +12242,7 @@ func TnRejecter[T any](ch chan T) func(...interface{}) {
 
 func TnReject[T any](ch chan T, reason interface{}) {
 	tnRejections.Store(ch, reason)
-	close(ch)
+	TnAsyncClose(ch)
 }
 
 // A detached call (\`main();\`): the process waits for it; a rejection is fatal
@@ -12153,6 +12296,18 @@ func TnAwait[T any](ch chan T) T {
 	return v
 }
 
+// await in code running inline on the loop goroutine (an async callback — an
+// arrow, an event handler): the self-draining receive — this goroutine is the
+// loop, so it must keep running tasks while it waits
+func TnAwaitInline[T any](ch chan T) T {
+	received, ok := tnRawReceive(ch)
+	v, reason, rejected := tnSettled(ch, received, ok)
+	if rejected {
+		panic(reason)
+	}
+	return v
+}
+
 func TnPromiseReject[T any](reason interface{}) chan T {
 	ch := make(chan T)
 	TnReject(ch, reason)
@@ -12168,8 +12323,8 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 			e, _ := reason.(E)
 			TnLoopCall(func() { TnAsyncRun(ctx, func() { onRejected(e) }) })
 		}
-		out <- v
-		close(out)
+		TnAsyncSend(out, v)
+		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -12183,8 +12338,8 @@ func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 			e, _ := reason.(E)
 			TnLoopCall(func() { TnAsyncRun(ctx, func() { v = onRejected(e) }) })
 		}
-		out <- v
-		close(out)
+		TnAsyncSend(out, v)
+		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -12199,8 +12354,8 @@ func TnPromiseFinally[T any](p chan T, onFinally func()) chan T {
 			TnReject(out, reason)
 			return
 		}
-		out <- v
-		close(out)
+		TnAsyncSend(out, v)
+		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -12217,8 +12372,8 @@ func TnPromiseRace[T any](chs []chan T) chan T {
 					TnReject(out, reason)
 					return
 				}
-				out <- v
-				close(out)
+				TnAsyncSend(out, v)
+				TnAsyncClose(out)
 			})
 		}(ch)
 	}
@@ -12243,8 +12398,8 @@ func TnPromiseAllSettled[T any](chs []chan T) chan []*TnSettled[T] {
 				results[i] = &TnSettled[T]{status: "fulfilled", value: v}
 			}
 		}
-		out <- results
-		close(out)
+		TnAsyncSend(out, results)
+		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -12268,8 +12423,8 @@ func TnPromiseAny[T any](chs []chan T) chan T {
 		for range chs {
 			select {
 			case v := <-values:
-				out <- v
-				close(out)
+				TnAsyncSend(out, v)
+				TnAsyncClose(out)
 				return
 			case <-failures:
 			}
@@ -12280,7 +12435,7 @@ func TnPromiseAny[T any](chs []chan T) chan T {
 }`,
   promiseAll: `// Promise.all: every channel drained in order, results collected
 func TnPromiseAll[T any](chs []chan T) chan []T {
-	out := make(chan []T)
+	out := make(chan []T, 1)
 	go func() {
 		results := make([]T, len(chs))
 		for i, ch := range chs {
@@ -12291,8 +12446,8 @@ func TnPromiseAll[T any](chs []chan T) chan []T {
 			}
 			results[i] = v
 		}
-		out <- results
-		close(out)
+		TnAsyncSend(out, results)
+		TnAsyncClose(out)
 	}()
 	return out
 }`,
@@ -13093,7 +13248,8 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
       if (declaration && isIdentifier(declaration.name)) registerLocalVariable(declaration.name.text, elemType);
       // A rejected iterator (a stream error) throws out of the loop
       useHelper('promise');
-      let awaitPrefix = `${valueVar}, __ok := TnLoopReceive(${chanVar})\n\t\tif !__ok {\n\t\t\tif __reason, __rejected := tnRejections.Load(${chanVar}); __rejected {\n\t\t\t\tpanic(__reason)\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
+      // Raw receive: iterator channels are fed by raw sends (generator yields)
+      let awaitPrefix = `${valueVar}, __ok := tnRawReceive(${chanVar})\n\t\tif !__ok {\n\t\t\tif __reason, __rejected := tnRejections.Load(${chanVar}); __rejected {\n\t\t\t\tpanic(__reason)\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
       if (declaration && isArrayBindingPattern(declaration.name)) {
         const memberType = elemType.startsWith('[]') ? elemType.slice(2) : undefined;
         useHelper('dynamic');

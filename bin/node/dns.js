@@ -113,7 +113,7 @@ func tnDnsPromise[T any](work func() (T, error)) chan T {
 			TnReject(ch, err)
 			return
 		}
-		ch <- v
+		TnAsyncSend(ch, v)
 	}()
 	return ch
 }

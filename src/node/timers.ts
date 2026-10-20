@@ -147,7 +147,7 @@ func TnTimeoutPromise[T any](ms float64, value T, options ...interface{}) chan T
 	timer = TnSetTimeout(ms, func() {
 		if !settled {
 			settled = true
-			ch <- value
+			TnAsyncSend(ch, value)
 		}
 	})
 	if signal != nil {

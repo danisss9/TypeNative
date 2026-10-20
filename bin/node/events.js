@@ -339,7 +339,7 @@ func TnEventsOnce(target tnEmitterLike, event string, options ...interface{}) ch
 		if event != "error" {
 			e.removeListener("error", errorListener)
 		}
-		ch <- args
+		TnAsyncSend(ch, args)
 	}
 	errorListener = func(args ...interface{}) {
 		e.removeListener(event, listener)
