@@ -1,0 +1,14 @@
+{
+    "include": ["**/*.ts"],
+    "compilerOptions": {
+      "target": "es2020",
+      "lib": [],
+      "types": ["../types/typenative.d.ts", "../types/typenative-go.d.ts", "../types/typenative-npm.d.ts"],
+      "rootDir": ".",
+      "strict": true,
+      "noImplicitAny": true,
+      "allowSyntheticDefaultImports": true,
+      // types/ is checked on its own (types/tsconfig.json)
+      "skipLibCheck": true
+    }
+}

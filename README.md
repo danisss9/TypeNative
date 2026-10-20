@@ -247,6 +247,10 @@ c.inc();
 console.log(`count=${c.count} seen=${seen.get('a')}`);
 ```
 
+Complete, runnable projects — including Node-vs-TypeNative benchmarks for
+each — live in [examples/](examples/): a hello world (startup), a recursive
+fibonacci (CPU), and a JSON web server (`node:http` GET/POST).
+
 ## How it works
 
 ```text
