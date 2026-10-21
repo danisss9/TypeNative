@@ -1243,7 +1243,8 @@ function visit(node, options = {}) {
         return toGoValueOfType(node.expression, getAsExpressionType(node));
     }
     else if (isTypeAssertionExpression(node)) {
-        return visit(node.expression);
+        // <T>x: like `x as T`
+        return toGoValueOfType(node.expression, getAsExpressionType(node));
     }
     else if (isTemplateExpression(node)) {
         return visitTemplateExpression(node);
@@ -1444,7 +1445,7 @@ function visit(node, options = {}) {
         // Static member access: `Counter.count` → `Counter_count`, also when the
         // member is inherited (`Child.make` → `Parent_make`) or private (`C.#n`)
         if (isIdentifier(node.expression)) {
-            const memberName = node.name.kind === 'PrivateIdentifier' ? node.name.text.slice(1) : node.name.text;
+            const memberName = memberKey(node.name);
             const owner = staticMemberOwner(node.expression.text, memberName);
             // the declaration's name (Go builtins such as `make` are renamed)
             if (owner)
@@ -1471,7 +1472,7 @@ function visit(node, options = {}) {
                 : leftGoType
                     ? leftGoType.slice(1).replace(/\[.*\]$/, '')
                     : undefined;
-            const accessorName = node.name.kind === 'PrivateIdentifier' ? node.name.text.slice(1) : node.name.text;
+            const accessorName = memberKey(node.name);
             if (className && classGetterMethods.has(`${className}.${accessorName}`)) {
                 return `${leftSide}.Get_${rightSide}()`;
             }
@@ -1574,8 +1575,11 @@ function visit(node, options = {}) {
             });
             return parts.join(';\n\t');
         }
-        // `const x: any = expr` keeps inference (x := expr); `any` elsewhere is interface{}
-        const isInferredAny = isAnyTypeNode(node.type) && !!node.initializer;
+        // `const x: any = expr` keeps inference (x := expr) for objects, so their
+        // members still dispatch; a primitive stays dynamic (`x - 1` on '6', and x
+        // may be reassigned another type); `any` elsewhere is interface{}
+        const anyInitType = isAnyTypeNode(node.type) && node.initializer ? inferExpressionType(node.initializer) : undefined;
+        const isInferredAny = isAnyTypeNode(node.type) && !!node.initializer && !['string', 'float64', 'bool'].includes(anyInitType ?? '');
         let type = isInferredAny ? ':' : getType(node.type);
         // Array aliasing: b = a keeps pointing at the same backing array
         if (isIdentifier(node.name) &&
@@ -1861,6 +1865,7 @@ function visit(node, options = {}) {
             objectType = resolveExpressionType(node.expression.expression);
         }
         currentCallArgTypes = (node.arguments ?? []).map((a) => inferExpressionType(a));
+        currentCallArgNodes = node.arguments ?? [];
         currentReceiverGoType = isPropertyAccessExpression(node.expression)
             ? inferExpressionType(node.expression.expression)
             : undefined;
@@ -2115,7 +2120,9 @@ function visit(node, options = {}) {
                 !isNilLiteral(node.left) &&
                 !isNilLiteral(node.right)) {
                 useHelper('dynamic');
-                const same = `TnSame(${visit(node.left)}, ${visit(node.right)})`;
+                // == / != coerce primitives; === / !== don't
+                const loose = node.operatorToken.kind === 'EqualsEqualsToken' || node.operatorToken.kind === 'ExclamationEqualsToken';
+                const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${visit(node.left)}, ${visit(node.right)})`;
                 return op === '==' ? same : `!${same}`;
             }
             const nullableComparison = visitNullableComparison(node, op);
@@ -2169,6 +2176,12 @@ function visit(node, options = {}) {
             useHelper('buffer');
             return `${visit(node.left.expression)}[int(${visit(node.left.argumentExpression)})] = TnByte(${visit(node.right)})`;
         }
+        // arr[i] = v on an array: writing past the end grows it, as in JS
+        if (op === '=' && isElementAccessExpression(node.left) && isExpressionStatement(node.parent)) {
+            const growing = visitGrowingArrayWrite(node.left, node.right);
+            if (growing)
+                return growing;
+        }
         // obj[key] = v on any
         if (op === '=' && isElementAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
             useHelper('dynamic');
@@ -2191,7 +2204,7 @@ function visit(node, options = {}) {
                 : node.left.expression.kind === 'ThisKeyword'
                     ? getEnclosingClassName(node)
                     : undefined;
-            const setterName = node.left.name.kind === 'PrivateIdentifier' ? node.left.name.text.slice(1) : node.left.name.text;
+            const setterName = memberKey(node.left.name);
             if (setterClass && classSetterMethods.has(`${setterClass}.${setterName}`)) {
                 return `${visit(node.left.expression)}.Set_${visit(node.left.name)}(${visit(node.right)})`;
             }
@@ -2550,8 +2563,8 @@ function visit(node, options = {}) {
         return 'self';
     }
     else if (node.kind === 'PrivateIdentifier') {
-        // #field → a plain (mangled) struct field
-        return goFieldName(node.text.slice(1));
+        // #field → a mangled struct field, distinct from a public `field`
+        return privateGoName(node.text);
     }
     else if (isEnumDeclaration(node)) {
         const enumName = node.name.text;
@@ -2661,8 +2674,7 @@ function visit(node, options = {}) {
             for (const member of (node.members ?? [])) {
                 const memberModifiers = member.modifiers;
                 const isStatic = memberModifiers?.some((m) => m.kind === 'StaticKeyword');
-                const isPrivate = member.name?.kind === 'PrivateIdentifier';
-                const memberName = isPrivate ? member.name.text.slice(1) : member.name?.text;
+                const memberName = memberKey(member.name);
                 if (isPropertyDeclaration(member) && memberName) {
                     if (isStatic) {
                         classStaticProps.add(`${className}.${memberName}`);
@@ -2749,7 +2761,7 @@ function visit(node, options = {}) {
             // Inferred once the class's fields and declared methods are known
             // (`return this.x`, `return this.other()`)
             for (const member of unannotatedMethods) {
-                const memberName = member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text;
+                const memberName = memberKey(member.name);
                 if ((member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
                     methods.set(memberName, `chan ${getPromiseChannelType(member)}`);
                     continue;
@@ -2783,9 +2795,10 @@ function visit(node, options = {}) {
             fields.push(`\t${extendsError ? 'TnError' : parentClass}`);
         }
         for (const member of (node.members ?? [])) {
-            if (isPropertyDeclaration(member)) {
+            // static properties are package-level Class_name variables, not fields
+            if (isPropertyDeclaration(member) && !(member.modifiers ?? []).some((m) => m.kind === 'StaticKeyword')) {
                 const fieldName = member.name?.kind === 'PrivateIdentifier'
-                    ? goFieldName(member.name.text.slice(1))
+                    ? privateGoName(member.name.text)
                     : visit(member.name);
                 let fieldType;
                 if (member.type && isArrayTypeNode(member.type)) {
@@ -2865,11 +2878,11 @@ function visit(node, options = {}) {
         for (const member of node.members ?? []) {
             if (!member.name?.text)
                 continue;
-            const memberKey = member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text;
+            const ownKey = memberKey(member.name);
             if (isGetAccessor(member) || isPropertyDeclaration(member))
-                ownAccessorKeys.add(`get:${memberKey}`);
+                ownAccessorKeys.add(`get:${ownKey}`);
             if (isSetAccessor(member) || isPropertyDeclaration(member))
-                ownAccessorKeys.add(`set:${memberKey}`);
+                ownAccessorKeys.add(`set:${ownKey}`);
         }
         for (const param of getParameterProperties(node)) {
             ownAccessorKeys.add(`get:${param.name.text}`);
@@ -2903,7 +2916,7 @@ function visit(node, options = {}) {
                     if ((isGetAccessor(member) || isSetAccessor(member)) && member.body && member.name?.text) {
                         if (member.modifiers?.some((m) => m.kind === 'StaticKeyword'))
                             continue;
-                        const accessorKey = `${isGetAccessor(member) ? 'get' : 'set'}:${member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text}`;
+                        const accessorKey = `${isGetAccessor(member) ? 'get' : 'set'}:${memberKey(member.name)}`;
                         if (ownAccessorKeys.has(accessorKey))
                             continue;
                         ownAccessorKeys.add(accessorKey);
@@ -2918,7 +2931,7 @@ function visit(node, options = {}) {
                         continue;
                     if (member.modifiers?.some((m) => m.kind === 'AbstractKeyword'))
                         continue;
-                    const methodName = member.name?.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name?.text;
+                    const methodName = memberKey(member.name);
                     if (!methodName || ownMethodNames.has(methodName))
                         continue;
                     ownMethodNames.add(methodName);
@@ -2956,7 +2969,7 @@ function visit(node, options = {}) {
                     }
                 }
                 else if (member.name && member.name.text) {
-                    genName = member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text;
+                    genName = memberKey(member.name);
                 }
                 if (genName) {
                     const yieldType = getGeneratorYieldType(member);
@@ -3944,7 +3957,7 @@ function fieldInitializers(classNode) {
         (isIdentifier(m.name) || m.name?.kind === 'PrivateIdentifier') &&
         !(m.modifiers ?? []).some((mod) => mod.kind === 'StaticKeyword'))
         .map((m) => {
-        const fieldName = m.name.kind === 'PrivateIdentifier' ? m.name.text.slice(1) : m.name.text;
+        const fieldName = memberKey(m.name);
         return `self.${goFieldName(fieldName)} = ${toGoValueOfType(m.initializer, getPropertyDeclarationType(m))}\n\t\t`;
     })
         .join('');
@@ -3972,6 +3985,8 @@ function mathCall(fn, args) {
 }
 // Go types of the arguments of the call being emitted (for call handlers)
 let currentCallArgTypes = [];
+// The argument nodes of that call (for handlers that need more than the types)
+let currentCallArgNodes = [];
 // for headers with several declarations / updates: Go's parallel forms
 // (i, j := 0, 10 and i, j = i+1, j-1)
 function visitMultiForHeader(node) {
@@ -4159,6 +4174,67 @@ function emitAccessor(member, receiver) {
     const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
     return `${lineMarker(member)}func (self *${receiver}) Set_${accessorName}(${parameterInfo.signature}) ${visit(member.body, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
 }
+// arr[i] = v through a pointer to the slice, so a write past the end can grow
+// it (holes read as the zero value, not undefined); '' when the array isn't
+// addressable or isn't a plain array
+function visitGrowingArrayWrite(target, value) {
+    const arrayType = inferExpressionType(target.expression) ?? '';
+    const sliceType = arrayType.startsWith('*[]') ? arrayType.slice(1) : arrayType;
+    if (!sliceType.startsWith('[]') || sliceType === '[]byte' || isTypedArrayGoType(arrayType))
+        return '';
+    const elementType = sliceType.slice(2);
+    const container = unwrapParentheses(target.expression);
+    let pointer = '';
+    if (isIdentifier(container) && referenceArrays.has(container.text)) {
+        pointer = getSafeName(container.text);
+    }
+    else if (isIdentifier(container) || isPropertyAccessExpression(container)) {
+        const code = visit(container);
+        // a field read through a getter call isn't addressable
+        if (code.endsWith(')'))
+            return '';
+        pointer = `&${code}`;
+    }
+    else if (isElementAccessExpression(container)) {
+        // m[0][1] = v: the inner array, addressed in its container
+        const outerType = inferExpressionType(container.expression) ?? '';
+        if (!outerType.replace(/^\*/, '').startsWith('[][]'))
+            return '';
+        const outer = unwrapParentheses(container.expression);
+        const outerCode = isIdentifier(outer) && referenceArrays.has(outer.text) ? `(*${getSafeName(outer.text)})` : visit(outer);
+        pointer = `&${outerCode}[int(${visit(container.argumentExpression)})]`;
+    }
+    else {
+        return '';
+    }
+    useHelper('arrayWrite');
+    return `TnSetAt[${elementType}](${pointer}, ${visit(target.argumentExpression)}, ${toGoValueOfType(value, elementType)})`;
+}
+// A TS (key, value) callback (JSON replacer / reviver) as the Go
+// func(string, interface{}) interface{} the JSON helpers call; '' if not a function
+function jsonCallbackAdapter(fnNode, fnCode) {
+    const fnType = fnNode ? inferExpressionType(fnNode) ?? '' : '';
+    if (!fnType.startsWith('func('))
+        return '';
+    const close = goFuncReturnType(fnType);
+    const paramList = fnType.slice(5, fnType.length - (close ? close.length + 1 : 0) - 1).trim();
+    const params = splitGoParameters(paramList).map((p) => {
+        // `func(k string, v any)`: drop parameter names
+        const space = p.indexOf(' ');
+        const first = space > 0 ? p.slice(0, space) : p;
+        return space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_]\w*$/.test(first)
+            ? p.slice(space + 1)
+            : p;
+    });
+    useHelper('dynamic');
+    const args = [];
+    if (params.length > 0)
+        args.push(params[0] === 'string' ? '__k' : `TnAs[${params[0]}](__k)`);
+    if (params.length > 1)
+        args.push(params[1] === 'interface{}' || params[1] === 'any' ? '__v' : `TnAs[${params[1]}](__v)`);
+    const call = `${fnCode}(${args.join(', ')})`;
+    return `func(__k string, __v interface{}) interface{} { ${close ? `return ${call}` : `${call}; return nil`} }`;
+}
 // Every declared class that extends `className`, directly or not
 function subclassNames(className) {
     const result = [];
@@ -4204,6 +4280,18 @@ function builtinInstanceOf(value, name) {
     }
     return '';
 }
+// #x → __x: a Go name that a public member `x` can't clash with
+function privateGoName(text) {
+    return `__${text.slice(1)}`;
+}
+// A member's name as the class registries key it (private names mangled)
+function memberKey(name) {
+    if (!name)
+        return '';
+    if (name.kind === 'PrivateIdentifier')
+        return privateGoName(name.text);
+    return name.text ?? '';
+}
 // Names a class declares itself: fields, methods, accessors, parameter
 // properties (private ones without the '#')
 function ownMemberNames(cls) {
@@ -4211,7 +4299,7 @@ function ownMemberNames(cls) {
     for (const member of cls.members ?? []) {
         if (!member.name?.text)
             continue;
-        names.add(member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text);
+        names.add(memberKey(member.name));
     }
     for (const param of getParameterProperties(cls))
         names.add(param.name.text);
@@ -5706,14 +5794,14 @@ function inferExpressionType(expr) {
     }
     if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression)) {
         // private methods are registered without their '#'
-        const methodName = expr.expression.name.kind === 'PrivateIdentifier' ? expr.expression.name.text.slice(1) : expr.expression.name.text;
+        const methodName = memberKey(expr.expression.name);
         // Class.staticMethod(): its declared or inferred result
         if (isIdentifier(expr.expression.expression) && classNames.has(expr.expression.expression.text)) {
             const owner = staticMemberOwner(expr.expression.expression.text, methodName);
             const staticMethod = owner
                 ? (declaredClasses.get(owner)?.members ?? []).find((m) => isMethodDeclaration(m) &&
                     (m.modifiers ?? []).some((mod) => mod.kind === 'StaticKeyword') &&
-                    (m.name?.kind === 'PrivateIdentifier' ? m.name.text.slice(1) : m.name?.text) === methodName)
+                    (memberKey(m.name)) === methodName)
                 : undefined;
             if (staticMethod) {
                 const isAsync = (staticMethod.modifiers ?? []).some((mod) => mod.kind === 'AsyncKeyword');
@@ -5865,6 +5953,9 @@ function inferExpressionType(expr) {
             return whenFalseType;
         if (whenFalseType && whenTrueType === `*${whenFalseType}`)
             return whenTrueType;
+        // one dynamic branch makes the result dynamic (`typeof v === 'number' ? v * 10 : v`)
+        if ([whenTrueType, whenFalseType].some((t) => t === 'interface{}' || t === 'any'))
+            return 'interface{}';
         const branchType = whenTrueType ?? whenFalseType;
         return branchType === 'nil' ? 'interface{}' : branchType;
     }
@@ -7563,11 +7654,20 @@ const callHandlers = {
     'JSON.stringify': (_caller, args) => {
         useHelper('jsonStringify');
         useHelper('dynamic');
-        return `TnJSONStringify(${args[0]}, ${args.length >= 3 ? '"  "' : '""'})`;
+        if (args.length === 1)
+            return `TnJSONStringify(${args[0]}, "")`;
+        const replacerNode = currentCallArgNodes[1];
+        const replacer = jsonCallbackAdapter(replacerNode, args[1]) || (isNilLiteral(replacerNode) ? 'nil' : args[1]);
+        return `TnJSONStringifyWith(${args[0]}, ${replacer}, ${args[2] ?? 'nil'})`;
     },
     'JSON.parse': (_caller, args) => {
-        importedPackages.add('encoding/json');
-        return `func() interface{} { var __v interface{}; json.Unmarshal([]byte(${args[0]}), &__v); return __v }()`;
+        useHelper('jsonStringify');
+        if (args.length >= 2) {
+            const reviver = jsonCallbackAdapter(currentCallArgNodes[1], args[1]);
+            if (reviver)
+                return `TnJSONParseWith(${args[0]}, ${reviver})`;
+        }
+        return `TnJSONParse(${args[0]})`;
     },
     'Object.keys': (_caller, args) => `${args[0]}.Keys()`,
     'Object.values': (_caller, args) => `${args[0]}.Values()`,
@@ -9378,6 +9478,7 @@ const helperRequires = {
     promise: ['error', 'eventLoop', 'asyncWait'],
     goMust: ['error'],
     bigint: ['error'],
+    jsonStringify: ['error', 'dynamic'],
     goBlocking: ['error', 'eventLoop'],
     decorators: [],
     jsx: [],
@@ -9498,7 +9599,7 @@ registerSystemExtra(nodeRegistry);
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
     orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt'],
-    jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe'],
+    jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
     objectAssign: ['reflect', 'unsafe'],
     typeOf: ['reflect'],
     isArray: ['reflect'],
@@ -9534,6 +9635,17 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    arrayWrite: `// arr[i] = v: past the end the array grows, as in JS (holes are zero values)
+func TnSetAt[T any](s *[]T, i float64, v T) {
+	n := int(i)
+	if n < 0 {
+		return // a[-1] = v sets a property in JS, not an element
+	}
+	if n >= len(*s) {
+		*s = append(*s, make([]T, n-len(*s)+1)...)
+	}
+	(*s)[n] = v
+}`,
     isArray: `// x instanceof Array: slices and the *[]T of array variables (not Buffers / Uint8Arrays)
 func TnIsArray(v interface{}) bool {
 	if _, ok := v.([]byte); ok {
@@ -9683,6 +9795,34 @@ func TnSame(a interface{}, b interface{}) bool {
 		return false
 	}
 	return a == b
+}
+
+// a == b (JS loose equality): null == undefined; a number, string or boolean
+// compares with another primitive by ToNumber; two strings compare as strings
+func TnLooseEqual(a interface{}, b interface{}) bool {
+	if TnSame(a, b) {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	_, aString := a.(string)
+	_, bString := b.(string)
+	if aString && bString {
+		return false
+	}
+	if !tnIsPrimitive(a) || !tnIsPrimitive(b) {
+		return false
+	}
+	return TnNumber(a) == TnNumber(b)
+}
+
+func tnIsPrimitive(v interface{}) bool {
+	switch v.(type) {
+	case float64, string, bool:
+		return true
+	}
+	return false
 }
 
 func TnAt[T any](s []T, i float64) T {
@@ -10195,149 +10335,349 @@ func TnIsNil(v interface{}) bool {
 	}
 	return "object"
 }`,
-    jsonStringify: `// JSON.stringify including unexported struct fields (Go's encoder skips them)
+    jsonStringify: `// JSON.stringify: JS's SerializeJSONProperty over TypeNative values
+// (unexported struct fields included; Go's encoder would skip them)
+type tnJSONWriter struct {
+	buf      bytes.Buffer
+	indent   string
+	replacer func(key string, value interface{}) interface{}
+	allow    map[string]bool
+	stack    []uintptr
+}
+
 func TnJSONStringify(v interface{}, indent string) string {
-	var buf bytes.Buffer
-	tnJSONWrite(&buf, reflect.ValueOf(v), indent, 0)
-	return buf.String()
+	w := &tnJSONWriter{indent: indent}
+	w.property("", v, 0)
+	return w.buf.String()
 }
 
-func tnJSONNewline(buf *bytes.Buffer, indent string, depth int) {
-	if indent == "" {
+// JSON.stringify(value, replacer, space): the replacer is a key/value
+// function or a list of keys; space a number of spaces or a string (≤ 10)
+func TnJSONStringifyWith(v interface{}, replacer interface{}, space interface{}) string {
+	w := &tnJSONWriter{}
+	switch s := space.(type) {
+	case float64:
+		w.indent = strings.Repeat(" ", int(math.Max(0, math.Min(10, s))))
+	case string:
+		w.indent = s
+		if len(w.indent) > 10 {
+			w.indent = w.indent[:10]
+		}
+	}
+	switch r := replacer.(type) {
+	case func(string, interface{}) interface{}:
+		w.replacer = r
+	case []string:
+		w.allow = map[string]bool{}
+		for _, k := range r {
+			w.allow[k] = true
+		}
+	case []interface{}:
+		w.allow = map[string]bool{}
+		for _, k := range r {
+			w.allow[TnJSString(k)] = true
+		}
+	case []float64:
+		w.allow = map[string]bool{}
+		for _, k := range r {
+			w.allow[TnNumStr(k)] = true
+		}
+	}
+	if w.replacer != nil {
+		v = w.replacer("", v)
+	}
+	if !w.property("", v, 0) {
+		return ""
+	}
+	return w.buf.String()
+}
+
+// Values being written, innermost last: meeting one again is a cycle
+func (w *tnJSONWriter) enter(p uintptr) {
+	for _, seen := range w.stack {
+		if seen == p {
+			panic(TnNodeError("TypeError", "", "Converting circular structure to JSON"))
+		}
+	}
+	w.stack = append(w.stack, p)
+}
+
+func (w *tnJSONWriter) leave() {
+	w.stack = w.stack[:len(w.stack)-1]
+}
+
+func (w *tnJSONWriter) newline(depth int) {
+	if w.indent == "" {
 		return
 	}
-	buf.WriteByte('\\n')
+	w.buf.WriteByte('\\n')
 	for i := 0; i < depth; i++ {
-		buf.WriteString(indent)
+		w.buf.WriteString(w.indent)
 	}
 }
 
-func tnJSONWrite(buf *bytes.Buffer, rv reflect.Value, indent string, depth int) {
-	if !rv.IsValid() {
-		buf.WriteString("null")
-		return
+// toJSON() methods (Dates' included): the value serialized in their place
+func tnJSONToJSON(v interface{}) interface{} {
+	switch t := v.(type) {
+	case time.Time:
+		if t.IsZero() {
+			return nil
+		}
+		return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	case interface{ toJSON() string }:
+		return t.toJSON()
+	case interface{ toJSON() float64 }:
+		return t.toJSON()
+	case interface{ toJSON() bool }:
+		return t.toJSON()
+	case interface{ toJSON() interface{} }:
+		return t.toJSON()
+	}
+	return v
+}
+
+var tnGoKeywords = map[string]bool{"break": true, "case": true, "chan": true, "const": true, "continue": true, "default": true, "defer": true, "else": true, "fallthrough": true, "for": true, "func": true, "go": true, "goto": true, "if": true, "import": true, "interface": true, "map": true, "package": true, "range": true, "return": true, "select": true, "struct": true, "switch": true, "type": true, "var": true}
+
+// A struct field's JS name (Go keywords carry a trailing '_')
+func tnJSONFieldName(name string) string {
+	if strings.HasSuffix(name, "_") && tnGoKeywords[strings.TrimSuffix(name, "_")] {
+		return strings.TrimSuffix(name, "_")
+	}
+	return name
+}
+
+// Writes one value; false when it serializes to undefined (functions)
+func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
+	v = tnJSONToJSON(v)
+	switch t := v.(type) {
+	case nil:
+		w.buf.WriteString("null")
+		return true
+	case bool:
+		if t {
+			w.buf.WriteString("true")
+		} else {
+			w.buf.WriteString("false")
+		}
+		return true
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			w.buf.WriteString("null")
+		} else {
+			w.buf.WriteString(TnNumStr(t))
+		}
+		return true
+	case string:
+		data, _ := tnJSONMarshal(t)
+		w.buf.Write(data)
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Type().String() == "*big.Int" {
+		panic(TnNodeError("TypeError", "", "Do not know how to serialize a BigInt"))
 	}
 	switch rv.Kind() {
+	case reflect.Func:
+		return false
 	case reflect.Pointer, reflect.Interface:
 		if rv.IsNil() {
-			buf.WriteString("null")
-			return
+			w.buf.WriteString("null")
+			return true
 		}
-		tnJSONWrite(buf, rv.Elem(), indent, depth)
-	case reflect.Bool:
-		if rv.Bool() {
-			buf.WriteString("true")
-		} else {
-			buf.WriteString("false")
+		if rv.Kind() == reflect.Pointer {
+			// Records and Maps: insertion order; Maps and Sets serialize as {}
+			if m, ok := v.(interface {
+				Entries() [][]interface{}
+				TnJSKind() uint8
+			}); ok {
+				if m.TnJSKind() != 0 {
+					w.buf.WriteString("{}")
+					return true
+				}
+				return w.object(depth, func(emit func(string, interface{})) {
+					for _, e := range m.Entries() {
+						emit(fmt.Sprint(e[0]), e[1])
+					}
+				})
+			}
+			if rv.Elem().Kind() == reflect.Struct || rv.Elem().Kind() == reflect.Slice || rv.Elem().Kind() == reflect.Map {
+				w.enter(rv.Pointer())
+				defer w.leave()
+			}
 		}
-	case reflect.Float32, reflect.Float64:
-		buf.WriteString(TnNumStr(rv.Float()))
-	case reflect.String:
-		data, _ := tnJSONMarshal(rv.String())
-		buf.Write(data)
+		elem := rv.Elem()
+		if elem.CanInterface() {
+			return w.property(key, elem.Interface(), depth)
+		}
+		return w.property(key, reflect.NewAt(elem.Type(), unsafe.Pointer(elem.UnsafeAddr())).Elem().Interface(), depth)
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
-			buf.WriteString("null")
-			return
+			w.buf.WriteString("[]")
+			return true
 		}
-		buf.WriteByte('[')
+		if rv.Len() == 0 {
+			w.buf.WriteString("[]")
+			return true
+		}
+		if rv.Kind() == reflect.Slice {
+			w.enter(rv.Pointer())
+			defer w.leave()
+		}
+		w.buf.WriteByte('[')
 		for i := 0; i < rv.Len(); i++ {
 			if i > 0 {
-				buf.WriteByte(',')
-				tnJSONNewline(buf, indent, depth+1)
+				w.buf.WriteByte(',')
 			}
-			tnJSONWrite(buf, rv.Index(i), indent, depth+1)
+			w.newline(depth + 1)
+			item := rv.Index(i).Interface()
+			if w.replacer != nil {
+				item = w.replacer(strconv.Itoa(i), item)
+			}
+			if !w.property(strconv.Itoa(i), item, depth+1) {
+				w.buf.WriteString("null")
+			}
 		}
-		buf.WriteByte(']')
+		w.newline(depth)
+		w.buf.WriteByte(']')
+		return true
 	case reflect.Map:
-		buf.WriteByte('{')
+		// Dynamic objects (JSON.parse results): Go maps keep no order, keys sort
+		w.enter(rv.Pointer())
+		defer w.leave()
 		keys := make([]string, 0, rv.Len())
-		byKey := map[string]reflect.Value{}
+		byKey := map[string]interface{}{}
 		for _, k := range rv.MapKeys() {
 			ks := fmt.Sprint(k.Interface())
 			keys = append(keys, ks)
-			byKey[ks] = rv.MapIndex(k)
+			byKey[ks] = rv.MapIndex(k).Interface()
 		}
 		sort.Strings(keys)
-		for i, ks := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-				tnJSONNewline(buf, indent, depth+1)
+		return w.object(depth, func(emit func(string, interface{})) {
+			for _, ks := range keys {
+				emit(ks, byKey[ks])
 			}
-			kd, _ := tnJSONMarshal(ks)
-			buf.Write(kd)
-			buf.WriteByte(':')
-			tnJSONWrite(buf, byKey[ks], indent, depth+1)
-		}
-		buf.WriteByte('}')
+		})
 	case reflect.Struct:
-		// Records (TnMap) keep their key order; reached through a pointer, the
-		// struct value needs Addr() for pointer-receiver methods
-		if rv.CanAddr() {
-			if m, ok := rv.Addr().Interface().(interface{ Entries() [][]interface{} }); ok {
-				buf.WriteByte('{')
-				for i, e := range m.Entries() {
-					if i > 0 {
-						buf.WriteByte(',')
-					}
-					tnJSONNewline(buf, indent, depth+1)
-					kd, _ := tnJSONMarshal(fmt.Sprint(e[0]))
-					buf.Write(kd)
-					buf.WriteByte(':')
-					if indent != "" {
-						buf.WriteByte(' ')
-					}
-					tnJSONWrite(buf, reflect.ValueOf(e[1]), indent, depth+1)
-				}
-				if len(m.Entries()) > 0 {
-					tnJSONNewline(buf, indent, depth)
-				}
-				buf.WriteByte('}')
-				return
+		if m, ok := v.(json.Marshaler); ok {
+			if data, err := m.MarshalJSON(); err == nil {
+				w.buf.Write(data)
+				return true
 			}
 		}
-		if m, ok := rv.Interface().(json.Marshaler); ok {
-			data, err := m.MarshalJSON()
-			if err == nil {
-				buf.Write(data)
-				return
+		return w.object(depth, func(emit func(string, interface{})) { w.structFields(rv, emit) })
+	}
+	data, err := tnJSONMarshal(v)
+	if err != nil {
+		w.buf.WriteString("null")
+		return true
+	}
+	w.buf.Write(data)
+	return true
+}
+
+// Class instances and object literals: fields in declaration order, inherited
+// (embedded) ones first; #private (__name), function and internal fields skipped
+func (w *tnJSONWriter) structFields(rv reflect.Value, emit func(string, interface{})) {
+	if !rv.CanAddr() {
+		tmp := reflect.New(rv.Type()).Elem()
+		tmp.Set(rv)
+		rv = tmp
+	}
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		value := reflect.NewAt(f.Type, unsafe.Pointer(rv.Field(i).UnsafeAddr())).Elem()
+		if f.Anonymous {
+			if f.Type.Kind() == reflect.Struct && f.Type.Name() != "TnError" {
+				w.structFields(value, emit)
 			}
+			continue
 		}
-		buf.WriteByte('{')
-		rt := rv.Type()
-		first := true
-		for i := 0; i < rt.NumField(); i++ {
-			f := rt.Field(i)
-			value := rv.Field(i)
-			if value.Kind() == reflect.Func {
-				continue
-			}
-			if !value.CanInterface() {
-				// Unexported field: read it through a pointer to bypass the flag
-				if !value.CanAddr() {
-					continue
-				}
-				value = reflect.NewAt(value.Type(), unsafe.Pointer(value.UnsafeAddr())).Elem()
-			}
-			if !first {
-				buf.WriteByte(',')
-				tnJSONNewline(buf, indent, depth+1)
-			}
-			first = false
-			kd, _ := tnJSONMarshal(f.Name)
-			buf.Write(kd)
-			buf.WriteByte(':')
-			tnJSONWrite(buf, value, indent, depth+1)
+		if value.Kind() == reflect.Func || strings.HasPrefix(f.Name, "__") {
+			continue
 		}
-		buf.WriteByte('}')
-	default:
-		data, err := tnJSONMarshal(rv.Interface())
-		if err != nil {
-			buf.WriteString("null")
+		emit(tnJSONFieldName(f.Name), value.Interface())
+	}
+}
+
+func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}))) bool {
+	w.buf.WriteByte('{')
+	wrote := false
+	each(func(key string, value interface{}) {
+		if w.allow != nil && !w.allow[key] {
 			return
 		}
-		buf.Write(data)
+		if w.replacer != nil {
+			value = w.replacer(key, value)
+		}
+		mark := w.buf.Len()
+		if wrote {
+			w.buf.WriteByte(',')
+		}
+		w.newline(depth + 1)
+		kd, _ := tnJSONMarshal(key)
+		w.buf.Write(kd)
+		w.buf.WriteByte(':')
+		if w.indent != "" {
+			w.buf.WriteByte(' ')
+		}
+		if !w.property(key, value, depth+1) {
+			w.buf.Truncate(mark) // undefined values leave the key out
+			return
+		}
+		wrote = true
+	})
+	if wrote {
+		w.newline(depth)
 	}
+	w.buf.WriteByte('}')
+	return true
+}
+
+// JSON.parse: a SyntaxError for invalid input, as in JS
+func TnJSONParse(text string) interface{} {
+	var v interface{}
+	if err := json.Unmarshal([]byte(text), &v); err != nil {
+		msg := "Unexpected end of JSON input"
+		if se, ok := err.(*json.SyntaxError); ok && int(se.Offset) <= len(text) && se.Offset > 0 && strings.TrimSpace(text) != "" {
+			at := int(se.Offset) - 1
+			if at < len(text) && !strings.HasPrefix(err.Error(), "unexpected end") {
+				shown := text
+				if len(shown) > 32 {
+					shown = shown[:32] + "..."
+				}
+				msg = fmt.Sprintf("Unexpected token '%c', %q is not valid JSON", text[at], shown)
+			}
+		}
+		panic(TnNodeError("SyntaxError", "", msg))
+	}
+	return v
+}
+
+// JSON.parse(text, reviver): the reviver sees every value bottom-up
+// (a nil result keeps the key, set to null)
+func TnJSONParseWith(text string, reviver func(string, interface{}) interface{}) interface{} {
+	root := TnJSONParse(text)
+	var walk func(key string, v interface{}) interface{}
+	walk = func(key string, v interface{}) interface{} {
+		switch t := v.(type) {
+		case map[string]interface{}:
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				t[k] = walk(k, t[k])
+			}
+		case []interface{}:
+			for i := range t {
+				t[i] = walk(strconv.Itoa(i), t[i])
+			}
+		}
+		return reviver(key, v)
+	}
+	return walk("", root)
 }
 
 // json.Marshal without HTML escaping of <, > and & (JSON.stringify does not escape them)

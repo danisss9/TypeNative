@@ -27,7 +27,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `null`                                         |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `undefined`                                    |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `any` / `unknown`                              |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Dynamic values handled at runtime (JSON-like objects, arrays, primitives) |
-| A variable declared `any` with a typed initializer (`const x: any = '6'`) | ❌ | — | Keeps the initializer's Go type, so `x - 1` fails the Go build; values that arrive as `any` (parameters, `JSON.parse`) are dynamic |
+| A variable declared `any` / `unknown` with a primitive initializer (`const x: any = '6'`) | ✅ | [semantics-any-variables.ts](conformance/semantics-any-variables.ts) | Dynamic: `-` `*` `/` use ToNumber, `==` coerces like JS, reassignment to another type works. `any + number` adds numbers (a string operand isn't concatenated); objects keep their inferred type |
 | Nullable types (`T \| null`, `T \| undefined`) |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     | Transpiled to Go pointer types                                            |
 | `bigint`                                       |   ✅    | [syntax-bigint.ts](conformance/syntax-bigint.ts)                     | `2n` literals → `*big.Int`; `**` → `.Exp`, comparisons via `.Cmp`         |
 | `bigint` bitwise / shift operators (`&`, `\|`, `^`, `~`, `<<`, `>>`, compound forms) | ✅ | [syntax-bigint-bitwise.ts](conformance/syntax-bigint-bitwise.ts) | `math/big`'s two's-complement `And` / `Or` / `Xor` / `Not`; shifts round toward -Infinity |
@@ -57,7 +57,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Hex / octal / binary literals           |   ✅    | [syntax-numeric-literals.ts](conformance/syntax-numeric-literals.ts)             | `0xFF`, `0o17`, `0b1010`, `1e3`                                          |
 | `var` declarations (hoisting)           |   ✅    | [syntax-var.ts](conformance/syntax-var.ts)                                       | Function- and module-level `var`                                         |
 | `using` / `await using` declarations    |   ✅    | [syntax-using.ts](conformance/syntax-using.ts)                                   | Disposed in reverse order when the block ends (`defer`); `[Symbol.dispose]` methods |
-| Writing past the end of an array (`arr[arr.length + 2] = x`) | ❌ | — | Plain Go indexing: index out of range. Growing the slice is feasible |
+| Writing past the end of an array (`arr[arr.length + 2] = x`) | ✅ | [semantics-array-growth.ts](conformance/semantics-array-growth.ts) | The array grows; holes read as the zero value (`0`, `""`), not `undefined` |
 | Sparse-array holes | 🚫 | — | Slices have no holes: a hole would read as the zero value, not `undefined` |
 
 ## Operators
@@ -80,7 +80,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `typeof`                     |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                             | `typeof x === "string"`; `"function"` for function values                    |
 | `instanceof`                 |   ✅    | [syntax-instanceof.ts](conformance/syntax-instanceof.ts)                     | User classes, `Error` classes and Node globals (`URL`, `Uint8Array`, …)      |
 | JS truthiness                |   ✅    | [syntax-optional-params.ts](conformance/syntax-optional-params.ts)           | `if (str)`, `!count`, `a \|\| fallback` on any type                          |
-| Loose equality (`==`)        |   ✅    | [semantics-loose-equality.ts](conformance/semantics-loose-equality.ts)       | `bool`/`number`/`string` mixtures coerce like JS (`TnNumber`/`TnParseFloat`) |
+| Loose equality (`==`)        |   ✅    | [semantics-loose-equality.ts](conformance/semantics-loose-equality.ts), [semantics-any-variables.ts](conformance/semantics-any-variables.ts) | `bool`/`number`/`string` mixtures coerce like JS (`TnNumber`/`TnParseFloat`), also between `any` values (`TnLooseEqual`) |
 | Optional call (`fn?.()`)     |   ✅    | [syntax-optional-call.ts](conformance/syntax-optional-call.ts)               | Nil check on the function value; result is nullable                          |
 | Comma operator               |   ✅    | [syntax-comma-operator.ts](conformance/syntax-comma-operator.ts)             | In `for` headers (`i = 0, j = 10` / `i++, j--`)                              |
 | `void` operator              |   ✅    | [syntax-void-operator.ts](conformance/syntax-void-operator.ts)               | Evaluates, then `nil`                                                        |
@@ -159,7 +159,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Getters / setters (classes)                                      |   ✅    | [syntax-class-getters.ts](conformance/syntax-class-getters.ts)                           | `c.v` reads/writes rewrite to `Get_v()`/`Set_v()` accessor calls                        |
 | Getters (object literals)                                        |   ✅    | [syntax-object-getters.ts](conformance/syntax-object-getters.ts)                         | Getter closures stored as function fields; reads invoke them                            |
 | Object-literal methods                                           |   ✅    | [syntax-object-methods.ts](conformance/syntax-object-methods.ts)                         | Method closures stored as function fields capturing the instance (`this` → the object)  |
-| Private `#` fields                                               |   ✅    | [syntax-class-private-fields.ts](conformance/syntax-class-private-fields.ts)             | `#secret` → a plain (name-mangled) struct field                                         |
+| Private `#` fields                                               |   ✅    | [syntax-class-private-fields.ts](conformance/syntax-class-private-fields.ts)             | `#secret` → a `__secret` struct field, left out of `JSON.stringify` and `console.log`  |
 | Access modifiers (`private` / `protected` / `public` on members) |   ✅    | [syntax-access-modifiers.ts](conformance/syntax-access-modifiers.ts)                     | `private` / `protected` / `public` are erased                                           |
 | Abstract classes                                                 |   ✅    | [syntax-class-abstract.ts](conformance/syntax-class-abstract.ts)                         | Abstract members skipped; concrete methods copied onto subclasses                       |
 | Static initialization blocks (`static {}`)                       |   ✅    | [syntax-static-blocks.ts](conformance/syntax-static-blocks.ts)                           | Go `func init()`                                                                        |
@@ -172,7 +172,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Field initializers reading parameter properties or parent fields | ✅ | [syntax-class-field-order.ts](conformance/syntax-class-field-order.ts) | `super()`, then parameter properties, then field initializers, then the constructor body (TS's ES2020 order) |
 | Arrow-function fields (`h = () => this.x`), fields reading earlier fields | ✅ | — | Run in the constructor; `this` is the instance |
 | Private methods (`#m()`) | ✅ | [syntax-method-return-inference.ts](conformance/syntax-method-return-inference.ts) | |
-| A private and a public member with the same name (`#x` and `x`) | ❌ | — | Both become the Go name `x` (`already declared`) |
+| A private and a public member with the same name (`#x` and `x`) | ✅ | [syntax-private-public-names.ts](conformance/syntax-private-public-names.ts) | `#x` is the Go field `__x` |
 | Private accessors (`get #x()`) / static private fields (`static #x`) | ✅ | [syntax-class-accessor-inheritance.ts](conformance/syntax-class-accessor-inheritance.ts), [syntax-class-static-inheritance.ts](conformance/syntax-class-static-inheritance.ts) | |
 | `accessor` fields | ✅ | — | Plain fields (decorating them is not supported) |
 | Static inheritance (`Child.staticOfParent()`) | ✅ | [syntax-class-static-inheritance.ts](conformance/syntax-class-static-inheritance.ts) | Resolved to the declaring class's `Parent_member` at compile time |
@@ -212,7 +212,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Type aliases                                              |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `type P = { x: number }` → Go struct; alias-of-alias                            |
 | Union types                                               |   ✅    | [syntax-union-types.ts](conformance/syntax-union-types.ts)           | Narrowed via `typeof` checks                                                    |
 | Type guards (`is`)                                        |   ✅    | [syntax-type-guards.ts](conformance/syntax-type-guards.ts)           | `p is T` → Go `bool`; `in` checks struct fields at runtime                      |
-| `as` assertions                                           |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `x as T`, incl. angle-bracket syntax                                            |
+| `as` assertions                                           |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `x as T`, incl. angle-bracket syntax (`<T>x`); `any` values convert to `T`          |
 | Self-host contextual typing                               |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Object/array literals typed from context, `Record` literals, `in`, `any` params |
 | Decorators (`@`)                                          |   ✅    | [syntax-decorators.ts](conformance/syntax-decorators.ts)             | Standard method & class decorators, applied in source order; `this` is the receiver |
 | Field / accessor / parameter decorators, `context.addInitializer`, `Symbol.metadata` | ❌ | — | Only method and class decorators: field and accessor decorators fail the type check (`ClassFieldDecoratorContext` / `ClassAccessorDecoratorContext` are not declared) |
@@ -345,9 +345,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | API              | Status | Probe                                                      | Notes                                                   |
 | ---------------- | :----: | ---------------------------------------------------------- | -------------------------------------                   |
 | `JSON.parse`     |   ✅    | [lib-json-parse.ts](conformance/lib-json-parse.ts)         | Mapped to `encoding/json` `Unmarshal`; assigned to an interface type, the result converts into its struct |
-| `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields; compact output only (see below) |
-| `JSON.stringify` `space` argument | ❌ | — | Any third argument gives one fixed layout that doesn't match Node's (newlines between top-level keys only) |
-| `JSON.stringify` replacer / `toJSON()`; `JSON.parse` reviver | ❌ | — | Ignored |
+| `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields and inherited ones |
+| `JSON.stringify` `space`, replacer (function or key list), `toJSON()`; circular structures; `JSON.parse` reviver and `SyntaxError`s | ✅ | [lib-json-options.ts](conformance/lib-json-options.ts) | Node's layout; Dates serialize as ISO strings, `Map` / `Set` as `{}`, bigints throw. A replacer or reviver returning `undefined` gives `null` (it doesn't drop the key) |
+| Key order of `JSON.parse` objects | ❌ | — | Parsed objects are Go maps: `JSON.stringify` writes their keys sorted |
 
 ### `Object`
 
@@ -1263,15 +1263,12 @@ These follow from compiling to a native Go binary, and won't change:
    and `static #x`, labeled blocks, exhaustive `switch`, enum reverse mapping, bigint bitwise
    operators, Date arithmetic, async methods, object-literal setters, declaration merging, and
    computed keys in `Object.hasOwn` / `defineProperty`. Remaining:
-   - `#x` and `x` in one class collide
-   - a `const x: any` keeps its initializer's Go type
-   - writing past the end of an array
    - `any[]` arrays don't share `push` through parameters
    - polymorphic `this` chains and `inst[key]` (also in step 3)
 2. **Everyday built-ins:**
    - `Date` (string and multi-argument constructors, `Date.parse`, setters, local-time
      `toString`)
-   - `JSON.stringify` `space` / replacer / `toJSON`, and the `JSON.parse` reviver
+   - key order of `JSON.parse` objects (`space` / replacer / `toJSON` / reviver are done)
    - `err.stack`
    - `bind` / `fn.name`
    - the missing `Promise` / `Array` / `Object` / `String` / `Number` / `Math` / `BigInt` /

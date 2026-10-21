@@ -503,8 +503,12 @@ declare function queueMicrotask(callback: () => void): void;
 // --- JSON / Object / process ---
 
 interface JSON {
-  stringify(value: any, replacer?: any, space?: number | string): string;
-  parse(text: string): any;
+  stringify(
+    value: any,
+    replacer?: ((key: string, value: any) => any) | (string | number)[] | null,
+    space?: number | string
+  ): string;
+  parse(text: string, reviver?: (key: string, value: any) => any): any;
 }
 declare var JSON: JSON;
 
