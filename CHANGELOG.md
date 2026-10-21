@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- `conformance.md` separates ❌ (not implemented yet, feasible) from 🚫 (will not be implemented)
+  and explains why for each row. Several rows that were ❌ for "impossible" reasons are now
+  marked feasible: terminal size and raw mode, `umask`, `getCallSites`, workers and `fork` for
+  another file, and freeing SQLite statements on GC
+- Rows for gaps the matrix didn't list, each checked by compiling a small program. Among them:
+  - Date parsing, setters and arithmetic
+  - `JSON.stringify` `space` / replacer / `toJSON`
+  - `err.stack`, `bind`, `Intl`, `Temporal`, `WeakRef`
+  - class methods without a return-type annotation
+  - field initializers that run too early
+  - `instanceof Map` / `Date`
+  - static and accessor inheritance
+- A "Roadmap: known limitations" section, which the link in CONTRIBUTION.md pointed to
+
 ## [0.4.0] - 2026-10-19
 
 A fuller CLI (`--target` cross-compilation, `--release`, `--emit-go`), typed arrays, Brotli and
