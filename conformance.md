@@ -4,7 +4,18 @@ Every TypeScript language feature and standard-library API TypeNative aims to
 support, split by area. Each ✅ row links to the [conformance/](conformance/)
 probe that proves it transpiles correctly (`npm run conformance`, filter with an
 optional substring: `node scripts/conformance.mjs <filter>`; `--native` runs the
-self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
+self-hosted binary).
+
+| Status | Meaning |
+| :----: | ------- |
+| ✅ | Implemented; the linked probe proves it (`—` in the Probe column: implemented, not probed yet) |
+| ❌ | Not implemented yet, but feasible: a known gap |
+| 🚫 | Will not be implemented: needs something a native Go binary doesn't have (a JavaScript engine, mutable prototypes, shared memory between isolates, cgo), or is deprecated upstream |
+
+User programs are type-checked against [types/](types/) only (`lib: []`), so an API that isn't
+declared there fails the type check before it reaches the transpiler. The
+[roadmap](#roadmap-known-limitations) lists the structural limitations and the order in which the
+❌ rows are planned.
 
 ## Basic types
 
@@ -18,6 +29,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `any` / `unknown`                              |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Dynamic values handled at runtime (JSON-like objects, arrays, primitives) |
 | Nullable types (`T \| null`, `T \| undefined`) |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     | Transpiled to Go pointer types                                            |
 | `bigint`                                       |   ✅    | [syntax-bigint.ts](conformance/syntax-bigint.ts)                     | `2n` literals → `*big.Int`; `**` → `.Exp`, comparisons via `.Cmp`         |
+| `bigint` bitwise / shift operators, `BigInt()`, `BigInt.asIntN` / `asUintN`, bigint–number comparisons | ❌ | — | `a & b` on bigints casts to `float64` (the Go build fails); `BigInt()` is not declared |
 | `symbol`                                       |   ✅    | [syntax-symbols.ts](conformance/syntax-symbols.ts)                   | `Symbol()` → unique `*TnSymbol` pointers, usable as record keys           |
 | `object` type                                  |   ✅    | [syntax-object-type.ts](conformance/syntax-object-type.ts)           | `object` → `interface{}`                                                  |
 | `void` / `never`                               |   ✅    | [syntax-void-never.ts](conformance/syntax-void-never.ts)             | No return value in Go                                                     |
@@ -31,7 +43,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Object destructuring                    |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads; the initializer is evaluated once ([lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts)) |
 | Destructuring with defaults             |   ✅    | [syntax-destructuring-defaults.ts](conformance/syntax-destructuring-defaults.ts) | Missing elements/properties take defaults (nil- and bounds-checked)      |
 | Destructured parameters                 |   ✅    | [syntax-destructuring-params.ts](conformance/syntax-destructuring-params.ts)     | `function f({ a, b }: T)`, `([x, y]: number[])`                          |
-| Object shorthand                        |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads           |
+| Object shorthand                        |   ✅    | [lib-go-container-heap.ts](conformance/lib-go-container-heap.ts)                 | `{ name, priority }` takes the fields from same-named variables          |
 | Object spread                           |   ✅    | [syntax-object-spread.ts](conformance/syntax-object-spread.ts)                   | Spread sources copied field-by-field into the new struct                 |
 | Array spread                            |   ✅    | [syntax-array-spread.ts](conformance/syntax-array-spread.ts)                     | `[...arr]`, `fn(...args)`                                                |
 | `delete` operator                       |   ✅    | [syntax-delete.ts](conformance/syntax-delete.ts)                                 | `delete o.key` on records                                                |
@@ -43,6 +55,8 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Hex / octal / binary literals           |   ✅    | [syntax-numeric-literals.ts](conformance/syntax-numeric-literals.ts)             | `0xFF`, `0o17`, `0b1010`, `1e3`                                          |
 | `var` declarations (hoisting)           |   ✅    | [syntax-var.ts](conformance/syntax-var.ts)                                       | Function- and module-level `var`                                         |
 | `using` / `await using` declarations    |   ✅    | [syntax-using.ts](conformance/syntax-using.ts)                                   | Disposed in reverse order when the block ends (`defer`); `[Symbol.dispose]` methods |
+| Writing past the end of an array (`arr[arr.length + 2] = x`) | ❌ | — | Plain Go indexing: index out of range. Growing the slice is feasible |
+| Sparse-array holes | 🚫 | — | Slices have no holes: a hole would read as the zero value, not `undefined` |
 
 ## Operators
 
@@ -61,14 +75,16 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Optional chaining            |   ✅    | [syntax-optional-chaining.ts](conformance/syntax-optional-chaining.ts)       | `obj?.prop`, `arr?.[i]`, chains across calls                                 |
 | Nullish / logical assignment |   ✅    | [syntax-logical-assignment.ts](conformance/syntax-logical-assignment.ts)     | `??=`, `\|\|=`, `&&=`                                                        |
 | `in` operator                |   ✅    | [syntax-in-operator.ts](conformance/syntax-in-operator.ts)                   | `"key" in obj` on records                                                    |
-| `typeof`                     |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                             | `"key" in obj`, `typeof x === "string"`                                      |
-| `instanceof`                 |   ✅    | [syntax-instanceof.ts](conformance/syntax-instanceof.ts)                     | Class instance checks                                                        |
+| `typeof`                     |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                             | `typeof x === "string"`; `"function"` for function values                    |
+| `instanceof`                 |   ✅    | [syntax-instanceof.ts](conformance/syntax-instanceof.ts)                     | User classes, `Error` classes and Node globals (`URL`, `Uint8Array`, …)      |
 | JS truthiness                |   ✅    | [syntax-optional-params.ts](conformance/syntax-optional-params.ts)           | `if (str)`, `!count`, `a \|\| fallback` on any type                          |
 | Loose equality (`==`)        |   ✅    | [semantics-loose-equality.ts](conformance/semantics-loose-equality.ts)       | `bool`/`number`/`string` mixtures coerce like JS (`TnNumber`/`TnParseFloat`) |
 | Optional call (`fn?.()`)     |   ✅    | [syntax-optional-call.ts](conformance/syntax-optional-call.ts)               | Nil check on the function value; result is nullable                          |
 | Comma operator               |   ✅    | [syntax-comma-operator.ts](conformance/syntax-comma-operator.ts)             | In `for` headers (`i = 0, j = 10` / `i++, j--`)                              |
 | `void` operator              |   ✅    | [syntax-void-operator.ts](conformance/syntax-void-operator.ts)               | Evaluates, then `nil`                                                        |
 | `new.target`                 |   ✅    | [syntax-new-target.ts](conformance/syntax-new-target.ts)                     | Constructors pass the target class name through `super()` chains             |
+| `instanceof Map` / `Set` / `Date` / `Array` | ❌ | — | Lowered to a type assertion on a Go type that doesn't exist (the Go build fails) |
+| `#x in obj` (private brand checks) | ❌ | — | Lowered to a lookup of an undefined `x` (the Go build fails) |
 
 ## Control flow
 
@@ -92,6 +108,11 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `Error.message`                     |   ✅    | [syntax-error-message.ts](conformance/syntax-error-message.ts)                                                 | `throw new Error` panics with a `*TnError`; `.message` on caught values    |
 | `Error` `cause` (`new Error(message, { cause })`, `err.cause`) |   ✅    | [lib-node-fetch-bad-port.ts](conformance/lib-node-fetch-bad-port.ts) | Built-in error classes too |
 | Narrowing                           |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                                                               | `T \| undefined` narrowed after `if (x)`, `x !== undefined`, early returns |
+| Exhaustive `switch` without `default` ending a function that returns a value | ❌ | — | `cannot fallthrough final case` / `missing return` in Go; adding a `default` works (discriminated unions included) |
+| Labeled blocks (`label: { … break label; }`) | ❌ | — | Go only breaks out of labeled loops / switches (the Go build fails); labeled loops work |
+| Throwing non-`Error` values (`throw 'x'`, `throw { code: 1 }`) | ✅ | — | Caught as `interface{}`; properties read dynamically |
+| `debugger` | ✅ | — | Erased |
+| `with` | 🚫 | — | Not allowed in strict mode (modules are strict) |
 
 ## Functions
 
@@ -117,6 +138,11 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Function overloads                            |   ✅    | [syntax-function-overloads.ts](conformance/syntax-function-overloads.ts)     | Signatures are erased; the implementation is emitted                                |
 | `this` parameter (`function f(this: T)`)      |   ✅    | [syntax-this-parameter.ts](conformance/syntax-this-parameter.ts)             | Erased                                                                              |
 | `arguments` object                            |   ✅    | [syntax-arguments.ts](conformance/syntax-arguments.ts)                       | Functions reading it take extra arguments variadically (`[]interface{}`)            |
+| Top-level `await` | ✅ | — | In modules (files with an `import` / `export`) |
+| Generator `next(value)` / `return()` / `throw()` | ❌ | — | Generators are goroutines feeding a channel: only iteration (`for...of`, spread) is lowered |
+| `fn.call` / `fn.apply` | ❌ | — | `call` works on function-typed variables (`const f = (…) => …`, `thisArg` dropped); `apply`, and `call` on function declarations, fail the Go build |
+| `fn.bind` / `fn.name` / `fn.length` | ❌ | — | Not declared |
+| `eval` / `new Function(…)` | 🚫 | — | Compile and run JavaScript at runtime: needs a JavaScript engine |
 
 ## Classes & interfaces
 
@@ -140,6 +166,20 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | Optional properties                                              |   ✅    | [syntax-optional-chaining.ts](conformance/syntax-optional-chaining.ts)                   | `prop?: Type` in interfaces/types                                                       |
 | Type-aware method dispatch                                       |   ✅    | [semantics-method-dispatch.ts](conformance/semantics-method-dispatch.ts)                 | Class `.push()` / `.length` not confused with array builtins                            |
 | Index signatures (`[key: string]: T`)                            |   ✅    | [syntax-index-signatures.ts](conformance/syntax-index-signatures.ts)                     | `{ [k: K]: V }` is `Record<K, V>` (an ordered Go map)                                   |
+| Methods without a return-type annotation | ❌ | — | Class methods (instance and static) compile as returning nothing, so `m() { return 8; }` fails the Go build; functions and arrows infer their return type. Annotate method return types |
+| Field initializers reading parameter properties or parent fields | ❌ | — | Initializers run before parameter properties and `super()` are assigned, so `d = this.k * 2` sees `0` (wrong value, no error) |
+| Arrow-function fields (`h = () => this.x`), fields reading earlier fields | ✅ | — | Run in the constructor; `this` is the instance |
+| Private methods (`#m()`) | ✅ | — | With a return-type annotation (see above) |
+| Private accessors (`get #x()`) / static private fields (`static #x`) | ❌ | — | Lowered to a missing `x` field / `C.x` (the Go build fails) |
+| `accessor` fields | ✅ | — | Plain fields (decorating them is not supported) |
+| Static inheritance (`Child.staticOfParent()`) | ❌ | — | Static members are registered on the declaring class only (the Go build fails) |
+| Inherited getters / setters, `super.x` on accessors | ❌ | — | Only methods are copied down to subclasses (the Go build fails) |
+| Object-literal setters (`set x(v) {}`) | ❌ | — | The setter is dropped; writes fail the Go build (object-literal getters work) |
+| Mixins (class factories, `return class extends Base {}`, `class extends f()`) | ❌ | — | `Unsupported syntax: ClassExpression` outside `const C = class {}` |
+| Polymorphic `this` return types (fluent chains) | ❌ | — | `this` types lower to `interface{}`, so a chained call fails the Go build |
+| Dynamic keys on class instances (`inst[key]`) | ❌ | — | Struct pointers can't be indexed (the Go build fails); records and `any` objects can |
+| Declaration merging (interface + interface, class + interface, string enum + string enum) | ❌ | — | Each declaration emits its own Go type (`redeclared in this block`); namespace + function merging works |
+| Prototype mutation (`C.prototype.m = …`, `Object.setPrototypeOf`, `util.inherits`) | 🚫 | — | Classes are static Go structs with fixed method sets |
 
 ## Generics
 
@@ -160,6 +200,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | String enums                          |   ✅    | [syntax-enum-string.ts](conformance/syntax-enum-string.ts)   | `enum` declarations and member access                                   |
 | `const enum`                          |   ✅    | [syntax-const-enum.ts](conformance/syntax-const-enum.ts)     | Compiled like a regular enum                                            |
 | Computed / heterogeneous enum members |   ✅    | [syntax-enum-computed.ts](conformance/syntax-enum-computed.ts) | Computed members assigned in source order; mixed enums keep each member's type |
+| Reverse mapping (`Color[0]`) | ❌ | — | Numeric members are plain constants: there is no `Color` value to index (the Go build fails) |
 
 ## Type-system features
 
@@ -171,6 +212,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `as` assertions                                           |   ✅    | [syntax-type-aliases.ts](conformance/syntax-type-aliases.ts)         | `x as T`, incl. angle-bracket syntax                                            |
 | Self-host contextual typing                               |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Object/array literals typed from context, `Record` literals, `in`, `any` params |
 | Decorators (`@`)                                          |   ✅    | [syntax-decorators.ts](conformance/syntax-decorators.ts)             | Standard method & class decorators, applied in source order; `this` is the receiver |
+| Field / accessor / parameter decorators, `context.addInitializer`, `Symbol.metadata` | ❌ | — | Only method and class decorators: field and accessor decorators fail the type check (`ClassFieldDecoratorContext` / `ClassAccessorDecoratorContext` are not declared) |
 | Namespaces / `module` blocks                              |   ✅    | [syntax-namespaces.ts](conformance/syntax-namespaces.ts)             | Flattened to prefixed declarations (`N.f` → `N_f`), nested and in types         |
 | `override` modifier                                       |   ✅    | [syntax-override.ts](conformance/syntax-override.ts)                 | Erased                                                                          |
 | `readonly` modifier (properties, `readonly T[]`)          |   ✅    | [syntax-readonly.ts](conformance/syntax-readonly.ts)                 | Erased (`readonly T[]` → `[]T`)                                                 |
@@ -191,6 +233,7 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | JSX / `.tsx` syntax                                       |   ✅    | [syntax-jsx.tsx](conformance/syntax-jsx.tsx)                           | Renders to HTML strings (text escaped); components are calls with props         |
 | Ambient declarations (`declare`, `.d.ts`, `x!: T`)        |   ✅    | [syntax-ambient-declarations.ts](conformance/syntax-ambient-declarations.ts) | `declare` only types code; `declare const` is an unset variable                 |
 | `export =` / `import x = require()`                       |   ✅    | [syntax-export-equals.ts](conformance/syntax-export-equals.ts)       | `import x = require()` is a namespace import                                    |
+| Recursive types (`type Tree = { children: Tree[] }`) | ✅ | — | Self-referencing structs |
 
 ## Modules & imports
 
@@ -226,6 +269,9 @@ self-hosted binary). Each ❌ row is a known gap with no passing probe yet.
 | `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker` posting to the event loop; the process lives until cleared                       |
 | `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or of an event-loop task)                 |
 | `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` posting the callback to the event loop, which keeps the process alive          |
+| `resolve` / `reject` passed as values                |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | `new Promise((resolve) => setTimeout(resolve, ms))`                 |
+| Async class methods returning a plain value (`async m(): Promise<T> { return v; }`) | ❌ | — | Methods skip the async lowering functions get: `return v` fails the Go build (`return otherPromise()` works) |
+| `Promise.withResolvers` / `Promise.try` | ❌ | — | Not declared |
 
 ## Semantics (JS behaviour preserved)
 
@@ -287,13 +333,17 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Math.trunc` / `sign`                                              |   ✅    | [lib-math-functions.ts](conformance/lib-math-functions.ts) | `math.Trunc` / inline sign check                                |
 | Constants (`Math.PI`, `Math.E`, …)                                 |   ✅    | [lib-math-constants.ts](conformance/lib-math-constants.ts) | `math.Pi`, `math.E`, `math.Sqrt2`, …                            |
 | `Math.asin` / `acos` / `atan` / `atan2` / `hypot` / `cbrt` / `exp` |   ✅    | [lib-math-more.ts](conformance/lib-math-more.ts)       | Corresponding `math` functions                                  |
+| `Math.sinh` / `cosh` / `tanh` / `expm1` / `log1p` | ✅ | — | Corresponding `math` functions |
+| `Math.fround` / `imul` / `clz32` / `asinh` / `acosh` / `atanh` / `sumPrecise` / `f16round` | ❌ | — | Not declared |
 
 ### `JSON`
 
 | API              | Status | Probe                                                      | Notes                                                   |
 | ---------------- | :----: | ---------------------------------------------------------- | -------------------------------------                   |
 | `JSON.parse`     |   ✅    | [lib-json-parse.ts](conformance/lib-json-parse.ts)         | Mapped to `encoding/json` `Unmarshal`; assigned to an interface type, the result converts into its struct |
-| `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields |
+| `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields; compact output only (see below) |
+| `JSON.stringify` `space` argument | ❌ | — | Any third argument gives one fixed layout that doesn't match Node's (newlines between top-level keys only) |
+| `JSON.stringify` replacer / `toJSON()`; `JSON.parse` reviver | ❌ | — | Ignored |
 
 ### `Object`
 
@@ -301,9 +351,11 @@ Every standard-library API TypeNative ports, split by module. Per
 | ---------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------------------- |
 | `Object.keys` / `values` / `entries`                       |   ✅    | [lib-object-helpers.ts](conformance/lib-object-helpers.ts) | Map key/value iteration helpers; typed results for maps and records |
 | `Object.assign`                                            |   ✅    | [lib-object-assign.ts](conformance/lib-object-assign.ts)   | Sources (structs, maps, dynamic objects) copied into an ordered map |
-| `Object.freeze` / `seal` / `isFrozen`                      |   ✅    | [lib-object-freeze.ts](conformance/lib-object-freeze.ts)   | Integrity level tracked by identity; writes rejected by `Readonly<T>` types |
+| `Object.freeze` / `seal` / `preventExtensions` / `isFrozen` / `isSealed` / `isExtensible` | ✅ | [lib-object-freeze.ts](conformance/lib-object-freeze.ts) | Integrity level tracked by identity; writes rejected by `Readonly<T>` types (`preventExtensions` / `isSealed` / `isExtensible` not probed) |
 | `Object.fromEntries`                                       |   ✅    | [lib-object-from-entries.ts](conformance/lib-object-from-entries.ts) | `TnFromEntries` → dynamic object                                    |
 | `Object.hasOwn` / `defineProperty` / `getOwnPropertyNames` |   ✅    | [lib-object-own.ts](conformance/lib-object-own.ts)         | Maps, dynamic objects and typed objects (literal keys); `{ value }` descriptors |
+| `Object.hasOwn` / `defineProperty` with a non-literal key on a typed object | ❌ | — | The compiler stops with an uncaught error (a stack trace) instead of a diagnostic |
+| `Object.is` / `groupBy` / `Map.groupBy` / `create` / `getPrototypeOf` / `getOwnPropertyDescriptor(s)` / `defineProperties` | ❌ | — | Not declared |
 
 ### `String`
 
@@ -321,12 +373,14 @@ Every standard-library API TypeNative ports, split by module. Per
 | `charCodeAt` / `String.fromCharCode`                      |   ✅    | [lib-string-char-codes.ts](conformance/lib-string-char-codes.ts)       | `charCodeAt` reads the byte; `String.fromCharCode` → `string(rune(n))` |
 | `concat` / `repeat`                                       |   ✅    | [lib-string-pad-repeat.ts](conformance/lib-string-pad-repeat.ts)       | Concatenation and `strings.Repeat`                                     |
 | `padStart` / `padEnd`                                     |   ✅    | [lib-string-pad-repeat.ts](conformance/lib-string-pad-repeat.ts)       | Via `strings.Repeat`                                                   |
-| `localeCompare`                                           |   ✅    | [lib-string-compare.ts](conformance/lib-string-compare.ts)             | `strings.Compare` → -1/0/1                                             |
+| `localeCompare`                                           |   ✅    | [lib-string-compare.ts](conformance/lib-string-compare.ts)             | `strings.Compare` → -1/0/1: code-unit order, not locale-aware          |
 | `match` / `matchAll` / `search`                           |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)     | Via `regexp` package (`String.match` with groups)                      |
 | `at` (negative indices)                                   |   ✅    | [lib-array-at.ts](conformance/lib-array-at.ts)                         | Supports negative indices                                              |
 | Unicode length / iteration                                |   ✅    | [lib-string-unicode.ts](conformance/lib-string-unicode.ts)             | `.length` counts runes; `[...str]` spreads runes                       |
 | `String.raw`                                              |   ✅    | [lib-string-raw.ts](conformance/lib-string-raw.ts)                     | Raw template text with values interpolated                             |
 | `normalize`                                               |   ✅    | [lib-string-normalize.ts](conformance/lib-string-normalize.ts)         | `golang.org/x/text/unicode/norm`, copied from GOROOT's vendor tree (offline) |
+| `split(sep, limit)` / `lastIndexOf(s, fromIndex)` / `localeCompare(s, locales, options)` | ❌ | — | The extra arguments are not declared (type error) |
+| `codePointAt` / `String.fromCodePoint` / `substr` / `trimLeft` / `trimRight` / `isWellFormed` / `toWellFormed` / `toLocaleUpperCase` / `toLocaleLowerCase` | ❌ | — | Not declared |
 
 ### `Array`
 
@@ -357,6 +411,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `copyWithin`                                                                |   ✅    | [lib-array-copy-within.ts](conformance/lib-array-copy-within.ts)             | Go `copy` (overlap-safe)                                                      |
 | Change-preserving copies (`toSorted` / `toReversed` / `with`)               |   ✅    | [lib-array-copies.ts](conformance/lib-array-copies.ts)                       | Clone, then sort / reverse / set                                              |
 | `toSpliced`                                                                 |   ✅    | [lib-array-to-spliced.ts](conformance/lib-array-to-spliced.ts)               | `slices.Concat` of the kept parts                                             |
+| `Array.of` / `Array.fromAsync`; iterator helpers (`Iterator.from`, `map` / `filter` / `take` / `drop` / `toArray` on iterators) | ❌ | — | Not declared (`Array.of` exists on typed arrays) |
 
 ### `Map` / `Set`
 
@@ -378,8 +433,10 @@ Every standard-library API TypeNative ports, split by module. Per
 | `toFixed`                                         |   ✅    | [lib-number-format.ts](conformance/lib-number-format.ts) | `n.toFixed(2)` via `strconv.FormatFloat`                 |
 | `parseInt` / `parseFloat` / `Number()`            |   ✅    | [lib-number-parse.ts](conformance/lib-number-parse.ts)   | Mapped to Go's `strconv` package                         |
 | `Number.isInteger` / `isNaN` / `MAX_SAFE_INTEGER` |   ✅    | [lib-number-checks.ts](conformance/lib-number-checks.ts) | Number predicates and constants                          |
+| `Number.MIN_SAFE_INTEGER` / `MAX_VALUE`             |   ✅    | —                                                        |                                                          |
 | `Number.EPSILON` / `isFinite` / `toPrecision`     |   ✅    | [lib-number-misc.ts](conformance/lib-number-misc.ts)     | `toPrecision` → `strconv.FormatFloat(x, 'g', n, 64)`     |
 | `String()` / `Boolean()` conversions              |   ✅    | [lib-conversions.ts](conformance/lib-conversions.ts)     | JS formatting / truthiness                               |
+| `toExponential` / `toLocaleString` / `Number.isSafeInteger` / `parseInt` / `parseFloat` / `MIN_VALUE` / `POSITIVE_INFINITY` / `NEGATIVE_INFINITY` | ❌ | — | Not declared (the global `parseInt` / `parseFloat` / `Infinity` work) |
 
 ### `Date`
 
@@ -388,6 +445,11 @@ Every standard-library API TypeNative ports, split by module. Per
 | `new Date()` / `getTime` / `toISOString`         |   ✅    | [lib-date.ts](conformance/lib-date.ts)         | `new Date(ms)` → `time.UnixMilli`; `getTime`/`toISOString` mapped to `time.Time` |
 | `Date.now()`                                     |   ✅    | [lib-date-now.ts](conformance/lib-date-now.ts) | `time.Now().UnixMilli()`                                                         |
 | Component getters (`getFullYear`, `getMonth`, …) |   ✅    | [lib-date-getters.ts](conformance/lib-date-getters.ts) | Local and `getUTC*` getters, `Date.UTC`                                          |
+| `toDateString` / `toJSON` / `valueOf` | ✅ | — | `toDateString` is in UTC |
+| `toString` | ❌ | — | Prints Go's format (`1970-01-01 00:00:00 +0000 UTC`), not Node's (`Thu Jan 01 1970 …`) |
+| `new Date(string)` / `new Date(y, m, d, …)` / `Date.parse` | ❌ | — | Only `new Date()` and `new Date(ms)` are declared |
+| Setters (`setFullYear`, `setDate`, `setHours`, …), `getTimezoneOffset`, `toUTCString`, `toLocale*String` | ❌ | — | Not declared |
+| Date arithmetic (`b - a`, `+d`) | ❌ | — | `+d` fails the Go build and `(b as any) - (a as any)` gives `0`: use `getTime()` |
 
 ### `RegExp`
 
@@ -404,21 +466,14 @@ Every standard-library API TypeNative ports, split by module. Per
 | Lookbehind                                             |   ✅    | [lib-regex-lookbehind.ts](conformance/lib-regex-lookbehind.ts)       | Lookaround patterns run on the backtracking engine              |
 | Remaining flags (`s` / `u` / `y`) & `source` / `flags` |   ✅    | [lib-regex-more-flags.ts](conformance/lib-regex-more-flags.ts)       | Sticky matching, `\u{…}` escapes, `lastIndex` / `source` / `flags` / flag getters |
 | `split` with RegExp                                    |   ✅    | [lib-regex-split.ts](conformance/lib-regex-split.ts)                 | `re.Split(s, -1)`                                               |
+| Unicode property escapes (`\p{L}`) with `u` | ✅ | — | Go's `regexp` |
+| `\p{…}` in patterns that need the backtracking engine (backreferences, lookaround); `d` flag (`indices`); `v` flag; `RegExp.escape` | ❌ | — | The backtracking engine has no `\p`: `/(\p{L})\1/u` doesn't match `aa` (wrong result, no error) |
 
 ### `Promise` / timers
 
-| API                                                  | Status | Probe                                                        | Notes                                                               |
-| ---------------------------------------------------- | :----: | ------------------------------------------------------------ | ------------------------------------------------------------------- |
-| `Promise` constructor / `.then`                      |   ✅    | [syntax-promise-then.ts](conformance/syntax-promise-then.ts) | Channel lowering works (see [Async & timing](#async--timing))       |
-| `resolve` / `reject` passed as values                |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | `new Promise((resolve) => setTimeout(resolve, ms))`                 |
-| `Promise.all`                                        |   ✅    | [syntax-promise-all.ts](conformance/syntax-promise-all.ts)   | Channel lowering works (see [Async & timing](#async--timing))       |
-| `Promise.resolve`                                    |   ✅    | [lib-promise-resolve.ts](conformance/lib-promise-resolve.ts) | Buffered channel holding the value                                  |
-| `Promise.reject` / `.catch` / `.finally`             |   ✅    | [lib-promise-catch.ts](conformance/lib-promise-catch.ts)     | Rejected promises are closed channels with a reason; `await` rethrows |
-| `Promise.race` / `allSettled` / `any`                |   ✅    | [lib-promise-combinators.ts](conformance/lib-promise-combinators.ts) | Goroutine per promise; first settled / all settled / first fulfilled |
-| `clearTimeout`                                       |   ✅    | [lib-timers.ts](conformance/lib-timers.ts)                   | `TnClearTimeout` stops the timer                                    |
-| `setInterval` / `clearInterval`                      |   ✅    | [lib-set-interval.ts](conformance/lib-set-interval.ts)       | `time.Ticker`; the process lives until cleared                      |
-| `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or a timer callback) |
-| `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | Lowered to `time.AfterFunc` (see [Async & timing](#async--timing))  |
+See [Async & timing](#async--timing): `Promise` (constructor, `.then` / `.catch` / `.finally`,
+`resolve` / `reject` / `all` / `race` / `allSettled` / `any`), `setTimeout`, `setInterval`,
+`queueMicrotask` and their `clear*` functions, plus the gaps.
 
 ### Misc globals
 
@@ -444,6 +499,16 @@ Every standard-library API TypeNative ports, split by module. Per
 | `MessageChannel` / `MessagePort` / `BroadcastChannel` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | See [worker_threads](#nodeworker_threads) |
 | `__filename` / `__dirname`                  |   ✅    | —                                                                  | The running executable (a native binary has no script file) |
 | `globalThis`                                |   ✅    | [lib-global-this.ts](conformance/lib-global-this.ts)               | `globalThis.x` is the global `x`; `(globalThis as any)` is a dynamic object |
+| `err.stack` | ❌ | — | `name: message` only, no frames. Feasible: the generated Go carries `//line` directives, so `runtime.Callers` reports `.ts` files and lines |
+| `AggregateError` / `Error.captureStackTrace` / `Error.isError` / `DOMException` | ❌ | — | Not declared |
+| `Symbol.for` / `keyFor` / `description`; `[Symbol.asyncIterator]()` methods; `Symbol.toPrimitive` / `hasInstance` / `toStringTag` | ❌ | — | Only `Symbol()`, `Symbol.iterator` and `Symbol.dispose` are lowered |
+| `WeakRef` / `FinalizationRegistry` | ❌ | — | Feasible on Go's `weak` package and `runtime.AddCleanup` |
+| `Reflect` (`ownKeys` / `has` / `get` / `set` / …) | ❌ | — | Feasible over the existing dynamic property access |
+| `Proxy` | 🚫 | — | Intercepting every property access on static Go structs; a `Proxy` limited to dynamic (`any`) objects would be feasible |
+| `Intl` (`NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`, `Segmenter`), `toLocaleString` | ❌ | — | Needs locale data (vendored `golang.org/x/text`, or hand-written `en-US` first) |
+| `Temporal` | ❌ | — | Feasible on Go's `time` and tzdata |
+| `WebSocket` / `navigator` / `CustomEvent` / `URLPattern` / `EventSource` / `reportError` | ❌ | — | Not declared |
+| `WebAssembly` | ❌ | — | Needs a Wasm runtime: vendoring wazero (pure Go, no cgo) would provide one (see [wasi](#nodewasi)) |
 
 ### Node builtins (`node:*`)
 
@@ -467,12 +532,12 @@ async function runs synchronously until its first `await`.
 | `node:dgram`                                |   ✅    | [dgram](#nodedgram)                                         |
 | `node:diagnostics_channel`                  |   ✅    | [diagnostics_channel](#nodediagnostics_channel)             |
 | `node:dns` / `node:dns/promises`            |   ✅    | [dns](#nodedns)                                             |
-| `node:domain`                               |   ❌    | [domain](#nodedomain)                                       |
+| `node:domain`                               |   🚫    | [domain](#nodedomain)                                       |
 | `node:events` (+ `EventTarget`, `AbortController`) | ✅ | [events](#nodeevents)                                      |
 | `node:fs` / `node:fs/promises`              |   ✅    | [fs](#nodefs)                                               |
 | `node:http` / `node:https`                  |   ✅    | [http / https](#nodehttp--nodehttps)                        |
 | `node:http2`                                |   ✅    | [http2](#nodehttp2)                                         |
-| `node:inspector`                            |   ❌    | [inspector](#nodeinspector)                                 |
+| `node:inspector`                            |   🚫    | [inspector](#nodeinspector)                                 |
 | `node:module`                               |   ❌    | [module](#nodemodule)                                       |
 | `node:net`                                  |   ✅    | [net](#nodenet)                                             |
 | `node:os`                                   |   ✅    | [os](#nodeos)                                               |
@@ -482,7 +547,7 @@ async function runs synchronously until its first `await`.
 | `node:punycode`                             |   ✅    | [punycode](#nodepunycode)                                   |
 | `node:querystring`                          |   ✅    | [querystring](#nodequerystring)                             |
 | `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
-| `node:repl`                                 |   ❌    | [repl](#noderepl)                                           |
+| `node:repl`                                 |   🚫    | [repl](#noderepl)                                           |
 | `node:sea`                                  |   ❌    | [sea](#nodesea)                                             |
 | `node:sqlite`                               |   ✅    | [sqlite](#nodesqlite)                                       |
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
@@ -493,12 +558,12 @@ async function runs synchronously until its first `await`.
 | `node:test/reporters`                       |   ❌    | [test/reporters](#nodetestreporters)                        |
 | `node:timers` / `node:timers/promises`      |   ✅    | [timers](#nodetimers)                                       |
 | `node:tls`                                  |   ✅    | [tls](#nodetls)                                             |
-| `node:trace_events`                         |   ❌    | [trace_events](#nodetrace_events)                           |
+| `node:trace_events`                         |   🚫    | [trace_events](#nodetrace_events)                           |
 | `node:tty`                                  |   ✅    | [tty](#nodetty)                                             |
 | `node:url` (+ globals `URL`, `URLSearchParams`) | ✅  | [url](#nodeurl)                                             |
 | `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
 | `node:v8`                                   |   ❌    | [v8](#nodev8)                                               |
-| `node:vm`                                   |   ❌    | [vm](#nodevm)                                               |
+| `node:vm`                                   |   🚫    | [vm](#nodevm)                                               |
 | `node:wasi`                                 |   ❌    | [wasi](#nodewasi)                                           |
 | `node:worker_threads` (+ globals `MessageChannel`, `MessagePort`, `BroadcastChannel`) | ✅ | [worker_threads](#nodeworker_threads) |
 | `node:zlib`                                 |   ✅    | [zlib](#nodezlib)                                           |
@@ -524,7 +589,9 @@ async function runs synchronously until its first `await`.
 | `read*` / `write*` (U)Int8/16/32 LE/BE, Float, Double                                    |   ✅    | [lib-node-buffer-binary.ts](conformance/lib-node-buffer-binary.ts)             | Out-of-range offsets throw `ERR_OUT_OF_RANGE`                                           |
 | `Blob` / `File` (`size`, `type`, `name`, `lastModified`, `text()` / `bytes()` / `arrayBuffer()`, `slice`, `stream()`); parts of strings, Buffers and Blobs | ✅ | [lib-node-blob.ts](conformance/lib-node-blob.ts) | Also globals; bytes held in memory |
 | `read/writeBigInt64LE/BE`, `read/writeBigUInt64LE/BE`, `swap16/32/64`; `isUtf8` / `isAscii` / `transcode` / `kMaxLength` | ✅ | [lib-node-buffer-bigint.ts](conformance/lib-node-buffer-bigint.ts) | bigints are `*big.Int` |
-| Typed arrays (`Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`): indexing, `length` / `byteLength` / `buffer`, `from` / `of`, `fill` / `set` / `subarray` / `slice` / `copyWithin`, `map` / `filter` / `reduce` / `forEach` & co., `sort` / `toSorted`, `join`, `for…of`, spread; `ArrayBuffer` (`slice`, `isView`); `DataView` (all getters / setters incl. BigInt64) | ✅ | [lib-typed-arrays.ts](conformance/lib-typed-arrays.ts) | One Go slice per element type; views on an `ArrayBuffer` share its memory. Writes convert like JS (wrapping, clamping). A view's `.buffer` is its own bytes (`byteOffset` 0). Out-of-range reads give `0`, not `undefined`. `BigInt64Array` / `BigUint64Array` are not implemented |
+| Typed arrays (`Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`): indexing, `length` / `byteLength` / `buffer`, `from` / `of`, `fill` / `set` / `subarray` / `slice` / `copyWithin`, `map` / `filter` / `reduce` / `forEach` & co., `sort` / `toSorted`, `join`, `for…of`, spread; `ArrayBuffer` (`slice`, `isView`); `DataView` (all getters / setters incl. BigInt64) | ✅ | [lib-typed-arrays.ts](conformance/lib-typed-arrays.ts) | One Go slice per element type; views on an `ArrayBuffer` share its memory. Writes convert like JS (wrapping, clamping). A view's `.buffer` is its own bytes (`byteOffset` 0). Out-of-range reads give `0`, not `undefined`. |
+| `BigInt64Array` / `BigUint64Array` | ❌ | — | `DataView` already has the BigInt64 accessors |
+| `Float16Array`, resizable `ArrayBuffer` (`resize`, `transfer`), `Uint8Array` `toBase64` / `fromBase64` / `toHex` / `fromHex` | ❌ | — | Not declared |
 
 #### `node:fs`
 
@@ -560,7 +627,7 @@ async function runs synchronously until its first `await`.
 | `process.stdin` / `stdout` / `stderr` as streams                                                     |   ✅    | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `stdin` keeps the process alive only while flowing                           |
 | `kill` / `emitWarning` / `getuid` / `getgid`                                                         |   ✅    | —                                                              | Implemented, not probed                                                     |
 | `on('uncaughtException')` / `'uncaughtExceptionMonitor'` / `'unhandledRejection'` / `'beforeExit'` (per drain, can schedule more work); `cpuUsage` / `resourceUsage` / `availableMemory` / `loadEnvFile` | ✅ | [lib-node-process-uncaught.ts](conformance/lib-node-process-uncaught.ts), [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | Throws in the top-level code, loop callbacks and detached async calls reach the handlers; CPU times from `/proc` (Linux) or Go's runtime metrics |
-| `umask` / `stdout.columns` / `setRawMode` | ❌ | — | Need OS-specific syscalls a single portable binary can't contain |
+| `umask` / `stdout.columns` / `rows` / `setRawMode` | ❌ | — | Feasible: each binary targets one OS, and the vendored `golang.org/x/sys` has `IoctlGetWinsize` / termios / `Umask` and the Windows console calls (a per-OS helper, as for `os.totalmem`) |
 
 #### `node:console`
 
@@ -578,8 +645,9 @@ async function runs synchronously until its first `await`.
 | `isDeepStrictEqual` / `types.*` (`node:util/types`) / `deprecate` / `stripVTControlCharacters` / `styleText` | ✅ | [lib-node-util-misc.ts](conformance/lib-node-util-misc.ts) | `styleText` colours only TTYs unless `validateStream: false`                               |
 | `promisify` / `callbackify`                                                           |   ✅    | [lib-node-util-promisify.ts](conformance/lib-node-util-promisify.ts) | Node functions map to their promise versions at compile time (`fs.readFile`, `setTimeout`, `exec`); other functions are wrapped |
 | `parseArgs` (short / long / grouped flags, `multiple`, `default`, `strict`, `allowPositionals`, `allowNegative`, `tokens`, Node's errors), `getSystemErrorName` / `getSystemErrorMessage` / `getSystemErrorMap`, `MIMEType` / `MIMEParams`, `parseEnv` (+ `process.loadEnvFile`), `aborted`, `debuglog` (`NODE_DEBUG`), `toUSVString` | ✅ | [lib-node-util-parse-args.ts](conformance/lib-node-util-parse-args.ts) | |
-| `inherits` (legacy), `inspect.custom` (symbols), `getCallSites` (V8 stack frames) | ❌ | — | Legacy or engine-specific |
-| Node's errno numbers on Windows (libuv's: `ENOENT` is `-4058`) | ❌ | — | errno values are the OS's (Go's `syscall` numbers): the same as Node's on Linux and macOS, but `ENOENT` is `-2` on Windows. `getSystemErrorName(err.errno)` still names any error TypeNative raises |
+| `inspect.custom` methods, `getCallSites` | ❌ | — | `[inspect.custom]()` can lower to a method like `[Symbol.dispose]()`; `getCallSites` can read `runtime.Callers`, which reports `.ts` lines through the `//line` directives |
+| `inherits` (legacy) | 🚫 | — | Rewrites prototypes; classes are static Go structs |
+| Node's errno numbers on Windows (libuv's: `ENOENT` is `-4058`) | ❌ | — | errno values are the OS's (Go's `syscall` numbers): the same as Node's on Linux and macOS, but `ENOENT` is `-2` on Windows. Feasible with a libuv errno table. `getSystemErrorName(err.errno)` still names any error TypeNative raises |
 
 #### `node:assert`
 
@@ -595,7 +663,7 @@ async function runs synchronously until its first `await`.
 | `fileURLToPath` / `pathToFileURL`                                                            |   ✅    | [lib-node-url.ts](conformance/lib-node-url.ts)                         | `pathToFileURL` returns a `URL`; Windows drive letters                                      |
 | `URL` (WHATWG): parsing, relative resolution, getters / setters, `canParse`, `parse`; `domainToASCII` / `domainToUnicode`; `format` | ✅ | [lib-node-url-class.ts](conformance/lib-node-url-class.ts) | Special schemes, dot segments, default ports, percent-encode sets, IDN hosts (punycode); invalid input throws `ERR_INVALID_URL` |
 | `URLSearchParams` (and `url.searchParams`, kept in sync)                                     |   ✅    | [lib-node-url-search-params.ts](conformance/lib-node-url-search-params.ts) | `for...of`, `forEach`, `sort`, construction from strings / objects / pairs                  |
-| Legacy `url.parse` / `url.resolve`                                                           |   ❌    | —                                                                      | Deprecated upstream; not implemented                                                       |
+| Legacy `url.parse` / `url.resolve`                                                           |   ❌    | —                                                                      | Deprecated upstream, but a pure port is feasible                                             |
 
 #### `node:querystring`
 
@@ -631,7 +699,7 @@ async function runs synchronously until its first `await`.
 | `generatePrime(Sync)` (`bigint`, `safe`, `add` / `rem`), `checkPrime(Sync)` | ✅ | [lib-node-crypto-sign.ts](conformance/lib-node-crypto-sign.ts) | `math/big`'s Miller-Rabin |
 | `X509Certificate` (`subject`, `issuer`, `subjectAltName`, `validFrom` / `validTo` (+ `Date`s), fingerprints, `serialNumber`, `ca`, `publicKey`, `raw`, `keyUsage`, `checkHost` / `checkIP` / `checkEmail`, `checkIssued`, `verify`, `toString`, `toLegacyObject`) | ✅ | [lib-node-crypto-keys.ts](conformance/lib-node-crypto-keys.ts) | `crypto/x509` |
 | `crypto.subtle` / `webcrypto.subtle`: `digest`, `generateKey`, `importKey` / `exportKey` (`raw`, `spki`, `pkcs8`, `jwk`), `sign` / `verify` (HMAC, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, Ed25519), `encrypt` / `decrypt` (AES-GCM / CBC / CTR, RSA-OAEP), `deriveBits` / `deriveKey` (PBKDF2, HKDF, ECDH, X25519), `wrapKey` / `unwrapKey` | ✅ | [lib-node-crypto-subtle.ts](conformance/lib-node-crypto-subtle.ts) | Key usages are recorded but not enforced |
-| Encrypted private keys (`passphrase` / `cipher`), `rsa-pss` / `dsa` / `dh` / `ed448` / `x448` key types, `secp256k1`, AES-KW, `Certificate` (SPKAC), `hash` streams (`createHash` as a stream) | ❌ | — | No Go standard-library support (encrypted PKCS#8, these algorithms) |
+| Encrypted private keys (`passphrase` / `cipher`), `rsa-pss` / `dsa` / `dh` / `ed448` / `x448` key types, `secp256k1`, AES-KW, `Certificate` (SPKAC), `hash` streams (`createHash` as a stream) | ❌ | — | Not in Go's standard library, but portable: AES-KW (RFC 3394) and hash streams are small; encrypted PKCS#8 is PBES2 over `pbkdf2` + AES-CBC; `rsa-pss` / `dsa` / `dh` keys and SPKAC are ASN.1 on existing primitives; `secp256k1` / `ed448` / `x448` need vendored curve code |
 
 #### `node:zlib`
 
@@ -662,7 +730,7 @@ async function runs synchronously until its first `await`.
 | API          | Status | Probe                                                      | Notes                                    |
 | ------------ | :----: | ---------------------------------------------------------- | ---------------------------------------- |
 | `isatty(fd)` |   ✅    | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Character-device check on fds 0–2        |
-| `ReadStream` / `WriteStream` (`columns`, `setRawMode`) | ❌ | — | Terminal sizes need non-portable syscalls |
+| `ReadStream` / `WriteStream` (`columns`, `setRawMode`) | ❌ | — | Feasible: see `stdout.columns` / `setRawMode` in [process](#nodeprocess) |
 
 #### `node:constants` / `node:sys`
 
@@ -680,7 +748,7 @@ async function runs synchronously until its first `await`.
 | `events.once` (→ promise) / `events.on` (async iterator)                                             |   ✅    | [lib-node-events-once.ts](conformance/lib-node-events-once.ts) | `'error'` rejects `once`                                                   |
 | `EventTarget` / `Event` / `AbortController` / `AbortSignal` (`abort`, `timeout`, `any`, `throwIfAborted`) | ✅ | [lib-node-abort.ts](conformance/lib-node-abort.ts)            | Globals (also exported by `node:events`)                                   |
 | `errorMonitor`, `captureRejections` (option and global), `getMaxListeners` / `setMaxListeners` (static), `addAbortListener` | ✅ | [lib-node-events-extra.ts](conformance/lib-node-events-extra.ts) | Captures rejections of listeners that return a promise; async arrow listeners run inline (their `await`s don't yield to `emit`) |
-| Symbol event names other than `errorMonitor`, `EventEmitterAsyncResource`, `Symbol.for('nodejs.rejection')` | ❌ | — | Event names are strings |
+| Symbol event names other than `errorMonitor`, `EventEmitterAsyncResource`, `Symbol.for('nodejs.rejection')` | ❌ | — | Event names are strings today; symbols are unique pointers, usable as listener keys, and `EventEmitterAsyncResource` fits on `AsyncResource` |
 
 #### `node:stream`
 
@@ -691,7 +759,7 @@ async function runs synchronously until its first `await`.
 | `Transform` / `PassThrough` / `Duplex`, `pipe` chains, subclasses overriding `_transform` & co.        |   ✅    | [lib-node-stream-transform.ts](conformance/lib-node-stream-transform.ts) | Option methods (`transform`, `flush`, `write`, `final`, `read`) and `_`-overrides both work; `this` inside option methods is not the stream (use the callback) |
 | `pipeline` / `finished` / `stream/promises` / `stream/consumers` (`text`, `json`, `buffer`)           |   ✅    | [lib-node-stream-pipeline.ts](conformance/lib-node-stream-pipeline.ts) | Errors destroy the pipeline and reach the callback / rejection                               |
 | `Readable.toWeb` / `fromWeb`, `Writable.toWeb` / `fromWeb`, `Duplex.toWeb` / `fromWeb`, `compose` (Node and web streams) | ✅ | [lib-node-stream-web-bridge.ts](conformance/lib-node-stream-web-bridge.ts) | `toWeb` pauses the Node stream while the web queue is full |
-| Backpressure (`highWaterMark` beyond `write()`'s return value), `compose` with generator functions | ❌  | —                                                                    | Not implemented                                                                              |
+| Backpressure (`highWaterMark` beyond `write()`'s return value), `compose` with generator functions | ❌  | —                                                                    | Not implemented yet                                                                          |
 
 #### `node:stream/web`
 
@@ -712,7 +780,7 @@ async function runs synchronously until its first `await`.
 | `node:readline/promises` (`await rl.question(q)`)                                        |   ✅    | [lib-node-readline-promises.ts](conformance/lib-node-readline-promises.ts) |                                                                         |
 | `question(prompt)` (synchronous)                                                        |   ✅    | [lib-node-readline-question.ts](conformance/lib-node-readline-question.ts) | TypeNative extension (not in Node): used by the self-hosted compiler     |
 | `cursorTo` / `moveCursor` / `clearLine` / `clearScreenDown`                              |   ✅    | [lib-node-readline-cursor.ts](conformance/lib-node-readline-cursor.ts)   | ANSI escape sequences written to the stream; optional callback           |
-| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Need raw terminal mode (OS-specific syscalls)                            |
+| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Need raw terminal mode (see `setRawMode` in [process](#nodeprocess))     |
 
 #### `node:child_process`
 
@@ -721,7 +789,8 @@ async function runs synchronously until its first `await`.
 | `execSync` / `execFileSync` / `spawnSync` (`encoding`, `input`, `cwd`, `env`, `shell`, `stdio: 'inherit'`) | ✅ | [lib-node-child-process-sync.ts](conformance/lib-node-child-process-sync.ts) | Buffers unless an encoding is given (as in Node); a non-zero exit throws with `status` / `stdout` / `stderr` |
 | `exec` / `execFile` (callbacks), `spawn` → `ChildProcess` (stdio streams, `'exit'` / `'close'`, `kill`); `promisify(exec)` | ✅ | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `'close'` follows the end of the stdio streams being read; exit codes on `err.code`     |
 | `fork(modulePath, args, { env, cwd, silent })` → `send` / `'message'` / `disconnect` / `'disconnect'` / `connected`; in the child `process.send` / `process.on('message')` / `process.connected` / `process.disconnect` | ✅ | [lib-node-child-process-fork.ts](conformance/lib-node-child-process-fork.ts) | The child is this program run again (branch on `process.argv` / `process.send`), linked over loopback TCP; messages are structured clones (a superset of Node's default JSON) |
-| `detached`, `stdio` arrays beyond stdout, `serialization: 'advanced'` handle passing (`send(msg, socket)`), forking another file | ❌ | — | `detached` needs OS-specific process attributes; one binary holds one program |
+| `detached`, `stdio` arrays beyond stdout, forking another file | ❌ | — | `detached` is `SysProcAttr` (`Setsid` / `CREATE_NEW_PROCESS_GROUP`, a per-OS helper); extra `stdio` entries are `ExtraFiles`; another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)) |
+| `serialization: 'advanced'` handle passing (`send(msg, socket)`) | ❌ | — | Needs file-descriptor passing over the IPC channel (`SCM_RIGHTS` on Unix) |
 
 #### `node:cluster`
 
@@ -730,7 +799,7 @@ async function runs synchronously until its first `await`.
 | `isPrimary` / `isWorker` / `isMaster`, `fork(env)`, `workers`, `worker`, `setupPrimary` / `settings`, `disconnect(cb)`, `SCHED_RR` / `schedulingPolicy`; events `'fork'` / `'online'` / `'listening'` / `'message'` / `'disconnect'` / `'exit'` | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | Workers are this program run again with `NODE_UNIQUE_ID` set |
 | `Worker` (`id`, `process`, `send`, `'message'`, `disconnect`, `kill`, `isConnected`, `isDead`, `exitedAfterDisconnect`); `process.send` from workers | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | |
 | Shared ports: `net` / `http` / `https` / `tls` servers in workers listen on one port (also `listen(0)`), connections round-robin | ✅ | [lib-node-cluster.ts](conformance/lib-node-cluster.ts) | The primary owns the listener and relays each connection to a worker's private loopback listener with the client's address (no handle passing) |
-| `SCHED_NONE` (OS-level balancing), `exclusive: true` listeners, dgram sockets in workers | ❌ | — | Everything goes through the primary |
+| `SCHED_NONE` (OS-level balancing), `exclusive: true` listeners, dgram sockets in workers | ❌ | — | Everything goes through the primary today; `SO_REUSEPORT` or handle passing would remove it |
 
 #### `node:diagnostics_channel`
 
@@ -758,7 +827,7 @@ async function runs synchronously until its first `await`.
 | `lookup` (`family`, `all`) and `dns/promises` / `dns.promises` `lookup`                 |   ✅    | [lib-node-dns.ts](conformance/lib-node-dns.ts) | Go's resolver; `getaddrinfo ENOTFOUND host` errors with `hostname`   |
 | `resolve` (rrtype) / `resolve4` / `resolve6` / `resolveCname` / `resolveMx` / `resolveTxt` / `resolveNs` / `resolveSrv` / `reverse` (callback and promise forms), `getServers` | ✅ | — | Implemented, not probed (needs a network); `getServers` reads `/etc/resolv.conf` |
 | `Resolver` class (callback and `dns/promises` forms: `setServers` / `getServers` / `setLocalAddress` / `cancel`, `timeout` option), module `setServers`, `lookupService` | ✅ | [lib-node-dns-resolver.ts](conformance/lib-node-dns-resolver.ts) | Go's pure resolver dialing the configured servers in turn; `ETIMEOUT` / `ECANCELLED`; services from `/etc/services` |
-| `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`, the `ttl` option, `tries` |   ❌    | —                                            | Go's resolver does not expose these records or TTLs                   |
+| `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`, the `ttl` option, `tries` |   ❌    | —                                            | Go's resolver hides these records and TTLs, but GOROOT vendors `golang.org/x/net/dns/dnsmessage`, which can be copied in the way `normalize` copies `x/text` |
 
 #### `node:http` / `node:https`
 
@@ -771,7 +840,8 @@ async function runs synchronously until its first `await`.
 | `https.createServer({ key, cert })` / `https.request` / `https.get` (`ca`, `rejectUnauthorized`, `servername`, client `key` / `cert`) | ✅ | [lib-node-https.ts](conformance/lib-node-https.ts) | Certificate checks as in [node:tls](#nodetls)                                               |
 | `headers` values                                                                                      |   ✅    | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | Repeated headers are joined with `, ` (`; ` for `cookie`) — including `set-cookie`, which Node keeps as an array: use `headersDistinct['set-cookie']` |
 | Server `'upgrade'` / `'connect'` (`req, socket, head`) and client `'upgrade'` / `'connect'` events | ✅ | [lib-node-http-upgrade.ts](conformance/lib-node-http-upgrade.ts) | The server hijacks the connection; an upgrade nobody listens for is an ordinary request, an unhandled CONNECT closes the connection, as in Node |
-| `statusMessage` on responses we send, `'checkContinue'`, `Agent` socket pooling control, trailers we send |   ❌    | —                              | Go's `ResponseWriter` sends its standard reason phrases                                      |
+| Trailers we send, `Agent` socket pooling control | ❌ | — | Feasible: Go's `Trailer` header, `Transport.MaxConnsPerHost` / `MaxIdleConnsPerHost` |
+| `statusMessage` on responses we send, `'checkContinue'` | ❌ | — | Go's `ResponseWriter` sends its standard reason phrases and answers `100-continue` itself: needs a hijacked connection |
 
 #### `node:http2`
 
@@ -781,7 +851,8 @@ async function runs synchronously until its first `await`.
 | Compatibility API: `(req, res)` handlers get `Http2ServerRequest` / `Http2ServerResponse` (`httpVersion` `'2.0'`, pseudo-headers in `req.headers`) | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts) | The node:http objects |
 | `connect(authority, { ca, rejectUnauthorized, servername })` → `ClientHttp2Session` (`request`, `close`, `destroy`, `'connect'` / `'error'` / `'close'`, `alpnProtocol`, `encrypted`); `ClientHttp2Stream` (`'response'` with `:status`, body as a Readable, request bodies) | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts), [lib-node-http2-secure.ts](conformance/lib-node-http2-secure.ts) | Connection failures error the session and cancel its streams (`ERR_HTTP2_STREAM_CANCEL`); request bodies are sent once the writable side ends |
 | `constants`, `getDefaultSettings` | ✅ | [lib-node-http2.ts](conformance/lib-node-http2.ts) | |
-| Server push, `ping`, `settings` / `goaway` / `altsvc`, `'session'` events, `getPackedSettings`, upgrades from HTTP/1 | ❌ | — | Go's standard library does not expose HTTP/2 frames |
+| `ping`, `settings` / `goaway` / `altsvc`, `'session'` events, `getPackedSettings`, upgrades from HTTP/1 | ❌ | — | Go's bundled HTTP/2 hides frames: needs a vendored `golang.org/x/net/http2` |
+| Server push | 🚫 | — | Deprecated (browsers removed it); Go's server doesn't push |
 
 #### `node:tls`
 
@@ -791,14 +862,14 @@ async function runs synchronously until its first `await`.
 | `connect` (`host`, `port`, `ca`, `servername`, `rejectUnauthorized`, client `key` / `cert`) / `'secureConnect'`; `TLSSocket` (`authorized`, `authorizationError`, `encrypted`, `alpnProtocol`, `getPeerCertificate`, `getProtocol`, `getCipher`) | ✅ | [lib-node-tls.ts](conformance/lib-node-tls.ts) | Node's verification codes: `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID` |
 | `createSecureContext` / `getCiphers` / `DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`                   |   ✅    | —                                            | Implemented, not probed; cipher names are Go's                                              |
 | `checkServerIdentity` (function and `connect` option)                                                  |   ✅    | [lib-node-tls-identity.ts](conformance/lib-node-tls-identity.ts) | Node's rules: one leftmost wildcard label, IP altnames, CN only without DNS altnames |
-| PFX / passphrase-protected keys, session resumption, `renegotiate`, `rootCertificates`                 |   ❌    | —                                     | Not implemented                                                                             |
+| PFX / passphrase-protected keys, session resumption, `renegotiate`, `rootCertificates`                 |   ❌    | —                                     | Not implemented yet: PFX needs a PKCS#12 decoder; `rootCertificates` can embed Mozilla's bundle (as Node does); Go has session tickets (`ClientSessionCache`) and client-side renegotiation |
 
 #### `node:dgram`
 
 | API                                                                                       | Status | Probe                                          | Notes                                         |
 | ----------------------------------------------------------------------------------------- | :----: | ---------------------------------------------- | --------------------------------------------- |
 | `createSocket('udp4' \| 'udp6' \| { type })`, `bind`, `send` (offset / length forms, callback), `'message'(msg, rinfo)`, `address`, `close`, `connect` / `disconnect` / `remoteAddress`, `ref` / `unref` | ✅ | [lib-node-dgram.ts](conformance/lib-node-dgram.ts) | `send` binds an unbound socket first, as in Node |
-| Multicast membership, `setBroadcast` / `setTTL` effects                                   |   ❌    | —                                              | Accepted without effect                       |
+| Multicast membership, `setBroadcast` / `setTTL` effects                                   |   ❌    | —                                              | Accepted without effect; feasible with `ListenConfig.Control` + `SetsockoptInt` per OS |
 
 #### `fetch`
 
@@ -816,7 +887,7 @@ async function runs synchronously until its first `await`.
 | ---------------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `AsyncLocalStorage` (`run`, `getStore`, `enterWith`, `exit`, `disable`, static `bind` / `snapshot`)    |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | The store follows timers, `setImmediate`, `nextTick`, microtasks, promise callbacks, `await`, async function bodies, fs / dns callbacks; streams, sockets and servers emit in the context they were created / listened in |
 | `AsyncResource` (`runInAsyncScope`, `bind`, `asyncId`, static `bind`)                                 |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | Captures the context it is created in                                                                   |
-| `createHook` callbacks (`init` / `before` / `after` / `destroy`), real `executionAsyncId` / `triggerAsyncId` |   ❌    | —                                                  | `createHook` is accepted but never calls back; ids are always `1` / `0`                                 |
+| `createHook` callbacks (`init` / `before` / `after` / `destroy`), real `executionAsyncId` / `triggerAsyncId` |   ❌    | —                                                  | `createHook` is accepted but never calls back; ids are always `1` / `0`. Feasible: the event loop's `TnAsyncSnapshot` / `TnAsyncRun` are where the callbacks would fire |
 
 #### `node:test`
 
@@ -825,11 +896,12 @@ async function runs synchronously until its first `await`.
 | `test` / `it` / `describe` / `suite` (+ `.skip` / `.todo` / `.only`; `skip` / `todo` / `timeout` options); sync, async and `done`-callback tests | ✅ | [lib-node-test.ts](conformance/lib-node-test.ts) | Tests run one after another once the main module has finished, as in Node |
 | `before` / `after` / `beforeEach` / `afterEach` (file and suite level, `t.before` & co.)              |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts)        | Node's order: outer `beforeEach` first, inner `afterEach` first                                          |
 | `TestContext`: `t.test` subtests, `t.skip`, `t.todo`, `t.diagnostic`, `t.plan`, `t.name`, `t.fullName`, `t.signal`, `t.mock` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) |                                                                                       |
-| Reporting: TAP (Node's default when stdout is not a terminal) / spec (on a terminal); `tests` / `suites` / `pass` / `fail` / `cancelled` / `skipped` / `todo` counters; exit code 1 on failure | ✅ | [lib-node-test-fail.ts](conformance/lib-node-test-fail.ts) | Same layout as Node, without `location` / `stack` (a native binary has no source positions); timeouts count as cancelled |
+| Reporting: TAP (Node's default when stdout is not a terminal) / spec (on a terminal); `tests` / `suites` / `pass` / `fail` / `cancelled` / `skipped` / `todo` counters; exit code 1 on failure | ✅ | [lib-node-test-fail.ts](conformance/lib-node-test-fail.ts) | Same layout as Node, without `location` / `stack` yet (the `//line` directives make them recoverable through `runtime.Callers`); timeouts count as cancelled |
 | `mock.fn(original?, implementation?)`; `fn.mock.calls` / `callCount()` / `mockImplementation(Once)` / `resetCalls()` / `restore()` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) | The mock has the original's Go function type                                                          |
 | `t.assert` (`node:assert`'s functions, counted by `t.plan`) and `mock.timers` (`enable({ apis, now })`, `tick`, `runAll`, `setTime`, `reset`; `setTimeout` / `setInterval` / `setImmediate` / `Date`) | ✅ | [lib-node-test-mock-timers.ts](conformance/lib-node-test-mock-timers.ts) | Mocked timers do not keep the process alive; `t.mock` timers reset after each test |
-| `mock.method` / `mock.getter` / `mock.setter`                                                         |   ❌    | —                                   | Go methods cannot be replaced at runtime                                                                 |
-| Snapshots, coverage, `--test` / `--test-reporter` / `--test-only` flags, `run()`                      |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`)                               |
+| `mock.method` / `mock.getter` / `mock.setter`                                                         |   ❌    | —                                   | Object-literal methods are function fields and can be swapped; class methods need calls routed through a replaceable table |
+| Snapshots, `--test-only` / `--test-name-pattern` / `--test-reporter` flags, `run()`                      |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`); flags can be read from the binary's arguments; `run()` needs extra entry points |
+| Coverage | ❌ | — | Would need Go's `-cover` instrumentation mapped back through the `//line` directives |
 
 #### `node:worker_threads`
 
@@ -839,7 +911,8 @@ async function runs synchronously until its first `await`.
 | Messages: structured clone of JSON-like values, Buffers (arriving as `Uint8Array`s), `Map`, `Set`, `Date`, `bigint`, errors |   ✅    | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Functions throw `DataCloneError`                                                                    |
 | Uncaught exceptions in a worker / `terminate()`                                                        |   ✅    | [lib-node-worker-errors.ts](conformance/lib-node-worker-errors.ts) | `'error'` with the message, then exit code `1`                                                          |
 | `MessageChannel` / `MessagePort` (`postMessage`, `on('message')`, `onmessage`, `start`, `close`, `ref` / `unref`), `receiveMessageOnPort`, `BroadcastChannel`, `get/setEnvironmentData` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Channels and broadcast channels work within one process (ports can't be transferred to workers)     |
-| Workers for another file / `eval: true`, transferring ports, `SharedArrayBuffer` / `Atomics`, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | One binary holds one program; memory is not shared between processes                                  |
+| Workers for another file, transferring ports, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | Another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)); ports can be relayed through the parent; `resourceLimits` maps to `debug.SetMemoryLimit` |
+| `eval: true`, `SharedArrayBuffer` / `Atomics` | 🚫 | — | `eval` needs a JavaScript engine; workers are processes, so memory is not shared |
 
 #### `node:sqlite`
 
@@ -861,71 +934,74 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 | `setAuthorizer(callback)`, `constants` (`SQLITE_OK` / `DENY` / `IGNORE`, action codes, `SQLITE_CHANGESET_*`) | ✅ | [lib-node-sqlite-functions.ts](conformance/lib-node-sqlite-functions.ts) | |
 | Errors: SQLite's message with `code: 'ERR_SQLITE_ERROR'`, `errcode` (extended result code), `errstr`; `ERR_INVALID_STATE` / `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_VALUE` | ✅ | [lib-node-sqlite-errors.ts](conformance/lib-node-sqlite-errors.ts) | Same messages as Node 24 |
 | `backup(db, path, { source, rate, progress })` | ✅ | [lib-node-sqlite-errors.ts](conformance/lib-node-sqlite-errors.ts) | Copies `rate` pages per event-loop turn; resolves with the page count |
-| `loadExtension` / `enableLoadExtension` | ❌ | — | SQLite runs as Wasm inside the program; native extensions can't load |
-| `createSession` / `applyChangeset` | ❌ | — | The bundled SQLite build has no session extension |
-| `serialize` / `deserialize` | ❌ | — | The driver has no `sqlite3_serialize` binding |
-| `undefined` as a parameter value, `[Object: null prototype]` rows | ❌ | — | `undefined` and `null` are both `nil` (binds NULL instead of throwing); rows print as plain objects |
-| Finalizing a statement when it is garbage-collected | ❌ | — | Statements live until `db.close()` (Go has no hook that is safe here): re-preparing in a loop holds every copy until then; reuse statements or `createTagStore()` |
+| `loadExtension` / `enableLoadExtension` | 🚫 | — | SQLite runs as Wasm inside the program; native extensions can't load |
+| `createSession` / `applyChangeset` | ❌ | — | The bundled SQLite build has no session extension: needs an emulation over the preupdate hook (hard) |
+| `serialize` / `deserialize` | ❌ | — | The driver has no `sqlite3_serialize` binding; feasible through a temporary file and the backup API |
+| `undefined` as a parameter value, `[Object: null prototype]` rows | 🚫 | — | `undefined` and `null` are both `nil` (binds NULL instead of throwing); rows print as plain objects |
+| Finalizing a statement when it is garbage-collected | ❌ | — | Statements live until `db.close()`: re-preparing in a loop holds every copy until then; reuse statements or `createTagStore()`. Feasible: `runtime.AddCleanup` can post the finalize to the event loop |
 
 #### `node:inspector`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| Debugger / profiler sessions (`Session`, `open`, `url`) | ❌ | — | Speaks the inspector protocol of a JavaScript engine; a native binary has none |
+| Debugger / profiler sessions (`Session`, `open`, `url`) | 🚫 | — | Speaks the inspector protocol of a JavaScript engine; a native binary has none |
 
 #### `node:repl`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `start` / `REPLServer` | ❌ | — | Evaluates JavaScript at runtime; needs a JavaScript engine |
+| `start` / `REPLServer` | 🚫 | — | Evaluates JavaScript at runtime; needs a JavaScript engine |
 
 #### `node:vm`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `Script` / `runInContext` / `createContext` / `compileFunction` & co. | ❌ | — | Compiles and runs JavaScript code at runtime; needs a JavaScript engine |
+| `Script` / `runInContext` / `createContext` / `compileFunction` & co. | 🚫 | — | Compiles and runs JavaScript code at runtime; needs a JavaScript engine |
 
 #### `node:v8`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| Heap statistics / snapshots, `serialize` / `deserialize`, flags | ❌ | — | V8 internals; there is no V8 in a native binary |
+| `getHeapStatistics` / `getHeapSpaceStatistics`, `serialize` / `deserialize` | ❌ | — | Feasible: `runtime.MemStats`; the structured-clone codec workers already use |
+| Heap snapshots, `setFlagsFromString`, `startupSnapshot` | 🚫 | — | V8 internals; there is no V8 in a native binary |
 
 #### `node:wasi`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `WASI` | ❌ | — | Runs WebAssembly modules; the generated program has no Wasm runtime |
+| `WASI` | ❌ | — | Needs a Wasm runtime: vendoring wazero (pure Go, no cgo) would provide one |
 
 #### `node:sea`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `isSea` / `getAsset` / `getRawAsset` | ❌ | — | Single-executable-application assets; TypeNative already produces a native binary |
+| `isSea` / `getAsset` / `getRawAsset` | ❌ | — | Every TypeNative binary is a single executable (`isSea()` would be `true`); assets would be files embedded with `go:embed` |
 
 #### `node:trace_events`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `createTracing` / `getEnabledCategories` | ❌ | — | V8 / Node trace categories; no native equivalent |
+| `createTracing` / `getEnabledCategories` | 🚫 | — | V8 / Node trace categories; no native equivalent |
 
 #### `node:module`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `createRequire` / `register` / `builtinModules` / `findPackageJSON` & co. | ❌ | — | Loader hooks for a JavaScript runtime; imports are resolved at compile time |
+| `builtinModules` / `isBuiltin` / `createRequire(…)('literal')` / `findPackageJSON` | ❌ | — | Feasible: static lists, and `require` of a literal specifier resolved at compile time like an import |
+| `register` / `registerHooks` (loader hooks), `require` of computed specifiers | 🚫 | — | Hooks into a JavaScript loader; imports are resolved at compile time |
 
 #### `node:test/reporters`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `tap` / `spec` / `dot` / `junit` / `lcov` | ❌ | — | Reporters consume `run()`'s event stream, and `run()` runs test files as separate processes; one binary holds one program (see [test](#nodetest)) |
+| `tap` / `spec` / `dot` / `junit` | ❌ | — | `tap` and `spec` already run in-process (see [test](#nodetest)); exporting them and adding `dot` / `junit` is feasible |
+| `lcov` | ❌ | — | Needs coverage (see [test](#nodetest)) |
 
 #### `node:domain`
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `create` / `Domain` | ❌ | — | Deprecated upstream |
+| `create` / `Domain` | 🚫 | — | Deprecated upstream |
 
 ### Go bridges (`go:*`)
 
@@ -1117,7 +1193,7 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | Rule | Meaning |
 | ---- | ------- |
 | Number conversion | All Go ints/floats map to TS `number`; args convert via `T(x)`, results read back via `float64(x)`. `int64`/`uint64` beyond 2^53 lose precision. |
-| Throw on error | `(T, error)` results throw a `GoError` on failure; `error`-only calls throw as statements and yield the error value in value position. |
+| Throw on error | `(T, error)` results throw a `GoError` on failure; `error`-only calls throw as statements and yield the error value in value position ([lib-go-bridge-smoke.ts](conformance/lib-go-bridge-smoke.ts)). |
 | Tuples | Multi-value results pack into a slice (TS tuple); `const [a, b] = f()` types each element (ints read as numbers). |
 | Structs | `new pkg.T({...})` builds a composite literal (pointer when any method needs it); fields read/write directly, converting numbers both ways (`h.Size += 1`). Embedded structs promote their fields. |
 | Named numerics | Typed constants (`time.Second`, `reflect.String`) stay typed in Go; arithmetic and `===` coerce the `number` side (`time.Second * 2`). Results read as numbers: `token.Token(n)` restores the methods. |
@@ -1125,8 +1201,8 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | Generics | Type args are inferred from the arguments, including through constraints (`maps.Keys(m)` with `Map ~map[K]V`); unresolved ones become `any`. |
 | printf verbs | With a literal format, numbers passed to `%d %x %o %b %c %U` convert to `int64`; scan into number refs with `%v`. |
 | nil | `null` passes as `nil`; `x === null` on nil-able Go values (slices, maps, interfaces, pointers) is a real nil check. |
-| Channels | `chan<T>(size?)` / `GoChan<T>` with `send`, `recv`, `close`; `for…of` ranges channels, `iter.Seq` and `iter.Seq2` (`for (const [k, v] of seq2)`). |
-| Out-params | `ref<T>(init?)` makes a pointer cell; `.value` dereferences it. |
+| Channels | `chan<T>(size?)` / `GoChan<T>` with `send`, `recv`, `close`; `for…of` ranges channels, `iter.Seq` and `iter.Seq2` (`for (const [k, v] of seq2)`) ([lib-go-builtin.ts](conformance/lib-go-builtin.ts)). |
+| Out-params | `ref<T>(init?)` makes a pointer cell; `.value` dereferences it ([lib-go-builtin.ts](conformance/lib-go-builtin.ts)). |
 | Byte slices | `[]byte` is `Uint8Array` (zero-copy); `number[]` converts per call (mutations of the copy are lost). |
 | Side-effect imports | `import 'go:time/tzdata'` emits a blank `import _`. |
 | Go interfaces | A TS class instance passed where Go expects an interface (`heap.Interface`, `sort.Interface`) is wrapped in a generated adapter with the exact Go method signatures (`Len() int` calls the class's `Len(): number`); the class needs every method, inherited ones count. Values typed as the interface itself are not adapted. |
@@ -1137,3 +1213,106 @@ Status: ✅ probed, ⚠️ typed (declared and bridged), no probe yet, ❌ exclu
 | ------------------------- | :----: | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `import { x } from 'pkg'` |   ✅    | [syntax-import-npm.ts](conformance/syntax-import-npm.ts) | Mapped to Go module imports (fixture dep in [conformance/package.json](conformance/package.json)) |
 | Packages published as plain JavaScript / CommonJS (tried: `ms`, `escape-html`, `tiny-invariant`) | ❌ | — | Without TypeScript sources there are no types to compile from: untyped packages stop at the type check (TS7016), and typed ones whose code is CommonJS (`module.exports`, union-typed callbacks) don't lower. Packages that ship `.ts` sources work |
+
+## Roadmap: known limitations
+
+### Structural limitations (🚫)
+
+These follow from compiling to a native Go binary, and won't change:
+
+- **No JavaScript engine at runtime**, so code can't be compiled while the program runs: `eval`,
+  `new Function`, `node:vm`, `node:repl`, Worker `eval: true`. Nothing can inspect an engine
+  either: `node:inspector`, `node:v8` heap snapshots and flags, `node:trace_events`, and
+  `node:module` loader hooks.
+- **Classes are static Go structs** with fixed fields and method sets: no prototype mutation
+  (`C.prototype.m = …`, `Object.setPrototypeOf`, `util.inherits`), no `Proxy` over typed values,
+  no sparse-array holes.
+- **`undefined` and `null` are both Go `nil`**, so APIs that tell them apart can't (`node:sqlite`
+  binding `undefined`).
+- **One process per isolate**: workers, `fork` and cluster workers are separate processes, so
+  `SharedArrayBuffer` / `Atomics` can't share memory.
+- **No cgo**: `go:plugin`, `go:runtime/cgo`, `go:runtime/race`, `go:unsafe`, and SQLite native
+  extensions (SQLite runs as Wasm translated to Go).
+- **Deprecated upstream**: `node:domain`, HTTP/2 server push, `util.inherits`.
+
+### Mechanisms that unlock several ❌ rows
+
+- **Per-OS helpers.** Each binary is built for one OS (`--target`), and the transpiler already
+  picks `@windows` / `@other` variants of a runtime helper (`os.totalmem`). With the vendored
+  `golang.org/x/sys`, this covers terminal size and raw mode (`process.stdout.columns`,
+  `setRawMode`, tty streams, readline keypresses), `process.umask`, `child_process` `detached`,
+  dgram multicast / broadcast, and Windows errno numbers.
+- **Source positions.** The generated Go carries `//line` directives, so `runtime.Callers`
+  reports `.ts` files and lines: `err.stack`, `util.getCallSites`, node:test `location`.
+- **Second entry points.** Compiling another `.ts` file into the same binary, and selecting it
+  with an environment variable as workers already do (`TN_WORKER_ADDR`), would cover
+  `new Worker('./w.ts')`, `fork('./child.ts')` and node:test `run({ files })`.
+- **Go 1.24+ runtime features.** `weak` and `runtime.AddCleanup` would cover `WeakRef`,
+  `FinalizationRegistry`, and freeing SQLite statements when they are garbage-collected.
+- **Copying from GOROOT's vendor tree**, the way `String.prototype.normalize` copies `x/text`.
+  `golang.org/x/net/dns/dnsmessage` would cover the remaining `node:dns` record types and TTLs.
+
+### Planned order
+
+1. **Correctness.** Some programs build no Go at all, or compute the wrong value, without a
+   TypeNative diagnostic. Turn these into `reportError` diagnostics, then fix them:
+   - class methods without a return-type annotation
+   - field initializers that run too early
+   - `instanceof Map` / `Set` / `Date` / `Array`
+   - static inheritance and inherited accessors
+   - private accessors and `static #x`
+   - labeled blocks
+   - exhaustive `switch` without `default`
+   - enum reverse mapping
+   - bigint bitwise operators
+   - Date arithmetic
+   - async methods returning a value
+   - object-literal setters
+   - declaration merging
+   - the uncaught compiler errors (`Object.hasOwn` / `Object.defineProperty` with computed
+     keys)
+2. **Everyday built-ins:**
+   - `Date` (string and multi-argument constructors, `Date.parse`, setters, local-time
+     `toString`)
+   - `JSON.stringify` `space` / replacer / `toJSON`, and the `JSON.parse` reviver
+   - `err.stack`
+   - `bind` / `fn.name`
+   - the missing `Promise` / `Array` / `Object` / `String` / `Number` / `Math` / `BigInt` /
+     `Symbol` statics
+   - iterator helpers
+   - `AggregateError`
+   - `Uint8Array` base64 / hex
+   - `BigInt64Array`
+3. **Language depth:**
+   - mixins
+   - polymorphic `this`
+   - field and accessor decorators
+   - `inst[key]` on class instances
+   - generator `next(value)`
+   - `WeakRef` / `FinalizationRegistry`
+4. **Node gaps:**
+   - the per-OS helpers above
+   - second entry points
+   - `node:dns` records
+   - `async_hooks.createHook`
+   - SQLite finalization and `serialize`
+   - node:test snapshots, flags and reporters
+   - `node:module` / `node:sea` / `node:v8` basics
+   - the smaller `node:crypto` items
+   - stream backpressure and BYOB readers
+   - http trailers
+   - TLS PFX and root certificates
+   - probes for the ⚠️ Go bridges
+5. **New surfaces:**
+   - `Intl`
+   - `Temporal`
+   - `WebSocket` and the other web globals
+   - `go:embed`
+   - `WebAssembly` / `node:wasi` (on vendored wazero)
+   - zstd
+   - CommonJS npm packages
+
+Every item needs:
+- a declaration in [types/](types/) (without one, user code fails the type check);
+- a `conformance/` probe;
+- its row in this file flipped to ✅.
