@@ -27,9 +27,11 @@ declared there fails the type check before it reaches the transpiler. The
 | `null`                                         |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `undefined`                                    |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `any` / `unknown`                              |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Dynamic values handled at runtime (JSON-like objects, arrays, primitives) |
+| A variable declared `any` with a typed initializer (`const x: any = '6'`) | ❌ | — | Keeps the initializer's Go type, so `x - 1` fails the Go build; values that arrive as `any` (parameters, `JSON.parse`) are dynamic |
 | Nullable types (`T \| null`, `T \| undefined`) |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     | Transpiled to Go pointer types                                            |
 | `bigint`                                       |   ✅    | [syntax-bigint.ts](conformance/syntax-bigint.ts)                     | `2n` literals → `*big.Int`; `**` → `.Exp`, comparisons via `.Cmp`         |
-| `bigint` bitwise / shift operators, `BigInt()`, `BigInt.asIntN` / `asUintN`, bigint–number comparisons | ❌ | — | `a & b` on bigints casts to `float64` (the Go build fails); `BigInt()` is not declared |
+| `bigint` bitwise / shift operators (`&`, `\|`, `^`, `~`, `<<`, `>>`, compound forms) | ✅ | [syntax-bigint-bitwise.ts](conformance/syntax-bigint-bitwise.ts) | `math/big`'s two's-complement `And` / `Or` / `Xor` / `Not`; shifts round toward -Infinity |
+| `BigInt()`, `BigInt.asIntN` / `asUintN`, bigint–number comparisons | ❌ | — | `BigInt()` is not declared; `5n == 5` is `false` |
 | `symbol`                                       |   ✅    | [syntax-symbols.ts](conformance/syntax-symbols.ts)                   | `Symbol()` → unique `*TnSymbol` pointers, usable as record keys           |
 | `object` type                                  |   ✅    | [syntax-object-type.ts](conformance/syntax-object-type.ts)           | `object` → `interface{}`                                                  |
 | `void` / `never`                               |   ✅    | [syntax-void-never.ts](conformance/syntax-void-never.ts)             | No return value in Go                                                     |
@@ -83,8 +85,8 @@ declared there fails the type check before it reaches the transpiler. The
 | Comma operator               |   ✅    | [syntax-comma-operator.ts](conformance/syntax-comma-operator.ts)             | In `for` headers (`i = 0, j = 10` / `i++, j--`)                              |
 | `void` operator              |   ✅    | [syntax-void-operator.ts](conformance/syntax-void-operator.ts)               | Evaluates, then `nil`                                                        |
 | `new.target`                 |   ✅    | [syntax-new-target.ts](conformance/syntax-new-target.ts)                     | Constructors pass the target class name through `super()` chains             |
-| `instanceof Map` / `Set` / `Date` / `Array` | ❌ | — | Lowered to a type assertion on a Go type that doesn't exist (the Go build fails) |
-| `#x in obj` (private brand checks) | ❌ | — | Lowered to a lookup of an undefined `x` (the Go build fails) |
+| `instanceof Map` / `Set` / `Date` / `Array`, subclass instances | ✅ | [syntax-instanceof-builtins.ts](conformance/syntax-instanceof-builtins.ts) | Maps and Sets made by `new Map()` / `new Set()` are tagged (records are not Maps); arrays exclude Buffers; `instanceof Parent` holds for subclass instances |
+| `#x in obj` (private brand checks) | ✅ | [syntax-instanceof-builtins.ts](conformance/syntax-instanceof-builtins.ts) | An instance of the class declaring `#x`, or of a subclass |
 
 ## Control flow
 
@@ -108,8 +110,8 @@ declared there fails the type check before it reaches the transpiler. The
 | `Error.message`                     |   ✅    | [syntax-error-message.ts](conformance/syntax-error-message.ts)                                                 | `throw new Error` panics with a `*TnError`; `.message` on caught values    |
 | `Error` `cause` (`new Error(message, { cause })`, `err.cause`) |   ✅    | [lib-node-fetch-bad-port.ts](conformance/lib-node-fetch-bad-port.ts) | Built-in error classes too |
 | Narrowing                           |   ✅    | [syntax-typeof.ts](conformance/syntax-typeof.ts)                                                               | `T \| undefined` narrowed after `if (x)`, `x !== undefined`, early returns |
-| Exhaustive `switch` without `default` ending a function that returns a value | ❌ | — | `cannot fallthrough final case` / `missing return` in Go; adding a `default` works (discriminated unions included) |
-| Labeled blocks (`label: { … break label; }`) | ❌ | — | Go only breaks out of labeled loops / switches (the Go build fails); labeled loops work |
+| Exhaustive `switch` without `default`; statements after a `switch` | ✅ | [syntax-switch-exhaustive.ts](conformance/syntax-switch-exhaustive.ts) | A function that can end without a `return` returns its result type's zero value (JS: `undefined`) |
+| Labeled blocks and statements (`label: { … break label; }`) | ✅ | [syntax-labeled-blocks.ts](conformance/syntax-labeled-blocks.ts) | `break label` jumps past the statement (`goto`) |
 | Throwing non-`Error` values (`throw 'x'`, `throw { code: 1 }`) | ✅ | — | Caught as `interface{}`; properties read dynamically |
 | `debugger` | ✅ | — | Erased |
 | `with` | 🚫 | — | Not allowed in strict mode (modules are strict) |
@@ -166,19 +168,20 @@ declared there fails the type check before it reaches the transpiler. The
 | Optional properties                                              |   ✅    | [syntax-optional-chaining.ts](conformance/syntax-optional-chaining.ts)                   | `prop?: Type` in interfaces/types                                                       |
 | Type-aware method dispatch                                       |   ✅    | [semantics-method-dispatch.ts](conformance/semantics-method-dispatch.ts)                 | Class `.push()` / `.length` not confused with array builtins                            |
 | Index signatures (`[key: string]: T`)                            |   ✅    | [syntax-index-signatures.ts](conformance/syntax-index-signatures.ts)                     | `{ [k: K]: V }` is `Record<K, V>` (an ordered Go map)                                   |
-| Methods without a return-type annotation | ❌ | — | Class methods (instance and static) compile as returning nothing, so `m() { return 8; }` fails the Go build; functions and arrows infer their return type. Annotate method return types |
-| Field initializers reading parameter properties or parent fields | ❌ | — | Initializers run before parameter properties and `super()` are assigned, so `d = this.k * 2` sees `0` (wrong value, no error) |
+| Methods without a return-type annotation | ✅ | [syntax-method-return-inference.ts](conformance/syntax-method-return-inference.ts) | Inferred from the returns, as for functions (also returns nested in `if` / loops / `switch` / `try`); an inherited `return this` returns the subclass |
+| Field initializers reading parameter properties or parent fields | ✅ | [syntax-class-field-order.ts](conformance/syntax-class-field-order.ts) | `super()`, then parameter properties, then field initializers, then the constructor body (TS's ES2020 order) |
 | Arrow-function fields (`h = () => this.x`), fields reading earlier fields | ✅ | — | Run in the constructor; `this` is the instance |
-| Private methods (`#m()`) | ✅ | — | With a return-type annotation (see above) |
-| Private accessors (`get #x()`) / static private fields (`static #x`) | ❌ | — | Lowered to a missing `x` field / `C.x` (the Go build fails) |
+| Private methods (`#m()`) | ✅ | [syntax-method-return-inference.ts](conformance/syntax-method-return-inference.ts) | |
+| A private and a public member with the same name (`#x` and `x`) | ❌ | — | Both become the Go name `x` (`already declared`) |
+| Private accessors (`get #x()`) / static private fields (`static #x`) | ✅ | [syntax-class-accessor-inheritance.ts](conformance/syntax-class-accessor-inheritance.ts), [syntax-class-static-inheritance.ts](conformance/syntax-class-static-inheritance.ts) | |
 | `accessor` fields | ✅ | — | Plain fields (decorating them is not supported) |
-| Static inheritance (`Child.staticOfParent()`) | ❌ | — | Static members are registered on the declaring class only (the Go build fails) |
-| Inherited getters / setters, `super.x` on accessors | ❌ | — | Only methods are copied down to subclasses (the Go build fails) |
-| Object-literal setters (`set x(v) {}`) | ❌ | — | The setter is dropped; writes fail the Go build (object-literal getters work) |
+| Static inheritance (`Child.staticOfParent()`) | ✅ | [syntax-class-static-inheritance.ts](conformance/syntax-class-static-inheritance.ts) | Resolved to the declaring class's `Parent_member` at compile time |
+| Inherited getters / setters, `super.x` on accessors | ✅ | [syntax-class-accessor-inheritance.ts](conformance/syntax-class-accessor-inheritance.ts) | Accessors are copied onto subclasses like methods |
+| Object-literal setters (`set x(v) {}`) | ✅ | [syntax-object-setters.ts](conformance/syntax-object-setters.ts) | A `Set_x` closure field: `o.x = v` calls it |
 | Mixins (class factories, `return class extends Base {}`, `class extends f()`) | ❌ | — | `Unsupported syntax: ClassExpression` outside `const C = class {}` |
 | Polymorphic `this` return types (fluent chains) | ❌ | — | `this` types lower to `interface{}`, so a chained call fails the Go build |
 | Dynamic keys on class instances (`inst[key]`) | ❌ | — | Struct pointers can't be indexed (the Go build fails); records and `any` objects can |
-| Declaration merging (interface + interface, class + interface, string enum + string enum) | ❌ | — | Each declaration emits its own Go type (`redeclared in this block`); namespace + function merging works |
+| Declaration merging (interface + interface, enum + enum, class + interface) | ✅ | [syntax-declaration-merging.ts](conformance/syntax-declaration-merging.ts) | Merged within one scope; an interface adds its properties to a same-named class as fields; namespace + function merging works too |
 | Prototype mutation (`C.prototype.m = …`, `Object.setPrototypeOf`, `util.inherits`) | 🚫 | — | Classes are static Go structs with fixed method sets |
 
 ## Generics
@@ -200,7 +203,7 @@ declared there fails the type check before it reaches the transpiler. The
 | String enums                          |   ✅    | [syntax-enum-string.ts](conformance/syntax-enum-string.ts)   | `enum` declarations and member access                                   |
 | `const enum`                          |   ✅    | [syntax-const-enum.ts](conformance/syntax-const-enum.ts)     | Compiled like a regular enum                                            |
 | Computed / heterogeneous enum members |   ✅    | [syntax-enum-computed.ts](conformance/syntax-enum-computed.ts) | Computed members assigned in source order; mixed enums keep each member's type |
-| Reverse mapping (`Color[0]`) | ❌ | — | Numeric members are plain constants: there is no `Color` value to index (the Go build fails) |
+| Reverse mapping (`Color[0]`), `Enum['Member']` | ✅ | [syntax-enum-reverse.ts](conformance/syntax-enum-reverse.ts) | A generated `Color__name` function: the last member with the value wins; an unknown value gives `""` (JS: `undefined`). String enum members concatenate and print as strings |
 
 ## Type-system features
 
@@ -270,7 +273,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `queueMicrotask`                                     |   ✅    | [lib-queue-microtask.ts](conformance/lib-queue-microtask.ts) | Runs after the current synchronous code (end of main or of an event-loop task)                 |
 | `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` posting the callback to the event loop, which keeps the process alive          |
 | `resolve` / `reject` passed as values                |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | `new Promise((resolve) => setTimeout(resolve, ms))`                 |
-| Async class methods returning a plain value (`async m(): Promise<T> { return v; }`) | ❌ | — | Methods skip the async lowering functions get: `return v` fails the Go build (`return otherPromise()` works) |
+| Async class methods (instance, static, inherited, unannotated); `return otherPromise()` | ✅ | [syntax-async-methods.ts](conformance/syntax-async-methods.ts) | Lowered like async functions; a returned promise is awaited |
 | `Promise.withResolvers` / `Promise.try` | ❌ | — | Not declared |
 
 ## Semantics (JS behaviour preserved)
@@ -278,6 +281,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Feature                                   | Status | Probe                                                                              | Notes                                                                                                       |
 | ----------------------------------------- | :----: | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Array reference semantics                 |   ✅    | [semantics-array-reference.ts](conformance/semantics-array-reference.ts)           | Array variables hold `*[]T` so aliases share the slice header                                               |
+| `any[]` arrays mutated through a parameter (`function f(a: any[]) { a.push(x) }`) | ❌ | — | `any[]` arrays are plain `[]interface{}`, not shared references: a `push` inside the callee is lost to the caller (typed arrays share) |
 | Object reference semantics                |   ✅    | [semantics-object-reference.ts](conformance/semantics-object-reference.ts)         | Aliased objects share state; [semantics-parameter-mutation.ts](conformance/semantics-parameter-mutation.ts) |
 | Object identity                           |   ✅    | [semantics-object-identity.ts](conformance/semantics-object-identity.ts)           | Equal literals are different references                                                                     |
 | Object key order                          |   ✅    | [semantics-object-key-order.ts](conformance/semantics-object-key-order.ts)         | Insertion order preserved                                                                                   |
@@ -354,7 +358,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Object.freeze` / `seal` / `preventExtensions` / `isFrozen` / `isSealed` / `isExtensible` | ✅ | [lib-object-freeze.ts](conformance/lib-object-freeze.ts) | Integrity level tracked by identity; writes rejected by `Readonly<T>` types (`preventExtensions` / `isSealed` / `isExtensible` not probed) |
 | `Object.fromEntries`                                       |   ✅    | [lib-object-from-entries.ts](conformance/lib-object-from-entries.ts) | `TnFromEntries` → dynamic object                                    |
 | `Object.hasOwn` / `defineProperty` / `getOwnPropertyNames` |   ✅    | [lib-object-own.ts](conformance/lib-object-own.ts)         | Maps, dynamic objects and typed objects (literal keys); `{ value }` descriptors |
-| `Object.hasOwn` / `defineProperty` with a non-literal key on a typed object | ❌ | — | The compiler stops with an uncaught error (a stack trace) instead of a diagnostic |
+| `Object.hasOwn` / `defineProperty` with a non-literal key on a typed object | ✅ | [lib-object-own-computed.ts](conformance/lib-object-own-computed.ts) | A `switch` over the declared fields (an unset optional field is not own) |
 | `Object.is` / `groupBy` / `Map.groupBy` / `create` / `getPrototypeOf` / `getOwnPropertyDescriptor(s)` / `defineProperties` | ❌ | — | Not declared |
 
 ### `String`
@@ -449,7 +453,7 @@ Every standard-library API TypeNative ports, split by module. Per
 | `toString` | ❌ | — | Prints Go's format (`1970-01-01 00:00:00 +0000 UTC`), not Node's (`Thu Jan 01 1970 …`) |
 | `new Date(string)` / `new Date(y, m, d, …)` / `Date.parse` | ❌ | — | Only `new Date()` and `new Date(ms)` are declared |
 | Setters (`setFullYear`, `setDate`, `setHours`, …), `getTimezoneOffset`, `toUTCString`, `toLocale*String` | ❌ | — | Not declared |
-| Date arithmetic (`b - a`, `+d`) | ❌ | — | `+d` fails the Go build and `(b as any) - (a as any)` gives `0`: use `getTime()` |
+| Date arithmetic and ordering (`b - a`, `+d`, `a < b`) | ✅ | [semantics-date-arithmetic.ts](conformance/semantics-date-arithmetic.ts) | The time value in milliseconds; `any` operands of `-` `*` `/` `%` convert with ToNumber |
 
 ### `RegExp`
 
@@ -1254,23 +1258,16 @@ These follow from compiling to a native Go binary, and won't change:
 
 ### Planned order
 
-1. **Correctness.** Some programs build no Go at all, or compute the wrong value, without a
-   TypeNative diagnostic. Turn these into `reportError` diagnostics, then fix them:
-   - class methods without a return-type annotation
-   - field initializers that run too early
-   - `instanceof Map` / `Set` / `Date` / `Array`
-   - static inheritance and inherited accessors
-   - private accessors and `static #x`
-   - labeled blocks
-   - exhaustive `switch` without `default`
-   - enum reverse mapping
-   - bigint bitwise operators
-   - Date arithmetic
-   - async methods returning a value
-   - object-literal setters
-   - declaration merging
-   - the uncaught compiler errors (`Object.hasOwn` / `Object.defineProperty` with computed
-     keys)
+1. **Correctness.** Done: class method return inference, constructor initialization order,
+   `instanceof` on built-ins and subclasses, static and accessor inheritance, private accessors
+   and `static #x`, labeled blocks, exhaustive `switch`, enum reverse mapping, bigint bitwise
+   operators, Date arithmetic, async methods, object-literal setters, declaration merging, and
+   computed keys in `Object.hasOwn` / `defineProperty`. Remaining:
+   - `#x` and `x` in one class collide
+   - a `const x: any` keeps its initializer's Go type
+   - writing past the end of an array
+   - `any[]` arrays don't share `push` through parameters
+   - polymorphic `this` chains and `inst[key]` (also in step 3)
 2. **Everyday built-ins:**
    - `Date` (string and multi-argument constructors, `Date.parse`, setters, local-time
      `toString`)

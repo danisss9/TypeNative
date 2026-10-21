@@ -764,6 +764,12 @@ func TnUtilFormat(args ...interface{}) string {
 			} else {
 				args[i] = *p
 			}
+		case string:
+		default:
+			// String enum members (type E string) print as strings
+			if rv := reflect.ValueOf(a); rv.Kind() == reflect.String {
+				args[i] = rv.String()
+			}
 		}
 	}
 	first, isString := args[0].(string)
