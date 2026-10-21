@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+Programs that built Go that didn't compile, or computed a wrong value, with no TypeNative error:
+
+- **Classes:**
+  - methods without a return-type annotation compiled as returning nothing; they now infer it
+    like functions do, including returns nested in `if` / loops / `switch` / `try`
+  - field initializers ran before `super()` and the parameter properties, so
+    `d = this.k * 2` read `0`
+  - static members and getters / setters are inherited (`Child.make()`, `super.v`)
+  - private accessors (`get #x()`), `static #x` and `#x in obj` work
+  - async methods are lowered like async functions
+  - `instanceof Map` / `Set` / `Date` / `Array` work, and `instanceof Parent` is true for
+    subclass instances
+- **Control flow:**
+  - a `switch` that covers every case without `default` builds; so does any statement after a
+    `switch`
+  - labeled blocks support `break label`
+- **Async:** `return otherPromise()` in an async function settles with the awaited value, and
+  unannotated async functions build
+- **Values and operators:**
+  - numeric enum reverse mapping (`Color[0]`)
+  - string enum members concatenate and print as strings (`console.log` printed `'a'`)
+  - bigint bitwise and shift operators
+  - Date arithmetic and ordering (`b - a`, `+d`, `a < b`)
+  - `any` operands of `-` / `*` / `/` convert like JS (`'6' - 1` is `5`)
+- **Objects:**
+  - object-literal setters (they were dropped)
+  - repeated interfaces / enums, and an interface named like a class, merge
+  - `Object.hasOwn` / `defineProperty` with a computed key build instead of crashing the
+    compiler
+  - unsupported decorators and descriptors are reported as diagnostics instead of crashes
+
 ### Documentation
 
 - `conformance.md` separates ❌ (not implemented yet, feasible) from 🚫 (will not be implemented)

@@ -336,6 +336,8 @@ let thisOverrideFn;
 // Classes with accessor members: "Class.prop" in these sets means reads/writes
 // of the property are Get_prop() / Set_prop(...) calls
 const classGetterMethods = new Set();
+// Labels of non-loop statements being emitted: `break label` jumps past them
+const blockLabels = new Set();
 const classSetterMethods = new Set();
 // Classes with a generator method named [Symbol.iterator]: className → yield type
 const classIteratorMethods = new Map();
@@ -681,6 +683,60 @@ function lowerAmbientDeclarations(node) {
             return true;
         }
         return !(statement.modifiers ?? []).some(isDeclare);
+    });
+    mergeDeclarations(node);
+}
+// Declaration merging within one scope: a repeated interface or enum adds its
+// members to the first declaration, and an interface named like a class adds
+// its properties to the class as fields
+function mergeDeclarations(node) {
+    const first = new Map();
+    for (const statement of node.statements) {
+        if (!statement.name?.text)
+            continue;
+        const kind = statement.kind;
+        const key = `${kind}:${statement.name.text}`;
+        const mergeable = kind === 'InterfaceDeclaration' || kind === 'EnumDeclaration';
+        if (kind === 'ClassDeclaration' || (mergeable && !first.has(key)))
+            first.set(key, statement);
+    }
+    node.statements = node.statements.filter((statement) => {
+        const kind = statement.kind;
+        if ((kind !== 'InterfaceDeclaration' && kind !== 'EnumDeclaration') || !statement.name?.text)
+            return true;
+        const name = statement.name.text;
+        const cls = kind === 'InterfaceDeclaration' ? first.get(`ClassDeclaration:${name}`) : undefined;
+        if (cls) {
+            const declared = new Set();
+            for (const m of cls.members ?? []) {
+                if (m.name?.text)
+                    declared.add(m.name.text);
+            }
+            const classMembers = cls.members ?? [];
+            for (const m of statement.members ?? []) {
+                if (m.kind !== 'PropertySignature' || !m.name?.text || declared.has(m.name.text))
+                    continue;
+                classMembers.push({ ...m, kind: 'PropertyDeclaration', parent: cls });
+            }
+            cls.members = classMembers;
+            return false;
+        }
+        const target = first.get(`${kind}:${name}`);
+        if (!target || target === statement)
+            return true;
+        const members = target.members ?? [];
+        for (const member of statement.members ?? []) {
+            member.parent = target;
+            members.push(member);
+        }
+        target.members = members;
+        if (statement.heritageClauses) {
+            const clauses = target.heritageClauses ?? [];
+            for (const clause of statement.heritageClauses)
+                clauses.push(clause);
+            target.heritageClauses = clauses;
+        }
+        return false;
     });
 }
 // Every module form becomes an import declaration (all files share one Go package):
@@ -1263,11 +1319,22 @@ function visit(node, options = {}) {
         return `[]${type} {${(node.elements ?? []).map((e) => visit(e)).join(', ')}}`;
     }
     else if (isBlock(node)) {
-        return `{\n\t\t${options.prefixBlockContent ?? ''}${visitBlockStatements(node.statements ?? [])}${options.extraBlockContent ?? ''}}${options.inline ? '' : '\n\t'}`;
+        return `{\n\t\t${options.prefixBlockContent ?? ''}${visitBlockStatements(node.statements ?? [])}${options.extraBlockContent ?? ''}${fallbackReturn(node)}}${options.inline ? '' : '\n\t'}`;
     }
     else if (isElementAccessExpression(node)) {
         if (hasQuestionDot(node)) {
             return visitOptionalElementAccess(node);
+        }
+        // Enum['Member'] is the member; NumericEnum[value] its name (reverse mapping)
+        if (isIdentifier(node.expression) && enumNames.has(node.expression.text)) {
+            const enumGoName = getSafeName(node.expression.text);
+            const key = node.argumentExpression;
+            if (isStringLiteral(key)) {
+                return `${enumGoName}_${getEnumMemberName(key)}`;
+            }
+            if (enumBaseTypes.get(node.expression.text) === 'float64') {
+                return `${enumGoName}__name(float64(${visit(key)}))`;
+            }
         }
         if (isDynamicValue(node.expression)) {
             useHelper('dynamic');
@@ -1359,6 +1426,10 @@ function visit(node, options = {}) {
             const ownerClass = getEnclosingClassName(node);
             const parentName = ownerClass ? classParentNames.get(ownerClass) : undefined;
             if (parentName) {
+                // super.x on an accessor reads the parent's getter
+                if (!isCallee(node) && !isAssignmentTarget(node) && classGetterMethods.has(`${parentName}.${node.name.text}`)) {
+                    return `self.${goFieldName(parentName)}.Get_${visit(node.name)}()`;
+                }
                 return `self.${goFieldName(parentName)}.${visit(node.name)}`;
             }
             return visit(node.name);
@@ -1370,12 +1441,14 @@ function visit(node, options = {}) {
         if (isIdentifier(node.expression) && defaultImportNamespaces.has(node.expression.text)) {
             return visit(node.name);
         }
-        // Static member access: `Counter.count` → `Counter_count`
+        // Static member access: `Counter.count` → `Counter_count`, also when the
+        // member is inherited (`Child.make` → `Parent_make`) or private (`C.#n`)
         if (isIdentifier(node.expression)) {
-            const key = `${node.expression.text}.${node.name.text}`;
-            if (classStaticMethods.has(key) || classStaticProps.has(key)) {
-                return `${node.expression.text}_${node.name.text}`;
-            }
+            const memberName = node.name.kind === 'PrivateIdentifier' ? node.name.text.slice(1) : node.name.text;
+            const owner = staticMemberOwner(node.expression.text, memberName);
+            // the declaration's name (Go builtins such as `make` are renamed)
+            if (owner)
+                return `${owner}_${node.name.kind === 'PrivateIdentifier' ? visit(node.name) : getSafeName(memberName)}`;
         }
         const leftSide = visit(node.expression);
         const rightSide = visit(node.name);
@@ -1398,7 +1471,8 @@ function visit(node, options = {}) {
                 : leftGoType
                     ? leftGoType.slice(1).replace(/\[.*\]$/, '')
                     : undefined;
-            if (className && classGetterMethods.has(`${className}.${node.name.text}`)) {
+            const accessorName = node.name.kind === 'PrivateIdentifier' ? node.name.text.slice(1) : node.name.text;
+            if (className && classGetterMethods.has(`${className}.${accessorName}`)) {
                 return `${leftSide}.Get_${rightSide}()`;
             }
         }
@@ -1798,6 +1872,14 @@ function visit(node, options = {}) {
         }
         if (isIncrementOrDecrement(node))
             return visitIncrementOrDecrement(node, true);
+        // +date / -date: the time value in milliseconds
+        if ((node.operator === 'PlusToken' || node.operator === 'MinusToken') && inferExpressionType(node.operand) === 'time.Time') {
+            return `${node.operator === 'MinusToken' ? '-' : ''}float64(${visit(node.operand)}.UnixMilli())`;
+        }
+        if (node.operator === 'TildeToken' && inferExpressionType(node.operand) === '*tnbig.Int') {
+            useHelper('bigint');
+            return `new(tnbig.Int).Not(${visit(node.operand)})`;
+        }
         if (node.operator === 'TildeToken') {
             useHelper('dynamic');
             return `float64(^TnInt32(${visit(node.operand)}))`;
@@ -1857,11 +1939,29 @@ function visit(node, options = {}) {
                 return `func() bool { _, ok := interface{}(${visit(node.left)}).(${nodeClass.goType}); return ok }()`;
             }
         }
+        if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right) && !classNames.has(node.right.text)) {
+            const builtinCheck = builtinInstanceOf(visit(node.left), node.right.text);
+            if (builtinCheck)
+                return builtinCheck;
+        }
         if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right)) {
-            // x instanceof C: the runtime type is C's pointer type
-            return `func() bool { _, ok := interface{}(${visit(node.left)}).(*${getSafeName(node.right.text)}); return ok }()`;
+            // x instanceof C: the runtime type is C's pointer type, or a subclass's
+            const rightClass = node.right.text;
+            const targets = [rightClass, ...subclassNames(rightClass)].map((c) => `*${getSafeName(c)}`);
+            if (targets.length === 1) {
+                return `func() bool { _, ok := interface{}(${visit(node.left)}).(${targets[0]}); return ok }()`;
+            }
+            return `func() bool { switch interface{}(${visit(node.left)}).(type) { case ${targets.join(', ')}: return true }; return false }()`;
         }
         if (node.operatorToken.kind === 'InKeyword') {
+            // #x in obj: obj was built by the class declaring #x (or a subclass)
+            if (node.left.kind === 'PrivateIdentifier') {
+                const owner = privateNameOwner(node, node.left.text);
+                if (owner) {
+                    const targets = [owner, ...subclassNames(owner)].map((c) => `*${getSafeName(c)}`);
+                    return `func() bool { switch interface{}(${visit(node.right)}).(type) { case ${targets.join(', ')}: return true }; return false }()`;
+                }
+            }
             if (isProcessEnv(node.right)) {
                 useHelper('nodeProcess');
                 return `TnHasEnv(${visit(node.left)})`;
@@ -1948,6 +2048,30 @@ function visit(node, options = {}) {
                 return `new(tnbig.Int).Rem(${bl}, ${br})`;
             if (op === '**')
                 return `new(tnbig.Int).Exp(${bl}, ${br}, nil)`;
+        }
+        // String enum members (type E string) concatenate as strings
+        if (op === '+' && [bigLeft, bigRight].some((t) => !!t && enumBaseTypes.get(t) === 'string')) {
+            const asString = (side, goType) => goType && enumBaseTypes.get(goType) === 'string' ? `string(${visit(side)})` : visit(side);
+            const bothEnums = [bigLeft, bigRight].every((t) => !!t && enumBaseTypes.get(t) === 'string');
+            if (bigLeft === 'string' || bigRight === 'string' || bothEnums) {
+                return `${asString(node.left, bigLeft)} + ${asString(node.right, bigRight)}`;
+            }
+        }
+        // Dates in arithmetic and ordering compare their time values (b - a, d1 < d2)
+        if ((bigLeft === 'time.Time' || bigRight === 'time.Time') &&
+            ['-', '*', '/', '%', '**', '<', '>', '<=', '>='].includes(op)) {
+            const asMillis = (side, goType) => goType === 'time.Time' ? `float64(${visit(side)}.UnixMilli())` : visit(side);
+            const dl = asMillis(node.left, bigLeft);
+            const dr = asMillis(node.right, bigRight);
+            if (op === '%') {
+                importedPackages.add('math');
+                return `math.Mod(${dl}, ${dr})`;
+            }
+            if (op === '**') {
+                importedPackages.add('math');
+                return `math.Pow(${dl}, ${dr})`;
+            }
+            return `${dl} ${op} ${dr}`;
         }
         if (op === '**') {
             importedPackages.add('math');
@@ -2057,12 +2181,18 @@ function visit(node, options = {}) {
         // Class setter writes are accessor calls: c.v = x → c.Set_v(x)
         if (op === '=' && isPropertyAccessExpression(node.left)) {
             const ownerGoType = inferExpressionType(node.left.expression);
+            // Object-literal setters are Set_x closure fields
+            const literalSetter = `Set_${goFieldName(node.left.name.text)} func(`;
+            if (ownerGoType?.startsWith('*struct{') && ownerGoType.includes(literalSetter)) {
+                return `${visit(node.left.expression)}.Set_${goFieldName(node.left.name.text)}(${visit(node.right)})`;
+            }
             const setterClass = ownerGoType?.startsWith('*') && !ownerGoType.startsWith('*TnMap[') && !ownerGoType.includes('struct{')
                 ? ownerGoType.slice(1).replace(/\[.*\]$/, '')
                 : node.left.expression.kind === 'ThisKeyword'
                     ? getEnclosingClassName(node)
                     : undefined;
-            if (setterClass && classSetterMethods.has(`${setterClass}.${node.left.name.text}`)) {
+            const setterName = node.left.name.kind === 'PrivateIdentifier' ? node.left.name.text.slice(1) : node.left.name.text;
+            if (setterClass && classSetterMethods.has(`${setterClass}.${setterName}`)) {
                 return `${visit(node.left.expression)}.Set_${visit(node.left.name)}(${visit(node.right)})`;
             }
         }
@@ -2239,13 +2369,21 @@ function visit(node, options = {}) {
         return condition;
     }
     else if (isSwitchStatement(node)) {
-        return `switch ${visit(node.expression)} ${visit(node.caseBlock)}`;
+        return `switch ${visit(node.expression)} ${visit(node.caseBlock)}` + (options.inline ? '' : '\n\t');
     }
     else if (isCaseBlock(node)) {
         return `{\n\t\t${(node.clauses ?? []).map((c) => visit(c)).join('\n\t\t')}\n\t}`;
     }
     else if (isCaseClause(node)) {
-        const isFallThrough = !(node.statements ?? []).some((c) => isBreakStatement(c));
+        // No fallthrough after a jump, nor out of the last clause (Go rejects it)
+        const caseStatements = node.statements ?? [];
+        const lastCaseStatement = caseStatements[caseStatements.length - 1];
+        const siblingClauses = node.parent?.clauses ?? [];
+        const endsInJump = !!lastCaseStatement &&
+            (isReturnStatement(lastCaseStatement) ||
+                isThrowStatement(lastCaseStatement) ||
+                lastCaseStatement.kind === 'ContinueStatement');
+        const isFallThrough = !caseStatements.some((c) => isBreakStatement(c)) && !endsInJump && siblingClauses[siblingClauses.length - 1] !== node;
         return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${(node.statements ?? [])
             .filter((n) => !isBreakStatement(n))
             .map((s) => visit(s))
@@ -2258,6 +2396,8 @@ function visit(node, options = {}) {
             .join('')}`;
     }
     else if (isBreakStatement(node)) {
+        if (node.label && blockLabels.has(node.label.text))
+            return `goto ${getSafeName(node.label.text)}__end`;
         return node.label ? `break ${getSafeName(node.label.text)}` : 'break';
     }
     else if (node.kind === 'ContinueStatement') {
@@ -2265,7 +2405,21 @@ function visit(node, options = {}) {
     }
     else if (node.kind === 'LabeledStatement') {
         const label = getSafeName(node.label.text);
-        return `${label}:\n\t\t${visit(node.statement)}` + (options.inline ? '' : ';\n\t');
+        const labeled = node.statement;
+        const breakable = ['ForStatement', 'ForOfStatement', 'ForInStatement', 'WhileStatement', 'DoStatement', 'SwitchStatement'];
+        if (!breakable.includes(labeled.kind)) {
+            // label: { … break label; … } — Go only breaks out of loops and
+            // switches: jump past the statement instead (an unused label is dropped)
+            const labelText = node.label.text;
+            const used = containsNode(labeled, (n) => isBreakStatement(n) && n.label?.text === labelText);
+            if (!used)
+                return visit(labeled, options);
+            blockLabels.add(labelText);
+            const body = visit(labeled);
+            blockLabels.delete(labelText);
+            return `${body}\n\t${label}__end:\n\t;` + (options.inline ? '' : '\n\t');
+        }
+        return `${label}:\n\t\t${visit(labeled)}` + (options.inline ? '' : ';\n\t');
     }
     else if (isThrowStatement(node)) {
         const expr = node.expression;
@@ -2297,7 +2451,14 @@ function visit(node, options = {}) {
             // An async return settles its promise (ordered wake); a generator's
             // sends stay raw (their consumers receive raw)
             if (asyncChannelIsAsync) {
-                return `TnAsyncSend(${asyncChannelVar}, ${visit(node.expression)}); return` + (options.inline ? '' : ';\n\t');
+                // `return otherPromise()` settles with the awaited value; the explicit
+                // type argument converts into an unannotated function's interface{}
+                const chanType = getPromiseChannelType(asyncFunctionNode);
+                const returnedType = inferExpressionType(node.expression);
+                const returned = returnedType?.startsWith('chan ') && chanType !== returnedType
+                    ? `TnAwait(${visit(node.expression)})`
+                    : visit(node.expression);
+                return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); return` + (options.inline ? '' : ';\n\t');
             }
             return `${asyncChannelVar} <- ${visit(node.expression)}; return` + (options.inline ? '' : ';\n\t');
         }
@@ -2496,6 +2657,7 @@ function visit(node, options = {}) {
             declaredClasses.set(className, node);
             const properties = new Map();
             const methods = new Map();
+            const unannotatedMethods = [];
             for (const member of (node.members ?? [])) {
                 const memberModifiers = member.modifiers;
                 const isStatic = memberModifiers?.some((m) => m.kind === 'StaticKeyword');
@@ -2515,14 +2677,16 @@ function visit(node, options = {}) {
                     }
                     else {
                         methods.set(memberName, member.type ? getType(member.type) : 'interface{}');
+                        if (!member.type)
+                            unannotatedMethods.push(member);
                     }
                 }
-                if (isGetAccessor(member) && isIdentifier(member.name)) {
-                    classGetterMethods.add(`${className}.${member.name.text}`);
-                    properties.set(member.name.text, member.type ? getType(member.type) : 'interface{}');
+                if (isGetAccessor(member) && memberName && !isStatic) {
+                    classGetterMethods.add(`${className}.${memberName}`);
+                    properties.set(memberName, member.type ? getType(member.type) : 'interface{}');
                 }
-                if (isSetAccessor(member) && isIdentifier(member.name)) {
-                    classSetterMethods.add(`${className}.${member.name.text}`);
+                if (isSetAccessor(member) && memberName && !isStatic) {
+                    classSetterMethods.add(`${className}.${memberName}`);
                 }
                 // *[Symbol.iterator]() — the class is iterable via a generator channel
                 if (isMethodDeclaration(member) && member.asteriskToken) {
@@ -2548,13 +2712,25 @@ function visit(node, options = {}) {
             }
             if (parentClassName && parentClassName !== 'Error') {
                 classParentNames.set(className, parentClassName);
+                // Inherited accessors are copied onto the subclass (see the class emitter)
+                for (const accessors of [classGetterMethods, classSetterMethods]) {
+                    const inherited = [...accessors].filter((key) => key.startsWith(`${parentClassName}.`));
+                    for (const key of inherited) {
+                        const accessorName = key.slice(parentClassName.length + 1);
+                        if (!ownMemberNames(node).has(accessorName))
+                            accessors.add(`${className}.${accessorName}`);
+                    }
+                }
                 const parent = declaredClasses.get(parentClassName);
                 if (parent) {
                     const parentMethods = classMethodReturnTypes.get(parentClassName);
                     if (parentMethods) {
                         for (const inheritedMethod of parentMethods.keys()) {
                             if (!methods.has(inheritedMethod)) {
-                                methods.set(inheritedMethod, parentMethods.get(inheritedMethod));
+                                const inheritedType = parentMethods.get(inheritedMethod);
+                                const ancestorMethod = findClassMethod(parentClassName, inheritedMethod);
+                                // see the copied methods in the class emitter
+                                methods.set(inheritedMethod, ancestorMethod && returnsOnlyThis(ancestorMethod) ? `*${className}` : inheritedType);
                             }
                         }
                     }
@@ -2570,6 +2746,18 @@ function visit(node, options = {}) {
             }
             classPropertyTypes.set(className, properties);
             classMethodReturnTypes.set(className, methods);
+            // Inferred once the class's fields and declared methods are known
+            // (`return this.x`, `return this.other()`)
+            for (const member of unannotatedMethods) {
+                const memberName = member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text;
+                if ((member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
+                    methods.set(memberName, `chan ${getPromiseChannelType(member)}`);
+                    continue;
+                }
+                const inferred = methodReturnGoType(member);
+                if (inferred)
+                    methods.set(memberName, inferred);
+            }
             return visitClassDecorators(node);
         }
         const name = visit(node.name);
@@ -2620,25 +2808,29 @@ function visit(node, options = {}) {
         const superCalledInCtor = (ctor?.body?.statements ?? []).some(isCtorSuperCall);
         if (ctor) {
             const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters ?? []);
+            // As in TS (ES2020 class fields): super(), then parameter properties,
+            // then field initializers, then the rest of the body
+            const parameterAssignments = getParameterProperties(node)
+                .map((p) => `self.${goFieldName(p.name.text)} = ${visit(p.name)}\n\t\t`)
+                .join('');
+            const instanceInit = `${parameterAssignments}${fieldInitializers(node)}`;
             const bodyStatements = (ctor.body?.statements ?? [])
                 .map((s) => {
                 // super(...) initializes the embedded parent (or the Error message)
                 if (isCtorSuperCall(s)) {
                     const args = (s.expression.arguments ?? []).map((a) => visit(a));
                     if (extendsError)
-                        return `self.message = ${args[0] ?? '""'}\n\t\t`;
-                    return `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, args)}\n\t\t`;
+                        return `self.message = ${args[0] ?? '""'}\n\t\t${instanceInit}`;
+                    return `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, args)}\n\t\t${instanceInit}`;
                 }
                 return visit(s);
             })
                 .join('\t') ?? '';
-            const parameterAssignments = getParameterProperties(node)
-                .map((p) => `self.${goFieldName(p.name.text)} = ${visit(p.name)}\n\t\t`)
-                .join('');
             const parentInit = parentClass && !extendsError && !superCalledInCtor
                 ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, [])}\n\t\t`
                 : '';
-            const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${parentInit}${fieldInitializers(node)}${parameterAssignments}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
+            const leadingInit = superCalledInCtor ? '' : `${parentInit}${instanceInit}`;
+            const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${leadingInit}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
             result += emitConstructor(name, typeParams, typeParamNames, ctorParameterInfo.signature, ctorBody);
         }
         else if (extendsError) {
@@ -2668,6 +2860,21 @@ function visit(node, options = {}) {
             ownMethodNames.add(member.name.text);
         }
         const copiedMethods = [];
+        // Accessors and fields the class declares itself shadow inherited accessors
+        const ownAccessorKeys = new Set();
+        for (const member of node.members ?? []) {
+            if (!member.name?.text)
+                continue;
+            const memberKey = member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text;
+            if (isGetAccessor(member) || isPropertyDeclaration(member))
+                ownAccessorKeys.add(`get:${memberKey}`);
+            if (isSetAccessor(member) || isPropertyDeclaration(member))
+                ownAccessorKeys.add(`set:${memberKey}`);
+        }
+        for (const param of getParameterProperties(node)) {
+            ownAccessorKeys.add(`get:${param.name.text}`);
+            ownAccessorKeys.add(`set:${param.name.text}`);
+        }
         if (parentClass && !extendsError) {
             // Walk the parent chain (iteratively — no local recursive closures)
             const pending = [parentClass];
@@ -2693,6 +2900,16 @@ function visit(node, options = {}) {
             while (ancestorIndex >= 0) {
                 const ancestor = ancestors[ancestorIndex];
                 for (const member of (ancestor.members ?? [])) {
+                    if ((isGetAccessor(member) || isSetAccessor(member)) && member.body && member.name?.text) {
+                        if (member.modifiers?.some((m) => m.kind === 'StaticKeyword'))
+                            continue;
+                        const accessorKey = `${isGetAccessor(member) ? 'get' : 'set'}:${member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text}`;
+                        if (ownAccessorKeys.has(accessorKey))
+                            continue;
+                        ownAccessorKeys.add(accessorKey);
+                        copiedMethods.push(emitAccessor(member, `${name}${typeParamNames}`));
+                        continue;
+                    }
                     if (!isMethodDeclaration(member))
                         continue;
                     if (!member.body || member.asteriskToken)
@@ -2709,8 +2926,17 @@ function visit(node, options = {}) {
                         copiedMethods.push(emitDecoratedMethod(name, typeParamNames, member, visit(ancestor.name)));
                         continue;
                     }
+                    if ((member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
+                        copiedMethods.push(`${lineMarker(member)}${emitChannelFunction(member, true, `func (self *${name}${typeParamNames}) ${methodName}`)}\n`);
+                        continue;
+                    }
                     const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-                    const returnType = member.type ? ` ${getType(member.type)}` : '';
+                    // `return this` in an unannotated ancestor method returns the subclass here
+                    let inheritedReturnType = methodReturnGoType(member);
+                    if (returnsOnlyThis(member)) {
+                        inheritedReturnType = `*${name}${typeParamNames}`;
+                    }
+                    const returnType = inheritedReturnType ? ` ${inheritedReturnType}` : '';
                     copiedMethods.push(`${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n`);
                 }
                 ancestorIndex--;
@@ -2752,14 +2978,21 @@ function visit(node, options = {}) {
             if (isMethodDeclaration(member)) {
                 const methodName = visit(member.name);
                 const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-                const returnType = member.type ? ` ${getType(member.type)}` : '';
+                const ownReturnType = methodReturnGoType(member);
+                const returnType = ownReturnType ? ` ${ownReturnType}` : '';
                 const isStatic = member.modifiers?.some((m) => m.kind === 'StaticKeyword');
                 if (!member.body)
                     continue; // abstract method — implemented by subclasses
                 if (isAbstractClass && !isStatic)
                     continue; // only reachable via subclasses
+                const isAsyncMethod = (member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
                 if (getDecorators(member).length > 0) {
                     result += emitDecoratedMethod(name, typeParamNames, member, name);
+                }
+                else if (isAsyncMethod) {
+                    // async methods run like async functions: a promise channel
+                    const header = isStatic ? `func ${name}_${methodName}` : `func (self *${name}${typeParamNames}) ${methodName}`;
+                    result += `${lineMarker(member)}${emitChannelFunction(member, true, header)}\n\n`;
                 }
                 else if (isStatic) {
                     // Static methods become package-level functions named ClassName_methodName
@@ -2769,17 +3002,8 @@ function visit(node, options = {}) {
                     result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent })}\n\n`;
                 }
             }
-            else if (isGetAccessor(member)) {
-                // Getter: get prop() { ... } → func (self *T) Get_prop() RetType { ... }
-                const getterName = visit(member.name);
-                const returnType = member.type ? ` ${getType(member.type)}` : ' interface{}';
-                result += `${lineMarker(member)}func (self *${name}${typeParamNames}) Get_${getterName}()${returnType} ${visit(member.body)}\n\n`;
-            }
-            else if (isSetAccessor(member)) {
-                // Setter: set prop(val) { ... } → func (self *T) Set_prop(val ValType) { ... }
-                const setterName = visit(member.name);
-                const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-                result += `${lineMarker(member)}func (self *${name}${typeParamNames}) Set_${setterName}(${parameterInfo.signature}) ${visit(member.body, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
+            else if (isGetAccessor(member) || isSetAccessor(member)) {
+                result += emitAccessor(member, `${name}${typeParamNames}`);
             }
         }
         result += copiedMethods.join('\n');
@@ -2831,11 +3055,14 @@ function visit(node, options = {}) {
             }
             return `regexp.MustCompile("")`;
         }
+        // Tagged so `instanceof Map` / `Set` can tell them from records
         if (className === 'Map') {
-            return visitNewMap(node);
+            useHelper('orderedMap');
+            return `TnJSCollection(${visitNewMap(node)}, 1)`;
         }
         if (className === 'Set') {
-            return visitNewSet(node);
+            useHelper('orderedMap');
+            return `TnJSCollection(${visitNewSet(node)}, 2)`;
         }
         // new TypeError(message) & co.: a TnError with that name
         if (BUILTIN_ERROR_NAMES.has(className) && !classNames.has(className)) {
@@ -3319,7 +3546,8 @@ function visitDynamicArithmetic(node, op) {
             return `TnJSString(${visit(side)})`;
         }
         useHelper('dynamic');
-        return `TnAs[float64](${visit(side)})`;
+        // - * / % convert with ToNumber ('6' - 1, date - date); + keeps the number cast
+        return op === '+' || op === '+=' ? `TnAs[float64](${visit(side)})` : `TnNumber(${visit(side)})`;
     };
     // Compound assignment with a dynamic left side reads through the interface
     if (op.endsWith('=') && leftDynamic) {
@@ -3478,6 +3706,26 @@ function visitBitwise(node, op) {
     const bitOp = base[kind];
     if (!bitOp)
         return undefined;
+    const isAssignment = kind.endsWith('EqualsToken');
+    // Bigint operands: math/big's bitwise methods (two's complement, as in JS)
+    if (inferExpressionType(node.left) === '*tnbig.Int' || inferExpressionType(node.right) === '*tnbig.Int') {
+        useHelper('bigint');
+        const bl = visit(node.left);
+        const br = visit(node.right);
+        const methods = { '&': 'And', '|': 'Or', '^': 'Xor' };
+        let bigValue;
+        if (methods[bitOp])
+            bigValue = `new(tnbig.Int).${methods[bitOp]}(${bl}, ${br})`;
+        else if (bitOp === '<<')
+            bigValue = `TnBigShift(${bl}, ${br})`;
+        else if (bitOp === '>>')
+            bigValue = `TnBigShift(${bl}, new(tnbig.Int).Neg(${br}))`;
+        else
+            bigValue = `func() *tnbig.Int { panic(TnNodeError("TypeError", "", "BigInts have no unsigned right shift, use >> instead")) }()`;
+        if (bitOp === '>>>')
+            useHelper('error');
+        return isAssignment ? `${bl} = ${bigValue}` : bigValue;
+    }
     useHelper('dynamic');
     const left = asFloatOperand(node.left, visit(node.left));
     const right = asFloatOperand(node.right, visit(node.right));
@@ -3489,7 +3737,6 @@ function visitBitwise(node, op) {
     }
     else
         value = `float64(TnInt32(${left}) ${bitOp} TnInt32(${right}))`;
-    const isAssignment = kind.endsWith('EqualsToken');
     return isAssignment ? `${left} = ${value}` : value;
 }
 // delete obj.key / delete obj[key] on maps (Records and dynamic objects)
@@ -3901,6 +4148,87 @@ function visitTypedArrayCall(node) {
 }
 // Adapter types generated so far ('IntHeap__container_heap_Interface')
 const goInterfaceAdapters = new Set();
+// get prop() { … } → func (self *T) Get_prop() RetType { … };
+// set prop(val) { … } → func (self *T) Set_prop(val ValType) { … }
+function emitAccessor(member, receiver) {
+    const accessorName = visit(member.name);
+    if (isGetAccessor(member)) {
+        const returnType = member.type ? ` ${getType(member.type)}` : ' interface{}';
+        return `${lineMarker(member)}func (self *${receiver}) Get_${accessorName}()${returnType} ${visit(member.body)}\n\n`;
+    }
+    const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
+    return `${lineMarker(member)}func (self *${receiver}) Set_${accessorName}(${parameterInfo.signature}) ${visit(member.body, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
+}
+// Every declared class that extends `className`, directly or not
+function subclassNames(className) {
+    const result = [];
+    for (const candidate of classParentNames.keys()) {
+        let parent = classParentNames.get(candidate);
+        for (let depth = 0; depth < 20 && parent; depth++) {
+            if (parent === className) {
+                result.push(candidate);
+                break;
+            }
+            parent = classParentNames.get(parent);
+        }
+    }
+    return result;
+}
+// The enclosing class that declares private name `#x`
+function privateNameOwner(node, privateName) {
+    let current = node.parent;
+    while (current) {
+        if (isClassDeclaration(current) &&
+            current.name &&
+            (current.members ?? []).some((m) => m.name?.kind === 'PrivateIdentifier' && m.name.text === privateName)) {
+            return current.name.text;
+        }
+        current = current.parent;
+    }
+    return undefined;
+}
+// x instanceof Map / Set / Date / Array on built-in values
+function builtinInstanceOf(value, name) {
+    if (name === 'Map' || name === 'WeakMap' || name === 'Set' || name === 'WeakSet') {
+        useHelper('orderedMap');
+        const kind = name.endsWith('Map') ? 1 : 2;
+        return `func() bool { m, ok := interface{}(${value}).(interface{ TnJSKind() uint8 }); return ok && m.TnJSKind() == ${kind} }()`;
+    }
+    if (name === 'Date') {
+        importedPackages.add('time');
+        return `func() bool { _, ok := interface{}(${value}).(time.Time); return ok }()`;
+    }
+    if (name === 'Array') {
+        useHelper('isArray');
+        return `TnIsArray(${value})`;
+    }
+    return '';
+}
+// Names a class declares itself: fields, methods, accessors, parameter
+// properties (private ones without the '#')
+function ownMemberNames(cls) {
+    const names = new Set();
+    for (const member of cls.members ?? []) {
+        if (!member.name?.text)
+            continue;
+        names.add(member.name.kind === 'PrivateIdentifier' ? member.name.text.slice(1) : member.name.text);
+    }
+    for (const param of getParameterProperties(cls))
+        names.add(param.name.text);
+    return names;
+}
+// The class declaring static member `memberName`, searched from `className`
+// up the inheritance chain (statics are package-level Class_member names)
+function staticMemberOwner(className, memberName) {
+    let name = className;
+    for (let depth = 0; depth < 20 && name; depth++) {
+        const key = `${name}.${memberName}`;
+        if (classStaticMethods.has(key) || classStaticProps.has(key))
+            return name;
+        name = classParentNames.get(name) ?? '';
+    }
+    return undefined;
+}
 // A class method declaration, searched up the inheritance chain
 function findClassMethod(className, methodName) {
     let name = className;
@@ -4087,6 +4415,10 @@ function getObjectLiteralGoType(node) {
         }
         if ((isMethodDeclaration(p) || isGetAccessor(p)) && isIdentifier(p.name)) {
             fields.set(goFieldName(p.name.text), methodFuncType(p));
+            continue;
+        }
+        if (isSetAccessor(p) && isIdentifier(p.name)) {
+            fields.set(`Set_${goFieldName(p.name.text)}`, methodFuncType(p));
             continue;
         }
         if (!isPropertyAssignment(p) && !isShorthandPropertyAssignment(p))
@@ -4294,8 +4626,9 @@ function visitAnonymousStructLiteral(node) {
             }
             continue;
         }
-        if ((isMethodDeclaration(p) || isGetAccessor(p)) && isIdentifier(p.name)) {
-            const field = goFieldName(p.name.text);
+        if ((isMethodDeclaration(p) || isGetAccessor(p) || isSetAccessor(p)) && isIdentifier(p.name)) {
+            // a setter is a Set_x closure field: `o.x = v` calls it
+            const field = isSetAccessor(p) ? `Set_${goFieldName(p.name.text)}` : goFieldName(p.name.text);
             fields.set(field, methodFuncType(p));
             const prevName = thisOverrideName;
             const prevFn = thisOverrideFn;
@@ -4309,8 +4642,6 @@ function visitAnonymousStructLiteral(node) {
             steps.push(`__obj.${field} = func(${paramInfo.signature})${retType} ${body.trimEnd()}`);
             continue;
         }
-        if (isSetAccessor(p))
-            continue;
         const isProp = isPropertyAssignment(p);
         if (!isProp && !isShorthandPropertyAssignment(p))
             continue;
@@ -4374,7 +4705,8 @@ function getEnclosingFunction(node) {
             isFunctionExpression(current) ||
             isArrowFunction(current) ||
             isMethodDeclaration(current) ||
-            isGetAccessor(current)) {
+            isGetAccessor(current) ||
+            isSetAccessor(current)) {
             return current;
         }
         current = current.parent;
@@ -4873,19 +5205,123 @@ function inferFunctionBodyReturnType(node) {
     }
     if (node.body && isBlock(node.body)) {
         let returnsNil = false;
-        for (const stmt of node.body.statements ?? []) {
-            if (isReturnStatement(stmt) && stmt.expression) {
-                const exprType = inferExpressionType(stmt.expression);
-                if (exprType === 'nil')
-                    returnsNil = true;
-                else if (exprType)
-                    return exprType;
-            }
+        for (const stmt of collectReturnStatements(node.body)) {
+            if (!stmt.expression)
+                continue;
+            const exprType = inferExpressionType(stmt.expression);
+            if (exprType === 'nil')
+                returnsNil = true;
+            else if (exprType)
+                return exprType;
         }
         if (returnsNil)
             return 'interface{}';
     }
     return undefined;
+}
+// Go result type of a class method: declared, else inferred from its returns
+// like a function's ('' for none). Unannotated async methods keep ''. The
+// body's locals are typed only for the inference (variable types are global),
+// so classes registered ahead of other code don't leak them.
+function methodReturnGoType(member) {
+    if (member.type)
+        return getType(member.type);
+    if ((member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword'))
+        return '';
+    if (!member.body || !isBlock(member.body))
+        return '';
+    if (!Array.isArray(member.body.statements))
+        return inferFunctionBodyReturnType(member) ?? '';
+    const added = [];
+    for (const stmt of member.body.statements) {
+        if (!isVariableStatement(stmt))
+            continue;
+        for (const decl of stmt.declarationList.declarations) {
+            if (isIdentifier(decl.name) && !variableGoTypes.has(decl.name.text))
+                added.push(decl.name.text);
+        }
+    }
+    prescanVariableDeclarations(member.body);
+    const inferred = inferFunctionBodyReturnType(member) ?? '';
+    for (const name of added) {
+        variableGoTypes.delete(name);
+        referenceArrays.delete(name);
+    }
+    return inferred;
+}
+// An unannotated method whose every `return` is `return this`
+function returnsOnlyThis(member) {
+    if (member.type || !member.body || !isBlock(member.body))
+        return false;
+    const returns = collectReturnStatements(member.body);
+    return returns.length > 0 && returns.every((r) => r.expression?.kind === 'ThisKeyword');
+}
+// A function body that can end without a `return` (an exhaustive switch
+// without `default`, or an implicit `undefined` result) still needs one in Go:
+// the result type's zero value
+function fallbackReturn(block) {
+    const fn = block.parent;
+    if (!fn || fn.body !== block || fn.asteriskToken)
+        return '';
+    if ((fn.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword'))
+        return '';
+    let goType = '';
+    if (isMethodDeclaration(fn)) {
+        goType = methodReturnGoType(fn);
+    }
+    else if (isFunctionDeclaration(fn) || isFunctionExpression(fn) || isArrowFunction(fn)) {
+        goType = goCallbackResultType(fn) ?? inferFunctionBodyReturnType(fn) ?? '';
+    }
+    else if (isGetAccessor(fn)) {
+        goType = fn.type ? getType(fn.type) : 'interface{}';
+    }
+    if (!goType)
+        return '';
+    const statements = block.statements ?? [];
+    const last = statements[statements.length - 1];
+    if (last && (isReturnStatement(last) || isThrowStatement(last)))
+        return '';
+    return `\n\treturn *new(${goType})\n\t`;
+}
+// The return statements of a function body in source order, including those
+// nested in if / loops / switch / try, but not those of nested functions.
+// (Returned rather than pushed into a parameter: an any[] passed to a function
+// doesn't share appends once self-hosted.)
+function collectReturnStatements(node) {
+    if (!node)
+        return [];
+    if (isReturnStatement(node))
+        return [node];
+    let found = [];
+    if (isBlock(node) || node.kind === 'CaseClause' || node.kind === 'DefaultClause') {
+        for (const stmt of node.statements ?? [])
+            found = found.concat(collectReturnStatements(stmt));
+    }
+    else if (isIfStatement(node)) {
+        found = collectReturnStatements(node.thenStatement);
+        if (node.elseStatement)
+            found = found.concat(collectReturnStatements(node.elseStatement));
+    }
+    else if (node.kind === 'ForStatement' ||
+        node.kind === 'ForOfStatement' ||
+        node.kind === 'ForInStatement' ||
+        node.kind === 'WhileStatement' ||
+        node.kind === 'DoStatement' ||
+        node.kind === 'LabeledStatement') {
+        found = collectReturnStatements(node.statement);
+    }
+    else if (node.kind === 'SwitchStatement') {
+        for (const clause of node.caseBlock?.clauses ?? [])
+            found = found.concat(collectReturnStatements(clause));
+    }
+    else if (node.kind === 'TryStatement') {
+        found = collectReturnStatements(node.tryBlock);
+        if (node.catchClause)
+            found = found.concat(collectReturnStatements(node.catchClause.block));
+        if (node.finallyBlock)
+            found = found.concat(collectReturnStatements(node.finallyBlock));
+    }
+    return found;
 }
 function getEnclosingParameterType(expr) {
     const primitives = ['NumberKeyword', 'StringKeyword', 'BooleanKeyword', 'BigIntKeyword'];
@@ -5079,6 +5515,11 @@ function inferExpressionType(expr) {
     // process.env.X (also through casts: (process.env as any).X)
     if (isPropertyAccessExpression(expr) && isProcessEnv(expr.expression))
         return 'string';
+    if (isPrefixUnaryExpression(expr) &&
+        (expr.operator === 'MinusToken' || expr.operator === 'TildeToken') &&
+        (expr.operand.kind === 'BigIntLiteral' || inferExpressionType(expr.operand) === '*tnbig.Int')) {
+        return '*tnbig.Int';
+    }
     if ((isPrefixUnaryExpression(expr) || isPostfixUnaryExpression(expr)) &&
         ['MinusToken', 'PlusToken', 'TildeToken', 'PlusPlusToken', 'MinusMinusToken'].includes(expr.operator)) {
         return 'float64';
@@ -5264,7 +5705,23 @@ function inferExpressionType(expr) {
             return goFuncReturnType(fnValueType);
     }
     if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression)) {
-        const methodName = expr.expression.name.text;
+        // private methods are registered without their '#'
+        const methodName = expr.expression.name.kind === 'PrivateIdentifier' ? expr.expression.name.text.slice(1) : expr.expression.name.text;
+        // Class.staticMethod(): its declared or inferred result
+        if (isIdentifier(expr.expression.expression) && classNames.has(expr.expression.expression.text)) {
+            const owner = staticMemberOwner(expr.expression.expression.text, methodName);
+            const staticMethod = owner
+                ? (declaredClasses.get(owner)?.members ?? []).find((m) => isMethodDeclaration(m) &&
+                    (m.modifiers ?? []).some((mod) => mod.kind === 'StaticKeyword') &&
+                    (m.name?.kind === 'PrivateIdentifier' ? m.name.text.slice(1) : m.name?.text) === methodName)
+                : undefined;
+            if (staticMethod) {
+                const isAsync = (staticMethod.modifiers ?? []).some((mod) => mod.kind === 'AsyncKeyword');
+                const staticType = isAsync && !staticMethod.type ? `chan ${getPromiseChannelType(staticMethod)}` : methodReturnGoType(staticMethod);
+                if (staticType)
+                    return staticType;
+            }
+        }
         const ownerType = inferExpressionType(expr.expression.expression);
         if (ownerType &&
             NULLABLE_PRIMITIVE_TYPES.includes(ownerType) &&
@@ -5423,7 +5880,10 @@ function inferExpressionType(expr) {
             return 'bool';
         }
         // BigInt operands stay bigint
-        if (['AsteriskToken', 'SlashToken', 'PercentToken', 'AsteriskAsteriskToken', 'PlusToken', 'MinusToken'].includes(kind) &&
+        if ([
+            'AsteriskToken', 'SlashToken', 'PercentToken', 'AsteriskAsteriskToken', 'PlusToken', 'MinusToken',
+            'AmpersandToken', 'BarToken', 'CaretToken', 'LessThanLessThanToken', 'GreaterThanGreaterThanToken'
+        ].includes(kind) &&
             (inferExpressionType(expr.left) === '*tnbig.Int' || inferExpressionType(expr.right) === '*tnbig.Int')) {
             return '*tnbig.Int';
         }
@@ -5446,7 +5906,10 @@ function inferExpressionType(expr) {
             return 'float64';
         }
         if (kind === 'PlusToken') {
-            const isString = [expr.left, expr.right].some((side) => inferExpressionType(side) === 'string');
+            const isString = [expr.left, expr.right].some((side) => {
+                const sideType = inferExpressionType(side);
+                return sideType === 'string' || (!!sideType && enumBaseTypes.get(sideType) === 'string');
+            });
             return isString ? 'string' : 'float64';
         }
         if (['LessThanToken', 'GreaterThanToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind)) {
@@ -5486,6 +5949,28 @@ function getObjectFieldGoType(objectType, field) {
         interfacePropertyTypes.get(base)?.get(field) ??
         classPropertyTypes.get(base)?.get(field));
 }
+// The property names of a typed object (an object type literal, interface or
+// class; class getters live on the prototype, so they are not own properties)
+function objectFieldNames(objectType) {
+    const bare = objectType.replace(/^\*/, '');
+    const parsed = parseStructFields(bare);
+    if (parsed.length > 0) {
+        // Go field names back to TS names (keywords carry a trailing '_')
+        return parsed
+            .map((entry) => entry[0])
+            .map((f) => (f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
+    }
+    const base = bare.replace(/\[.*$/, '');
+    const props = interfacePropertyTypes.get(base) ?? classPropertyTypes.get(base);
+    const names = [];
+    if (!props)
+        return names;
+    for (const f of props.keys()) {
+        if (!classGetterMethods.has(`${base}.${f}`))
+            names.push(f);
+    }
+    return names;
+}
 function inferObjectCallType(expr) {
     const name = getObjectCallName(expr);
     if (!name)
@@ -5524,8 +6009,19 @@ function visitObjectCall(node) {
         }
         if (objectType.startsWith('*TnMap['))
             return `${visit(args[0])}.Has(${visit(key)})`;
-        if (!isStringLiteral(key))
-            throw new Error('Object.hasOwn on a typed object needs a literal key');
+        // a computed key on a typed object: a switch over its declared fields
+        if (!isStringLiteral(key)) {
+            const fieldNames = objectFieldNames(objectType);
+            if (fieldNames.length === 0) {
+                useHelper('dynamic');
+                return `TnHas(${visit(args[0])}, ${visit(key)})`;
+            }
+            const cases = fieldNames.map((f) => {
+                const fieldType = getObjectFieldGoType(objectType, f) ?? '';
+                return `case ${toGoStringLiteral(f)}: return ${/^\*(float64|string|bool)$/.test(fieldType) ? `o.${goFieldName(f)} != nil` : 'true'}`;
+            });
+            return `func(o ${objectType}, k string) bool { switch k { ${cases.join('; ')} }; return false }(${visit(args[0])}, ${visit(key)})`;
+        }
         const fieldType = getObjectFieldGoType(objectType, key.text);
         if (!fieldType)
             return 'false';
@@ -5537,8 +6033,10 @@ function visitObjectCall(node) {
         const valueProp = isObjectLiteralExpression(descriptor)
             ? (descriptor.properties ?? []).find((p) => isPropertyAssignment(p) && isIdentifier(p.name) && p.name.text === 'value')
             : undefined;
-        if (!valueProp)
-            throw new Error('Object.defineProperty needs a { value } descriptor literal');
+        if (!valueProp) {
+            reportError(node, 'Unsupported Object.defineProperty descriptor: only a { value } object literal');
+            return 'nil';
+        }
         const target = visit(args[0]);
         if (isDynamicValue(args[0])) {
             useHelper('dynamic');
@@ -5547,8 +6045,16 @@ function visitObjectCall(node) {
         if (objectType.startsWith('*TnMap[')) {
             return `${target}.Set(${visit(key)}, ${toGoValueOfType(valueProp.initializer, extractMapValueType(objectType))})`;
         }
-        if (!isStringLiteral(key))
-            throw new Error('Object.defineProperty on a typed object needs a literal key');
+        if (!isStringLiteral(key)) {
+            const fieldNames = objectFieldNames(objectType);
+            if (fieldNames.length === 0) {
+                useHelper('dynamic');
+                return `TnSet(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+            }
+            useHelper('dynamic');
+            const cases = fieldNames.map((f) => `case ${toGoStringLiteral(f)}: o.${goFieldName(f)} = TnAs[${getObjectFieldGoType(objectType, f) ?? 'interface{}'}](v)`);
+            return `func(o ${objectType}, k string, v interface{}) { switch k { ${cases.join('; ')} } }(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+        }
         return `${target}.${goFieldName(key.text)} = ${toGoValueOfType(valueProp.initializer, getObjectFieldGoType(objectType, key.text))}`;
     }
     return undefined;
@@ -6502,6 +7008,15 @@ function visitEnumDeclaration(node, inPlace = false) {
     // Numeric enums are plain float64 constants so they compare against numbers
     // (variables when a member is computed); string enums keep a named type
     if (baseType === 'float64') {
+        // Reverse mapping (Color[0] → "Red"): the last member with the value wins, as in TS
+        const reverse = members
+            .map((m, i) => {
+            const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
+            const tsName = node.members[i].name.text;
+            return `if v == ${name} { return ${toGoStringLiteral(tsName)} }`;
+        })
+            .reverse()
+            .join('; ');
         return `${hasComputedMember ? 'var' : 'const'} (\n${members
             .map((m) => {
             const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
@@ -6512,7 +7027,7 @@ function visitEnumDeclaration(node, inPlace = false) {
                 : value;
             return `\t${name} float64 = ${plain}`;
         })
-            .join('\n')}\n)`;
+            .join('\n')}\n)\n\nfunc ${enumName}__name(v float64) string { ${reverse}; return "" }`;
     }
     return `type ${enumName} ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
 }
@@ -8070,10 +8585,12 @@ function emitDecoratedMethod(className, typeParamNames, member, ownerClass) {
     useHelper('dynamic');
     const methodName = visit(member.name);
     const info = getFunctionParametersInfo(member.parameters ?? []);
-    if (info.signature.includes('...'))
-        throw new Error(`decorated method ${methodName}: rest/default parameters are not supported`);
+    if (info.signature.includes('...')) {
+        reportError(member, `Unsupported decorated method ${methodName}: rest or default parameters`);
+        return '';
+    }
     const names = splitGoParameters(info.signature).map((p) => p.slice(0, p.indexOf(' ')));
-    const returnType = member.type ? getType(member.type) : '';
+    const returnType = methodReturnGoType(member);
     const result = returnType ? ` ${returnType}` : '';
     const body = visit(member.body, { prefixBlockContent: info.prefixBlockContent });
     const call = `${ownerClass}_${methodName}__decorated(${names.join(', ')})`;
@@ -8093,8 +8610,10 @@ function visitClassDecorators(node) {
         const decorators = getDecorators(member);
         if (decorators.length === 0)
             continue;
-        if (!isMethodDeclaration(member) || !member.body)
-            throw new Error(`${className}: only method and class decorators are supported`);
+        if (!isMethodDeclaration(member) || !member.body) {
+            reportError(member, `Unsupported decorator on ${className}: only method and class decorators are supported`);
+            continue;
+        }
         useHelper('decorators');
         useHelper('dynamic');
         const methodName = visit(member.name);
@@ -8102,7 +8621,7 @@ function visitClassDecorators(node) {
         const isPrivate = member.name?.kind === 'PrivateIdentifier';
         const params = splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature);
         const paramTypes = params.map((p) => p.slice(p.indexOf(' ') + 1));
-        const returnType = member.type ? getType(member.type) : '';
+        const returnType = methodReturnGoType(member);
         const varName = `${className}_${methodName}__decorated`;
         mainPackageVariables.push(`var ${varName} func(...interface{}) interface{}`);
         const args = paramTypes.map((t, i) => `TnAs[${t}](__args[${i}])`).join(', ');
@@ -8489,9 +9008,11 @@ function getPromiseChannelType(node) {
 }
 // A function whose body runs in a goroutine and communicates over a channel:
 // async functions (return sends) and generators (yield sends)
-function emitChannelFunction(node, isAsync) {
-    const name = getSafeName(visit(node.name, { inline: true }));
-    const typeParams = getTypeParameters(node.typeParameters);
+// `header` replaces `func name[T]` (methods: `func (self *C) name`)
+function emitChannelFunction(node, isAsync, header) {
+    const name = header ? '' : getSafeName(visit(node.name, { inline: true }));
+    const typeParams = header ? '' : getTypeParameters(node.typeParameters);
+    const declaration = header ?? `func ${name}${typeParams}`;
     const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
     if (node.body && isBlock(node.body)) {
         prescanVariableDeclarations(node.body);
@@ -8514,9 +9035,9 @@ function emitChannelFunction(node, isAsync) {
     if (isAsync) {
         // The body runs synchronously until its first await, holding the JS baton
         useHelper('eventLoop');
-        return (`func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`);
+        return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`);
     }
-    return (`func ${name}${typeParams}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
+    return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
 }
 // The type a generator yields: from its first yield expression's operand
 function getGeneratorYieldType(fn) {
@@ -8980,7 +9501,8 @@ const helperPackages = {
     jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe'],
     objectAssign: ['reflect', 'unsafe'],
     typeOf: ['reflect'],
-    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe'],
+    isArray: ['reflect'],
+    dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time'],
     regexReplaceFunc: ['regexp'],
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
@@ -9012,6 +9534,17 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    isArray: `// x instanceof Array: slices and the *[]T of array variables (not Buffers / Uint8Arrays)
+func TnIsArray(v interface{}) bool {
+	if _, ok := v.([]byte); ok {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+		rv = rv.Elem()
+	}
+	return rv.Kind() == reflect.Slice
+}`,
     dynamic: `// Dynamic (any) values: JSON-like objects are map[string]interface{},
 // arrays []interface{}, numbers float64
 func TnGet(obj interface{}, key string) interface{} {
@@ -9274,6 +9807,23 @@ func TnNumber(v interface{}) float64 {
 		}
 	case nil:
 		return 0
+	case time.Time:
+		return float64(t.UnixMilli())
+	case *float64:
+		if t == nil {
+			return 0
+		}
+		return *t
+	}
+	// Go numeric kinds (int, named numerics such as time.Duration)
+	rv := reflect.ValueOf(v)
+	switch {
+	case rv.CanFloat():
+		return rv.Float()
+	case rv.CanInt():
+		return float64(rv.Int())
+	case rv.CanUint():
+		return float64(rv.Uint())
 	}
 	return math.NaN()
 }
@@ -9804,6 +10354,19 @@ func tnJSONMarshal(v interface{}) ([]byte, error) {
 type TnMap[K comparable, V any] struct {
 	keys   []K
 	values map[K]V
+	jsKind uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
+}
+
+func TnJSCollection[K comparable, V any](m *TnMap[K, V], kind uint8) *TnMap[K, V] {
+	m.jsKind = kind
+	return m
+}
+
+func (m *TnMap[K, V]) TnJSKind() uint8 {
+	if m == nil {
+		return 0
+	}
+	return m.jsKind
 }
 
 func TnNewMap[K comparable, V any]() *TnMap[K, V] {
@@ -11098,6 +11661,14 @@ func (e *TnError) Get_generatedMessage() bool {
 // event loop alive until it settles
 var __tnWaitGroup tnLoopGroup`,
     bigint: `// Base from the literal's prefix (0x / 0o / 0b), decimal otherwise
+// a << n for bigints (n < 0 shifts right, rounding toward -Infinity as JS does)
+func TnBigShift(a, n *tnbig.Int) *tnbig.Int {
+	if n.Sign() >= 0 {
+		return new(tnbig.Int).Lsh(a, uint(n.Uint64()))
+	}
+	return new(tnbig.Int).Rsh(a, uint(new(tnbig.Int).Neg(n).Uint64()))
+}
+
 func TnBigInt(s string) *tnbig.Int {
 	v, ok := new(tnbig.Int).SetString(s, 0)
 	if !ok {
