@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`JSON.stringify`:**
+  - `space` (number or string) with Node's layout
+  - replacer functions and key lists
+  - `toJSON()` methods
+  - Dates as ISO strings, `Map` / `Set` as `{}`
+  - `TypeError`s for circular structures and bigints
+- **`JSON.parse`:** reviver, and a `SyntaxError` for invalid JSON (it returned `null`)
+- **Arrays:** writing past the end grows the array
+
 ### Fixed
+
+- **`any` variables:**
+  - a variable declared `any` / `unknown` with a primitive initializer is dynamic:
+    `const s: any = '6'; s - 1` builds, and reassigning another type works
+  - `==` between `any` values coerces like JS
+  - `<T>x` converts like `x as T`
+- **Class members:**
+  - `#x` and `x` in one class no longer collide
+  - private fields and static properties stay out of `JSON.stringify`
 
 Programs that built Go that didn't compile, or computed a wrong value, with no TypeNative error:
 
