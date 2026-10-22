@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`String`:** `codePointAt`, `String.fromCodePoint`, `substr`, `trimLeft` / `trimRight`,
   `isWellFormed` / `toWellFormed`, `toLocaleUpperCase` / `toLocaleLowerCase`, `split` limit,
   `lastIndexOf` position
+- **`process`:** `stdout.columns` / `rows` / `getWindowSize()` (and `stderr`),
+  `stdin.setRawMode` / `isRaw` (undone at exit), `umask`, on Linux, macOS, FreeBSD and Windows
 
 ### Fixed
 

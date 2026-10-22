@@ -32,9 +32,15 @@ func tnRunBeforeExit(code float64) {
 	}
 }
 
+// Set by process.stdin.setRawMode: puts the terminal back as it was, as Node does at exit
+var tnResetStdio func()
+
 // The end of main: exit with process.exitCode
 func TnProcessExit() {
 	tnRunBeforeExit(tnExitCode)
+	if tnResetStdio != nil {
+		tnResetStdio()
+	}
 	if tnExitCode != 0 {
 		os.Exit(int(tnExitCode))
 	}
@@ -46,6 +52,9 @@ func TnProcessExitWith(code ...float64) {
 		tnExitCode = code[0]
 	}
 	tnRunBeforeExit(tnExitCode)
+	if tnResetStdio != nil {
+		tnResetStdio()
+	}
 	os.Exit(int(tnExitCode))
 }
 
@@ -171,6 +180,197 @@ func TnHasEnv(name string) bool {
 	_, ok := os.LookupEnv(name)
 	return ok
 }`;
+// Terminal size, raw mode and umask: one variant per target OS (nodeTtyOS@os)
+const ttyHelper = `var tnStdinRaw bool
+
+// process.stdout.columns / rows: 0 when the stream is not a terminal
+func TnTtyColumns(f *os.File) float64 {
+	cols, _, _ := tnTerminalSize(f)
+	return float64(cols)
+}
+
+func TnTtyRows(f *os.File) float64 {
+	_, rows, _ := tnTerminalSize(f)
+	return float64(rows)
+}
+
+func TnTtyWindowSize(f *os.File) []float64 {
+	cols, rows, _ := tnTerminalSize(f)
+	return []float64{float64(cols), float64(rows)}
+}
+
+// process.stdin.setRawMode(mode): libuv's raw mode; throws when stdin is not a terminal
+func TnTtySetRawMode(mode bool) {
+	if !tnSetRawMode(os.Stdin, mode) {
+		panic(TnNodeError("Error", "EINVAL", "setRawMode EINVAL"))
+	}
+	tnStdinRaw = mode
+	tnResetStdio = func() { tnSetRawMode(os.Stdin, false) }
+}
+
+// process.umask(mask?): the previous mask (a number or an octal string)
+func TnProcessUmask(mask ...interface{}) float64 {
+	if len(mask) == 0 || mask[0] == nil {
+		old := tnUmask(0)
+		tnUmask(old)
+		return float64(old)
+	}
+	var m int
+	switch x := mask[0].(type) {
+	case string:
+		n, err := strconv.ParseInt(x, 8, 32)
+		if err != nil {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '" + x + "'"))
+		}
+		m = int(n)
+	default:
+		m = int(TnNumber(x))
+	}
+	return float64(tnUmask(m & 0o777))
+}`;
+// Linux: the asm-generic termios ioctls and flags (std syscall only has them
+// for some architectures); PowerPC and MIPS number them differently
+const linuxTtyHelper = `type tnWinsize struct {
+	Row, Col, X, Y uint16
+}
+
+func tnTerminalSize(f *os.File) (int, int, bool) {
+	var ws tnWinsize
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 || ws.Col == 0 {
+		return 0, 0, false
+	}
+	return int(ws.Col), int(ws.Row), true
+}
+
+var tnSavedTermios *syscall.Termios
+
+func tnSetRawMode(f *os.File, raw bool) bool {
+	if strings.HasPrefix(runtime.GOARCH, "ppc") || strings.HasPrefix(runtime.GOARCH, "mips") {
+		return false
+	}
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), 0x5401, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return false
+	}
+	if raw {
+		if tnSavedTermios == nil {
+			saved := t
+			tnSavedTermios = &saved
+		}
+		t.Iflag &^= 0x2 | 0x100 | 0x10 | 0x20 | 0x400
+		t.Oflag |= 0x4
+		t.Cflag |= 0x30
+		t.Lflag &^= 0x8 | 0x2 | 0x8000 | 0x1
+		t.Cc[6], t.Cc[5] = 1, 0
+	} else if tnSavedTermios != nil {
+		t = *tnSavedTermios
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), 0x5402, uintptr(unsafe.Pointer(&t)))
+	return errno == 0
+}
+
+func tnUmask(mask int) int {
+	return syscall.Umask(mask)
+}`;
+// macOS and FreeBSD: TIOCGETA / TIOCSETA
+const bsdTtyHelper = `type tnWinsize struct {
+	Row, Col, X, Y uint16
+}
+
+func tnTerminalSize(f *os.File) (int, int, bool) {
+	var ws tnWinsize
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 || ws.Col == 0 {
+		return 0, 0, false
+	}
+	return int(ws.Col), int(ws.Row), true
+}
+
+var tnSavedTermios *syscall.Termios
+
+func tnSetRawMode(f *os.File, raw bool) bool {
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCGETA), uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return false
+	}
+	if raw {
+		if tnSavedTermios == nil {
+			saved := t
+			tnSavedTermios = &saved
+		}
+		t.Iflag &^= syscall.BRKINT | syscall.ICRNL | syscall.INPCK | syscall.ISTRIP | syscall.IXON
+		t.Oflag |= syscall.ONLCR
+		t.Cflag |= syscall.CS8
+		t.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
+		t.Cc[syscall.VMIN], t.Cc[syscall.VTIME] = 1, 0
+	} else if tnSavedTermios != nil {
+		t = *tnSavedTermios
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSETA), uintptr(unsafe.Pointer(&t)))
+	return errno == 0
+}
+
+func tnUmask(mask int) int {
+	return syscall.Umask(mask)
+}`;
+// Windows: the console API (there is no umask; Node returns 0)
+const windowsTtyHelper = `var (
+	tnTtyKernel32                   = syscall.NewLazyDLL("kernel32.dll")
+	tnGetConsoleScreenBufferInfo    = tnTtyKernel32.NewProc("GetConsoleScreenBufferInfo")
+	tnSetConsoleMode                = tnTtyKernel32.NewProc("SetConsoleMode")
+	tnSavedConsoleMode           uint32
+	tnConsoleModeSaved           bool
+)
+
+type tnConsoleScreenBufferInfo struct {
+	Size, CursorPosition       [2]int16
+	Attributes                 uint16
+	Left, Top, Right, Bottom   int16
+	MaximumWindowSize          [2]int16
+}
+
+func tnTerminalSize(f *os.File) (int, int, bool) {
+	var info tnConsoleScreenBufferInfo
+	ok, _, _ := tnGetConsoleScreenBufferInfo.Call(f.Fd(), uintptr(unsafe.Pointer(&info)))
+	if ok == 0 {
+		return 0, 0, false
+	}
+	return int(info.Right-info.Left) + 1, int(info.Bottom-info.Top) + 1, true
+}
+
+func tnSetRawMode(f *os.File, raw bool) bool {
+	var mode uint32
+	if syscall.GetConsoleMode(syscall.Handle(f.Fd()), &mode) != nil {
+		return false
+	}
+	if raw {
+		if !tnConsoleModeSaved {
+			tnSavedConsoleMode, tnConsoleModeSaved = mode, true
+		}
+		// no ENABLE_ECHO_INPUT / LINE_INPUT / PROCESSED_INPUT; ENABLE_VIRTUAL_TERMINAL_INPUT
+		mode = mode&^(0x4|0x2|0x1) | 0x200
+	} else if tnConsoleModeSaved {
+		mode = tnSavedConsoleMode
+	}
+	ok, _, _ := tnSetConsoleMode.Call(f.Fd(), uintptr(mode))
+	return ok != 0
+}
+
+func tnUmask(mask int) int {
+	return 0
+}`;
+const otherTtyHelper = `func tnTerminalSize(f *os.File) (int, int, bool) {
+	return 0, 0, false
+}
+
+func tnSetRawMode(f *os.File, raw bool) bool {
+	return false
+}
+
+func tnUmask(mask int) int {
+	return 0
+}`;
 export function registerProcess(r) {
     defineModule(r, 'process');
     r.globals['process'] = 'process';
@@ -182,6 +382,13 @@ export function registerProcess(r) {
     defineHelper(r, 'nodeProcess', ['fmt', 'math/big', 'os', 'runtime', 'strings', 'syscall', 'time'], ['error', 'orderedMap'], processHelper);
     defineClass(r, 'process.MemoryUsage', '*TnMemoryUsage', 'class', '', 'rss=float64; heapTotal=float64; heapUsed=float64; external=float64; arrayBuffers=float64', '', '');
     const use = () => r.helper('nodeProcess');
+    defineHelper(r, 'nodeTtyOS@linux', ['os', 'runtime', 'strings', 'syscall', 'unsafe'], [], linuxTtyHelper);
+    for (const goos of ['darwin', 'freebsd'])
+        defineHelper(r, `nodeTtyOS@${goos}`, ['os', 'syscall', 'unsafe'], [], bsdTtyHelper);
+    defineHelper(r, 'nodeTtyOS@windows', ['os', 'syscall', 'unsafe'], [], windowsTtyHelper);
+    defineHelper(r, 'nodeTtyOS@other', ['os'], [], otherTtyHelper);
+    defineHelper(r, 'nodeTty', ['os', 'strconv'], ['nodeTtyOS@os', 'nodeProcess', 'error', 'dynamic'], ttyHelper);
+    const tty = () => r.helper('nodeTty');
     const value = (name, type, emit) => {
         r.values[`process.${name}`] = (_c) => emit();
         r.valueTypes[`process.${name}`] = type;
@@ -241,6 +448,26 @@ export function registerProcess(r) {
         use();
         return 'TnIsTTY(os.Stdin)';
     });
+    value('stdout.columns', 'float64', () => {
+        tty();
+        return 'TnTtyColumns(os.Stdout)';
+    });
+    value('stdout.rows', 'float64', () => {
+        tty();
+        return 'TnTtyRows(os.Stdout)';
+    });
+    value('stderr.columns', 'float64', () => {
+        tty();
+        return 'TnTtyColumns(os.Stderr)';
+    });
+    value('stderr.rows', 'float64', () => {
+        tty();
+        return 'TnTtyRows(os.Stderr)';
+    });
+    value('stdin.isRaw', 'bool', () => {
+        tty();
+        return 'tnStdinRaw';
+    });
     value('stdout.fd', 'float64', () => 'float64(1)');
     value('stderr.fd', 'float64', () => 'float64(2)');
     value('stdin.fd', 'float64', () => 'float64(0)');
@@ -291,6 +518,21 @@ export function registerProcess(r) {
     fn('stderr.write', 'bool', (call) => {
         use();
         return `TnProcessWrite(os.Stderr, ${call.args[0]})`;
+    });
+    for (const stream of ['stdout', 'stderr']) {
+        const f = stream === 'stdout' ? 'os.Stdout' : 'os.Stderr';
+        fn(`${stream}.getWindowSize`, '[]float64', (_c) => {
+            tty();
+            return `TnTtyWindowSize(${f})`;
+        });
+    }
+    fn('stdin.setRawMode', '', (call) => {
+        tty();
+        return `TnTtySetRawMode(${call.args[0]})`;
+    });
+    fn('umask', 'float64', (call) => {
+        tty();
+        return `TnProcessUmask(${call.args.slice(0, 1).join(', ')})`;
     });
     fn('nextTick', '', (call) => {
         r.helper('timerWait');
