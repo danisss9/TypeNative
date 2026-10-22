@@ -31,7 +31,8 @@ declared there fails the type check before it reaches the transpiler. The
 | Nullable types (`T \| null`, `T \| undefined`) |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     | Transpiled to Go pointer types                                            |
 | `bigint`                                       |   ✅    | [syntax-bigint.ts](conformance/syntax-bigint.ts)                     | `2n` literals → `*big.Int`; `**` → `.Exp`, comparisons via `.Cmp`         |
 | `bigint` bitwise / shift operators (`&`, `\|`, `^`, `~`, `<<`, `>>`, compound forms) | ✅ | [syntax-bigint-bitwise.ts](conformance/syntax-bigint-bitwise.ts) | `math/big`'s two's-complement `And` / `Or` / `Xor` / `Not`; shifts round toward -Infinity |
-| `BigInt()`, `BigInt.asIntN` / `asUintN`, bigint–number comparisons | ❌ | — | `BigInt()` is not declared; `5n == 5` is `false` |
+| `BigInt()`, `BigInt.asIntN` / `asUintN` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | Integers, numeric strings and booleans; a fraction throws a `RangeError`, a bad string a `SyntaxError` |
+| bigint–number loose comparisons (`5n == 5`) | ❌ | — | `false` (no cross-type coercion) |
 | `symbol`                                       |   ✅    | [syntax-symbols.ts](conformance/syntax-symbols.ts)                   | `Symbol()` → unique `*TnSymbol` pointers, usable as record keys           |
 | `object` type                                  |   ✅    | [syntax-object-type.ts](conformance/syntax-object-type.ts)           | `object` → `interface{}`                                                  |
 | `void` / `never`                               |   ✅    | [syntax-void-never.ts](conformance/syntax-void-never.ts)             | No return value in Go                                                     |
@@ -142,8 +143,8 @@ declared there fails the type check before it reaches the transpiler. The
 | `arguments` object                            |   ✅    | [syntax-arguments.ts](conformance/syntax-arguments.ts)                       | Functions reading it take extra arguments variadically (`[]interface{}`)            |
 | Top-level `await` | ✅ | — | In modules (files with an `import` / `export`) |
 | Generator `next(value)` / `return()` / `throw()` | ❌ | — | Generators are goroutines feeding a channel: only iteration (`for...of`, spread) is lowered |
-| `fn.call` / `fn.apply` | ❌ | — | `call` works on function-typed variables (`const f = (…) => …`, `thisArg` dropped); `apply`, and `call` on function declarations, fail the Go build |
-| `fn.bind` / `fn.name` / `fn.length` | ❌ | — | Not declared |
+| `fn.call` / `fn.apply` / `fn.bind` | ✅ | [syntax-function-values.ts](conformance/syntax-function-values.ts) | Function declarations and function values; `apply` spreads the array over the parameters; `thisArg` is ignored (methods taken from an object are already bound in Go) |
+| `fn.name` / `fn.length` | ✅ | [syntax-function-values.ts](conformance/syntax-function-values.ts) | Known at compile time for declared functions, classes and function variables |
 | `eval` / `new Function(…)` | 🚫 | — | Compile and run JavaScript at runtime: needs a JavaScript engine |
 
 ## Classes & interfaces
@@ -274,7 +275,8 @@ declared there fails the type check before it reaches the transpiler. The
 | `setTimeout`                                         |   ✅    | [lib-set-timeout.ts](conformance/lib-set-timeout.ts)         | `time.AfterFunc` posting the callback to the event loop, which keeps the process alive          |
 | `resolve` / `reject` passed as values                |   ✅    | [lib-node-async-hooks.ts](conformance/lib-node-async-hooks.ts) | `new Promise((resolve) => setTimeout(resolve, ms))`                 |
 | Async class methods (instance, static, inherited, unannotated); `return otherPromise()` | ✅ | [syntax-async-methods.ts](conformance/syntax-async-methods.ts) | Lowered like async functions; a returned promise is awaited |
-| `Promise.withResolvers` / `Promise.try` | ❌ | — | Not declared |
+| `Promise.withResolvers` / `Promise.try` | ✅ | [lib-promise-extras.ts](conformance/lib-promise-extras.ts) | |
+| Async arrows kept as values (`const f = async () => …`) | ✅ | [lib-promise-extras.ts](conformance/lib-promise-extras.ts) | Return a promise like async functions (concise bodies too); async arrows passed straight to a call run inline (see above) |
 
 ## Semantics (JS behaviour preserved)
 
@@ -293,6 +295,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `NaN` semantics                           |   ✅    | [semantics-nan.ts](conformance/semantics-nan.ts)                                   | `NaN !== NaN`, `Number.isNaN(0 / 0)`                                                                        |
 | String-number concatenation order         |   ✅    | [semantics-string-number-concat.ts](conformance/semantics-string-number-concat.ts) | `'a' + 1 + 2` vs `1 + 2 + 'a'`                                                                              |
 | Array truthiness                          |   ✅    | [semantics-array-truthy.ts](conformance/semantics-array-truthy.ts)                 | Empty array is truthy                                                                                       |
+| An object's own `length` field (`{ length: 3 }.length`) | ✅ | [semantics-length-field.ts](conformance/semantics-length-field.ts) | A field read, not an array length |
 | Loop closures capture per-iteration `let` |   ✅    | [semantics-loop-closures.ts](conformance/semantics-loop-closures.ts)               |                                                                                                             |
 | Functions stored in Records               |   ✅    | [semantics-record-functions.ts](conformance/semantics-record-functions.ts)         | `rec.fn()` → `rec.Get("fn")()`, also for names like `get` / `sort`                                          |
 
@@ -338,7 +341,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | Constants (`Math.PI`, `Math.E`, …)                                 |   ✅    | [lib-math-constants.ts](conformance/lib-math-constants.ts) | `math.Pi`, `math.E`, `math.Sqrt2`, …                            |
 | `Math.asin` / `acos` / `atan` / `atan2` / `hypot` / `cbrt` / `exp` |   ✅    | [lib-math-more.ts](conformance/lib-math-more.ts)       | Corresponding `math` functions                                  |
 | `Math.sinh` / `cosh` / `tanh` / `expm1` / `log1p` | ✅ | — | Corresponding `math` functions |
-| `Math.fround` / `imul` / `clz32` / `asinh` / `acosh` / `atanh` / `sumPrecise` / `f16round` | ❌ | — | Not declared |
+| `Math.fround` / `imul` / `clz32` / `asinh` / `acosh` / `atanh` / `sumPrecise` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | `sumPrecise` is a compensated (Neumaier) sum |
+| `Math.f16round` | ❌ | — | Not declared |
 
 ### `JSON`
 
@@ -359,7 +363,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Object.fromEntries`                                       |   ✅    | [lib-object-from-entries.ts](conformance/lib-object-from-entries.ts) | `TnFromEntries` → dynamic object                                    |
 | `Object.hasOwn` / `defineProperty` / `getOwnPropertyNames` |   ✅    | [lib-object-own.ts](conformance/lib-object-own.ts)         | Maps, dynamic objects and typed objects (literal keys); `{ value }` descriptors |
 | `Object.hasOwn` / `defineProperty` with a non-literal key on a typed object | ✅ | [lib-object-own-computed.ts](conformance/lib-object-own-computed.ts) | A `switch` over the declared fields (an unset optional field is not own) |
-| `Object.is` / `groupBy` / `Map.groupBy` / `create` / `getPrototypeOf` / `getOwnPropertyDescriptor(s)` / `defineProperties` | ❌ | — | Not declared |
+| `Object.is` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | SameValue; two empty object literals may share an address in Go, so `Object.is({}, {})` can be `true` |
+| `Object.groupBy` / `Map.groupBy` | ✅ | [lib-group-by.ts](conformance/lib-group-by.ts) | Groups in first-seen key order |
+| `Object.create` / `getPrototypeOf` / `getOwnPropertyDescriptor(s)` / `defineProperties` | ❌ | — | Not declared |
 
 ### `String`
 
@@ -383,8 +389,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | Unicode length / iteration                                |   ✅    | [lib-string-unicode.ts](conformance/lib-string-unicode.ts)             | `.length` counts runes; `[...str]` spreads runes                       |
 | `String.raw`                                              |   ✅    | [lib-string-raw.ts](conformance/lib-string-raw.ts)                     | Raw template text with values interpolated                             |
 | `normalize`                                               |   ✅    | [lib-string-normalize.ts](conformance/lib-string-normalize.ts)         | `golang.org/x/text/unicode/norm`, copied from GOROOT's vendor tree (offline) |
-| `split(sep, limit)` / `lastIndexOf(s, fromIndex)` / `localeCompare(s, locales, options)` | ❌ | — | The extra arguments are not declared (type error) |
-| `codePointAt` / `String.fromCodePoint` / `substr` / `trimLeft` / `trimRight` / `isWellFormed` / `toWellFormed` / `toLocaleUpperCase` / `toLocaleLowerCase` | ❌ | — | Not declared |
+| `split(sep, limit)` / `lastIndexOf(s, fromIndex)` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | |
+| `localeCompare(s, locales, options)` | ❌ | — | Locales / options are not declared; the comparison is by code unit |
+| `codePointAt` / `String.fromCodePoint` / `substr` / `trimLeft` / `trimRight` / `isWellFormed` / `toWellFormed` / `toLocaleUpperCase` / `toLocaleLowerCase` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | `codePointAt` past the end is `NaN` (JS: `undefined`); the locale variants ignore the locale |
 
 ### `Array`
 
@@ -415,7 +422,9 @@ Every standard-library API TypeNative ports, split by module. Per
 | `copyWithin`                                                                |   ✅    | [lib-array-copy-within.ts](conformance/lib-array-copy-within.ts)             | Go `copy` (overlap-safe)                                                      |
 | Change-preserving copies (`toSorted` / `toReversed` / `with`)               |   ✅    | [lib-array-copies.ts](conformance/lib-array-copies.ts)                       | Clone, then sort / reverse / set                                              |
 | `toSpliced`                                                                 |   ✅    | [lib-array-to-spliced.ts](conformance/lib-array-to-spliced.ts)               | `slices.Concat` of the kept parts                                             |
-| `Array.of` / `Array.fromAsync`; iterator helpers (`Iterator.from`, `map` / `filter` / `take` / `drop` / `toArray` on iterators) | ❌ | — | Not declared (`Array.of` exists on typed arrays) |
+| `Array.of` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | |
+| `Array.fromAsync`; iterator helpers (`Iterator.from`, `map` / `filter` / `take` / `drop` / `toArray` on iterators) | ❌ | — | Not declared |
+| `[...map.keys()]` / `[...map.values()]` | ✅ | [lib-group-by.ts](conformance/lib-group-by.ts) | |
 
 ### `Map` / `Set`
 
@@ -440,7 +449,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | `Number.MIN_SAFE_INTEGER` / `MAX_VALUE`             |   ✅    | —                                                        |                                                          |
 | `Number.EPSILON` / `isFinite` / `toPrecision`     |   ✅    | [lib-number-misc.ts](conformance/lib-number-misc.ts)     | `toPrecision` → `strconv.FormatFloat(x, 'g', n, 64)`     |
 | `String()` / `Boolean()` conversions              |   ✅    | [lib-conversions.ts](conformance/lib-conversions.ts)     | JS formatting / truthiness                               |
-| `toExponential` / `toLocaleString` / `Number.isSafeInteger` / `parseInt` / `parseFloat` / `MIN_VALUE` / `POSITIVE_INFINITY` / `NEGATIVE_INFINITY` | ❌ | — | Not declared (the global `parseInt` / `parseFloat` / `Infinity` work) |
+| `toExponential` / `Number.isSafeInteger` / `parseInt` / `parseFloat` / `MIN_VALUE` / `NEGATIVE_INFINITY` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | |
+| Number `toLocaleString` | ❌ | — | Needs `Intl` |
 
 ### `Date`
 
@@ -449,10 +459,11 @@ Every standard-library API TypeNative ports, split by module. Per
 | `new Date()` / `getTime` / `toISOString`         |   ✅    | [lib-date.ts](conformance/lib-date.ts)         | `new Date(ms)` → `time.UnixMilli`; `getTime`/`toISOString` mapped to `time.Time` |
 | `Date.now()`                                     |   ✅    | [lib-date-now.ts](conformance/lib-date-now.ts) | `time.Now().UnixMilli()`                                                         |
 | Component getters (`getFullYear`, `getMonth`, …) |   ✅    | [lib-date-getters.ts](conformance/lib-date-getters.ts) | Local and `getUTC*` getters, `Date.UTC`                                          |
-| `toDateString` / `toJSON` / `valueOf` | ✅ | — | `toDateString` is in UTC |
-| `toString` | ❌ | — | Prints Go's format (`1970-01-01 00:00:00 +0000 UTC`), not Node's (`Thu Jan 01 1970 …`) |
-| `new Date(string)` / `new Date(y, m, d, …)` / `Date.parse` | ❌ | — | Only `new Date()` and `new Date(ms)` are declared |
-| Setters (`setFullYear`, `setDate`, `setHours`, …), `getTimezoneOffset`, `toUTCString`, `toLocale*String` | ❌ | — | Not declared |
+| `toJSON` / `valueOf`; Invalid Dates (`getTime()` is `NaN`, `toISOString` throws a `RangeError`) | ✅ | [lib-date-parse-set.ts](conformance/lib-date-parse-set.ts) | |
+| `toString` / `toDateString` / `toTimeString` / `toUTCString`, `String(date)`, `` `${date}` `` | ✅ | [lib-date-parse-set.ts](conformance/lib-date-parse-set.ts) | Node's formats in the local zone; long zone names for common zones (`Coordinated Universal Time`, `Central European Standard Time`, …), `GMT±hh:mm` otherwise |
+| `new Date(string)` / `new Date(y, m, d, …)` / `new Date(date)` / `Date.parse` | ✅ | [lib-date-parse-set.ts](conformance/lib-date-parse-set.ts) | ISO strings (date-only UTC, date-times local unless offset) and the formats `toString` / `toUTCString` / common `Month D, YYYY` and `YYYY/MM/DD` forms produce; an unparsable string is an Invalid Date |
+| Setters (`setFullYear`, `setDate`, `setHours`, … and `setUTC*`), `setTime`, `getTimezoneOffset` | ✅ | [lib-date-parse-set.ts](conformance/lib-date-parse-set.ts) | Fields overflow like JS. Dates are values: a setter updates the variable or field it is called on, not other references to the same Date |
+| `toLocaleDateString` / `toLocaleTimeString` / `toLocaleString` | ✅ | [lib-date-parse-set.ts](conformance/lib-date-parse-set.ts) | `en-US` format; locales and options are ignored |
 | Date arithmetic and ordering (`b - a`, `+d`, `a < b`) | ✅ | [semantics-date-arithmetic.ts](conformance/semantics-date-arithmetic.ts) | The time value in milliseconds; `any` operands of `-` `*` `/` `%` convert with ToNumber |
 
 ### `RegExp`
@@ -503,9 +514,11 @@ See [Async & timing](#async--timing): `Promise` (constructor, `.then` / `.catch`
 | `MessageChannel` / `MessagePort` / `BroadcastChannel` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | See [worker_threads](#nodeworker_threads) |
 | `__filename` / `__dirname`                  |   ✅    | —                                                                  | The running executable (a native binary has no script file) |
 | `globalThis`                                |   ✅    | [lib-global-this.ts](conformance/lib-global-this.ts)               | `globalThis.x` is the global `x`; `(globalThis as any)` is a dynamic object |
-| `err.stack` | ❌ | — | `name: message` only, no frames. Feasible: the generated Go carries `//line` directives, so `runtime.Callers` reports `.ts` files and lines |
-| `AggregateError` / `Error.captureStackTrace` / `Error.isError` / `DOMException` | ❌ | — | Not declared |
-| `Symbol.for` / `keyFor` / `description`; `[Symbol.asyncIterator]()` methods; `Symbol.toPrimitive` / `hasInstance` / `toStringTag` | ❌ | — | Only `Symbol()`, `Symbol.iterator` and `Symbol.dispose` are lowered |
+| `err.stack` | ✅ | [lib-error-stack.ts](conformance/lib-error-stack.ts) | `Name: message` and an `at fn (file.ts:line)` line per TS frame (no columns), from `runtime.Callers` and the `//line` directives |
+| `AggregateError` (`errors`) | ✅ | [lib-error-stack.ts](conformance/lib-error-stack.ts) | |
+| `Error.captureStackTrace` / `Error.isError` / `DOMException` | ❌ | — | Not declared |
+| `Symbol.for` / `Symbol.keyFor` / `description` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | A global registry by key |
+| `[Symbol.asyncIterator]()` methods; `Symbol.toPrimitive` / `hasInstance` / `toStringTag` | ❌ | — | Only `Symbol()`, `Symbol.iterator` and `Symbol.dispose` are lowered |
 | `WeakRef` / `FinalizationRegistry` | ❌ | — | Feasible on Go's `weak` package and `runtime.AddCleanup` |
 | `Reflect` (`ownKeys` / `has` / `get` / `set` / …) | ❌ | — | Feasible over the existing dynamic property access |
 | `Proxy` | 🚫 | — | Intercepting every property access on static Go structs; a `Proxy` limited to dynamic (`any`) objects would be feasible |
@@ -1265,18 +1278,15 @@ These follow from compiling to a native Go binary, and won't change:
    computed keys in `Object.hasOwn` / `defineProperty`. Remaining:
    - `any[]` arrays don't share `push` through parameters
    - polymorphic `this` chains and `inst[key]` (also in step 3)
-2. **Everyday built-ins:**
-   - `Date` (string and multi-argument constructors, `Date.parse`, setters, local-time
-     `toString`)
-   - key order of `JSON.parse` objects (`space` / replacer / `toJSON` / reviver are done)
-   - `err.stack`
-   - `bind` / `fn.name`
-   - the missing `Promise` / `Array` / `Object` / `String` / `Number` / `Math` / `BigInt` /
-     `Symbol` statics
-   - iterator helpers
-   - `AggregateError`
-   - `Uint8Array` base64 / hex
-   - `BigInt64Array`
+2. **Everyday built-ins.** Done: `Date` (parsing, multi-field constructors, setters, Node's
+   formats), `JSON.stringify` options and the `JSON.parse` reviver, `err.stack`,
+   `AggregateError`, `bind` / `fn.name` / `fn.length`, `Promise.withResolvers` / `try`,
+   `Object.is` / `groupBy`, `Array.of`, and the `Number` / `Math` / `String` / `BigInt` /
+   `Symbol` additions. Remaining:
+   - key order of `JSON.parse` objects
+   - iterator helpers, `Array.fromAsync`
+   - `Uint8Array` base64 / hex, `BigInt64Array`
+   - `localeCompare` with locales (needs `Intl`)
 3. **Language depth:**
    - mixins
    - polymorphic `this`

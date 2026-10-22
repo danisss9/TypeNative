@@ -85,7 +85,7 @@ func tnInvokeArg(a interface{}, t reflect.Type) reflect.Value {
 }`;
 export function registerCore(r) {
     defineHelper(r, 'nodeInvoke', ['reflect'], ['dynamic'], invokeHelper);
-    defineClass(r, 'NodeJS.ErrnoException', '*TnError', 'class', '', 'message=string; code=string', 'name=string; stack=string; cause=interface{}; syscall=string; path=string; errno=float64; hostname=string; address=string; port=float64; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool', '');
+    defineClass(r, 'NodeJS.ErrnoException', '*TnError', 'class', '', 'message=string; code=string', 'name=string; stack=string; cause=interface{}; syscall=string; path=string; errno=float64; hostname=string; address=string; port=float64; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool; errors=[]interface{}', '');
     r.globals['NodeJS'] = 'NodeJS';
     // Callback types of Node's typings (TransformCallback …)
     for (const name of ['stream.TransformCallback', 'fs.NoParamCallback']) {

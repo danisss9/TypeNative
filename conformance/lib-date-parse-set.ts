@@ -1,0 +1,31 @@
+// Date strings, Date.parse, multi-field constructors, setters and formats
+// (assertions hold in any time zone)
+const iso = new Date('2024-03-10T12:34:56.789Z');
+assert(iso.getTime() === 1710074096789, 'ISO date-time');
+assert(iso.toISOString() === '2024-03-10T12:34:56.789Z', 'toISOString');
+assert(iso.toUTCString() === 'Sun, 10 Mar 2024 12:34:56 GMT', iso.toUTCString());
+assert(new Date('2024-03-10').getTime() === Date.UTC(2024, 2, 10), 'date-only strings are UTC');
+assert(new Date('2024-03-10T08:00').getHours() === 8, 'date-times without an offset are local');
+assert(new Date('2024-03-10T08:00:00+02:00').toISOString() === '2024-03-10T06:00:00.000Z', 'offsets');
+assert(Date.parse('2024-01-02T03:04:05Z') === 1704164645000, 'Date.parse');
+assert(isNaN(Date.parse('not a date')) && String(new Date('nope')) === 'Invalid Date', 'invalid dates');
+assert(new Date('Thu, 01 Jan 1970 00:00:00 GMT').getTime() === 0, 'toUTCString format');
+assert(new Date(new Date(0).toString()).getTime() === 0, 'toString format round-trips');
+const local = new Date(2024, 0, 31, 10, 30);
+assert(local.getFullYear() === 2024 && local.getMonth() === 0 && local.getDate() === 31 && local.getHours() === 10, 'fields');
+local.setMonth(1);
+assert(local.getMonth() === 2 && local.getDate() === 2, 'setMonth overflows like JS (Feb 31 → Mar 2)');
+const d = new Date(0);
+assert(d.setUTCHours(5, 6, 7, 8) === 18367008 && d.toISOString() === '1970-01-01T05:06:07.008Z', 'setUTCHours');
+d.setUTCFullYear(2000);
+d.setUTCDate(40);
+assert(d.toISOString() === '2000-02-09T05:06:07.008Z', d.toISOString());
+d.setTime(86400000);
+assert(d.getTime() === 86400000, 'setTime');
+assert(new Date(99, 0).getFullYear() === 1999, 'two-digit years');
+assert(new Date(new Date(5)).getTime() === 5, 'copy constructor');
+const offset = new Date(0).getTimezoneOffset();
+assert(offset === -new Date(0).getHours() * 60 || Math.abs(offset) > 0, 'getTimezoneOffset');
+assert(/^Thu Jan 01 1970|^Wed Dec 31 1969/.test(new Date(0).toString()), new Date(0).toString());
+assert(`${new Date(0)}` === new Date(0).toString(), 'template literals use toString');
+assert(/^\d+\/\d+\/\d{4}, \d+:\d{2}:\d{2} [AP]M$/.test(new Date(0).toLocaleString()), new Date(0).toLocaleString());
