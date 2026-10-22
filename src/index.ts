@@ -239,6 +239,23 @@ function vendorXText(outDir: string): GoModule {
   return { path: 'golang.org/x/text', version: 'v0.0.0', dir: './tnvendor/x-text' };
 }
 
+// golang.org/x/net's dns/dnsmessage (node:dns record queries), copied from
+// GOROOT/src/vendor
+function vendorXNet(outDir: string): GoModule {
+  const goroot = runCommand('go', ['env', 'GOROOT']).stdout.trim();
+  const pkg = path.join('dns', 'dnsmessage');
+  const source = path.join(goroot, 'src', 'vendor', 'golang.org', 'x', 'net', pkg);
+  const target = path.join(outDir, 'tnvendor', 'x-net', pkg);
+  fs.mkdirSync(target, { recursive: true });
+  for (const file of fs.readdirSync(source)) {
+    if (file.endsWith('.go') && !file.endsWith('_test.go')) {
+      fs.writeFileSync(path.join(target, file), fs.readFileSync(path.join(source, file), 'utf-8'));
+    }
+  }
+  fs.writeFileSync(path.join(outDir, 'tnvendor', 'x-net', 'go.mod'), 'module golang.org/x/net\n\ngo 1.23\n');
+  return { path: 'golang.org/x/net', version: 'v0.0.0', dir: './tnvendor/x-net' };
+}
+
 // node:sqlite's driver, the Brotli codec, fsnotify and their dependencies,
 // copied from the package's govendor/ (listed in govendor/manifest.txt); the
 // copy is skipped while dist/tnvendor already holds the same version. Returns
@@ -462,6 +479,8 @@ export function run(opts: RunOptions): void {
   const modules: GoModule[] = [];
   let goVersion = `${MIN_GO_MAJOR}.${MIN_GO_MINOR}`;
   if (generated.some((content) => xTextImport.test(content))) modules.push(vendorXText(outDir));
+  const xNetImport = /^import (\w+ )?"golang\.org\/x\/net\//m;
+  if (generated.some((content) => xNetImport.test(content))) modules.push(vendorXNet(outDir));
   if (generated.some((content) => importsVendoredModule(content, opts.vendorDir))) {
     const vendored = vendorGoModules(opts.vendorDir, outDir);
     for (const mod of vendored.modules) modules.push(mod);

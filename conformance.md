@@ -849,7 +849,7 @@ async function runs synchronously until its first `await`.
 | `lookup` (`family`, `all`) and `dns/promises` / `dns.promises` `lookup`                 |   ✅    | [lib-node-dns.ts](conformance/lib-node-dns.ts) | Go's resolver; `getaddrinfo ENOTFOUND host` errors with `hostname`   |
 | `resolve` (rrtype) / `resolve4` / `resolve6` / `resolveCname` / `resolveMx` / `resolveTxt` / `resolveNs` / `resolveSrv` / `reverse` (callback and promise forms), `getServers` | ✅ | — | Implemented, not probed (needs a network); `getServers` reads `/etc/resolv.conf` |
 | `Resolver` class (callback and `dns/promises` forms: `setServers` / `getServers` / `setLocalAddress` / `cancel`, `timeout` option), module `setServers`, `lookupService` | ✅ | [lib-node-dns-resolver.ts](conformance/lib-node-dns-resolver.ts) | Go's pure resolver dialing the configured servers in turn; `ETIMEOUT` / `ECANCELLED`; services from `/etc/services` |
-| `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`, the `ttl` option, `tries` |   ❌    | —                                            | Go's resolver hides these records and TTLs, but GOROOT vendors `golang.org/x/net/dns/dnsmessage`, which can be copied in the way `normalize` copies `x/text` |
+| `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa` (and `resolve(name, rrtype)` for them), `resolve4` / `resolve6` `{ ttl: true }`, the `tries` option | ✅ | [lib-node-dns-records.ts](conformance/lib-node-dns-records.ts) | Queries built and parsed with `golang.org/x/net/dns/dnsmessage`, copied from GOROOT like `x/text`: UDP with EDNS0, TCP when truncated, each server in turn `tries` times (default 4, 5 s each). Errors are Node's (`queryX ENOTFOUND host`, `ENODATA`, `ESERVFAIL`, `EREFUSED`, `ETIMEOUT`, `ECANCELLED`); `resolveAny` groups records by type in Node's order |
 
 #### `node:http` / `node:https`
 
@@ -1271,8 +1271,8 @@ These follow from compiling to a native Go binary, and won't change:
   `new Worker('./w.ts')`, `fork('./child.ts')` and node:test `run({ files })`.
 - **Go 1.24+ runtime features.** `weak` and `runtime.AddCleanup` would cover `WeakRef`,
   `FinalizationRegistry`, and freeing SQLite statements when they are garbage-collected.
-- **Copying from GOROOT's vendor tree**, the way `String.prototype.normalize` copies `x/text`.
-  `golang.org/x/net/dns/dnsmessage` would cover the remaining `node:dns` record types and TTLs.
+- **Copying from GOROOT's vendor tree**, the way `String.prototype.normalize` copies `x/text`
+  and `node:dns` copies `x/net/dns/dnsmessage` (record types and TTLs).
 
 ### Planned order
 
@@ -1299,9 +1299,8 @@ These follow from compiling to a native Go binary, and won't change:
    - generator `next(value)` / `return()` / `throw()`
 4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`,
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
-   options, errno numbers per OS. Remaining:
+   options, errno numbers per OS, `node:dns` record types and TTLs. Remaining:
    - second entry points
-   - `node:dns` records
    - `async_hooks.createHook`
    - SQLite finalization and `serialize`
    - node:test snapshots, flags and reporters

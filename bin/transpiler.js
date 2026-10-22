@@ -3775,6 +3775,12 @@ function jsStringOf(code, goType) {
         useHelper('date');
         return `TnDateString(${code})`;
     }
+    // Errors: `${err}` is "Name: message"
+    if (goType === '*TnError') {
+        useHelper('dynamic');
+        useHelper('error');
+        return `TnJSString(${code})`;
+    }
     // Node classes with a toString() (MIMEType, X509Certificate, …)
     const nodeKey = goType ? nodeRegistry.classByGoType[goType] : undefined;
     if (nodeKey && 'toString' in nodeRegistry.classes[nodeKey].methods)
@@ -11234,6 +11240,9 @@ func TnJSString(v interface{}) string {
 	case map[string]interface{}:
 		return "[object Object]"
 	case *TnError:
+		if x == nil {
+			return "null"
+		}
 		return x.Get_name() + ": " + x.message
 	case fmt.Stringer:
 		return x.String()

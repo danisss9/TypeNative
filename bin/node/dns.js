@@ -176,6 +176,7 @@ type TnDnsResolver struct {
 	mu      sync.Mutex
 	servers []string
 	timeout time.Duration
+	tries   int
 	local4  net.IP
 	local6  net.IP
 	next    uint32
@@ -195,6 +196,9 @@ func TnNewDnsResolver(options ...interface{}) *TnDnsResolver {
 	if len(options) > 0 && options[0] != nil {
 		if ms, ok := tnNetNumber(TnGet(options[0], "timeout")); ok && ms > 0 {
 			r.timeout = time.Duration(ms) * time.Millisecond
+		}
+		if n, ok := tnNetNumber(TnGet(options[0], "tries")); ok && n > 0 {
+			r.tries = int(n)
 		}
 	}
 	return r
@@ -515,6 +519,440 @@ func TnDnsGetServers() []string {
 		}
 	}
 	return out
+}
+
+// Raw DNS queries (golang.org/x/net/dns/dnsmessage, copied from GOROOT) for
+// what Go's resolver hides: TTLs, ANY / CAA / NAPTR / PTR / SOA records
+type TnRecordWithTtl struct {
+	address string
+	ttl     float64
+}
+
+type TnSoaRecord struct {
+	nsname     string
+	hostmaster string
+	serial     float64
+	refresh    float64
+	retry      float64
+	expire     float64
+	minttl     float64
+}
+
+type TnNaptrRecord struct {
+	flags       string
+	service     string
+	regexp      string
+	replacement string
+	order       float64
+	preference  float64
+}
+
+func (r *TnDnsResolver) queryError(code string, syscallName string, hostname string) *TnError {
+	e := TnNodeError("Error", code, syscallName+" "+code+" "+hostname)
+	e.props["syscall"] = syscallName
+	e.props["hostname"] = hostname
+	return e
+}
+
+// One exchange with a server: UDP, then TCP when the answer is truncated
+func tnDnsExchange(ctx context.Context, server string, local net.IP, query []byte, id uint16) (*dnsmessage.Message, error) {
+	for _, network := range []string{"udp", "tcp"} {
+		d := net.Dialer{}
+		if local != nil {
+			if network == "udp" {
+				d.LocalAddr = &net.UDPAddr{IP: local}
+			} else {
+				d.LocalAddr = &net.TCPAddr{IP: local}
+			}
+		}
+		conn, err := d.DialContext(ctx, network, server)
+		if err != nil {
+			return nil, err
+		}
+		stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+		var answer []byte
+		if network == "udp" {
+			_, err = conn.Write(query)
+			buf := make([]byte, 65535)
+			for err == nil {
+				var n int
+				n, err = conn.Read(buf)
+				// skip stray answers to other queries
+				if err == nil && n >= 2 && uint16(buf[0])<<8|uint16(buf[1]) == id {
+					answer = buf[:n]
+					break
+				}
+			}
+		} else {
+			framed := append([]byte{byte(len(query) >> 8), byte(len(query))}, query...)
+			if _, err = conn.Write(framed); err == nil {
+				header := make([]byte, 2)
+				if _, err = io.ReadFull(conn, header); err == nil {
+					answer = make([]byte, int(header[0])<<8|int(header[1]))
+					_, err = io.ReadFull(conn, answer)
+				}
+			}
+		}
+		stop()
+		conn.Close()
+		if err != nil {
+			return nil, err
+		}
+		var msg dnsmessage.Message
+		if err := msg.Unpack(answer); err != nil {
+			return nil, err
+		}
+		if msg.Truncated && network == "udp" {
+			continue
+		}
+		return &msg, nil
+	}
+	return nil, errors.New("truncated")
+}
+
+// rawQuery(name, type): the answers of that type (all of them for ANY), trying
+// each server in turn, tries times (Node's c-ares defaults: 5 s, 4 tries)
+func (r *TnDnsResolver) rawQuery(hostname string, qtype dnsmessage.Type, syscallName string) ([]dnsmessage.Resource, error) {
+	r.mu.Lock()
+	if r.ctx == nil {
+		r.ctx, r.stop = context.WithCancel(context.Background())
+	}
+	parent := r.ctx
+	servers := append([]string{}, r.servers...)
+	local4, local6 := r.local4, r.local6
+	timeout, tries := r.timeout, r.tries
+	r.mu.Unlock()
+	if len(servers) == 0 {
+		for _, s := range TnDnsGetServers() {
+			if addr, err := netip.ParseAddr(s); err == nil {
+				servers = append(servers, netip.AddrPortFrom(addr, 53).String())
+			}
+		}
+	}
+	if len(servers) == 0 {
+		servers = []string{"127.0.0.1:53"}
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if tries <= 0 {
+		tries = 4
+	}
+	fqdn := hostname
+	if !strings.HasSuffix(fqdn, ".") {
+		fqdn += "."
+	}
+	name, err := dnsmessage.NewName(fqdn)
+	if err != nil {
+		return nil, r.queryError("EBADNAME", syscallName, hostname)
+	}
+	id := uint16(time.Now().UnixNano())
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: id, RecursionDesired: true})
+	b.EnableCompression()
+	b.StartQuestions()
+	b.Question(dnsmessage.Question{Name: name, Type: qtype, Class: dnsmessage.ClassINET})
+	b.StartAdditionals()
+	var opt dnsmessage.ResourceHeader
+	opt.SetEDNS0(1232, dnsmessage.RCodeSuccess, false)
+	b.OPTResource(opt, dnsmessage.OPTResource{})
+	query, err := b.Finish()
+	if err != nil {
+		return nil, r.queryError("EBADQUERY", syscallName, hostname)
+	}
+	code := "ECONNREFUSED"
+	for try := 0; try < tries; try++ {
+		for _, server := range servers {
+			if parent.Err() != nil {
+				return nil, r.queryError("ECANCELLED", syscallName, hostname)
+			}
+			local := local4
+			if ap, err := netip.ParseAddrPort(server); err == nil && ap.Addr().Is6() {
+				local = local6
+			}
+			ctx, done := context.WithTimeout(parent, timeout)
+			msg, err := tnDnsExchange(ctx, server, local, query, id)
+			timedOut := ctx.Err() == context.DeadlineExceeded
+			done()
+			if err != nil {
+				if parent.Err() != nil {
+					return nil, r.queryError("ECANCELLED", syscallName, hostname)
+				}
+				if timedOut {
+					code = "ETIMEOUT"
+				}
+				continue
+			}
+			switch msg.RCode {
+			case dnsmessage.RCodeSuccess:
+			case dnsmessage.RCodeNameError:
+				return nil, r.queryError("ENOTFOUND", syscallName, hostname)
+			case dnsmessage.RCodeServerFailure:
+				code = "ESERVFAIL"
+				continue
+			case dnsmessage.RCodeRefused:
+				code = "EREFUSED"
+				continue
+			case dnsmessage.RCodeNotImplemented:
+				return nil, r.queryError("ENOTIMP", syscallName, hostname)
+			default:
+				return nil, r.queryError("EFORMERR", syscallName, hostname)
+			}
+			answers := []dnsmessage.Resource{}
+			for _, a := range msg.Answers {
+				if qtype == dnsmessage.TypeALL || a.Header.Type == qtype {
+					answers = append(answers, a)
+				}
+			}
+			if len(answers) == 0 {
+				return nil, r.queryError("ENODATA", syscallName, hostname)
+			}
+			return answers, nil
+		}
+	}
+	return nil, r.queryError(code, syscallName, hostname)
+}
+
+func tnDnsName(n dnsmessage.Name) string {
+	return strings.TrimSuffix(n.String(), ".")
+}
+
+// <character-string>s and an uncompressed name, for NAPTR and CAA
+func tnDnsCharString(data []byte, i *int) string {
+	if *i >= len(data) {
+		return ""
+	}
+	n := int(data[*i])
+	end := *i + 1 + n
+	if end > len(data) {
+		end = len(data)
+	}
+	s := string(data[*i+1 : end])
+	*i = end
+	return s
+}
+
+func tnDnsWireName(data []byte, i int) string {
+	labels := []string{}
+	for i < len(data) && data[i] != 0 {
+		n := int(data[i])
+		if i+1+n > len(data) {
+			break
+		}
+		labels = append(labels, string(data[i+1:i+1+n]))
+		i += 1 + n
+	}
+	return strings.Join(labels, ".")
+}
+
+func tnNaptrRecord(data []byte) *TnNaptrRecord {
+	rec := &TnNaptrRecord{}
+	if len(data) < 4 {
+		return rec
+	}
+	rec.order = float64(int(data[0])<<8 | int(data[1]))
+	rec.preference = float64(int(data[2])<<8 | int(data[3]))
+	i := 4
+	rec.flags = tnDnsCharString(data, &i)
+	rec.service = tnDnsCharString(data, &i)
+	rec.regexp = tnDnsCharString(data, &i)
+	rec.replacement = tnDnsWireName(data, i)
+	return rec
+}
+
+// CAA: { critical, <tag>: value }
+func tnCaaRecord(data []byte) *TnMap[string, interface{}] {
+	m := TnNewMap[string, interface{}]()
+	if len(data) < 2 {
+		return m
+	}
+	m.Set("critical", float64(data[0]))
+	n := int(data[1])
+	if 2+n > len(data) {
+		return m
+	}
+	m.Set(string(data[2:2+n]), string(data[2+n:]))
+	return m
+}
+
+func tnSoaRecord(b *dnsmessage.SOAResource) *TnSoaRecord {
+	return &TnSoaRecord{
+		nsname: tnDnsName(b.NS), hostmaster: tnDnsName(b.MBox), serial: float64(b.Serial),
+		refresh: float64(b.Refresh), retry: float64(b.Retry), expire: float64(b.Expire), minttl: float64(b.MinTTL),
+	}
+}
+
+// resolveAny: each record with its type, in Node's shape
+func tnAnyRecord(rr dnsmessage.Resource) interface{} {
+	m := TnNewMap[string, interface{}]()
+	ttl := float64(rr.Header.TTL)
+	switch b := rr.Body.(type) {
+	case *dnsmessage.AResource:
+		m.Set("address", net.IP(b.A[:]).String())
+		m.Set("ttl", ttl)
+		m.Set("type", "A")
+	case *dnsmessage.AAAAResource:
+		m.Set("address", net.IP(b.AAAA[:]).String())
+		m.Set("ttl", ttl)
+		m.Set("type", "AAAA")
+	case *dnsmessage.CNAMEResource:
+		m.Set("value", tnDnsName(b.CNAME))
+		m.Set("type", "CNAME")
+	case *dnsmessage.MXResource:
+		m.Set("exchange", tnDnsName(b.MX))
+		m.Set("priority", float64(b.Pref))
+		m.Set("type", "MX")
+	case *dnsmessage.NSResource:
+		m.Set("value", tnDnsName(b.NS))
+		m.Set("type", "NS")
+	case *dnsmessage.PTRResource:
+		m.Set("value", tnDnsName(b.PTR))
+		m.Set("type", "PTR")
+	case *dnsmessage.SOAResource:
+		s := tnSoaRecord(b)
+		m.Set("nsname", s.nsname)
+		m.Set("hostmaster", s.hostmaster)
+		m.Set("serial", s.serial)
+		m.Set("refresh", s.refresh)
+		m.Set("retry", s.retry)
+		m.Set("expire", s.expire)
+		m.Set("minttl", s.minttl)
+		m.Set("type", "SOA")
+	case *dnsmessage.TXTResource:
+		m.Set("entries", append([]string{}, b.TXT...))
+		m.Set("type", "TXT")
+	case *dnsmessage.SRVResource:
+		m.Set("priority", float64(b.Priority))
+		m.Set("weight", float64(b.Weight))
+		m.Set("port", float64(b.Port))
+		m.Set("name", tnDnsName(b.Target))
+		m.Set("type", "SRV")
+	case *dnsmessage.UnknownResource:
+		switch rr.Header.Type {
+		case 35:
+			n := tnNaptrRecord(b.Data)
+			m.Set("flags", n.flags)
+			m.Set("service", n.service)
+			m.Set("regexp", n.regexp)
+			m.Set("replacement", n.replacement)
+			m.Set("order", n.order)
+			m.Set("preference", n.preference)
+			m.Set("type", "NAPTR")
+		case 257:
+			caa := tnCaaRecord(b.Data)
+			caa.Set("type", "CAA")
+			return caa
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
+	return m
+}
+
+func (r *TnDnsResolver) resolveAny(hostname string) ([]interface{}, error) {
+	answers, err := r.rawQuery(hostname, dnsmessage.TypeALL, "queryAny")
+	if err != nil {
+		return nil, err
+	}
+	// grouped by type in Node's order
+	out := []interface{}{}
+	for _, t := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeCNAME, dnsmessage.TypeAAAA, dnsmessage.TypeMX, dnsmessage.TypeNS, dnsmessage.TypeTXT, dnsmessage.TypeSRV, dnsmessage.TypePTR, 35, dnsmessage.TypeSOA, 257} {
+		for _, a := range answers {
+			if a.Header.Type != t {
+				continue
+			}
+			if rec := tnAnyRecord(a); rec != nil {
+				out = append(out, rec)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (r *TnDnsResolver) resolveCaa(hostname string) ([]interface{}, error) {
+	answers, err := r.rawQuery(hostname, dnsmessage.Type(257), "queryCaa")
+	if err != nil {
+		return nil, err
+	}
+	out := []interface{}{}
+	for _, a := range answers {
+		if u, ok := a.Body.(*dnsmessage.UnknownResource); ok {
+			out = append(out, tnCaaRecord(u.Data))
+		}
+	}
+	return out, nil
+}
+
+func (r *TnDnsResolver) resolveNaptr(hostname string) ([]*TnNaptrRecord, error) {
+	answers, err := r.rawQuery(hostname, dnsmessage.Type(35), "queryNaptr")
+	if err != nil {
+		return nil, err
+	}
+	out := []*TnNaptrRecord{}
+	for _, a := range answers {
+		if u, ok := a.Body.(*dnsmessage.UnknownResource); ok {
+			out = append(out, tnNaptrRecord(u.Data))
+		}
+	}
+	return out, nil
+}
+
+func (r *TnDnsResolver) resolvePtr(hostname string) ([]string, error) {
+	answers, err := r.rawQuery(hostname, dnsmessage.TypePTR, "queryPtr")
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, a := range answers {
+		if b, ok := a.Body.(*dnsmessage.PTRResource); ok {
+			out = append(out, tnDnsName(b.PTR))
+		}
+	}
+	return out, nil
+}
+
+func (r *TnDnsResolver) resolveSoa(hostname string) (*TnSoaRecord, error) {
+	answers, err := r.rawQuery(hostname, dnsmessage.TypeSOA, "querySoa")
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range answers {
+		if b, ok := a.Body.(*dnsmessage.SOAResource); ok {
+			return tnSoaRecord(b), nil
+		}
+	}
+	return nil, r.queryError("ENODATA", "querySoa", hostname)
+}
+
+// resolve4 / resolve6 with { ttl: true }
+func (r *TnDnsResolver) resolveTtl(hostname string, family int) ([]*TnRecordWithTtl, error) {
+	qtype, syscallName := dnsmessage.TypeA, "queryA"
+	if family == 6 {
+		qtype, syscallName = dnsmessage.TypeAAAA, "queryAaaa"
+	}
+	answers, err := r.rawQuery(hostname, qtype, syscallName)
+	if err != nil {
+		return nil, err
+	}
+	out := []*TnRecordWithTtl{}
+	for _, a := range answers {
+		switch b := a.Body.(type) {
+		case *dnsmessage.AResource:
+			out = append(out, &TnRecordWithTtl{address: net.IP(b.A[:]).String(), ttl: float64(a.Header.TTL)})
+		case *dnsmessage.AAAAResource:
+			out = append(out, &TnRecordWithTtl{address: net.IP(b.AAAA[:]).String(), ttl: float64(a.Header.TTL)})
+		}
+	}
+	return out, nil
+}
+
+func (r *TnDnsResolver) resolve4Ttl(hostname string) ([]*TnRecordWithTtl, error) {
+	return r.resolveTtl(hostname, 4)
+}
+
+func (r *TnDnsResolver) resolve6Ttl(hostname string) ([]*TnRecordWithTtl, error) {
+	return r.resolveTtl(hostname, 6)
 }`;
 const RESOLVERS = {
     resolve4: '[]string',
@@ -524,7 +962,14 @@ const RESOLVERS = {
     resolveTxt: '[][]string',
     resolveNs: '[]string',
     resolveSrv: '[]*TnSrvRecord',
-    reverse: '[]string'
+    reverse: '[]string',
+    resolveAny: '[]interface{}',
+    resolveCaa: '[]interface{}',
+    resolveNaptr: '[]*TnNaptrRecord',
+    resolvePtr: '[]string',
+    resolveSoa: '*TnSoaRecord',
+    resolve4Ttl: '[]*TnRecordWithTtl',
+    resolve6Ttl: '[]*TnRecordWithTtl'
 };
 // dns.resolve(hostname, rrtype) → the resolve function for the record type
 const RRTYPES = {
@@ -535,8 +980,20 @@ const RRTYPES = {
     TXT: 'resolveTxt',
     NS: 'resolveNs',
     SRV: 'resolveSrv',
-    PTR: 'reverse'
+    PTR: 'resolvePtr',
+    ANY: 'resolveAny',
+    CAA: 'resolveCaa',
+    NAPTR: 'resolveNaptr',
+    SOA: 'resolveSoa'
 };
+// resolve4 / resolve6 with { ttl: true } return { address, ttl } records
+function withTtl(fn, nodes) {
+    const options = nodes[1];
+    if (!options || options.kind !== 'ObjectLiteralExpression')
+        return fn;
+    const ttl = getOption(options, 'ttl');
+    return ttl && ttl.kind === 'TrueKeyword' ? `${fn}Ttl` : fn;
+}
 function lookupAll(nodes) {
     const options = nodes[1];
     if (!options || options.kind !== 'ObjectLiteralExpression')
@@ -554,11 +1011,14 @@ export function registerDns(r) {
     defineModule(r, 'dns');
     defineModule(r, 'dns/promises');
     r.namespaces['dns.promises'] = 'dns/promises';
-    defineHelper(r, 'nodeDns', ['context', 'net', 'net/netip', 'os', 'strconv', 'strings', 'sync', 'sync/atomic', 'time'], ['nodeNet', 'netErrors', 'eventLoop', 'promise', 'nodeInvoke', 'dynamic'], dnsHelper);
+    defineHelper(r, 'nodeDns', ['context', 'errors', 'golang.org/x/net/dns/dnsmessage', 'io', 'net', 'net/netip', 'os', 'strconv', 'strings', 'sync', 'sync/atomic', 'time'], ['nodeNet', 'netErrors', 'eventLoop', 'promise', 'nodeInvoke', 'dynamic'], dnsHelper);
     const use = () => r.helper('nodeDns');
     defineClass(r, 'dns.LookupAddress', '*TnLookupAddress', 'class', '', 'address=string; family=float64', '', '');
     defineClass(r, 'dns.MxRecord', '*TnMxRecord', 'class', '', 'exchange=string; priority=float64', '', '');
     defineClass(r, 'dns.SrvRecord', '*TnSrvRecord', 'class', '', 'name=string; port=float64; priority=float64; weight=float64', '', '');
+    defineClass(r, 'dns.RecordWithTtl', '*TnRecordWithTtl', 'class', '', 'address=string; ttl=float64', '', '');
+    defineClass(r, 'dns.SoaRecord', '*TnSoaRecord', 'class', '', 'nsname=string; hostmaster=string; serial=float64; refresh=float64; retry=float64; expire=float64; minttl=float64', '', '');
+    defineClass(r, 'dns.NaptrRecord', '*TnNaptrRecord', 'class', '', 'flags=string; service=string; regexp=string; replacement=string; order=float64; preference=float64', '', '');
     r.functions['dns.lookup'] = (c) => {
         use();
         return `TnDnsLookup(${c.args.join(', ')})`;
@@ -583,12 +1043,12 @@ export function registerDns(r) {
     const resolver = (fn, typeFn) => {
         const callback = (recv) => (c) => {
             use();
-            const target = fn === 'resolve' ? rrtypeOf(c.nodes) : fn;
+            const target = typeFn(c.nodes);
             return `TnDnsResolveCb(${recv || c.recv}.${target}, ${c.args[0]}, ${c.args[c.args.length - 1]})`;
         };
         const promise = (recv) => (c) => {
             use();
-            const target = fn === 'resolve' ? rrtypeOf(c.nodes) : fn;
+            const target = typeFn(c.nodes);
             return `TnDnsResolvePromise(${recv || c.recv}.${target}, ${c.args[0]})`;
         };
         const cbTypes = (nodes) => ['*TnError', RESOLVERS[typeFn(nodes)]];
@@ -603,8 +1063,11 @@ export function registerDns(r) {
         r.methods[`dns/promises.Resolver#${fn}`] = promise('');
         r.typers[`dns/promises.Resolver#${fn}`] = promiseType;
     };
-    for (const fn of Object.keys(RESOLVERS))
-        resolver(fn, (_n) => fn);
+    for (const fn of Object.keys(RESOLVERS)) {
+        if (fn.endsWith('Ttl'))
+            continue;
+        resolver(fn, fn === 'resolve4' || fn === 'resolve6' ? (nodes) => withTtl(fn, nodes) : (_n) => fn);
+    }
     resolver('resolve', rrtypeOf);
     defineClass(r, 'dns.LookupServiceResult', '*TnLookupService', 'class', '', 'hostname=string; service=string', '', '');
     r.functions['dns.lookupService'] = (c) => {

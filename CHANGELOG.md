@@ -51,9 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Errors:** `err.errno` and `util.getSystemErrorName` / `Message` / `Map` use Node's numbers for
   the target OS (libuv's table: `ENOENT` is `-4058` on Windows, `ECONNREFUSED` `-61` on macOS) and
   libuv's messages; `getSystemErrorMap` has all 85 entries in Node's order
+- **`node:dns`:** `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`,
+  `resolve4` / `resolve6` with `{ ttl: true }`, and the `Resolver` `tries` option
 
 ### Fixed
 
+- **`node:dns`:** `resolve(name, 'PTR')` queries the name's PTR records (it did a reverse lookup)
+- **Templates:** `${err}` on an `Error` builds and prints `Name: message` (`null` when null)
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)
