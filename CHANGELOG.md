@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`node:crypto`:** `Hash` / `Hmac` as streams; AES key wrap ciphers (`id-aes*-wrap`,
   `id-aes*-wrap-pad`)
 - **`node:http`:** `res.addTrailers()`
+- **`node:test`:** `--test-name-pattern`, `--test-skip-pattern`, `--test-only` and
+  `--test-reporter` (`tap`, `spec`, `dot`, `junit`) from `NODE_OPTIONS`; Node's notice for `.only`
+  without `--test-only`
 - **`node:stream`:** `'readable'` events and Node's `read()` / `read(size)`
 - **`node:sqlite`:** statements are finalized once garbage-collected (they lived until
   `db.close()`); `db.serialize()` / `db.deserialize()`
@@ -77,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`stream.push(cond ? text : null)`:** a nullable string is a chunk or the end of the stream
   (`null` through it never ended the stream)
 - **`hmac.digest()` a second time** returns an empty result, as in Node (it threw)
+- **Destructured callback parameters** (`([k, v]) => …`, `({ a }) => …`) in `map` / `filter` & co.
+  were unsupported syntax
+- **`[...map]`, `map.entries()`** and **`{ ...record, k: v }`** (such as `{ ...process.env }`)
+  did not build
+- **`+` on two dynamic values** concatenates when one is a string (`'a' + 1` gave `1`)
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)

@@ -16,6 +16,7 @@ type TnTestNode struct {
 	skipMsg     string
 	todo        bool
 	todoMsg     string
+	only        bool
 	timeoutMs   float64
 	parent      *TnTestNode
 	children    []*TnTestNode
@@ -39,6 +40,8 @@ var tnTestCurrent = tnTestRoot
 var tnTestRunning *TnTestNode
 var tnTestScheduled bool
 var tnTestSpec bool
+var tnTestTap bool
+var tnTestReporter string
 var tnTestColor bool
 var tnTestStart time.Time
 var tnTestCounts = map[string]int{}
@@ -147,6 +150,9 @@ func tnTestNew(suite bool, args []interface{}) *TnTestNode {
 			if ms, ok := TnGet(a, "timeout").(float64); ok {
 				n.timeoutMs = ms
 			}
+			if only, ok := TnGet(a, "only").(bool); ok {
+				n.only = only
+			}
 		}
 	}
 	return n
@@ -173,9 +179,16 @@ func TnTestRegister(variant string, args ...interface{}) chan struct{} {
 		n.skip = true
 	case "todo":
 		n.todo = true
+	case "only":
+		n.only = true
 	}
 	if tnTestRunning != nil && tnTestCurrent == tnTestRoot && tnTestRunning.ctx != nil {
 		n.parent = tnTestRunning
+		// subtests go through the same filters
+		if tnTestFilters().active() && !tnTestSelected(n) {
+			n.done <- struct{}{}
+			return n.done
+		}
 		tnTestRunning.children = append(tnTestRunning.children, n)
 		tnRunTestNode(n, tnTestDepth(n))
 		return n.done
@@ -194,6 +207,8 @@ func TnSuiteRegister(variant string, args ...interface{}) chan struct{} {
 		n.skip = true
 	case "todo":
 		n.todo = true
+	case "only":
+		n.only = true
 	}
 	n.parent = tnTestCurrent
 	tnTestCurrent.children = append(tnTestCurrent.children, n)
@@ -342,14 +357,174 @@ func tnTestAncestors(n *TnTestNode) []*TnTestNode {
 	return chain
 }
 
+// The test runner's flags, from NODE_OPTIONS as Node reads them:
+// --test-name-pattern / --test-skip-pattern (repeatable, "/re/flags" or a
+// plain regular expression), --test-only and --test-reporter
+type tnTestConfig struct {
+	names    []*regexp.Regexp
+	skips    []*regexp.Regexp
+	only     bool
+	reporter string
+}
+
+func (c *tnTestConfig) active() bool { return len(c.names) > 0 || len(c.skips) > 0 || c.only }
+
+var tnTestCfg *tnTestConfig
+
+// NODE_OPTIONS words: spaces separate them, double quotes group
+func tnNodeOptionWords(s string) []string {
+	words := []string{}
+	cur := strings.Builder{}
+	inQuote, has := false, false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			has = true
+		case r == ' ' && !inQuote:
+			if has {
+				words = append(words, cur.String())
+				cur.Reset()
+				has = false
+			}
+		default:
+			cur.WriteRune(r)
+			has = true
+		}
+	}
+	if has {
+		words = append(words, cur.String())
+	}
+	return words
+}
+
+func tnTestPattern(s string) *regexp.Regexp {
+	if len(s) > 2 && s[0] == '/' {
+		if i := strings.LastIndexByte(s, '/'); i > 0 {
+			prefix := ""
+			if strings.Contains(s[i+1:], "i") {
+				prefix = "(?i)"
+			}
+			if re, err := regexp.Compile(prefix + s[1:i]); err == nil {
+				return re
+			}
+		}
+	}
+	re, err := regexp.Compile(s)
+	if err != nil {
+		return regexp.MustCompile(regexp.QuoteMeta(s))
+	}
+	return re
+}
+
+func tnTestFilters() *tnTestConfig {
+	if tnTestCfg != nil {
+		return tnTestCfg
+	}
+	c := &tnTestConfig{}
+	words := tnNodeOptionWords(os.Getenv("NODE_OPTIONS"))
+	for i := 0; i < len(words); i++ {
+		name, value, hasValue := strings.Cut(words[i], "=")
+		takesValue := name == "--test-name-pattern" || name == "--test-skip-pattern" || name == "--test-reporter"
+		if takesValue && !hasValue && i+1 < len(words) {
+			i++
+			value = words[i]
+		}
+		switch name {
+		case "--test-name-pattern":
+			c.names = append(c.names, tnTestPattern(value))
+		case "--test-skip-pattern":
+			c.skips = append(c.skips, tnTestPattern(value))
+		case "--test-only":
+			c.only = true
+		case "--test-reporter":
+			c.reporter = value
+		}
+	}
+	tnTestCfg = c
+	return c
+}
+
+// A pattern matches a test's name, an ancestor's, or the names joined with spaces
+func tnTestNameMatches(n *TnTestNode, patterns []*regexp.Regexp) bool {
+	names := []string{}
+	for p := n; p != nil && p.parent != nil; p = p.parent {
+		for _, re := range patterns {
+			if re.MatchString(p.name) {
+				return true
+			}
+		}
+		names = append([]string{p.name}, names...)
+	}
+	full := strings.Join(names, " ")
+	for _, re := range patterns {
+		if re.MatchString(full) {
+			return true
+		}
+	}
+	return false
+}
+
+func tnTestSelected(n *TnTestNode) bool {
+	c := tnTestFilters()
+	if len(c.names) > 0 && !tnTestNameMatches(n, c.names) {
+		return false
+	}
+	if len(c.skips) > 0 && tnTestNameMatches(n, c.skips) {
+		return false
+	}
+	if c.only {
+		for p := n; p != nil; p = p.parent {
+			if p.only {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// Drops the tests the filters leave out, and the suites left empty (Node
+// does not report them)
+func tnTestPrune(n *TnTestNode) bool {
+	kept := []*TnTestNode{}
+	for _, child := range n.children {
+		if child.suite {
+			if tnTestPrune(child) {
+				kept = append(kept, child)
+			}
+		} else if tnTestSelected(child) {
+			kept = append(kept, child)
+		}
+	}
+	n.children = kept
+	return len(kept) > 0
+}
+
 func tnRunRoot() {
 	tnTestStart = time.Now()
-	tnTestSpec = TnIsTTY(os.Stdout)
-	tnTestColor = tnTestSpec && os.Getenv("NO_COLOR") == ""
-	if !tnTestSpec {
+	cfg := tnTestFilters()
+	tnTestReporter = cfg.reporter
+	if tnTestReporter != "spec" && tnTestReporter != "dot" && tnTestReporter != "junit" && tnTestReporter != "tap" {
+		tnTestReporter = "tap"
+		if TnIsTTY(os.Stdout) {
+			tnTestReporter = "spec"
+		}
+	}
+	tnTestSpec = tnTestReporter == "spec"
+	tnTestTap = tnTestReporter == "tap"
+	tnTestColor = (tnTestSpec || tnTestReporter == "dot") && TnIsTTY(os.Stdout) && os.Getenv("NO_COLOR") == ""
+	if tnTestTap {
 		fmt.Println("TAP version 13")
 	}
+	if tnTestReporter == "junit" {
+		fmt.Println("<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?>")
+		fmt.Println("<testsuites>")
+	}
 	root := tnTestRoot
+	if cfg.active() {
+		tnTestPrune(root)
+	}
 	ctx := &TnTestContext{node: root}
 	failedHook := tnRunHooks(root.before, ctx)
 	for i := 0; i < len(root.children); i++ {
@@ -367,8 +542,12 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 	n.started = true
 	tnTestShowParents(n)
 	indent := strings.Repeat("    ", depth)
-	if !tnTestSpec {
+	if tnTestTap {
 		fmt.Println(indent + "# Subtest: " + n.name)
+	}
+	// .only without --test-only: Node's notice, as the test's diagnostic
+	if n.only && !tnTestFilters().only {
+		n.diagnostics = append(n.diagnostics, "'only' and 'runOnly' require the --test-only command-line option.")
 	}
 	start := time.Now()
 	ctx := &TnTestContext{node: n, mock: TnNewMockTracker(), signal: TnNewAbortSignal()}
@@ -550,8 +729,18 @@ func tnTestYamlString(s string, indent string) string {
 }
 
 func tnTestReport(n *TnTestNode, depth int) {
-	if tnTestSpec {
+	switch tnTestReporter {
+	case "spec":
 		tnTestReportSpec(n, depth)
+		return
+	case "dot":
+		mark := "."
+		if n.status == "fail" {
+			mark = tnTestColorize("31", "X")
+		}
+		fmt.Print(mark)
+		return
+	case "junit":
 		return
 	}
 	indent := strings.Repeat("    ", depth)
@@ -652,9 +841,117 @@ func tnTestReportSpec(n *TnTestNode, depth int) {
 	}
 }
 
+// dot: the failures after the line of dots, in the spec reporter's format
+func tnTestFailureLines(n *TnTestNode) {
+	fmt.Println("\\n" + tnTestColorize("31", "\\u2716 "+n.name+" ("+tnTestDuration(n.duration)+"ms)"))
+	name := TnJSString(tnTestErrorField(n.err, "name"))
+	head := name
+	if code, ok := tnTestErrorField(n.err, "code").(string); ok && code != "" {
+		head += " [" + code + "]"
+	}
+	for _, l := range strings.Split(head+": "+TnJSString(tnTestErrorField(n.err, "message")), "\\n") {
+		fmt.Println("  " + l)
+	}
+}
+
+func tnXMLEscape(s string, attr bool) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	if attr {
+		s = strings.ReplaceAll(s, "\\"", "&quot;")
+		s = strings.ReplaceAll(s, "\\n", "")
+	}
+	return s
+}
+
+// junit: Node's layout (testcase / testsuite elements, diagnostics and the
+// counters as comments); failure bodies show the error, without a stack
+func tnTestJunit(n *TnTestNode, depth int) {
+	indent := strings.Repeat("\\t", depth+1)
+	dur := strconv.FormatFloat(n.duration/1000, 'f', 6, 64)
+	if n.suite {
+		tests, failures, skipped := 0, 0, 0
+		for _, c := range n.children {
+			if !c.suite {
+				tests++
+				if c.status == "fail" {
+					failures++
+				}
+				if c.status == "skip" || c.status == "todo" {
+					skipped++
+				}
+			}
+		}
+		host, _ := os.Hostname()
+		fmt.Printf("%s<testsuite name=\\"%s\\" time=\\"%s\\" disabled=\\"0\\" errors=\\"0\\" tests=\\"%d\\" failures=\\"%d\\" skipped=\\"%d\\" hostname=\\"%s\\">\\n", indent, tnXMLEscape(n.name, true), dur, tests, failures, skipped, tnXMLEscape(host, true))
+		for _, c := range n.children {
+			tnTestJunit(c, depth+1)
+		}
+		fmt.Println(indent + "</testsuite>")
+	} else {
+		open := fmt.Sprintf("%s<testcase name=\\"%s\\" time=\\"%s\\" classname=\\"test\\"", indent, tnXMLEscape(n.name, true), dur)
+		switch {
+		case n.status == "fail":
+			msg := tnXMLEscape(TnJSString(tnTestErrorField(n.err, "message")), true)
+			fmt.Printf("%s failure=\\"%s\\">\\n", open, msg)
+			fmt.Printf("%s\\t<failure type=\\"%s\\" message=\\"%s\\">\\n", indent, n.failureType, msg)
+			// Node wraps the error in an ERR_TEST_FAILURE whose cause it is
+			cause := strings.ReplaceAll(TnInspect(n.err), "\\n", "\\n  ")
+			raw := strings.TrimSuffix(TnJSString(tnTestErrorField(n.err, "message")), "\\n")
+			fmt.Println(tnXMLEscape("[Error [ERR_TEST_FAILURE]: "+raw+"\\n] {\\n  code: 'ERR_TEST_FAILURE',\\n  failureType: '"+n.failureType+"',\\n  cause: "+cause+"\\n}", false))
+			fmt.Println(indent + "\\t</failure>")
+			fmt.Println(indent + "</testcase>")
+		case n.status == "skip" || n.status == "todo":
+			kind := "skipped"
+			msg := n.skipMsg
+			if n.status == "todo" {
+				kind, msg = "todo", n.todoMsg
+			}
+			if msg == "" {
+				msg = "true"
+			}
+			fmt.Println(open + ">")
+			fmt.Printf("%s\\t<skipped type=\\"%s\\" message=\\"%s\\"/>\\n", indent, kind, tnXMLEscape(msg, true))
+			fmt.Println(indent + "</testcase>")
+		default:
+			fmt.Println(open + "/>")
+		}
+		for _, c := range n.children {
+			tnTestJunit(c, depth+1)
+		}
+	}
+	for _, d := range n.diagnostics {
+		fmt.Println(indent + "<!-- " + d + " -->")
+	}
+}
+
 func tnTestFinish() {
 	stats := []string{"tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"}
-	if !tnTestSpec {
+	duration := "duration_ms " + tnTestDuration(float64(time.Since(tnTestStart).Nanoseconds())/1e6)
+	switch tnTestReporter {
+	case "dot":
+		fmt.Println()
+		if len(tnTestFailures) > 0 {
+			fmt.Println("\\n" + tnTestColorize("31", "Failed tests:"))
+			for _, n := range tnTestFailures {
+				tnTestFailureLines(n)
+			}
+		}
+		tnTestExitCode()
+		return
+	case "junit":
+		for _, n := range tnTestRoot.children {
+			tnTestJunit(n, 0)
+		}
+		for _, key := range stats {
+			fmt.Println("\\t<!-- " + key + " " + strconv.Itoa(tnTestCounts[key]) + " -->")
+		}
+		fmt.Println("\\t<!-- " + duration + " -->")
+		fmt.Println("</testsuites>")
+		tnTestExitCode()
+		return
+	}
+	if tnTestTap {
 		fmt.Println("1.." + strconv.Itoa(len(tnTestRoot.children)))
 	}
 	for _, key := range stats {
@@ -665,26 +962,21 @@ func tnTestFinish() {
 			fmt.Println("# " + line)
 		}
 	}
-	duration := "duration_ms " + tnTestDuration(float64(time.Since(tnTestStart).Nanoseconds())/1e6)
 	if tnTestSpec {
 		fmt.Println(tnTestColorize("34", "\\u2139 "+duration))
 		if len(tnTestFailures) > 0 {
 			fmt.Println("\\n" + tnTestColorize("31", "\\u2716 failing tests:"))
 			for _, n := range tnTestFailures {
-				fmt.Println("\\n" + tnTestColorize("31", "\\u2716 "+n.name+" ("+tnTestDuration(n.duration)+"ms)"))
-				name := TnJSString(tnTestErrorField(n.err, "name"))
-				head := name
-				if code, ok := tnTestErrorField(n.err, "code").(string); ok && code != "" {
-					head += " [" + code + "]"
-				}
-				for _, l := range strings.Split(head+": "+TnJSString(tnTestErrorField(n.err, "message")), "\\n") {
-					fmt.Println("  " + l)
-				}
+				tnTestFailureLines(n)
 			}
 		}
 	} else {
 		fmt.Println("# " + duration)
 	}
+	tnTestExitCode()
+}
+
+func tnTestExitCode() {
 	if tnTestCounts["fail"] > 0 || tnTestCounts["cancelled"] > 0 {
 		TnSetExitCode(1)
 	}
@@ -979,7 +1271,7 @@ export function registerTest(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeTest',
-    ['fmt', 'math', 'os', 'reflect', 'strconv', 'strings', 'time'],
+    ['fmt', 'math', 'os', 'reflect', 'regexp', 'strconv', 'strings', 'time'],
     ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error', 'timerWait', 'clock'],
     testHelper
   );
@@ -1038,13 +1330,13 @@ export function registerTest(r: NodeRegistry): void {
     register(name, 'TnTestRegister', '');
     register(`${name}.skip`, 'TnTestRegister', 'skip');
     register(`${name}.todo`, 'TnTestRegister', 'todo');
-    register(`${name}.only`, 'TnTestRegister', '');
+    register(`${name}.only`, 'TnTestRegister', 'only');
   }
   for (const name of ['describe', 'suite']) {
     register(name, 'TnSuiteRegister', '');
     register(`${name}.skip`, 'TnSuiteRegister', 'skip');
     register(`${name}.todo`, 'TnSuiteRegister', 'todo');
-    register(`${name}.only`, 'TnSuiteRegister', '');
+    register(`${name}.only`, 'TnSuiteRegister', 'only');
   }
   for (const variant of ['', '.skip', '.todo', '.only']) {
     r.functions[`test.default${variant}`] = r.functions[`test.test${variant}`];

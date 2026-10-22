@@ -872,6 +872,8 @@ interface Map<K, V> {
   keys(): K[];
   /** The values, in insertion order. */
   values(): V[];
+  /** The [key, value] pairs, in insertion order. */
+  entries(): [K, V][];
   /** Iterates [key, value] pairs in insertion order. */
   [Symbol.iterator](): IterableIterator<[K, V]>;
 }
