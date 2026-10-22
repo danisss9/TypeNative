@@ -1899,6 +1899,47 @@ declare module 'node:dns' {
       priority: number;
       weight: number;
     }
+    interface RecordWithTtl {
+      address: string;
+      ttl: number;
+    }
+    interface ResolveWithTtlOptions {
+      ttl: true;
+    }
+    interface SoaRecord {
+      nsname: string;
+      hostmaster: string;
+      serial: number;
+      refresh: number;
+      retry: number;
+      expire: number;
+      minttl: number;
+    }
+    interface NaptrRecord {
+      flags: string;
+      service: string;
+      regexp: string;
+      replacement: string;
+      order: number;
+      preference: number;
+    }
+    interface CaaRecord {
+      critical: number;
+      issue?: string;
+      issuewild?: string;
+      iodef?: string;
+      contactemail?: string;
+      contactphone?: string;
+    }
+    type AnyRecord =
+      | (RecordWithTtl & { type: 'A' | 'AAAA' })
+      | { type: 'CNAME' | 'NS' | 'PTR'; value: string }
+      | (MxRecord & { type: 'MX' })
+      | (SoaRecord & { type: 'SOA' })
+      | { type: 'TXT'; entries: string[] }
+      | (SrvRecord & { type: 'SRV' })
+      | (NaptrRecord & { type: 'NAPTR' })
+      | (CaaRecord & { type: 'CAA' });
     function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
     function lookup(hostname: string, family: number, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
     function lookup(hostname: string, options: LookupOptions & { all: true }, callback: (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void): void;
@@ -1908,6 +1949,17 @@ declare module 'node:dns' {
     function resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
     function resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
     function resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+    function resolve(hostname: string, rrtype: 'ANY', callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
+    function resolve(hostname: string, rrtype: 'CAA', callback: (err: NodeJS.ErrnoException | null, addresses: CaaRecord[]) => void): void;
+    function resolve(hostname: string, rrtype: 'NAPTR', callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
+    function resolve(hostname: string, rrtype: 'SOA', callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void;
+    function resolve4(hostname: string, options: ResolveWithTtlOptions, callback: (err: NodeJS.ErrnoException | null, addresses: RecordWithTtl[]) => void): void;
+    function resolve6(hostname: string, options: ResolveWithTtlOptions, callback: (err: NodeJS.ErrnoException | null, addresses: RecordWithTtl[]) => void): void;
+    function resolveAny(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
+    function resolveCaa(hostname: string, callback: (err: NodeJS.ErrnoException | null, records: CaaRecord[]) => void): void;
+    function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
+    function resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    function resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void;
     function resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
     function resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
     function resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
@@ -1921,6 +1973,7 @@ declare module 'node:dns' {
     function lookupService(address: string, port: number, callback: (err: NodeJS.ErrnoException | null, hostname: string, service: string) => void): void;
     interface ResolverOptions {
       timeout?: number;
+      /** Rounds over the servers for record queries (default 4) */
       tries?: number;
     }
     class Resolver {
@@ -1934,6 +1987,17 @@ declare module 'node:dns' {
       resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
       resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
       resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+      resolve(hostname: string, rrtype: 'ANY', callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
+      resolve(hostname: string, rrtype: 'CAA', callback: (err: NodeJS.ErrnoException | null, addresses: CaaRecord[]) => void): void;
+      resolve(hostname: string, rrtype: 'NAPTR', callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
+      resolve(hostname: string, rrtype: 'SOA', callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void;
+      resolve4(hostname: string, options: ResolveWithTtlOptions, callback: (err: NodeJS.ErrnoException | null, addresses: RecordWithTtl[]) => void): void;
+      resolve6(hostname: string, options: ResolveWithTtlOptions, callback: (err: NodeJS.ErrnoException | null, addresses: RecordWithTtl[]) => void): void;
+      resolveAny(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
+      resolveCaa(hostname: string, callback: (err: NodeJS.ErrnoException | null, records: CaaRecord[]) => void): void;
+      resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
+      resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+      resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void;
       resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
       resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
       resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
@@ -1951,7 +2015,7 @@ declare module 'node:dns' {
 }
 
 declare module 'node:dns/promises' {
-  import { LookupOptions, LookupAddress, MxRecord, SrvRecord, ResolverOptions } from 'node:dns';
+  import { LookupOptions, LookupAddress, MxRecord, SrvRecord, ResolverOptions, RecordWithTtl, ResolveWithTtlOptions, SoaRecord, NaptrRecord, CaaRecord, AnyRecord } from 'node:dns';
   namespace dnsPromises {
     function lookup(hostname: string, options: LookupOptions & { all: true }): Promise<LookupAddress[]>;
     function lookup(hostname: string, options?: number | LookupOptions): Promise<LookupAddress>;
@@ -1959,6 +2023,17 @@ declare module 'node:dns/promises' {
     function resolve(hostname: string, rrtype: 'MX'): Promise<MxRecord[]>;
     function resolve(hostname: string, rrtype: 'TXT'): Promise<string[][]>;
     function resolve(hostname: string, rrtype: 'SRV'): Promise<SrvRecord[]>;
+    function resolve(hostname: string, rrtype: 'ANY'): Promise<AnyRecord[]>;
+    function resolve(hostname: string, rrtype: 'CAA'): Promise<CaaRecord[]>;
+    function resolve(hostname: string, rrtype: 'NAPTR'): Promise<NaptrRecord[]>;
+    function resolve(hostname: string, rrtype: 'SOA'): Promise<SoaRecord>;
+    function resolve4(hostname: string, options: ResolveWithTtlOptions): Promise<RecordWithTtl[]>;
+    function resolve6(hostname: string, options: ResolveWithTtlOptions): Promise<RecordWithTtl[]>;
+    function resolveAny(hostname: string): Promise<AnyRecord[]>;
+    function resolveCaa(hostname: string): Promise<CaaRecord[]>;
+    function resolveNaptr(hostname: string): Promise<NaptrRecord[]>;
+    function resolvePtr(hostname: string): Promise<string[]>;
+    function resolveSoa(hostname: string): Promise<SoaRecord>;
     function resolve4(hostname: string): Promise<string[]>;
     function resolve6(hostname: string): Promise<string[]>;
     function resolveCname(hostname: string): Promise<string[]>;
@@ -1980,6 +2055,17 @@ declare module 'node:dns/promises' {
       resolve(hostname: string, rrtype: 'MX'): Promise<MxRecord[]>;
       resolve(hostname: string, rrtype: 'TXT'): Promise<string[][]>;
       resolve(hostname: string, rrtype: 'SRV'): Promise<SrvRecord[]>;
+      resolve(hostname: string, rrtype: 'ANY'): Promise<AnyRecord[]>;
+      resolve(hostname: string, rrtype: 'CAA'): Promise<CaaRecord[]>;
+      resolve(hostname: string, rrtype: 'NAPTR'): Promise<NaptrRecord[]>;
+      resolve(hostname: string, rrtype: 'SOA'): Promise<SoaRecord>;
+      resolve4(hostname: string, options: ResolveWithTtlOptions): Promise<RecordWithTtl[]>;
+      resolve6(hostname: string, options: ResolveWithTtlOptions): Promise<RecordWithTtl[]>;
+      resolveAny(hostname: string): Promise<AnyRecord[]>;
+      resolveCaa(hostname: string): Promise<CaaRecord[]>;
+      resolveNaptr(hostname: string): Promise<NaptrRecord[]>;
+      resolvePtr(hostname: string): Promise<string[]>;
+      resolveSoa(hostname: string): Promise<SoaRecord>;
       resolve4(hostname: string): Promise<string[]>;
       resolve6(hostname: string): Promise<string[]>;
       resolveCname(hostname: string): Promise<string[]>;
