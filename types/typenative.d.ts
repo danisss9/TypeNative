@@ -65,7 +65,26 @@ interface IterableIterator<T, TReturn = any, TNext = undefined> extends Iterator
 
 interface Generator<T = any, TReturn = any, TNext = any> extends Iterator<T, TReturn, TNext> {
   [Symbol.iterator](): Generator<T, TReturn, TNext>;
+  // ES2025 iterator helpers (lazy)
+  map<U>(callbackfn: (value: T, index: number) => U): Generator<U>;
+  filter(predicate: (value: T, index: number) => unknown): Generator<T>;
+  flatMap<U>(callback: (value: T, index: number) => U[]): Generator<U>;
+  take(limit: number): Generator<T>;
+  drop(count: number): Generator<T>;
+  toArray(): T[];
+  forEach(callbackfn: (value: T, index: number) => void): void;
+  some(predicate: (value: T, index: number) => unknown): boolean;
+  every(predicate: (value: T, index: number) => unknown): boolean;
+  find(predicate: (value: T, index: number) => unknown): T | undefined;
+  reduce<U>(callbackfn: (accumulator: U, value: T, index: number) => U, initialValue: U): U;
+  reduce(callbackfn: (accumulator: T, value: T, index: number) => T): T;
 }
+
+interface IteratorConstructor {
+  /** An iterator over an array or generator (with the iterator helpers) */
+  from<T>(source: T[] | Generator<T>): Generator<T>;
+}
+declare var Iterator: IteratorConstructor;
 
 interface AsyncIterator<T, TReturn = any, TNext = any> {
   next(...[value]: [] | [TNext]): Promise<IteratorResult<T, TReturn>>;
@@ -784,6 +803,20 @@ interface PromiseConstructor {
   withResolvers<T>(): PromiseWithResolvers<T>;
   try<T>(fn: (...args: any[]) => T | Promise<T>, ...args: any[]): Promise<T>;
 }
+
+interface WeakRef<T extends object> {
+  /** The target, or undefined once it was garbage-collected */
+  deref(): T | undefined;
+}
+declare var WeakRef: { new <T extends object>(target: T): WeakRef<T> };
+
+interface FinalizationRegistry<T> {
+  register(target: object, heldValue: T, unregisterToken?: object): void;
+  unregister(unregisterToken: object): boolean;
+}
+declare var FinalizationRegistry: {
+  new <T>(cleanupCallback: (heldValue: T) => void): FinalizationRegistry<T>;
+};
 
 interface PromiseWithResolvers<T> {
   promise: Promise<T>;

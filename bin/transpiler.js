@@ -1356,6 +1356,12 @@ function visit(node, options = {}) {
         if (targetType?.startsWith('*TnMap[')) {
             return `${visit(node.expression)}.Get(${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))})`;
         }
+        // obj['field'] / obj[key] on a class instance or typed object
+        if (targetType && isFieldObjectType(targetType)) {
+            const member = visitObjectMemberAccess(node, targetType);
+            if (member)
+                return member;
+        }
         if (isStringLiteral(node.argumentExpression)) {
             return `${visit(node.expression)}[${visit(node.argumentExpression)}]`;
         }
@@ -2144,6 +2150,14 @@ function visit(node, options = {}) {
                 const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${visit(node.left)}, ${visit(node.right)})`;
                 return op === '==' ? same : `!${same}`;
             }
+            // x == null on an interface{} value or an optional chain (emitted as
+            // interface{}): a nil pointer inside it is nullish too
+            const nilOther = isNilLiteral(node.right) ? node.left : isNilLiteral(node.left) ? node.right : undefined;
+            const optionalChain = !!nilOther && (hasQuestionDot(nilOther) || (isCallExpression(nilOther) && hasQuestionDot(nilOther.expression)));
+            if (nilOther && !isNilLiteral(nilOther) && (optionalChain || inferExpressionType(nilOther) === 'interface{}')) {
+                useHelper('dynamic');
+                return `${op === '!=' ? '!' : ''}TnIsNil(${visit(nilOther)})`;
+            }
             const nullableComparison = visitNullableComparison(node, op);
             if (nullableComparison)
                 return nullableComparison;
@@ -2194,6 +2208,18 @@ function visit(node, options = {}) {
         if (op === '=' && isElementAccessExpression(node.left) && inferExpressionType(node.left.expression) === '[]byte') {
             useHelper('buffer');
             return `${visit(node.left.expression)}[int(${visit(node.left.argumentExpression)})] = TnByte(${visit(node.right)})`;
+        }
+        // obj[key] = v on a class instance or typed object: a switch over its fields
+        if (op === '=' && isElementAccessExpression(node.left) && !isStringLiteral(node.left.argumentExpression)) {
+            const objectGoType = inferExpressionType(node.left.expression);
+            if (objectGoType && isFieldObjectType(objectGoType) && inferExpressionType(node.left.argumentExpression) !== 'float64') {
+                const fieldNames = objectFieldNames(objectGoType);
+                if (fieldNames.length > 0) {
+                    useHelper('dynamic');
+                    const cases = fieldNames.map((f) => `case ${toGoStringLiteral(f)}: o.${goFieldName(f)} = TnAs[${getObjectFieldGoType(objectGoType, f) ?? 'interface{}'}](v)`);
+                    return `func(o ${objectGoType}, k string, v interface{}) { switch k { ${cases.join('; ')} } }(${visit(node.left.expression)}, ${toGoValueOfType(node.left.argumentExpression, 'string')}, ${visit(node.right)})`;
+                }
+            }
         }
         // arr[i] = v on an array: writing past the end grows it, as in JS
         if (op === '=' && isElementAccessExpression(node.left) && isExpressionStatement(node.parent)) {
@@ -3099,6 +3125,23 @@ function visit(node, options = {}) {
         if (className === 'Set') {
             useHelper('orderedMap');
             return `TnJSCollection(${visitNewSet(node)}, 2)`;
+        }
+        // new WeakRef(obj) / new FinalizationRegistry(callback)
+        if (className === 'WeakRef' && !classNames.has(className) && node.arguments?.[0]) {
+            useHelper('weakRefs');
+            const targetType = inferExpressionType(node.arguments[0]) ?? '';
+            if (!targetType.startsWith('*')) {
+                reportError(node, 'Unsupported WeakRef target: only objects (class instances, object literals) can be weakly referenced');
+                return 'nil';
+            }
+            return `TnNewWeakRef(${visit(node.arguments[0])})`;
+        }
+        if (className === 'FinalizationRegistry' && !classNames.has(className) && node.arguments?.[0]) {
+            useHelper('weakRefs');
+            const callback = node.arguments[0];
+            const params = goFuncParamTypes(functionValueGoType(callback));
+            const held = params[0] && params[0] !== 'interface{}' ? `TnAs[${params[0]}](__h)` : '__h';
+            return `TnNewFinalizationRegistry(func(__h interface{}) { ${visit(callback)}(${params.length > 0 ? held : ''}) })`;
         }
         // new AggregateError(errors, message?): errors is an iterable of reasons
         if (className === 'AggregateError' && !classNames.has(className)) {
@@ -4350,6 +4393,150 @@ function visitGroupBy(args, asMap) {
 function promiseWithResolversGoType(t) {
     return `*struct{ promise chan ${t}; resolve func(...interface{}); reject func(...interface{}) }`;
 }
+// A class instance / typed object (a pointer to a struct with known fields)
+function isFieldObjectType(goType) {
+    if (!goType.startsWith('*') || goType.startsWith('*[]') || goType.startsWith('*TnMap['))
+        return false;
+    // typed arrays and Node classes index / dispatch on their own
+    if (isTypedArrayGoType(goType) || goType in nodeRegistry.classByGoType)
+        return false;
+    return objectFieldNames(goType).length > 0 || objectGetterNames(goType).length > 0;
+}
+// The getters a class declares or inherits (read through Get_x())
+function objectGetterNames(goType) {
+    const base = goType.replace(/^\*/, '').replace(/\[.*$/, '');
+    const names = [];
+    for (const key of classGetterMethods) {
+        if (key.startsWith(`${base}.`) && !key.slice(base.length + 1).startsWith('__'))
+            names.push(key.slice(base.length + 1));
+    }
+    return names;
+}
+// The common Go type of an object's readable members, or interface{}
+function objectMemberCommonType(goType) {
+    const types = [...objectFieldNames(goType), ...objectGetterNames(goType)].map((f) => getObjectFieldGoType(goType, f) ?? 'interface{}');
+    return types.length > 0 && types.every((t) => t === types[0]) ? types[0] : 'interface{}';
+}
+// obj['field'] → obj.field (a getter call for accessors); obj[key] → a switch
+// over the fields and getters ('' when it doesn't apply)
+function visitObjectMemberAccess(node, goType) {
+    const key = node.argumentExpression;
+    if (inferExpressionType(key) === 'float64')
+        return '';
+    const object = visit(node.expression);
+    const getters = objectGetterNames(goType);
+    if (isStringLiteral(key)) {
+        if (getters.includes(key.text) && !isAssignmentTarget(node))
+            return `${object}.Get_${goFieldName(key.text)}()`;
+        return `${object}.${goFieldName(key.text)}`;
+    }
+    if (isAssignmentTarget(node))
+        return '';
+    const resultType = objectMemberCommonType(goType);
+    const cases = [
+        ...objectFieldNames(goType).map((f) => `case ${toGoStringLiteral(f)}: return o.${goFieldName(f)}`),
+        ...getters.map((g) => `case ${toGoStringLiteral(g)}: return o.Get_${goFieldName(g)}()`)
+    ];
+    return `func(o ${goType}, k string) ${resultType} { switch k { ${cases.join('; ')} }; var zero ${resultType}; return zero }(${object}, ${toGoValueOfType(key, 'string')})`;
+}
+const ITERATOR_HELPERS = new Set(['next', 'map', 'filter', 'flatMap', 'take', 'drop', 'toArray', 'forEach', 'some', 'every', 'find', 'reduce']);
+// A callback of an iterator helper as func(T, float64) R (its own arity may be smaller)
+function iteratorCallbackAdapter(callbackNode, callback, elementType, resultType) {
+    const fnType = callbackNode ? functionValueGoType(callbackNode) : '';
+    const arity = goFuncParamTypes(fnType).length;
+    const callResult = goFuncReturnType(fnType) ?? '';
+    const call = `${callback}(${['__v', '__i'].slice(0, arity).join(', ')})`;
+    if (!resultType)
+        return `func(__v ${elementType}, __i float64) { ${call} }`;
+    const value = resultType === 'bool' ? truthinessCheck(call, callResult) : call;
+    return `func(__v ${elementType}, __i float64) ${resultType} { return ${value} }`;
+}
+// gen.map(fn) / filter / take / drop / flatMap / toArray / forEach / some /
+// every / find / reduce / next() on a generator's channel
+function visitIteratorHelper(receiver, method, elementType, args, callbackNode, extraArgs) {
+    useHelper('iterators');
+    const callbackResult = goFuncReturnType(callbackNode ? functionValueGoType(callbackNode) : '') ?? 'interface{}';
+    switch (method) {
+        case 'next':
+            return `TnIterNext(${receiver})`;
+        case 'map':
+            return `TnIterMap(${receiver}, ${iteratorCallbackAdapter(callbackNode, args[0], elementType, callbackResult)})`;
+        case 'flatMap':
+            return `TnIterFlatMap(${receiver}, ${iteratorCallbackAdapter(callbackNode, args[0], elementType, callbackResult)})`;
+        case 'filter':
+        case 'some':
+        case 'every':
+        case 'find': {
+            const name = { filter: 'Filter', some: 'Some', every: 'Every', find: 'Find' }[method];
+            return `TnIter${name}(${receiver}, ${iteratorCallbackAdapter(callbackNode, args[0], elementType, 'bool')})`;
+        }
+        case 'take':
+            return `TnIterTake(${receiver}, ${args[0]})`;
+        case 'drop':
+            return `TnIterDrop(${receiver}, ${args[0]})`;
+        case 'toArray':
+            return `TnIterToArray(${receiver})`;
+        case 'forEach':
+            return `TnIterForEach(${receiver}, ${iteratorCallbackAdapter(callbackNode, args[0], elementType, '')})`;
+        case 'reduce': {
+            const accType = extraArgs[0] ? inferExpressionType(extraArgs[0]) ?? elementType : elementType;
+            const fnType = callbackNode ? functionValueGoType(callbackNode) : '';
+            const arity = goFuncParamTypes(fnType).length;
+            const call = `${args[0]}(${['__a', '__v', '__i'].slice(0, arity).join(', ')})`;
+            const reducer = `func(__a ${accType}, __v ${elementType}, __i float64) ${accType} { return ${call} }`;
+            return `TnIterReduce(${receiver}, ${reducer}, ${args[1] ?? `*new(${accType})`}, ${args.length > 1})`;
+        }
+    }
+    return `${receiver}.${method}(${args.join(', ')})`;
+}
+// (value, index) / (acc, value, index) of an iterator helper callback on a generator
+function iteratorCallbackParamType(param) {
+    const fn = param.parent;
+    const call = fn?.parent;
+    if (!fn || !isCallExpression(call) || call.arguments?.[0] !== fn || !isPropertyAccessExpression(call.expression))
+        return undefined;
+    const method = call.expression.name.text;
+    if (!ITERATOR_HELPERS.has(method))
+        return undefined;
+    const receiverType = inferExpressionType(call.expression.expression) ?? '';
+    if (!receiverType.startsWith('chan '))
+        return undefined;
+    const elementType = receiverType.slice(5);
+    const index = (fn.parameters ?? []).indexOf(param);
+    if (method === 'reduce') {
+        if (index === 0)
+            return call.arguments[1] ? inferExpressionType(call.arguments[1]) : elementType;
+        return index === 1 ? elementType : index === 2 ? 'float64' : undefined;
+    }
+    return index === 0 ? elementType : index === 1 ? 'float64' : undefined;
+}
+// The result type of an iterator helper call on a generator
+function iteratorHelperGoType(expr, receiverType, method) {
+    const elementType = receiverType.slice(5);
+    const callbackResult = expr.arguments?.[0] ? goFuncReturnType(functionValueGoType(expr.arguments[0])) : undefined;
+    switch (method) {
+        case 'next':
+            return `*TnIterResult[${elementType}]`;
+        case 'map':
+            return `chan ${callbackResult ?? 'interface{}'}`;
+        case 'flatMap':
+            return callbackResult?.startsWith('[]') ? `chan ${callbackResult.slice(2)}` : 'chan interface{}';
+        case 'filter':
+        case 'take':
+        case 'drop':
+            return receiverType;
+        case 'toArray':
+            return `[]${elementType}`;
+        case 'some':
+        case 'every':
+            return 'bool';
+        case 'find':
+            return elementType;
+        case 'reduce':
+            return expr.arguments?.[1] ? inferExpressionType(expr.arguments[1]) : elementType;
+    }
+    return undefined;
+}
 // Array.of(a, b, …): a slice of the arguments' common type
 function arrayOfGoType(argTypes) {
     const first = argTypes[0];
@@ -5459,8 +5646,11 @@ function methodReturnGoType(member) {
     }
     return inferred;
 }
-// An unannotated method whose every `return` is `return this`
+// A method typed `this`, or an unannotated one whose every `return` is
+// `return this`: in a subclass it returns the subclass
 function returnsOnlyThis(member) {
+    if (member.type?.kind === 'ThisType')
+        return true;
     if (member.type || !member.body || !isBlock(member.body))
         return false;
     const returns = collectReturnStatements(member.body);
@@ -5678,6 +5868,12 @@ function inferExpressionType(expr) {
         if (ctorName === 'Date') {
             return 'time.Time';
         }
+        if (ctorName === 'WeakRef' && !classNames.has(ctorName) && expr.arguments?.[0]) {
+            const target = inferExpressionType(expr.arguments[0]) ?? '';
+            return target.startsWith('*') ? `*TnWeakRef[${target.slice(1)}]` : 'interface{}';
+        }
+        if (ctorName === 'FinalizationRegistry' && !classNames.has(ctorName))
+            return '*TnFinalizationRegistry';
         if (ctorName === 'Map' && typeArguments.length === 2) {
             return mapGoType(getType(typeArguments[0]), getType(typeArguments[1]));
         }
@@ -5697,6 +5893,11 @@ function inferExpressionType(expr) {
             return 'string';
         if (objectType?.startsWith('[]'))
             return objectType.slice(2);
+        if (objectType && isFieldObjectType(objectType) && inferExpressionType(expr.argumentExpression) !== 'float64') {
+            if (isStringLiteral(expr.argumentExpression))
+                return getObjectFieldGoType(objectType, expr.argumentExpression.text);
+            return objectMemberCommonType(objectType);
+        }
         if (isTypedArrayGoType(objectType))
             return 'float64';
         if (objectType?.startsWith('*TnMap['))
@@ -5768,6 +5969,12 @@ function inferExpressionType(expr) {
         }
         if (callee === 'Array.of')
             return arrayOfGoType((expr.arguments ?? []).map((a) => inferExpressionType(a)));
+        if (callee === 'Iterator.from' && expr.arguments?.[0]) {
+            const sourceType = (inferExpressionType(expr.arguments[0]) ?? '').replace(/^\*/, '');
+            if (sourceType.startsWith('chan '))
+                return sourceType;
+            return sourceType.startsWith('[]') ? `chan ${sourceType.slice(2)}` : 'chan interface{}';
+        }
         if ((callee === 'Object.groupBy' || callee === 'Map.groupBy') && expr.arguments?.length === 2) {
             return groupByGoType(expr.arguments[0], expr.arguments[1], callee === 'Map.groupBy');
         }
@@ -6059,6 +6266,15 @@ function inferExpressionType(expr) {
             if (methodName === 'join')
                 return 'string';
         }
+        if (ownerType?.startsWith('*TnWeakRef[') && methodName === 'deref')
+            return `*${ownerType.slice('*TnWeakRef['.length, -1)}`;
+        if (ownerType?.startsWith('chan ') && ITERATOR_HELPERS.has(methodName)) {
+            const helperType = iteratorHelperGoType(expr, ownerType, methodName);
+            if (helperType)
+                return helperType;
+        }
+        if (ownerType === '*TnFinalizationRegistry' && methodName === 'unregister')
+            return 'bool';
         // Map / Set iteration: m.keys() → []K, m.values() → []V
         if (ownerType?.startsWith('*TnMap[') && (methodName === 'keys' || methodName === 'values' || methodName === 'entries')) {
             const keyType = extractMapKeyType(ownerType);
@@ -6994,6 +7210,9 @@ function visitArrayHigherOrderCall(node) {
         return undefined;
     }
     const arrayExprNode = node.expression.expression;
+    // generators (channels) take the iterator helpers instead
+    if (!typedReceiver && inferExpressionType(arrayExprNode)?.startsWith('chan '))
+        return undefined;
     const arrayExpr = typedReceiver ? typedReceiver : visit(arrayExprNode);
     const ownerType = typedReceiver ? '[]float64' : inferExpressionType(arrayExprNode);
     const elementType = isArrayLikeGoType(ownerType)
@@ -7306,6 +7525,9 @@ function getType(typeNode, getArrayType = false) {
         return ':';
     if (typeNode.kind === 'ParenthesizedType')
         return getType(typeNode.type, getArrayType);
+    // `this` in a class: the class (subclasses get their own, see the class emitter)
+    if (typeNode.kind === 'ThisType')
+        return thisGoType(typeNode) ?? 'interface{}';
     if (isArrayTypeNode(typeNode)) {
         const elementType = getType(typeNode.elementType);
         return getArrayType ? elementType : `[]${elementType}`;
@@ -7443,6 +7665,12 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'Set' && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
             return mapGoType(getType(typeNode.typeArguments[0]), 'struct{}');
         }
+        if (name === 'WeakRef' && typeNode.typeArguments?.length === 1 && !classNames.has(name)) {
+            const target = getType(typeNode.typeArguments[0]);
+            return target.startsWith('*') ? `*TnWeakRef[${target.slice(1)}]` : 'interface{}';
+        }
+        if (name === 'FinalizationRegistry' && !classNames.has(name))
+            return '*TnFinalizationRegistry';
         if (name === 'PromiseWithResolvers' && typeNode.typeArguments?.length === 1) {
             return promiseWithResolversGoType(getType(typeNode.typeArguments[0]));
         }
@@ -7764,6 +7992,13 @@ const callHandlers = {
     },
     'Object.groupBy': (_caller, args) => visitGroupBy(args, false),
     'Map.groupBy': (_caller, args) => visitGroupBy(args, true),
+    'Iterator.from': (_caller, args) => {
+        useHelper('iterators');
+        const sourceType = (currentCallArgTypes[0] ?? '').replace(/^\*/, '');
+        if (sourceType.startsWith('chan '))
+            return args[0];
+        return `TnIterFrom(${args[0]})`;
+    },
     'Object.is': (_caller, args) => {
         useHelper('builtins');
         return `TnObjectIs(${args[0]}, ${args[1]})`;
@@ -8559,6 +8794,25 @@ function getDynamicCallHandler(caller, objectType) {
         if (objectType === 'class')
             return null;
         let handler;
+        // `map` reaches here as `map_` (Go keywords get a trailing underscore)
+        const helperName = methodName.endsWith('_') && goFieldName(methodName.slice(0, -1)) === methodName ? methodName.slice(0, -1) : methodName;
+        if (currentReceiverGoType?.startsWith('chan ') && ITERATOR_HELPERS.has(helperName)) {
+            const elementType = currentReceiverGoType.slice(5);
+            const callbackNode = currentCallArgNodes[0];
+            const extraArgs = currentCallArgNodes.slice(1);
+            return (c, args) => visitIteratorHelper(c.substring(0, dotIndex), helperName, elementType, args, callbackNode, extraArgs);
+        }
+        if (currentReceiverGoType?.startsWith('*TnWeakRef[') && methodName === 'deref') {
+            return (c) => `${c.substring(0, dotIndex)}.deref()`;
+        }
+        if (currentReceiverGoType === '*TnFinalizationRegistry' && (methodName === 'register' || methodName === 'unregister')) {
+            return (c, args) => {
+                const obj = c.substring(0, dotIndex);
+                if (methodName === 'unregister')
+                    return `${obj}.unregister(${args[0]})`;
+                return `TnRegistryRegister(${obj}, ${args[0]}, ${args[1] ?? 'nil'}, ${args[2] ?? 'nil'})`;
+            };
+        }
         if (objectType === 'string') {
             handler = ownMethodHandler(stringMethodHandlers, methodName);
         }
@@ -9250,6 +9504,9 @@ function getParameterGoType(param) {
     const groupByType = groupByCallbackParamType(param);
     if (groupByType)
         return groupByType;
+    const iteratorType = iteratorCallbackParamType(param);
+    if (iteratorType)
+        return iteratorType;
     const contextualFn = param.parent ? getContextualFunctionType(param.parent) : undefined;
     if (contextualFn) {
         const index = (param.parent.parameters ?? []).indexOf(param);
@@ -9909,6 +10166,7 @@ const helperRequires = {
     goMust: ['error'],
     bigint: ['error'],
     jsonStringify: ['error', 'dynamic'],
+    weakRefs: ['eventLoop', 'dynamic'],
     builtins: ['error', 'dynamic', 'bigint'],
     date: ['error', 'dynamic'],
     goBlocking: ['error', 'eventLoop'],
@@ -10035,6 +10293,8 @@ const helperPackages = {
     objectAssign: ['reflect', 'unsafe'],
     typeOf: ['reflect'],
     isArray: ['reflect'],
+    iterators: [],
+    weakRefs: ['weak', 'runtime', 'sync'],
     builtins: ['math', 'strconv', 'strings', 'math/big'],
     date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
     dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time'],
@@ -10069,6 +10329,213 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    iterators: `// Iterator helpers over generators (channels): lazy, one goroutine per stage
+type TnIterResult[T any] struct {
+	value T
+	done  bool
+}
+
+// it.next(): { value, done }
+func TnIterNext[T any](ch chan T) *TnIterResult[T] {
+	v, ok := <-ch
+	return &TnIterResult[T]{value: v, done: !ok}
+}
+
+// Iterator.from(array)
+func TnIterFrom[T any](values []T) chan T {
+	ch := make(chan T)
+	go func() {
+		defer close(ch)
+		for _, v := range values {
+			ch <- v
+		}
+	}()
+	return ch
+}
+
+func TnIterMap[T, U any](ch chan T, fn func(T, float64) U) chan U {
+	out := make(chan U)
+	go func() {
+		defer close(out)
+		i := 0.0
+		for v := range ch {
+			out <- fn(v, i)
+			i++
+		}
+	}()
+	return out
+}
+
+func TnIterFilter[T any](ch chan T, fn func(T, float64) bool) chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		i := 0.0
+		for v := range ch {
+			if fn(v, i) {
+				out <- v
+			}
+			i++
+		}
+	}()
+	return out
+}
+
+func TnIterFlatMap[T, U any](ch chan T, fn func(T, float64) []U) chan U {
+	out := make(chan U)
+	go func() {
+		defer close(out)
+		i := 0.0
+		for v := range ch {
+			for _, u := range fn(v, i) {
+				out <- u
+			}
+			i++
+		}
+	}()
+	return out
+}
+
+func TnIterTake[T any](ch chan T, n float64) chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		if n <= 0 {
+			return
+		}
+		count := 0.0
+		for v := range ch {
+			out <- v
+			count++
+			if count >= n {
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func TnIterDrop[T any](ch chan T, n float64) chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		count := 0.0
+		for v := range ch {
+			if count >= n {
+				out <- v
+			}
+			count++
+		}
+	}()
+	return out
+}
+
+func TnIterToArray[T any](ch chan T) []T {
+	out := []T{}
+	for v := range ch {
+		out = append(out, v)
+	}
+	return out
+}
+
+func TnIterForEach[T any](ch chan T, fn func(T, float64)) {
+	i := 0.0
+	for v := range ch {
+		fn(v, i)
+		i++
+	}
+}
+
+func TnIterSome[T any](ch chan T, fn func(T, float64) bool) bool {
+	i := 0.0
+	for v := range ch {
+		if fn(v, i) {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+func TnIterEvery[T any](ch chan T, fn func(T, float64) bool) bool {
+	i := 0.0
+	for v := range ch {
+		if !fn(v, i) {
+			return false
+		}
+		i++
+	}
+	return true
+}
+
+func TnIterFind[T any](ch chan T, fn func(T, float64) bool) T {
+	i := 0.0
+	for v := range ch {
+		if fn(v, i) {
+			return v
+		}
+		i++
+	}
+	var zero T
+	return zero
+}
+
+func TnIterReduce[T, A any](ch chan T, fn func(A, T, float64) A, acc A, hasInitial bool) A {
+	i := 0.0
+	for v := range ch {
+		if !hasInitial {
+			if a, ok := interface{}(v).(A); ok {
+				acc = a
+			}
+			hasInitial = true
+		} else {
+			acc = fn(acc, v, i)
+		}
+		i++
+	}
+	return acc
+}`,
+    weakRefs: `// WeakRef: a weak pointer to an object (Go's weak package)
+type TnWeakRef[T any] struct{ p weak.Pointer[T] }
+
+func TnNewWeakRef[T any](v *T) *TnWeakRef[T] { return &TnWeakRef[T]{p: weak.Make(v)} }
+
+// ref.deref(): the object, or nil once it was garbage-collected
+func (w *TnWeakRef[T]) deref() *T { return w.p.Value() }
+
+// FinalizationRegistry: after a registered target is garbage-collected, the
+// callback runs on the event loop with its held value (runtime.AddCleanup)
+type TnFinalizationRegistry struct {
+	callback func(interface{})
+	mu       sync.Mutex
+	tokens   map[interface{}][]runtime.Cleanup
+}
+
+func TnNewFinalizationRegistry(callback func(interface{})) *TnFinalizationRegistry {
+	return &TnFinalizationRegistry{callback: callback, tokens: map[interface{}][]runtime.Cleanup{}}
+}
+
+func TnRegistryRegister[T any](r *TnFinalizationRegistry, target *T, held interface{}, token interface{}) {
+	callback := r.callback
+	cleanup := runtime.AddCleanup(target, func(h interface{}) { TnLoopPost(func() { callback(h) }) }, held)
+	if token != nil {
+		r.mu.Lock()
+		r.tokens[token] = append(r.tokens[token], cleanup)
+		r.mu.Unlock()
+	}
+}
+
+// registry.unregister(token): stops the cleanups registered with it
+func (r *TnFinalizationRegistry) unregister(token interface{}) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cleanups, ok := r.tokens[token]
+	for _, c := range cleanups {
+		c.Stop()
+	}
+	delete(r.tokens, token)
+	return ok
+}`,
     builtins: `// Smaller ECMAScript built-ins (Number, Math, String, Object.is, BigInt)
 // n.toExponential(digits?): JS writes the exponent without padding (1.5e+3)
 func TnToExponential(x float64, digits float64, hasDigits bool) string {
@@ -10509,7 +10976,52 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		o[key] = value
 		return
 	}
+	if tnSetMember(obj, key, value) {
+		return
+	}
 	panic("TnSet: cannot set property " + key)
+}
+
+// obj.key = value on a typed value held as any: a setter (Set_key), a
+// record's key, or a struct field (inherited ones too)
+func tnSetMember(obj interface{}, key string, value interface{}) bool {
+	rv := reflect.ValueOf(obj)
+	if !rv.IsValid() {
+		return false
+	}
+	if m := rv.MethodByName("Set_" + key); m.IsValid() && m.Type().NumIn() == 1 {
+		m.Call([]reflect.Value{tnConvertTo(value, m.Type().In(0))})
+		return true
+	}
+	if strings.HasPrefix(rv.Type().String(), "*main.TnMap[") {
+		if set := rv.MethodByName("Set"); set.IsValid() && set.Type().NumIn() == 2 {
+			set.Call([]reflect.Value{tnConvertTo(key, set.Type().In(0)), tnConvertTo(value, set.Type().In(1))})
+			return true
+		}
+	}
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+		sv := rv.Elem()
+		f := sv.FieldByName(key)
+		if !f.IsValid() {
+			f = sv.FieldByName(key + "_")
+		}
+		if f.IsValid() && f.CanAddr() {
+			f = reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+			f.Set(tnConvertTo(value, f.Type()))
+			return true
+		}
+	}
+	return false
+}
+
+func tnConvertTo(v interface{}, t reflect.Type) reflect.Value {
+	if v == nil {
+		return reflect.Zero(t)
+	}
+	if converted, ok := TnConvertDynamic(v, t); ok {
+		return converted
+	}
+	return reflect.Zero(t)
 }
 
 func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
@@ -10524,6 +11036,9 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 			o[int(i)] = value
 			return
 		}
+	}
+	if k, ok := key.(string); ok && tnSetMember(obj, k, value) {
+		return
 	}
 	panic(fmt.Sprintf("TnSetIndex: cannot set property %v", key))
 }
@@ -10551,6 +11066,10 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 			v, _ := o.TnProp(k)
 			return v
 		}
+	}
+	// a class instance / typed object held as any: its field
+	if k, ok := key.(string); ok && obj != nil {
+		return TnGet(obj, k)
 	}
 	return nil
 }
