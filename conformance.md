@@ -27,7 +27,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `null`                                         |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `undefined`                                    |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     |                                                                           |
 | `any` / `unknown`                              |   ✅    | [syntax-selfhost-context.ts](conformance/syntax-selfhost-context.ts) | Dynamic values handled at runtime (JSON-like objects, arrays, primitives) |
-| A variable declared `any` / `unknown` with a primitive initializer (`const x: any = '6'`) | ✅ | [semantics-any-variables.ts](conformance/semantics-any-variables.ts) | Dynamic: `-` `*` `/` use ToNumber, `==` coerces like JS, reassignment to another type works. `any + number` adds numbers (a string operand isn't concatenated); objects keep their inferred type |
+| A variable declared `any` / `unknown` with a primitive initializer (`const x: any = '6'`) | ✅ | [semantics-any-variables.ts](conformance/semantics-any-variables.ts) | Dynamic: `-` `*` `/` use ToNumber, `==` coerces like JS, reassignment to another type works. `any + number` adds numbers (a string operand isn't concatenated), while `+` on two dynamic values decides at run time like JS ([syntax-callback-destructuring.ts](conformance/syntax-callback-destructuring.ts)); objects keep their inferred type |
 | Nullable types (`T \| null`, `T \| undefined`) |   ✅    | [syntax-null-undefined.ts](conformance/syntax-null-undefined.ts)     | Transpiled to Go pointer types                                            |
 | `bigint`                                       |   ✅    | [syntax-bigint.ts](conformance/syntax-bigint.ts)                     | `2n` literals → `*big.Int`; `**` → `.Exp`, comparisons via `.Cmp`         |
 | `bigint` bitwise / shift operators (`&`, `\|`, `^`, `~`, `<<`, `>>`, compound forms) | ✅ | [syntax-bigint-bitwise.ts](conformance/syntax-bigint-bitwise.ts) | `math/big`'s two's-complement `And` / `Or` / `Xor` / `Not`; shifts round toward -Infinity |
@@ -46,6 +46,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Object destructuring                    |   ✅    | [syntax-destructuring.ts](conformance/syntax-destructuring.ts)                   | Parenthesized initializers; elision and element/property reads; the initializer is evaluated once ([lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts)) |
 | Destructuring with defaults             |   ✅    | [syntax-destructuring-defaults.ts](conformance/syntax-destructuring-defaults.ts) | Missing elements/properties take defaults (nil- and bounds-checked)      |
 | Destructured parameters                 |   ✅    | [syntax-destructuring-params.ts](conformance/syntax-destructuring-params.ts)     | `function f({ a, b }: T)`, `([x, y]: number[])`                          |
+| Destructured callback parameters (`([k, v]) => …`, `({ a }) => …`), `[...map]`, `map.entries()`, `{ ...record, k: v }` | ✅ | [syntax-callback-destructuring.ts](conformance/syntax-callback-destructuring.ts) | Without annotations, in `map` / `filter` / `some` & co. over tuples, Map pairs and `Object.entries`; elements of mixed tuples are dynamic |
 | Object shorthand                        |   ✅    | [lib-go-container-heap.ts](conformance/lib-go-container-heap.ts)                 | `{ name, priority }` takes the fields from same-named variables          |
 | Object spread                           |   ✅    | [syntax-object-spread.ts](conformance/syntax-object-spread.ts)                   | Spread sources copied field-by-field into the new struct                 |
 | Array spread                            |   ✅    | [syntax-array-spread.ts](conformance/syntax-array-spread.ts)                     | `[...arr]`, `fn(...args)`                                                |
@@ -927,7 +928,8 @@ async function runs synchronously until its first `await`.
 | `mock.fn(original?, implementation?)`; `fn.mock.calls` / `callCount()` / `mockImplementation(Once)` / `resetCalls()` / `restore()` |   ✅    | [lib-node-test.ts](conformance/lib-node-test.ts) | The mock has the original's Go function type                                                          |
 | `t.assert` (`node:assert`'s functions, counted by `t.plan`) and `mock.timers` (`enable({ apis, now })`, `tick`, `runAll`, `setTime`, `reset`; `setTimeout` / `setInterval` / `setImmediate` / `Date`) | ✅ | [lib-node-test-mock-timers.ts](conformance/lib-node-test-mock-timers.ts) | Mocked timers do not keep the process alive; `t.mock` timers reset after each test |
 | `mock.method` / `mock.getter` / `mock.setter`                                                         |   ❌    | —                                   | Object-literal methods are function fields and can be swapped; class methods need calls routed through a replaceable table |
-| Snapshots, `--test-only` / `--test-name-pattern` / `--test-reporter` flags, `run()`                      |   ❌    | —                                   | Not implemented (`only` runs everything, like Node without `--test-only`); flags can be read from the binary's arguments; `run()` needs extra entry points |
+| `NODE_OPTIONS` flags: `--test-name-pattern` / `--test-skip-pattern` (repeatable, `/re/flags`), `--test-only`, `--test-reporter=tap\|spec\|dot\|junit`; Node's notice for `.only` without `--test-only` | ✅ | [lib-node-test-flags.ts](conformance/lib-node-test-flags.ts) | Read from `NODE_OPTIONS`, as Node reads them (arguments after a program never reach Node's runner either). Filtered-out tests are not reported; a matching suite runs all its tests. The TAP / spec / dot outputs match Node's; junit's failure bodies have no stack traces |
+| Snapshots, `run()`, `--test-reporter-destination` | ❌ | — | Snapshots need `--test-update-snapshots` files next to the program; `run()` needs extra entry points |
 | Coverage | ❌ | — | Would need Go's `-cover` instrumentation mapped back through the `//line` directives |
 
 #### `node:worker_threads`
@@ -1024,7 +1026,7 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `tap` / `spec` / `dot` / `junit` | ❌ | — | `tap` and `spec` already run in-process (see [test](#nodetest)); exporting them and adding `dot` / `junit` is feasible |
+| `tap` / `spec` / `dot` / `junit` as exports | ❌ | — | The four reporters exist (`--test-reporter` in [test](#nodetest)); exporting them as stream transforms only matters with `run()` |
 | `lcov` | ❌ | — | Needs coverage (see [test](#nodetest)) |
 
 #### `node:domain`
@@ -1308,10 +1310,10 @@ These follow from compiling to a native Go binary, and won't change:
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
    options, errno numbers per OS, `node:dns` record types and TTLs, `node:module` /
    `node:v8` / `node:sea` basics, `Hash` streams, AES key wrap, `res.addTrailers()`, SQLite
-   finalization and `serialize`. Remaining:
+   finalization and `serialize`, node:test flags and reporters. Remaining:
    - second entry points
    - `async_hooks.createHook`
-   - node:test snapshots, flags and reporters
+   - node:test snapshots and `run()`
    - `createRequire`, `sea` assets
    - the smaller `node:crypto` items
    - stream backpressure and BYOB readers

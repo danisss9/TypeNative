@@ -3302,6 +3302,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         .filter((e) => e);
       return `map[string]interface{}${compositeBody(entries)}`;
     }
+    const recordSpread = visitRecordSpreadLiteral(node);
+    if (recordSpread) return recordSpread;
     const contextualType = resolveTypeNode(getContextualTypeNode(node));
     if (isRecordTypeNode(contextualType)) {
       return visitMapLiteral(node, contextualType);
@@ -3723,6 +3725,12 @@ function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
     // - * / % convert with ToNumber ('6' - 1, date - date); + keeps the number cast
     return op === '+' || op === '+=' ? `TnAs[float64](${visit(side)})` : `TnNumber(${visit(side)})`;
   };
+  // Two dynamic operands: + decides at run time, as in JS
+  if ((op === '+' || op === '+=') && leftDynamic && rightDynamic && !isConcat) {
+    useHelper('dynamic');
+    const sum = `TnDynamicAdd(${visit(node.left)}, ${visit(node.right)})`;
+    return op === '+=' ? `${visit(node.left)} = ${sum}` : sum;
+  }
   // Compound assignment with a dynamic left side reads through the interface
   if (op.endsWith('=') && leftDynamic) {
     const binOp = op.slice(0, -1);
@@ -4991,6 +4999,36 @@ function orderedMapLiteral(keyType: string, valueType: string, entries: string[]
   return `${constructor}${sets}`;
 }
 
+// The Record type of a spread in an object literal ({ ...process.env, K: v }),
+// when every spread is a string-keyed record
+function recordSpreadType(node: AstNode): string | undefined {
+  let mapType: string | undefined;
+  for (const p of node.properties ?? []) {
+    if (p.kind !== 'SpreadAssignment') continue;
+    const t = inferExpressionType(p.expression);
+    if (!t || !t.startsWith('*TnMap[string, ') || (mapType && t !== mapType)) return undefined;
+    mapType = t;
+  }
+  return mapType;
+}
+
+// { ...record, k: v } → a new record with record's entries, then k
+function visitRecordSpreadLiteral(node: AstNode): string | undefined {
+  const mapType = recordSpreadType(node);
+  if (!mapType) return undefined;
+  useHelper('orderedMap');
+  const valueType = extractMapValueType(mapType) ?? 'interface{}';
+  const steps = (node.properties ?? []).map((p: AstNode) => {
+    if (p.kind === 'SpreadAssignment') {
+      return `{ __src := ${visit(p.expression)}; for _, __k := range __src.Keys() { __obj.Set(__k, __src.Get(__k)) } }`;
+    }
+    if (isShorthandPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${visit(p.name)})`;
+    if (isPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)})`;
+    return '';
+  });
+  return `func() ${mapType} { __obj := TnNewMap[string, ${valueType}](); ${steps.filter((x: string) => x).join('; ')}; return __obj }()`;
+}
+
 function visitMapLiteral(node: AstNode, recordType: AstNode): string {
   const keyType = getType(recordType.typeArguments[0]);
   const valueType = getType(recordType.typeArguments[1]);
@@ -5370,6 +5408,7 @@ function getArrayLiteralElementType(node: AstNode): string {
       if (spreadType?.startsWith('*TnMap[') && extractMapValueType(spreadType) === 'struct{}') {
         return extractMapKeyType(spreadType);
       }
+      if (spreadType?.startsWith('*TnMap[')) return '[]interface{}';
       continue;
     }
     // mixed element types ([['a', 1]]) make an interface{} array
@@ -5511,6 +5550,8 @@ function visitSpreadSource(expr: AstNode): string {
   if (sourceType?.startsWith('*TnMap[') && extractMapValueType(sourceType) === 'struct{}') {
     return `${visit(expr)}.Keys()`;
   }
+  // [...map]: its [key, value] pairs
+  if (sourceType?.startsWith('*TnMap[')) return `${visit(expr)}.Entries()`;
   if (sourceType === 'string') {
     return `func() []string { __parts := []string{}; for _, __r := range ${visit(expr)} { __parts = append(__parts, string(__r)) }; return __parts }()`;
   }
@@ -5867,7 +5908,7 @@ function inferExpressionType(expr: AstNode): string | undefined {
   if (isArrayLiteralExpression(expr)) {
     return `[]${getArrayLiteralElementType(expr)}`;
   }
-  if (isObjectLiteralExpression(expr)) return getObjectLiteralGoType(expr);
+  if (isObjectLiteralExpression(expr)) return recordSpreadType(expr) ?? getObjectLiteralGoType(expr);
   if (isNewExpression(expr) && isIdentifier(expr.expression)) {
     const ctorName = expr.expression.text;
     if (classNames.has(ctorName)) return `*${ctorName}`;
@@ -5889,6 +5930,13 @@ function inferExpressionType(expr: AstNode): string | undefined {
     if (ctorName === 'FinalizationRegistry' && !classNames.has(ctorName)) return '*TnFinalizationRegistry';
     if (ctorName === 'Map' && typeArguments.length === 2) {
       return mapGoType(getType(typeArguments[0]), getType(typeArguments[1]));
+    }
+    // as visitNewMap emits it: from a contextual type, else interface{} keys and values
+    if (ctorName === 'Map' && !classNames.has(ctorName)) {
+      const contextual = getCollectionTypeArguments(expr);
+      return contextual.length === 2
+        ? mapGoType(getType(contextual[0]), getType(contextual[1]))
+        : mapGoType('interface{}', 'interface{}');
     }
     if (ctorName === 'Set' && typeArguments.length === 1) {
       return mapGoType(getType(typeArguments[0]), 'struct{}');
@@ -6364,7 +6412,10 @@ function inferExpressionType(expr: AstNode): string | undefined {
         const sideType = inferExpressionType(side);
         return sideType === 'string' || (!!sideType && enumBaseTypes.get(sideType) === 'string');
       });
-      return isString ? 'string' : 'float64';
+      if (isString) return 'string';
+      // two dynamic values: a string or a number, known at run time
+      if (isDynamicValue(expr.left) && isDynamicValue(expr.right)) return 'interface{}';
+      return 'float64';
     }
     if (['LessThanToken', 'GreaterThanToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind)) {
       return 'bool';
@@ -7187,23 +7238,28 @@ function buildArrayCallbackInfo(
 ): ArrayCallbackInfo {
   if (isArrowFunction(callback) || isFunctionExpression(callback)) {
     const paramCount = (callback.parameters ?? []).length;
+    // ([k, v]) => … / ({ a }) => …: a temporary parameter unpacked first
+    const unpack: string[] = [];
     (callback.parameters ?? []).slice(0, paramTypes.length).forEach((p: AstNode, index: number) => {
       if (isIdentifier(p.name)) registerLocalVariable(p.name.text, paramTypes[index]);
+      else unpack.push(destructureCallbackParam(p.name, `__dp${index}`, paramTypes[index]));
     });
     const callbackReturnType =
       forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, elementType);
 
     const params = (callback.parameters ?? [])
       .slice(0, paramTypes.length)
-      .map((p: AstNode, index: number) => `${visit(p.name)} ${paramTypes[index]}`);
+      .map((p: AstNode, index: number) => `${isIdentifier(p.name) ? visit(p.name) : `__dp${index}`} ${paramTypes[index]}`);
 
-    const body = isBlock(callback.body)
+    const prefix = unpack.join('');
+    let body = isBlock(callback.body)
       ? visit(callback.body, { inline: true })
       : forcedReturnType === 'bool'
         ? `{ return ${toGoCondition(callback.body)}; }`
         : forcedReturnType === ''
           ? `{ ${visit(unwrapParentheses(callback.body))}; }`
           : `{ return ${visit(callback.body)}; }`;
+    if (prefix) body = `{ ${prefix}${body.slice(body.indexOf('{') + 1)}`;
 
     return {
       fnExpr: `func(${params.join(', ')}) ${callbackReturnType} ${body}`,
@@ -7217,6 +7273,44 @@ function buildArrayCallbackInfo(
     paramCount: 1,
     returnType: forcedReturnType ?? 'interface{}'
   };
+}
+
+// Unpacks a destructured callback parameter (source of Go type goType) into
+// locals: tuples / arrays by index, objects by field, record or dynamic key
+function destructureCallbackParam(pattern: AstNode, source: string, goType: string): string {
+  let code = '';
+  (pattern.elements ?? []).forEach((el: AstNode, index: number) => {
+    if (isOmittedExpression(el) || !el.name || !isIdentifier(el.name)) return;
+    let value: string;
+    let valueType = 'interface{}';
+    if (isArrayBindingPattern(pattern)) {
+      const arrayType = goType.startsWith('*[]') ? goType.slice(1) : goType;
+      if (arrayType.startsWith('[]')) {
+        const ref = goType.startsWith('*[]') ? `(*${source})` : source;
+        value = `${ref}[${index}]`;
+        valueType = arrayType.slice(2);
+      } else {
+        useHelper('dynamic');
+        value = `TnIndex(${source}, float64(${index}))`;
+      }
+    } else {
+      const field: string = (el.propertyName ?? el.name).text;
+      if (goType.startsWith('*TnMap[string, ')) {
+        value = `${source}.Get(${JSON.stringify(field)})`;
+        valueType = extractMapValueType(goType);
+      } else if (goType === 'interface{}' || goType === '') {
+        useHelper('dynamic');
+        value = `TnGet(${source}, ${JSON.stringify(field)})`;
+      } else {
+        value = `${source}.${goFieldName(field)}`;
+        valueType =
+          interfacePropertyTypes.get(goType)?.get(field) ?? getStructFieldGoType(goType, field) ?? 'interface{}';
+      }
+    }
+    registerLocalVariable(el.name.text, valueType);
+    code += `${visit(el.name)} := ${value}; _ = ${visit(el.name)}; `;
+  });
+  return code;
 }
 
 function buildArrayCallbackInvocation(
@@ -8794,7 +8888,8 @@ const mapMethodHandlers: Record<string, MethodHandler> = {
   delete: (obj, args) => `${obj}.Delete(${args[0]})`,
   clear: (obj) => `${obj}.Clear()`,
   keys: (obj) => `${obj}.Keys()`,
-  values: (obj) => `${obj}.Values()`
+  values: (obj) => `${obj}.Values()`,
+  entries: (obj) => `${obj}.Entries()`
 };
 
 const setMethodHandlers: Record<string, MethodHandler> = {
@@ -11214,6 +11309,22 @@ func TnSame(a interface{}, b interface{}) bool {
 		return false
 	}
 	return a == b
+}
+
+// a + b on two dynamic values: numbers (and booleans, null) add; anything
+// else concatenates as strings ('a' + 1, [1] + [2])
+func TnDynamicAdd(a interface{}, b interface{}) interface{} {
+	numeric := func(v interface{}) bool {
+		switch v.(type) {
+		case float64, int, bool, nil:
+			return true
+		}
+		return false
+	}
+	if numeric(a) && numeric(b) {
+		return TnNumber(a) + TnNumber(b)
+	}
+	return TnJSString(a) + TnJSString(b)
 }
 
 // a == b (JS loose equality): null == undefined; a number, string or boolean
