@@ -59,7 +59,7 @@ func tnCloneEncode(v interface{}) interface{} {
 		return out
 	}
 	if withEntries, ok := v.(interface{ Entries() [][]interface{} }); ok {
-		if _, isSet := v.(interface{ IsSet() bool }); isSet {
+		if kind, ok := v.(interface{ TnJSKind() uint8 }); ok && kind.TnJSKind() == 2 {
 			values := []interface{}{}
 			for _, e := range withEntries.Entries() {
 				values = append(values, tnCloneEncode(e[0]))
@@ -143,7 +143,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				}
 				return e
 			case "Map":
-				m := TnNewMap[interface{}, interface{}]()
+				m := TnJSCollection(TnNewMap[interface{}, interface{}](), 1)
 				if pairs, ok := x["v"].([]interface{}); ok {
 					for _, p := range pairs {
 						if pair, ok := p.([]interface{}); ok && len(pair) == 2 {
@@ -153,7 +153,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				}
 				return m
 			case "Set":
-				m := TnNewMap[interface{}, interface{}]()
+				m := TnJSCollection(TnNewMap[interface{}, interface{}](), 2)
 				if values, ok := x["v"].([]interface{}); ok {
 					for _, val := range values {
 						d := tnCloneDecode(val)

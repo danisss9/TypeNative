@@ -558,7 +558,7 @@ async function runs synchronously until its first `await`.
 | `node:http` / `node:https`                  |   ✅    | [http / https](#nodehttp--nodehttps)                        |
 | `node:http2`                                |   ✅    | [http2](#nodehttp2)                                         |
 | `node:inspector`                            |   🚫    | [inspector](#nodeinspector)                                 |
-| `node:module`                               |   ❌    | [module](#nodemodule)                                       |
+| `node:module`                               |   ✅    | [module](#nodemodule)                                       |
 | `node:net`                                  |   ✅    | [net](#nodenet)                                             |
 | `node:os`                                   |   ✅    | [os](#nodeos)                                               |
 | `node:path` / `path/posix` / `path/win32`   |   ✅    | [path](#nodepath)                                           |
@@ -568,7 +568,7 @@ async function runs synchronously until its first `await`.
 | `node:querystring`                          |   ✅    | [querystring](#nodequerystring)                             |
 | `node:readline` / `node:readline/promises`  |   ✅    | [readline](#nodereadline)                                   |
 | `node:repl`                                 |   🚫    | [repl](#noderepl)                                           |
-| `node:sea`                                  |   ❌    | [sea](#nodesea)                                             |
+| `node:sea`                                  |   ✅    | [sea](#nodesea)                                             |
 | `node:sqlite`                               |   ✅    | [sqlite](#nodesqlite)                                       |
 | `node:stream` / `stream/promises` / `stream/consumers` | ✅ | [stream](#nodestream)                                     |
 | `node:stream/web` (+ globals `ReadableStream`, `WritableStream`, `TransformStream`, …) | ✅ | [stream/web](#nodestreamweb)                 |
@@ -582,7 +582,7 @@ async function runs synchronously until its first `await`.
 | `node:tty`                                  |   ✅    | [tty](#nodetty)                                             |
 | `node:url` (+ globals `URL`, `URLSearchParams`) | ✅  | [url](#nodeurl)                                             |
 | `node:util` / `node:util/types`             |   ✅    | [util](#nodeutil)                                           |
-| `node:v8`                                   |   ❌    | [v8](#nodev8)                                               |
+| `node:v8`                                   |   ✅    | [v8](#nodev8)                                               |
 | `node:vm`                                   |   🚫    | [vm](#nodevm)                                               |
 | `node:wasi`                                 |   ❌    | [wasi](#nodewasi)                                           |
 | `node:worker_threads` (+ globals `MessageChannel`, `MessagePort`, `BroadcastChannel`) | ✅ | [worker_threads](#nodeworker_threads) |
@@ -985,7 +985,8 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `getHeapStatistics` / `getHeapSpaceStatistics`, `serialize` / `deserialize` | ❌ | — | Feasible: `runtime.MemStats`; the structured-clone codec workers already use |
+| `getHeapStatistics`, `serialize` / `deserialize` | ✅ | [lib-node-module-v8.ts](conformance/lib-node-module-v8.ts) | Heap numbers from `runtime.MemStats` (the limit is `GOMEMLIMIT`, else 4 GiB); `serialize` uses the structured-clone codec workers use, not V8's wire format, and object keys come back in sorted order |
+| `getHeapSpaceStatistics`, `getHeapCodeStatistics` | ❌ | — | Feasible as approximations; Go's heap has no V8 spaces |
 | Heap snapshots, `setFlagsFromString`, `startupSnapshot` | 🚫 | — | V8 internals; there is no V8 in a native binary |
 
 #### `node:wasi`
@@ -998,7 +999,8 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `isSea` / `getAsset` / `getRawAsset` | ❌ | — | Every TypeNative binary is a single executable (`isSea()` would be `true`); assets would be files embedded with `go:embed` |
+| `isSea` | ✅ | [lib-node-module-v8.ts](conformance/lib-node-module-v8.ts) | Always `true`: every TypeNative binary is a single executable |
+| `getAsset` / `getRawAsset` with assets | ❌ | — | No asset can be added yet, so these throw `ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND`; assets would be files embedded with `go:embed` |
 
 #### `node:trace_events`
 
@@ -1010,7 +1012,8 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
-| `builtinModules` / `isBuiltin` / `createRequire(…)('literal')` / `findPackageJSON` | ❌ | — | Feasible: static lists, and `require` of a literal specifier resolved at compile time like an import |
+| `builtinModules` / `isBuiltin` | ✅ | [lib-node-module-v8.ts](conformance/lib-node-module-v8.ts) | Node 22's list; `node:test`, `node:sqlite` and `node:sea` need the scheme, as in Node |
+| `createRequire(…)('literal')` / `findPackageJSON` | ❌ | — | Feasible: `require` of a literal specifier resolved at compile time like an import |
 | `register` / `registerHooks` (loader hooks), `require` of computed specifiers | 🚫 | — | Hooks into a JavaScript loader; imports are resolved at compile time |
 
 #### `node:test/reporters`
@@ -1299,12 +1302,13 @@ These follow from compiling to a native Go binary, and won't change:
    - generator `next(value)` / `return()` / `throw()`
 4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`,
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
-   options, errno numbers per OS, `node:dns` record types and TTLs. Remaining:
+   options, errno numbers per OS, `node:dns` record types and TTLs, `node:module` /
+   `node:v8` / `node:sea` basics. Remaining:
    - second entry points
    - `async_hooks.createHook`
    - SQLite finalization and `serialize`
    - node:test snapshots, flags and reporters
-   - `node:module` / `node:sea` / `node:v8` basics
+   - `createRequire`, `sea` assets
    - the smaller `node:crypto` items
    - stream backpressure and BYOB readers
    - http trailers

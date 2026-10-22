@@ -53,11 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   libuv's messages; `getSystemErrorMap` has all 85 entries in Node's order
 - **`node:dns`:** `resolveAny` / `resolveCaa` / `resolveNaptr` / `resolvePtr` / `resolveSoa`,
   `resolve4` / `resolve6` with `{ ttl: true }`, and the `Resolver` `tries` option
+- **`node:module`** (`builtinModules`, `isBuiltin`), **`node:v8`** (`getHeapStatistics`,
+  `serialize` / `deserialize`) and **`node:sea`** (`isSea`)
 
 ### Fixed
 
 - **`node:dns`:** `resolve(name, 'PTR')` queries the name's PTR records (it did a reverse lookup)
 - **Templates:** `${err}` on an `Error` builds and prints `Name: message` (`null` when null)
+- **`Date` annotations:** `let d: Date`, `Date` parameters, return types, fields and `as Date`
+  compiled to an undefined Go type
+- **Named imports of Node values:** `import { METHODS } from 'node:http'` keeps its array type
+  (`METHODS.includes(…)` compiled as a string method)
+- **`console.log` / `inspect`:** Maps and Sets nested in objects print as `Map(n) {…}` /
+  `Set(n) {…}` (string-keyed Maps printed as plain objects)
+- **Worker messages / `v8.deserialize`:** Sets arrive as Sets and both pass `instanceof`
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)

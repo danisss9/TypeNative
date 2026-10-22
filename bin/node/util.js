@@ -330,8 +330,16 @@ func (ins *tnInspector) formatCompound(v interface{}, rv reflect.Value, depth in
 	isTop := depth == 0
 	if withEntries, ok := v.(interface{ Entries() [][]interface{} }); ok {
 		entries = withEntries.Entries()
-		if tnInspectSetLike(rv) {
+		// new Map() / new Set() are tagged; untagged maps are records unless a
+		// key is not a string
+		jsKind := uint8(0)
+		if tagged, ok := v.(interface{ TnJSKind() uint8 }); ok {
+			jsKind = tagged.TnJSKind()
+		}
+		if jsKind == 2 || (jsKind == 0 && tnInspectSetLike(rv)) {
 			kind = "set"
+		} else if jsKind == 1 {
+			kind = "map"
 		} else {
 			kind = "map"
 			stringKeys := true

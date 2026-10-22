@@ -38,6 +38,7 @@ import { registerWorkerThreads } from './node/worker_threads.js';
 import { registerCluster } from './node/cluster.js';
 import { registerHttp2 } from './node/http2.js';
 import { registerSystemExtra } from './node/system_extra.js';
+import { registerModuleV8 } from './node/module_v8.js';
 import { goStdlib } from './go/stdlib.generated.js';
 import {
   goPackage,
@@ -7708,6 +7709,10 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (name === 'RegExp') {
       return '*regexp.Regexp';
     }
+    if (name === 'Date' && !classNames.has(name)) {
+      importedPackages.add('time');
+      return 'time.Time';
+    }
     // go:builtin GoError values are Go errors.
     if (name === 'GoError') {
       return 'error';
@@ -7848,7 +7853,10 @@ function getClassNameFromTypeNode(typeNode: AstNode): string | undefined {
 
 function resolveExpressionType(expr: AstNode): string | undefined {
   if (isIdentifier(expr)) {
-    return variableTypes.get(expr.text) ?? goTypeCategory(variableGoTypes.get(expr.text));
+    const known = variableTypes.get(expr.text) ?? goTypeCategory(variableGoTypes.get(expr.text));
+    // Named imports of Node values (import { METHODS } from 'node:http')
+    if (known === undefined && nodeLocalNames.has(expr.text)) return goTypeCategory(inferExpressionType(expr));
+    return known;
   }
   if (expr.kind === 'ThisKeyword') {
     return 'class';
@@ -10396,6 +10404,7 @@ registerWorkerThreads(nodeRegistry);
 registerCluster(nodeRegistry);
 registerHttp2(nodeRegistry);
 registerSystemExtra(nodeRegistry);
+registerModuleV8(nodeRegistry);
 
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
