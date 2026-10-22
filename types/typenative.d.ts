@@ -172,6 +172,9 @@ declare var RegExp: RegExpConstructor;
 
 // --- Array ---
 
+/** readonly T[] / ReadonlyArray<T> (mutating methods are not hidden) */
+interface ReadonlyArray<T> extends Array<T> {}
+
 interface Array<T> extends IterableIterator<T> {
   /**
    * Gets or sets the length of the array. This is a number one higher than the highest index in the array.

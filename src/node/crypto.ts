@@ -3,6 +3,7 @@
 // (cbc / ctr / gcm). Backed by Go's crypto packages.
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { streamListenerTypes } from './stream.js';
 
 const cryptoHelper = `// node:crypto
 func tnHashFactory(alg string) func() hash.Hash {
@@ -44,6 +45,9 @@ type TnHash struct {
 	h         hash.Hash
 	alg       string
 	finalized bool
+	hmac      bool
+	// set when the hash is used as a stream (hashStream)
+	stream interface{}
 }
 
 func TnCreateHash(alg string, options ...interface{}) *TnHash {
@@ -51,7 +55,7 @@ func TnCreateHash(alg string, options ...interface{}) *TnHash {
 }
 
 func TnCreateHmac(alg string, key interface{}, options ...interface{}) *TnHash {
-	return &TnHash{h: hmac.New(tnHashFactory(alg), tnCryptoBytes(key, "")), alg: alg}
+	return &TnHash{h: hmac.New(tnHashFactory(alg), tnCryptoBytes(key, "")), alg: alg, hmac: true}
 }
 
 // Bytes of data passed to crypto APIs: strings in an encoding (utf8 by default) or Buffers
@@ -78,6 +82,10 @@ func (h *TnHash) update(data interface{}, enc ...string) *TnHash {
 }
 
 func (h *TnHash) digestBytes() []byte {
+	// a second hmac.digest() is empty; a second hash.digest() throws
+	if h.finalized && h.hmac {
+		return []byte{}
+	}
 	if h.finalized {
 		panic(TnNodeError("Error", "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"))
 	}
@@ -191,13 +199,158 @@ type TnCipher struct {
 	authTag     []byte
 	autoPadding bool
 	finalized   bool
+	wrapped     bool
 }
 
 func TnGetCiphers() []string {
-	return []string{"aes-128-cbc", "aes-128-ctr", "aes-128-gcm", "aes-192-cbc", "aes-192-ctr", "aes-192-gcm", "aes-256-cbc", "aes-256-ctr", "aes-256-gcm"}
+	return []string{"aes-128-cbc", "aes-128-ctr", "aes-128-gcm", "aes-192-cbc", "aes-192-ctr", "aes-192-gcm", "aes-256-cbc", "aes-256-ctr", "aes-256-gcm",
+		"aes128-wrap", "aes128-wrap-pad", "aes192-wrap", "aes192-wrap-pad", "aes256-wrap", "aes256-wrap-pad",
+		"id-aes128-wrap", "id-aes128-wrap-pad", "id-aes192-wrap", "id-aes192-wrap-pad", "id-aes256-wrap", "id-aes256-wrap-pad"}
+}
+
+// AES key wrap (RFC 3394) and key wrap with padding (RFC 5649): the whole
+// input goes through one update(), as with OpenSSL
+func tnAESWrapRounds(block cipher.Block, a []byte, r [][]byte) []byte {
+	n := len(r)
+	buf := make([]byte, 16)
+	for j := 0; j <= 5; j++ {
+		for i := 1; i <= n; i++ {
+			copy(buf, a)
+			copy(buf[8:], r[i-1])
+			block.Encrypt(buf, buf)
+			t := uint64(n*j + i)
+			for k := 0; k < 8; k++ {
+				a[k] = buf[k] ^ byte(t>>(56-8*k))
+			}
+			copy(r[i-1], buf[8:])
+		}
+	}
+	out := append([]byte{}, a...)
+	for _, b := range r {
+		out = append(out, b...)
+	}
+	return out
+}
+
+func tnAESUnwrapRounds(block cipher.Block, data []byte) ([]byte, []byte) {
+	n := len(data)/8 - 1
+	a := append([]byte{}, data[:8]...)
+	r := make([][]byte, n)
+	for i := range r {
+		r[i] = append([]byte{}, data[8*(i+1):8*(i+2)]...)
+	}
+	buf := make([]byte, 16)
+	for j := 5; j >= 0; j-- {
+		for i := n; i >= 1; i-- {
+			t := uint64(n*j + i)
+			for k := 0; k < 8; k++ {
+				buf[k] = a[k] ^ byte(t>>(56-8*k))
+			}
+			copy(buf[8:], r[i-1])
+			block.Decrypt(buf, buf)
+			copy(a, buf[:8])
+			copy(r[i-1], buf[8:])
+		}
+	}
+	plain := []byte{}
+	for _, b := range r {
+		plain = append(plain, b...)
+	}
+	return a, plain
+}
+
+func tnWrapState() *TnError {
+	return TnNodeError("Error", "", "Trying to add data in unsupported state")
+}
+
+func (c *TnCipher) keyWrap(data []byte) []byte {
+	if c.wrapped {
+		panic(tnWrapState())
+	}
+	c.wrapped = true
+	padded := c.mode == "wrap-pad"
+	if !c.decrypt {
+		if padded {
+			aiv := append(append([]byte{}, c.iv...), byte(len(data)>>24), byte(len(data)>>16), byte(len(data)>>8), byte(len(data)))
+			plain := append(append([]byte{}, data...), make([]byte, (8-len(data)%8)%8)...)
+			if len(plain) == 8 {
+				out := make([]byte, 16)
+				c.block.Encrypt(out, append(aiv, plain...))
+				return out
+			}
+			data = plain
+			c.iv = aiv
+		} else if len(data) < 16 || len(data)%8 != 0 {
+			panic(tnWrapState())
+		}
+		r := make([][]byte, len(data)/8)
+		for i := range r {
+			r[i] = append([]byte{}, data[8*i:8*i+8]...)
+		}
+		return tnAESWrapRounds(c.block, append([]byte{}, c.iv...), r)
+	}
+	if len(data) < 16 || len(data)%8 != 0 {
+		panic(tnWrapState())
+	}
+	var a, plain []byte
+	if padded && len(data) == 16 {
+		buf := make([]byte, 16)
+		c.block.Decrypt(buf, data)
+		a, plain = buf[:8], buf[8:]
+	} else {
+		a, plain = tnAESUnwrapRounds(c.block, data)
+	}
+	if !padded {
+		if subtle.ConstantTimeCompare(a, c.iv) != 1 {
+			panic(tnWrapState())
+		}
+		return plain
+	}
+	size := int(a[4])<<24 | int(a[5])<<16 | int(a[6])<<8 | int(a[7])
+	if subtle.ConstantTimeCompare(a[:4], c.iv) != 1 || size > len(plain) || size <= len(plain)-8 {
+		panic(tnWrapState())
+	}
+	for _, b := range plain[size:] {
+		if b != 0 {
+			panic(tnWrapState())
+		}
+	}
+	return plain[:size]
+}
+
+// aes128-wrap / id-aes256-wrap-pad / …
+func tnCreateWrapCipher(alg string, key interface{}, iv interface{}, decrypt bool) *TnCipher {
+	name := strings.TrimPrefix(strings.ToLower(alg), "id-")
+	mode := "wrap"
+	if strings.HasSuffix(name, "-wrap-pad") {
+		mode = "wrap-pad"
+	}
+	bits := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "aes"), "-pad"), "-wrap")
+	k := tnCryptoBytes(key, "")
+	if strconv.Itoa(len(k)*8) != bits {
+		panic(TnNodeError("RangeError", "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length"))
+	}
+	block, err := aes.NewCipher(k)
+	if err != nil {
+		panic(TnNodeError("RangeError", "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length"))
+	}
+	ivBytes := []byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6}
+	if mode == "wrap-pad" {
+		ivBytes = []byte{0xA6, 0x59, 0x59, 0xA6}
+	}
+	if iv != nil && !TnIsNil(iv) {
+		ivBytes = tnCryptoBytes(iv, "")
+	}
+	if len(ivBytes) != 8 && mode == "wrap" || len(ivBytes) != 4 && mode == "wrap-pad" {
+		panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"))
+	}
+	return &TnCipher{decrypt: decrypt, mode: mode, block: block, iv: ivBytes}
 }
 
 func TnCreateCipher(alg string, key interface{}, iv interface{}, decrypt bool, options ...interface{}) *TnCipher {
+	if strings.Contains(strings.ToLower(alg), "-wrap") {
+		return tnCreateWrapCipher(alg, key, iv, decrypt)
+	}
 	parts := strings.Split(strings.ToLower(alg), "-")
 	if len(parts) != 3 || parts[0] != "aes" {
 		panic(TnNodeError("Error", "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher"))
@@ -240,6 +393,8 @@ func TnCreateCipher(alg string, key interface{}, iv interface{}, decrypt bool, o
 
 func (c *TnCipher) process(data []byte) []byte {
 	switch c.mode {
+	case "wrap", "wrap-pad":
+		return c.keyWrap(data)
 	case "ctr":
 		out := make([]byte, len(data))
 		c.stream.XORKeyStream(out, data)
@@ -266,7 +421,7 @@ func (c *TnCipher) finish() []byte {
 	}
 	c.finalized = true
 	switch c.mode {
-	case "ctr":
+	case "ctr", "wrap", "wrap-pad":
 		return []byte{}
 	case "gcm":
 		if c.decrypt {
@@ -347,6 +502,39 @@ func (c *TnCipher) setAutoPadding(pad ...bool) *TnCipher {
 	return c
 }`;
 
+// Hash / Hmac as streams (write / end / pipe / pipeline): a transform that
+// hashes what is written and pushes the digest at the end, as in Node; only
+// programs that use a hash as a stream carry it
+const hashStreamHelper = `func (h *TnHash) tnStream() *TnStream {
+	if h.stream == nil {
+		s := TnNewTransform()
+		s.goTransform = func(chunk []byte) {
+			if !h.finalized {
+				h.h.Write(chunk)
+			}
+		}
+		s.goFlush = func() []byte { return h.digestBytes() }
+		h.stream = s
+	}
+	return h.stream.(*TnStream)
+}
+
+func (h *TnHash) write(chunk interface{}, args ...interface{}) bool {
+	return h.tnStream().write(chunk, args...)
+}
+
+func (h *TnHash) end(args ...interface{}) *TnStream { return h.tnStream().end(args...) }
+
+func (h *TnHash) on(event string, fn interface{}) *TnEventEmitter { return h.tnStream().on(event, fn) }
+
+func (h *TnHash) once(event string, fn interface{}) *TnEventEmitter {
+	return h.tnStream().once(event, fn)
+}
+
+func (h *TnHash) read(size ...float64) interface{} { return h.tnStream().read(size...) }
+
+func (h *TnHash) setEncoding(enc string) *TnStream { return h.tnStream().setEncoding(enc) }`;
+
 export function registerCrypto(r: NodeRegistry): void {
   defineModule(r, 'crypto');
   r.globals['crypto'] = 'crypto';
@@ -377,7 +565,21 @@ export function registerCrypto(r: NodeRegistry): void {
     ['error', 'buffer', 'dynamic'],
     cryptoHelper
   );
-  defineClass(r, 'crypto.Hash', '*TnHash', 'class', 'update=*TnHash; copy=*TnHash', '', '', '');
+  defineClass(r, 'crypto.Hash', '*TnHash', 'class', 'update=*TnHash; copy=*TnHash; write=bool; end=*TnStream; on=*TnEventEmitter; once=*TnEventEmitter; read=interface{}; setEncoding=*TnStream; pipe=interface{}', '', '', '');
+  defineHelper(r, 'hashStream', [], ['nodeCrypto', 'nodeStream'], hashStreamHelper);
+  for (const method of ['write', 'end', 'on', 'once', 'read', 'setEncoding']) {
+    r.methods[`crypto.Hash#${method}`] = (c: NodeCall) => {
+      r.helper('hashStream');
+      return `${c.recv}.${method}(${c.args.join(', ')})`;
+    };
+  }
+  r.methods['crypto.Hash#pipe'] = (c: NodeCall) => {
+    r.helper('hashStream');
+    return `TnPipe(${c.recv}, ${c.args.join(', ')})`;
+  };
+  r.typers['crypto.Hash#pipe'] = (c: NodeCall) => c.types[0] || '*TnStream';
+  r.paramTypers['crypto.Hash#on'] = (nodes: any[]) => streamListenerTypes(nodes);
+  r.paramTypers['crypto.Hash#once'] = r.paramTypers['crypto.Hash#on'];
   r.classes['crypto.Hmac'] = r.classes['crypto.Hash'];
   defineClass(r, 'crypto.Cipher', '*TnCipher', 'class', 'setAAD=*TnCipher; setAuthTag=*TnCipher; getAuthTag=[]byte; setAutoPadding=*TnCipher', '', '', '');
   r.classes['crypto.Cipheriv'] = r.classes['crypto.Cipher'];

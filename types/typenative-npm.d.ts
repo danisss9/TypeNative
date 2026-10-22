@@ -609,16 +609,18 @@ declare module 'node:assert/strict' {
 }
 
 declare module 'node:crypto' {
+  import { Transform } from 'node:stream';
   namespace crypto {
     type BinaryLike = string | Uint8Array;
     type BinaryToTextEncoding = 'base64' | 'base64url' | 'hex' | 'binary';
-    interface Hash {
+    /** Hash / Hmac are also Transform streams: write, then read or pipe the digest */
+    interface Hash extends Transform {
       update(data: BinaryLike, inputEncoding?: BufferEncoding): Hash;
       digest(): Buffer;
       digest(encoding: BinaryToTextEncoding | BufferEncoding): string;
       copy(): Hash;
     }
-    interface Hmac {
+    interface Hmac extends Transform {
       update(data: BinaryLike, inputEncoding?: BufferEncoding): Hmac;
       digest(): Buffer;
       digest(encoding: BinaryToTextEncoding | BufferEncoding): string;
@@ -2176,6 +2178,8 @@ declare module 'node:http' {
       writeHead(statusCode: number, headers?: OutgoingHttpHeaders | string[]): this;
       writeContinue(): void;
       setTimeout(msecs: number, callback?: () => void): this;
+      /** Trailing headers, sent after a chunked body (not with a Content-Length) */
+      addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void;
     }
     class ClientRequest extends OutgoingMessage {
       readonly method: string;

@@ -31,6 +31,8 @@ type TnStream struct {
 	readEnded     bool
 	endEmitted    bool
 	flowing       int
+	// a 'readable' listener: paused mode, the consumer pulls with read()
+	readableListening bool
 	reading       bool
 	flowScheduled bool
 	source        func(s *TnStream)
@@ -172,7 +174,11 @@ func (s *TnStream) toChunk(chunk interface{}, enc string) interface{} {
 }
 
 func (s *TnStream) push(chunk interface{}, encoding ...string) bool {
-	if chunk == nil {
+	// nullable strings (cond ? text : null) and typed nils
+	if p, ok := chunk.(*string); ok && p != nil {
+		chunk = *p
+	}
+	if chunk == nil || TnIsNil(chunk) {
 		s.readEnded = true
 		if s.decoder != nil {
 			if rest := s.decoder.end(); rest != "" {
@@ -218,6 +224,10 @@ func (s *TnStream) flow() {
 	if s.destroyed {
 		return
 	}
+	if s.readableListening && s.flowing != 1 {
+		s.flowReadable()
+		return
+	}
 	for s.flowing == 1 && len(s.queue) > 0 {
 		chunk := s.queue[0]
 		s.queue = s.queue[1:]
@@ -228,6 +238,32 @@ func (s *TnStream) flow() {
 		return
 	}
 	if s.flowing == 1 {
+		s.requestRead()
+	}
+}
+
+// Paused mode: 'readable' while there is data, then one last 'readable' (read()
+// gives null) before 'end', as in Node
+func (s *TnStream) flowReadable() {
+	for !s.endEmitted && (len(s.queue) > 0 || s.readEnded) {
+		before := len(s.queue)
+		s.emit("readable")
+		if s.destroyed || s.flowing == 1 {
+			return
+		}
+		if len(s.queue) == 0 && s.readEnded {
+			if before == 0 {
+				s.emitEnd()
+				return
+			}
+			continue
+		}
+		// the consumer left data buffered: wait for read() or more data
+		if len(s.queue) >= before {
+			return
+		}
+	}
+	if len(s.queue) == 0 {
 		s.requestRead()
 	}
 }
@@ -295,6 +331,13 @@ func (s *TnStream) once(event string, fn interface{}) *TnEventEmitter {
 }
 
 func (s *TnStream) listening(event string) {
+	if event == "readable" && s.readableSide {
+		s.readableListening = true
+		s.flowing = 0
+		s.requestRead()
+		s.scheduleFlow()
+		return
+	}
 	if event == "data" && s.flowing != 0 && s.readableSide {
 		s.resume()
 	}
@@ -316,7 +359,10 @@ func (s *TnStream) pause() *TnStream {
 
 func (s *TnStream) isPaused() bool { return s.flowing == 0 }
 
-// read(): paused-mode pull of the next buffered chunk (null when none)
+// read(size?): paused-mode pull (null when nothing is buffered). As in Node,
+// without a size it returns everything buffered as one Buffer / string, and
+// with one it waits for that many bytes (characters with an encoding) unless
+// the stream has ended; object mode returns one object
 func (s *TnStream) read(size ...float64) interface{} {
 	if len(s.queue) == 0 {
 		s.requestRead()
@@ -325,9 +371,83 @@ func (s *TnStream) read(size ...float64) interface{} {
 		}
 		return nil
 	}
-	chunk := s.queue[0]
-	s.queue = s.queue[1:]
-	return chunk
+	if s.objectMode {
+		chunk := s.queue[0]
+		s.queue = s.queue[1:]
+		s.emit("data", chunk)
+		return chunk
+	}
+	n := -1
+	if len(size) > 0 && size[0] >= 0 {
+		n = int(size[0])
+	}
+	total := 0
+	for _, c := range s.queue {
+		total += tnChunkLen(c)
+	}
+	if n == 0 || (n > total && !s.readEnded) {
+		s.requestRead()
+		return nil
+	}
+	if n < 0 || n > total {
+		n = total
+	}
+	var text []rune
+	var data []byte
+	isText := false
+	// (empty chunks, such as a split UTF-8 sequence, go along with the rest)
+	for len(s.queue) > 0 && (n > 0 || tnChunkLen(s.queue[0]) == 0) {
+		switch c := s.queue[0].(type) {
+		case string:
+			isText = true
+			r := []rune(c)
+			if len(r) > n {
+				text = append(text, r[:n]...)
+				s.queue[0] = string(r[n:])
+				n = 0
+				continue
+			}
+			text = append(text, r...)
+			n -= len(r)
+		case []byte:
+			if len(c) > n {
+				data = append(data, c[:n]...)
+				s.queue[0] = c[n:]
+				n = 0
+				continue
+			}
+			data = append(data, c...)
+			n -= len(c)
+		default:
+			n--
+		}
+		s.queue = s.queue[1:]
+	}
+	if len(s.queue) == 0 && !s.readEnded {
+		s.requestRead()
+	}
+	var out interface{}
+	if isText && len(text) > 0 {
+		out = string(text)
+	} else if len(data) > 0 {
+		out = data
+	}
+	// what read() returns is also a 'data' event, as in Node
+	if out != nil {
+		s.emit("data", out)
+	}
+	return out
+}
+
+// The length read(size) counts: bytes, or characters of decoded strings
+func tnChunkLen(c interface{}) int {
+	switch x := c.(type) {
+	case string:
+		return utf8.RuneCountInString(x)
+	case []byte:
+		return len(x)
+	}
+	return 1
 }
 
 func (s *TnStream) setEncoding(enc string) *TnStream {
@@ -1065,7 +1185,7 @@ export function registerStream(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeStream',
-    ['encoding/json', 'os', 'reflect'],
+    ['encoding/json', 'os', 'reflect', 'unicode/utf8'],
     ['nodeEvents', 'buffer', 'stringDecoder', 'eventLoop', 'promise', 'dynamic', 'nodeInvoke', 'stdinReader'],
     streamHelper
   );
@@ -1120,6 +1240,7 @@ func tnStdin() *bufio.Reader {
 
   r.methods['stream.Duplex#pipe'] = (c: NodeCall) => {
     use();
+    useHashStream(r, c.types);
     return `TnPipe(${c.recv}, ${c.args.join(', ')})`;
   };
   r.typers['stream.Duplex#pipe'] = (c: NodeCall) => c.types[0] || '*TnStream';
@@ -1133,6 +1254,7 @@ func tnStdin() *bufio.Reader {
   r.results['stream.Readable.from'] = '*TnStream';
   const pipeline = (call: NodeCall) => {
     use();
+    useHashStream(r, call.types);
     const last = call.nodes.length - 1;
     const hasCallback = last >= 0 && (call.nodes[last].kind === 'ArrowFunction' || call.nodes[last].kind === 'FunctionExpression');
     const streams = hasCallback ? call.args.slice(0, last) : call.args;
@@ -1148,6 +1270,7 @@ func tnStdin() *bufio.Reader {
   r.paramTypers['stream.finished'] = (_n: any[]) => ['interface{}'];
   r.functions['stream/promises.pipeline'] = (call: NodeCall) => {
     use();
+    useHashStream(r, call.types);
     return `TnPipelinePromise(${call.args.join(', ')})`;
   };
   r.functions['stream/promises.finished'] = (call: NodeCall) => {
@@ -1216,7 +1339,10 @@ func tnStdin() *bufio.Reader {
   for (const method of ['on', 'once', 'resume', 'pause', 'setEncoding', 'pipe', 'read', 'destroy']) {
     r.functions[`process.stdin.${method}`] = (call: NodeCall) => {
       use();
-      if (method === 'pipe') return `TnPipe(TnStdin(), ${call.args.join(', ')})`;
+      if (method === 'pipe') {
+        useHashStream(r, call.types);
+        return `TnPipe(TnStdin(), ${call.args.join(', ')})`;
+      }
       const refCall = method === 'destroy' ? '; TnStdin().stdinRef(false)' : '; TnStdin().stdinRef(TnStdin().flowing == 1)';
       return `func() *TnStream { TnStdin().${method}(${call.args.join(', ')})${refCall}; return TnStdin() }()`;
     };
@@ -1224,6 +1350,11 @@ func tnStdin() *bufio.Reader {
   }
   r.paramTypers['process.stdin.on'] = (nodes: any[]) => streamListenerTypes(nodes);
   r.paramTypers['process.stdin.once'] = r.paramTypers['process.stdin.on'];
+}
+
+// Pulls in crypto's hashStream when a Hash is passed to pipe() / pipeline()
+function useHashStream(r: NodeRegistry, types: string[]): void {
+  if (types.indexOf('*TnHash') >= 0) r.helper('hashStream');
 }
 
 // Listener parameters of stream events

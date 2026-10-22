@@ -7665,8 +7665,12 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'Uint8Array' || name === 'Buffer' || name === 'ArrayBuffer') {
             return '[]byte';
         }
-        if (name === 'TemplateStringsArray' || name === 'ReadonlyArray') {
-            return name === 'TemplateStringsArray' ? '[]string' : getType(typeNode.typeArguments?.[0]);
+        if (name === 'TemplateStringsArray')
+            return '[]string';
+        // Array<T> / ReadonlyArray<T> are T[]
+        if ((name === 'Array' || name === 'ReadonlyArray') && !classNames.has(name) && typeNode.typeArguments?.length === 1) {
+            const elementType = getType(typeNode.typeArguments[0]);
+            return getArrayType ? elementType : `[]${elementType}`;
         }
         if ((name === 'Map' || name === 'Record') &&
             typeNode.typeArguments &&
