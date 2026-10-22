@@ -2707,8 +2707,8 @@ declare module 'node:sqlite' {
       allowUnknownNamedParameters?: boolean;
     }
     // SQLite runs as Wasm inside the program (github.com/ncruces/go-sqlite3):
-    // loadExtension, createSession / applyChangeset and serialize / deserialize
-    // throw
+    // loadExtension and createSession / applyChangeset throw; serialize /
+    // deserialize go through a temporary file
     class DatabaseSync {
       constructor(path: string | Uint8Array | URL, options?: DatabaseSyncOptions);
       readonly isOpen: boolean;
