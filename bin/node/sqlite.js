@@ -632,14 +632,51 @@ func (db *TnSqliteDb) applyChangeset(changeset []byte, options ...interface{}) b
 	panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "Changesets are not supported: the bundled SQLite has no session extension"))
 }
 
+// serialize(dbName = 'main') / deserialize(buffer, { dbName }): the database
+// image goes through a temporary file and SQLite's backup API (the driver
+// has no sqlite3_serialize binding)
+func tnSqliteTempFile() string {
+	f, err := os.CreateTemp("", "tnsqlite-*.db")
+	if err != nil {
+		panic(tnSqliteError(err))
+	}
+	f.Close()
+	return f.Name()
+}
+
 func (db *TnSqliteDb) serialize(name ...interface{}) []byte {
 	db.requireOpen()
-	panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "serialize() is not supported: the bundled SQLite driver has no sqlite3_serialize binding"))
+	schema := "main"
+	if len(name) > 0 {
+		if s, ok := name[0].(string); ok {
+			schema = s
+		}
+	}
+	path := tnSqliteTempFile()
+	defer os.Remove(path)
+	os.Remove(path)
+	db.check(db.conn.Backup(schema, path))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		panic(tnSqliteError(err))
+	}
+	return data
 }
 
 func (db *TnSqliteDb) deserialize(data []byte, options ...interface{}) {
 	db.requireOpen()
-	panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "deserialize() is not supported: the bundled SQLite driver has no sqlite3_deserialize binding"))
+	schema := "main"
+	if len(options) > 0 && options[0] != nil {
+		if s, ok := TnGet(options[0], "dbName").(string); ok {
+			schema = s
+		}
+	}
+	path := tnSqliteTempFile()
+	defer os.Remove(path)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		panic(tnSqliteError(err))
+	}
+	db.check(db.conn.Restore(schema, path))
 }
 
 func (st *TnSqliteStmt) requireLive() {
@@ -1074,7 +1111,7 @@ func TnSqliteBackup(db *TnSqliteDb, path string, opts ...interface{}) chan float
 }`;
 export function registerSqlite(r) {
     defineModule(r, 'sqlite');
-    defineHelper(r, 'nodeSqlite', ['github.com/ncruces/go-sqlite3', 'errors', 'fmt', 'math', 'math/big', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise'], sqliteHelper);
+    defineHelper(r, 'nodeSqlite', ['github.com/ncruces/go-sqlite3', 'errors', 'fmt', 'math', 'math/big', 'os', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise'], sqliteHelper);
     const use = () => r.helper('nodeSqlite');
     defineClass(r, 'sqlite.DatabaseSync', '*TnSqliteDb', 'class', 'open=; close=; exec=; prepare=*TnSqliteStmt; location=*string; function=; aggregate=; enableLoadExtension=; enableDefensive=; loadExtension=; setAuthorizer=; createTagStore=*TnSqliteTagStore; createSession=interface{}; applyChangeset=bool; serialize=[]byte; deserialize=', '', 'isOpen=bool; isTransaction=bool; limits=*TnSqliteLimits', '');
     defineClass(r, 'sqlite.StatementSync', '*TnSqliteStmt', 'class', 'run=*TnSqliteRunResult; get=interface{}; all=[]interface{}; iterate=*TnSqliteIterator; columns=[]interface{}; setReadBigInts=; setReturnArrays=; setAllowBareNamedParameters=; setAllowUnknownNamedParameters=', '', 'sourceSQL=string; expandedSQL=string', '');

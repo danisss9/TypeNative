@@ -963,7 +963,7 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 | `backup(db, path, { source, rate, progress })` | ✅ | [lib-node-sqlite-errors.ts](conformance/lib-node-sqlite-errors.ts) | Copies `rate` pages per event-loop turn; resolves with the page count |
 | `loadExtension` / `enableLoadExtension` | 🚫 | — | SQLite runs as Wasm inside the program; native extensions can't load |
 | `createSession` / `applyChangeset` | ❌ | — | The bundled SQLite build has no session extension: needs an emulation over the preupdate hook (hard) |
-| `serialize` / `deserialize` | ❌ | — | The driver has no `sqlite3_serialize` binding; feasible through a temporary file and the backup API |
+| `serialize(dbName?)` / `deserialize(buffer, { dbName })` | ✅ | [lib-node-sqlite-serialize.ts](conformance/lib-node-sqlite-serialize.ts) | Newer Node API (not in Node 22). The driver has no `sqlite3_serialize` binding, so the image goes through a temporary file and SQLite's backup API |
 | `undefined` as a parameter value, `[Object: null prototype]` rows | 🚫 | — | `undefined` and `null` are both `nil` (binds NULL instead of throwing); rows print as plain objects |
 | Finalizing a statement when it is garbage-collected | ✅ | [lib-node-sqlite-finalize.ts](conformance/lib-node-sqlite-finalize.ts) | `runtime.AddCleanup` posts the finalize to the event loop once nothing references the statement; `db.close()` finalizes the rest |
 
@@ -1308,10 +1308,9 @@ These follow from compiling to a native Go binary, and won't change:
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
    options, errno numbers per OS, `node:dns` record types and TTLs, `node:module` /
    `node:v8` / `node:sea` basics, `Hash` streams, AES key wrap, `res.addTrailers()`, SQLite
-   finalization. Remaining:
+   finalization and `serialize`. Remaining:
    - second entry points
    - `async_hooks.createHook`
-   - SQLite `serialize`
    - node:test snapshots, flags and reporters
    - `createRequire`, `sea` assets
    - the smaller `node:crypto` items

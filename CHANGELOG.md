@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`node:http`:** `res.addTrailers()`
 - **`node:stream`:** `'readable'` events and Node's `read()` / `read(size)`
 - **`node:sqlite`:** statements are finalized once garbage-collected (they lived until
-  `db.close()`)
+  `db.close()`); `db.serialize()` / `db.deserialize()`
 
 ### Fixed
 
