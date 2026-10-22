@@ -17,9 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TypeError`s for circular structures and bigints
 - **`JSON.parse`:** reviver, and a `SyntaxError` for invalid JSON (it returned `null`)
 - **Arrays:** writing past the end grows the array
+- **`Date`:**
+  - `new Date(string)` (ISO and the formats `toString` / `toUTCString` produce), and
+    `new Date(y, m, d, …)` in local time
+  - `Date.parse`, the setters (`setHours`, `setUTCDate`, …), `getTimezoneOffset`
+  - `toUTCString`, `toLocale*String` (en-US)
+  - Node's `toString` format for `String(date)` and templates
+  - Invalid Dates (`getTime()` is `NaN`)
+- **Errors:** `err.stack` lists the TS frames (`at fn (file.ts:line)`); `AggregateError`
+- **Functions:** `fn.bind`, `fn.name`, `fn.length`; `apply` on non-variadic functions, and
+  `call` / `apply` on function declarations
+- **Statics:** `Promise.withResolvers`, `Promise.try`, `Object.is`, `Object.groupBy`,
+  `Map.groupBy`, `Array.of`, `Symbol.for` / `keyFor` / `description`, `BigInt()`,
+  `BigInt.asIntN` / `asUintN`
+- **`Number`:** `toExponential`, `isSafeInteger`, `parseInt` / `parseFloat`, `MIN_VALUE`,
+  `NEGATIVE_INFINITY`
+- **`Math`:** `fround`, `imul`, `clz32`, `asinh` / `acosh` / `atanh`, `sumPrecise`
+- **`String`:** `codePointAt`, `String.fromCodePoint`, `substr`, `trimLeft` / `trimRight`,
+  `isWellFormed` / `toWellFormed`, `toLocaleUpperCase` / `toLocaleLowerCase`, `split` limit,
+  `lastIndexOf` position
 
 ### Fixed
 
+- **Dates:** local getters on `new Date(ms)` used UTC
+- **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
+  build)
+- **Maps:** `[...map.keys()]` / `[...map.values()]` build
+- **`length` fields:** `obj.length` on an object with its own `length` field read it (it compiled
+  to Go's `len()`)
+- **Error casts:** `(err as Error)` works on instances of custom error classes
 - **`any` variables:**
   - a variable declared `any` / `unknown` with a primitive initializer is dynamic:
     `const s: any = '6'; s - 1` builds, and reassigning another type works

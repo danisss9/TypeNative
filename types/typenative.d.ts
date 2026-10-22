@@ -8,8 +8,11 @@ interface Boolean {}
 
 interface Function {
   readonly name: string;
+  readonly length: number;
   apply(thisArg: any, argArray?: any): any;
   call(thisArg: any, ...argArray: any[]): any;
+  /** `thisArg` is ignored for plain functions; the bound arguments are fixed */
+  bind(thisArg: any, ...argArray: any[]): any;
 }
 
 interface CallableFunction extends Function {}
@@ -24,6 +27,7 @@ interface Number {
   toString(radix?: number): string;
   toFixed(fractionDigits?: number): string;
   toPrecision(precision?: number): string;
+  toExponential(fractionDigits?: number): string;
 }
 
 interface Object {
@@ -308,6 +312,7 @@ interface ArrayConstructor {
   isArray(arg: any): arg is any[];
   from<T>(arrayLike: ArrayLike<T>): T[];
   from<T, U>(arrayLike: ArrayLike<T>, mapFn: (value: T, index: number) => U): U[];
+  of<T>(...items: T[]): T[];
 }
 
 declare var Array: ArrayConstructor;
@@ -324,7 +329,17 @@ interface String {
   /** Returns the position of the first occurrence of a substring. */
   indexOf(searchString: string, position?: number): number;
   /** Returns the position of the last occurrence of a substring. */
-  lastIndexOf(searchString: string): number;
+  lastIndexOf(searchString: string, position?: number): number;
+  /** The code point at a (code point) index; NaN past the end */
+  codePointAt(pos: number): number;
+  /** Deprecated: `length` characters from `from` */
+  substr(from: number, length?: number): string;
+  trimLeft(): string;
+  trimRight(): string;
+  toLocaleUpperCase(locales?: string | string[]): string;
+  toLocaleLowerCase(locales?: string | string[]): string;
+  isWellFormed(): boolean;
+  toWellFormed(): string;
   /** Determines whether a string contains the specified substring. */
   includes(searchString: string): boolean;
   /** Determines whether a string begins with the specified characters. */
@@ -332,7 +347,7 @@ interface String {
   /** Determines whether a string ends with the specified characters. */
   endsWith(searchString: string): boolean;
   /** Splits a string into substrings using the specified separator. */
-  split(separator: string | RegExp): string[];
+  split(separator: string | RegExp, limit?: number): string[];
   /** Removes whitespace from both ends of a string. */
   trim(): string;
   /** Removes whitespace from the beginning of a string. */
@@ -382,6 +397,7 @@ interface String {
 interface StringConstructor {
   (value?: any): string;
   fromCharCode(...charCodes: number[]): string;
+  fromCodePoint(...codePoints: number[]): string;
   raw(strings: TemplateStringsArray, ...values: any[]): string;
 }
 
@@ -395,7 +411,12 @@ interface NumberConstructor {
   readonly MAX_SAFE_INTEGER: number;
   readonly MIN_SAFE_INTEGER: number;
   readonly MAX_VALUE: number;
+  readonly MIN_VALUE: number;
   readonly POSITIVE_INFINITY: number;
+  readonly NEGATIVE_INFINITY: number;
+  isSafeInteger(value: number): boolean;
+  parseInt(string: string, radix?: number): number;
+  parseFloat(string: string): number;
   readonly EPSILON: number;
   readonly NaN: number;
 }
@@ -459,6 +480,13 @@ interface Math {
   sinh(x: number): number;
   cosh(x: number): number;
   tanh(x: number): number;
+  asinh(x: number): number;
+  acosh(x: number): number;
+  atanh(x: number): number;
+  fround(x: number): number;
+  imul(a: number, b: number): number;
+  clz32(x: number): number;
+  sumPrecise(values: number[]): number;
   cbrt(x: number): number;
   hypot(...values: number[]): number;
   trunc(x: number): number;
@@ -513,6 +541,9 @@ interface JSON {
 declare var JSON: JSON;
 
 interface ObjectConstructor {
+  /** SameValue: NaN is NaN, +0 is not -0 */
+  is(a: any, b: any): boolean;
+  groupBy<T>(items: T[], keySelector: (item: T, index: number) => string | number): Record<string, T[]>;
   keys(obj: any): string[];
   values(obj: any): any[];
   entries(obj: any): [string, any][];
@@ -638,6 +669,17 @@ type TypeError = Error;
 type RangeError = Error;
 type SyntaxError = Error;
 
+interface AggregateError extends Error {
+  errors: any[];
+}
+
+interface AggregateErrorConstructor {
+  new (errors: Iterable<any>, message?: string, options?: ErrorOptions): AggregateError;
+  (errors: Iterable<any>, message?: string, options?: ErrorOptions): AggregateError;
+}
+
+declare var AggregateError: AggregateErrorConstructor;
+
 interface Date {
   getTime(): number;
   valueOf(): number;
@@ -662,11 +704,45 @@ interface Date {
   toString(): string;
   toDateString(): string;
   toTimeString(): string;
+  toUTCString(): string;
+  toGMTString(): string;
+  /** en-US format; locales and options are ignored */
+  toLocaleDateString(locales?: string | string[], options?: any): string;
+  /** en-US format; locales and options are ignored */
+  toLocaleTimeString(locales?: string | string[], options?: any): string;
+  /** en-US format; locales and options are ignored */
+  toLocaleString(locales?: string | string[], options?: any): string;
+  getTimezoneOffset(): number;
+  setTime(time: number): number;
+  setFullYear(year: number, month?: number, date?: number): number;
+  setMonth(month: number, date?: number): number;
+  setDate(date: number): number;
+  setHours(hours: number, min?: number, sec?: number, ms?: number): number;
+  setMinutes(min: number, sec?: number, ms?: number): number;
+  setSeconds(sec: number, ms?: number): number;
+  setMilliseconds(ms: number): number;
+  setUTCFullYear(year: number, month?: number, date?: number): number;
+  setUTCMonth(month: number, date?: number): number;
+  setUTCDate(date: number): number;
+  setUTCHours(hours: number, min?: number, sec?: number, ms?: number): number;
+  setUTCMinutes(min: number, sec?: number, ms?: number): number;
+  setUTCSeconds(sec: number, ms?: number): number;
+  setUTCMilliseconds(ms: number): number;
 }
 
 interface DateConstructor {
   new (): Date;
-  new (ms: number): Date;
+  new (value: number | string | Date): Date;
+  new (
+    year: number,
+    monthIndex: number,
+    date?: number,
+    hours?: number,
+    minutes?: number,
+    seconds?: number,
+    ms?: number
+  ): Date;
+  parse(s: string): number;
   now(): number;
   UTC(
     year: number,
@@ -705,6 +781,14 @@ interface PromiseConstructor {
   race<T>(values: Promise<T>[]): Promise<T>;
   any<T>(values: Promise<T>[]): Promise<T>;
   allSettled<T>(values: Promise<T>[]): Promise<{ status: string; value?: T; reason?: any }[]>;
+  withResolvers<T>(): PromiseWithResolvers<T>;
+  try<T>(fn: (...args: any[]) => T | Promise<T>, ...args: any[]): Promise<T>;
+}
+
+interface PromiseWithResolvers<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: any) => void;
 }
 
 declare var Promise: PromiseConstructor;
@@ -737,6 +821,7 @@ interface Map<K, V> {
 interface MapConstructor {
   new <K, V>(): Map<K, V>;
   new <K, V>(entries: [K, V][]): Map<K, V>;
+  groupBy<K, T>(items: T[], keySelector: (item: T, index: number) => K): Map<K, T[]>;
 }
 
 declare var Map: MapConstructor;
@@ -809,9 +894,15 @@ interface SymbolConstructor {
   readonly iterator: unique symbol;
   readonly asyncIterator: unique symbol;
   readonly dispose: unique symbol;
+  for(key: string): symbol;
+  keyFor(sym: symbol): string | undefined;
 }
 
 declare var Symbol: SymbolConstructor;
+
+interface Symbol {
+  readonly description: string;
+}
 
 // --- Decorators (class and class-method decorators are lowered) ---
 
@@ -840,6 +931,14 @@ interface ClassMethodDecoratorContext<
 interface BigInt {
   toString(radix?: number): string;
 }
+
+interface BigIntConstructor {
+  (value: bigint | boolean | number | string): bigint;
+  asIntN(bits: number, int: bigint): bigint;
+  asUintN(bits: number, int: bigint): bigint;
+}
+
+declare var BigInt: BigIntConstructor;
 
 // --- Node.js globals (Buffer, URL, TextEncoder, AbortController, performance, …) ---
 

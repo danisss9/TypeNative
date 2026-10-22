@@ -196,6 +196,9 @@ func (ins *tnInspector) format(v interface{}, depth int) string {
 		name, values := x.TnTypedInspect()
 		return name + " " + ins.format(values, depth)
 	case time.Time:
+		if x.IsZero() {
+			return "Invalid Date"
+		}
 		return x.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	case *regexp.Regexp:
 		if x == nil {

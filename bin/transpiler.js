@@ -1422,6 +1422,17 @@ function visit(node, options = {}) {
         if (hasQuestionDot(node)) {
             return visitOptionalPropertyAccess(node);
         }
+        // fn.name / fn.length on a declared function, class or function variable
+        if (isIdentifier(node.expression) && (node.name.text === 'name' || node.name.text === 'length') && !isAssignmentTarget(node)) {
+            const fnInfo = functionNameAndLength(node.expression.text);
+            if (fnInfo)
+                return node.name.text === 'name' ? toGoStringLiteral(fnInfo.name) : `float64(${fnInfo.arity})`;
+        }
+        // Symbol.for / Symbol.keyFor: keep the names (`for` is a Go keyword) so the
+        // call handlers match
+        if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && (node.name.text === 'for' || node.name.text === 'keyFor')) {
+            return `Symbol.${node.name.text}`;
+        }
         // super.method() → the parent's implementation on the embedded struct
         if (node.expression.kind === 'SuperKeyword') {
             const ownerClass = getEnclosingClassName(node);
@@ -1484,6 +1495,14 @@ function visit(node, options = {}) {
             !isCallee(node) &&
             !isAssignmentTarget(node)) {
             return `${leftSide}.Get(${toGoStringLiteral(rightSide)})`;
+        }
+        // an object with its own `length` field (not an array's length)
+        if (rightSide === 'length' &&
+            leftGoType?.startsWith('*') &&
+            !leftGoType.startsWith('*[]') &&
+            !leftGoType.startsWith('*TnMap[') &&
+            getObjectFieldGoType(leftGoType, 'length')) {
+            return `${leftSide}.length`;
         }
         return getAcessString(leftSide, rightSide, objectType);
     }
@@ -2532,6 +2551,10 @@ function visit(node, options = {}) {
         })}`;
     }
     else if (isArrowFunction(node)) {
+        // An async arrow kept as a value (assigned, returned) returns a promise
+        // like an async function; one passed straight to a call runs inline
+        if (isPromiseReturningArrow(node))
+            return emitAsyncArrow(node);
         const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
         const inferredRetType = inferFunctionBodyReturnType(node);
         const returnType = inferredRetType ? ` ${inferredRetType}` : '';
@@ -2833,7 +2856,7 @@ function visit(node, options = {}) {
                 if (isCtorSuperCall(s)) {
                     const args = (s.expression.arguments ?? []).map((a) => visit(a));
                     if (extendsError)
-                        return `self.message = ${args[0] ?? '""'}\n\t\t${instanceInit}`;
+                        return `self.message = ${args[0] ?? '""'}\n\t\tself.TnError.tnCapture(3)\n\t\t${instanceInit}`;
                     return `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, args)}\n\t\t${instanceInit}`;
                 }
                 return visit(s);
@@ -2848,7 +2871,7 @@ function visit(node, options = {}) {
         }
         else if (extendsError) {
             // class X extends Error {} — the constructor takes the message
-            result += `func New${name}${typeParams}(message string) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\tself.message = message\n\t\t${fieldInitializers(node)}return self\n\t}\n\n`;
+            result += `func New${name}${typeParams}(message string) *${name}${typeParamNames} {\n\t\tself := &${name}${typeParamNames}{}\n\t\tself.message = message\n\t\tself.TnError.tnCapture(3)\n\t\t${fieldInitializers(node)}return self\n\t}\n\n`;
         }
         else {
             // No constructor: JS's implicit constructor(...args) { super(...args) }
@@ -3077,6 +3100,14 @@ function visit(node, options = {}) {
             useHelper('orderedMap');
             return `TnJSCollection(${visitNewSet(node)}, 2)`;
         }
+        // new AggregateError(errors, message?): errors is an iterable of reasons
+        if (className === 'AggregateError' && !classNames.has(className)) {
+            useHelper('error');
+            const errs = (node.arguments ?? [])[0];
+            const msg = (node.arguments ?? [])[1] ? visit(node.arguments[1]) : '""';
+            const list = errs ? toGoValueOfType(errs, '[]interface{}') : '[]interface{}{}';
+            return `func() *TnError { __e := TnNodeError("AggregateError", "", ${msg}); __e.props["errors"] = ${list}; return __e }()`;
+        }
         // new TypeError(message) & co.: a TnError with that name
         if (BUILTIN_ERROR_NAMES.has(className) && !classNames.has(className)) {
             useHelper('error');
@@ -3090,13 +3121,26 @@ function visit(node, options = {}) {
             return withErrorOptions(`TnNewError(${msg})`, (node.arguments ?? [])[1]);
         }
         // new Date() / new Date(ms) → Go time
+        // new Date(value) / new Date(y, m, d?, …): local time, as in JS
         if (className === 'Date') {
             importedPackages.add('time');
-            if ((node.arguments ?? []).length === 0) {
+            const dateArgs = node.arguments ?? [];
+            if (dateArgs.length === 0) {
                 useHelper('clock');
                 return 'TnTimeNow()';
             }
-            return `time.UnixMilli(int64(${visit(node.arguments[0])})).UTC()`;
+            useHelper('date');
+            if (dateArgs.length >= 2) {
+                return `TnDateFields(time.Local, ${dateArgs.map((a) => asFloatOperand(a, visit(a))).join(', ')})`;
+            }
+            const argType = inferExpressionType(dateArgs[0]);
+            if (argType === 'float64')
+                return `TnDateFromMs(${visit(dateArgs[0])})`;
+            if (argType === 'string')
+                return `TnParseDate(${visit(dateArgs[0])})`;
+            if (argType === 'time.Time')
+                return visit(dateArgs[0]);
+            return `TnNewDate(${visit(dateArgs[0])})`;
         }
         // new Array<number>(3) → make([]float64, 3)
         if (className === 'Array' && (node.typeArguments ?? []).length === 1) {
@@ -3684,6 +3728,10 @@ function jsStringOf(code, goType) {
         useHelper('error');
         return `TnJSString(${code})`;
     }
+    if (goType === 'time.Time') {
+        useHelper('date');
+        return `TnDateString(${code})`;
+    }
     // Node classes with a toString() (MIMEType, X509Certificate, …)
     const nodeKey = goType ? nodeRegistry.classByGoType[goType] : undefined;
     if (nodeKey && 'toString' in nodeRegistry.classes[nodeKey].methods)
@@ -4234,6 +4282,80 @@ function jsonCallbackAdapter(fnNode, fnCode) {
         args.push(params[1] === 'interface{}' || params[1] === 'any' ? '__v' : `TnAs[${params[1]}](__v)`);
     const call = `${fnCode}(${args.join(', ')})`;
     return `func(__k string, __v interface{}) interface{} { ${close ? `return ${call}` : `${call}; return nil`} }`;
+}
+// An async arrow function that isn't an argument of a call: it is lowered to a
+// promise-returning function (callbacks keep running inline, see the arrow emitter)
+function isPromiseReturningArrow(node) {
+    if (!isArrowFunction(node) && !isFunctionExpression(node))
+        return false;
+    if (!(node.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword'))
+        return false;
+    let parent = node.parent;
+    while (parent && isParenthesizedExpression(parent))
+        parent = parent.parent;
+    return !((isCallExpression(parent) || isNewExpression(parent)) && (parent.arguments ?? []).includes(node));
+}
+// async (…) => body as `func(…) chan T`, run like an async function
+function emitAsyncArrow(node) {
+    if (isBlock(node.body))
+        return emitChannelFunction(node, true, 'func');
+    // a concise body is the promise's value: emitted as `{ return body }`
+    const original = node.body;
+    const returned = { kind: 'ReturnStatement', expression: original };
+    const block = { kind: 'Block', statements: [returned], parent: node };
+    returned.parent = block;
+    node.body = block;
+    const emitted = emitChannelFunction(node, true, 'func');
+    node.body = original;
+    return emitted;
+}
+// Object.groupBy(items, cb) → Record<string, T[]>; Map.groupBy → Map<K, T[]>
+function groupByGoType(items, callback, asMap) {
+    const itemsType = (inferExpressionType(items) ?? '').replace(/^\*/, '');
+    const elementType = itemsType.startsWith('[]') ? itemsType.slice(2) : 'interface{}';
+    const keyType = asMap ? goFuncReturnType(functionValueGoType(callback)) ?? 'interface{}' : 'string';
+    return `*TnMap[${keyType}, []${elementType}]`;
+}
+// (item, index) of an Object.groupBy / Map.groupBy key selector: the items'
+// element type and number
+function groupByCallbackParamType(param) {
+    const fn = param.parent;
+    const call = fn?.parent;
+    if (!fn || !isCallExpression(call) || call.arguments?.[1] !== fn || !isPropertyAccessExpression(call.expression))
+        return undefined;
+    const owner = call.expression.expression;
+    if (!isIdentifier(owner) || (owner.text !== 'Object' && owner.text !== 'Map') || call.expression.name.text !== 'groupBy')
+        return undefined;
+    const index = (fn.parameters ?? []).indexOf(param);
+    if (index === 1)
+        return 'float64';
+    if (index !== 0)
+        return undefined;
+    const itemsType = (inferExpressionType(call.arguments[0]) ?? '').replace(/^\*/, '');
+    return itemsType.startsWith('[]') ? itemsType.slice(2) : undefined;
+}
+function visitGroupBy(args, asMap) {
+    useHelper('orderedMap');
+    useHelper('dynamic');
+    const [itemsNode, callbackNode] = currentCallArgNodes;
+    const mapType = groupByGoType(itemsNode, callbackNode, asMap);
+    const [keyType, valueType] = splitMapTypeArgs(mapType) ?? ['string', '[]interface{}'];
+    const callbackParams = goFuncParamTypes(functionValueGoType(callbackNode));
+    const callArgs = ['__x', 'float64(__i)'].slice(0, callbackParams.length).join(', ');
+    const key = asMap ? `${args[1]}(${callArgs})` : `TnJSString(${args[1]}(${callArgs}))`;
+    const grouped = `func() ${mapType} { __g := TnNewMap[${keyType}, ${valueType}](); for __i, __x := range ${args[0]} { _ = __i; __k := ${key}; __g.Set(__k, append(__g.Get(__k), __x)) }; return __g }()`;
+    return asMap ? `TnJSCollection(${grouped}, 1)` : grouped;
+}
+// Promise.withResolvers<T>()'s result: { promise, resolve, reject }
+function promiseWithResolversGoType(t) {
+    return `*struct{ promise chan ${t}; resolve func(...interface{}); reject func(...interface{}) }`;
+}
+// Array.of(a, b, …): a slice of the arguments' common type
+function arrayOfGoType(argTypes) {
+    const first = argTypes[0];
+    if (!first || argTypes.some((t) => t !== first))
+        return '[]interface{}';
+    return `[]${first}`;
 }
 // Every declared class that extends `className`, directly or not
 function subclassNames(className) {
@@ -5441,7 +5563,7 @@ function inferArrowFunctionGoType(node) {
     if (hasTrailingDefaults)
         paramTypes.push('...interface{}');
     const params = paramTypes.join(', ');
-    const retType = inferFunctionBodyReturnType(node);
+    const retType = isPromiseReturningArrow(node) ? `chan ${getPromiseChannelType(node)}` : inferFunctionBodyReturnType(node);
     return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
 // fn.mock on a function value: the call record of a node:test mock (functions have no fields in Go)
@@ -5643,6 +5765,27 @@ function inferExpressionType(expr) {
             const fn = declaredFunctions.get(expr.expression.text);
             if (fn)
                 return `chan ${getGeneratorYieldType(fn)}`;
+        }
+        if (callee === 'Array.of')
+            return arrayOfGoType((expr.arguments ?? []).map((a) => inferExpressionType(a)));
+        if ((callee === 'Object.groupBy' || callee === 'Map.groupBy') && expr.arguments?.length === 2) {
+            return groupByGoType(expr.arguments[0], expr.arguments[1], callee === 'Map.groupBy');
+        }
+        if (callee === 'Promise.withResolvers') {
+            return promiseWithResolversGoType((expr.typeArguments ?? [])[0] ? getType(expr.typeArguments[0]) : 'interface{}');
+        }
+        if (callee === 'Promise.try' && expr.arguments?.[0]) {
+            const result = goFuncReturnType(functionValueGoType(expr.arguments[0])) ?? '';
+            return result.startsWith('chan ') ? result : `chan ${result || 'struct{}'}`;
+        }
+        // f.bind(thisArg, a…): a function of the remaining parameters
+        if (isPropertyAccessExpression(expr.expression) && expr.expression.name.text === 'bind') {
+            const fnType = functionValueGoType(expr.expression.expression);
+            if (fnType) {
+                const rest = goFuncParamTypes(fnType).slice(Math.max(0, (expr.arguments ?? []).length - 1));
+                const result = goFuncReturnType(fnType);
+                return `func(${rest.join(', ')})${result ? ` ${result}` : ''}`;
+            }
         }
         if (callee && BUILTIN_CALL_TYPES[callee])
             return BUILTIN_CALL_TYPES[callee];
@@ -5916,6 +6059,16 @@ function inferExpressionType(expr) {
             if (methodName === 'join')
                 return 'string';
         }
+        // Map / Set iteration: m.keys() → []K, m.values() → []V
+        if (ownerType?.startsWith('*TnMap[') && (methodName === 'keys' || methodName === 'values' || methodName === 'entries')) {
+            const keyType = extractMapKeyType(ownerType);
+            const valueType = extractMapValueType(ownerType);
+            if (methodName === 'entries')
+                return '[][]interface{}';
+            if (methodName === 'keys' || valueType === 'struct{}')
+                return `[]${keyType}`;
+            return `[]${valueType}`;
+        }
         if (ownerType && ownerType.startsWith('*')) {
             const className = ownerType.replace(/^\*/, '').replace(/\[.*\]$/, '');
             const returnType = classMethodReturnTypes.get(className)?.get(methodName);
@@ -6015,6 +6168,24 @@ const BUILTIN_CALL_TYPES = {
     decodeURIComponent: 'string',
     'Object.fromEntries': 'interface{}',
     'Date.UTC': 'float64',
+    'Date.parse': 'float64',
+    'Math.asinh': 'float64',
+    'Math.acosh': 'float64',
+    'Math.atanh': 'float64',
+    'Math.fround': 'float64',
+    'Math.imul': 'float64',
+    'Math.clz32': 'float64',
+    'Math.sumPrecise': 'float64',
+    'Number.isSafeInteger': 'bool',
+    'Number.parseInt': 'float64',
+    'Number.parseFloat': 'float64',
+    'Object.is': 'bool',
+    'String.fromCodePoint': 'string',
+    'Symbol.for': '*TnSymbol',
+    'Symbol.keyFor': '*string',
+    BigInt: '*tnbig.Int',
+    'BigInt.asIntN': '*tnbig.Int',
+    'BigInt.asUintN': '*tnbig.Int',
     'Number.isNaN': 'bool',
     'Number.isFinite': 'bool',
     'Number.isInteger': 'bool',
@@ -6257,7 +6428,15 @@ const STRING_METHOD_RETURN_TYPES = {
     lastIndexOf: 'float64',
     search: 'float64',
     charCodeAt: 'float64',
-    localeCompare: 'float64'
+    codePointAt: 'float64',
+    localeCompare: 'float64',
+    substr: 'string',
+    trimLeft: 'string',
+    trimRight: 'string',
+    toLocaleUpperCase: 'string',
+    toLocaleLowerCase: 'string',
+    isWellFormed: 'bool',
+    toWellFormed: 'string'
 };
 // Return type of a Go func type string: `func(a T) R` → `R`
 function goFuncReturnType(funcType) {
@@ -7264,6 +7443,9 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'Set' && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
             return mapGoType(getType(typeNode.typeArguments[0]), 'struct{}');
         }
+        if (name === 'PromiseWithResolvers' && typeNode.typeArguments?.length === 1) {
+            return promiseWithResolversGoType(getType(typeNode.typeArguments[0]));
+        }
         // Partial / Required / Readonly / Pick / Omit / NonNullable<T, ...> → T's Go type
         if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
             return getType(typeNode.typeArguments[0], getArrayType);
@@ -7460,10 +7642,14 @@ function getAcessString(leftSide, rightSide, objectType) {
         };
         if (constants[rightSide])
             return constants[rightSide];
-        if (rightSide === 'MAX_VALUE' || rightSide === 'POSITIVE_INFINITY' || rightSide === 'NaN') {
+        if (['MAX_VALUE', 'MIN_VALUE', 'POSITIVE_INFINITY', 'NEGATIVE_INFINITY', 'NaN'].includes(rightSide)) {
             importedPackages.add('math');
             if (rightSide === 'MAX_VALUE')
                 return 'math.MaxFloat64';
+            if (rightSide === 'MIN_VALUE')
+                return 'math.SmallestNonzeroFloat64';
+            if (rightSide === 'NEGATIVE_INFINITY')
+                return 'math.Inf(-1)';
             return rightSide === 'NaN' ? 'math.NaN()' : 'math.Inf(1)';
         }
     }
@@ -7547,6 +7733,63 @@ const callHandlers = {
     'Math.sinh': (_caller, args) => mathCall('Sinh', args),
     'Math.cosh': (_caller, args) => mathCall('Cosh', args),
     'Math.tanh': (_caller, args) => mathCall('Tanh', args),
+    'Math.asinh': (_caller, args) => mathCall('Asinh', args),
+    'Math.acosh': (_caller, args) => mathCall('Acosh', args),
+    'Math.atanh': (_caller, args) => mathCall('Atanh', args),
+    'Math.fround': (_caller, args) => `float64(float32(${args[0]}))`,
+    'Math.imul': (_caller, args) => {
+        useHelper('dynamic');
+        return `float64(TnInt32(${args[0]}) * TnInt32(${args[1]}))`;
+    },
+    'Math.clz32': (_caller, args) => {
+        useHelper('dynamic');
+        importedPackages.add('math/bits');
+        return `float64(bits.LeadingZeros32(TnUint32(${args[0]})))`;
+    },
+    'Math.sumPrecise': (_caller, args) => {
+        useHelper('builtins');
+        return `TnSumPrecise(${args[0]})`;
+    },
+    'Number.isSafeInteger': (_caller, args) => {
+        importedPackages.add('math');
+        return `(${args[0]} == math.Trunc(${args[0]}) && math.Abs(${args[0]}) <= 9007199254740991)`;
+    },
+    'Number.parseInt': (_caller, args) => {
+        useHelper('dynamic');
+        return `TnParseInt(${args[0]}, ${args[1] ?? '10'})`;
+    },
+    'Number.parseFloat': (_caller, args) => {
+        useHelper('dynamic');
+        return `TnParseFloat(${args[0]})`;
+    },
+    'Object.groupBy': (_caller, args) => visitGroupBy(args, false),
+    'Map.groupBy': (_caller, args) => visitGroupBy(args, true),
+    'Object.is': (_caller, args) => {
+        useHelper('builtins');
+        return `TnObjectIs(${args[0]}, ${args[1]})`;
+    },
+    'Array.of': (_caller, args) => `${arrayOfGoType(currentCallArgTypes)}{${args.join(', ')}}`,
+    'String.fromCodePoint': (_caller, args) => `string([]rune{${args.map((a) => `rune(int(${a}))`).join(', ')}})`,
+    'Symbol.for': (_caller, args) => {
+        useHelper('symbol');
+        return `TnSymbolFor(${args[0]})`;
+    },
+    'Symbol.keyFor': (_caller, args) => {
+        useHelper('symbol');
+        return `TnSymbolKeyFor(${args[0]})`;
+    },
+    BigInt: (_caller, args) => {
+        useHelper('builtins');
+        return `TnBigIntOf(${args[0]})`;
+    },
+    'BigInt.asIntN': (_caller, args) => {
+        useHelper('builtins');
+        return `TnBigIntAsN(${args[0]}, ${args[1]}, true)`;
+    },
+    'BigInt.asUintN': (_caller, args) => {
+        useHelper('builtins');
+        return `TnBigIntAsN(${args[0]}, ${args[1]}, false)`;
+    },
     isFinite: (_caller, args) => {
         importedPackages.add('math');
         return `(!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]}))`;
@@ -7563,10 +7806,34 @@ const callHandlers = {
         useHelper('dynamic');
         return `TnFromEntries(${args[0]})`;
     },
+    'Date.parse': (_caller, args) => {
+        useHelper('date');
+        return `TnDateMs(TnParseDate(${args[0]}))`;
+    },
     'Date.UTC': (_caller, args) => {
         importedPackages.add('time');
         const part = (i, fallback) => (args[i] ? `int(${args[i]})` : fallback);
         return `float64(time.Date(${part(0, '1970')}, time.Month(${part(1, '0')}+1), ${part(2, '1')}, ${part(3, '0')}, ${part(4, '0')}, ${part(5, '0')}, ${part(6, '0')}*1000000, time.UTC).UnixMilli())`;
+    },
+    // Promise.withResolvers<T>(): the promise channel and its resolve / reject
+    'Promise.withResolvers': (_caller, _args, typeArgs) => {
+        useHelper('promise');
+        const t = typeArgs ? typeArgs.slice(1, -1) : 'interface{}';
+        return `func() ${promiseWithResolversGoType(t)} { ch := make(chan ${t}, 1); return &struct{ promise chan ${t}; resolve func(...interface{}); reject func(...interface{}) }{promise: ch, resolve: TnResolver[${t}](ch), reject: TnRejecter[${t}](ch)} }()`;
+    },
+    // Promise.try(fn, ...args): fn runs now; its result (or a promise it
+    // returns) settles the promise, and a throw rejects it
+    'Promise.try': (_caller, args) => {
+        useHelper('promise');
+        const fnType = currentCallArgNodes[0] ? functionValueGoType(currentCallArgNodes[0]) : '';
+        const result = fnType ? goFuncReturnType(fnType) ?? '' : '';
+        const call = `${args[0]}(${args.slice(1).join(', ')})`;
+        if (result.startsWith('chan ')) {
+            return `func() (__r ${result}) { defer func() { if p := recover(); p != nil { __r = make(${result}, 1); TnReject(__r, p) } }(); return ${call} }()`;
+        }
+        const t = result || 'struct{}';
+        const settle = result ? `TnResolver[${t}](ch)(${call})` : `${call}; TnResolveZero(ch)`;
+        return `func() chan ${t} { ch := make(chan ${t}, 1); func() { defer TnRejectExecutor(ch); ${settle} }(); return ch }()`;
     },
     'Promise.resolve': (_caller, args) => {
         const valueType = currentCallArgTypes[0] ?? 'interface{}';
@@ -7756,7 +8023,7 @@ const callHandlers = {
     'Boolean': (_caller, args) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
 };
 // Built-in Error subclasses (TnErrors carrying their name)
-const BUILTIN_ERROR_NAMES = new Set(['TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError']);
+const BUILTIN_ERROR_NAMES = new Set(['TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'AggregateError']);
 // Whether the program uses console.group (then every console line is
 // written through the indentation-aware helper)
 let consoleGroupsUsed = false;
@@ -7817,6 +8084,9 @@ const stringMethodHandlers = {
             return `${args[0]}.SplitStr(${obj}, -1)`;
         }
         importedPackages.add('strings');
+        // split(sep, limit): at most `limit` parts
+        if (args.length >= 2)
+            return `func() []string { __p := strings.Split(${obj}, ${args[0]}); return __p[:min(len(__p), max(0, int(${args[1]})))] }()`;
         return `strings.Split(${obj}, ${args[0]})`;
     },
     trim: (obj) => {
@@ -7929,7 +8199,43 @@ const stringMethodHandlers = {
     },
     lastIndexOf: (obj, args) => {
         importedPackages.add('strings');
+        if (args.length >= 2) {
+            useHelper('builtins');
+            return `TnLastIndexFrom(${obj}, ${args[0]}, ${args[1]})`;
+        }
         return `float64(strings.LastIndex(${obj}, ${args[0]}))`;
+    },
+    codePointAt: (obj, args) => {
+        useHelper('builtins');
+        return `TnCodePointAt(${obj}, ${args[0] ?? '0'})`;
+    },
+    substr: (obj, args) => {
+        useHelper('builtins');
+        return `TnSubstr(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
+    },
+    trimLeft: (obj) => {
+        importedPackages.add('strings');
+        return `strings.TrimLeft(${obj}, " \\t\\n\\r")`;
+    },
+    trimRight: (obj) => {
+        importedPackages.add('strings');
+        return `strings.TrimRight(${obj}, " \\t\\n\\r")`;
+    },
+    toLocaleUpperCase: (obj) => {
+        importedPackages.add('strings');
+        return `strings.ToUpper(${obj})`;
+    },
+    toLocaleLowerCase: (obj) => {
+        importedPackages.add('strings');
+        return `strings.ToLower(${obj})`;
+    },
+    isWellFormed: (obj) => {
+        importedPackages.add('unicode/utf8');
+        return `utf8.ValidString(${obj})`;
+    },
+    toWellFormed: (obj) => {
+        importedPackages.add('strings');
+        return `strings.ToValidUTF8(${obj}, "\\uFFFD")`;
     },
     at: (obj, args) => {
         return `func() string { __i := int(${args[0]}); if __i < 0 { __i = len(${obj}) + __i }; return string(${obj}[__i]) }()`;
@@ -7954,8 +8260,25 @@ const regexpMethodHandlers = {
         return `${obj}.FindStringSubmatch(${args[0]})`;
     }
 };
+// d.setHours(h, …) & co.: Dates are values, so the variable is reassigned
+function dateSetter(field, utc) {
+    return (obj, args) => {
+        useHelper('date');
+        const call = `TnDateSet(${obj}, ${toGoStringLiteral(field)}, ${utc}${args.map((a) => `, ${a}`).join('')})`;
+        return isAddressable(obj) ? `func() float64 { ${obj} = ${call}; return TnDateMs(${obj}) }()` : `TnDateMs(${call})`;
+    };
+}
+function dateFormatter(kind) {
+    return (obj) => {
+        useHelper('date');
+        return `TnDateFormat(${obj}, ${toGoStringLiteral(kind)})`;
+    };
+}
 const dateMethodHandlers = {
-    getTime: (obj) => `float64((${obj}).UnixMilli())`,
+    getTime: (obj) => {
+        useHelper('date');
+        return `TnDateMs(${obj})`;
+    },
     getMilliseconds: (obj) => `float64((${obj}).Millisecond())`,
     getSeconds: (obj) => `float64((${obj}).Second())`,
     getMinutes: (obj) => `float64((${obj}).Minute())`,
@@ -7964,8 +8287,8 @@ const dateMethodHandlers = {
     getDay: (obj) => `float64(int((${obj}).Weekday()))`,
     getMonth: (obj) => `float64(int((${obj}).Month()) - 1)`,
     getFullYear: (obj) => `float64((${obj}).Year())`,
-    toISOString: (obj) => `(${obj}).UTC().Format("2006-01-02T15:04:05.000Z07:00")`,
-    toJSON: (obj) => `(${obj}).UTC().Format("2006-01-02T15:04:05.000Z07:00")`,
+    toISOString: dateFormatter('iso'),
+    toJSON: dateFormatter('iso'),
     getUTCMilliseconds: (obj) => `float64((${obj}).UTC().Nanosecond() / 1000000)`,
     getUTCSeconds: (obj) => `float64((${obj}).UTC().Second())`,
     getUTCMinutes: (obj) => `float64((${obj}).UTC().Minute())`,
@@ -7974,10 +8297,37 @@ const dateMethodHandlers = {
     getUTCDay: (obj) => `float64(int((${obj}).UTC().Weekday()))`,
     getUTCMonth: (obj) => `float64(int((${obj}).UTC().Month()) - 1)`,
     getUTCFullYear: (obj) => `float64((${obj}).UTC().Year())`,
-    toString: (obj) => `(${obj}).UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (UTC)")`,
-    toDateString: (obj) => `(${obj}).UTC().Format("Mon Jan 02 2006")`,
-    toTimeString: (obj) => `(${obj}).UTC().Format("15:04:05 GMT+0000 (UTC)")`,
-    valueOf: (obj) => `float64((${obj}).UnixMilli())`
+    toString: dateFormatter('string'),
+    toDateString: dateFormatter('date'),
+    toTimeString: dateFormatter('time'),
+    toUTCString: dateFormatter('utc'),
+    toGMTString: dateFormatter('utc'),
+    toLocaleDateString: dateFormatter('localeDate'),
+    toLocaleTimeString: dateFormatter('localeTime'),
+    toLocaleString: dateFormatter('locale'),
+    getTimezoneOffset: (obj) => {
+        useHelper('date');
+        return `TnDateTimezoneOffset(${obj})`;
+    },
+    valueOf: (obj) => {
+        useHelper('date');
+        return `TnDateMs(${obj})`;
+    },
+    setTime: dateSetter('time', false),
+    setFullYear: dateSetter('fullYear', false),
+    setMonth: dateSetter('month', false),
+    setDate: dateSetter('date', false),
+    setHours: dateSetter('hours', false),
+    setMinutes: dateSetter('minutes', false),
+    setSeconds: dateSetter('seconds', false),
+    setMilliseconds: dateSetter('milliseconds', false),
+    setUTCFullYear: dateSetter('fullYear', true),
+    setUTCMonth: dateSetter('month', true),
+    setUTCDate: dateSetter('date', true),
+    setUTCHours: dateSetter('hours', true),
+    setUTCMinutes: dateSetter('minutes', true),
+    setUTCSeconds: dateSetter('seconds', true),
+    setUTCMilliseconds: dateSetter('milliseconds', true)
 };
 const arrayMethodHandlers = {
     push: (obj, args) => `${obj} = append(${obj}, ${args.join(', ')})`,
@@ -8168,6 +8518,10 @@ function getDynamicCallHandler(caller, objectType) {
         if (methodName === 'toString') {
             return (c, args) => {
                 const obj = c.substring(0, dotIndex);
+                if (currentReceiverGoType === 'time.Time') {
+                    useHelper('date');
+                    return `TnDateString(${obj})`;
+                }
                 if (args.length > 0) {
                     // bigint.toString(radix)
                     if (currentReceiverGoType === '*tnbig.Int')
@@ -8180,6 +8534,12 @@ function getDynamicCallHandler(caller, objectType) {
                     : currentReceiverGoType === 'interface{}'
                         ? 'interface{}'
                         : undefined);
+            };
+        }
+        if (methodName === 'toExponential') {
+            return (c, args) => {
+                useHelper('builtins');
+                return `TnToExponential(${c.substring(0, dotIndex)}, ${args[0] ?? '0'}, ${args.length > 0})`;
             };
         }
         if (methodName === 'toPrecision') {
@@ -8647,19 +9007,86 @@ function isThisOfPlainFunction(node) {
     }
     return false;
 }
-// f.call(thisArg, a, b) → f(a, b); f.apply(thisArg, args) → f(args...) (this is TnThis)
+// fn.name / fn.length known at compile time: declared functions, classes
+// (not one with a static `name`) and variables holding functions
+function functionNameAndLength(target) {
+    const declared = declaredFunctions.get(target);
+    if (declared && !variableGoTypes.has(target)) {
+        const params = declared.parameters ?? [];
+        const firstOptional = params.findIndex((p) => !!p.initializer || !!p.questionToken || !!p.dotDotDotToken);
+        return { name: target, arity: firstOptional < 0 ? params.length : firstOptional };
+    }
+    if (classNames.has(target) && !variableGoTypes.has(target)) {
+        if (staticMemberOwner(target, 'name') || staticMemberOwner(target, 'length'))
+            return undefined;
+        return { name: target, arity: 0 };
+    }
+    const varType = variableGoTypes.get(target);
+    if (varType?.startsWith('func(')) {
+        const params = goFuncParamTypes(varType).filter((p) => !p.startsWith('...'));
+        return { name: target, arity: params.length };
+    }
+    return undefined;
+}
+// The Go func type of a function value, including a declared function's name
+function functionValueGoType(expr) {
+    const inferred = inferExpressionType(expr);
+    if (inferred?.startsWith('func('))
+        return inferred;
+    if (isIdentifier(expr) && !variableGoTypes.has(expr.text)) {
+        const declared = declaredFunctions.get(expr.text);
+        if (declared && !declared.asteriskToken && !(declared.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
+            return inferArrowFunctionGoType(declared);
+        }
+    }
+    return '';
+}
+// The parameter types of a Go func type (`func(a float64, string) R` → ['float64', 'string'])
+function goFuncParamTypes(funcType) {
+    const result = goFuncReturnType(funcType);
+    const paramList = funcType.slice(5, funcType.length - (result ? result.length + 1 : 0) - 1).trim();
+    return splitGoParameters(paramList).map((p) => {
+        const space = p.indexOf(' ');
+        const first = space > 0 ? p.slice(0, space) : p;
+        const isName = space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_]\w*$/.test(first);
+        return isName ? p.slice(space + 1) : p;
+    });
+}
+// f.call(thisArg, a, b) → f(a, b); f.apply(thisArg, args) → f(args[0], args[1], …);
+// f.bind(thisArg, a) → a closure over the bound arguments (this is TnThis)
 function visitFunctionCallApply(node) {
     if (!isPropertyAccessExpression(node.expression))
         return undefined;
     const method = node.expression.name.text;
-    if (method !== 'call' && method !== 'apply')
+    if (method !== 'call' && method !== 'apply' && method !== 'bind')
         return undefined;
-    if (!inferExpressionType(node.expression.expression)?.startsWith('func('))
+    const fnType = functionValueGoType(node.expression.expression);
+    if (!fnType)
         return undefined;
     const fn = visit(node.expression.expression);
     const args = (node.arguments ?? []).slice(1);
-    if (method === 'apply')
-        return `${fn}(${args[0] ? `${visit(args[0])}...` : ''})`;
+    const params = goFuncParamTypes(fnType);
+    const result = goFuncReturnType(fnType) ?? '';
+    const variadic = params.length > 0 && params[params.length - 1].startsWith('...');
+    if (method === 'apply') {
+        if (!args[0])
+            return `${fn}()`;
+        if (variadic)
+            return `${fn}(${visit(args[0])}...)`;
+        // a non-variadic Go func takes the array's elements one by one (missing ones are zero)
+        useHelper('dynamic');
+        const picks = params.map((p, i) => `TnAs[${p}](TnAt(__a, ${i}))`).join(', ');
+        return `func() ${result} { __a := ${toGoValueOfType(args[0], '[]interface{}')}; ${result ? 'return ' : ''}${fn}(${picks}) }()`;
+    }
+    if (method === 'bind') {
+        const bound = args.map((a, i) => `__b${i} := ${toGoValueOfType(a, params[i] ?? 'interface{}')}`);
+        const rest = params.slice(args.length);
+        const restDecl = rest.map((p, i) => `__p${i} ${p}`).join(', ');
+        const forward = [...args.map((_, i) => `__b${i}`), ...rest.map((p, i) => (p.startsWith('...') ? `__p${i}...` : `__p${i}`))];
+        const inner = `func(${restDecl}) ${result} { ${result ? 'return ' : ''}__f(${forward.join(', ')}) }`;
+        const setup = [`__f := ${fn}`, ...bound].join('; ');
+        return `func() func(${rest.join(', ')}) ${result} { ${setup}; return ${inner} }()`;
+    }
     return `${fn}(${args.map((a) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))).join(', ')})`;
 }
 // Whether a decorator call returns a value (a replacement), or only has effects
@@ -8820,6 +9247,9 @@ function getParameterGoType(param) {
     const sortElementType = param.parent ? getSortComparatorElementType(param.parent) : undefined;
     if (sortElementType)
         return sortElementType;
+    const groupByType = groupByCallbackParamType(param);
+    if (groupByType)
+        return groupByType;
     const contextualFn = param.parent ? getContextualFunctionType(param.parent) : undefined;
     if (contextualFn) {
         const index = (param.parent.parameters ?? []).indexOf(param);
@@ -9479,6 +9909,8 @@ const helperRequires = {
     goMust: ['error'],
     bigint: ['error'],
     jsonStringify: ['error', 'dynamic'],
+    builtins: ['error', 'dynamic', 'bigint'],
+    date: ['error', 'dynamic'],
     goBlocking: ['error', 'eventLoop'],
     decorators: [],
     jsx: [],
@@ -9603,11 +10035,13 @@ const helperPackages = {
     objectAssign: ['reflect', 'unsafe'],
     typeOf: ['reflect'],
     isArray: ['reflect'],
+    builtins: ['math', 'strconv', 'strings', 'math/big'],
+    date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
     dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time'],
     regexReplaceFunc: ['regexp'],
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
-    error: [],
+    error: ['runtime', 'strings', 'fmt'],
     bigint: ['math/big', 'math'],
     symbol: [],
     fancyRegex: ['regexp', 'strings', 'strconv', 'fmt'],
@@ -9635,6 +10069,347 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    builtins: `// Smaller ECMAScript built-ins (Number, Math, String, Object.is, BigInt)
+// n.toExponential(digits?): JS writes the exponent without padding (1.5e+3)
+func TnToExponential(x float64, digits float64, hasDigits bool) string {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return TnNumStr(x)
+	}
+	precision := -1
+	if hasDigits {
+		precision = int(digits)
+	}
+	s := strconv.FormatFloat(x, 'e', precision, 64)
+	mantissa, exponent, _ := strings.Cut(s, "e")
+	sign := exponent[:1]
+	exponent = strings.TrimLeft(exponent[1:], "0")
+	if exponent == "" {
+		exponent = "0"
+	}
+	return mantissa + "e" + sign + exponent
+}
+
+// Math.sumPrecise: Neumaier-compensated sum
+func TnSumPrecise(values []float64) float64 {
+	sum, compensation := 0.0, 0.0
+	for _, v := range values {
+		t := sum + v
+		if math.Abs(sum) >= math.Abs(v) {
+			compensation += (sum - t) + v
+		} else {
+			compensation += (v - t) + sum
+		}
+		sum = t
+	}
+	if len(values) == 0 {
+		return math.Copysign(0, -1)
+	}
+	return sum + compensation
+}
+
+// Object.is: SameValue (NaN is NaN, +0 is not -0)
+func TnObjectIs(a, b interface{}) bool {
+	fa, aok := a.(float64)
+	fb, bok := b.(float64)
+	if aok && bok {
+		if math.IsNaN(fa) && math.IsNaN(fb) {
+			return true
+		}
+		return fa == fb && math.Signbit(fa) == math.Signbit(fb)
+	}
+	return TnSame(a, b)
+}
+
+// BigInt(value): integers, numeric strings, booleans and bigints
+func TnBigIntOf(v interface{}) *tnbig.Int {
+	switch x := v.(type) {
+	case *tnbig.Int:
+		return x
+	case bool:
+		if x {
+			return tnbig.NewInt(1)
+		}
+		return tnbig.NewInt(0)
+	case float64:
+		if x != math.Trunc(x) || math.IsInf(x, 0) || math.IsNaN(x) {
+			panic(TnNodeError("RangeError", "", "The number "+TnNumStr(x)+" cannot be converted to a BigInt because it is not an integer"))
+		}
+		b, _ := new(tnbig.Float).SetFloat64(x).Int(nil)
+		return b
+	case string:
+		t := strings.TrimSpace(x)
+		if t == "" {
+			return tnbig.NewInt(0)
+		}
+		if b, ok := new(tnbig.Int).SetString(t, 0); ok && !strings.ContainsAny(t, "_") {
+			return b
+		}
+		panic(TnNodeError("SyntaxError", "", "Cannot convert "+x+" to a BigInt"))
+	}
+	panic(TnNodeError("TypeError", "", "Cannot convert "+TnJSString(v)+" to a BigInt"))
+}
+
+// BigInt.asIntN / asUintN: x modulo 2^bits (signed: two's complement)
+func TnBigIntAsN(bits float64, x *tnbig.Int, signed bool) *tnbig.Int {
+	n := uint(bits)
+	if n == 0 {
+		return tnbig.NewInt(0)
+	}
+	modulus := new(tnbig.Int).Lsh(tnbig.NewInt(1), n)
+	r := new(tnbig.Int).Mod(x, modulus)
+	if signed && r.Cmp(new(tnbig.Int).Rsh(modulus, 1)) >= 0 {
+		r.Sub(r, modulus)
+	}
+	return r
+}
+
+// s.codePointAt(i): NaN past the end (JS: undefined)
+func TnCodePointAt(s string, i float64) float64 {
+	runes := []rune(s)
+	if i < 0 || int(i) >= len(runes) {
+		return math.NaN()
+	}
+	return float64(runes[int(i)])
+}
+
+// s.substr(start, length?)
+func TnSubstr(s string, start float64, length float64, hasLength bool) string {
+	n := float64(len(s))
+	if start < 0 {
+		start = math.Max(0, n+start)
+	}
+	start = math.Min(start, n)
+	end := n
+	if hasLength {
+		end = math.Min(n, start+math.Max(0, length))
+	}
+	if end <= start {
+		return ""
+	}
+	return s[int(start):int(end)]
+}
+
+// s.lastIndexOf(search, fromIndex)
+func TnLastIndexFrom(s, search string, from float64) float64 {
+	if math.IsNaN(from) {
+		return float64(strings.LastIndex(s, search))
+	}
+	end := int(math.Max(0, from)) + len(search)
+	if end > len(s) {
+		end = len(s)
+	}
+	return float64(strings.LastIndex(s[:end], search))
+}`,
+    date: `// Dates: time.Time in the local zone; the zero time is an Invalid Date
+func TnDateMs(t time.Time) float64 {
+	if t.IsZero() {
+		return math.NaN()
+	}
+	return float64(t.UnixMilli())
+}
+
+// new Date(ms): NaN or beyond ±8.64e15 ms is an Invalid Date
+func TnDateFromMs(ms float64) time.Time {
+	if math.IsNaN(ms) || math.Abs(ms) > 8.64e15 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(ms))
+}
+
+// new Date(value): another Date, a date string or a time value
+func TnNewDate(v interface{}) time.Time {
+	switch x := v.(type) {
+	case time.Time:
+		return x
+	case *time.Time:
+		if x != nil {
+			return *x
+		}
+	case string:
+		return TnParseDate(x)
+	case nil:
+		return TnDateFromMs(0)
+	}
+	return TnDateFromMs(TnNumber(v))
+}
+
+// new Date(y, m, d?, h?, min?, s?, ms?): local time; fields overflow as in JS
+func TnDateFields(loc *time.Location, fields ...float64) time.Time {
+	vals := []float64{0, 0, 1, 0, 0, 0, 0}
+	copy(vals, fields)
+	for _, f := range vals {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return time.Time{}
+		}
+	}
+	year := int(vals[0])
+	if year >= 0 && year <= 99 {
+		year += 1900
+	}
+	t := time.Date(year, time.Month(int(vals[1])+1), int(vals[2]), int(vals[3]), int(vals[4]), int(vals[5]), 0, loc)
+	return t.Add(time.Duration(vals[6]) * time.Millisecond).In(time.Local)
+}
+
+var tnISODate = regexp.MustCompile("^([+-]\\\\d{6}|\\\\d{4})(?:-(\\\\d{2})(?:-(\\\\d{2}))?)?(?:[T ](\\\\d{2}):(\\\\d{2})(?::(\\\\d{2})(?:[.,](\\\\d+))?)?)?\\\\s*(Z|z|[+-]\\\\d{2}:?\\\\d{2})?$")
+
+var tnDateLayouts = []string{
+	"Mon Jan 02 2006 15:04:05 GMT-0700",
+	"Mon Jan 2 2006 15:04:05 GMT-0700",
+	"Mon, 02 Jan 2006 15:04:05 GMT",
+	"Mon, 2 Jan 2006 15:04:05 GMT",
+	"Mon, 02 Jan 2006 15:04:05 -0700",
+	"Mon Jan 02 2006",
+	"Mon Jan 02 2006 15:04:05",
+	"January 2, 2006 15:04:05",
+	"January 2, 2006",
+	"Jan 2, 2006 15:04:05",
+	"Jan 2, 2006",
+	"2 January 2006",
+	"2 Jan 2006",
+	"2006/01/02 15:04:05",
+	"2006/01/02",
+	"2006/1/2",
+	"01/02/2006 15:04:05",
+	"1/2/2006 15:04:05",
+	"01/02/2006",
+	"1/2/2006",
+}
+
+// Date.parse / new Date(string): the ISO format (date-only forms are UTC,
+// date-times without an offset local), then the formats V8 also accepts
+func TnParseDate(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if m := tnISODate.FindStringSubmatch(s); m != nil {
+		num := func(part string, def int) int {
+			if part == "" {
+				return def
+			}
+			n, _ := strconv.Atoi(part)
+			return n
+		}
+		year := num(m[1], 0)
+		month, day := num(m[2], 1), num(m[3], 1)
+		hour, minute, second := num(m[4], 0), num(m[5], 0), num(m[6], 0)
+		if month < 1 || month > 12 || day < 1 || day > 31 || hour > 24 || minute > 59 || second > 59 {
+			return time.Time{}
+		}
+		nanos := 0
+		if m[7] != "" {
+			frac := (m[7] + "000000000")[:9]
+			nanos, _ = strconv.Atoi(frac)
+			nanos = nanos / 1000000 * 1000000
+		}
+		loc := time.Local
+		if m[4] == "" || m[8] == "Z" || m[8] == "z" {
+			loc = time.UTC
+		} else if m[8] != "" {
+			zone := strings.ReplaceAll(m[8], ":", "")
+			hours, _ := strconv.Atoi(zone[1:3])
+			mins, _ := strconv.Atoi(zone[3:5])
+			offset := hours*3600 + mins*60
+			if zone[0] == '-' {
+				offset = -offset
+			}
+			loc = time.FixedZone("", offset)
+		}
+		return time.Date(year, time.Month(month), day, hour, minute, second, nanos, loc).In(time.Local)
+	}
+	// "… GMT+0100 (Central European Standard Time)": the zone name is a comment
+	if i := strings.Index(s, " ("); i > 0 && strings.HasSuffix(s, ")") {
+		s = s[:i]
+	}
+	for _, layout := range tnDateLayouts {
+		loc := time.Local
+		if strings.HasSuffix(layout, "GMT") {
+			loc = time.UTC
+		}
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+			return t.In(time.Local)
+		}
+	}
+	return time.Time{}
+}
+
+// d.setHours(h, m?, s?, ms?) & co.: the date with those fields changed (local
+// or UTC); a NaN field makes an Invalid Date
+func TnDateSet(t time.Time, field string, utc bool, args ...float64) time.Time {
+	if field == "time" {
+		if len(args) == 0 {
+			return time.Time{}
+		}
+		return TnDateFromMs(args[0])
+	}
+	loc := time.Local
+	if utc {
+		loc = time.UTC
+	}
+	if t.IsZero() {
+		if field != "fullYear" {
+			return t
+		}
+		t = time.UnixMilli(0)
+	}
+	lt := t.In(loc)
+	f := []float64{float64(lt.Year()), float64(int(lt.Month()) - 1), float64(lt.Day()), float64(lt.Hour()), float64(lt.Minute()), float64(lt.Second()), float64(lt.Nanosecond() / 1000000)}
+	start := map[string]int{"fullYear": 0, "month": 1, "date": 2, "hours": 3, "minutes": 4, "seconds": 5, "milliseconds": 6}[field]
+	limit := map[string]int{"fullYear": 3, "month": 2, "date": 1, "hours": 4, "minutes": 3, "seconds": 2, "milliseconds": 1}[field]
+	for i, a := range args {
+		if i >= limit {
+			break
+		}
+		f[start+i] = a
+	}
+	for _, v := range f {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return time.Time{}
+		}
+	}
+	nt := time.Date(int(f[0]), time.Month(int(f[1])+1), int(f[2]), int(f[3]), int(f[4]), int(f[5]), 0, loc)
+	return nt.Add(time.Duration(f[6]) * time.Millisecond).In(time.Local)
+}
+
+func TnDateFormat(t time.Time, kind string) string {
+	if t.IsZero() {
+		if kind == "iso" {
+			panic(TnNodeError("RangeError", "", "Invalid time value"))
+		}
+		return "Invalid Date"
+	}
+	switch kind {
+	case "iso":
+		u := t.UTC()
+		if u.Year() < 0 || u.Year() > 9999 {
+			sign := "+"
+			year := u.Year()
+			if year < 0 {
+				sign, year = "-", -year
+			}
+			return fmt.Sprintf("%s%06d", sign, year) + u.Format("-01-02T15:04:05.000Z")
+		}
+		return u.Format("2006-01-02T15:04:05.000Z")
+	case "date":
+		return t.Format("Mon Jan 02 2006")
+	case "time":
+		return t.Format("15:04:05 ") + tnZoneSuffix(t)
+	case "utc":
+		return t.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	case "localeDate":
+		return t.Format("1/2/2006")
+	case "localeTime":
+		return t.Format("3:04:05 PM")
+	case "locale":
+		return t.Format("1/2/2006, 3:04:05 PM")
+	}
+	return TnDateString(t)
+}
+
+func TnDateTimezoneOffset(t time.Time) float64 {
+	if t.IsZero() {
+		return math.NaN()
+	}
+	_, offset := t.Zone()
+	return float64(-offset / 60)
+}`,
     arrayWrite: `// arr[i] = v: past the end the array grows, as in JS (holes are zero values)
 func TnSetAt[T any](s *[]T, i float64, v T) {
 	n := int(i)
@@ -9855,8 +10630,65 @@ func TnLength(v interface{}) float64 {
 
 // A value as JS prints it in a template literal (nil pointers are "undefined")
 // String(v) of a dynamic value, as JS renders it
+// Long zone names as Node prints them in toString() (ICU's); others keep
+// Go's abbreviation
+var tnZoneNames = map[string]string{
+	"UTC": "Coordinated Universal Time", "GMT": "Greenwich Mean Time",
+	"EST": "Eastern Standard Time", "EDT": "Eastern Daylight Time",
+	"CST": "Central Standard Time", "CDT": "Central Daylight Time",
+	"MST": "Mountain Standard Time", "MDT": "Mountain Daylight Time",
+	"PST": "Pacific Standard Time", "PDT": "Pacific Daylight Time",
+	"AKST": "Alaska Standard Time", "AKDT": "Alaska Daylight Time",
+	"HST": "Hawaii-Aleutian Standard Time",
+	"WET": "Western European Standard Time", "WEST": "Western European Summer Time",
+	"CET": "Central European Standard Time", "CEST": "Central European Summer Time",
+	"EET": "Eastern European Standard Time", "EEST": "Eastern European Summer Time",
+	"BST": "British Summer Time", "IST": "India Standard Time",
+	"JST": "Japan Standard Time", "KST": "Korean Standard Time",
+	"AEST": "Australian Eastern Standard Time", "AEDT": "Australian Eastern Daylight Time",
+	"NZST": "New Zealand Standard Time", "NZDT": "New Zealand Daylight Time",
+}
+
+func tnZoneSuffix(t time.Time) string {
+	name, offset := t.Zone()
+	long, ok := tnZoneNames[name]
+	if !ok {
+		sign := '+'
+		if offset < 0 {
+			sign, offset = '-', -offset
+		}
+		long = fmt.Sprintf("GMT%c%02d:%02d", sign, offset/3600, offset%3600/60)
+	}
+	return t.Format("GMT-0700") + " (" + long + ")"
+}
+
+// String(date) / date.toString(): Node's format in the local zone
+func TnDateString(t time.Time) string {
+	if t.IsZero() {
+		return "Invalid Date"
+	}
+	return t.Format("Mon Jan 02 2006 15:04:05 ") + tnZoneSuffix(t)
+}
+
 func TnJSString(v interface{}) string {
 	switch x := v.(type) {
+	case time.Time:
+		return TnDateString(x)
+	case *string:
+		if x == nil {
+			return "undefined"
+		}
+		return *x
+	case *float64:
+		if x == nil {
+			return "undefined"
+		}
+		return TnNumStr(*x)
+	case *bool:
+		if x == nil {
+			return "undefined"
+		}
+		return TnJSString(*x)
 	case nil:
 		return "undefined"
 	case string:
@@ -10174,6 +11006,11 @@ func TnAsPtr[T any](v interface{}) *T {
 	if t, ok := v.(T); ok {
 		return &t
 	}
+	if custom, isErr := v.(interface{ TnBaseError() *TnError }); isErr {
+		if base, bok := interface{}(custom.TnBaseError()).(*T); bok {
+			return base
+		}
+	}
 	var zero T
 	if converted, ok := TnConvertDynamic(v, reflect.TypeOf(&zero)); ok {
 		return converted.Interface().(*T)
@@ -10187,6 +11024,11 @@ func TnAs[T any](v interface{}) T {
 	}
 	t, ok := v.(T)
 	if !ok && v != nil {
+		if custom, isErr := v.(interface{ TnBaseError() *TnError }); isErr {
+			if base, bok := interface{}(custom.TnBaseError()).(T); bok {
+				return base
+			}
+		}
 		if converted, cok := TnConvertDynamic(v, reflect.TypeOf((*T)(nil)).Elem()); cok {
 			return converted.Interface().(T)
 		}
@@ -11911,12 +12753,51 @@ type TnError struct {
 	code    string
 	props   map[string]interface{}
 	goErr   error
+	pcs     []uintptr // where the error was created (err.stack)
 }
 
 func (e *TnError) Error() string { return e.message }
 
+// The embedded TnError of a custom error class (class E extends Error), so
+// (err as Error) works on its instances
+func (e *TnError) TnBaseError() *TnError { return e }
+
 func TnNewError(message string) *TnError {
-	return &TnError{message: message}
+	e := &TnError{message: message}
+	e.tnCapture(3)
+	return e
+}
+
+// Records the call stack, skipping runtime.Callers, tnCapture and skip-2 callers
+func (e *TnError) tnCapture(skip int) {
+	var pcs [32]uintptr
+	n := runtime.Callers(skip, pcs[:])
+	e.pcs = pcs[:n]
+}
+
+// One "at …" line of err.stack: frames of TS code only (the //line
+// directives give them their .ts file and line); helper frames are skipped
+func tnStackLine(f runtime.Frame) string {
+	if !strings.HasSuffix(f.File, ".ts") && !strings.HasSuffix(f.File, ".tsx") {
+		return ""
+	}
+	name := strings.TrimPrefix(f.Function, "main.")
+	for {
+		i := strings.LastIndex(name, ".func")
+		if i < 0 {
+			break
+		}
+		name = name[:i]
+	}
+	name = strings.NewReplacer("(*", "", ")", "").Replace(name)
+	if strings.HasPrefix(name, "New") && len(name) > 3 && !strings.Contains(name, ".") {
+		name = "new " + name[3:]
+	}
+	location := fmt.Sprintf("%s:%d", f.File, f.Line)
+	if name == "main" || name == "init" || strings.HasPrefix(name, "init.") {
+		return location
+	}
+	return name + " (" + location + ")"
 }
 
 
@@ -11932,7 +12813,9 @@ func TnIsErrorOf(v interface{}, name string) bool {
 
 // A Node error: name ('TypeError', 'AssertionError'), code and message
 func TnNodeError(name string, code string, message string) *TnError {
-	return &TnError{message: message, code: code, props: map[string]interface{}{"name": name}}
+	e := &TnError{message: message, code: code, props: map[string]interface{}{"name": name}}
+	e.tnCapture(3)
+	return e
 }
 
 func (e *TnError) prop(key string) interface{} {
@@ -11949,7 +12832,38 @@ func (e *TnError) Get_name() string {
 	return "Error"
 }
 
-func (e *TnError) Get_stack() string { return e.Get_name() + ": " + e.message }
+// err.stack: "Name: message" and an "at" line per TS frame, as in Node
+func (e *TnError) Get_stack() string {
+	head := e.Get_name()
+	if e.message != "" {
+		head += ": " + e.message
+	}
+	if len(e.pcs) == 0 {
+		return head
+	}
+	var b strings.Builder
+	b.WriteString(head)
+	frames := runtime.CallersFrames(e.pcs)
+	previous := ""
+	for {
+		f, more := frames.Next()
+		// a try block's closure repeats its function's line
+		if line := tnStackLine(f); line != "" && line != previous {
+			b.WriteString("\\n    at " + line)
+			previous = line
+		}
+		if !more {
+			break
+		}
+	}
+	return b.String()
+}
+
+// AggregateError: the errors it was created with
+func (e *TnError) Get_errors() []interface{} {
+	errs, _ := e.prop("errors").([]interface{})
+	return errs
+}
 
 func (e *TnError) Get_syscall() string {
 	s, _ := e.prop("syscall").(string)
@@ -12133,10 +13047,30 @@ func tnGoBlocking(fn func() interface{}) interface{} {
     symbol: `// TnSymbol: JS symbol values (unique by identity)
 type TnSymbol struct {
 	description string
+	registered  bool
 }
 
 func TnNewSymbol(description string) *TnSymbol {
 	return &TnSymbol{description: description}
+}
+
+// Symbol.for(key) / Symbol.keyFor(sym): the global symbol registry
+var tnSymbolRegistry = map[string]*TnSymbol{}
+
+func TnSymbolFor(key string) *TnSymbol {
+	if s, ok := tnSymbolRegistry[key]; ok {
+		return s
+	}
+	s := &TnSymbol{description: key, registered: true}
+	tnSymbolRegistry[key] = s
+	return s
+}
+
+func TnSymbolKeyFor(s *TnSymbol) *string {
+	if s == nil || !s.registered {
+		return nil
+	}
+	return &s.description
 }`,
     timerWait: `// Timers: callbacks run on the event loop; pending (ref'ed) timers keep the process alive
 var __tnTimers tnLoopGroup
