@@ -8,6 +8,15 @@
 // uncaught exception in a worker becomes an 'error' event and exit code 1.
 import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
 const cloneHelper = `// Structured clone (subset): values to and from JSON with type tags
+// Objects keep their key order: {"$tn": "Object", "k": keys, "v": values}
+func tnCloneObject(keys []string, values []interface{}) map[string]interface{} {
+	k := make([]interface{}, len(keys))
+	for i, key := range keys {
+		k[i] = key
+	}
+	return map[string]interface{}{"$tn": "Object", "k": k, "v": values}
+}
+
 func tnCloneEncode(v interface{}) interface{} {
 	switch x := v.(type) {
 	case nil:
@@ -44,11 +53,16 @@ func tnCloneEncode(v interface{}) interface{} {
 		}
 		return map[string]interface{}{"$tn": "Error", "message": x.message, "code": x.code, "props": props}
 	case map[string]interface{}:
-		out := map[string]interface{}{}
-		for k, val := range x {
-			out[k] = tnCloneEncode(val)
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
 		}
-		return out
+		sort.Strings(keys)
+		values := make([]interface{}, len(keys))
+		for i, k := range keys {
+			values[i] = tnCloneEncode(x[k])
+		}
+		return tnCloneObject(keys, values)
 	case []interface{}:
 		out := make([]interface{}, len(x))
 		for i, val := range x {
@@ -57,7 +71,30 @@ func tnCloneEncode(v interface{}) interface{} {
 		return out
 	}
 	if withEntries, ok := v.(interface{ Entries() [][]interface{} }); ok {
-		if kind, ok := v.(interface{ TnJSKind() uint8 }); ok && kind.TnJSKind() == 2 {
+		kind := uint8(0)
+		if tagged, ok := v.(interface{ TnJSKind() uint8 }); ok {
+			kind = tagged.TnJSKind()
+		}
+		// a record (string keys, not made by new Map()) is a plain object
+		if kind == 0 {
+			entries := withEntries.Entries()
+			keys := make([]string, 0, len(entries))
+			values := make([]interface{}, 0, len(entries))
+			plain := true
+			for _, e := range entries {
+				k, isString := e[0].(string)
+				if !isString {
+					plain = false
+					break
+				}
+				keys = append(keys, k)
+				values = append(values, tnCloneEncode(e[1]))
+			}
+			if plain {
+				return tnCloneObject(keys, values)
+			}
+		}
+		if kind == 2 {
 			values := []interface{}{}
 			for _, e := range withEntries.Entries() {
 				values = append(values, tnCloneEncode(e[0]))
@@ -92,16 +129,18 @@ func tnCloneEncode(v interface{}) interface{} {
 		}
 		if rv.Elem().Kind() == reflect.Struct {
 			sv := rv.Elem()
-			out := map[string]interface{}{}
+			keys := []string{}
+			values := []interface{}{}
 			for i := 0; i < sv.NumField(); i++ {
 				f := sv.Field(i)
 				if f.Kind() == reflect.Func {
 					continue
 				}
 				value := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
-				out[strings.TrimSuffix(sv.Type().Field(i).Name, "_")] = tnCloneEncode(value)
+				keys = append(keys, strings.TrimSuffix(sv.Type().Field(i).Name, "_"))
+				values = append(values, tnCloneEncode(value))
 			}
-			return out
+			return tnCloneObject(keys, values)
 		}
 		return tnCloneEncode(rv.Elem().Interface())
 	case reflect.Float32, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -147,6 +186,17 @@ func tnCloneDecode(v interface{}) interface{} {
 						if pair, ok := p.([]interface{}); ok && len(pair) == 2 {
 							m.Set(tnCloneDecode(pair[0]), tnCloneDecode(pair[1]))
 						}
+					}
+				}
+				return m
+			case "Object":
+				// an ordered record, as plain objects print and stringify in order
+				m := TnNewMap[string, interface{}]()
+				keys, _ := x["k"].([]interface{})
+				values, _ := x["v"].([]interface{})
+				for i, k := range keys {
+					if i < len(values) {
+						m.Set(TnJSString(k), tnCloneDecode(values[i]))
 					}
 				}
 				return m
@@ -410,8 +460,10 @@ func init() {
 	var setup map[string]interface{}
 	json.Unmarshal(payload, &setup)
 	TnWorkerData = tnCloneDecode(setup["workerData"])
-	if env, ok := tnCloneDecode(setup["environmentData"]).(map[string]interface{}); ok {
-		tnEnvironmentData = env
+	if env, ok := tnCloneDecode(setup["environmentData"]).(*TnMap[string, interface{}]); ok {
+		for _, k := range env.Keys() {
+			tnEnvironmentData[k] = env.Get(k)
+		}
 	}
 	TnThreadID, _ = setup["threadId"].(float64)
 	port := tnNewPort()
@@ -666,7 +718,7 @@ func (w *TnWorker) unref() *TnWorker {
 const EMITTER = 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64';
 export function registerWorkerThreads(r) {
     defineModule(r, 'worker_threads');
-    defineHelper(r, 'nodeClone', ['encoding/base64', 'encoding/json', 'fmt', 'math/big', 'reflect', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'error'], cloneHelper);
+    defineHelper(r, 'nodeClone', ['encoding/base64', 'encoding/json', 'fmt', 'math/big', 'reflect', 'sort', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'error'], cloneHelper);
     defineHelper(r, 'nodeWorker', ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'], ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild', 'entryPoints'], workerHelper);
     const use = () => r.helper('nodeWorker');
     defineClass(r, 'worker_threads.Worker', '*TnWorker', 'class', `${EMITTER}; postMessage=; terminate=chan float64; ref=*TnWorker; unref=*TnWorker`, '', 'threadId=float64', '');

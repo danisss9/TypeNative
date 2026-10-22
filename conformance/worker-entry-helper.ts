@@ -11,5 +11,6 @@ function scale(n: number): number {
 
 parentPort?.on('message', (n: any) => {
   seen.push(n as number);
-  parentPort?.postMessage({ result: scale(n as number), mainThread: isMainThread, threadId: threadId, count: seen.length });
+  const tally: Record<string, number> = { zeta: 26, alpha: 1 };
+  parentPort?.postMessage({ result: scale(n as number), mainThread: isMainThread, threadId: threadId, count: seen.length, tally: tally });
 });

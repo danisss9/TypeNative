@@ -10561,7 +10561,7 @@ registerModuleV8(nodeRegistry);
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
     entryPoints: ['os'],
-    orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt'],
+    orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect'],
     jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
     objectAssign: ['reflect', 'unsafe'],
     typeOf: ['reflect'],
@@ -11867,6 +11867,33 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		if rv.Kind() == reflect.Pointer && rv.IsNil() {
 			return reflect.Zero(t), true
 		}
+		// a Map / Record type: filled entry by entry
+		if t.Elem().Kind() == reflect.Struct {
+			target := reflect.New(t.Elem())
+			if filler, isMap := target.Interface().(interface {
+				TnFill([][]interface{}, func(interface{}, reflect.Type) (reflect.Value, bool)) bool
+			}); isMap {
+				var entries [][]interface{}
+				if src, ok := v.(interface{ Entries() [][]interface{} }); ok {
+					entries = src.Entries()
+				} else if src, ok := v.(map[string]interface{}); ok {
+					keys := make([]string, 0, len(src))
+					for k := range src {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					for _, k := range keys {
+						entries = append(entries, []interface{}{k, src[k]})
+					}
+				} else {
+					return reflect.Value{}, false
+				}
+				if !filler.TnFill(entries, TnConvertDynamic) {
+					return reflect.Value{}, false
+				}
+				return target, true
+			}
+		}
 		inner, ok := TnConvertDynamic(v, t.Elem())
 		if !ok {
 			return reflect.Value{}, false
@@ -12364,6 +12391,25 @@ func (m *TnMap[K, V]) TnJSKind() uint8 {
 
 func TnNewMap[K comparable, V any]() *TnMap[K, V] {
 	return &TnMap[K, V]{values: map[K]V{}}
+}
+
+// Fills a new map from dynamic entries (a decoded record held as any),
+// converting keys and values with convert
+func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, reflect.Type) (reflect.Value, bool)) bool {
+	if m.values == nil {
+		m.values = map[K]V{}
+	}
+	keyType := reflect.TypeOf((*K)(nil)).Elem()
+	valueType := reflect.TypeOf((*V)(nil)).Elem()
+	for _, e := range entries {
+		k, kok := convert(e[0], keyType)
+		v, vok := convert(e[1], valueType)
+		if !kok || !vok {
+			return false
+		}
+		m.Set(k.Interface().(K), v.Interface().(V))
+	}
+	return true
 }
 
 func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
