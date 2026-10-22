@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lastIndexOf` position
 - **`process`:** `stdout.columns` / `rows` / `getWindowSize()` (and `stderr`),
   `stdin.setRawMode` / `isRaw` (undone at exit), `umask`, on Linux, macOS, FreeBSD and Windows
+- **`node:readline`:** `emitKeypressEvents` and `'keypress'` events (Node's key decoder)
+- **`node:child_process`:** `spawn` `detached`, `child.unref()` / `ref()`
+- **`node:dgram`:** multicast (`addMembership` / `dropMembership`, `setMulticastInterface`), and
+  `setBroadcast` / `setTTL` / `setMulticastTTL` / `setMulticastLoopback` take effect (they were
+  accepted and ignored)
+- **Errors:** `err.errno` and `util.getSystemErrorName` / `Message` / `Map` use Node's numbers for
+  the target OS (libuv's table: `ENOENT` is `-4058` on Windows, `ECONNREFUSED` `-61` on macOS) and
+  libuv's messages; `getSystemErrorMap` has all 85 entries in Node's order
 
 ### Fixed
 

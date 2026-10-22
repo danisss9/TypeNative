@@ -1232,5 +1232,6 @@ export function streamListenerTypes(nodes: any[]): string[] {
   const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
   if (name === 'data') return ['interface{}'];
   if (name === 'error') return ['interface{}'];
+  if (name === 'keypress') return ['string', '*TnKey'];
   return [];
 }

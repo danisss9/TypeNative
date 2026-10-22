@@ -255,31 +255,13 @@ func tnArgEntries(v interface{}) [][2]interface{} {
 
 // --- system errors ---
 
-var tnSystemErrors = map[string]syscall.Errno{
-	"E2BIG": syscall.E2BIG, "EACCES": syscall.EACCES, "EADDRINUSE": syscall.EADDRINUSE, "EADDRNOTAVAIL": syscall.EADDRNOTAVAIL,
-	"EAFNOSUPPORT": syscall.EAFNOSUPPORT, "EAGAIN": syscall.EAGAIN, "EALREADY": syscall.EALREADY, "EBADF": syscall.EBADF,
-	"EBUSY": syscall.EBUSY, "ECANCELED": syscall.ECANCELED, "ECONNABORTED": syscall.ECONNABORTED, "ECONNREFUSED": syscall.ECONNREFUSED,
-	"ECONNRESET": syscall.ECONNRESET, "EDESTADDRREQ": syscall.EDESTADDRREQ, "EEXIST": syscall.EEXIST, "EFAULT": syscall.EFAULT,
-	"EFBIG": syscall.EFBIG, "EHOSTUNREACH": syscall.EHOSTUNREACH, "EINTR": syscall.EINTR, "EINVAL": syscall.EINVAL,
-	"EIO": syscall.EIO, "EISCONN": syscall.EISCONN, "EISDIR": syscall.EISDIR, "ELOOP": syscall.ELOOP, "EMFILE": syscall.EMFILE,
-	"EMLINK": syscall.EMLINK, "EMSGSIZE": syscall.EMSGSIZE, "ENAMETOOLONG": syscall.ENAMETOOLONG, "ENETDOWN": syscall.ENETDOWN,
-	"ENETUNREACH": syscall.ENETUNREACH, "ENFILE": syscall.ENFILE, "ENOBUFS": syscall.ENOBUFS, "ENODEV": syscall.ENODEV,
-	"ENOENT": syscall.ENOENT, "ENOMEM": syscall.ENOMEM, "ENOSPC": syscall.ENOSPC, "ENOSYS": syscall.ENOSYS,
-	"ENOTCONN": syscall.ENOTCONN, "ENOTDIR": syscall.ENOTDIR, "ENOTEMPTY": syscall.ENOTEMPTY, "ENOTSOCK": syscall.ENOTSOCK,
-	"ENOTSUP": syscall.ENOTSUP, "ENXIO": syscall.ENXIO, "EPERM": syscall.EPERM, "EPIPE": syscall.EPIPE,
-	"EPROTO": syscall.EPROTO, "EPROTONOSUPPORT": syscall.EPROTONOSUPPORT, "EPROTOTYPE": syscall.EPROTOTYPE,
-	"ERANGE": syscall.ERANGE, "EROFS": syscall.EROFS, "ESPIPE": syscall.ESPIPE, "ESRCH": syscall.ESRCH,
-	"ETIMEDOUT": syscall.ETIMEDOUT, "ETXTBSY": syscall.ETXTBSY, "EXDEV": syscall.EXDEV,
-}
-
 func tnSystemErrorEntry(errno float64) (string, string, bool) {
 	if errno >= 0 || errno != float64(int64(errno)) {
 		panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"err\\" is out of range. It must be a negative integer. Received "+TnNumStr(errno)))
 	}
-	target := syscall.Errno(int64(-errno))
-	for name, e := range tnSystemErrors {
-		if e == target {
-			return name, e.Error(), true
+	for _, e := range tnUvErrorList {
+		if tnUvErrnos[e[0]] == errno {
+			return e[0], e[1], true
 		}
 	}
 	return "", "", false
@@ -303,14 +285,8 @@ func TnGetSystemErrorMessage(errno float64) string {
 
 func TnGetSystemErrorMap() *TnMap[float64, []string] {
 	m := TnNewMap[float64, []string]()
-	names := make([]string, 0, len(tnSystemErrors))
-	for name := range tnSystemErrors {
-		names = append(names, name)
-	}
-	sort.Slice(names, func(i, j int) bool { return tnSystemErrors[names[i]] < tnSystemErrors[names[j]] })
-	for _, name := range names {
-		e := tnSystemErrors[name]
-		m.Set(-float64(e), []string{name, e.Error()})
+	for _, e := range tnUvErrorList {
+		m.Set(tnUvErrnos[e[0]], []string{e[0], e[1]})
 	}
 	return m
 }
@@ -566,8 +542,8 @@ export function registerUtilExtra(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeUtilExtra',
-    ['fmt', 'os', 'reflect', 'regexp', 'sort', 'strconv', 'strings', 'syscall', 'unsafe'],
-    ['nodeUtil', 'dynamic', 'orderedMap', 'error', 'eventLoop', 'nodeEvents', 'fsErrors'],
+    ['fmt', 'os', 'reflect', 'regexp', 'sort', 'strconv', 'strings', 'unsafe'],
+    ['nodeUtil', 'dynamic', 'orderedMap', 'error', 'eventLoop', 'nodeEvents', 'fsErrors', 'uvErrno'],
     utilExtraHelper
   );
   const use = () => r.helper('nodeUtilExtra');

@@ -12,6 +12,7 @@ type tnSpawnOptions struct {
 	input    []byte
 	stdio    string
 	encoding string
+	detached bool
 }
 
 // Environment entries from an env option (records, objects, process.env)
@@ -85,6 +86,9 @@ func tnSpawnOpts(options []interface{}) tnSpawnOptions {
 	if e, ok := TnGet(opts, "encoding").(string); ok {
 		o.encoding = e
 	}
+	if d, ok := TnGet(opts, "detached").(bool); ok {
+		o.detached = d
+	}
 	return o
 }
 
@@ -103,6 +107,9 @@ func tnCommand(file string, args []string, o tnSpawnOptions) *exec.Cmd {
 	cmd.Dir = o.cwd
 	if o.env != nil {
 		cmd.Env = o.env
+	}
+	if o.detached {
+		tnDetach(cmd)
 	}
 	return cmd
 }
@@ -251,6 +258,8 @@ type TnChildProcess struct {
 	spawnfile  string
 	// IPC state of forked children (node:cluster / fork)
 	ipc interface{}
+	// whether the child keeps the event loop alive (unref() drops it)
+	refHeld bool
 }
 
 func (cp *TnChildProcess) Get_stdin() *TnStream       { return cp.stdin }
@@ -261,6 +270,21 @@ func (cp *TnChildProcess) Get_exitCode() interface{}  { return cp.exitCode }
 func (cp *TnChildProcess) Get_signalCode() interface{} { return cp.signalCode }
 func (cp *TnChildProcess) Get_killed() bool           { return cp.killed }
 func (cp *TnChildProcess) Get_spawnfile() string      { return cp.spawnfile }
+
+// unref(): the parent can exit while the child runs; ref() undoes it
+func (cp *TnChildProcess) unref() {
+	if cp.refHeld {
+		cp.refHeld = false
+		TnLoopUnref()
+	}
+}
+
+func (cp *TnChildProcess) ref() {
+	if !cp.refHeld && cp.exitCode == nil && cp.cmd != nil && cp.cmd.Process != nil {
+		cp.refHeld = true
+		TnLoopRef()
+	}
+}
 
 func (cp *TnChildProcess) kill(signal ...interface{}) bool {
 	if cp.cmd == nil || cp.cmd.Process == nil || cp.exitCode != nil {
@@ -332,6 +356,7 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 		return cp
 	}
 	cp.pid = float64(cmd.Process.Pid)
+	cp.refHeld = true
 	TnLoopRef()
 	TnLoopPost(func() { cp.emit("spawn") })
 	go func() {
@@ -339,7 +364,7 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 		err := cmd.Wait()
 		status, _ := tnExitStatus(err)
 		TnLoopPost(func() {
-			defer TnLoopUnref()
+			defer cp.unref()
 			var code interface{} = status
 			var signal interface{}
 			if cp.killed {
@@ -487,13 +512,35 @@ function isFunctionArg(node: any, type: string): boolean {
   return !!node && (node.kind === 'ArrowFunction' || node.kind === 'FunctionExpression' || type.startsWith('func('));
 }
 
+// detached: a new session on Unix (setsid, as libuv does), a detached process
+// in a new process group on Windows
+const unixDetachHelper = `func tnDetach(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setsid = true
+}`;
+
+const windowsDetachHelper = `func tnDetach(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+	cmd.SysProcAttr.CreationFlags |= 0x8 | 0x200
+}`;
+
 export function registerChildProcess(r: NodeRegistry): void {
   defineModule(r, 'child_process');
+  for (const goos of ['linux', 'darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly', 'solaris', 'illumos', 'aix']) {
+    defineHelper(r, `nodeChildOS@${goos}`, ['os/exec', 'syscall'], [], unixDetachHelper);
+  }
+  defineHelper(r, 'nodeChildOS@windows', ['os/exec', 'syscall'], [], windowsDetachHelper);
+  defineHelper(r, 'nodeChildOS@other', ['os/exec'], [], 'func tnDetach(cmd *exec.Cmd) {}');
   defineHelper(
     r,
     'nodeChild',
     ['bytes', 'errors', 'fmt', 'io', 'io/fs', 'os', 'os/exec', 'reflect', 'runtime', 'strings', 'sync', 'unsafe'],
-    ['nodeStream', 'fsErrors', 'buffer', 'dynamic', 'nodeInvoke', 'eventLoop', 'promise'],
+    ['nodeStream', 'fsErrors', 'buffer', 'dynamic', 'nodeInvoke', 'eventLoop', 'promise', 'nodeChildOS@os'],
     childHelper
   );
   defineClass(
@@ -501,7 +548,7 @@ export function registerChildProcess(r: NodeRegistry): void {
     'child_process.ChildProcess',
     '*TnChildProcess',
     'class',
-    'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; emit=bool; kill=bool',
+    'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; emit=bool; kill=bool; ref=; unref=',
     '',
     'stdin=*TnStream; stdout=*TnStream; stderr=*TnStream; pid=float64; exitCode=interface{}; signalCode=interface{}; killed=bool; spawnfile=string',
     ''

@@ -1564,6 +1564,8 @@ declare module 'node:child_process' {
       shell?: boolean | string;
       stdio?: StdioOption | StdioOption[];
       input?: string | Uint8Array;
+      /** spawn: run the child in its own session / process group, so it can outlive the parent (with unref()) */
+      detached?: boolean;
     }
     interface ExecException extends Error {
       code?: number;
@@ -1594,6 +1596,9 @@ declare module 'node:child_process' {
       readonly spawnfile: string;
       readonly connected: boolean;
       kill(signal?: string | number): boolean;
+      /** The parent no longer waits for the child */
+      unref(): void;
+      ref(): void;
       send(message: any, callback?: (error: Error | null) => void): boolean;
       disconnect(): void;
     }
@@ -1656,6 +1661,17 @@ declare module 'node:readline' {
     function moveCursor(stream: Writable, dx: number, dy: number, callback?: () => void): boolean;
     function clearLine(stream: Writable, dir: Direction, callback?: () => void): boolean;
     function clearScreenDown(stream: Writable, callback?: () => void): boolean;
+    /** A decoded key ('keypress' events); missing fields are "" */
+    interface Key {
+      sequence?: string;
+      name?: string;
+      ctrl?: boolean;
+      meta?: boolean;
+      shift?: boolean;
+      code?: string;
+    }
+    /** Makes the stream emit 'keypress' (str, key) events (str is "" for escape sequences) */
+    function emitKeypressEvents(stream: Readable, readlineInterface?: Interface): void;
     const promises: typeof import('node:readline/promises');
   }
   export = readline;
@@ -2246,6 +2262,10 @@ declare module 'node:dgram' {
       setTTL(ttl: number): number;
       setMulticastTTL(ttl: number): number;
       setMulticastLoopback(flag: boolean): boolean;
+      setMulticastInterface(multicastInterface: string): void;
+      /** Joins a multicast group (an unbound socket binds first) */
+      addMembership(multicastAddress: string, multicastInterface?: string): void;
+      dropMembership(multicastAddress: string, multicastInterface?: string): void;
       setRecvBufferSize(size: number): void;
       setSendBufferSize(size: number): void;
     }

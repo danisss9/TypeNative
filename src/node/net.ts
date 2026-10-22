@@ -7,11 +7,14 @@ import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setRes
 import { STREAM_METHODS, STREAM_GETTERS, streamListenerTypes } from './stream.js';
 
 const netErrorsHelper = `// Node-style network errors: connect ECONNREFUSED 127.0.0.1:80
-var tnNetErrnos = map[string]float64{
-	"ECONNREFUSED": -111, "EADDRINUSE": -98, "EADDRNOTAVAIL": -99, "ECONNRESET": -104, "EPIPE": -32,
-	"ETIMEDOUT": -110, "EACCES": -13, "ENOTFOUND": -3008, "EAI_AGAIN": -3001, "ENETUNREACH": -101,
-	"EHOSTUNREACH": -113, "ECONNABORTED": -103, "EINVAL": -22, "ENOENT": -2,
-}
+// Node's errno numbers, plus ENOTFOUND (getaddrinfo's EAI_NONAME)
+var tnNetErrnos = func() map[string]float64 {
+	m := map[string]float64{"ENOTFOUND": -3008}
+	for code, errno := range tnUvErrnos {
+		m[code] = errno
+	}
+	return m
+}()
 
 func tnNetCode(err error) string {
 	var dnsErr *net.DNSError
@@ -1054,7 +1057,7 @@ func (b *TnBlockList) Get_rules() []string {
 
 export function registerNet(r: NodeRegistry): void {
   defineModule(r, 'net');
-  defineHelper(r, 'netErrors', ['errors', 'net', 'os', 'reflect', 'strconv', 'strings', 'syscall'], ['error', 'dynamic'], netErrorsHelper);
+  defineHelper(r, 'netErrors', ['errors', 'net', 'os', 'reflect', 'strconv', 'strings', 'syscall'], ['error', 'dynamic', 'uvErrno'], netErrorsHelper);
   defineHelper(
     r,
     'nodeNet',

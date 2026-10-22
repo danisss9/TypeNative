@@ -228,6 +228,270 @@ func TnClearLine(stream interface{}, dir float64, rest ...interface{}) bool {
 func TnClearScreenDown(stream interface{}, rest ...interface{}) bool {
 	return tnCursorWrite(stream, "\\x1b[0J", tnCursorCallback(rest))
 }`;
+// readline.emitKeypressEvents(stream): 'keypress' (str, key) events decoded
+// from the stream's data, a port of Node's emitKeys
+const keypressHelper = `// A decoded key; "" stands for undefined
+type TnKey struct {
+	sequence string
+	name     string
+	ctrl     bool
+	meta     bool
+	shift    bool
+	code     string
+}
+
+type tnKeyDecoder struct {
+	buf   []rune // -1 is the escape timeout ('' in Node)
+	timer *TnTimeout
+}
+
+var tnKeyDecoders = map[*TnStream]*tnKeyDecoder{}
+
+func TnEmitKeypressEvents(stream interface{}, rest ...interface{}) {
+	sl, ok := stream.(tnStreamLike)
+	if !ok || TnIsNil(stream) {
+		return
+	}
+	s := sl.tnStream()
+	if tnKeyDecoders[s] != nil {
+		return
+	}
+	d := &tnKeyDecoder{}
+	tnKeyDecoders[s] = d
+	var pending []byte
+	s.TnEventEmitter.on("data", func(chunk interface{}) {
+		if s.listenerCount("keypress") == 0 {
+			return
+		}
+		switch c := chunk.(type) {
+		case string:
+			pending = append(pending, c...)
+		case []byte:
+			pending = append(pending, c...)
+		default:
+			pending = append(pending, TnJSString(chunk)...)
+		}
+		// whole UTF-8 characters only, as a StringDecoder would
+		text := []rune{}
+		for len(pending) > 0 && utf8.FullRune(pending) {
+			r, size := utf8.DecodeRune(pending)
+			text = append(text, r)
+			pending = pending[size:]
+		}
+		if len(text) == 0 {
+			return
+		}
+		if d.timer != nil {
+			TnClearTimeout(d.timer)
+			d.timer = nil
+		}
+		for _, r := range text {
+			d.feed(s, r)
+		}
+		// a lone ESC at the end is the Escape key unless more follows soon
+		if text[len(text)-1] == 0x1b {
+			d.timer = TnSetTimeout(500, func() {
+				d.timer = nil
+				if len(d.buf) > 0 {
+					d.feed(s, -1)
+				}
+			})
+		}
+	})
+	s.listening("data")
+}
+
+func (d *tnKeyDecoder) feed(s *TnStream, r rune) {
+	d.buf = append(d.buf, r)
+	for len(d.buf) > 0 {
+		key, str, emit, n := tnDecodeKey(d.buf)
+		if n == 0 {
+			return
+		}
+		d.buf = d.buf[n:]
+		if emit {
+			s.emit("keypress", str, key)
+		}
+	}
+}
+
+type tnKeyNeedMore struct{}
+
+var tnKeyTilde = regexp.MustCompile("^(?:(\\\\d\\\\d?)(?:;(\\\\d))?([~^$])|(\\\\d{3}~))$")
+var tnKeyLetter = regexp.MustCompile("^((\\\\d;)?(\\\\d))?([A-Za-z])$")
+
+var tnKeyCodes = map[string]string{
+	"[P": "f1", "[Q": "f2", "[R": "f3", "[S": "f4",
+	"OP": "f1", "OQ": "f2", "OR": "f3", "OS": "f4",
+	"[11~": "f1", "[12~": "f2", "[13~": "f3", "[14~": "f4",
+	"[200~": "paste-start", "[201~": "paste-end",
+	"[[A": "f1", "[[B": "f2", "[[C": "f3", "[[D": "f4", "[[E": "f5",
+	"[15~": "f5", "[17~": "f6", "[18~": "f7", "[19~": "f8", "[20~": "f9", "[21~": "f10", "[23~": "f11", "[24~": "f12",
+	"[A": "up", "[B": "down", "[C": "right", "[D": "left", "[E": "clear", "[F": "end", "[H": "home",
+	"OA": "up", "OB": "down", "OC": "right", "OD": "left", "OE": "clear", "OF": "end", "OH": "home",
+	"[1~": "home", "[2~": "insert", "[3~": "delete", "[4~": "end", "[5~": "pageup", "[6~": "pagedown",
+	"[[5~": "pageup", "[[6~": "pagedown", "[7~": "home", "[8~": "end",
+	"[a": "up shift", "[b": "down shift", "[c": "right shift", "[d": "left shift", "[e": "clear shift",
+	"[2$": "insert shift", "[3$": "delete shift", "[5$": "pageup shift", "[6$": "pagedown shift", "[7$": "home shift", "[8$": "end shift",
+	"Oa": "up ctrl", "Ob": "down ctrl", "Oc": "right ctrl", "Od": "left ctrl", "Oe": "clear ctrl",
+	"[2^": "insert ctrl", "[3^": "delete ctrl", "[5^": "pageup ctrl", "[6^": "pagedown ctrl", "[7^": "home ctrl", "[8^": "end ctrl",
+	"[Z": "tab shift",
+}
+
+// One key from the start of in: n is how many characters it used (0 when
+// it needs more input)
+func tnDecodeKey(in []rune) (key *TnKey, str string, emit bool, n int) {
+	defer func() {
+		if x := recover(); x != nil {
+			if _, ok := x.(tnKeyNeedMore); !ok {
+				panic(x)
+			}
+			key, str, emit, n = nil, "", false, 0
+		}
+	}()
+	i := 0
+	s := ""
+	next := func() rune {
+		if i >= len(in) {
+			panic(tnKeyNeedMore{})
+		}
+		r := in[i]
+		i++
+		if r >= 0 {
+			s += string(r)
+		}
+		return r
+	}
+	isDigit := func(r rune) bool { return r >= '0' && r <= '9' }
+	k := &TnKey{}
+	ch := next()
+	escaped := false
+	if ch == 0x1b {
+		escaped = true
+		ch = next()
+		if ch == 0x1b {
+			ch = next()
+		}
+	}
+	if escaped && (ch == 'O' || ch == '[') {
+		code := string(ch)
+		modifier := 0
+		if ch == 'O' {
+			ch = next()
+			if isDigit(ch) {
+				modifier = int(ch-'0') - 1
+				ch = next()
+			}
+			if ch >= 0 {
+				code += string(ch)
+			}
+		} else {
+			ch = next()
+			if ch == '[' {
+				code += "["
+				ch = next()
+			}
+			// the command starts at ch (Node: s.length - 1)
+			cmdStart := len(s) - 1
+			if ch >= 0 {
+				cmdStart = len(s) - utf8.RuneLen(ch)
+			}
+			if isDigit(ch) {
+				ch = next()
+				if isDigit(ch) {
+					ch = next()
+					if isDigit(ch) {
+						ch = next()
+					}
+				}
+			}
+			if ch == ';' {
+				ch = next()
+				if isDigit(ch) {
+					next()
+				}
+			}
+			cmd := s[cmdStart:]
+			if m := tnKeyTilde.FindStringSubmatch(cmd); m != nil {
+				if m[4] != "" {
+					code += m[4]
+				} else {
+					code += m[1] + m[3]
+					modifier = 0
+					if m[2] != "" {
+						modifier, _ = strconv.Atoi(m[2])
+						modifier--
+					}
+				}
+			} else if m := tnKeyLetter.FindStringSubmatch(cmd); m != nil {
+				code += m[4]
+				modifier = 0
+				if m[3] != "" {
+					modifier, _ = strconv.Atoi(m[3])
+					modifier--
+				}
+			} else {
+				code += cmd
+			}
+		}
+		k.ctrl = modifier&4 != 0
+		k.meta = modifier&10 != 0
+		k.shift = modifier&1 != 0
+		k.code = code
+		if named, ok := tnKeyCodes[code]; ok {
+			parts := strings.SplitN(named, " ", 2)
+			k.name = parts[0]
+			if len(parts) == 2 && parts[1] == "shift" {
+				k.shift = true
+			} else if len(parts) == 2 {
+				k.ctrl = true
+			}
+		} else {
+			k.name = "undefined"
+		}
+	} else {
+		named := true
+		switch {
+		case ch == '\\r':
+			k.name, k.meta = "return", escaped
+		case ch == '\\n':
+			k.name, k.meta = "enter", escaped
+		case ch == '\\t':
+			k.name, k.meta = "tab", escaped
+		case ch == '\\b' || ch == 0x7f:
+			k.name, k.meta = "backspace", escaped
+		case ch == 0x1b:
+			k.name, k.meta = "escape", escaped
+		case ch == ' ':
+			k.name, k.meta = "space", escaped
+		case !escaped && ch >= 0 && ch <= 0x1a:
+			k.name, k.ctrl = string(rune(ch+'a'-1)), true
+		case isDigit(ch) || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'):
+			k.name = strings.ToLower(string(ch))
+			k.shift = ch >= 'A' && ch <= 'Z'
+			k.meta = escaped
+		case escaped:
+			if ch < 0 {
+				k.name = "escape"
+			} else {
+				named = false
+			}
+			k.meta = true
+		default:
+			named = false
+		}
+		if !named && !escaped {
+			k.sequence = s
+			// a single unnamed character, e.g. "."
+			return k, s, utf8.RuneCountInString(s) == 1, i
+		}
+	}
+	k.sequence = s
+	if escaped {
+		return k, "", s != "", i
+	}
+	return k, s, s != "", i
+}`;
 export function registerReadline(r) {
     defineModule(r, 'readline');
     defineModule(r, 'readline/promises');
@@ -280,6 +544,13 @@ export function registerReadline(r) {
         return event && event.kind === 'StringLiteral' && event.text === 'line' ? ['string'] : [];
     };
     r.paramTypers['readline.Interface#once'] = r.paramTypers['readline.Interface#on'];
+    defineHelper(r, 'nodeKeypress', ['regexp', 'strconv', 'strings', 'unicode/utf8'], ['nodeStream', 'nodeEvents', 'timerWait'], keypressHelper);
+    defineClass(r, 'readline.Key', '*TnKey', 'class', '', 'sequence=string; name=string; ctrl=bool; meta=bool; shift=bool; code=string', '', '');
+    r.functions['readline.emitKeypressEvents'] = (call) => {
+        r.helper('nodeKeypress');
+        return `TnEmitKeypressEvents(${call.args.join(', ')})`;
+    };
+    r.results['readline.emitKeypressEvents'] = '';
     defineHelper(r, 'nodeReadlineCursor', [], ['nodeStream', 'nodeInvoke', 'eventLoop'], cursorHelper);
     const cursorFns = {
         cursorTo: 'TnCursorTo',
