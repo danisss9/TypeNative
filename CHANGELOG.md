@@ -87,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[...map]`, `map.entries()`** and **`{ ...record, k: v }`** (such as `{ ...process.env }`)
   did not build
 - **`+` on two dynamic values** concatenates when one is a string (`'a' + 1` gave `1`)
+- **Worker / IPC messages and `v8.deserialize`:** objects keep their key order (they arrived
+  sorted), records arrive as plain objects rather than `Map`s, and both convert to typed
+  `Record` fields
 - **Optional method calls as statements** (`port?.postMessage(x)`) on `void` methods, and
   `process.send?.(…)` / `process.disconnect?.()`, did not build
 - **Dates:** local getters on `new Date(ms)` used UTC

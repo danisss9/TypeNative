@@ -12,6 +12,8 @@ const worker = new Worker(new URL('./worker-entry-helper.ts', import.meta.url), 
 worker.once('message', (m: any) => {
   assert(m.result === 42 && m.mainThread === false && m.count === 1, `worker reply: ${JSON.stringify(m)}`);
   assert(m.threadId === worker.threadId, 'threadId');
+  assert(JSON.stringify(m).startsWith('{"result":42,"mainThread":false,"threadId":'), `messages keep key order: ${JSON.stringify(m)}`);
+  assert(JSON.stringify(m.tally) === '{"zeta":26,"alpha":1}', `records arrive in order: ${JSON.stringify(m.tally)}`);
   worker.terminate();
 
   const child = fork('./fork-entry-helper.ts', ['one', 'two']);
