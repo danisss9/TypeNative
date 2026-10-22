@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TypeError`s for circular structures and bigints
 - **`JSON.parse`:** reviver, and a `SyntaxError` for invalid JSON (it returned `null`)
 - **Arrays:** writing past the end grows the array
+- **Classes:** polymorphic `this` return types (fluent builders), and `obj[key]` on class
+  instances and typed objects
+- **Generators:** iterator helpers (`map`, `filter`, `take`, `drop`, `flatMap`, `toArray`,
+  `forEach`, `some`, `every`, `find`, `reduce`), `Iterator.from` and `next()`
+- **Weak references:** `WeakRef` / `FinalizationRegistry`
 - **`Date`:**
   - `new Date(string)` (ISO and the formats `toString` / `toUTCString` produce), and
     `new Date(y, m, d, …)` in local time
@@ -43,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)
 - **Maps:** `[...map.keys()]` / `[...map.values()]` build
+- **Optional chains:** comparing an optional chain or an `any` value with `null` / `undefined`
+  sees a nil pointer inside it
 - **`length` fields:** `obj.length` on an object with its own `length` field read it (it compiled
   to Go's `len()`)
 - **Error casts:** `(err as Error)` works on instances of custom error classes

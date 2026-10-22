@@ -52,6 +52,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `delete` operator                       |   ✅    | [syntax-delete.ts](conformance/syntax-delete.ts)                                 | `delete o.key` on records                                                |
 | Computed keys                           |   ✅    | [syntax-computed-keys.ts](conformance/syntax-computed-keys.ts)                   | Computed keys become map entries; `o.name` reads lower to `.Get("name")` |
 | Records / dictionaries                  |   ✅    | [syntax-in-operator.ts](conformance/syntax-in-operator.ts)                       | `Record<K, V>` and objects indexed by key → Go maps; so are literals with keys that aren't identifiers (`{ 'Content-Type': … }`, [lib-node-http-server.ts](conformance/lib-node-http-server.ts)) |
+| Reading a missing key of a `Record` / `Map` of primitives (`rec[k] === undefined`) | ❌ | — | Gives the value type's zero value (`""`, `0`), so the comparison is `false`; test with `k in rec` / `map.has(k)` |
 | Tuples                                  |   ✅    | [syntax-tuples.ts](conformance/syntax-tuples.ts)                                 | `[string, number]` fixed-length arrays                                   |
 | Top-level / module-scope variables      |   ✅    | [syntax-top-level-scope.ts](conformance/syntax-top-level-scope.ts)               | Functions see main-file top-level variables                              |
 | Numeric separators                      |   ✅    | [syntax-numeric-separators.ts](conformance/syntax-numeric-separators.ts)         | `1_000_000`                                                              |
@@ -142,7 +143,8 @@ declared there fails the type check before it reaches the transpiler. The
 | `this` parameter (`function f(this: T)`)      |   ✅    | [syntax-this-parameter.ts](conformance/syntax-this-parameter.ts)             | Erased                                                                              |
 | `arguments` object                            |   ✅    | [syntax-arguments.ts](conformance/syntax-arguments.ts)                       | Functions reading it take extra arguments variadically (`[]interface{}`)            |
 | Top-level `await` | ✅ | — | In modules (files with an `import` / `export`) |
-| Generator `next(value)` / `return()` / `throw()` | ❌ | — | Generators are goroutines feeding a channel: only iteration (`for...of`, spread) is lowered |
+| Generator `next()` | ✅ | [lib-iterator-helpers.ts](conformance/lib-iterator-helpers.ts) | `{ value, done }` |
+| Generator `next(value)` (sending a value in) / `return()` / `throw()` | ❌ | — | Generators are goroutines feeding a channel: values only flow out |
 | `fn.call` / `fn.apply` / `fn.bind` | ✅ | [syntax-function-values.ts](conformance/syntax-function-values.ts) | Function declarations and function values; `apply` spreads the array over the parameters; `thisArg` is ignored (methods taken from an object are already bound in Go) |
 | `fn.name` / `fn.length` | ✅ | [syntax-function-values.ts](conformance/syntax-function-values.ts) | Known at compile time for declared functions, classes and function variables |
 | `eval` / `new Function(…)` | 🚫 | — | Compile and run JavaScript at runtime: needs a JavaScript engine |
@@ -180,8 +182,8 @@ declared there fails the type check before it reaches the transpiler. The
 | Inherited getters / setters, `super.x` on accessors | ✅ | [syntax-class-accessor-inheritance.ts](conformance/syntax-class-accessor-inheritance.ts) | Accessors are copied onto subclasses like methods |
 | Object-literal setters (`set x(v) {}`) | ✅ | [syntax-object-setters.ts](conformance/syntax-object-setters.ts) | A `Set_x` closure field: `o.x = v` calls it |
 | Mixins (class factories, `return class extends Base {}`, `class extends f()`) | ❌ | — | `Unsupported syntax: ClassExpression` outside `const C = class {}` |
-| Polymorphic `this` return types (fluent chains) | ❌ | — | `this` types lower to `interface{}`, so a chained call fails the Go build |
-| Dynamic keys on class instances (`inst[key]`) | ❌ | — | Struct pointers can't be indexed (the Go build fails); records and `any` objects can |
+| Polymorphic `this` return types (fluent chains) | ✅ | [syntax-polymorphic-this.ts](conformance/syntax-polymorphic-this.ts) | `this` is the class; methods inherited by a subclass return the subclass |
+| Dynamic keys on class instances and typed objects (`inst[key]`) | ✅ | [syntax-instance-keys.ts](conformance/syntax-instance-keys.ts) | A `switch` over the declared fields and getters (reads and writes); through `any`, reflection |
 | Declaration merging (interface + interface, enum + enum, class + interface) | ✅ | [syntax-declaration-merging.ts](conformance/syntax-declaration-merging.ts) | Merged within one scope; an interface adds its properties to a same-named class as fields; namespace + function merging works too |
 | Prototype mutation (`C.prototype.m = …`, `Object.setPrototypeOf`, `util.inherits`) | 🚫 | — | Classes are static Go structs with fixed method sets |
 
@@ -423,7 +425,8 @@ Every standard-library API TypeNative ports, split by module. Per
 | Change-preserving copies (`toSorted` / `toReversed` / `with`)               |   ✅    | [lib-array-copies.ts](conformance/lib-array-copies.ts)                       | Clone, then sort / reverse / set                                              |
 | `toSpliced`                                                                 |   ✅    | [lib-array-to-spliced.ts](conformance/lib-array-to-spliced.ts)               | `slices.Concat` of the kept parts                                             |
 | `Array.of` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | |
-| `Array.fromAsync`; iterator helpers (`Iterator.from`, `map` / `filter` / `take` / `drop` / `toArray` on iterators) | ❌ | — | Not declared |
+| Iterator helpers on generators (`map` / `filter` / `flatMap` / `take` / `drop` / `toArray` / `forEach` / `some` / `every` / `find` / `reduce`), `Iterator.from(array)` | ✅ | [lib-iterator-helpers.ts](conformance/lib-iterator-helpers.ts) | Lazy (works on infinite generators): one goroutine per stage |
+| `Array.fromAsync` | ❌ | — | Not declared |
 | `[...map.keys()]` / `[...map.values()]` | ✅ | [lib-group-by.ts](conformance/lib-group-by.ts) | |
 
 ### `Map` / `Set`
@@ -519,7 +522,7 @@ See [Async & timing](#async--timing): `Promise` (constructor, `.then` / `.catch`
 | `Error.captureStackTrace` / `Error.isError` / `DOMException` | ❌ | — | Not declared |
 | `Symbol.for` / `Symbol.keyFor` / `description` | ✅ | [lib-builtins-statics.ts](conformance/lib-builtins-statics.ts) | A global registry by key |
 | `[Symbol.asyncIterator]()` methods; `Symbol.toPrimitive` / `hasInstance` / `toStringTag` | ❌ | — | Only `Symbol()`, `Symbol.iterator` and `Symbol.dispose` are lowered |
-| `WeakRef` / `FinalizationRegistry` | ❌ | — | Feasible on Go's `weak` package and `runtime.AddCleanup` |
+| `WeakRef` / `FinalizationRegistry` | ✅ | [lib-weak-refs.ts](conformance/lib-weak-refs.ts) | Go's `weak` package and `runtime.AddCleanup`; cleanup callbacks run on the event loop. Targets must be objects (pointers) |
 | `Reflect` (`ownKeys` / `has` / `get` / `set` / …) | ❌ | — | Feasible over the existing dynamic property access |
 | `Proxy` | 🚫 | — | Intercepting every property access on static Go structs; a `Proxy` limited to dynamic (`any`) objects would be feasible |
 | `Intl` (`NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`, `Segmenter`), `toLocaleString` | ❌ | — | Needs locale data (vendored `golang.org/x/text`, or hand-written `en-US` first) |
@@ -1284,16 +1287,14 @@ These follow from compiling to a native Go binary, and won't change:
    `Object.is` / `groupBy`, `Array.of`, and the `Number` / `Math` / `String` / `BigInt` /
    `Symbol` additions. Remaining:
    - key order of `JSON.parse` objects
-   - iterator helpers, `Array.fromAsync`
+   - `Array.fromAsync`
    - `Uint8Array` base64 / hex, `BigInt64Array`
    - `localeCompare` with locales (needs `Intl`)
-3. **Language depth:**
+3. **Language depth.** Done: polymorphic `this`, `inst[key]` on class instances,
+   `WeakRef` / `FinalizationRegistry`, iterator helpers and generator `next()`. Remaining:
    - mixins
-   - polymorphic `this`
    - field and accessor decorators
-   - `inst[key]` on class instances
-   - generator `next(value)`
-   - `WeakRef` / `FinalizationRegistry`
+   - generator `next(value)` / `return()` / `throw()`
 4. **Node gaps:**
    - the per-OS helpers above
    - second entry points
