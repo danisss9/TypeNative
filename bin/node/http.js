@@ -326,8 +326,9 @@ func tnInfoSocket(local net.Addr, remote string) *TnSocket {
 
 // One operation of a response, applied by the handler goroutine
 type tnResOp struct {
-	status int
-	header http.Header
+	status  int
+	header  http.Header
+	trailer http.Header
 	data   []byte
 	end    bool
 	done   func(err error)
@@ -346,6 +347,7 @@ type TnServerResponse struct {
 	mu            sync.Mutex
 	ops           []tnResOp
 	signal        chan struct{}
+	trailer       http.Header
 }
 
 func (res *TnServerResponse) Get_headersSent() bool       { return res.headersSent }
@@ -399,6 +401,19 @@ func (res *TnServerResponse) appendHeader(name string, value interface{}) *TnSer
 	current := tnHeaderStrings(res.store.get(name))
 	res.store.set(name, append(current, tnHeaderStrings(value)...))
 	return res
+}
+
+// addTrailers(headers): sent after a chunked body (Node, too, sends them only
+// without a Content-Length)
+func (res *TnServerResponse) addTrailers(headers interface{}) {
+	if res.trailer == nil {
+		res.trailer = http.Header{}
+	}
+	for _, e := range tnEntries(headers) {
+		for _, v := range tnHeaderStrings(e[1]) {
+			res.trailer.Add(fmt.Sprint(e[0]), v)
+		}
+	}
 }
 
 func (res *TnServerResponse) getHeader(name string) interface{} { return res.store.get(name) }
@@ -493,7 +508,7 @@ func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
 		if !res.headersSent {
 			res.post(res.headerOp())
 		}
-		res.post(tnResOp{end: true, done: func(err error) {
+		res.post(tnResOp{end: true, trailer: res.trailer, done: func(err error) {
 			TnLoopPost(func() { done(nil) })
 		}})
 	}
@@ -685,6 +700,9 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 				w.WriteHeader(op.status)
 				rc.Flush()
 			case op.end:
+				for k, v := range op.trailer {
+					w.Header()[http.TrailerPrefix+k] = v
+				}
 				ended = true
 				op.done(nil)
 			default:
@@ -1397,7 +1415,7 @@ func TnHttpGet(secure bool, args ...interface{}) *TnClientRequest {
 const CLIENT_REQUEST_METHODS = STREAM_METHODS.replace('end=*TnStream', 'end=*TnClientRequest').replace('destroy=*TnStream', 'destroy=*TnClientRequest') +
     '; setHeader=*TnClientRequest; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; getRawHeaderNames=[]string; hasHeader=bool; removeHeader=; flushHeaders=; setTimeout=*TnClientRequest; setNoDelay=; setSocketKeepAlive=; abort=';
 const SERVER_RESPONSE_METHODS = STREAM_METHODS.replace('end=*TnStream', 'end=*TnServerResponse') +
-    '; setHeader=*TnServerResponse; setHeaders=*TnServerResponse; appendHeader=*TnServerResponse; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; hasHeader=bool; removeHeader=; writeHead=*TnServerResponse; flushHeaders=; writeContinue=; setTimeout=*TnServerResponse';
+    '; setHeader=*TnServerResponse; setHeaders=*TnServerResponse; appendHeader=*TnServerResponse; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; hasHeader=bool; removeHeader=; addTrailers=; writeHead=*TnServerResponse; flushHeaders=; writeContinue=; setTimeout=*TnServerResponse';
 function eventName(nodes) {
     const event = nodes[0];
     return event && event.kind === 'StringLiteral' ? String(event.text) : '';

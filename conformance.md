@@ -719,7 +719,9 @@ async function runs synchronously until its first `await`.
 | `generatePrime(Sync)` (`bigint`, `safe`, `add` / `rem`), `checkPrime(Sync)` | ✅ | [lib-node-crypto-sign.ts](conformance/lib-node-crypto-sign.ts) | `math/big`'s Miller-Rabin |
 | `X509Certificate` (`subject`, `issuer`, `subjectAltName`, `validFrom` / `validTo` (+ `Date`s), fingerprints, `serialNumber`, `ca`, `publicKey`, `raw`, `keyUsage`, `checkHost` / `checkIP` / `checkEmail`, `checkIssued`, `verify`, `toString`, `toLegacyObject`) | ✅ | [lib-node-crypto-keys.ts](conformance/lib-node-crypto-keys.ts) | `crypto/x509` |
 | `crypto.subtle` / `webcrypto.subtle`: `digest`, `generateKey`, `importKey` / `exportKey` (`raw`, `spki`, `pkcs8`, `jwk`), `sign` / `verify` (HMAC, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, Ed25519), `encrypt` / `decrypt` (AES-GCM / CBC / CTR, RSA-OAEP), `deriveBits` / `deriveKey` (PBKDF2, HKDF, ECDH, X25519), `wrapKey` / `unwrapKey` | ✅ | [lib-node-crypto-subtle.ts](conformance/lib-node-crypto-subtle.ts) | Key usages are recorded but not enforced |
-| Encrypted private keys (`passphrase` / `cipher`), `rsa-pss` / `dsa` / `dh` / `ed448` / `x448` key types, `secp256k1`, AES-KW, `Certificate` (SPKAC), `hash` streams (`createHash` as a stream) | ❌ | — | Not in Go's standard library, but portable: AES-KW (RFC 3394) and hash streams are small; encrypted PKCS#8 is PBES2 over `pbkdf2` + AES-CBC; `rsa-pss` / `dsa` / `dh` keys and SPKAC are ASN.1 on existing primitives; `secp256k1` / `ed448` / `x448` need vendored curve code |
+| `Hash` / `Hmac` as streams (`write` / `end`, `'readable'`, `pipe` into a hash, `pipeline`, `setEncoding`) | ✅ | [lib-node-crypto-hash-stream.ts](conformance/lib-node-crypto-hash-stream.ts) | A transform that pushes the digest at the end, as in Node; afterwards `hash.digest()` throws and `hmac.digest()` is empty. Only programs that use a hash as a stream carry the stream code |
+| AES key wrap: `id-aes128-wrap` … `id-aes256-wrap-pad` (and the `aes128-wrap` aliases) | ✅ | [lib-node-crypto-keywrap.ts](conformance/lib-node-crypto-keywrap.ts) | RFC 3394 and RFC 5649, checked against the RFC vectors; the whole input goes through one `update()`, as with OpenSSL |
+| Encrypted private keys (`passphrase` / `cipher`), `rsa-pss` / `dsa` / `dh` / `ed448` / `x448` key types, `secp256k1`, `Certificate` (SPKAC) | ❌ | — | Not in Go's standard library, but portable: encrypted PKCS#8 is PBES2 over `pbkdf2` + AES-CBC; `rsa-pss` / `dsa` / `dh` keys and SPKAC are ASN.1 on existing primitives; `secp256k1` / `ed448` / `x448` need vendored curve code |
 
 #### `node:zlib`
 
@@ -775,6 +777,7 @@ async function runs synchronously until its first `await`.
 | API                                                                                                   | Status | Probe                                                                | Notes                                                                                        |
 | ----------------------------------------------------------------------------------------------------- | :----: | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `Readable` (`push`, `read`, `pause` / `resume`, `setEncoding`, `destroy`), `Readable.from`, `for await` | ✅    | [lib-node-stream-readable.ts](conformance/lib-node-stream-readable.ts) | Arrays, strings, Buffers and async generators as sources                                      |
+| `'readable'` events (paused mode), `read()` / `read(size)` | ✅ | [lib-node-stream-readable-event.ts](conformance/lib-node-stream-readable-event.ts) | A last `'readable'` (with `read()` giving `null`) comes before `'end'`; `read()` returns everything buffered, `read(n)` waits for `n` bytes unless the stream ended, and what it returns is also a `'data'` event. Chunk boundaries can differ from Node's read-ahead |
 | `Writable` (`write` / `end` / callbacks, `final`, `'finish'`, write after end)                         |   ✅    | [lib-node-stream-writable.ts](conformance/lib-node-stream-writable.ts) | Strings become Buffers unless `decodeStrings: false` or `objectMode`                          |
 | `Transform` / `PassThrough` / `Duplex`, `pipe` chains, subclasses overriding `_transform` & co.        |   ✅    | [lib-node-stream-transform.ts](conformance/lib-node-stream-transform.ts) | Option methods (`transform`, `flush`, `write`, `final`, `read`) and `_`-overrides both work; `this` inside option methods is not the stream (use the callback) |
 | `pipeline` / `finished` / `stream/promises` / `stream/consumers` (`text`, `json`, `buffer`)           |   ✅    | [lib-node-stream-pipeline.ts](conformance/lib-node-stream-pipeline.ts) | Errors destroy the pipeline and reach the callback / rejection                               |
@@ -862,7 +865,8 @@ async function runs synchronously until its first `await`.
 | `https.createServer({ key, cert })` / `https.request` / `https.get` (`ca`, `rejectUnauthorized`, `servername`, client `key` / `cert`) | ✅ | [lib-node-https.ts](conformance/lib-node-https.ts) | Certificate checks as in [node:tls](#nodetls)                                               |
 | `headers` values                                                                                      |   ✅    | [lib-node-http-client.ts](conformance/lib-node-http-client.ts) | Repeated headers are joined with `, ` (`; ` for `cookie`) — including `set-cookie`, which Node keeps as an array: use `headersDistinct['set-cookie']` |
 | Server `'upgrade'` / `'connect'` (`req, socket, head`) and client `'upgrade'` / `'connect'` events | ✅ | [lib-node-http-upgrade.ts](conformance/lib-node-http-upgrade.ts) | The server hijacks the connection; an upgrade nobody listens for is an ordinary request, an unhandled CONNECT closes the connection, as in Node |
-| Trailers we send, `Agent` socket pooling control | ❌ | — | Feasible: Go's `Trailer` header, `Transport.MaxConnsPerHost` / `MaxIdleConnsPerHost` |
+| `res.addTrailers()` | ✅ | [lib-node-http-trailers.ts](conformance/lib-node-http-trailers.ts) | Sent after a chunked body, as in Node (not with a `Content-Length`); clients read them as `res.trailers` |
+| Trailers on client requests, `Agent` socket pooling control | ❌ | — | Feasible: Go's `Request.Trailer`, `Transport.MaxConnsPerHost` / `MaxIdleConnsPerHost` |
 | `statusMessage` on responses we send, `'checkContinue'` | ❌ | — | Go's `ResponseWriter` sends its standard reason phrases and answers `100-continue` itself: needs a hijacked connection |
 
 #### `node:http2`
@@ -961,7 +965,7 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 | `createSession` / `applyChangeset` | ❌ | — | The bundled SQLite build has no session extension: needs an emulation over the preupdate hook (hard) |
 | `serialize` / `deserialize` | ❌ | — | The driver has no `sqlite3_serialize` binding; feasible through a temporary file and the backup API |
 | `undefined` as a parameter value, `[Object: null prototype]` rows | 🚫 | — | `undefined` and `null` are both `nil` (binds NULL instead of throwing); rows print as plain objects |
-| Finalizing a statement when it is garbage-collected | ❌ | — | Statements live until `db.close()`: re-preparing in a loop holds every copy until then; reuse statements or `createTagStore()`. Feasible: `runtime.AddCleanup` can post the finalize to the event loop |
+| Finalizing a statement when it is garbage-collected | ✅ | [lib-node-sqlite-finalize.ts](conformance/lib-node-sqlite-finalize.ts) | `runtime.AddCleanup` posts the finalize to the event loop once nothing references the statement; `db.close()` finalizes the rest |
 
 #### `node:inspector`
 
@@ -1303,15 +1307,15 @@ These follow from compiling to a native Go binary, and won't change:
 4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`,
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
    options, errno numbers per OS, `node:dns` record types and TTLs, `node:module` /
-   `node:v8` / `node:sea` basics. Remaining:
+   `node:v8` / `node:sea` basics, `Hash` streams, AES key wrap, `res.addTrailers()`, SQLite
+   finalization. Remaining:
    - second entry points
    - `async_hooks.createHook`
-   - SQLite finalization and `serialize`
+   - SQLite `serialize`
    - node:test snapshots, flags and reporters
    - `createRequire`, `sea` assets
    - the smaller `node:crypto` items
    - stream backpressure and BYOB readers
-   - http trailers
    - TLS PFX and root certificates
    - probes for the ⚠️ Go bridges
 5. **New surfaces:**

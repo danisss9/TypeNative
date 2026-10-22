@@ -26,7 +26,9 @@ type TnSqliteDb struct {
 	allowUnknown bool
 	defensive    bool
 	limitOptions interface{}
-	stmts        []*TnSqliteStmt
+	// prepared statements not finalized yet; the JS objects are not kept, so
+	// one that becomes unreachable is finalized on the event loop
+	live   map[*sqlite3.Stmt]bool
 	limits       *TnSqliteLimits
 	// A JS throw inside a user-defined function, rethrown after the statement
 	pending    interface{}
@@ -363,13 +365,10 @@ func (db *TnSqliteDb) setAuthorizer(callback interface{}) {
 
 func (db *TnSqliteDb) close() {
 	db.requireOpen()
-	for _, st := range db.stmts {
-		if st.s != nil {
-			st.s.Close()
-			st.s = nil
-		}
+	for s := range db.live {
+		s.Close()
 	}
-	db.stmts = nil
+	db.live = nil
 	err := db.conn.Close()
 	db.conn = nil
 	if err != nil {
@@ -419,7 +418,18 @@ func (db *TnSqliteDb) prepare(sql string, opts ...interface{}) *TnSqliteStmt {
 		st.allowBare = tnSqliteFlag(opts[0], "allowBareNamedParameters", st.allowBare)
 		st.allowUnknown = tnSqliteFlag(opts[0], "allowUnknownNamedParameters", st.allowUnknown)
 	}
-	db.stmts = append(db.stmts, st)
+	if db.live == nil {
+		db.live = map[*sqlite3.Stmt]bool{}
+	}
+	db.live[s] = true
+	runtime.AddCleanup(st, func(s *sqlite3.Stmt) {
+		TnLoopPost(func() {
+			if db.live[s] {
+				delete(db.live, s)
+				s.Close()
+			}
+		})
+	}, s)
 	return st
 }
 
@@ -635,7 +645,8 @@ func (db *TnSqliteDb) deserialize(data []byte, options ...interface{}) {
 }
 
 func (st *TnSqliteStmt) requireLive() {
-	if st.s == nil {
+	// db.close() (or a reopen) finalized it
+	if st.s == nil || !st.db.live[st.s] {
 		panic(tnSqliteState("statement has been finalized"))
 	}
 	st.db.requireOpen()
@@ -1069,7 +1080,7 @@ export function registerSqlite(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeSqlite',
-    ['github.com/ncruces/go-sqlite3', 'errors', 'fmt', 'math', 'math/big', 'reflect', 'sort', 'strconv', 'strings', 'time', 'unsafe'],
+    ['github.com/ncruces/go-sqlite3', 'errors', 'fmt', 'math', 'math/big', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'],
     ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise'],
     sqliteHelper
   );

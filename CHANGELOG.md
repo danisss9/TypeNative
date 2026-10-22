@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve4` / `resolve6` with `{ ttl: true }`, and the `Resolver` `tries` option
 - **`node:module`** (`builtinModules`, `isBuiltin`), **`node:v8`** (`getHeapStatistics`,
   `serialize` / `deserialize`) and **`node:sea`** (`isSea`)
+- **`node:crypto`:** `Hash` / `Hmac` as streams; AES key wrap ciphers (`id-aes*-wrap`,
+  `id-aes*-wrap-pad`)
+- **`node:http`:** `res.addTrailers()`
+- **`node:stream`:** `'readable'` events and Node's `read()` / `read(size)`
+- **`node:sqlite`:** statements are finalized once garbage-collected (they lived until
+  `db.close()`)
 
 ### Fixed
 
@@ -67,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`console.log` / `inspect`:** Maps and Sets nested in objects print as `Map(n) {…}` /
   `Set(n) {…}` (string-keyed Maps printed as plain objects)
 - **Worker messages / `v8.deserialize`:** Sets arrive as Sets and both pass `instanceof`
+- **`Array<T>` / `ReadonlyArray<T>` annotations** compiled to an undefined Go type
+- **`stream.push(cond ? text : null)`:** a nullable string is a chunk or the end of the stream
+  (`null` through it never ended the stream)
+- **`hmac.digest()` a second time** returns an empty result, as in Node (it threw)
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)
