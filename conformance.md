@@ -647,7 +647,7 @@ async function runs synchronously until its first `await`.
 | `process.stdin` / `stdout` / `stderr` as streams                                                     |   ✅    | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `stdin` keeps the process alive only while flowing                           |
 | `kill` / `emitWarning` / `getuid` / `getgid`                                                         |   ✅    | —                                                              | Implemented, not probed                                                     |
 | `on('uncaughtException')` / `'uncaughtExceptionMonitor'` / `'unhandledRejection'` / `'beforeExit'` (per drain, can schedule more work); `cpuUsage` / `resourceUsage` / `availableMemory` / `loadEnvFile` | ✅ | [lib-node-process-uncaught.ts](conformance/lib-node-process-uncaught.ts), [lib-node-os-mem.ts](conformance/lib-node-os-mem.ts) | Throws in the top-level code, loop callbacks and detached async calls reach the handlers; CPU times from `/proc` (Linux) or Go's runtime metrics |
-| `umask` / `stdout.columns` / `rows` / `setRawMode` | ❌ | — | Feasible: each binary targets one OS, and the vendored `golang.org/x/sys` has `IoctlGetWinsize` / termios / `Umask` and the Windows console calls (a per-OS helper, as for `os.totalmem`) |
+| `stdout.columns` / `rows` / `getWindowSize()` (and `stderr`), `stdin.setRawMode` / `isRaw`, `umask` | ✅ | [lib-node-process-tty.ts](conformance/lib-node-process-tty.ts) | A per-OS helper: `TIOCGWINSZ` and termios ioctls (Linux, macOS, FreeBSD), the console API (Windows). `columns` / `rows` are `0`, not `undefined`, when not a terminal (`columns \|\| 80` still works); raw mode is libuv's and is undone at exit; `setRawMode` throws when stdin isn't a terminal. No raw mode on Linux PowerPC / MIPS, no `umask` on Windows (`0`, as in Node); no `'resize'` event |
 
 #### `node:console`
 
@@ -750,7 +750,7 @@ async function runs synchronously until its first `await`.
 | API          | Status | Probe                                                      | Notes                                    |
 | ------------ | :----: | ---------------------------------------------------------- | ---------------------------------------- |
 | `isatty(fd)` |   ✅    | [lib-node-perf-hooks.ts](conformance/lib-node-perf-hooks.ts) | Character-device check on fds 0–2        |
-| `ReadStream` / `WriteStream` (`columns`, `setRawMode`) | ❌ | — | Feasible: see `stdout.columns` / `setRawMode` in [process](#nodeprocess) |
+| `ReadStream` / `WriteStream` classes | ❌ | — | Feasible; the terminal calls behind them exist (`process.stdout.columns`, `process.stdin.setRawMode` in [process](#nodeprocess)) |
 
 #### `node:constants` / `node:sys`
 
@@ -800,7 +800,7 @@ async function runs synchronously until its first `await`.
 | `node:readline/promises` (`await rl.question(q)`)                                        |   ✅    | [lib-node-readline-promises.ts](conformance/lib-node-readline-promises.ts) |                                                                         |
 | `question(prompt)` (synchronous)                                                        |   ✅    | [lib-node-readline-question.ts](conformance/lib-node-readline-question.ts) | TypeNative extension (not in Node): used by the self-hosted compiler     |
 | `cursorTo` / `moveCursor` / `clearLine` / `clearScreenDown`                              |   ✅    | [lib-node-readline-cursor.ts](conformance/lib-node-readline-cursor.ts)   | ANSI escape sequences written to the stream; optional callback           |
-| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Need raw terminal mode (see `setRawMode` in [process](#nodeprocess))     |
+| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Feasible: raw mode exists (`process.stdin.setRawMode`); needs the keypress decoder on top |
 
 #### `node:child_process`
 
@@ -1258,10 +1258,9 @@ These follow from compiling to a native Go binary, and won't change:
 ### Mechanisms that unlock several ❌ rows
 
 - **Per-OS helpers.** Each binary is built for one OS (`--target`), and the transpiler already
-  picks `@windows` / `@other` variants of a runtime helper (`os.totalmem`). With the vendored
-  `golang.org/x/sys`, this covers terminal size and raw mode (`process.stdout.columns`,
-  `setRawMode`, tty streams, readline keypresses), `process.umask`, `child_process` `detached`,
-  dgram multicast / broadcast, and Windows errno numbers.
+  picks `@windows` / `@other` variants of a runtime helper (`os.totalmem`, terminal size and raw
+  mode). With Go's `syscall` package, this also covers tty streams, readline keypresses,
+  `child_process` `detached`, dgram multicast / broadcast, and Windows errno numbers.
 - **Source positions.** The generated Go carries `//line` directives, so `runtime.Callers`
   reports `.ts` files and lines: `err.stack`, `util.getCallSites`, node:test `location`.
 - **Second entry points.** Compiling another `.ts` file into the same binary, and selecting it
@@ -1295,8 +1294,8 @@ These follow from compiling to a native Go binary, and won't change:
    - mixins
    - field and accessor decorators
    - generator `next(value)` / `return()` / `throw()`
-4. **Node gaps:**
-   - the per-OS helpers above
+4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`. Remaining:
+   - the other per-OS helpers above
    - second entry points
    - `node:dns` records
    - `async_hooks.createHook`

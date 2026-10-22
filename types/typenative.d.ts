@@ -584,6 +584,15 @@ interface ObjectConstructor {
 }
 declare var Object: ObjectConstructor;
 
+/** process.stdout / stderr terminal info: 0 columns and rows when not a terminal */
+interface TnTtyOutput {
+  readonly isTTY?: boolean;
+  readonly columns: number;
+  readonly rows: number;
+  /** [columns, rows] */
+  getWindowSize(): [number, number];
+}
+
 interface Process {
   argv: string[];
   readonly argv0: string;
@@ -639,9 +648,18 @@ interface Process {
   on(event: 'uncaughtException' | 'uncaughtExceptionMonitor', listener: (error: Error, origin: 'uncaughtException' | 'unhandledRejection') => void): this;
   on(event: 'unhandledRejection', listener: (reason: unknown, promise: Promise<unknown>) => void): this;
   on(event: 'beforeExit', listener: (code: number) => void): this;
-  readonly stdout: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 1 };
-  readonly stderr: import('node:stream').Writable & { readonly isTTY?: boolean; readonly fd: 2 };
-  readonly stdin: import('node:stream').Readable & { readonly isTTY?: boolean; readonly fd: 0 };
+  readonly stdout: import('node:stream').Writable & TnTtyOutput & { readonly fd: 1 };
+  readonly stderr: import('node:stream').Writable & TnTtyOutput & { readonly fd: 2 };
+  readonly stdin: import('node:stream').Readable & {
+    readonly isTTY?: boolean;
+    readonly fd: 0;
+    /** Whether raw mode is on */
+    readonly isRaw: boolean;
+    /** Raw mode (no echo, no line buffering, Ctrl+C as a byte); throws when stdin is not a terminal */
+    setRawMode(mode: boolean): void;
+  };
+  /** The file mode creation mask; with an argument sets it and returns the previous one (0 on Windows) */
+  umask(mask?: number | string): number;
   on(event: 'exit', listener: (code: number) => void): this;
   on(event: string, listener: (...args: any[]) => void): this;
   once(event: 'exit', listener: (code: number) => void): this;
