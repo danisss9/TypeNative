@@ -650,7 +650,11 @@ interface Process {
   on(event: 'beforeExit', listener: (code: number) => void): this;
   readonly stdout: import('node:stream').Writable & TnTtyOutput & { readonly fd: 1 };
   readonly stderr: import('node:stream').Writable & TnTtyOutput & { readonly fd: 2 };
-  readonly stdin: import('node:stream').Readable & {
+  readonly stdin: {
+    /** After readline.emitKeypressEvents(process.stdin) */
+    on(event: 'keypress', listener: (str: string, key: import('node:readline').Key) => void): import('node:stream').Readable;
+    once(event: 'keypress', listener: (str: string, key: import('node:readline').Key) => void): import('node:stream').Readable;
+  } & import('node:stream').Readable & {
     readonly isTTY?: boolean;
     readonly fd: 0;
     /** Whether raw mode is on */

@@ -1220,5 +1220,7 @@ export function streamListenerTypes(nodes) {
         return ['interface{}'];
     if (name === 'error')
         return ['interface{}'];
+    if (name === 'keypress')
+        return ['string', '*TnKey'];
     return [];
 }

@@ -1,20 +1,20 @@
 // node:fs — the synchronous file system API. Errors are Node's system errors
 // (err.code 'ENOENT', err.syscall, err.path, Node's message format).
 import { defineClass, defineHelper, defineModule, setResults, encodingOf, getOption, optionIsTrue, isObjectLiteral, isStringNode } from './registry.js';
-const fsErrorsHelper = `// Node-style system errors from Go errors: code, errno, syscall, path
-var tnErrnoCodes = map[string]float64{
-	"EPERM": -1, "ENOENT": -2, "EIO": -5, "EBADF": -9, "EACCES": -13, "EBUSY": -16, "EEXIST": -17,
-	"EXDEV": -18, "ENOTDIR": -20, "EISDIR": -21, "EINVAL": -22, "EMFILE": -24, "ENOSPC": -28,
-	"ENOTEMPTY": -39, "ELOOP": -40,
-}
+import { uvErrorMessages, uvErrnoTable } from './errno_tables.js';
+// libuv's error names and messages (util.getSystemErrorMap / err.message)
+const uvErrnoHelper = `var tnUvErrorList = [][2]string{${uvErrorMessages}}
 
-var tnErrnoDescriptions = map[string]string{
-	"EPERM": "operation not permitted", "ENOENT": "no such file or directory", "EIO": "i/o error",
-	"EBADF": "bad file descriptor", "EACCES": "permission denied", "EBUSY": "resource busy or locked",
-	"EEXIST": "file already exists", "EXDEV": "cross-device link not permitted", "ENOTDIR": "not a directory",
-	"EISDIR": "illegal operation on a directory", "EINVAL": "invalid argument", "EMFILE": "too many open files",
-	"ENOSPC": "no space left on device", "ENOTEMPTY": "directory not empty", "ELOOP": "too many symbolic links encountered",
-}
+var tnErrnoDescriptions = func() map[string]string {
+	m := map[string]string{}
+	for _, e := range tnUvErrorList {
+		m[e[0]] = e[1]
+	}
+	return m
+}()`;
+const fsErrorsHelper = `// Node-style system errors from Go errors: code, errno, syscall, path
+// Node's errno numbers for the target OS (see errno_tables.ts)
+var tnErrnoCodes = tnUvErrnos
 
 func tnErrnoCode(err error) string {
 	msg := strings.ToLower(err.Error())
@@ -662,7 +662,12 @@ const FS_CONSTANTS = {
 };
 export function registerFs(r) {
     defineModule(r, 'fs');
-    defineHelper(r, 'fsErrors', ['errors', 'io/fs', 'strings'], ['error'], fsErrorsHelper);
+    for (const goos of ['linux', 'darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly', 'solaris', 'illumos', 'aix']) {
+        defineHelper(r, `uvErrnoOS@${goos}`, ['syscall'], [], uvErrnoTable(goos === 'illumos' ? 'solaris' : goos));
+    }
+    defineHelper(r, 'uvErrnoOS@other', [], [], uvErrnoTable(''));
+    defineHelper(r, 'uvErrno', [], ['uvErrnoOS@os'], uvErrnoHelper);
+    defineHelper(r, 'fsErrors', ['errors', 'io/fs', 'strings'], ['error', 'uvErrno'], fsErrorsHelper);
     defineHelper(r, 'nodeFs', ['errors', 'fmt', 'io', 'io/fs', 'math', 'os', 'path/filepath', 'runtime', 'strconv', 'strings', 'sync', 'time'], ['fsErrors', 'buffer', 'dynamic'], fsHelper);
     defineClass(r, 'fs.Stats', '*TnStats', 'class', 'isFile=bool; isDirectory=bool; isSymbolicLink=bool; isFIFO=bool; isSocket=bool; isBlockDevice=bool; isCharacterDevice=bool', 'dev=float64; ino=float64; mode=float64; nlink=float64; uid=float64; gid=float64; rdev=float64; size=float64; blksize=float64; blocks=float64; atimeMs=float64; mtimeMs=float64; ctimeMs=float64; birthtimeMs=float64; atime=time.Time; mtime=time.Time; ctime=time.Time; birthtime=time.Time', '', '');
     defineClass(r, 'fs.Dirent', '*TnDirent', 'class', 'isFile=bool; isDirectory=bool; isSymbolicLink=bool; isFIFO=bool; isSocket=bool; isBlockDevice=bool; isCharacterDevice=bool', 'name=string; parentPath=string; path=string', '', '');

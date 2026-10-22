@@ -667,7 +667,7 @@ async function runs synchronously until its first `await`.
 | `parseArgs` (short / long / grouped flags, `multiple`, `default`, `strict`, `allowPositionals`, `allowNegative`, `tokens`, Node's errors), `getSystemErrorName` / `getSystemErrorMessage` / `getSystemErrorMap`, `MIMEType` / `MIMEParams`, `parseEnv` (+ `process.loadEnvFile`), `aborted`, `debuglog` (`NODE_DEBUG`), `toUSVString` | ✅ | [lib-node-util-parse-args.ts](conformance/lib-node-util-parse-args.ts) | |
 | `inspect.custom` methods, `getCallSites` | ❌ | — | `[inspect.custom]()` can lower to a method like `[Symbol.dispose]()`; `getCallSites` can read `runtime.Callers`, which reports `.ts` lines through the `//line` directives |
 | `inherits` (legacy) | 🚫 | — | Rewrites prototypes; classes are static Go structs |
-| Node's errno numbers on Windows (libuv's: `ENOENT` is `-4058`) | ❌ | — | errno values are the OS's (Go's `syscall` numbers): the same as Node's on Linux and macOS, but `ENOENT` is `-2` on Windows. Feasible with a libuv errno table. `getSystemErrorName(err.errno)` still names any error TypeNative raises |
+| Node's errno numbers per OS (`err.errno`, `getSystemErrorMap`) | ✅ | [lib-node-errno.ts](conformance/lib-node-errno.ts) | libuv's table, generated into `src/node/errno_tables.ts`: the OS's errno on Unix (`ECONNREFUSED` is `-111` on Linux, `-61` on macOS) and libuv's fixed numbers on Windows (`ENOENT` is `-4058`). Messages are libuv's; the map matches Node's on Linux entry for entry |
 
 #### `node:assert`
 
@@ -800,7 +800,8 @@ async function runs synchronously until its first `await`.
 | `node:readline/promises` (`await rl.question(q)`)                                        |   ✅    | [lib-node-readline-promises.ts](conformance/lib-node-readline-promises.ts) |                                                                         |
 | `question(prompt)` (synchronous)                                                        |   ✅    | [lib-node-readline-question.ts](conformance/lib-node-readline-question.ts) | TypeNative extension (not in Node): used by the self-hosted compiler     |
 | `cursorTo` / `moveCursor` / `clearLine` / `clearScreenDown`                              |   ✅    | [lib-node-readline-cursor.ts](conformance/lib-node-readline-cursor.ts)   | ANSI escape sequences written to the stream; optional callback           |
-| `emitKeypressEvents`, `history`, `completer`                                            |   ❌    | —                                                                        | Feasible: raw mode exists (`process.stdin.setRawMode`); needs the keypress decoder on top |
+| `emitKeypressEvents(stream)` (`'keypress'` with `(str, key)`) | ✅ | [lib-node-readline-keypress.ts](conformance/lib-node-readline-keypress.ts) | A port of Node's key decoder: names, `ctrl` / `meta` / `shift`, xterm / rxvt / putty sequences, Escape after 500 ms. `str` is `""` (not `undefined`) for escape sequences, and so are `name` / `code` when Node leaves them out |
+| `Interface` line editing, `history`, `completer` | ❌ | — | Feasible: keypresses and raw mode exist; needs the terminal-mode line editor on top |
 
 #### `node:child_process`
 
@@ -809,7 +810,8 @@ async function runs synchronously until its first `await`.
 | `execSync` / `execFileSync` / `spawnSync` (`encoding`, `input`, `cwd`, `env`, `shell`, `stdio: 'inherit'`) | ✅ | [lib-node-child-process-sync.ts](conformance/lib-node-child-process-sync.ts) | Buffers unless an encoding is given (as in Node); a non-zero exit throws with `status` / `stdout` / `stderr` |
 | `exec` / `execFile` (callbacks), `spawn` → `ChildProcess` (stdio streams, `'exit'` / `'close'`, `kill`); `promisify(exec)` | ✅ | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `'close'` follows the end of the stdio streams being read; exit codes on `err.code`     |
 | `fork(modulePath, args, { env, cwd, silent })` → `send` / `'message'` / `disconnect` / `'disconnect'` / `connected`; in the child `process.send` / `process.on('message')` / `process.connected` / `process.disconnect` | ✅ | [lib-node-child-process-fork.ts](conformance/lib-node-child-process-fork.ts) | The child is this program run again (branch on `process.argv` / `process.send`), linked over loopback TCP; messages are structured clones (a superset of Node's default JSON) |
-| `detached`, `stdio` arrays beyond stdout, forking another file | ❌ | — | `detached` is `SysProcAttr` (`Setsid` / `CREATE_NEW_PROCESS_GROUP`, a per-OS helper); extra `stdio` entries are `ExtraFiles`; another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)) |
+| `spawn` `detached`, `child.unref()` / `ref()` | ✅ | [lib-node-child-process-detached.ts](conformance/lib-node-child-process-detached.ts) | A new session (`setsid`) on Unix; `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` on Windows, as libuv does. An unref'ed child's stdio pipes don't keep the parent alive either |
+| `stdio` arrays beyond stdout, forking another file | ❌ | — | Extra `stdio` entries are `ExtraFiles`; another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)) |
 | `serialization: 'advanced'` handle passing (`send(msg, socket)`) | ❌ | — | Needs file-descriptor passing over the IPC channel (`SCM_RIGHTS` on Unix) |
 
 #### `node:cluster`
@@ -889,7 +891,8 @@ async function runs synchronously until its first `await`.
 | API                                                                                       | Status | Probe                                          | Notes                                         |
 | ----------------------------------------------------------------------------------------- | :----: | ---------------------------------------------- | --------------------------------------------- |
 | `createSocket('udp4' \| 'udp6' \| { type })`, `bind`, `send` (offset / length forms, callback), `'message'(msg, rinfo)`, `address`, `close`, `connect` / `disconnect` / `remoteAddress`, `ref` / `unref` | ✅ | [lib-node-dgram.ts](conformance/lib-node-dgram.ts) | `send` binds an unbound socket first, as in Node |
-| Multicast membership, `setBroadcast` / `setTTL` effects                                   |   ❌    | —                                              | Accepted without effect; feasible with `ListenConfig.Control` + `SetsockoptInt` per OS |
+| `addMembership` / `dropMembership`, `setMulticastInterface` / `setMulticastTTL` / `setMulticastLoopback`, `setBroadcast`, `setTTL` | ✅ | [lib-node-dgram-multicast.ts](conformance/lib-node-dgram-multicast.ts) | `setsockopt` on the socket per OS (Linux, macOS, the BSDs, Windows). Options before `bind()` throw `EBADF` and membership binds an unbound socket, as in Node |
+| `addSourceSpecificMembership` / `dropSourceSpecificMembership` | ❌ | — | Feasible: `IP_ADD_SOURCE_MEMBERSHIP`, whose struct layout differs per OS |
 
 #### `fetch`
 
@@ -1259,8 +1262,8 @@ These follow from compiling to a native Go binary, and won't change:
 
 - **Per-OS helpers.** Each binary is built for one OS (`--target`), and the transpiler already
   picks `@windows` / `@other` variants of a runtime helper (`os.totalmem`, terminal size and raw
-  mode). With Go's `syscall` package, this also covers tty streams, readline keypresses,
-  `child_process` `detached`, dgram multicast / broadcast, and Windows errno numbers.
+  mode, `child_process` `detached`, dgram socket options, errno numbers). With Go's `syscall`
+  package, this also covers tty `ReadStream` / `WriteStream`.
 - **Source positions.** The generated Go carries `//line` directives, so `runtime.Callers`
   reports `.ts` files and lines: `err.stack`, `util.getCallSites`, node:test `location`.
 - **Second entry points.** Compiling another `.ts` file into the same binary, and selecting it
@@ -1294,8 +1297,9 @@ These follow from compiling to a native Go binary, and won't change:
    - mixins
    - field and accessor decorators
    - generator `next(value)` / `return()` / `throw()`
-4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`. Remaining:
-   - the other per-OS helpers above
+4. **Node gaps.** Done: `process.stdout.columns` / `rows`, `setRawMode`, `umask`,
+   `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
+   options, errno numbers per OS. Remaining:
    - second entry points
    - `node:dns` records
    - `async_hooks.createHook`
