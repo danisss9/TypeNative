@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`node:crypto`:** `Hash` / `Hmac` as streams; AES key wrap ciphers (`id-aes*-wrap`,
   `id-aes*-wrap-pad`)
 - **`node:http`:** `res.addTrailers()`
+- **Workers and `fork` for another file:** `new Worker('./worker.ts')` / `fork('./child.ts')` compile
+  that file into the binary as a second entry point, run in the child process
 - **`node:test`:** `--test-name-pattern`, `--test-skip-pattern`, `--test-only` and
   `--test-reporter` (`tap`, `spec`, `dot`, `junit`) from `NODE_OPTIONS`; Node's notice for `.only`
   without `--test-only`
@@ -85,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[...map]`, `map.entries()`** and **`{ ...record, k: v }`** (such as `{ ...process.env }`)
   did not build
 - **`+` on two dynamic values** concatenates when one is a string (`'a' + 1` gave `1`)
+- **Optional method calls as statements** (`port?.postMessage(x)`) on `void` methods, and
+  `process.send?.(…)` / `process.disconnect?.()`, did not build
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)

@@ -40,7 +40,8 @@ export function createNodeRegistry() {
         typeOf: (_node) => '',
         visit: (_node) => '',
         categoryOf: (_node) => '',
-        isArrayBuffer: (_node) => false
+        isArrayBuffer: (_node) => false,
+        entryPoint: (_node) => ''
     };
     return registry;
 }

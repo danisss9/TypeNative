@@ -88,6 +88,10 @@ export interface NodeRegistry {
   // Whether a []byte expression is an ArrayBuffer (typed-array constructors
   // view it) rather than a Uint8Array / Buffer (they copy it)
   isArrayBuffer: (node: AstNode) => boolean;
+  // The entry id of a worker / fork file named by a literal path ('./w.ts',
+  // new URL('./w.ts', import.meta.url), path.join(__dirname, 'w.ts')): the
+  // file is compiled into the binary as a second entry point ('' otherwise)
+  entryPoint: (node: AstNode) => string;
 }
 
 // Services start as no-ops; the transpiler binds them before each run
@@ -121,7 +125,8 @@ export function createNodeRegistry(): NodeRegistry {
     typeOf: (_node: AstNode) => '',
     visit: (_node: AstNode) => '',
     categoryOf: (_node: AstNode) => '',
-    isArrayBuffer: (_node: AstNode) => false
+    isArrayBuffer: (_node: AstNode) => false,
+    entryPoint: (_node: AstNode) => ''
   };
   return registry;
 }

@@ -6,7 +6,7 @@
 // workerData are set. MessageChannel / MessagePort / BroadcastChannel work
 // within one process. The worker's stdout / stderr are the parent's; an
 // uncaught exception in a worker becomes an 'error' event and exit code 1.
-import { defineClass, defineHelper, defineModule, setResults, isStringNode } from './registry.js';
+import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
 const cloneHelper = `// Structured clone (subset): values to and from JSON with type tags
 func tnCloneEncode(v interface{}) interface{} {
 	switch x := v.(type) {
@@ -463,6 +463,13 @@ type TnWorker struct {
 
 func (w *TnWorker) Get_threadId() float64 { return w.threadId }
 
+// new Worker('./w.ts'): runs the entry point compiled from that file
+func TnNewWorkerAt(entry string, filename interface{}, options ...interface{}) *TnWorker {
+	tnNextEntry = entry
+	defer func() { tnNextEntry = "" }()
+	return TnNewWorker(filename, options...)
+}
+
 func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 	tnNextThreadID++
 	w := &TnWorker{threadId: tnNextThreadID}
@@ -505,6 +512,7 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 			}
 		}
 	}
+	env = tnSpawnEntryEnv(env)
 	env = append(env, "TN_WORKER_ADDR="+ln.Addr().String(), "TN_WORKER_TOKEN="+token)
 	setup, err := json.Marshal(map[string]interface{}{
 		"workerData":      tnCloneEncode(workerData),
@@ -659,7 +667,7 @@ const EMITTER = 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventE
 export function registerWorkerThreads(r) {
     defineModule(r, 'worker_threads');
     defineHelper(r, 'nodeClone', ['encoding/base64', 'encoding/json', 'fmt', 'math/big', 'reflect', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'error'], cloneHelper);
-    defineHelper(r, 'nodeWorker', ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'], ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild'], workerHelper);
+    defineHelper(r, 'nodeWorker', ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'], ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild', 'entryPoints'], workerHelper);
     const use = () => r.helper('nodeWorker');
     defineClass(r, 'worker_threads.Worker', '*TnWorker', 'class', `${EMITTER}; postMessage=; terminate=chan float64; ref=*TnWorker; unref=*TnWorker`, '', 'threadId=float64', '');
     defineClass(r, 'worker_threads.MessagePort', '*TnMessagePort', 'class', `${EMITTER}; postMessage=; start=; close=; ref=*TnMessagePort; unref=*TnMessagePort; hasRef=bool`, '', 'onmessage=interface{}', 'onmessage');
@@ -686,10 +694,10 @@ export function registerWorkerThreads(r) {
     r.paramTypers['worker_threads.BroadcastChannel#addEventListener'] = (_n) => ['*TnMessageEvent'];
     r.constructors['worker_threads.Worker'] = (c) => {
         use();
-        // The worker runs this program again: other files can't be loaded at runtime
-        if (isStringNode(c.nodes[0]) && /\.(m?[jt]s|tsx?)$/.test(String(c.nodes[0].text))) {
-            console.warn(`[TypeNative] new Worker('${c.nodes[0].text}') runs the current program; use new Worker(__filename) / new URL(import.meta.url) and branch on isMainThread`);
-        }
+        // new Worker('./w.ts'): that file is compiled in as a second entry point
+        const entry = r.entryPoint(c.nodes[0]);
+        if (entry !== '')
+            return `TnNewWorkerAt(${JSON.stringify(entry)}, ${c.args.join(', ')})`;
         return `TnNewWorker(${c.args.join(', ')})`;
     };
     r.constructors['worker_threads.MessageChannel'] = (_c) => {
