@@ -1698,6 +1698,52 @@ declare module 'node:readline/promises' {
   export = promises;
 }
 
+declare module 'node:module' {
+  namespace Module {
+    /** Node's built-in module names (without the node:-only ones such as node:test) */
+    const builtinModules: string[];
+    /** Whether the specifier names a built-in module ('fs', 'node:fs', 'node:test') */
+    function isBuiltin(moduleName: string): boolean;
+  }
+  export = Module;
+}
+
+declare module 'node:v8' {
+  namespace v8 {
+    interface HeapInfo {
+      total_heap_size: number;
+      total_heap_size_executable: number;
+      total_physical_size: number;
+      total_available_size: number;
+      used_heap_size: number;
+      heap_size_limit: number;
+      malloced_memory: number;
+      peak_malloced_memory: number;
+      does_zap_garbage: number;
+      number_of_native_contexts: number;
+      number_of_detached_contexts: number;
+      total_global_handles_size: number;
+      used_global_handles_size: number;
+      external_memory: number;
+    }
+    /** From Go's runtime.MemStats; the limit is GOMEMLIMIT, else 4 GiB */
+    function getHeapStatistics(): HeapInfo;
+    /** The structured-clone codec workers use (not V8's wire format) */
+    function serialize(value: any): Buffer;
+    function deserialize(buffer: Uint8Array): any;
+  }
+  export = v8;
+}
+
+declare module 'node:sea' {
+  /** Always true: a TypeNative program is a single executable */
+  export function isSea(): boolean;
+  /** TypeNative binaries carry no assets yet: throws ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND */
+  export function getAsset(key: string): ArrayBuffer;
+  export function getAsset(key: string, encoding: string): string;
+  export function getRawAsset(key: string): ArrayBuffer;
+}
+
 declare module 'node:diagnostics_channel' {
   namespace diagnostics_channel {
     type ChannelListener = (message: unknown, name: string | symbol) => void;
@@ -2798,6 +2844,8 @@ declare module 'fs/promises' { import m = require('node:fs/promises'); export = 
 declare module 'url' { import m = require('node:url'); export = m; }
 declare module 'querystring' { import m = require('node:querystring'); export = m; }
 declare module 'punycode' { import m = require('node:punycode'); export = m; }
+declare module 'module' { import m = require('node:module'); export = m; }
+declare module 'v8' { import m = require('node:v8'); export = m; }
 declare module 'string_decoder' { import m = require('node:string_decoder'); export = m; }
 declare module 'os' { import m = require('node:os'); export = m; }
 declare module 'process' { import m = require('node:process'); export = m; }

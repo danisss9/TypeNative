@@ -31,3 +31,9 @@ assert(inspect([new Point(0, 0)]) === '[ Point { x: 0, y: 0 } ]', 'nested class 
 assert(inspect(Buffer.from('hi')) === '<Buffer 68 69>', 'Buffer');
 const err = new Error('boom');
 assert(inspect(err).startsWith('Error: boom'), 'Error');
+// Maps and Sets nested in objects keep their shape, string keys or not
+const tags: Record<string, number> = { a: 1 };
+assert(
+  inspect({ m: new Map([['k', 'v']]), s: new Set(['x']), tags }) === "{ m: Map(1) { 'k' => 'v' }, s: Set(1) { 'x' }, tags: { a: 1 } }",
+  'nested Map / Set / record'
+);
