@@ -423,6 +423,11 @@ const diagnostics = [];
 const includedLocalImports = new Set();
 // Collects Go source files generated from local TS imports (filename → content)
 let localImportFiles = new Map();
+// Second entry points (new Worker('./w.ts') / fork('./c.ts')): file key → id,
+// and the files still to compile
+const entryPointIds = new Map();
+let pendingEntryPoints = [];
+let mainSourcePath = '';
 // Token kind names → operator source text (JSON AST tokens carry kind names)
 const OPERATOR_TEXT = {
     EqualsEqualsEqualsToken: '===',
@@ -1072,6 +1077,9 @@ export function transpileToNative(code, options) {
     enumBaseTypes.clear();
     importAliases.clear();
     includedLocalImports.clear();
+    entryPointIds.clear();
+    pendingEntryPoints = [];
+    mainSourcePath = options?.fileName ?? '';
     localImportFiles = new Map();
     defaultImportNamespaces.clear();
     classStaticMethods.clear();
@@ -1089,6 +1097,11 @@ export function transpileToNative(code, options) {
     goInterfaceAdapters.clear();
     const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
     const transpiledCodeOutside = outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n');
+    // Worker / fork files, including the ones they start in turn
+    while (pendingEntryPoints.length > 0) {
+        const entry = pendingEntryPoints.shift();
+        compileEntryPoint(entry.id, entry.file);
+    }
     // Keep the process alive until detached async work and timers settle
     const drains = [];
     // The event loop runs until no timers, async work or open handles remain
@@ -1121,7 +1134,11 @@ export function transpileToNative(code, options) {
         ? `import _ "${pkg}"`
         : goImportLine(pkg);
     // process.on('uncaughtException'): a throw in the top-level code is handed to it too
-    const body = usedHelpers.has('nodeUncaught') ? `func() {\n\tdefer TnMainRecover()\n\t${mainCode.trim()}\n\t}()` : mainCode.trim();
+    // With second entry points, TN_ENTRY runs one of them instead of the program
+    const programCode = usedHelpers.has('entryPoints')
+        ? `if __entry := tnEntryPoints[tnCurrentEntry]; __entry != nil {\n\t__entry()\n\t} else {\n\t${mainCode.trim()}\n\t}`
+        : mainCode.trim();
+    const body = usedHelpers.has('nodeUncaught') ? `func() {\n\tdefer TnMainRecover()\n\t${programCode}\n\t}()` : programCode;
     const main = `${GENERATED_HEADER}
 
 package main
@@ -7133,6 +7150,14 @@ function withNarrowingType(names, infer) {
 function visitOptionalCall(node) {
     // f?.(): call only when the function value is not nil
     if (hasQuestionDot(node)) {
+        // Node functions that may be absent (process.send?.(…))
+        const nodeKey = resolveNodeKey(node.expression);
+        const guarded = nodeKey ? nodeRegistry.functions[`${nodeKey}?.`] : undefined;
+        if (guarded) {
+            const callArgs = node.arguments ?? [];
+            const guardedCall = { args: callArgs.map((a) => visit(a)), nodes: callArgs, types: callArgs.map((a) => inferExpressionType(a) ?? ''), recv: '' };
+            return guarded(guardedCall);
+        }
         const fnType = inferExpressionType(node.expression) ?? '';
         const returnType = fnType.startsWith('func(') ? goFuncReturnType(fnType) : undefined;
         const fn = getTempName('fn');
@@ -7159,6 +7184,18 @@ function visitOptionalCall(node) {
         const plainCall = { ...node, questionDotToken: undefined, expression: plainAccess };
         plainAccess.parent = plainCall;
         return visit(plainCall);
+    }
+    // a?.m(…) whose value is unused (a statement, or a void method as an arrow's
+    // body): call only when a is set, through the usual method dispatch
+    const parentKind = node.parent?.kind;
+    if (parentKind === 'ExpressionStatement' || (parentKind === 'ArrowFunction' && node.parent.body === node)) {
+        const guard = getTempName('optc');
+        const call = makeNarrowedReceiverCall(node, guard, baseType);
+        const callType = withNarrowingType([guard], () => inferExpressionType(call));
+        if (parentKind === 'ExpressionStatement' || callType === '') {
+            const callCode = withNarrowing([guard], () => visit(call));
+            return `func() { ${guard} := ${baseExpr}; if ${guard} != nil { ${callCode} } }()`;
+        }
     }
     const className = baseType.replace(/^\*/, '').replace(/\[.*\]$/, '');
     const returnType = classMethodReturnTypes.get(className)?.get(methodName) ?? 'interface{}';
@@ -10187,6 +10224,111 @@ function includeLocalImport(code, dir, goFileName, tsx = false, fileName = '') {
     currentFileDir = prevDir;
     currentFileName = prevFileName;
 }
+// The literal path a Worker / fork is given ('./w.ts', new URL('./w.ts',
+// import.meta.url), path.join(__dirname, 'w.ts')), or ''
+function entryPointSpecifier(node) {
+    if (!node)
+        return '';
+    if (isStringLiteral(node) || node.kind === 'NoSubstitutionTemplateLiteral')
+        return String(node.text);
+    if (isNewExpression(node) && isIdentifier(node.expression) && node.expression.text === 'URL') {
+        const args = node.arguments ?? [];
+        const base = args[1];
+        if (args[0] && isStringLiteral(args[0]) && base && isPropertyAccessExpression(base) && base.name.text === 'url') {
+            return String(args[0].text);
+        }
+        return '';
+    }
+    if (isCallExpression(node) && isPropertyAccessExpression(node.expression)) {
+        const method = node.expression.name.text;
+        const args = node.arguments ?? [];
+        if ((method === 'join' || method === 'resolve') && args.length === 2 && isIdentifier(args[0]) && args[0].text === '__dirname' && isStringLiteral(args[1])) {
+            const rel = String(args[1].text);
+            return rel.startsWith('.') ? rel : `./${rel}`;
+        }
+    }
+    return '';
+}
+// Queues the file a Worker / fork names for compilation as an entry point;
+// '' when it is not a literal source path (or is the program itself)
+function registerEntryPoint(node) {
+    const spec = entryPointSpecifier(node);
+    if (!spec || !fileResolver || !(spec.startsWith('.') || spec.startsWith('/')))
+        return '';
+    if (!/\.(m?[jt]s|tsx?)$/.test(spec))
+        return '';
+    const file = fileResolver(spec, currentFileDir);
+    if (!file)
+        return '';
+    const key = file.path ?? `${file.dir}::${spec}`;
+    if (key === mainSourcePath)
+        return '';
+    const known = entryPointIds.get(key);
+    if (known !== undefined)
+        return known;
+    const id = `${specifierToGoFileName(spec).replace(/\.go$/, '')}_${entryPointIds.size + 1}`;
+    entryPointIds.set(key, id);
+    pendingEntryPoints.push({ id: id, file: file });
+    useHelper('entryPoints');
+    return id;
+}
+// An entry point file: compiled like the main file (top-level variables at
+// package level), its top-level code in a function registered under its id
+function compileEntryPoint(id, file) {
+    const prevDir = currentFileDir;
+    const prevTsx = currentFileIsTsx;
+    const prevFileName = currentFileName;
+    currentFileDir = file.dir;
+    currentFileIsTsx = !!file.tsx;
+    currentFileName = file.path ?? id;
+    const savedOutsideNodes = outsideNodes;
+    const savedPackages = [...importedPackages];
+    const savedHelperPackages = [...helperProvidedPackages];
+    outsideNodes = [];
+    importedPackages.clear();
+    helperProvidedPackages.clear();
+    const varsBefore = mainPackageVariables.length;
+    const sf = parseSource(file.content);
+    const statements = [];
+    for (const stmt of sf.statements) {
+        const result = visit(stmt, { addFunctionOutside: true });
+        if (!result.trim())
+            continue;
+        statements.push(withLineMarker(stmt, localizeGoPaths(result)));
+    }
+    const fileOutside = localizeGoPaths(outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n'));
+    // its top-level variables live in its own Go file
+    const fileVars = mainPackageVariables.splice(varsBefore).map((v) => localizeGoPaths(v));
+    const fnName = `tnEntry_${id}`;
+    const fileCode = `${fileVars.join('\n')}\n\nfunc init() { tnEntryPoints[${JSON.stringify(id)}] = ${fnName} }\n\nfunc ${fnName}() {\n\t${statements.join('\n\t')}\n}\n\n${fileOutside}`;
+    const fileImports = [...importedPackages]
+        .filter((pkg) => {
+        if (!helperProvidedPackages.has(pkg))
+            return true;
+        const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop();
+        return stripGoStrings(fileCode).includes(`${pkgName}.`);
+    })
+        .sort()
+        .map((pkg) => goImportLine(pkg))
+        .join('\n');
+    const goFileName = `entry_${id}.go`;
+    const parts = [GENERATED_HEADER, 'package main'];
+    if (fileImports)
+        parts.push(fileImports);
+    parts.push(fileCode.trim());
+    localImportFiles.set(goFileName, applyLineDirectives(parts.join('\n\n'), goFileName));
+    outsideNodes = savedOutsideNodes;
+    importedPackages.clear();
+    for (const p of savedPackages)
+        importedPackages.add(p);
+    for (const p of savedHelperPackages)
+        helperProvidedPackages.add(p);
+    for (const p of helperProvidedPackages)
+        importedPackages.add(p);
+    currentFileDir = prevDir;
+    currentFileIsTsx = prevTsx;
+    currentFileName = prevFileName;
+}
 // Go source without its string literals (for detecting real package use)
 function stripGoStrings(code) {
     return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`/g, '""');
@@ -10350,6 +10492,7 @@ function bindNodeRegistryServices() {
     nodeRegistry.visit = (node) => visit(node);
     nodeRegistry.categoryOf = (node) => resolveExpressionType(node) ?? '';
     nodeRegistry.isArrayBuffer = (node) => isArrayBufferExpression(node);
+    nodeRegistry.entryPoint = (node) => registerEntryPoint(node);
     bindConvertServices({
         pkg: needPkg,
         helper: useHelper,
@@ -10417,6 +10560,7 @@ registerModuleV8(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages = {
     regexReplaceFirst: ['regexp'],
+    entryPoints: ['os'],
     orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt'],
     jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
     objectAssign: ['reflect', 'unsafe'],
@@ -13738,6 +13882,31 @@ func TnSymbolKeyFor(s *TnSymbol) *string {
 		return nil
 	}
 	return &s.description
+}`,
+    entryPoints: `// Second entry points: new Worker('./w.ts') / fork('./c.ts') compile that
+// file into this binary as a function; TN_ENTRY picks it in the child process
+var tnEntryPoints = map[string]func(){}
+
+var tnCurrentEntry = func() string {
+	e := os.Getenv("TN_ENTRY")
+	os.Unsetenv("TN_ENTRY")
+	return e
+}()
+
+// The entry a spawned copy of this program runs: the one asked for, else this
+// process's own (new Worker(__filename) inside a worker file)
+var tnNextEntry string
+
+func tnSpawnEntryEnv(env []string) []string {
+	entry := tnNextEntry
+	tnNextEntry = ""
+	if entry == "" {
+		entry = tnCurrentEntry
+	}
+	if entry == "" {
+		return env
+	}
+	return append(env, "TN_ENTRY="+entry)
 }`,
     timerWait: `// Timers: callbacks run on the event loop; pending (ref'ed) timers keep the process alive
 var __tnTimers tnLoopGroup

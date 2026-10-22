@@ -815,7 +815,8 @@ async function runs synchronously until its first `await`.
 | `exec` / `execFile` (callbacks), `spawn` → `ChildProcess` (stdio streams, `'exit'` / `'close'`, `kill`); `promisify(exec)` | ✅ | [lib-node-child-process-async.ts](conformance/lib-node-child-process-async.ts) | `'close'` follows the end of the stdio streams being read; exit codes on `err.code`     |
 | `fork(modulePath, args, { env, cwd, silent })` → `send` / `'message'` / `disconnect` / `'disconnect'` / `connected`; in the child `process.send` / `process.on('message')` / `process.connected` / `process.disconnect` | ✅ | [lib-node-child-process-fork.ts](conformance/lib-node-child-process-fork.ts) | The child is this program run again (branch on `process.argv` / `process.send`), linked over loopback TCP; messages are structured clones (a superset of Node's default JSON) |
 | `spawn` `detached`, `child.unref()` / `ref()` | ✅ | [lib-node-child-process-detached.ts](conformance/lib-node-child-process-detached.ts) | A new session (`setsid`) on Unix; `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` on Windows, as libuv does. An unref'ed child's stdio pipes don't keep the parent alive either |
-| `stdio` arrays beyond stdout, forking another file | ❌ | — | Extra `stdio` entries are `ExtraFiles`; another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)) |
+| `fork('./child.ts')` (another file) | ✅ | [lib-node-worker-entry.ts](conformance/lib-node-worker-entry.ts) | As for workers: a second entry point of the binary |
+| `stdio` arrays beyond stdout | ❌ | — | Extra `stdio` entries are `ExtraFiles` |
 | `serialization: 'advanced'` handle passing (`send(msg, socket)`) | ❌ | — | Needs file-descriptor passing over the IPC channel (`SCM_RIGHTS` on Unix) |
 
 #### `node:cluster`
@@ -940,7 +941,8 @@ async function runs synchronously until its first `await`.
 | Messages: structured clone of JSON-like values, Buffers (arriving as `Uint8Array`s), `Map`, `Set`, `Date`, `bigint`, errors |   ✅    | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Functions throw `DataCloneError`                                                                    |
 | Uncaught exceptions in a worker / `terminate()`                                                        |   ✅    | [lib-node-worker-errors.ts](conformance/lib-node-worker-errors.ts) | `'error'` with the message, then exit code `1`                                                          |
 | `MessageChannel` / `MessagePort` (`postMessage`, `on('message')`, `onmessage`, `start`, `close`, `ref` / `unref`), `receiveMessageOnPort`, `BroadcastChannel`, `get/setEnvironmentData` | ✅ | [lib-node-worker-threads.ts](conformance/lib-node-worker-threads.ts) | Channels and broadcast channels work within one process (ports can't be transferred to workers)     |
-| Workers for another file, transferring ports, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | Another file needs a second entry point compiled into the binary (see the [roadmap](#roadmap-known-limitations)); ports can be relayed through the parent; `resourceLimits` maps to `debug.SetMemoryLimit` |
+| `new Worker('./worker.ts')` (another file) | ✅ | [lib-node-worker-entry.ts](conformance/lib-node-worker-entry.ts) | The file (a literal path, `new URL('./f.ts', import.meta.url)` or `path.join(__dirname, 'f.ts')`, resolved from the source file at compile time) is compiled into the binary as a second entry point; the child runs it instead of the program, picked by `TN_ENTRY`. Its top-level names share one Go package with the program, so they must not clash; files the program imports still run their top-level code in every process |
+| Transferring ports, `resourceLimits`, worker `stdout: true` streams |   ❌    | —                                     | Ports can be relayed through the parent; `resourceLimits` maps to `debug.SetMemoryLimit` |
 | `eval: true`, `SharedArrayBuffer` / `Atomics` | 🚫 | — | `eval` needs a JavaScript engine; workers are processes, so memory is not shared |
 
 #### `node:sqlite`
@@ -1275,9 +1277,9 @@ These follow from compiling to a native Go binary, and won't change:
   package, this also covers tty `ReadStream` / `WriteStream`.
 - **Source positions.** The generated Go carries `//line` directives, so `runtime.Callers`
   reports `.ts` files and lines: `err.stack`, `util.getCallSites`, node:test `location`.
-- **Second entry points.** Compiling another `.ts` file into the same binary, and selecting it
-  with an environment variable as workers already do (`TN_WORKER_ADDR`), would cover
-  `new Worker('./w.ts')`, `fork('./child.ts')` and node:test `run({ files })`.
+- **Second entry points.** Another `.ts` file compiled into the same binary and selected with an
+  environment variable (`TN_ENTRY`) covers `new Worker('./w.ts')` and `fork('./child.ts')`; node:test
+  `run({ files })` can use it too.
 - **Go 1.24+ runtime features.** `weak` and `runtime.AddCleanup` would cover `WeakRef`,
   `FinalizationRegistry`, and freeing SQLite statements when they are garbage-collected.
 - **Copying from GOROOT's vendor tree**, the way `String.prototype.normalize` copies `x/text`
@@ -1310,8 +1312,9 @@ These follow from compiling to a native Go binary, and won't change:
    `readline.emitKeypressEvents`, `child_process` `detached`, dgram multicast and socket
    options, errno numbers per OS, `node:dns` record types and TTLs, `node:module` /
    `node:v8` / `node:sea` basics, `Hash` streams, AES key wrap, `res.addTrailers()`, SQLite
-   finalization and `serialize`, node:test flags and reporters. Remaining:
-   - second entry points
+   finalization and `serialize`, node:test flags and reporters, second entry points for workers and
+   `fork`. Remaining:
+   - node:test `run({ files })` on top of second entry points
    - `async_hooks.createHook`
    - node:test snapshots and `run()`
    - `createRequire`, `sea` assets

@@ -212,6 +212,7 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 	}
 	env = append(env, extraEnv...)
 	env = append(env, "TN_IPC_ADDR="+ln.Addr().String(), "TN_IPC_TOKEN="+token)
+	env = tnSpawnEntryEnv(env)
 	envMap := map[string]interface{}{}
 	for _, kv := range env {
 		if k, v, ok := strings.Cut(kv, "="); ok {
@@ -279,6 +280,13 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 
 // fork(modulePath, args?, options?): this program, run again (a native binary
 // holds one program; branch on process.send / cluster.isPrimary)
+// fork('./child.ts'): runs the entry point compiled from that file
+func TnForkAt(entry string, modulePath interface{}, rest ...interface{}) *TnChildProcess {
+	tnNextEntry = entry
+	defer func() { tnNextEntry = "" }()
+	return TnFork(modulePath, rest...)
+}
+
 func TnFork(modulePath interface{}, rest ...interface{}) *TnChildProcess {
 	argv := []string{}
 	var opts interface{}
@@ -908,7 +916,7 @@ export function registerCluster(r: NodeRegistry): void {
     r,
     'nodeIpc',
     ['crypto/rand', 'encoding/binary', 'encoding/hex', 'encoding/json', 'io', 'net', 'os', 'reflect', 'strings', 'sync', 'time'],
-    ['nodeClone', 'nodeChild', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic'],
+    ['nodeClone', 'nodeChild', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'entryPoints'],
     ipcHelper
   );
   const useIpc = () => r.helper('nodeIpc');
@@ -916,6 +924,9 @@ export function registerCluster(r: NodeRegistry): void {
   // child_process.fork and the child's process.send / connected / disconnect
   r.functions['child_process.fork'] = (c: NodeCall) => {
     useIpc();
+    // fork('./child.ts'): that file is compiled in as a second entry point
+    const entry = r.entryPoint(c.nodes[0]);
+    if (entry !== '') return `TnForkAt(${JSON.stringify(entry)}, ${c.args.join(', ')})`;
     return `TnFork(${c.args.join(', ')})`;
   };
   r.results['child_process.fork'] = '*TnChildProcess';
@@ -936,6 +947,16 @@ export function registerCluster(r: NodeRegistry): void {
     return `TnProcessSend(${c.args.join(', ')})`;
   };
   r.results['process.send'] = 'bool';
+  // process.send?.(…) / process.disconnect?.(): they exist only in a process
+  // with an IPC channel (a forked child)
+  r.functions['process.send?.'] = (c: NodeCall) => {
+    useIpc();
+    return `func() { if tnIpcParent != nil { TnProcessSend(${c.args.join(', ')}) } }()`;
+  };
+  r.functions['process.disconnect?.'] = (_c: NodeCall) => {
+    useIpc();
+    return 'func() { if tnIpcParent != nil { TnProcessDisconnect() } }()';
+  };
   r.functions['process.disconnect'] = (_c: NodeCall) => {
     useIpc();
     return 'TnProcessDisconnect()';

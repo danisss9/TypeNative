@@ -7,7 +7,7 @@
 // within one process. The worker's stdout / stderr are the parent's; an
 // uncaught exception in a worker becomes an 'error' event and exit code 1.
 
-import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults, isStringNode } from './registry.js';
+import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
 
 const cloneHelper = `// Structured clone (subset): values to and from JSON with type tags
 func tnCloneEncode(v interface{}) interface{} {
@@ -466,6 +466,13 @@ type TnWorker struct {
 
 func (w *TnWorker) Get_threadId() float64 { return w.threadId }
 
+// new Worker('./w.ts'): runs the entry point compiled from that file
+func TnNewWorkerAt(entry string, filename interface{}, options ...interface{}) *TnWorker {
+	tnNextEntry = entry
+	defer func() { tnNextEntry = "" }()
+	return TnNewWorker(filename, options...)
+}
+
 func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 	tnNextThreadID++
 	w := &TnWorker{threadId: tnNextThreadID}
@@ -508,6 +515,7 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 			}
 		}
 	}
+	env = tnSpawnEntryEnv(env)
 	env = append(env, "TN_WORKER_ADDR="+ln.Addr().String(), "TN_WORKER_TOKEN="+token)
 	setup, err := json.Marshal(map[string]interface{}{
 		"workerData":      tnCloneEncode(workerData),
@@ -669,7 +677,7 @@ export function registerWorkerThreads(r: NodeRegistry): void {
     r,
     'nodeWorker',
     ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'],
-    ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild'],
+    ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild', 'entryPoints'],
     workerHelper
   );
   const use = () => r.helper('nodeWorker');
@@ -715,10 +723,9 @@ export function registerWorkerThreads(r: NodeRegistry): void {
 
   r.constructors['worker_threads.Worker'] = (c: NodeCall) => {
     use();
-    // The worker runs this program again: other files can't be loaded at runtime
-    if (isStringNode(c.nodes[0]) && /\.(m?[jt]s|tsx?)$/.test(String(c.nodes[0].text))) {
-      console.warn(`[TypeNative] new Worker('${c.nodes[0].text}') runs the current program; use new Worker(__filename) / new URL(import.meta.url) and branch on isMainThread`);
-    }
+    // new Worker('./w.ts'): that file is compiled in as a second entry point
+    const entry = r.entryPoint(c.nodes[0]);
+    if (entry !== '') return `TnNewWorkerAt(${JSON.stringify(entry)}, ${c.args.join(', ')})`;
     return `TnNewWorker(${c.args.join(', ')})`;
   };
   r.constructors['worker_threads.MessageChannel'] = (_c: NodeCall) => {
