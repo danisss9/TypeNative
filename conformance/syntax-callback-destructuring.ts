@@ -19,7 +19,8 @@ assert([...untyped].map(([k, v]) => k + v).join() === 'k1', 'an untyped Map: + d
 const merged = { ...record, c: 3, a: 10 };
 assert(Object.keys(merged).join() === 'a,b,c' && merged.a === 10, 'a record spread keeps key order');
 const env = { ...process.env, TN_PROBE_EXTRA: 'yes' };
-assert(env.TN_PROBE_EXTRA === 'yes' && 'PATH' in env, 'spreading process.env');
+// a spread copy is case-sensitive, and Windows names it Path
+assert(env.TN_PROBE_EXTRA === 'yes' && Object.keys(env).some((k) => k.toUpperCase() === 'PATH'), 'spreading process.env');
 
 const one: any = 1;
 const two: any = 2;
