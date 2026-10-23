@@ -1077,6 +1077,7 @@ export function transpileToNative(code, options) {
     enumBaseTypes.clear();
     importAliases.clear();
     includedLocalImports.clear();
+    requireFunctionNames.clear();
     entryPointIds.clear();
     pendingEntryPoints = [];
     mainSourcePath = options?.fileName ?? '';
@@ -1531,6 +1532,9 @@ function visit(node, options = {}) {
         return getAcessString(leftSide, rightSide, objectType);
     }
     else if (isVariableDeclaration(node)) {
+        const requireDeclaration = visitRequireDeclaration(node);
+        if (requireDeclaration !== undefined)
+            return requireDeclaration;
         const nodeAlias = visitNodeAliasDeclaration(node);
         if (nodeAlias !== undefined)
             return nodeAlias;
@@ -10361,6 +10365,56 @@ function compileEntryPoint(id, file) {
     currentFileIsTsx = prevTsx;
     currentFileName = prevFileName;
 }
+// JSON modules: `import data from './data.json'` (with { type: 'json' }) and
+// `createRequire(import.meta.url)('./data.json')` read the file at compile
+// time; JSON is an object-literal expression, so the value compiles as
+// `const data = <json>` with the types an object literal would get
+const requireFunctionNames = new Set();
+function visitJsonImport(node, moduleSpec) {
+    const name = node.importClause?.name?.text;
+    if (!name)
+        return '';
+    return visitJsonValueDeclaration(node, name, moduleSpec);
+}
+function visitJsonValueDeclaration(node, name, moduleSpec) {
+    const file = fileResolver ? fileResolver(moduleSpec, currentFileDir) : null;
+    if (!file) {
+        reportError(node, `Cannot find JSON module '${moduleSpec}'`);
+        return '';
+    }
+    try {
+        JSON.parse(file.content);
+    }
+    catch (e) {
+        reportError(node, `'${moduleSpec}' is not valid JSON`);
+        return '';
+    }
+    const prevName = currentFileName;
+    currentFileName = file.path ?? moduleSpec;
+    const sf = parseSource(`const ${name} = ${file.content.trim()};`);
+    currentFileName = prevName;
+    const declaration = sf.statements[0];
+    return visit(declaration);
+}
+// const require = createRequire(import.meta.url) / const data = require('./x.json')
+function visitRequireDeclaration(node) {
+    const init = node.initializer;
+    if (!init || !isCallExpression(init) || !isIdentifier(node.name))
+        return undefined;
+    if (resolveNodeKey(init.expression) === 'module.createRequire') {
+        requireFunctionNames.add(node.name.text);
+        return '';
+    }
+    const arg = (init.arguments ?? [])[0];
+    if (isIdentifier(init.expression) && requireFunctionNames.has(init.expression.text) && arg && isStringLiteral(arg)) {
+        const spec = String(arg.text);
+        if (/\.json$/i.test(spec))
+            return visitJsonValueDeclaration(node, node.name.text, spec);
+        reportError(node, `require('${spec}') is not supported: only JSON files can be required (use import for modules)`);
+        return '';
+    }
+    return undefined;
+}
 // Whether Object.keys & co.'s argument is a Map / Record (an ordered map)
 function isOrderedMapArg(node) {
     return !!node && (inferExpressionType(node) ?? '').startsWith('*TnMap[');
@@ -11376,6 +11430,19 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 		if k, ok := key.(string); ok {
 			v, _ := o.TnProp(k)
 			return v
+		}
+	}
+	// typed slices held as any ([]*struct{…}, *[]T reference arrays)
+	if i, ok := key.(float64); ok && obj != nil {
+		rv := reflect.ValueOf(obj)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+			rv = rv.Elem()
+		}
+		if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && i >= 0 && int(i) < rv.Len() && i == float64(int(i)) {
+			return rv.Index(int(i)).Interface()
+		}
+		if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+			return nil
 		}
 	}
 	// a class instance / typed object held as any: its field
@@ -15820,6 +15887,9 @@ function visitImportDeclaration(node) {
     if (!isStringLiteral(node.moduleSpecifier))
         return '';
     const moduleSpec = node.moduleSpecifier.text;
+    if (/\.json$/i.test(moduleSpec) && (moduleSpec.startsWith('.') || moduleSpec.startsWith('/'))) {
+        return visitJsonImport(node, moduleSpec);
+    }
     // Relative imports → transpile to a separate Go file
     if (moduleSpec.startsWith('.') || moduleSpec.startsWith('/')) {
         // Key combines current dir + specifier to avoid cross-package collisions

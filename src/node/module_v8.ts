@@ -111,6 +111,10 @@ export function registerModuleV8(r: NodeRegistry): void {
     return `TnIsBuiltin(${c.args[0]})`;
   };
   r.results['module.isBuiltin'] = 'bool';
+  // const require = createRequire(import.meta.url) is handled by the
+  // transpiler (require('./x.json') reads the file at compile time)
+  r.functions['module.createRequire'] = (_c: NodeCall) => 'nil';
+  r.results['module.createRequire'] = 'interface{}';
 
   defineModule(r, 'v8');
   defineHelper(r, 'nodeV8', ['encoding/json', 'math', 'runtime', 'runtime/debug'], ['nodeClone', 'error'], v8Helper);

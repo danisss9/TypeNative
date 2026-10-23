@@ -172,6 +172,11 @@ declare var RegExp: RegExpConstructor;
 
 // --- Array ---
 
+/** import data from './data.json' with { type: 'json' } */
+interface ImportAttributes {
+  [key: string]: string;
+}
+
 /** readonly T[] / ReadonlyArray<T> (mutating methods are not hidden) */
 interface ReadonlyArray<T> extends Array<T> {}
 

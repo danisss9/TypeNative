@@ -49,6 +49,7 @@ export function typeCheckNode(entry: string, typesDir: string): TypeCheckDiagnos
       noImplicitAny: true,
       allowSyntheticDefaultImports: true,
       allowImportingTsExtensions: true,
+      resolveJsonModule: true,
       jsx: ts.JsxEmit.Preserve,
       skipLibCheck: true
     };

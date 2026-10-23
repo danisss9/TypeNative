@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`node:crypto`:** `Hash` / `Hmac` as streams; AES key wrap ciphers (`id-aes*-wrap`,
   `id-aes*-wrap-pad`)
 - **`node:http`:** `res.addTrailers()`
+- **JSON modules:** `import data from './x.json' with { type: 'json' }` and
+  `createRequire(import.meta.url)('./x.json')`, read at compile time
 - **Workers and `fork` for another file:** `new Worker('./worker.ts')` / `fork('./child.ts')` compile
   that file into the binary as a second entry point, run in the child process
 - **`node:test`:** `--test-name-pattern`, `--test-skip-pattern`, `--test-only` and
@@ -90,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Object.keys` / `values` / `entries` and `for...in`** on typed objects (interfaces, object
   literals, class instances) did not build
 - **`JSON.parse`:** objects keep the text's key order (they came out sorted)
+- **Indexing a typed array held as `any`** (`record.list[1].id`) gave `undefined`
 - **Worker / IPC messages and `v8.deserialize`:** objects keep their key order (they arrived
   sorted), records arrive as plain objects rather than `Map`s, and both convert to typed
   `Record` fields

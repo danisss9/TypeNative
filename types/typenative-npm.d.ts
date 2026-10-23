@@ -1706,6 +1706,12 @@ declare module 'node:module' {
     const builtinModules: string[];
     /** Whether the specifier names a built-in module ('fs', 'node:fs', 'node:test') */
     function isBuiltin(moduleName: string): boolean;
+    interface Require {
+      /** require('./data.json'): JSON files only, read at compile time */
+      (id: string): any;
+    }
+    /** const require = createRequire(import.meta.url): its require() loads JSON files */
+    function createRequire(path: string | URL): Require;
   }
   export = Module;
 }

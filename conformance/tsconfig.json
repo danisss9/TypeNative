@@ -2,6 +2,9 @@
     "include": ["*.ts", "*.tsx"],
     "compilerOptions": {
       "target": "es2020",
+      // import attributes (JSON modules) and import x = require() both type-check
+      "module": "preserve",
+      "resolveJsonModule": true,
       "jsx": "preserve",    
       "lib": [], 
       "types": ["../types/typenative.d.ts", "../types/typenative-go.d.ts", "../types/typenative-npm.d.ts"],

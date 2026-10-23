@@ -260,6 +260,7 @@ declared there fails the type check before it reaches the transpiler. The
 | Dynamic `import()`                                 |   ✅    | [syntax-dynamic-import.ts](conformance/syntax-dynamic-import.ts) | `const m = await import('./x')` is a namespace import                                                                  |
 | Side-effect imports (`import './mod'`)             |   ✅    | [syntax-side-effect-import.ts](conformance/syntax-side-effect-import.ts) | Module top-level statements run in Go's `init()`                                                                       |
 | `import.meta.url`                                  |   ✅    | [syntax-import-meta.ts](conformance/syntax-import-meta.ts)       | The `file://` URL of the running program (`os.Executable` → `pathToFileURL`)                                           |
+| JSON modules (`import data from './x.json' with { type: 'json' }`) | ✅ | [lib-json-modules.ts](conformance/lib-json-modules.ts) | Read at compile time and compiled as an object literal, so fields keep their types (helper [json-module-helper.json](conformance/json-module-helper.json)); needs `resolveJsonModule` and a `module` setting that allows import attributes in a project tsconfig |
 
 ## Async & timing
 
@@ -1022,7 +1023,8 @@ network; it adds about 10 MB to a binary. Rows are records: `row.name`, `row as 
 | API | Status | Probe | Notes |
 | --- | :----: | ----- | ----- |
 | `builtinModules` / `isBuiltin` | ✅ | [lib-node-module-v8.ts](conformance/lib-node-module-v8.ts) | Node 22's list; `node:test`, `node:sqlite` and `node:sea` need the scheme, as in Node |
-| `createRequire(…)('literal')` / `findPackageJSON` | ❌ | — | Feasible: `require` of a literal specifier resolved at compile time like an import |
+| `createRequire(import.meta.url)` and `require('./data.json')` | ✅ | [lib-json-modules.ts](conformance/lib-json-modules.ts) | JSON files only, read at compile time; `require` of a module reports an error (use `import`) |
+| `findPackageJSON`, `require` of modules | ❌ | — | Feasible: a literal module specifier resolved at compile time like an import |
 | `register` / `registerHooks` (loader hooks), `require` of computed specifiers | 🚫 | — | Hooks into a JavaScript loader; imports are resolved at compile time |
 
 #### `node:test/reporters`
@@ -1317,7 +1319,7 @@ These follow from compiling to a native Go binary, and won't change:
    - node:test `run({ files })` on top of second entry points
    - `async_hooks.createHook`
    - node:test snapshots and `run()`
-   - `createRequire`, `sea` assets
+   - `sea` assets
    - the smaller `node:crypto` items
    - stream backpressure and BYOB readers
    - TLS PFX and root certificates
