@@ -47,6 +47,7 @@ export function typeCheckNode(entry, typesDir) {
             noImplicitAny: true,
             allowSyntheticDefaultImports: true,
             allowImportingTsExtensions: true,
+            resolveJsonModule: true,
             jsx: ts.JsxEmit.Preserve,
             skipLibCheck: true
         };

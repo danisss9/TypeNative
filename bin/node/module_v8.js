@@ -106,6 +106,10 @@ export function registerModuleV8(r) {
         return `TnIsBuiltin(${c.args[0]})`;
     };
     r.results['module.isBuiltin'] = 'bool';
+    // const require = createRequire(import.meta.url) is handled by the
+    // transpiler (require('./x.json') reads the file at compile time)
+    r.functions['module.createRequire'] = (_c) => 'nil';
+    r.results['module.createRequire'] = 'interface{}';
     defineModule(r, 'v8');
     defineHelper(r, 'nodeV8', ['encoding/json', 'math', 'runtime', 'runtime/debug'], ['nodeClone', 'error'], v8Helper);
     defineClass(r, 'v8.HeapInfo', '*TnHeapStatistics', 'class', '', 'total_heap_size=float64; total_heap_size_executable=float64; total_physical_size=float64; total_available_size=float64; used_heap_size=float64; heap_size_limit=float64; malloced_memory=float64; peak_malloced_memory=float64; does_zap_garbage=float64; number_of_native_contexts=float64; number_of_detached_contexts=float64; total_global_handles_size=float64; used_global_handles_size=float64; external_memory=float64', '', '');
