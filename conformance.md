@@ -354,13 +354,14 @@ Every standard-library API TypeNative ports, split by module. Per
 | `JSON.parse`     |   ✅    | [lib-json-parse.ts](conformance/lib-json-parse.ts)         | Mapped to `encoding/json` `Unmarshal`; assigned to an interface type, the result converts into its struct |
 | `JSON.stringify` |   ✅    | [lib-json-stringify.ts](conformance/lib-json-stringify.ts) | Reflection serializer includes unexported struct fields and inherited ones |
 | `JSON.stringify` `space`, replacer (function or key list), `toJSON()`; circular structures; `JSON.parse` reviver and `SyntaxError`s | ✅ | [lib-json-options.ts](conformance/lib-json-options.ts) | Node's layout; Dates serialize as ISO strings, `Map` / `Set` as `{}`, bigints throw. A replacer or reviver returning `undefined` gives `null` (it doesn't drop the key) |
-| Key order of `JSON.parse` objects | ❌ | — | Parsed objects are Go maps: `JSON.stringify` writes their keys sorted |
+| Key order of `JSON.parse` objects | ✅ | [lib-object-keys-typed.ts](conformance/lib-object-keys-typed.ts) | Parsed objects are ordered records (a duplicate key keeps its first position and last value); `delete`, `in`, `for...in` and spreads keep the order |
 
 ### `Object`
 
 | API                                                        | Status | Probe                                                      | Notes                                                               |
 | ---------------------------------------------------------- | :----: | ---------------------------------------------------------- | ------------------------------------------------------------------- |
 | `Object.keys` / `values` / `entries`                       |   ✅    | [lib-object-helpers.ts](conformance/lib-object-helpers.ts) | Map key/value iteration helpers; typed results for maps and records |
+| `Object.keys` / `values` / `entries`, `for...in` on typed objects (interfaces, object literals, class instances) | ✅ | [lib-object-keys-typed.ts](conformance/lib-object-keys-typed.ts) | Own data fields in declaration order, a parent class's first; no `#private` fields or accessors (they are on the prototype); unset optional properties are absent |
 | `Object.assign`                                            |   ✅    | [lib-object-assign.ts](conformance/lib-object-assign.ts)   | Sources (structs, maps, dynamic objects) copied into an ordered map |
 | `Object.freeze` / `seal` / `preventExtensions` / `isFrozen` / `isSealed` / `isExtensible` | ✅ | [lib-object-freeze.ts](conformance/lib-object-freeze.ts) | Integrity level tracked by identity; writes rejected by `Readonly<T>` types (`preventExtensions` / `isSealed` / `isExtensible` not probed) |
 | `Object.fromEntries`                                       |   ✅    | [lib-object-from-entries.ts](conformance/lib-object-from-entries.ts) | `TnFromEntries` → dynamic object                                    |
@@ -1299,7 +1300,6 @@ These follow from compiling to a native Go binary, and won't change:
    `AggregateError`, `bind` / `fn.name` / `fn.length`, `Promise.withResolvers` / `try`,
    `Object.is` / `groupBy`, `Array.of`, and the `Number` / `Math` / `String` / `BigInt` /
    `Symbol` additions. Remaining:
-   - key order of `JSON.parse` objects
    - `Array.fromAsync`
    - `Uint8Array` base64 / hex, `BigInt64Array`
    - `localeCompare` with locales (needs `Intl`)
