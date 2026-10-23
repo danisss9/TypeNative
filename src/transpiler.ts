@@ -2434,8 +2434,14 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const varName = isVariableDeclarationList(node.initializer)
       ? visit(node.initializer.declarations[0].name)
       : visit(node.initializer as AstNode);
+    const forInType = inferExpressionType(node.expression) ?? '';
+    // objects (structs, dynamic values): their own property names
+    if (!forInType.startsWith('*TnMap[') && !forInType.startsWith('map[') && !forInType.startsWith('[]') && !forInType.startsWith('*[]') && forInType !== 'string') {
+      useHelper('dynamic');
+      return `for _, ${varName} := range TnKeys(${visit(node.expression, { inline: true })})${visitLoopBody(node.statement, `_ = ${varName}\n\t\t`)}`;
+    }
     const iterated = visit(node.expression, { inline: true });
-    const isOrderedMap = inferExpressionType(node.expression)?.startsWith('*TnMap[');
+    const isOrderedMap = forInType.startsWith('*TnMap[');
     // A key the body never reads would be "declared and not used" in Go
     return `for ${varName} := range ${iterated}${isOrderedMap ? '.All()' : ''}${visitLoopBody(
       node.statement,
@@ -2450,7 +2456,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       isIdentifier(iterNode.expression.expression) &&
       iterNode.expression.expression.text === 'Object' &&
       iterNode.expression.name.text === 'entries' &&
-      iterNode.arguments.length > 0
+      iterNode.arguments.length > 0 &&
+      isOrderedMapArg(iterNode.arguments[0])
     ) {
       iterNode = iterNode.arguments[0] as AstNode;
     }
@@ -3302,13 +3309,14 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (isDynamicObjectLiteral(node)) {
       // { ...a, k: v } → copy a's properties, then set k (in source order)
       if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
-        useHelper('dynamic');
+        // an ordered record, so the keys keep their order
+        useHelper('dynamicSpread');
         const steps = (node.properties ?? []).map((p) => {
-          if (p.kind === 'SpreadAssignment') return `TnAssign(__obj, ${visit(p.expression)})`;
-          if (isShorthandPropertyAssignment(p)) return `__obj[${mapKeyText(p.name)}] = ${visit(p.name)}`;
-          return `__obj[${propertyKeyString(p.name)}] = ${visit(p.initializer)}`;
+          if (p.kind === 'SpreadAssignment') return `TnAssignInto(__obj, ${visit(p.expression)})`;
+          if (isShorthandPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${visit(p.name)})`;
+          return `__obj.Set(${propertyKeyString(p.name)}, ${visit(p.initializer)})`;
         });
-        return `func() map[string]interface{} { __obj := map[string]interface{}{}; ${steps.join('; ')}; return __obj }()`;
+        return `func() *TnMap[string, interface{}] { __obj := TnNewMap[string, interface{}](); ${steps.join('; ')}; return __obj }()`;
       }
       const entries = (node.properties ?? [])
         .map((p) => {
@@ -6083,6 +6091,10 @@ function inferExpressionType(expr: AstNode): string | undefined {
       if (expr.expression.name.text === 'keys') return `[]${extractMapKeyType(mapType)}`;
       if (expr.expression.name.text === 'values') return `[]${extractMapValueType(mapType)}`;
       if (expr.expression.name.text === 'entries') return '[][]interface{}';
+    } else if (expr.arguments?.[0]) {
+      if (expr.expression.name.text === 'keys') return '[]string';
+      if (expr.expression.name.text === 'values') return '[]interface{}';
+      if (expr.expression.name.text === 'entries') return '[][]interface{}';
     }
   }
   if (isCallExpression(expr) && isIdentifier(expr.expression)) {
@@ -8379,10 +8391,23 @@ const callHandlers: Record<string, CallHandler> = {
     }
     return `TnJSONParse(${args[0]})`;
   },
-  'Object.keys': (_caller, args) => `${args[0]}.Keys()`,
-  'Object.values': (_caller, args) => `${args[0]}.Values()`,
+  // Maps / records have ordered keys; other objects go through reflection
+  'Object.keys': (_caller, args) => {
+    if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Keys()`;
+    useHelper('dynamic');
+    return `TnKeys(${args[0]})`;
+  },
+  'Object.values': (_caller, args) => {
+    if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Values()`;
+    useHelper('dynamic');
+    return `TnValues(${args[0]})`;
+  },
   // Outside for...of (which iterates the map directly): [key, value] pairs
-  'Object.entries': (_caller, args) => `${args[0]}.Entries()`,
+  'Object.entries': (_caller, args) => {
+    if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Entries()`;
+    useHelper('dynamic');
+    return `TnEntries(${args[0]})`;
+  },
   // Object.assign copies sources into a fresh ordered map (mutating structs is
   // not observable the way it is in JS)
   'Object.assign': (_caller, args) => {
@@ -10410,6 +10435,11 @@ function compileEntryPoint(id: string, file: ResolvedSourceFile): void {
   currentFileName = prevFileName;
 }
 
+// Whether Object.keys & co.'s argument is a Map / Record (an ordered map)
+function isOrderedMapArg(node: AstNode | undefined): boolean {
+  return !!node && (inferExpressionType(node) ?? '').startsWith('*TnMap[');
+}
+
 // Go source without its string literals (for detecting real package use)
 function stripGoStrings(code: string): string {
   return code.replace(/"(?:[^"\\\n]|\\.)*"|`[^`]*`/g, '""');
@@ -10514,7 +10544,8 @@ const helperRequires: Record<string, string[]> = {
   promise: ['error', 'eventLoop', 'asyncWait'],
   goMust: ['error'],
   bigint: ['error'],
-  jsonStringify: ['error', 'dynamic'],
+  jsonStringify: ['error', 'dynamic', 'orderedMap'],
+  dynamicSpread: ['dynamic', 'orderedMap'],
   weakRefs: ['eventLoop', 'dynamic'],
   builtins: ['error', 'dynamic', 'bigint'],
   date: ['error', 'dynamic'],
@@ -10644,9 +10675,10 @@ registerModuleV8(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
+  dynamicSpread: ['sort'],
   entryPoints: ['os'],
   orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect'],
-  jsonStringify: ['encoding/json', 'bytes', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
+  jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
   objectAssign: ['reflect', 'unsafe'],
   typeOf: ['reflect'],
   isArray: ['reflect'],
@@ -11637,6 +11669,12 @@ func TnAssign(dst map[string]interface{}, src interface{}) {
 		for k, v := range o {
 			dst[k] = v
 		}
+		return
+	}
+	for _, e := range TnEntries(src) {
+		if k, isString := e[0].(string); isString {
+			dst[k] = e[1]
+		}
 	}
 }
 
@@ -11766,6 +11804,12 @@ func TnInt32(f float64) int32 {
 func TnUint32(f float64) uint32 { return uint32(TnInt32(f)) }
 
 func TnDelete(obj interface{}, key interface{}) bool {
+	if record, ok := obj.(interface{ Delete(string) bool }); ok {
+		if k, isString := key.(string); isString {
+			record.Delete(k)
+			return true
+		}
+	}
 	o, ok := obj.(map[string]interface{})
 	k, isString := key.(string)
 	if !ok || !isString {
@@ -11789,6 +11833,12 @@ func TnFromEntries(entries interface{}) interface{} {
 }
 
 func TnHas(obj interface{}, key interface{}) bool {
+	if record, ok := obj.(interface{ TnProp(string) (interface{}, bool) }); ok {
+		if k, isString := key.(string); isString {
+			_, found := record.TnProp(k)
+			return found
+		}
+	}
 	if o, ok := obj.(map[string]interface{}); ok {
 		if k, ok := key.(string); ok {
 			_, found := o[k]
@@ -11811,9 +11861,94 @@ func TnHas(obj interface{}, key interface{}) bool {
 	return false
 }
 
+// An object's own enumerable properties, for structs (object literals, typed
+// objects, class instances): the data fields in declaration order, without
+// #private fields, embedded types and unset optional primitives
+func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
+	rv := reflect.ValueOf(obj)
+	if !rv.IsValid() || rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+		return nil, nil, false
+	}
+	keys := []string{}
+	values := []interface{}{}
+	tnCollectStructProps(rv.Elem(), &keys, &values)
+	return keys, values, true
+}
+
+func tnCollectStructProps(sv reflect.Value, keys *[]string, values *[]interface{}) {
+	st := sv.Type()
+	for i := 0; i < st.NumField(); i++ {
+		field := st.Field(i)
+		// a parent class's fields come first (TypeNative's own runtime types
+		// embedded by Node subclasses are not properties)
+		if field.Anonymous {
+			if field.Type.Kind() == reflect.Struct && !strings.HasPrefix(field.Type.Name(), "Tn") {
+				tnCollectStructProps(sv.Field(i), keys, values)
+			}
+			continue
+		}
+		if strings.HasPrefix(field.Name, "__") {
+			continue
+		}
+		f := sv.Field(i)
+		value := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+		// optional primitives (*string & co.): absent when unset, else their value
+		if value.Kind() == reflect.Pointer {
+			switch value.Type().Elem().Kind() {
+			case reflect.String, reflect.Float64, reflect.Bool:
+				if value.IsNil() {
+					continue
+				}
+				value = value.Elem()
+			}
+		}
+		*keys = append(*keys, strings.TrimSuffix(field.Name, "_"))
+		*values = append(*values, value.Interface())
+	}
+}
+
+// Object.values / Object.entries on any object
+func TnValues(obj interface{}) []interface{} {
+	if record, ok := obj.(interface{ Entries() [][]interface{} }); ok {
+		out := []interface{}{}
+		for _, e := range record.Entries() {
+			out = append(out, e[1])
+		}
+		return out
+	}
+	if _, values, ok := tnStructProps(obj); ok {
+		return values
+	}
+	out := []interface{}{}
+	for _, k := range TnKeys(obj) {
+		out = append(out, TnGet(obj, k))
+	}
+	return out
+}
+
+func TnEntries(obj interface{}) [][]interface{} {
+	if record, ok := obj.(interface{ Entries() [][]interface{} }); ok {
+		return record.Entries()
+	}
+	out := [][]interface{}{}
+	if keys, values, ok := tnStructProps(obj); ok {
+		for i, k := range keys {
+			out = append(out, []interface{}{k, values[i]})
+		}
+		return out
+	}
+	for _, k := range TnKeys(obj) {
+		out = append(out, []interface{}{k, TnGet(obj, k)})
+	}
+	return out
+}
+
 func TnKeys(obj interface{}) []string {
 	if record, ok := obj.(interface{ Keys() []string }); ok {
 		return append([]string{}, record.Keys()...)
+	}
+	if keys, _, ok := tnStructProps(obj); ok {
+		return keys
 	}
 	o, _ := obj.(map[string]interface{})
 	keys := make([]string, 0, len(o))
@@ -12400,7 +12535,53 @@ func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}
 }
 
 // JSON.parse: a SyntaxError for invalid input, as in JS
+// Objects decode into ordered records, so their keys keep the text's order
+func tnJSONDecodeOrdered(dec *json.Decoder) (interface{}, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, isDelim := tok.(json.Delim)
+	if !isDelim {
+		return tok, nil
+	}
+	if delim == '[' {
+		arr := []interface{}{}
+		for dec.More() {
+			v, err := tnJSONDecodeOrdered(dec)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, v)
+		}
+		_, err := dec.Token()
+		return arr, err
+	}
+	m := TnNewMap[string, interface{}]()
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := keyTok.(string)
+		v, err := tnJSONDecodeOrdered(dec)
+		if err != nil {
+			return nil, err
+		}
+		m.Set(key, v)
+	}
+	_, err = dec.Token()
+	return m, err
+}
+
 func TnJSONParse(text string) interface{} {
+	dec := json.NewDecoder(strings.NewReader(text))
+	if ordered, err := tnJSONDecodeOrdered(dec); err == nil {
+		if _, extra := dec.Token(); extra == io.EOF {
+			return ordered
+		}
+	}
+	// invalid JSON: the error message comes from encoding/json's offsets
 	var v interface{}
 	if err := json.Unmarshal([]byte(text), &v); err != nil {
 		msg := "Unexpected end of JSON input"
@@ -12426,6 +12607,10 @@ func TnJSONParseWith(text string, reviver func(string, interface{}) interface{})
 	var walk func(key string, v interface{}) interface{}
 	walk = func(key string, v interface{}) interface{} {
 		switch t := v.(type) {
+		case *TnMap[string, interface{}]:
+			for _, k := range t.Keys() {
+				t.Set(k, walk(k, t.Get(k)))
+			}
 		case map[string]interface{}:
 			keys := make([]string, 0, len(t))
 			for k := range t {
@@ -14013,6 +14198,25 @@ func TnSymbolKeyFor(s *TnSymbol) *string {
 		return nil
 	}
 	return &s.description
+}`,
+  dynamicSpread: `// { ...a, k: v } with dynamic sources: a's own properties, in order
+func TnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
+	if o, ok := src.(map[string]interface{}); ok {
+		keys := make([]string, 0, len(o))
+		for k := range o {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			dst.Set(k, o[k])
+		}
+		return
+	}
+	for _, e := range TnEntries(src) {
+		if k, isString := e[0].(string); isString {
+			dst.Set(k, e[1])
+		}
+	}
 }`,
   entryPoints: `// Second entry points: new Worker('./w.ts') / fork('./c.ts') compile that
 // file into this binary as a function; TN_ENTRY picks it in the child process
