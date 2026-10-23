@@ -72,11 +72,12 @@ function parseResults(s) {
 export function goPackage(path) {
     if (path in packageCache)
         return packageCache[path];
-    const raw = goStdlib[path];
-    if (raw === undefined) {
+    // `in`, not `=== undefined`: natively a missing key reads as ''
+    if (!(path in goStdlib)) {
         packageCache[path] = null;
         return null;
     }
+    const raw = goStdlib[path];
     const info = { path, name: path, funcs: {}, types: {}, consts: {}, vars: {} };
     for (const line of raw.split('\n')) {
         if (!line)
@@ -161,11 +162,17 @@ export function goPackage(path) {
 }
 // Whether a package path has bridge metadata.
 export function hasGoPackage(path) {
-    return goStdlib[path] !== undefined;
+    return path in goStdlib;
 }
 // All known package paths (for resolving cross-package type references).
 export function allGoPaths() {
     return Object.keys(goStdlib);
+}
+// Package path of an emitted qualifier ('dwarf' → 'debug/dwarf'), bound by
+// the bridge: annotated types (`let d: dwarf.Data`) carry the local form.
+let qualifierPath = (_qualifier) => '';
+export function bindQualifierPath(fn) {
+    qualifierPath = fn;
 }
 // Resolve a qualified Go type to its type info.
 export function goTypeInfo(goType) {
@@ -175,11 +182,13 @@ export function goTypeInfo(goType) {
     const dot = base.lastIndexOf('.');
     if (dot < 0)
         return null;
-    const path = base.slice(0, dot);
+    let path = base.slice(0, dot);
     let name = base.slice(dot + 1);
     const bracket = name.indexOf('[');
     if (bracket >= 0)
         name = name.slice(0, bracket);
+    if (!hasGoPackage(path) && qualifierPath(path) !== '')
+        path = qualifierPath(path);
     const info = goPackage(path);
     if (!info)
         return null;

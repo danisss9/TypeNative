@@ -2,7 +2,7 @@
 // prints the pass rate per category (syntax / semantics / lib) plus the failures.
 // Usage: node scripts/conformance.mjs [--native] [filter]
 import { spawnSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -15,6 +15,15 @@ const compiler = native
 const probes = readdirSync(path.join(root, 'conformance'))
   .filter((f) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts') && f.includes(filter))
   .sort();
+
+// A probe whose first line reads `// conformance-skip: win32 (reason)` doesn't run on those platforms
+function skipsHere(file) {
+  const first = readFileSync(path.join(root, 'conformance', file), 'utf-8').split('\n', 1)[0];
+  const match = /^\/\/ conformance-skip: ([\w, ]+)/.exec(first);
+  return !!match && match[1].split(',').some((p) => p.trim() === process.platform);
+}
+const skipped = probes.filter(skipsHere);
+for (const file of skipped) probes.splice(probes.indexOf(file), 1);
 
 const categories = new Map();
 const failures = [];
@@ -49,5 +58,6 @@ for (const [category, { passed, total }] of categories) {
   console.log(`  ${category.padEnd(10)} ${passed}/${total} (${Math.round((passed / total) * 100)}%)`);
 }
 console.log(`  ${'total'.padEnd(10)} ${passedTotal}/${probes.length} (${Math.round((passedTotal / probes.length) * 100)}%)`);
+if (skipped.length > 0) console.log(`  skipped on ${process.platform}: ${skipped.join(', ')}`);
 
 if (passedTotal < probes.length) process.exit(1);

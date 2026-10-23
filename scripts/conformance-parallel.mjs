@@ -1,8 +1,8 @@
 // Fast parallel conformance runner: each probe runs in its own temp cwd
 // (the CLI writes dist/ relative to cwd) so Go builds don't clash.
 // Usage: node scripts/conformance-parallel.mjs [--native] [filter]
-import { spawn } from 'node:child_process';
-import { readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -16,24 +16,52 @@ const probes = readdirSync(path.join(root, 'conformance'))
   .filter((f) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts') && f.includes(filter))
   .sort();
 
+// A probe whose first line reads `// conformance-skip: win32 (reason)` doesn't run on those platforms
+function skipsHere(file) {
+  const first = readFileSync(path.join(root, 'conformance', file), 'utf-8').split('\n', 1)[0];
+  const match = /^\/\/ conformance-skip: ([\w, ]+)/.exec(first);
+  return !!match && match[1].split(',').some((p) => p.trim() === process.platform);
+}
+const skipped = probes.filter(skipsHere);
+for (const file of skipped) probes.splice(probes.indexOf(file), 1);
+
 // Each probe is a Go build; two per core keeps them busy while others type-check or run
 const N = Math.min(8, Math.max(2, os.availableParallelism() * 2));
 let idx = 0;
 let done = 0;
 const failures = [];
 
+// Kills a probe with everything it started: the compiler runs the probe's
+// binary, which may spawn workers or children of its own. Killing only the
+// compiler would leave those running (a runaway probe then starves the rest).
+function killTree(p) {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(p.pid), '/t', '/f'], { stdio: 'ignore' });
+    return;
+  }
+  try {
+    process.kill(-p.pid, 'SIGKILL');
+  } catch { /* the group is already gone */ }
+}
+
 function runOne(file) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'conf-'));
   const name = file.replace(/\.tsx?$/, '');
   return new Promise((resolve) => {
     const [command, ...args] = compiler;
-    const p = spawn(command, [...args, '--source', path.join(root, 'conformance', file), '--script'], { cwd: dir });
+    // Its own process group (POSIX) so a timeout can kill the whole group
+    const p = spawn(command, [...args, '--source', path.join(root, 'conformance', file), '--script'], {
+      cwd: dir,
+      detached: process.platform !== 'win32'
+    });
     let out = '';
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (out += d));
-    const t = setTimeout(() => p.kill(), 90000);
+    const t = setTimeout(() => killTree(p), 90000);
     p.on('close', (code) => {
       clearTimeout(t);
+      // Anything the probe left running in its group goes too
+      if (process.platform !== 'win32') killTree(p);
       if (code !== 0) {
         const line =
           out
@@ -89,4 +117,5 @@ for (const [c, s] of cats) {
   console.log(`  ${c.padEnd(10)} ${s.passed}/${s.total} (${Math.round((s.passed / s.total) * 100)}%)`);
 }
 console.log(`  ${'total'.padEnd(10)} ${tot}/${probes.length} (${Math.round((tot / probes.length) * 100)}%)`);
+if (skipped.length > 0) console.log(`  skipped on ${process.platform}: ${skipped.join(', ')}`);
 if (tot < probes.length) process.exit(1);

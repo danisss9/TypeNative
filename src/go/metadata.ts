@@ -129,11 +129,12 @@ function parseResults(s: string): string[] {
 // The metadata of one Go package, parsed on demand and cached.
 export function goPackage(path: string): GoPackageInfo | null {
   if (path in packageCache) return packageCache[path];
-  const raw = goStdlib[path];
-  if (raw === undefined) {
+  // `in`, not `=== undefined`: natively a missing key reads as ''
+  if (!(path in goStdlib)) {
     packageCache[path] = null;
     return null;
   }
+  const raw = goStdlib[path];
   const info: GoPackageInfo = { path, name: path, funcs: {}, types: {}, consts: {}, vars: {} };
   for (const line of raw.split('\n')) {
     if (!line) continue;
@@ -210,12 +211,20 @@ export function goPackage(path: string): GoPackageInfo | null {
 
 // Whether a package path has bridge metadata.
 export function hasGoPackage(path: string): boolean {
-  return goStdlib[path] !== undefined;
+  return path in goStdlib;
 }
 
 // All known package paths (for resolving cross-package type references).
 export function allGoPaths(): string[] {
   return Object.keys(goStdlib);
+}
+
+// Package path of an emitted qualifier ('dwarf' → 'debug/dwarf'), bound by
+// the bridge: annotated types (`let d: dwarf.Data`) carry the local form.
+let qualifierPath: (qualifier: string) => string = (_qualifier: string) => '';
+
+export function bindQualifierPath(fn: (qualifier: string) => string): void {
+  qualifierPath = fn;
 }
 
 // Resolve a qualified Go type to its type info.
@@ -224,10 +233,11 @@ export function goTypeInfo(goType: string): GoType | null {
   while (base.startsWith('*')) base = base.slice(1);
   const dot = base.lastIndexOf('.');
   if (dot < 0) return null;
-  const path = base.slice(0, dot);
+  let path = base.slice(0, dot);
   let name = base.slice(dot + 1);
   const bracket = name.indexOf('[');
   if (bracket >= 0) name = name.slice(0, bracket);
+  if (!hasGoPackage(path) && qualifierPath(path) !== '') path = qualifierPath(path);
   const info = goPackage(path);
   if (!info) return null;
   const type = info.types[name] ?? null;

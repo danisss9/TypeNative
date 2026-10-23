@@ -43,7 +43,7 @@ import { goStdlib } from './go/stdlib.generated.js';
 import { goPackage, goTypeInfo as goMetaTypeInfo, hasGoPackage, isGoNumeric as isGoNumericType } from './go/metadata.js';
 import { bindConvertServices, initConvertPaths, isGoBasicKind, isGoNumericKind, toGo as toGoType, fromGo as fromGoType } from './go/convert.js';
 import { goPathAliases } from './go/overrides.js';
-import { bindBridgeServices, resetGoBridge, initKnownPaths, goLocalType, ensureGoTypePackages, registerGoBuiltin, registerGoImport, goQualifier, goPathOf, goMemberOf, visitGoCall, visitGoMethod, visitGoNew, inferGoType, goFieldType, isGoRefCall, goTupleTypes, goCallbackResultType, ensureGoQualifier } from './go/bridge.js';
+import { bindBridgeServices, resetGoBridge, initKnownPaths, goLocalType, ensureGoTypePackages, registerGoBuiltin, registerGoImport, goQualifier, goPathOf, goMemberOf, visitGoCall, visitGoMethod, visitGoNew, inferGoType, goFieldType, isGoRefCall, goTupleTypes, goCallbackResultType, ensureGoQualifier, goAnnotationType, splitGoMember } from './go/bridge.js';
 // Shim over the removed `typescript` import: predicates and kind names operate
 // on the normalized JSON AST ({kind: 'Xxx', ...} plain objects) produced by
 // src/parse-node.ts (Node) or the tsparser Go tool (self-hosted).
@@ -2367,7 +2367,7 @@ function visit(node, options = {}) {
         const multi = visitMultiForHeader(node);
         if (multi)
             return multi;
-        return `for ${visit(node.initializer, { inline: true })}; ${node.condition ? toGoCondition(node.condition) : ''}; ${visit(node.incrementor, { inline: true })}${visitLoopBody(node.statement)}`;
+        return `for ${node.initializer ? visit(node.initializer, { inline: true }) : ''}; ${node.condition ? toGoCondition(node.condition) : ''}; ${node.incrementor ? visit(node.incrementor, { inline: true }) : ''}${visitLoopBody(node.statement)}`;
     }
     else if (isForInStatement(node)) {
         const varName = isVariableDeclarationList(node.initializer)
@@ -7782,6 +7782,9 @@ function getType(typeNode, getArrayType = false) {
         const nodeClassKey = nodeClassKeyOfTypeName(typeNode.typeName);
         if (nodeClassKey)
             return nodeRegistry.classes[nodeClassKey].goType;
+        const goAnnotation = goAnnotationOf(typeNode.typeName);
+        if (goAnnotation)
+            return goAnnotation;
     }
     if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
@@ -10299,9 +10302,9 @@ function registerEntryPoint(node) {
     const key = file.path ?? `${file.dir}::${spec}`;
     if (key === mainSourcePath)
         return '';
-    const known = entryPointIds.get(key);
-    if (known !== undefined)
-        return known;
+    // has(), not get() !== undefined: natively get() returns '' for a missing key
+    if (entryPointIds.has(key))
+        return entryPointIds.get(key);
     const id = `${specifierToGoFileName(spec).replace(/\.go$/, '')}_${entryPointIds.size + 1}`;
     entryPointIds.set(key, id);
     pendingEntryPoints.push({ id: id, file: file });
@@ -10524,6 +10527,7 @@ const helperRequires = {
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
     promise: ['error', 'eventLoop', 'asyncWait'],
     goMust: ['error'],
+    goMaps: ['orderedMap'],
     bigint: ['error'],
     jsonStringify: ['error', 'dynamic', 'orderedMap'],
     dynamicSpread: ['dynamic', 'orderedMap'],
@@ -10681,6 +10685,7 @@ const helperPackages = {
     promise: ['sync'],
     goMust: [],
     goNums: [],
+    goMaps: [],
     goStrings: [],
     goBlocking: [],
     decorators: [],
@@ -14113,6 +14118,25 @@ func tnGoFromNums[T tnGoNumber](s []T) []float64 {
 	}
 	return out
 }`,
+    goMaps: `// Go bridge: TS records / Maps into Go maps (slogtest results, map params)
+func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
+	if m == nil {
+		return nil
+	}
+	out := make(map[K]V, len(m.keys))
+	for _, k := range m.keys {
+		out[k] = m.values[k]
+	}
+	return out
+}
+
+func tnGoMaps[K comparable, V any](ms []*TnMap[K, V]) []map[K]V {
+	out := make([]map[K]V, len(ms))
+	for i, m := range ms {
+		out[i] = tnGoMap(m)
+	}
+	return out
+}`,
     goStrings: `// Go bridge: first rune of a string (unicode funcs take rune)
 func tnGoRune(s string) rune {
 	for _, r := range s {
@@ -14122,13 +14146,14 @@ func tnGoRune(s string) rune {
 }`,
     goBlocking: `// Go bridge: blocking calls run on a goroutine while the baton holder
 // pumps pending loop tasks, so timers and handlers keep running
+type tnGoPanic struct{ value interface{} }
+
 func tnGoBlocking(fn func() interface{}) interface{} {
 	done := make(chan interface{}, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- r
-				return
+				done <- tnGoPanic{r}
 			}
 		}()
 		done <- fn()
@@ -14136,28 +14161,35 @@ func tnGoBlocking(fn func() interface{}) interface{} {
 	for {
 		select {
 		case v := <-done:
-			if err, ok := v.(*TnError); ok {
-				panic(err)
-			}
-			return v
+			return tnGoBlockingResult(v)
 		default:
 		}
 		TnRunMicrotasks()
 		if TnLoopRunPending() {
 			continue
 		}
+		// Nothing holds the loop open, so nothing can post to it: wait on the call
+		// alone (a synctest bubble sees this wait as durable)
+		if atomic.LoadInt64(&tnLoopRefs) == 0 {
+			return tnGoBlockingResult(<-done)
+		}
 		tnRelease()
 		select {
 		case v := <-done:
 			tnAcquire()
-			if err, ok := v.(*TnError); ok {
-				panic(err)
-			}
-			return v
+			return tnGoBlockingResult(v)
 		case <-tnLoopSignal:
 			tnAcquire()
 		}
 	}
+}
+
+// The call's result, or its panic raised again on the caller
+func tnGoBlockingResult(v interface{}) interface{} {
+	if p, ok := v.(tnGoPanic); ok {
+		panic(p.value)
+	}
+	return v
 }`,
     symbol: `// TnSymbol: JS symbol values (unique by identity)
 type TnSymbol struct {
@@ -15455,6 +15487,17 @@ function withErrorOptions(errorExpr, options) {
     useHelper('dynamic');
     return `TnErrorWithOptions(${errorExpr}, ${visit(options)})`;
 }
+// A bridged Go type named in an annotation: `dwarf.Data`, or `Data` imported from 'go:debug/dwarf'
+function goAnnotationOf(typeName) {
+    if (typeName?.kind === 'QualifiedName' && isIdentifier(typeName.left)) {
+        const path = goPathOf(typeName.left.text);
+        return path ? goAnnotationType(path, typeName.right.text) : undefined;
+    }
+    if (!isIdentifier(typeName))
+        return undefined;
+    const member = splitGoMember(goMemberOf(typeName.text));
+    return member ? goAnnotationType(member.path, member.member) : undefined;
+}
 // The Node class key of a (qualified) type reference: `Stats`, `fs.Stats`, `NodeJS.ErrnoException`
 function nodeClassKeyOfTypeName(typeName) {
     if (isIdentifier(typeName))
@@ -15696,20 +15739,22 @@ function visitGoProperty(node) {
         return undefined;
     }
     // Field on a Go-typed value.
-    if (isCallee(node) || isAssignmentTarget(node))
+    if (isCallee(node))
         return undefined;
     const recvType = inferExpressionType(base);
     if (!recvType)
         return undefined;
-    const field = goFieldType(recvType, node.name.text);
+    const field = isAssignmentTarget(node) ? undefined : goFieldType(recvType, node.name.text);
     if (field) {
         const recv = visit(base);
         return fromGoType(`${recv}.${node.name.text}`, field);
     }
-    // GoRef<T>.value dereferences the pointer cell (structs with a real
-    // `value` field take the branch above). Only when the receiver is
-    // declared as GoRef<...> or initialized by ref<T>(), or points to a
+    // GoRef<T>.value dereferences the pointer cell, read or written (structs
+    // with a real `value` field take the branch above). Only when the receiver
+    // is declared as GoRef<...> or initialized by ref<T>(), or points to a
     // basic type (flag.String's *string has no fields to read).
+    if (node.name.text === 'value' && isAssignmentTarget(node) && goFieldType(recvType, 'value'))
+        return undefined;
     if (node.name.text === 'value' && recvType.startsWith('*') && isIdentifier(base)) {
         const base2 = recvType.slice(1);
         const isBasic = base2 === 'string' || base2 === 'float64' || base2 === 'bool' || isGoBasicKind(base2);

@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`node:stream`:** `'readable'` events and Node's `read()` / `read(size)`
 - **`node:sqlite`:** statements are finalized once garbage-collected (they lived until
   `db.close()`); `db.serialize()` / `db.deserialize()`
+- **Go bridges:** a probe for every bridged `go:` package, new ones for `debug/*`, `log/syslog`,
+  `math/cmplx`, `net/http/fcgi`, `net/rpc`, `net/rpc/jsonrpc`, `net/smtp`, `testing/cryptotest`,
+  `testing/slogtest` and `testing/synctest`. Along with them:
+  - `pkg.T` in type annotations is the Go type (`let d: dwarf.Data | null = null`,
+    `(t: testing.T) => …`)
+  - `ref.value` can be written (`r.value = x`), also through `GoRef<T>` parameters, so TS classes
+    can be `net/rpc` services
+  - `chan<T>()` makes a `chan T`
+  - TS records pass where Go takes a `map[K]V`
+  - callbacks whose Go signature returns `(T, error)`
 
 ### Fixed
 
@@ -146,6 +156,9 @@ Programs that built Go that didn't compile, or computed a wrong value, with no T
   - `Object.hasOwn` / `defineProperty` with a computed key build instead of crashing the
     compiler
   - unsupported decorators and descriptors are reported as diagnostics instead of crashes
+- **Go bridges:** a blocking call (`time.Sleep`) inside a callback failed to build, a panic in
+  one was swallowed, and `time.Sleep` hung inside a `synctest` bubble
+- **`for (;;)`** without an initializer or update crashed the compiler
 
 ### Documentation
 
@@ -162,6 +175,8 @@ Programs that built Go that didn't compile, or computed a wrong value, with no T
   - `instanceof Map` / `Date`
   - static and accessor inheritance
 - A "Roadmap: known limitations" section, which the link in CONTRIBUTION.md pointed to
+- The Go bridges table has no ⚠️ ("typed, no probe yet") status any more. A probe that can't run on
+  a platform opts out with a first line like `// conformance-skip: win32 (reason)`
 
 ## [0.4.0] - 2026-10-19
 

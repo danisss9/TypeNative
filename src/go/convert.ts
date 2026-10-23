@@ -153,6 +153,15 @@ export function toGo(expr: string, fromType: string, toType: string): string {
     }
     return `func() ${convertServices.localType(toType)} { __v := ${expr}; return __v[:] }()`;
   }
+  // TS records / Maps (*TnMap[K, V]) into Go maps of the same key and value types
+  if (sameMapTypes(fromType, toType)) {
+    convertServices.helper('goMaps');
+    return `tnGoMap(${expr})`;
+  }
+  if (fromType.startsWith('[]') && toType.startsWith('[]') && sameMapTypes(fromType.slice(2), toType.slice(2))) {
+    convertServices.helper('goMaps');
+    return `tnGoMaps(${expr})`;
+  }
   // Slices of numbers: tnGoNums[T](x) / element conversion.
   // []byte ↔ []byte passes through (Uint8Array needs no conversion).
   if (toType.startsWith('[]') && fromType.startsWith('[]')) {
@@ -198,6 +207,41 @@ export function toGo(expr: string, fromType: string, toType: string): string {
     return `tnGoRune(${expr})`;
   }
   return expr;
+}
+
+// Whether fromType is *TnMap[K, V] and toType is map[K]V (any = interface{}).
+function sameMapTypes(fromType: string, toType: string): boolean {
+  if (!fromType.startsWith('*TnMap[') || !fromType.endsWith(']') || !toType.startsWith('map[')) return false;
+  const tnArgs = splitTopLevelTypes(fromType.slice(7, -1));
+  let depth = 0;
+  let close = -1;
+  for (let i = 3; i < toType.length && close < 0; i++) {
+    if (toType[i] === '[') depth++;
+    else if (toType[i] === ']') {
+      depth--;
+      if (depth === 0) close = i;
+    }
+  }
+  if (tnArgs.length !== 2 || close < 0) return false;
+  const norm = (t: string): string => (t.trim() === 'any' ? 'interface{}' : t.trim());
+  return norm(tnArgs[0]) === norm(toType.slice(4, close)) && norm(tnArgs[1]) === norm(toType.slice(close + 1));
+}
+
+function splitTopLevelTypes(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '[' || ch === '(' || ch === '{') depth++;
+    else if (ch === ']' || ch === ')' || ch === '}') depth--;
+    else if (ch === ',' && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
 }
 
 // Convert a Go expression back to a TS-facing value.

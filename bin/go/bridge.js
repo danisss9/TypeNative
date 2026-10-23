@@ -6,7 +6,7 @@
 //
 // Kept in a plain style because this file is part of the self-hosted
 // compiler and must transpile with TypeNative.
-import { goPackage, goTypeInfo, allGoPaths } from './metadata.js';
+import { goPackage, goTypeInfo, allGoPaths, bindQualifierPath } from './metadata.js';
 import { toGo, fromGo, mustCall, checkCall, isGoNumericKind } from './convert.js';
 import { isSyncCallback, isBlockingCall, goPathAliases } from './overrides.js';
 let services = {
@@ -26,6 +26,14 @@ let services = {
 };
 export function bindBridgeServices(s) {
     services = s;
+    bindQualifierPath(pathOfQualifier);
+}
+function pathOfQualifier(qualifier) {
+    for (const path of Object.keys(pathToLocal)) {
+        if (pathToLocal[path] === qualifier)
+            return path;
+    }
+    return '';
 }
 // Local import name → Go package path ('strings' → 'strings').
 const localToPath = {};
@@ -182,6 +190,10 @@ function goBuiltinName(callee) {
 export function isGoRefCall(node) {
     return !!node && node.kind === 'CallExpression' && goBuiltinName(node.expression) === 'ref';
 }
+function chanElementType(node) {
+    const typeArg = (node.typeArguments ?? [])[0];
+    return typeArg ? services.goTypeOf(typeArg) : 'interface{}';
+}
 // go:builtin calls: ref<T>(init?) → new(T), chan<T>(size?) → make(chan T).
 function visitGoBuiltinCall(node) {
     const name = goBuiltinName(node.expression);
@@ -198,11 +210,12 @@ function visitGoBuiltinCall(node) {
     }
     if (name === 'chan') {
         const size = (node.arguments ?? [])[0];
-        // Element type from the contextual annotation is unavailable here;
-        // default to interface{} (callers annotate: const ch: GoChan<T> = ...).
+        // The element type comes from chan<T>(); without one it is interface{}
+        // (callers annotate: const ch: GoChan<T> = chan()).
+        const goType = chanElementType(node);
         if (size)
-            return `make(chan interface{}, int(${services.visit(size)}))`;
-        return 'make(chan interface{})';
+            return `make(chan ${goType}, int(${services.visit(size)}))`;
+        return `make(chan ${goType})`;
     }
     return undefined;
 }
@@ -529,7 +542,12 @@ function goCallResults(node) {
 // pumps pending loop tasks.
 function emitBlocking(call, results, asStatement = false) {
     services.helper('goBlocking');
-    const wrapped = `tnGoBlocking(func() interface{} { return ${call} })`;
+    if (results.length === 0)
+        return `tnGoBlocking(func() interface{} { ${call}; return nil })`;
+    // The results come back through named returns: void and multi-value calls fit too
+    const names = results.map((_, i) => `__r${i}`);
+    const decl = results.map((r, i) => `${names[i]} ${goLocalType(r)}`).join(', ');
+    const wrapped = `func() (${decl}) { tnGoBlocking(func() interface{} { ${names.join(', ')} = ${call}; return nil }); return }()`;
     return emitResults(wrapped, results, asStatement);
 }
 function isFuncType(goType) {
@@ -568,21 +586,28 @@ function emitCallback(node, goType, path, funcName) {
             services.declareLocal(name, tsType);
     }
     void isSyncCallback(path, funcName);
-    const result = sig.results.length === 1 ? sig.results[0] : '';
+    // (T, error): the TS closure returns T (a throw stays a panic)
+    const withError = sig.results.length === 2 && sig.results[1] === 'error';
+    const result = sig.results.length === 1 || withError ? sig.results[0] : '';
     if (result) {
         ensureGoTypePackages(result);
         node.tnGoCallbackResult = result;
     }
-    const resultDecl = sig.results.length > 0 ? ' ' + sig.results.map((r) => goLocalType(r)).join(', ') : '';
+    const localResults = sig.results.map((r) => goLocalType(r));
+    const resultDecl = localResults.length === 0 ? '' : localResults.length === 1 ? ` ${localResults[0]}` : ` (${localResults.join(', ')})`;
     const head = `func(${params.join(', ')})${resultDecl}`;
     const pre = prelude.length > 0 ? prelude.join('; ') + '; ' : '';
+    let inner = '';
     if (node.body && node.body.kind === 'Block') {
-        return `${head} { ${pre}${services.visit(node.body)} }`;
+        inner = services.visit(node.body);
     }
-    const body = services.visit(node.body);
-    if (!result)
-        return `${head} { ${pre}${body} }`;
-    return `${head} { ${pre}return ${toGo(body, services.typeOf(node.body) ?? '', result)} }`;
+    else {
+        const body = services.visit(node.body);
+        inner = result ? `return ${toGo(body, services.typeOf(node.body) ?? '', result)}` : body;
+    }
+    if (withError)
+        return `${head} { ${pre}return func() ${goLocalType(result)} { ${inner} }(), nil }`;
+    return `${head} { ${pre}${inner} }`;
 }
 // "name T" → "T" (metadata signatures keep parameter names).
 function stripParamName(param) {
@@ -662,7 +687,7 @@ export function inferGoType(node) {
     if (node && node.kind === 'CallExpression') {
         const builtinName = goBuiltinName(node.expression);
         if (builtinName === 'chan')
-            return 'chan interface{}';
+            return `chan ${chanElementType(node)}`;
         if (builtinName === 'ref') {
             const typeArg = (node.typeArguments ?? [])[0];
             const goType = typeArg ? services.goTypeOf(typeArg) : 'interface{}';
@@ -902,6 +927,41 @@ export function visitGoNew(node, path, typeName) {
     }
     const empty = `${qualifier}.${typeName}{}`;
     return hasPtrReceiver(type) ? `(&${empty})` : empty;
+}
+// Go type of a TS annotation naming a bridged type (`dwarf.Data`, or a named
+// import). A struct is a pointer when the package hands out *T, a value when
+// it hands out T (time.Time), else whatever `new pkg.T()` builds.
+export function goAnnotationType(path, typeName) {
+    const info = goPackage(path);
+    if (!info || !Object.hasOwn(info.types, typeName))
+        return undefined;
+    const type = info.types[typeName];
+    if (type.tparams.length > 0)
+        return undefined;
+    if (type.numeric)
+        return 'float64';
+    services.pkg(path);
+    ensureGoQualifier(path);
+    const local = `${goQualifier(path)}.${typeName}`;
+    if (type.kind !== 'struct')
+        return local;
+    const full = `${path}.${typeName}`;
+    const results = [];
+    for (const name of Object.keys(info.funcs)) {
+        for (const r of info.funcs[name].results)
+            results.push(r);
+    }
+    for (const name of Object.keys(info.types)) {
+        for (const m of info.types[name].methods) {
+            for (const r of m.results)
+                results.push(r);
+        }
+    }
+    if (results.includes(`*${full}`))
+        return `*${local}`;
+    if (results.includes(full))
+        return local;
+    return hasPtrReceiver(type) ? `*${local}` : local;
 }
 function fieldGoTypeOf(type, field) {
     for (const f of type.fields) {

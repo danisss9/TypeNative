@@ -114,7 +114,7 @@ npm run bootstrap:check         # native/typenative must emit the same Go for sr
 node scripts/conformance-parallel.mjs --native  # full suite through your new binary
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm run build`, `npm run check:go-types` and `npm run conformance:parallel` on Ubuntu, Windows and macOS (Node 24 + Go 1.26), plus a Linux job that builds the native compiler, runs `npm run bootstrap:check` and the suite through it. Probes that depend on the OS should hold on all three (branch on `process.platform` where Node itself differs).
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm run build`, `npm run check:go-types` and `npm run conformance:parallel` on Ubuntu, Windows and macOS (Node 24 + Go 1.26), plus a Linux job that builds the native compiler, runs `npm run bootstrap:check` and the suite through it. Probes that depend on the OS should hold on all three (branch on `process.platform` where Node itself differs). A probe that can't build on one of them (`go:log/syslog` has no Windows build) starts with `// conformance-skip: win32 (reason)`; the runners skip it there and list it.
 
 ## Pull requests
 

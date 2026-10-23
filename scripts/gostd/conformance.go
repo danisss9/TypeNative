@@ -10,12 +10,13 @@ import (
 
 // Rewrite the Go bridges table in conformance.md between
 // <!-- go-bridges:start --> and <!-- go-bridges:end --> markers.
-// Status per package: ✅ when conformance/lib-go-<path with / → ->.ts
-// exists, ⚠️ typed-only, ❌ excluded with the reason from overrides.
+// Status per package: ✅ with the probe that covers it (see probeMap),
+// ❌ excluded with the reason from overrides. A bridged package without a
+// probe is ✅ with no probe link, and the generator warns about it.
 
-var typedOnlyNotes = map[string]string{
+var moduleNotes = map[string]string{
 	"syscall":                 "Portable subset probed; per-arch constants dropped",
-	"log/syslog":              "Unix syslog; no portable probe",
+	"log/syslog":              "Network syslog; Unix only (no Windows build, the probe skips it)",
 	"database/sql":            "No std driver: registry and errors probed",
 	"database/sql/driver":     "Driver interfaces and value converters",
 	"crypto/tls":              "TLS client/server; loopback probe is a later phase",
@@ -36,22 +37,22 @@ var typedOnlyNotes = map[string]string{
 	"go/printer":              "Go AST printer",
 	"go/constant":             "Untyped constant values",
 	"net/http/cgi":            "CGI request parsing",
-	"net/http/fcgi":           "FastCGI handler; needs a FastCGI web server",
+	"net/http/fcgi":           "FastCGI responder serving a TS `http.Handler` class",
 	"net/http/httptrace":      "HTTP tracing hooks",
 	"net/http/pprof":          "pprof HTTP handlers",
-	"net/rpc":                 "Needs Go method sets on registered receivers",
-	"net/rpc/jsonrpc":         "Needs Go method sets on registered receivers",
-	"net/smtp":                "SMTP client; needs a server",
+	"net/rpc":                 "TS class services: methods compile to `M(*Args, *Reply) error`",
+	"net/rpc/jsonrpc":         "JSON-RPC codec (client, server and the wire format)",
+	"net/smtp":                "SMTP client, against a TS server over loopback",
 	"runtime/metrics":         "Runtime metrics sampling",
 	"runtime/pprof":           "Profiling data",
 	"runtime/trace":           "Execution tracing",
 	"testing":                 "Helpers usable outside `go test`",
-	"testing/cryptotest":      "Needs a `*testing.T` (no `go test` harness)",
+	"testing/cryptotest":      "Real `*testing.T` via `testing.Main`; refuses outside `go test`",
 	"testing/fstest":          "`TestFS` over any `fs.FS`",
 	"testing/iotest":          "Reader/writer test wrappers",
 	"testing/quick":           "Property checks with TS callbacks",
-	"testing/slogtest":        "Needs a `*testing.T` (no `go test` harness)",
-	"testing/synctest":        "Needs a `*testing.T` (no `go test` harness)",
+	"testing/slogtest":        "Handler suite: `TestHandler`, and `Run` under `testing.Main`",
+	"testing/synctest":        "Fake-time bubbles under `testing.Main`",
 	"encoding":                "Shared encoding interfaces",
 	"structs":                 "`HostLayout` marker",
 	"io/ioutil":               "Deprecated I/O helpers (Go 1.16)",
@@ -176,18 +177,18 @@ var typedOnlyNotes = map[string]string{
 	"go/build/constraint":     "Build-tag constraint parsing",
 	"container/list":          "Doubly linked list",
 	"container/ring":          "Circular list",
-	"container/heap":          "Needs a TS class satisfying `heap.Interface`; TS classes cannot implement Go interfaces yet",
+	"container/heap":          "A TS class implementing `heap.Interface` (see Go interfaces below)",
 	"math":                    "Math functions",
 	"math/bits":               "Bit operations",
 	"math/big":                "Arbitrary-precision arithmetic",
 	"math/rand":               "Pseudo-random numbers",
 	"math/rand/v2":            "Pseudo-random numbers (v2 API)",
-	"math/cmplx":              "`complex128` has no TS mapping",
+	"math/cmplx":              "`complex128` values pass between calls opaquely",
 	"log/slog":                "Structured logging",
 }
 
 func probeName(path string) string {
-	return "lib-go-" + strings.ReplaceAll(path, "/", "->") + ".ts"
+	return "lib-go-" + strings.ReplaceAll(path, "/", "-") + ".ts"
 }
 
 // Probes covering multiple packages: package path → probe files.
@@ -344,6 +345,21 @@ var probeMap = map[string][]string{
 	"crypto/dsa": {"lib-go-crypto-more.ts"},
 	"crypto/hpke": {"lib-go-crypto-more.ts"},
 	"crypto/mlkem/mlkemtest": {"lib-go-crypto-more.ts"},
+	"debug/dwarf": {"lib-go-debug.ts"},
+	"debug/elf": {"lib-go-debug.ts"},
+	"debug/gosym": {"lib-go-debug.ts"},
+	"debug/macho": {"lib-go-debug.ts"},
+	"debug/pe": {"lib-go-debug.ts"},
+	"debug/plan9obj": {"lib-go-debug.ts"},
+	"log/syslog": {"lib-go-syslog.ts"},
+	"math/cmplx": {"lib-go-math-cmplx.ts"},
+	"net/http/fcgi": {"lib-go-fcgi.ts"},
+	"net/rpc": {"lib-go-rpc.ts"},
+	"net/rpc/jsonrpc": {"lib-go-rpc.ts"},
+	"net/smtp": {"lib-go-smtp.ts"},
+	"testing/cryptotest": {"lib-go-testing-t.ts"},
+	"testing/slogtest": {"lib-go-testing-t.ts"},
+	"testing/synctest": {"lib-go-testing-t.ts"},
 }
 
 func updateConformance(root string, models []pkgModel) error {
@@ -370,19 +386,17 @@ func updateConformance(root string, models []pkgModel) error {
 		// Probes: the exact file, or a covering multi-package probe.
 		candidates := append([]string{probeName(m.path)}, probeMap[m.path]...)
 		probeCell := "—"
-		status := "⚠️"
-		notes := typedOnlyNotes[m.path]
-		if notes == "" {
-			notes = "Typed and bridged; no probe yet"
-		}
+		notes := moduleNotes[m.path]
 		for _, probe := range candidates {
 			if _, err := os.Stat(filepath.Join(root, "conformance", probe)); err == nil {
-				status = "✅"
 				probeCell = fmt.Sprintf("[%s](conformance/%s)", probe, probe)
 				break
 			}
 		}
-		fmt.Fprintf(&b, "| `go:%s` | %s | %s | %s |\n", m.path, status, probeCell, notes)
+		if probeCell == "—" {
+			fmt.Fprintf(os.Stderr, "warning: go:%s is bridged but no probe covers it\n", m.path)
+		}
+		fmt.Fprintf(&b, "| `go:%s` | ✅ | %s | %s |\n", m.path, probeCell, notes)
 	}
 	// Excluded packages.
 	for _, p := range []string{"plugin", "unsafe", "runtime/race", "runtime/coverage", "runtime/cgo", "embed"} {
