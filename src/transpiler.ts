@@ -6025,11 +6025,13 @@ function inferExpressionType(expr: AstNode): string | undefined {
     return 'float64';
   }
   if (isCallExpression(expr)) {
-    const callee = isIdentifier(expr.expression)
-      ? expr.expression.text
+    // A typed string ('' when not a plain name): mixing `any` text with
+    // `string | undefined` compiles natively to a boxed *string that never matches
+    const callee: string = isIdentifier(expr.expression)
+      ? String(expr.expression.text)
       : isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression)
         ? `${expr.expression.expression.text}.${expr.expression.name.text}`
-        : undefined;
+        : '';
     const promiseType = inferPromiseCallType(expr);
     if (promiseType) return promiseType;
     const objectCallType = inferObjectCallType(expr);
@@ -6082,7 +6084,7 @@ function inferExpressionType(expr: AstNode): string | undefined {
       }
     }
     if (callee && BUILTIN_CALL_TYPES[callee]) return BUILTIN_CALL_TYPES[callee];
-    if (callee?.startsWith('Math.')) return 'float64';
+    if (callee.startsWith('Math.')) return 'float64';
   }
   // Object.keys(map) / Object.values(map)
   if (

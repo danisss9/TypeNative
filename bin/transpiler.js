@@ -6026,11 +6026,13 @@ function inferExpressionType(expr) {
         return 'float64';
     }
     if (isCallExpression(expr)) {
+        // A typed string ('' when not a plain name): mixing `any` text with
+        // `string | undefined` compiles natively to a boxed *string that never matches
         const callee = isIdentifier(expr.expression)
-            ? expr.expression.text
+            ? String(expr.expression.text)
             : isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression)
                 ? `${expr.expression.expression.text}.${expr.expression.name.text}`
-                : undefined;
+                : '';
         const promiseType = inferPromiseCallType(expr);
         if (promiseType)
             return promiseType;
@@ -6086,7 +6088,7 @@ function inferExpressionType(expr) {
         }
         if (callee && BUILTIN_CALL_TYPES[callee])
             return BUILTIN_CALL_TYPES[callee];
-        if (callee?.startsWith('Math.'))
+        if (callee.startsWith('Math.'))
             return 'float64';
     }
     // Object.keys(map) / Object.values(map)
