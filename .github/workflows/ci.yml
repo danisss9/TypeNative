@@ -39,8 +39,8 @@ jobs:
   # The self-hosted compiler: same probes, and it must reproduce its own Go
   native:
     runs-on: ubuntu-latest
-    # Normally ~25 min (the self-compile alone is ~20); fail fast if a probe runs away
-    timeout-minutes: 45
+    # Normally ~5–8 min (the self-compile is ~2); fail fast if a probe runs away
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 

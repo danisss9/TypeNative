@@ -85,6 +85,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Regex performance:** global `replace` / `split` / `matchAll` and backreference or
+  lookaround patterns no longer re-scan the whole string for every match (quadratic on long
+  input); the self-hosted compiler builds itself ~10× faster
+- **Regex empty matches:** `/g` patterns can match empty at the end of input
+  (`'abc'.replace(/x*/g, '-')` is `-a-b-c-`)
+- **Regex `split`:** follows JS: capture groups are included (`'a1b'.split(/(\d)/)` is `a`,
+  `1`, `b`), `limit` is honored, and empty matches split like JS
+  (`'aXbXXc'.split(/(?<=X)/)` is `aX`, `bX`, `X`, `c`)
+- **Match `.index`:** `exec`, `match` and `matchAll` results have `.index` (a compile error
+  before); `search` returns a character index (it returned a byte offset)
+- **`match` with `/g`:** returns every match (it returned the first match's groups)
+- **Arrays as strings:** `arr.toString()`, `String(arr)` and `` `${arr}` `` join elements with
+  commas (they printed Go's `[a b]`)
 - **`node:dns`:** `resolve(name, 'PTR')` queries the name's PTR records (it did a reverse lookup)
 - **Templates:** `${err}` on an `Error` builds and prints `Name: message` (`null` when null)
 - **`Date` annotations:** `let d: Date`, `Date` parameters, return types, fields and `as Date`

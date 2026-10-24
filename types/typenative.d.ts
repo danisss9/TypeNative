@@ -163,6 +163,12 @@ interface RegExpExecArray extends Array<string> {
   readonly groups: Record<string, string> | undefined;
 }
 
+// match() result: .index is set unless the regex is /g (that returns every match)
+interface RegExpMatchArray extends Array<string> {
+  index?: number;
+  readonly groups?: Record<string, string> | undefined;
+}
+
 interface RegExpConstructor {
   new (pattern: string | RegExp, flags?: string): RegExp;
   (pattern: string | RegExp, flags?: string): RegExp;
@@ -403,9 +409,9 @@ interface String {
   /** Pads the end of a string with another string to a total length. */
   padEnd(targetLength: number, padString?: string): string;
   /** Matches a string against a regex and returns the matches. */
-  match(regexp: string | RegExp): string[] | null;
+  match(regexp: string | RegExp): RegExpMatchArray | null;
   /** Matches all occurrences of a regex. */
-  matchAll(regexp: string | RegExp): string[][];
+  matchAll(regexp: string | RegExp): RegExpExecArray[];
   /** Searches for a match and returns the index. */
   search(regexp: string | RegExp): number;
   /** Returns the character at the given index (supports negative indices). */

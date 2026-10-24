@@ -1505,6 +1505,11 @@ function visit(node, options = {}) {
         // Anonymous-struct function fields (object-literal methods/getters): a
         // property read invokes the closure, unless it is itself being called
         const leftGoType = inferExpressionType(node.expression);
+        // A match array's .index (string[] has no other .index)
+        if (rightSide === 'index' && leftGoType === '[]string' && !isCallee(node) && !isAssignmentTarget(node)) {
+            useHelper('regexMatch');
+            return `TnMatchIndex(${leftSide})`;
+        }
         if (leftGoType?.includes('struct{') &&
             !isCallee(node) &&
             getStructFieldGoType(leftGoType.replace(/^\*/, ''), node.name.text)?.startsWith('func')) {
@@ -3835,8 +3840,8 @@ function jsStringOf(code, goType) {
         useHelper('date');
         return `TnDateString(${code})`;
     }
-    // Errors: `${err}` is "Name: message"
-    if (goType === '*TnError') {
+    // Errors: `${err}` is "Name: message"; arrays join with commas
+    if (goType === '*TnError' || goType?.startsWith('[]') || goType?.startsWith('*[]')) {
         useHelper('dynamic');
         useHelper('error');
         return `TnJSString(${code})`;
@@ -6217,6 +6222,8 @@ function inferExpressionType(expr) {
         const leftType = inferExpressionType(expr.expression);
         if (expr.name.text === 'length')
             return 'float64';
+        if (expr.name.text === 'index' && leftType === '[]string')
+            return 'float64';
         // record.key reads the Record's value type
         if (leftType?.startsWith('*TnMap[') && expr.name.text !== 'size' && !isCallee(expr)) {
             const objectType = resolveExpressionType(expr.expression);
@@ -7126,6 +7133,11 @@ function visitOptionalPropertyAccess(node) {
         const objectType = resolveExpressionType(node.expression);
         if (objectType === 'Map' || objectType === 'Record') {
             return `${baseExpr}.Get(${toGoStringLiteral(node.name.text)})`;
+        }
+        // m?.index: NaN (compares like undefined) when there is no match
+        if (node.name.text === 'index' && baseType === '[]string') {
+            useHelper('regexMatch');
+            return `TnMatchIndex(${baseExpr})`;
         }
         return getAcessString(baseExpr, visit(node.name), objectType);
     }
@@ -8538,11 +8550,15 @@ function consoleArgs(args) {
 }
 const stringMethodHandlers = {
     split: (obj, args) => {
-        if (args[0]?.startsWith('regexp.MustCompile('))
-            return `${args[0]}.Split(${obj}, -1)`;
+        // Regex separators: JS split (captures included, limit counts items)
+        const limit = args.length >= 2 ? `int(${args[1]})` : '-1';
+        if (args[0]?.startsWith('regexp.MustCompile(') || variableGoTypes.get(args[0]) === '*regexp.Regexp') {
+            useHelper('regexMatch');
+            return `TnRegexpSplit(${args[0]}, ${obj}, ${limit})`;
+        }
         if (isTnRegexArg(args[0])) {
             useHelper('fancyRegex');
-            return `${args[0]}.SplitStr(${obj}, -1)`;
+            return `${args[0]}.SplitStr(${obj}, ${limit})`;
         }
         importedPackages.add('strings');
         // split(sep, limit): at most `limit` parts
@@ -8642,21 +8658,25 @@ const stringMethodHandlers = {
             useHelper('fancyRegex');
             return `${args[0]}.FindSub(${obj})`;
         }
-        return `${toGoRegexp(args[0])}.FindStringSubmatch(${obj})`;
+        useHelper('regexMatch');
+        return `TnRegexpExec(${toGoRegexp(args[0])}, ${obj})`;
     },
     matchAll: (obj, args) => {
         if (isTnRegexArg(args[0])) {
             useHelper('fancyRegex');
             return `${args[0]}.FindAllSub(${obj})`;
         }
-        return `${toGoRegexp(args[0])}.FindAllStringSubmatch(${obj}, -1)`;
+        useHelper('regexMatch');
+        return `TnRegexpMatchAll(${toGoRegexp(args[0])}, ${obj})`;
     },
+    // A character index, like the other string methods
     search: (obj, args) => {
+        useHelper('regexMatch');
         if (isTnRegexArg(args[0])) {
             useHelper('fancyRegex');
-            return `func() float64 { __loc := ${args[0]}.FindIndexSub(${obj}); if __loc == nil { return -1 }; return float64(__loc[0]) }()`;
+            return `func() float64 { __s := ${obj}; return TnMatchCharIndex(__s, ${args[0]}.FindIndexSub(__s)) }()`;
         }
-        return `func() float64 { __loc := ${toGoRegexp(args[0])}.FindStringIndex(${obj}); if __loc == nil { return -1 }; return float64(__loc[0]) }()`;
+        return `func() float64 { __s := ${obj}; return TnMatchCharIndex(__s, ${toGoRegexp(args[0])}.FindStringIndex(__s)) }()`;
     },
     lastIndexOf: (obj, args) => {
         importedPackages.add('strings');
@@ -8718,7 +8738,8 @@ const regexpMethodHandlers = {
             useHelper('namedGroups');
             return `TnRegexExecNamed(${obj}, ${args[0]})`;
         }
-        return `${obj}.FindStringSubmatch(${args[0]})`;
+        useHelper('regexMatch');
+        return `TnRegexpExec(${obj}, ${args[0]})`;
     }
 };
 // d.setHours(h, …) & co.: Dates are values, so the variable is reassigned
@@ -8883,8 +8904,9 @@ const arrayMethodHandlers = {
         return `func() ${elementType} { var __flat ${elementType}; for _, __inner := range ${obj} { __flat = append(__flat, __inner...) }; return __flat }()`;
     },
     toString: (obj) => {
-        importedPackages.add('fmt');
-        return `fmt.Sprintf("%v", ${obj})`;
+        useHelper('dynamic');
+        useHelper('error');
+        return `TnJSString(${obj})`;
     },
     // padStart / padEnd for string arrays (rarely used, but added for completeness)
     at: (obj, args) => {
@@ -8993,8 +9015,10 @@ function getDynamicCallHandler(caller, objectType) {
                 }
                 return jsStringOf(obj, objectType === 'number' || objectType === 'float64'
                     ? 'float64'
-                    : currentReceiverGoType === 'interface{}'
-                        ? 'interface{}'
+                    : currentReceiverGoType === 'interface{}' ||
+                        currentReceiverGoType?.startsWith('[]') ||
+                        currentReceiverGoType?.startsWith('*[]')
+                        ? currentReceiverGoType
                         : undefined);
             };
         }
@@ -10643,8 +10667,8 @@ const helperRequires = {
     objectIntegrity: [],
     structuredClone: [],
     globalThis: ['dynamic'],
-    namedGroups: ['orderedMap'],
-    fancyRegex: ['orderedMap'],
+    namedGroups: ['orderedMap', 'regexMatch'],
+    fancyRegex: ['orderedMap', 'regexMatch'],
     dynamic: ['error'],
     moduleUrl: ['pathToFileURL'],
     timerWait: ['eventLoop'],
@@ -10668,7 +10692,7 @@ function useHelper(id) {
     usedHelpers.add(id);
     // The match object type the named-groups helper returns
     if (id === 'namedGroups') {
-        interfacePropertyTypes.set('TnMatch', new Map([['groups', '*TnMap[string, string]']]));
+        interfacePropertyTypes.set('TnMatch', new Map([['groups', '*TnMap[string, string]'], ['index', 'float64']]));
     }
     for (const dep of helperRequires[id] ?? nodeRegistry.helperRequires[id] ?? [])
         useHelper(platformHelper(dep));
@@ -10776,8 +10800,9 @@ const helperPackages = {
     error: ['runtime', 'strings', 'fmt'],
     bigint: ['math/big', 'math'],
     symbol: [],
-    fancyRegex: ['regexp', 'strings', 'strconv', 'fmt'],
-    namedGroups: ['regexp'],
+    fancyRegex: ['regexp', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8'],
+    namedGroups: ['regexp', 'unicode/utf8'],
+    regexMatch: ['regexp', 'strings', 'strconv', 'math', 'unicode/utf8'],
     moduleUrl: ['os'],
     asyncWait: [],
     timerWait: ['sort', 'sync', 'sync/atomic', 'time'],
@@ -11744,6 +11769,22 @@ func TnJSString(v interface{}) string {
 		return x.String()
 	case interface{ toString() string }:
 		return x.toString()
+	}
+	// Other arrays join their elements with commas (null/undefined as "")
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		rv = rv.Elem()
+	}
+	if rv.Kind() == reflect.Slice {
+		parts := make([]string, rv.Len())
+		for i := range parts {
+			e := rv.Index(i)
+			if (e.Kind() == reflect.Pointer || e.Kind() == reflect.Interface) && e.IsNil() {
+				continue
+			}
+			parts[i] = TnJSString(e.Interface())
+		}
+		return strings.Join(parts, ",")
 	}
 	return fmt.Sprintf("%v", v)
 }
@@ -12990,20 +13031,150 @@ func (m *TnMap[K, V]) MarshalJSON() ([]byte, error) {
 	}
 	return s[:loc[0]] + string(re.ExpandString(nil, repl, s, loc)) + s[loc[1]:]
 }`,
+    regexMatch: `// JS match arrays are []string; the match's .index rides in a hidden slot
+// past len, which reslicing up to cap reaches (an append overwrites it)
+const tnMatchIndexTag = "\\x00index:"
+
+// The groups of the match at loc, with room for the .index slot
+func tnMatchGroups(s string, loc []int) []string {
+	n := len(loc) / 2
+	groups := make([]string, n, n+1)
+	for i := 0; i < n; i++ {
+		if loc[2*i] >= 0 {
+			groups[i] = s[loc[2*i]:loc[2*i+1]]
+		}
+	}
+	return groups
+}
+
+// The groups of the match at loc, tagged with its character index
+func tnMatchArray(s string, loc []int, index int) []string {
+	groups := tnMatchGroups(s, loc)
+	tnSetMatchIndex(groups, index)
+	return groups
+}
+
+func tnSetMatchIndex(groups []string, index int) {
+	if cap(groups) > len(groups) {
+		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + strconv.Itoa(index)
+	}
+}
+
+// m.index; NaN when m is not a match array
+func TnMatchIndex(m []string) float64 {
+	if cap(m) > len(m) {
+		if tag := m[:len(m)+1][len(m)]; strings.HasPrefix(tag, tnMatchIndexTag) {
+			if n, err := strconv.Atoi(tag[len(tnMatchIndexTag):]); err == nil {
+				return float64(n)
+			}
+		}
+	}
+	return math.NaN()
+}
+
+// The character index of a byte match location (search), -1 without a match
+func TnMatchCharIndex(s string, loc []int) float64 {
+	if loc == nil {
+		return -1
+	}
+	return float64(utf8.RuneCountInString(s[:loc[0]]))
+}
+
+func TnRegexpExec(re *regexp.Regexp, s string) []string {
+	loc := re.FindStringSubmatchIndex(s)
+	if loc == nil {
+		return nil
+	}
+	return tnMatchArray(s, loc, utf8.RuneCountInString(s[:loc[0]]))
+}
+
+func TnRegexpMatchAll(re *regexp.Regexp, s string) [][]string {
+	var out [][]string
+	at, index := 0, 0
+	for _, loc := range re.FindAllStringSubmatchIndex(s, -1) {
+		index += utf8.RuneCountInString(s[at:loc[0]])
+		at = loc[0]
+		out = append(out, tnMatchArray(s, loc, index))
+	}
+	return out
+}
+
+func TnRegexpSplit(re *regexp.Regexp, s string, limit int) []string {
+	return tnRegexSplit(s, limit, func(start int) []int {
+		loc := re.FindStringSubmatchIndex(s[start:])
+		for i := range loc {
+			if loc[i] >= 0 {
+				loc[i] += start
+			}
+		}
+		return loc
+	})
+}
+
+// JS split: the pieces between matches plus each match's captures, at most
+// limit items (negative: no limit); an empty match at the start of a piece
+// or at the end of the string does not split. find returns the leftmost
+// match at or after a byte offset.
+func tnRegexSplit(s string, limit int, find func(start int) []int) []string {
+	parts := []string{}
+	if limit == 0 {
+		return parts
+	}
+	if s == "" {
+		if find(0) == nil {
+			parts = append(parts, s)
+		}
+		return parts
+	}
+	last := 0
+	for at := 0; at < len(s); {
+		loc := find(at)
+		if loc == nil || loc[0] >= len(s) {
+			break
+		}
+		if loc[1] == last {
+			_, size := utf8.DecodeRuneInString(s[loc[0]:])
+			at = loc[0] + size
+			continue
+		}
+		parts = append(parts, s[last:loc[0]])
+		if len(parts) == limit {
+			return parts
+		}
+		for i := 1; i < len(loc)/2; i++ {
+			group := ""
+			if loc[2*i] >= 0 {
+				group = s[loc[2*i]:loc[2*i+1]]
+			}
+			parts = append(parts, group)
+			if len(parts) == limit {
+				return parts
+			}
+		}
+		last = loc[1]
+		at = last
+	}
+	return append(parts, s[last:])
+}`,
     namedGroups: `// TnMatch: the result of exec on a regex with named groups
 type TnMatch struct {
 	groups *TnMap[string, string]
+	index  float64
 }
 
 func TnRegexExecNamed(re *regexp.Regexp, s string) *TnMatch {
-	m := re.FindStringSubmatch(s)
-	if m == nil {
+	loc := re.FindStringSubmatchIndex(s)
+	if loc == nil {
 		return nil
 	}
-	res := &TnMatch{groups: TnNewMap[string, string]()}
+	res := &TnMatch{groups: TnNewMap[string, string](), index: float64(utf8.RuneCountInString(s[:loc[0]]))}
 	for i, name := range re.SubexpNames() {
-		if name != "" && i < len(m) {
-			res.groups.Set(name, m[i])
+		if name != "" && 2*i < len(loc) {
+			group := ""
+			if loc[2*i] >= 0 {
+				group = s[loc[2*i]:loc[2*i+1]]
+			}
+			res.groups.Set(name, group)
 		}
 	}
 	return res
@@ -13060,67 +13231,60 @@ func (r *TnRegex) Test(s string) bool {
 }
 
 func (r *TnRegex) Find(s string) []string {
-	groups, _ := r.find(s)
+	groups, loc := r.find(s)
+	// find tags /g and /y matches with their index as it moves lastIndex
+	if groups != nil && !r.global && !r.sticky {
+		tnSetMatchIndex(groups, utf8.RuneCountInString(s[:loc[0]]))
+	}
 	return groups
 }
 
-// First match only, without advancing state (string .match)
+// string .match: with /g every whole match (nil for none), else the first
+// match's groups
 func (r *TnRegex) FindSub(s string) []string {
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = false, 0
-	groups, _ := r.find(s)
-	r.global, r.lastIndex = savedG, savedI
+	if r.global {
+		var all []string
+		r.scan(s, func(groups []string, loc []int) bool {
+			all = append(all, groups[0])
+			return true
+		})
+		r.lastIndex = 0
+		return all
+	}
+	groups, loc := r.matchAt(&tnRegexInput{s: s}, 0, false)
+	if groups != nil {
+		tnSetMatchIndex(groups, utf8.RuneCountInString(s[:loc[0]]))
+	}
 	return groups
 }
 
 func (r *TnRegex) FindAllSub(s string) [][]string {
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = true, 0
 	var out [][]string
-	for {
-		groups, _ := r.find(s)
-		if groups == nil {
-			break
-		}
+	at, index := 0, 0
+	r.scan(s, func(groups []string, loc []int) bool {
+		index += utf8.RuneCountInString(s[at:loc[0]])
+		at = loc[0]
+		tnSetMatchIndex(groups, index)
 		out = append(out, groups)
-	}
-	r.global, r.lastIndex = savedG, savedI
+		return true
+	})
 	return out
 }
 
 func (r *TnRegex) FindIndexSub(s string) []int {
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = false, 0
-	_, loc := r.find(s)
-	r.global, r.lastIndex = savedG, savedI
+	_, loc := r.matchAt(&tnRegexInput{s: s}, 0, false)
 	if loc == nil {
 		return nil
 	}
 	return loc[:2]
 }
 
-func (r *TnRegex) SplitStr(s string, n int) []string {
-	if r.bt == nil {
-		return r.re.Split(s, n)
-	}
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = true, 0
-	parts := []string{}
-	last := 0
-	for {
-		_, loc := r.find(s)
-		if loc == nil || (n > 0 && len(parts) >= n-1) {
-			break
-		}
-		parts = append(parts, s[last:loc[0]])
-		last = loc[1]
-		if loc[1] == loc[0] && loc[1] < len(s) {
-			parts = append(parts, string(s[loc[1]]))
-			last = loc[1] + 1
-		}
-	}
-	r.global, r.lastIndex = savedG, savedI
-	return append(parts, s[last:])
+func (r *TnRegex) SplitStr(s string, limit int) []string {
+	in := &tnRegexInput{s: s}
+	return tnRegexSplit(s, limit, func(start int) []int {
+		_, loc := r.matchAt(in, start, false)
+		return loc
+	})
 }
 
 func TnRegexWrapReplaceAll(r *TnRegex, s string, repl string) string {
@@ -13132,162 +13296,160 @@ func TnRegexWrapReplaceFirst(r *TnRegex, s string, repl string) string {
 }
 
 func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string) string, all bool) string {
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = true, 0
-	out := ""
+	var out strings.Builder
 	last := 0
-	for {
-		groups, loc := r.find(s)
-		if groups == nil {
-			break
-		}
-		out += s[last:loc[0]] + fn(groups)
+	r.scan(s, func(groups []string, loc []int) bool {
+		out.WriteString(s[last:loc[0]])
+		out.WriteString(fn(groups))
 		last = loc[1]
-		if !all {
-			break
-		}
-	}
-	r.global, r.lastIndex = savedG, savedI
-	return out + s[last:]
+		return all
+	})
+	out.WriteString(s[last:])
+	return out.String()
 }
 
 func (r *TnRegex) replace(s string, repl string, all bool) string {
-	savedG, savedI := r.global, r.lastIndex
-	r.global, r.lastIndex = true, 0
-	out := ""
+	var out strings.Builder
 	last := 0
-	for {
-		groups, loc := r.find(s)
-		if groups == nil {
-			break
-		}
-		out += s[last:loc[0]] + tnExpandGroups(repl, groups)
+	r.scan(s, func(groups []string, loc []int) bool {
+		out.WriteString(s[last:loc[0]])
+		out.WriteString(tnExpandGroups(repl, groups))
 		last = loc[1]
-		if !all {
-			break
-		}
-		if loc[1] == loc[0] && loc[1] < len(s) {
-			out += string(s[loc[1]])
-			last = loc[1] + 1
-		}
-	}
-	r.global, r.lastIndex = savedG, savedI
-	return out + s[last:]
+		return all
+	})
+	out.WriteString(s[last:])
+	return out.String()
 }
 
 // Replaces the numeric group placeholders in the replacement with captures
 func tnExpandGroups(repl string, groups []string) string {
-	out := ""
+	if strings.IndexByte(repl, '$') < 0 {
+		return repl
+	}
+	var out strings.Builder
 	for i := 0; i < len(repl); i++ {
 		if repl[i] == '$' && i+1 < len(repl) && repl[i+1] == '{' {
 			if j := strings.IndexByte(repl[i+2:], '}'); j >= 0 {
 				if n, err := strconv.Atoi(repl[i+2 : i+2+j]); err == nil && n < len(groups) {
-					out += groups[n]
+					out.WriteString(groups[n])
 					i = i + 2 + j
 					continue
 				}
 			}
 		}
-		out += string(repl[i])
+		out.WriteByte(repl[i])
 	}
-	return out
+	return out.String()
+}
+
+// A subject string; the rune view the backtracking engine needs is built
+// once per string, not once per match
+type tnRegexInput struct {
+	s    string
+	runs []rune
+	offs []int
+}
+
+func (in *tnRegexInput) runes() ([]rune, []int) {
+	if in.offs == nil {
+		in.runs = []rune(in.s)
+		in.offs = tnByteOffsets(in.runs)
+	}
+	return in.runs, in.offs
+}
+
+// scan: every match left to right, like a /g loop from lastIndex 0 (an empty
+// match steps one rune forward), until yield returns false
+func (r *TnRegex) scan(s string, yield func(groups []string, loc []int) bool) {
+	in := &tnRegexInput{s: s}
+	for at := 0; at <= len(s); {
+		groups, loc := r.matchAt(in, at, r.sticky)
+		if groups == nil || !yield(groups, loc) {
+			return
+		}
+		at = loc[1]
+		if loc[1] == loc[0] {
+			if at == len(s) {
+				return
+			}
+			_, size := utf8.DecodeRuneInString(s[at:])
+			at += size
+		}
+	}
+}
+
+// matchAt: leftmost match at or after byte offset start (only at start when
+// sticky); loc holds byte offsets
+func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, []int) {
+	if r.bt == nil {
+		loc := r.re.FindStringSubmatchIndex(in.s[start:])
+		if loc == nil || (sticky && loc[0] != 0) {
+			return nil, nil
+		}
+		for i := range loc {
+			if loc[i] >= 0 {
+				loc[i] += start
+			}
+		}
+		return tnMatchGroups(in.s, loc), loc
+	}
+	runs, offs := in.runes()
+	first := sort.SearchInts(offs, start)
+	for pos := first; pos <= len(runs) && (!sticky || pos == first); pos++ {
+		caps := make([]int, (r.bt.ngroups+1)*2)
+		for i := range caps {
+			caps[i] = -1
+		}
+		m := &tnBtMatchState{runs: runs, caps: caps}
+		end := -1
+		if m.match(r.bt.root, pos, func(e int) bool { end = e; return true }) {
+			caps[0], caps[1] = pos, end
+			// room for the hidden .index slot (tnSetMatchIndex)
+			groups := make([]string, r.bt.ngroups+1, r.bt.ngroups+2)
+			loc := make([]int, (r.bt.ngroups+1)*2)
+			for i := 0; i <= r.bt.ngroups; i++ {
+				si, ei := caps[2*i], caps[2*i+1]
+				if si >= 0 && ei >= si {
+					groups[i] = string(runs[si:ei])
+					loc[2*i], loc[2*i+1] = offs[si], offs[ei]
+				} else {
+					loc[2*i], loc[2*i+1] = -1, -1
+				}
+			}
+			return groups, loc
+		}
+	}
+	return nil, nil
 }
 
 // find: leftmost match at or after lastIndex (which /g advances in runes)
 func (r *TnRegex) find(s string) ([]string, []int) {
-	runs := []rune(s)
-	if r.bt != nil {
-		start := 0
-		if r.global || r.sticky {
-			if int(r.lastIndex) > len(runs) {
-				r.lastIndex = 0
-				return nil, nil
-			}
-			start = int(r.lastIndex)
-		}
-		offs := tnByteOffsets(runs)
-		for pos := start; pos <= len(runs) && (!r.sticky || pos == start); pos++ {
-			caps := make([]int, (r.bt.ngroups+1)*2)
-			for i := range caps {
-				caps[i] = -1
-			}
-			m := &tnBtMatchState{runs: runs, caps: caps}
-			end := -1
-			if m.match(r.bt.root, pos, func(e int) bool { end = e; return true }) {
-				caps[0], caps[1] = pos, end
-				groups := make([]string, r.bt.ngroups+1)
-				loc := make([]int, (r.bt.ngroups+1)*2)
-				for i := 0; i <= r.bt.ngroups; i++ {
-					si, ei := caps[2*i], caps[2*i+1]
-					if si >= 0 && ei >= si {
-						groups[i] = string(runs[si:ei])
-						loc[2*i], loc[2*i+1] = offs[si], offs[ei]
-					} else {
-						loc[2*i], loc[2*i+1] = -1, -1
-					}
-				}
-				if r.global || r.sticky {
-					next := end
-					if next == pos {
-						next++
-					}
-					r.lastIndex = float64(next)
-				}
-				return groups, loc
-			}
-		}
-		if r.global || r.sticky {
-			r.lastIndex = 0
-		}
-		return nil, nil
-	}
+	in := &tnRegexInput{s: s}
 	if !r.global && !r.sticky {
-		loc := r.re.FindStringSubmatchIndex(s)
-		if loc == nil {
-			return nil, nil
-		}
-		groups := make([]string, len(loc)/2)
-		for i := range groups {
-			if loc[2*i] >= 0 {
-				groups[i] = s[loc[2*i]:loc[2*i+1]]
-			}
-		}
-		return groups, loc
+		return r.matchAt(in, 0, false)
 	}
-	if int(r.lastIndex) >= len(runs) {
+	start, skipped := 0, 0
+	for skipped < int(r.lastIndex) && start < len(s) {
+		_, size := utf8.DecodeRuneInString(s[start:])
+		start += size
+		skipped++
+	}
+	if skipped < int(r.lastIndex) {
 		r.lastIndex = 0
 		return nil, nil
 	}
-	byteStart := 0
-	for i := 0; i < int(r.lastIndex); i++ {
-		byteStart += len(string(runs[i]))
-	}
-	loc := r.re.FindStringSubmatchIndex(s[byteStart:])
-	if loc == nil || (r.sticky && loc[0] != 0) {
+	groups, loc := r.matchAt(in, start, r.sticky)
+	if groups == nil {
 		r.lastIndex = 0
 		return nil, nil
 	}
-	for i := range loc {
-		if loc[i] >= 0 {
-			loc[i] += byteStart
-		}
+	index := int(r.lastIndex) + utf8.RuneCountInString(s[start:loc[0]])
+	tnSetMatchIndex(groups, index)
+	next := float64(index + utf8.RuneCountInString(s[loc[0]:loc[1]]))
+	if loc[1] == loc[0] {
+		next++
 	}
-	groups := make([]string, len(loc)/2)
-	for i := range groups {
-		if loc[2*i] >= 0 {
-			groups[i] = s[loc[2*i]:loc[2*i+1]]
-		}
-	}
-	endRune := int(r.lastIndex)
-	bo := byteStart
-	for ri := int(r.lastIndex); ri < len(runs) && bo < loc[1]; ri++ {
-		bo += len(string(runs[ri]))
-		endRune = ri + 1
-	}
-	if endRune == int(r.lastIndex) {
-		endRune++
-	}
-	r.lastIndex = float64(endRune)
+	r.lastIndex = next
 	return groups, loc
 }
 
