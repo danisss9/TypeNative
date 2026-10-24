@@ -1980,9 +1980,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         useHelper('eventLoop');
         // A callback without parameters (then(() => …)) takes no value
         const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
-        const receive = takesValue ? `__v := <-(${recv})` : `<-(${recv})`;
+        const receive = takesValue ? `__v := <-__tnP` : `<-__tnP`;
         const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
-        return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${invoke} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot())`;
+        // The promise expression is a go-statement argument: it runs now, with
+        // the baton (exec() registering its listeners off the loop would race it)
+        return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${invoke} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})`;
       }
     }
     // Array.from(arrayLike, mapFn) — array-likes are { length } structs

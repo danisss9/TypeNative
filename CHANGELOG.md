@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-24
+
+Node-accurate JSON (`stringify` with spacing and replacers, `parse` with a reviver, and JSON
+modules), regexes with JS semantics that no longer re-scan the whole string on global matches,
+`Date` and error-stack parity, generator iterator helpers, `go:embed` and
+`go:runtime/coverage`, seven more Go bridge packages, and `async` calls that start when the
+statement runs.
+
 ### Added
 
 - **`JSON.stringify`:**
@@ -128,6 +136,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dates:** local getters on `new Date(ms)` used UTC
 - **Async arrows:** async arrows kept as values return promises (`return` of a plain value didn't
   build)
+- **`.then` on async calls:** the call starts when the statement runs, like JS (it started inside
+  the background goroutine, where `exec()` registering its listeners off the event loop could
+  race it)
 - **Maps:** `[...map.keys()]` / `[...map.values()]` build
 - **Optional chains:** comparing an optional chain or an `any` value with `null` / `undefined`
   sees a nil pointer inside it
