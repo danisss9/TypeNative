@@ -51,7 +51,9 @@ server.listen(3000, '127.0.0.1');
 | `/todos`        | POST   | Create a todo: `{ "title": "..." }` → 201    |
 | anything else   | *      | `404` with a JSON error                      |
 
-Invalid JSON or a missing `title` returns `400` with a JSON error.
+A missing `title` returns `400` with a JSON error. (The example keeps
+`JSON.parse` unguarded, so invalid JSON throws — under Node and the compiled
+binary alike, an uncaught throw ends the process.)
 
 ## Run it
 
@@ -91,35 +93,35 @@ curl -s -w "%{http_code}" -X POST -d '{}' http://127.0.0.1:3000/todos # 400
 Reproduce with `node bench.mjs [gets=20000] [posts=10000]`. The script
 compiles `main.ts` with the TypeNative CLI, starts the server under each
 runtime, seeds 50 todos, and drives load over keep-alive connections at
-concurrency 16 with a Node.js `node:http` client (identical client for both).
-It measures requests/second plus p50/p99 latency per request for
-`GET /todos` (20,000 requests, ~50-item JSON response) and `POST /todos`
-(10,000 requests).
+concurrency 16 (identical client for both). It measures requests/second plus
+p50/p99 latency per request for `GET /todos` (20,000 requests, ~50-item JSON
+response) and `POST /todos` (10,000 requests).
+
+The load generator is built to stay out of the way, like `wrk` or
+`autocannon`: 8 worker threads × 2 raw keep-alive sockets send prebuilt
+request bytes and read each response just far enough to find its end. A
+plain `node:http` client tops out around 8–11k req/s on this machine, so
+with it both servers would simply tie at the client's limit.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.0, default (non-`--release`) build. Re-run variation is about
-±5%.
+TypeNative 0.4.0, default (non-`--release`) build, client and server on the
+same machine. Re-run variation is about ±10%; across runs TypeNative was
+1.2–1.3x Node on GET and 1.2–1.4x on POST.
 
-| Runtime    | Endpoint    | req/s | p50 (ms) | p99 (ms) |
+| Runtime    | Endpoint    |  req/s | p50 (ms) | p99 (ms) |
 |------------|-------------|-------:|---------:|---------:|
-| Node.js    | GET /todos  |  7709 |     1.87 |     6.05 |
-| TypeNative | GET /todos  |  4834 |     3.08 |     6.60 |
-| Node.js    | POST /todos |  9244 |     1.57 |     3.97 |
-| TypeNative | POST /todos |  6141 |     2.46 |     4.55 |
+| Node.js    | GET /todos  |  13379 |     1.02 |     3.03 |
+| TypeNative | GET /todos  |  17794 |     0.66 |     1.87 |
+| Node.js    | POST /todos |  15405 |     0.94 |     2.17 |
+| TypeNative | POST /todos |  19581 |     0.60 |     2.32 |
 
-**Node.js serves ~1.5x more requests per second** on this workload. That is
-the honest result, and it is worth understanding: V8 and Node's `node:http`
-have been tuned for exactly this I/O-bound pattern for over a decade, while
-TypeNative re-implements the request lifecycle (event emission, stream
-callbacks, per-request closures) on top of Go's `net/http`, and that
-translation still has overhead. Tail latency (p99) is comparable for both.
+**TypeNative serves ~1.3x more requests per second**, with lower median
+latency on both routes. JavaScript still runs one thing at a time, as in
+Node, but the compiled server spreads everything around it — socket reads
+and writes, HTTP parsing — across Go's `net/http` goroutines, and runs the
+handler right on the request's goroutine whenever the event loop is free.
 
-Where the compiled binary wins is everything *around* the steady-state loop:
-it starts in ~15 ms instead of ~100 ms, it is a single 9.7 MB executable with
-zero dependencies — `scp` it to a server and run it, no Node install, no
-`node_modules` — and CPU-heavy work inside a handler runs ~2x faster (see the
-[fibonacci example](../fibonacci/README.md)).
-
-Takeaway: for I/O-bound HTTP services Node remains the throughput king today;
-choose TypeNative when startup time, deployment simplicity, or CPU-bound
-handler work dominates.
+On top of that, the binary starts in ~15 ms instead of ~100 ms and is a
+single 9.7 MB executable with zero dependencies — `scp` it to a server and
+run it, no Node install, no `node_modules` — and CPU-heavy work inside a
+handler runs ~2x faster (see the [fibonacci example](../fibonacci/README.md)).

@@ -8,7 +8,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 |----------------------------------------------|--------------------------------------------------------------------------|--------------------------------------------------|
 | [hello-world](hello-world/)                  | `console.log`, `process.argv`, template literals                        | **7.0x faster startup** (14.7 ms vs 103.5 ms)    |
 | [fibonacci](fibonacci/)                      | Recursion, `perf_hooks` timing, CPU-bound number crunching              | **1.9x faster compute** (50.2 ms vs 94.8 ms)     |
-| [json-server](json-server/)                  | `node:http` web server with GET + POST JSON routes, zero dependencies   | Node **1.5x higher HTTP throughput** (honest!)   |
+| [json-server](json-server/)                  | `node:http` web server with GET + POST JSON routes, zero dependencies   | **1.3x higher HTTP throughput** (17.8k vs 13.4k GET req/s) |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.4.0. See each example's README for full methodology and numbers.
@@ -48,7 +48,7 @@ cd examples/fibonacci   && node bench.mjs 35 15
 cd examples/json-server && node bench.mjs
 ```
 
-The json-server harness also shows where Node is still ahead: its V8 +
-`node:http` stack out-serves the compiled binary ~1.5x on I/O-bound HTTP
-throughput, while TypeNative wins process startup (~7x) and CPU-bound
-compute (~2x). The READMEs report what was measured, not what flatters.
+Across the three, TypeNative wins process startup (~7x), CPU-bound compute
+(~2x) and HTTP throughput (~1.3x, with lower median latency). The READMEs
+report what was measured, including run-to-run variation and how each load
+was generated.

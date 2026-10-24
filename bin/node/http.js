@@ -274,28 +274,43 @@ func tnNewIncoming() *TnIncomingMessage {
 	return m
 }
 
-// Streams a body into the message on a goroutine; done runs (off the loop) at the end
-func tnPumpBody(body io.ReadCloser, m *TnIncomingMessage, done func()) {
+// Read buffers of the body pumps (chunks are copied out of them)
+var tnBodyBufs = sync.Pool{New: func() any { b := make([]byte, 32768); return &b }}
+
+// Streams a body into the message on a goroutine; atEOF (optional) runs on the
+// loop just before the end of the stream, done (off the loop) at the end
+func tnPumpBody(body io.ReadCloser, m *TnIncomingMessage, atEOF func(), done func()) {
 	go func() {
 		defer done()
 		defer body.Close()
-		buf := make([]byte, 32768)
+		bp := tnBodyBufs.Get().(*[]byte)
+		defer tnBodyBufs.Put(bp)
 		for {
-			n, err := body.Read(buf)
+			n, err := body.Read(*bp)
+			var chunk []byte
 			if n > 0 {
-				chunk := append([]byte{}, buf[:n]...)
-				TnLoopPost(func() {
-					if !m.destroyed {
-						m.push(chunk)
-					}
-				})
+				chunk = append([]byte{}, (*bp)[:n]...)
+				if err == nil {
+					tnLoopRunOrPost(func() {
+						if !m.destroyed {
+							m.push(chunk)
+						}
+					})
+				}
 			}
 			if err != nil {
-				TnLoopPost(func() {
+				// The last chunk usually comes with the EOF: one task for both
+				tnLoopRunOrPost(func() {
 					if m.destroyed {
 						return
 					}
+					if chunk != nil {
+						m.push(chunk)
+					}
 					if err == io.EOF {
+						if atEOF != nil {
+							atEOF()
+						}
 						m.complete = true
 						m.push(nil)
 						return
@@ -331,6 +346,8 @@ type tnResOp struct {
 	trailer http.Header
 	data   []byte
 	end    bool
+	// Header ops: send the headers now (flushHeaders) instead of with the body
+	flush  bool
 	done   func(err error)
 }
 
@@ -348,16 +365,24 @@ type TnServerResponse struct {
 	ops           []tnResOp
 	signal        chan struct{}
 	trailer       http.Header
+	// end(chunk) is writing its chunk; endPosted: that write also ended the response
+	lastWrite     bool
+	endPosted     bool
 }
 
 func (res *TnServerResponse) Get_headersSent() bool       { return res.headersSent }
 func (res *TnServerResponse) Get_req() *TnIncomingMessage { return res.req }
 func (res *TnServerResponse) Get_socket() *TnSocket       { return res.req.socket }
 
-func (res *TnServerResponse) post(op tnResOp) {
+// Queues an op without waking the handler goroutine (it goes out with the next post)
+func (res *TnServerResponse) queue(op tnResOp) {
 	res.mu.Lock()
 	res.ops = append(res.ops, op)
 	res.mu.Unlock()
+}
+
+func (res *TnServerResponse) post(op tnResOp) {
+	res.queue(op)
 	select {
 	case res.signal <- struct{}{}:
 	default:
@@ -437,13 +462,16 @@ func (res *TnServerResponse) writeHead(status float64, args ...interface{}) *TnS
 			}
 		}
 	}
-	res.post(res.headerOp())
+	// As in Node, the headers go out with the first write or end()
+	res.queue(res.headerOp())
 	return res
 }
 
 func (res *TnServerResponse) flushHeaders() {
 	if !res.headersSent {
-		res.post(res.headerOp())
+		op := res.headerOp()
+		op.flush = true
+		res.post(op)
 	}
 }
 
@@ -460,7 +488,11 @@ func (res *TnServerResponse) end(args ...interface{}) *TnServerResponse {
 				if len(args) > 1 {
 					enc, _ = args[1].(string)
 				}
-				size = len(TnBufferFromString(d, enc))
+				if tnEncoding(enc) == "utf8" {
+					size = len(d)
+				} else {
+					size = len(TnBufferFromString(d, enc))
+				}
 			case []byte:
 				size = len(d)
 			}
@@ -469,6 +501,7 @@ func (res *TnServerResponse) end(args ...interface{}) *TnServerResponse {
 			res.store.set("Content-Length", strconv.Itoa(size))
 		}
 	}
+	res.lastWrite = true
 	res.TnStream.end(args...)
 	return res
 }
@@ -484,7 +517,7 @@ func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
 	res.tnSelf = res
 	res.sink = func(chunk interface{}, done func(err interface{})) {
 		if !res.headersSent {
-			res.post(res.headerOp())
+			res.queue(res.headerOp())
 		}
 		var data []byte
 		switch c := chunk.(type) {
@@ -494,7 +527,13 @@ func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
 			data = []byte(c)
 		}
 		res.wroteData = true
-		res.post(tnResOp{data: data, done: func(err error) {
+		// end(chunk)'s last chunk also ends the response: the handler goroutine
+		// finishes without another round trip through the loop
+		last := res.lastWrite && len(res.writeQueue) == 0
+		if last {
+			res.endPosted = true
+		}
+		res.post(tnResOp{data: data, end: last, trailer: res.trailer, done: func(err error) {
 			TnLoopPost(func() {
 				if err != nil {
 					done(TnNetError(err, "write", "", -1))
@@ -505,8 +544,12 @@ func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
 		}})
 	}
 	res.sinkFinal = func(done func(err interface{})) {
+		if res.endPosted {
+			done(nil)
+			return
+		}
 		if !res.headersSent {
-			res.post(res.headerOp())
+			res.queue(res.headerOp())
 		}
 		res.post(tnResOp{end: true, trailer: res.trailer, done: func(err error) {
 			TnLoopPost(func() { done(nil) })
@@ -561,10 +604,20 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NewResponseController(w).EnableFullDuplex()
-	// The messages are created on the loop (streams capture its async context)
+	// The messages are created on the loop (streams capture its async context);
+	// when it is idle, right here
 	created := make(chan *TnServerResponse, 1)
 	bodyDone := make(chan struct{})
-	TnLoopPost(func() {
+	// A small body that comes with the headers (a Content-Length, no Expect:
+	// 100-continue) is read here first, so the request needs no reader goroutine
+	var small []byte
+	var smallErr error
+	if r.ProtoMajor == 1 && r.ContentLength > 0 && r.ContentLength <= 65536 && r.Header.Get("Expect") == "" {
+		small = make([]byte, r.ContentLength)
+		_, smallErr = io.ReadFull(r.Body, small)
+		r.Body.Close()
+	}
+	tnLoopRunOrPost(func() {
 		TnAsyncRun(hs.asyncCtx, func() {
 			req := hs.incoming(r, local)
 			req.socket = tnInfoSocket(local, r.RemoteAddr)
@@ -574,7 +627,24 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			res := tnNewServerResponse(req)
 			created <- res
 			hs.emit("request", req, res)
-			tnPumpBody(r.Body, req, func() { close(bodyDone) })
+			if small != nil {
+				if smallErr != nil {
+					req.aborted = true
+					req.destroy(TnNodeError("Error", "ECONNRESET", "aborted"))
+				} else {
+					req.push(small)
+					req.complete = true
+					req.push(nil)
+				}
+				close(bodyDone)
+			} else if r.Body == nil || r.Body == http.NoBody {
+				// No body: the request ends at once, without a reader goroutine
+				req.complete = true
+				req.push(nil)
+				close(bodyDone)
+			} else {
+				tnPumpBody(r.Body, req, nil, func() { close(bodyDone) })
+			}
 		})
 	})
 	res := <-created
@@ -698,13 +768,21 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 					}
 				}
 				w.WriteHeader(op.status)
-				rc.Flush()
+				if op.flush {
+					rc.Flush()
+				}
 			case op.end:
+				// end(chunk): its data goes out with the headers; net/http flushes
+				// once the handler returns
+				var err error
+				if len(op.data) > 0 {
+					_, err = w.Write(op.data)
+				}
 				for k, v := range op.trailer {
 					w.Header()[http.TrailerPrefix+k] = v
 				}
 				ended = true
-				op.done(nil)
+				op.done(err)
 			default:
 				_, err := w.Write(op.data)
 				if err == nil {
@@ -1233,12 +1311,14 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 			} else {
 				res.resume()
 			}
+			// The trailers are read with the end of the body, before 'end'
 			tnPumpBody(resp.Body, res, func() {
+				for k, v := range resp.Trailer {
+					res.trailers.Set(strings.ToLower(k), strings.Join(v, ", "))
+				}
+			}, func() {
 				TnLoopPost(func() {
 					defer TnLoopUnref()
-					for k, v := range resp.Trailer {
-						res.trailers.Set(strings.ToLower(k), strings.Join(v, ", "))
-					}
 					cr.closeHeld = false
 					cr.emitClose()
 				})

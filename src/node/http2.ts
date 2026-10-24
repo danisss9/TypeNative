@@ -326,7 +326,10 @@ func (st *TnHttp2Stream) respond(args ...interface{}) {
 		}
 	}
 	st.res.statusCode = float64(status)
-	st.res.post(st.res.headerOp())
+	// respond() sends the HEADERS frame right away
+	op := st.res.headerOp()
+	op.flush = true
+	st.res.post(op)
 	st.headersSent = true
 	st.sentHeaders = sent
 	if len(args) > 1 && args[1] != nil {

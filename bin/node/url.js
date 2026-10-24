@@ -18,7 +18,23 @@ type TnURL struct {
 
 var tnSpecialSchemes = map[string]string{"http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21", "file:": ""}
 
-var tnSchemePattern = regexp.MustCompile("^[A-Za-z][A-Za-z0-9+.-]*:")
+// The leading "scheme:" of s (/^[A-Za-z][A-Za-z0-9+.-]*:/), "" when there is none
+func tnURLScheme(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '.' || c == '-'):
+		case i > 0 && c == ':':
+			return s[:i+1]
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+var tnURLStrip = strings.NewReplacer("\\t", "", "\\n", "", "\\r", "")
 
 func tnInvalidURL(input string) *TnError {
 	e := TnNodeError("TypeError", "ERR_INVALID_URL", "Invalid URL")
@@ -213,7 +229,9 @@ func tnCopyURL(b *TnURL) *TnURL {
 
 func tnParseURLString(input string, base *TnURL) (*TnURL, bool) {
 	input = strings.TrimFunc(input, func(r rune) bool { return r <= 0x20 })
-	input = strings.NewReplacer("\\t", "", "\\n", "", "\\r", "").Replace(input)
+	if strings.ContainsAny(input, "\\t\\n\\r") {
+		input = tnURLStrip.Replace(input)
+	}
 	fragment, hasFragment := "", false
 	if i := strings.Index(input, "#"); i >= 0 {
 		fragment, hasFragment = input[i+1:], true
@@ -225,7 +243,7 @@ func tnParseURLString(input string, base *TnURL) (*TnURL, bool) {
 		input = input[:i]
 	}
 	u := &TnURL{}
-	if scheme := tnSchemePattern.FindString(input); scheme != "" {
+	if scheme := tnURLScheme(input); scheme != "" {
 		u.protocol = strings.ToLower(scheme)
 		rest := input[len(scheme):]
 		if u.special() {
@@ -451,7 +469,7 @@ func (u *TnURL) Set_href(v string) {
 
 func (u *TnURL) Set_protocol(v string) {
 	v = strings.ToLower(strings.TrimSuffix(v, ":")) + ":"
-	if !tnSchemePattern.MatchString(v) {
+	if tnURLScheme(v) == "" {
 		return
 	}
 	_, toSpecial := tnSpecialSchemes[v]
@@ -809,7 +827,7 @@ func TnDomainToUnicode(domain string) string {
 }`;
 export function registerUrl(r) {
     defineModule(r, 'url');
-    defineHelper(r, 'nodeUrl', ['encoding/hex', 'fmt', 'net/url', 'path/filepath', 'reflect', 'regexp', 'runtime', 'sort', 'strconv', 'strings', 'unicode/utf16', 'unsafe'], ['error', 'dynamic', 'punycode', 'pathToFileURL', 'nodeInvoke'], urlHelper);
+    defineHelper(r, 'nodeUrl', ['encoding/hex', 'fmt', 'net/url', 'path/filepath', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'unicode/utf16', 'unsafe'], ['error', 'dynamic', 'punycode', 'pathToFileURL', 'nodeInvoke'], urlHelper);
     defineClass(r, 'url.URL', '*TnURL', 'class', 'toString=string; toJSON=string', '', 'href=string; protocol=string; username=string; password=string; host=string; hostname=string; port=string; pathname=string; search=string; hash=string; origin=string; searchParams=*TnURLSearchParams', 'href; protocol; username; password; host; hostname; port; pathname; search; hash');
     defineClass(r, 'url.URLSearchParams', '*TnURLSearchParams', 'class', 'append=; set=; delete=; get=*string; getAll=[]string; has=bool; sort=; toString=string; keys=[]string; values=[]string; entries=[][]string; forEach=', '', 'size=float64', '');
     r.iterators['*TnURLSearchParams'] = 'entries';

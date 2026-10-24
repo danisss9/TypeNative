@@ -10871,7 +10871,7 @@ const helperPackages: Record<string, string[]> = {
   dynamicSpread: ['sort'],
   entryPoints: ['os'],
   orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect'],
-  jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time'],
+  jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time', 'sync', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
   typeOf: ['reflect'],
   isArray: ['reflect'],
@@ -11904,6 +11904,10 @@ func TnAssign(dst map[string]interface{}, src interface{}) {
 
 // A number as JS prints it
 func TnNumStr(f float64) string {
+	// Integers (the common case) skip float formatting; -0 keeps its sign below
+	if f == math.Trunc(f) && f < 9007199254740992 && f > -9007199254740992 && (f != 0 || !math.Signbit(f)) {
+		return strconv.FormatInt(int64(f), 10)
+	}
 	switch {
 	case math.IsNaN(f):
 		return "NaN"
@@ -12592,8 +12596,7 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 		}
 		return true
 	case string:
-		data, _ := tnJSONMarshal(t)
-		w.buf.Write(data)
+		tnJSONQuote(&w.buf, t)
 		return true
 	}
 	rv := reflect.ValueOf(v)
@@ -12623,6 +12626,9 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 						emit(fmt.Sprint(e[0]), e[1])
 					}
 				})
+			}
+			if rv.Elem().Kind() == reflect.Struct && w.replacer == nil && w.allow == nil && !rv.Elem().Type().Implements(tnJSONMarshalerType) {
+				return w.fastStruct(rv, depth)
 			}
 			if rv.Elem().Kind() == reflect.Struct || rv.Elem().Kind() == reflect.Slice || rv.Elem().Kind() == reflect.Map {
 				w.enter(rv.Pointer())
@@ -12724,6 +12730,153 @@ func (w *tnJSONWriter) structFields(rv reflect.Value, emit func(string, interfac
 	}
 }
 
+// A JSON string as JSON.stringify writes it: U+2028 / U+2029 stay raw (Go's
+// encoder escapes them), invalid UTF-8 becomes \\ufffd
+func tnJSONQuote(buf *bytes.Buffer, s string) {
+	const hex = "0123456789abcdef"
+	buf.WriteByte('"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				buf.WriteString(s[start:i])
+				buf.WriteString("\\\\ufffd")
+				start = i + 1
+			}
+			i += size
+			continue
+		}
+		if c >= 0x20 && c != '"' && c != '\\\\' {
+			i++
+			continue
+		}
+		buf.WriteString(s[start:i])
+		buf.WriteByte('\\\\')
+		switch c {
+		case '"', '\\\\':
+			buf.WriteByte(c)
+		case '\\n':
+			buf.WriteByte('n')
+		case '\\r':
+			buf.WriteByte('r')
+		case '\\t':
+			buf.WriteByte('t')
+		case '\\b':
+			buf.WriteByte('b')
+		case '\\f':
+			buf.WriteByte('f')
+		default:
+			buf.WriteString("u00")
+			buf.WriteByte(hex[c>>4])
+			buf.WriteByte(hex[c&0xF])
+		}
+		i++
+		start = i
+	}
+	buf.WriteString(s[start:])
+	buf.WriteByte('"')
+}
+
+// A struct type's JSON fields (structFields' rules), resolved once per type:
+// offset from the struct start, the quoted "key": and how to write the value
+// inline (1 float64, 2 string, 3 bool, 0 through property)
+type tnJSONField struct {
+	offset uintptr
+	typ    reflect.Type
+	name   string
+	key    string
+	kind   uint8
+}
+
+var tnJSONPlans sync.Map
+var tnJSONMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+
+func tnJSONPlan(t reflect.Type) []tnJSONField {
+	if plan, ok := tnJSONPlans.Load(t); ok {
+		return plan.([]tnJSONField)
+	}
+	fields := []tnJSONField{}
+	var walk func(t reflect.Type, base uintptr)
+	walk = func(t reflect.Type, base uintptr) {
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.Anonymous {
+				if f.Type.Kind() == reflect.Struct && f.Type.Name() != "TnError" {
+					walk(f.Type, base+f.Offset)
+				}
+				continue
+			}
+			if f.Type.Kind() == reflect.Func || strings.HasPrefix(f.Name, "__") {
+				continue
+			}
+			name := tnJSONFieldName(f.Name)
+			var key bytes.Buffer
+			tnJSONQuote(&key, name)
+			key.WriteByte(':')
+			kind := uint8(0)
+			switch f.Type {
+			case reflect.TypeOf(float64(0)):
+				kind = 1
+			case reflect.TypeOf(""):
+				kind = 2
+			case reflect.TypeOf(false):
+				kind = 3
+			}
+			fields = append(fields, tnJSONField{offset: base + f.Offset, typ: f.Type, name: name, key: key.String(), kind: kind})
+		}
+	}
+	walk(t, 0)
+	tnJSONPlans.Store(t, fields)
+	return fields
+}
+
+// A struct behind a pointer, written in place: no copy of the struct, no
+// boxing of its numbers, strings and booleans
+func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
+	w.enter(rv.Pointer())
+	defer w.leave()
+	base := rv.UnsafePointer()
+	w.buf.WriteByte('{')
+	wrote := false
+	for _, f := range tnJSONPlan(rv.Elem().Type()) {
+		mark := w.buf.Len()
+		if wrote {
+			w.buf.WriteByte(',')
+		}
+		w.newline(depth + 1)
+		w.buf.WriteString(f.key)
+		if w.indent != "" {
+			w.buf.WriteByte(' ')
+		}
+		p := unsafe.Add(base, f.offset)
+		switch f.kind {
+		case 1:
+			if x := *(*float64)(p); math.IsNaN(x) || math.IsInf(x, 0) {
+				w.buf.WriteString("null")
+			} else {
+				w.buf.WriteString(TnNumStr(x))
+			}
+		case 2:
+			tnJSONQuote(&w.buf, *(*string)(p))
+		case 3:
+			w.buf.WriteString(strconv.FormatBool(*(*bool)(p)))
+		default:
+			if !w.property(f.name, reflect.NewAt(f.typ, p).Elem().Interface(), depth+1) {
+				w.buf.Truncate(mark) // undefined values leave the key out
+				continue
+			}
+		}
+		wrote = true
+	}
+	if wrote {
+		w.newline(depth)
+	}
+	w.buf.WriteByte('}')
+	return true
+}
+
 func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}))) bool {
 	w.buf.WriteByte('{')
 	wrote := false
@@ -12739,8 +12892,7 @@ func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}
 			w.buf.WriteByte(',')
 		}
 		w.newline(depth + 1)
-		kd, _ := tnJSONMarshal(key)
-		w.buf.Write(kd)
+		tnJSONQuote(&w.buf, key)
 		w.buf.WriteByte(':')
 		if w.indent != "" {
 			w.buf.WriteByte(' ')
@@ -14949,6 +15101,31 @@ func TnLoopPost(fn func()) {
 	tnLoopNotify()
 }
 
+// (a goroutine that never holds the baton: a server's request goroutine) Posts
+// fn and, when no JS is running, takes the baton and runs the queue right here
+// instead of waking the loop goroutine: one thread hand-off less per callback.
+// A throw still ends the process (net/http would swallow a handler panic).
+func tnLoopRunOrPost(fn func()) {
+	select {
+	case <-tnBaton:
+	default:
+		TnLoopPost(fn)
+		return
+	}
+	tnLoopMu.Lock()
+	tnLoopTasks = append(tnLoopTasks, fn)
+	tnLoopMu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			go func() { panic(r) }()
+			select {}
+		}
+	}()
+	TnRunMicrotasks()
+	TnLoopRunPending()
+	tnRelease()
+}
+
 // Runs a callback on the loop from a goroutine that does not hold the baton,
 // and waits for it
 func TnLoopCall(fn func()) {
@@ -15004,8 +15181,19 @@ func tnLoopIdle() bool {
 	return len(tnLoopTasks) == 0 && len(tnMicrotasks) == 0 && atomic.LoadInt64(&tnLoopRefs) <= 0
 }
 
+// (loop goroutine, waiting) Tasks or microtasks are queued, or nothing keeps
+// the loop alive any more (time to check for the exit)
+func tnLoopWanted() bool {
+	tnLoopMu.Lock()
+	defer tnLoopMu.Unlock()
+	tnMicrotasksMu.Lock()
+	defer tnMicrotasksMu.Unlock()
+	return len(tnLoopTasks) > 0 || len(tnMicrotasks) > 0 || atomic.LoadInt64(&tnLoopRefs) <= 0
+}
+
 // The end of main: run until nothing is pending
 func TnRunLoop() {
+	var idle *time.Timer
 	for {
 		TnRunMicrotasks()
 		TnLoopRunPending()
@@ -15021,9 +15209,24 @@ func TnRunLoop() {
 			continue
 		}
 		tnRelease()
-		select {
-		case <-tnLoopSignal:
-		case <-time.After(10 * time.Millisecond):
+		for {
+			// One timer reused across waits (time.After would allocate one per wake)
+			if idle == nil {
+				idle = time.NewTimer(10 * time.Millisecond)
+			} else {
+				idle.Reset(10 * time.Millisecond)
+			}
+			select {
+			case <-tnLoopSignal:
+				idle.Stop()
+			case <-idle.C:
+			}
+			// Work a server goroutine already ran in place (tnLoopRunOrPost) needs
+			// no baton here; taking it anyway would push those goroutines back to
+			// posting
+			if tnLoopWanted() {
+				break
+			}
 		}
 		tnAcquire()
 	}
