@@ -49,12 +49,10 @@ export const goPathAliases = {
     'github.com/ncruces/go-sqlite3': 'sqlite3'
 };
 export const goExcluded = {
-    plugin: 'cgo, `-buildmode=plugin`',
-    unsafe: 'raw pointers',
-    'runtime/race': 'needs `-race`',
-    'runtime/coverage': 'needs `-cover`',
-    'runtime/cgo': 'needs cgo',
-    embed: 'needs a `//go:embed` directive; a later phase'
+    plugin: 'Loads plugins with `dlopen`: needs cgo and `-buildmode=plugin` (no Windows support)',
+    unsafe: 'Raw pointer arithmetic and memory reinterpretation; TS values have no addresses',
+    'runtime/race': 'No public API: the race detector is a build mode (`-race`) that needs cgo',
+    'runtime/cgo': 'Links only with cgo and a C toolchain; `Handle` exists to pass Go values to C'
 };
 // Whether a call taking a callback invokes it synchronously.
 export function isSyncCallback(pkgPath, funcName) {

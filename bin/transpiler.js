@@ -410,6 +410,11 @@ const classStaticProps = new Set();
 // fromDir: directory of the file containing the import (null = main file's dir)
 // Returns the file content and its directory (for resolving that file's own imports)
 let fileResolver = null;
+// Resolves a go:embed path from a file's directory to a pattern relative to
+// the entry file's directory; null when missing or outside it
+let embedResolver = null;
+// The embed patterns the program uses (the CLI copies them next to the Go sources)
+const embedPatterns = new Set();
 // Directory of the file currently being processed (null = main entry file)
 let currentFileDir = null;
 // Name of the file currently being parsed, as diagnostics and line directives show it
@@ -530,7 +535,8 @@ function lineMarker(node) {
 // Prefixes generated code with its node's line marker (after any leading
 // whitespace, so the position applies to the code's first token)
 function withLineMarker(node, code) {
-    if (!code.trim())
+    // (a //go: directive must start its line)
+    if (!code.trim() || code.trimStart().startsWith('//go:'))
         return code;
     const marker = lineMarker(node);
     if (!marker)
@@ -567,7 +573,7 @@ function applyLineDirectives(code, goFile) {
                 return pin;
             });
         }
-        else if (pin && startState === '' && text.trim()) {
+        else if (pin && startState === '' && text.trim() && !text.trimStart().startsWith('//go:')) {
             const indent = text.length - text.trimStart().length;
             lines[index] = text.slice(0, indent) + pin + text.slice(indent);
         }
@@ -1034,6 +1040,8 @@ let targetGoos = 'linux';
 let currentFileIsTsx = false;
 export function transpileToNative(code, options) {
     fileResolver = options?.readFile ?? null;
+    embedResolver = options?.resolveEmbed ?? null;
+    embedPatterns.clear();
     parseFunction = options?.parse ?? defaultParseFunction;
     currentFileIsTsx = !!options?.tsx;
     currentFileName = options?.fileName ?? (currentFileIsTsx ? 'main.tsx' : 'main.ts');
@@ -1119,7 +1127,7 @@ export function transpileToNative(code, options) {
     // Go bridge packages pulled in for a type that never got emitted
     // (a method's result type, a param type needing no conversion) would be
     // unused imports, which Go rejects.
-    const emitted = stripGoStrings(`${mainCode}\n${outsideCode}\n${packageVariables.join('\n')}`);
+    const emitted = stripEmbedDirectives(stripGoStrings(`${mainCode}\n${outsideCode}\n${packageVariables.join('\n')}`));
     const helpersCode = emitGoHelpers();
     const mainImports = [...importedPackages].filter((pkg) => {
         if (!hasGoPackage(pkg))
@@ -1131,7 +1139,10 @@ export function transpileToNative(code, options) {
         if (!mainImports.includes(pkg))
             mainImports.push(pkg);
     }
-    const importLine = (pkg) => goSideEffectImports.has(pkg) && !importedPackages.has(pkg)
+    const blankEmbed = hasEmbedDirective(packageVariables.join('\n')) && !mainImports.includes('embed');
+    if (blankEmbed)
+        mainImports.push('embed');
+    const importLine = (pkg) => (goSideEffectImports.has(pkg) && !importedPackages.has(pkg)) || (pkg === 'embed' && blankEmbed)
         ? `import _ "${pkg}"`
         : goImportLine(pkg);
     // process.on('uncaughtException'): a throw in the top-level code is handed to it too
@@ -1158,7 +1169,8 @@ ${helpersCode}`.trimEnd();
     return {
         main: applyLineDirectives(main, goFile),
         files: localImportFiles,
-        diagnostics: diagnostics.slice()
+        diagnostics: diagnostics.slice(),
+        embeds: [...embedPatterns]
     };
 }
 export // Property map of an interface, including inherited properties (flattened —
@@ -1535,6 +1547,9 @@ function visit(node, options = {}) {
         const requireDeclaration = visitRequireDeclaration(node);
         if (requireDeclaration !== undefined)
             return requireDeclaration;
+        const embedDeclaration = visitEmbedDeclaration(node);
+        if (embedDeclaration !== undefined)
+            return embedDeclaration;
         const nodeAlias = visitNodeAliasDeclaration(node);
         if (nodeAlias !== undefined)
             return nodeAlias;
@@ -1782,6 +1797,12 @@ function visit(node, options = {}) {
         const nodeCall = visitNodeCall(node);
         if (nodeCall !== undefined)
             return nodeCall;
+        // (a declaration's initializer is handled by visitEmbedDeclaration)
+        const embedCall = embedIntrinsic(node.expression);
+        if (embedCall) {
+            reportError(node, `embed.${embedCall}() must initialize a top-level variable`);
+            return '';
+        }
         const goCall = visitGoCall(node);
         if (goCall !== undefined)
             return goCall;
@@ -10206,7 +10227,7 @@ function includeLocalImport(code, dir, goFileName, tsx = false, fileName = '') {
     importedPackages.clear();
     helperProvidedPackages.clear();
     const sf = parseSource(code);
-    const isDeclarationLine = (line) => /^(var|const|type|func|import)\b/.test(line.trim());
+    const isDeclarationLine = (line) => /^(var|const|type|func|import)\b|^\/\/go:embed /.test(line.trim());
     const declarationLines = [];
     const statementLines = [];
     const prevEmittingModuleFile = emittingModuleFile;
@@ -10233,16 +10254,7 @@ function includeLocalImport(code, dir, goFileName, tsx = false, fileName = '') {
     // references them; the main file (which carries the helper sources)
     // always imports them.
     const fileCode = `${fileInline}\n${fileOutside}`;
-    const fileImports = [...importedPackages]
-        .filter((pkg) => {
-        if (!helperProvidedPackages.has(pkg))
-            return true;
-        const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop();
-        return stripGoStrings(fileCode).includes(`${pkgName}.`);
-    })
-        .sort()
-        .map((pkg) => goImportLine(pkg))
-        .join('\n');
+    const fileImports = goFileImportLines(fileCode);
     const parts = [GENERATED_HEADER, 'package main'];
     if (fileImports)
         parts.push(fileImports);
@@ -10342,16 +10354,7 @@ function compileEntryPoint(id, file) {
     const fileVars = mainPackageVariables.splice(varsBefore).map((v) => localizeGoPaths(v));
     const fnName = `tnEntry_${id}`;
     const fileCode = `${fileVars.join('\n')}\n\nfunc init() { tnEntryPoints[${JSON.stringify(id)}] = ${fnName} }\n\nfunc ${fnName}() {\n\t${statements.join('\n\t')}\n}\n\n${fileOutside}`;
-    const fileImports = [...importedPackages]
-        .filter((pkg) => {
-        if (!helperProvidedPackages.has(pkg))
-            return true;
-        const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop();
-        return stripGoStrings(fileCode).includes(`${pkgName}.`);
-    })
-        .sort()
-        .map((pkg) => goImportLine(pkg))
-        .join('\n');
+    const fileImports = goFileImportLines(fileCode);
     const goFileName = `entry_${id}.go`;
     const parts = [GENERATED_HEADER, 'package main'];
     if (fileImports)
@@ -10419,6 +10422,104 @@ function visitRequireDeclaration(node) {
         return '';
     }
     return undefined;
+}
+// go:embed intrinsics: `const page = embed.string('./page.html')` compiles to
+// a package-level `//go:embed page.html` var. Paths resolve from the calling
+// file to patterns relative to the entry file's directory, where the CLI
+// copies the files next to the Go sources (so embed.FS names match Go's)
+const embedGoTypes = { string: 'string', bytes: '[]byte', files: 'embed.FS' };
+// 'string' / 'bytes' / 'files' when callee is a go:embed intrinsic, else ''
+function embedIntrinsic(callee) {
+    let member = '';
+    if (isIdentifier(callee)) {
+        const split = splitGoMember(goMemberOf(callee.text));
+        if (split && split.path === 'embed')
+            member = split.member;
+    }
+    else if (isPropertyAccessExpression(callee) && isIdentifier(callee.expression) && goPathOf(callee.expression.text) === 'embed') {
+        member = callee.name.text;
+    }
+    return Object.hasOwn(embedGoTypes, member) ? member : '';
+}
+function visitEmbedDeclaration(node) {
+    const init = node.initializer;
+    if (!init || !isCallExpression(init))
+        return undefined;
+    const kind = embedIntrinsic(init.expression);
+    if (!kind)
+        return undefined;
+    const isTopLevel = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
+    if (!isTopLevel || !isIdentifier(node.name)) {
+        reportError(node, `embed.${kind}() must initialize a top-level variable`);
+        return '';
+    }
+    const args = init.arguments ?? [];
+    if (kind === 'files' ? args.length === 0 : args.length !== 1) {
+        reportError(init, kind === 'files' ? 'embed.files() needs at least one pattern' : `embed.${kind}() takes exactly one path`);
+        return '';
+    }
+    const patterns = [];
+    for (const arg of args) {
+        if (!isStringLiteral(arg) && !isNoSubstitutionTemplateLiteral(arg)) {
+            reportError(arg, 'embed paths must be string literals');
+            return '';
+        }
+        const spec = String(arg.text);
+        const resolved = embedResolver ? embedResolver(spec, currentFileDir) : null;
+        if (resolved === null) {
+            reportError(arg, embedResolver
+                ? `Cannot embed '${spec}': no such file, or it is outside the entry file's directory`
+                : `Cannot embed '${spec}': embedding needs the files on disk`);
+            return '';
+        }
+        patterns.push(resolved);
+    }
+    for (const pattern of patterns)
+        embedPatterns.add(pattern);
+    const name = node.name.text;
+    const goType = embedGoTypes[kind];
+    variableClassNames.delete(name);
+    variableTypeNodes.delete(name);
+    narrowedVariables.delete(name);
+    if (kind === 'files')
+        variableTypes.delete(name);
+    else
+        variableTypes.set(name, kind === 'string' ? 'string' : 'Uint8Array');
+    setVarGoType(name, goType);
+    ensureGoTypePackages(goType);
+    // Go reads a pattern with spaces only when quoted
+    const directive = patterns.map((p) => (/\s/.test(p) ? JSON.stringify(p) : p)).join(' ');
+    const declaration = `//go:embed ${directive}\nvar ${getSafeName(name)} ${goLocalType(goType)}`;
+    if (emittingModuleFile)
+        return declaration;
+    mainPackageVariables.push(declaration);
+    return '';
+}
+function hasEmbedDirective(code) {
+    return /^\/\/go:embed /m.test(code);
+}
+// Without the //go:embed lines: their file patterns (embed.txt) would read
+// as uses of a package to the import pruning
+function stripEmbedDirectives(code) {
+    return code.replace(/^\/\/go:embed .*$/gm, '');
+}
+// Import lines of a local or entry-point file: helper packages only when its
+// own code names them; embed blank when only //go:embed directives need it
+function goFileImportLines(fileCode) {
+    const code = stripEmbedDirectives(stripGoStrings(fileCode));
+    const imports = [...importedPackages].filter((pkg) => {
+        if (!helperProvidedPackages.has(pkg))
+            return true;
+        const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop();
+        return code.includes(`${pkgName}.`);
+    });
+    const blankEmbed = hasEmbedDirective(fileCode) && !referencesQualifier(code, 'embed');
+    if (blankEmbed && !imports.includes('embed'))
+        imports.push('embed');
+    return imports
+        .sort()
+        .map((pkg) => (pkg === 'embed' && blankEmbed ? 'import _ "embed"' : goImportLine(pkg)))
+        .join('\n');
 }
 // Whether Object.keys & co.'s argument is a Map / Record (an ordered map)
 function isOrderedMapArg(node) {

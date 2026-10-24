@@ -25,13 +25,20 @@ function skipsHere(file) {
 const skipped = probes.filter(skipsHere);
 for (const file of skipped) probes.splice(probes.indexOf(file), 1);
 
+// Extra CLI flags from a first line reading `// conformance-flags: --cover`
+function probeFlags(file) {
+  const first = readFileSync(path.join(root, 'conformance', file), 'utf-8').split('\n', 1)[0];
+  const match = /^\/\/ conformance-flags: (.+)/.exec(first);
+  return match ? match[1].trim().split(/\s+/) : [];
+}
+
 const categories = new Map();
 const failures = [];
 for (const file of probes) {
   const name = file.replace(/\.tsx?$/, '');
   const category = name.split('-')[0];
   const [command, ...args] = compiler;
-  const result = spawnSync(command, [...args, '--source', path.join('conformance', file), '--script'], {
+  const result = spawnSync(command, [...args, '--source', path.join('conformance', file), '--script', ...probeFlags(file)], {
     cwd: root,
     encoding: 'utf-8',
     timeout: 60000

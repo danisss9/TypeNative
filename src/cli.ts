@@ -84,6 +84,7 @@ import { VERSION } from './version.js';
     vendorDir: fileURLToPath(new URL('../govendor', import.meta.url)),
     target: args.target,
     release: args.release,
+    cover: args.cover,
     emitGo: args.emitGo
   });
 })();

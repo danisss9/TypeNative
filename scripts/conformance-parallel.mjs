@@ -25,6 +25,13 @@ function skipsHere(file) {
 const skipped = probes.filter(skipsHere);
 for (const file of skipped) probes.splice(probes.indexOf(file), 1);
 
+// Extra CLI flags from a first line reading `// conformance-flags: --cover`
+function probeFlags(file) {
+  const first = readFileSync(path.join(root, 'conformance', file), 'utf-8').split('\n', 1)[0];
+  const match = /^\/\/ conformance-flags: (.+)/.exec(first);
+  return match ? match[1].trim().split(/\s+/) : [];
+}
+
 // Each probe is a Go build; two per core keeps them busy while others type-check or run
 const N = Math.min(8, Math.max(2, os.availableParallelism() * 2));
 let idx = 0;
@@ -50,7 +57,7 @@ function runOne(file) {
   return new Promise((resolve) => {
     const [command, ...args] = compiler;
     // Its own process group (POSIX) so a timeout can kill the whole group
-    const p = spawn(command, [...args, '--source', path.join(root, 'conformance', file), '--script'], {
+    const p = spawn(command, [...args, '--source', path.join(root, 'conformance', file), '--script', ...probeFlags(file)], {
       cwd: dir,
       detached: process.platform !== 'win32'
     });

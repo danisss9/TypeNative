@@ -20,6 +20,8 @@ assert(all.includes(join('b', 'two.txt')) && all.includes(join('b', 'c')), 'recu
 
 cpSync(join(root, 'a'), join(root, 'copy'), { recursive: true });
 assert(readFileSync(join(root, 'copy', 'b', 'two.txt'), 'utf8') === '2', 'cpSync recursive');
+cpSync(join(root, 'a', 'b', 'two.txt'), join(root, 'new', 'dir', 'two.txt'));
+assert(readFileSync(join(root, 'new', 'dir', 'two.txt'), 'utf8') === '2', 'cpSync creates parent dirs');
 
 rmdirSync(join(root, 'a', 'b', 'c'));
 assert(!existsSync(join(root, 'a', 'b', 'c')), 'rmdirSync');

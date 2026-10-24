@@ -379,6 +379,8 @@ func TnCp(src string, dst string, recursive bool, force bool) {
 	if !force && TnExists(dst) {
 		return
 	}
+	// like Node, a file copied into a missing directory creates it
+	tnFsCheck(os.MkdirAll(filepath.Dir(dst), 0o777), "cp", dst)
 	TnCopyFile(src, dst, 0)
 }
 

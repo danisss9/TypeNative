@@ -78,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `chan<T>()` makes a `chan T`
   - TS records pass where Go takes a `map[K]V`
   - callbacks whose Go signature returns `(T, error)`
+- **`go:embed`:** `embed.string(path)`, `embed.bytes(path)` and `embed.files(...patterns)` (an
+  `embed.FS`) compile to `//go:embed` vars; the CLI copies the files next to the Go sources
+- **`go:runtime/coverage`**, with a `--cover` CLI option that builds with coverage counters. Probes
+  can pass CLI options with a first line like `// conformance-flags: --cover`
 
 ### Fixed
 
@@ -177,6 +181,8 @@ Programs that built Go that didn't compile, or computed a wrong value, with no T
 - A "Roadmap: known limitations" section, which the link in CONTRIBUTION.md pointed to
 - The Go bridges table has no ⚠️ ("typed, no probe yet") status any more. A probe that can't run on
   a platform opts out with a first line like `// conformance-skip: win32 (reason)`
+- `go:plugin`, `go:unsafe`, `go:runtime/race` and `go:runtime/cgo` are 🚫 (cgo or raw memory),
+  each with the reason
 
 ## [0.4.0] - 2026-10-19
 

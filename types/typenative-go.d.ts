@@ -5753,6 +5753,21 @@ declare module 'go:debug/plan9obj' {
   export const ErrNoSymbols: import('go:builtin').GoError;
 }
 
+declare module 'go:embed' {
+  export class FS {
+    constructor(init?: Partial<FS>);
+    Open(name: string): import('go:io/fs').File;
+    ReadDir(name: string): import('go:io/fs').DirEntry[];
+    ReadFile(name: string): Uint8Array;
+  }
+  // Compile-time embedding (//go:embed): only as a top-level const initializer.
+  // Paths are relative to this file and must stay inside the entry file's directory.
+  export function string(path: string): string;
+  export function bytes(path: string): Uint8Array;
+  // Go embed patterns: files, directories, globs, an 'all:' prefix for dotfiles
+  export function files(...patterns: string[]): FS;
+}
+
 declare module 'go:encoding' {
   export interface BinaryAppender {
     AppendBinary(b: Uint8Array | number[] | null): Uint8Array;
@@ -12524,6 +12539,14 @@ declare module 'go:runtime' {
   export const GOARCH: string;
   export const GOOS: string;
   export const MemProfileRate: number;
+}
+
+declare module 'go:runtime/coverage' {
+  export function ClearCounters(): import('go:builtin').GoError;
+  export function WriteCounters(w: import('go:io').Writer | null): import('go:builtin').GoError;
+  export function WriteCountersDir(dir: string): import('go:builtin').GoError;
+  export function WriteMeta(w: import('go:io').Writer | null): import('go:builtin').GoError;
+  export function WriteMetaDir(dir: string): import('go:builtin').GoError;
 }
 
 declare module 'go:runtime/debug' {

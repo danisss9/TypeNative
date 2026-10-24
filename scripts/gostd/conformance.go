@@ -11,7 +11,7 @@ import (
 // Rewrite the Go bridges table in conformance.md between
 // <!-- go-bridges:start --> and <!-- go-bridges:end --> markers.
 // Status per package: ✅ with the probe that covers it (see probeMap),
-// ❌ excluded with the reason from overrides. A bridged package without a
+// 🚫 excluded with the reason from excludeReason. A bridged package without a
 // probe is ✅ with no probe link, and the generator warns about it.
 
 var moduleNotes = map[string]string{
@@ -72,6 +72,8 @@ var moduleNotes = map[string]string{
 	"unicode/utf8":            "UTF-8 encoding",
 	"unique":                  "Canonical values",
 	"weak":                    "Weak pointers",
+	"embed":                   "`embed.string` / `bytes` / `files` compile to `//go:embed` vars",
+	"runtime/coverage":        "Needs `--cover`; calls throw without it",
 	"cmp":                     "Ordered comparison primitives",
 	"iter":                    "Range-over-func iterators via `for…of`; `Pull` not bridged",
 	"maps":                    "Generic map helpers",
@@ -360,6 +362,8 @@ var probeMap = map[string][]string{
 	"testing/cryptotest": {"lib-go-testing-t.ts"},
 	"testing/slogtest": {"lib-go-testing-t.ts"},
 	"testing/synctest": {"lib-go-testing-t.ts"},
+	"embed":            {"lib-go-embed.ts"},
+	"runtime/coverage": {"lib-go-coverage.ts"},
 }
 
 func updateConformance(root string, models []pkgModel) error {
@@ -399,8 +403,8 @@ func updateConformance(root string, models []pkgModel) error {
 		fmt.Fprintf(&b, "| `go:%s` | ✅ | %s | %s |\n", m.path, probeCell, notes)
 	}
 	// Excluded packages.
-	for _, p := range []string{"plugin", "unsafe", "runtime/race", "runtime/coverage", "runtime/cgo", "embed"} {
-		fmt.Fprintf(&b, "| `go:%s` | ❌ | — | %s |\n", p, excludeReason(p))
+	for _, p := range []string{"plugin", "unsafe", "runtime/race", "runtime/cgo"} {
+		fmt.Fprintf(&b, "| `go:%s` | 🚫 | — | %s |\n", p, excludeReason(p))
 	}
 	block := b.String()
 	content = content[:si+len(start)] + block + content[ei:]

@@ -59,6 +59,18 @@ func renderBuiltin() string {	return `declare module 'go:builtin' {
 `
 }
 
+// Hand-written declarations appended to a package's module: compile-time
+// intrinsics the transpiler lowers itself (they have no Go counterpart).
+var dtsExtras = map[string]string{
+	"embed": `  // Compile-time embedding (//go:embed): only as a top-level const initializer.
+  // Paths are relative to this file and must stay inside the entry file's directory.
+  export function string(path: string): string;
+  export function bytes(path: string): Uint8Array;
+  // Go embed patterns: files, directories, globs, an 'all:' prefix for dotfiles
+  export function files(...patterns: string[]): FS;
+`,
+}
+
 func renderModule(m *pkgModel, all map[string]*pkgModel) string {
 	tm := newTypeMapper(m, all)
 	var b strings.Builder
@@ -91,6 +103,7 @@ func renderModule(m *pkgModel, all map[string]*pkgModel) string {
 	for _, v := range m.vars {
 		fmt.Fprintf(&b, "  export const %s: %s;\n", sanitizeName(v.name), tm.mapType(v.goTy, "field"))
 	}
+	b.WriteString(dtsExtras[m.path])
 	b.WriteString("}\n")
 	return b.String()
 }

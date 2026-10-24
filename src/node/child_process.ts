@@ -363,6 +363,9 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 		streams.Wait()
 		err := cmd.Wait()
 		status, _ := tnExitStatus(err)
+		if ipc, ok := cp.ipc.(interface{ waitDrained() }); ok {
+			ipc.waitDrained()
+		}
 		TnLoopPost(func() {
 			defer cp.unref()
 			var code interface{} = status

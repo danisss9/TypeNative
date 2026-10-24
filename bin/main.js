@@ -54,6 +54,7 @@ import { VERSION } from './version.js';
         vendorDir,
         target: args.target,
         release: args.release,
+        cover: args.cover,
         emitGo: args.emitGo
     });
 })();

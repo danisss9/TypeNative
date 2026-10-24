@@ -116,27 +116,20 @@ func stdPackages() ([]string, error) {
 }
 
 func isExcluded(path string) bool {
-	switch path {
-	case "unsafe", "plugin", "embed", "runtime/race", "runtime/coverage", "runtime/cgo":
-		return true
-	}
-	return false
+	return excludeReason(path) != ""
 }
 
+// Packages that can't work in a TypeNative program (🚫 in conformance.md).
 func excludeReason(path string) string {
 	switch path {
 	case "plugin":
-		return "cgo, `-buildmode=plugin`"
+		return "Loads plugins with `dlopen`: needs cgo and `-buildmode=plugin` (no Windows support)"
 	case "unsafe":
-		return "raw pointers"
+		return "Raw pointer arithmetic and memory reinterpretation; TS values have no addresses"
 	case "runtime/race":
-		return "needs `-race`"
-	case "runtime/coverage":
-		return "needs `-cover`"
-	case "embed":
-		return "needs a `//go:embed` directive; a later phase"
+		return "No public API: the race detector is a build mode (`-race`) that needs cgo"
 	case "runtime/cgo":
-		return "needs cgo"
+		return "Links only with cgo and a C toolchain; `Handle` exists to pass Go values to C"
 	}
 	return ""
 }

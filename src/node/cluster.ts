@@ -60,6 +60,7 @@ type tnIpcLink struct {
 	onControl     func(ctl map[string]interface{})
 	directControl func(ctl map[string]interface{}) bool
 	onClose       func()
+	done          chan struct{}
 }
 
 func (l *tnIpcLink) write(kind byte, data []byte) bool {
@@ -97,6 +98,9 @@ func (l *tnIpcLink) start() {
 						l.onClose()
 					}
 				})
+				if l.done != nil {
+					close(l.done)
+				}
 				return
 			}
 			switch kind {
@@ -140,6 +144,16 @@ type tnChildIpc struct {
 	connected bool
 	onConnect func()
 	onControl func(ctl map[string]interface{})
+	drained   chan struct{}
+}
+
+// Holds the child's 'exit' until everything it sent (and the channel's close)
+// is delivered, so 'message' and 'disconnect' come first as in Node
+func (st *tnChildIpc) waitDrained() {
+	select {
+	case <-st.drained:
+	case <-time.After(time.Second):
+	}
 }
 
 func tnCPIpc(cp *TnChildProcess) *tnChildIpc {
@@ -228,7 +242,7 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 		spawnOpts["cwd"] = cwd
 	}
 	cp := TnSpawn(exe, argv, spawnOpts)
-	st := &tnChildIpc{connected: true}
+	st := &tnChildIpc{connected: true, drained: make(chan struct{})}
 	cp.ipc = st
 	go func() {
 		ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
@@ -236,6 +250,7 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 			conn, err := ln.Accept()
 			if err != nil {
 				ln.Close()
+				close(st.drained)
 				return
 			}
 			kind, payload, err := tnReadFrame(conn)
@@ -244,11 +259,12 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 				continue
 			}
 			ln.Close()
-			link := &tnIpcLink{conn: conn}
+			link := &tnIpcLink{conn: conn, done: st.drained}
 			TnLoopPost(func() {
 				st.link = link
 				if !st.connected {
 					link.close()
+					close(st.drained)
 					return
 				}
 				for _, data := range st.pending {

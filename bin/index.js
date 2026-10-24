@@ -27,6 +27,8 @@ Options:
   --target <os/arch>   Cross-compile, e.g. linux/amd64, linux/arm64, darwin/arm64,
                        windows/amd64 ('go tool dist list' shows every pair)
   --release            Smaller binary: drop symbols and file paths
+  --cover              Build with coverage counters, for go:runtime/coverage
+                       (set GOCOVERDIR to also write a profile at exit)
   --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
   --no-typecheck       Skip type-checking
   -h, --help           Show this help
@@ -47,6 +49,7 @@ export function parseCliArgs(argv) {
         script: false,
         noTypeCheck: false,
         release: false,
+        cover: false,
         source: null,
         output: null,
         target: null,
@@ -73,6 +76,8 @@ export function parseCliArgs(argv) {
             args.noTypeCheck = true;
         else if (arg === '--release')
             args.release = true;
+        else if (arg === '--cover')
+            args.cover = true;
         else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
             if (value === null) {
                 if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
@@ -274,6 +279,92 @@ export function createProject(projectName, installDependencies) {
         console.log('Dependencies installed successfully!');
     }
 }
+// go:embed files are copied next to the Go sources at their paths relative
+// to the entry file; this manifest lists the copies for the next build to remove
+const EMBED_MANIFEST = '.tnembed';
+// A go:embed path from a source file's directory → the pattern relative to
+// rootDir (the entry file's directory), or null when nothing matches or it
+// leaves rootDir. An `all:` prefix (dotfiles too) is kept.
+function resolveEmbedPattern(pattern, fromDir, rootDir) {
+    const all = pattern.startsWith('all:');
+    const spec = all ? pattern.slice(4) : pattern;
+    const rel = path.relative(rootDir, path.resolve(fromDir, spec)).split(path.sep).join('/');
+    if (!rel || rel === '..' || rel.startsWith('../') || path.isAbsolute(rel))
+        return null;
+    if (embedMatches(rootDir, rel).length === 0)
+        return null;
+    return all ? `all:${rel}` : rel;
+}
+// The paths under rootDir an embed pattern names: itself, or for a glob
+// (* ? [...], in the last element) the matching entries of its directory
+function embedMatches(rootDir, rel) {
+    const slash = rel.lastIndexOf('/');
+    const dir = slash < 0 ? '' : rel.slice(0, slash);
+    const base = rel.slice(slash + 1);
+    if (!/[*?[]/.test(base))
+        return fs.existsSync(path.join(rootDir, rel)) ? [rel] : [];
+    if (/[*?[]/.test(dir))
+        return [];
+    const glob = globRegExp(base);
+    let names = [];
+    try {
+        names = fs.readdirSync(path.join(rootDir, dir));
+    }
+    catch {
+        return [];
+    }
+    return names.filter((name) => glob.test(name)).map((name) => (dir ? `${dir}/${name}` : name));
+}
+// Go path.Match syntax for one path element: * ? and [...] ([^...] negates)
+function globRegExp(glob) {
+    let source = '';
+    for (let i = 0; i < glob.length; i++) {
+        const c = glob[i];
+        const close = c === '[' ? glob.indexOf(']', i + 1) : -1;
+        if (c === '*')
+            source += '.*';
+        else if (c === '?')
+            source += '.';
+        else if (close > i) {
+            source += `[${glob.slice(i + 1, close)}]`;
+            i = close;
+        }
+        else
+            source += /[\\^$.|+(){}[\]]/.test(c) ? `\\${c}` : c;
+    }
+    return new RegExp(`^${source}$`);
+}
+// Removes the go:embed copies the previous build listed
+function removeEmbedCopies(outDir) {
+    const manifest = path.join(outDir, EMBED_MANIFEST);
+    if (!fs.existsSync(manifest))
+        return;
+    for (const line of fs.readFileSync(manifest, 'utf-8').split('\n')) {
+        if (line.trim())
+            fs.rmSync(path.join(outDir, line.trim()), { recursive: true, force: true });
+    }
+    fs.rmSync(manifest);
+}
+// Copies the go:embed files into outDir, where go build resolves the
+// directives (embed paths can't leave the package directory)
+function copyEmbeds(rootDir, patterns, outDir) {
+    const copied = [];
+    for (const pattern of patterns) {
+        const rel = pattern.startsWith('all:') ? pattern.slice(4) : pattern;
+        for (const match of embedMatches(rootDir, rel)) {
+            const top = match.split('/')[0];
+            if ((top === match && match.endsWith('.go')) || ['go.mod', 'go.sum', 'tnvendor', EMBED_MANIFEST].includes(top)) {
+                console.error(`error: can't embed '${match}': the generated Go files use that name`);
+                process.exit(1);
+            }
+            fs.cpSync(path.join(rootDir, match), path.join(outDir, match), { recursive: true });
+            if (!copied.includes(top))
+                copied.push(top);
+        }
+    }
+    if (copied.length > 0)
+        fs.writeFileSync(path.join(outDir, EMBED_MANIFEST), `${copied.join('\n')}\n`);
+}
 export function run(opts) {
     const goError = checkGo(opts.target);
     if (goError) {
@@ -359,6 +450,7 @@ export function run(opts) {
                 content = typed;
             return { content, dir, path: displayPath(resolved.path) };
         };
+        transpileOptions.resolveEmbed = (pattern, fromDir) => resolveEmbedPattern(pattern, fromDir ?? sourceDir, sourceDir);
     }
     const transpileResult = transpileToNative(tsCode, transpileOptions);
     if (transpileResult.diagnostics.length > 0) {
@@ -379,6 +471,7 @@ export function run(opts) {
     }
     // Clean up stale Go files from previous runs before writing new ones (in an
     // --emit-go directory, only files TypeNative generated)
+    removeEmbedCopies(outDir);
     for (const existing of fs.readdirSync(outDir)) {
         const file = path.join(outDir, existing);
         if (existing === 'go.mod' || existing === 'go.sum')
@@ -392,6 +485,8 @@ export function run(opts) {
         fs.writeFileSync(path.join(outDir, filename), content);
         goFiles.push(filename);
     }
+    if (sourceDir)
+        copyEmbeds(sourceDir, transpileResult.embeds, outDir);
     // Third-party Go modules the program imports (see vendorXText / vendorGoModules)
     const generated = [transpileResult.main];
     for (const content of transpileResult.files.values())
@@ -431,6 +526,9 @@ export function run(opts) {
         buildArgs.push('-trimpath');
     if (opts.release)
         buildArgs.push('-ldflags=-s -w');
+    // atomic counters: coverage.ClearCounters refuses the default 'set' mode
+    if (opts.cover)
+        buildArgs.push('-cover', '-covermode=atomic');
     for (const file of goFiles)
         buildArgs.push(file);
     const buildResult = runCommand('go', buildArgs);
