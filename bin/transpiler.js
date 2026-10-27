@@ -1624,6 +1624,13 @@ function visit(node, options = {}) {
                     return;
                 const bindEl = el;
                 const localName = visit(bindEl.name);
+                if (bindEl.dotDotDotToken) {
+                    // `...rest` copies the remaining elements (empty past the end)
+                    importedPackages.add('slices');
+                    parts.push(`${localName} := slices.Clone(${tmpVar}[min(${idx}, len(${tmpVar})):])`);
+                    registerLocalVariable(localName, initGoType?.startsWith('[]') ? initGoType : undefined);
+                    return;
+                }
                 const defaultVal = bindEl.initializer;
                 if (defaultVal) {
                     // Missing element (past the end) takes the default
@@ -11830,10 +11837,16 @@ func TnNumStr(f float64) string {
 		return "Infinity"
 	case math.IsInf(f, -1):
 		return "-Infinity"
-	case f == math.Trunc(f) && math.Abs(f) < 1e21:
+	case math.Abs(f) >= 1e-6 && math.Abs(f) < 1e21:
+		// Plain notation in JS's range: 1761603012345.678, 0.000001
 		return strconv.FormatFloat(f, 'f', -1, 64)
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	// Exponent form without Go's zero padding: 1e-7, 1.5e+21
+	s := strconv.FormatFloat(f, 'e', -1, 64)
+	if n := len(s); s[n-2] == '0' && (s[n-3] == '+' || s[n-3] == '-') {
+		s = s[:n-2] + s[n-1:]
+	}
+	return s
 }
 
 // Number(x) like JS: "" → 0, invalid → NaN, booleans → 0/1
@@ -11863,6 +11876,16 @@ func TnNumber(v interface{}) float64 {
 			return 0
 		}
 		return *t
+	case *string:
+		if t == nil {
+			return 0
+		}
+		return TnNumber(*t)
+	case *bool:
+		if t == nil {
+			return 0
+		}
+		return TnNumber(*t)
 	}
 	// Go numeric kinds (int, named numerics such as time.Duration)
 	rv := reflect.ValueOf(v)

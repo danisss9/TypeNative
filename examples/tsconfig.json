@@ -8,6 +8,9 @@
       "strict": true,
       "noImplicitAny": true,
       "allowSyntheticDefaultImports": true,
+      // Local imports keep their .ts extension, as `node main.ts` requires
+      "allowImportingTsExtensions": true,
+      "noEmit": true,
       // types/ is checked on its own (types/tsconfig.json)
       "skipLibCheck": true
     }

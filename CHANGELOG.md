@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Examples:** `todo-cli`, `dupe-finder`, `mandelbrot-png` and `desktop-notes` (a notes app in an
+  Edge/Chrome app window), each with a Node-vs-TypeNative benchmark
+- **Conformance:** every `examples/*/main.ts` is type-checked and built by the suite as
+  `example-<name>`
+
+### Fixed
+
+- **Destructuring:** `const [a, ...rest] = arr` gives `rest` the remaining elements (it compiled to
+  a single element)
+- **Numbers:** `String(n)`, templates and `JSON.stringify` print non-integers in plain notation
+  from `1e-6` up to `1e21` (`1761603012345.678`, not `1.761603012345678e+12`), and exponents
+  without padding (`1e-7`, not `1e-07`)
+- **`Number()`:** converts optional strings and booleans (`Number(s)` with `s: string | undefined`
+  gave `NaN`)
+
 ## [0.4.1] - 2026-10-24
 
 Node-accurate JSON (`stringify` with spacing and replacers, `parse` with a reviver, and JSON
