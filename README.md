@@ -1,6 +1,6 @@
 ﻿# TypeNative
 
-TypeNative is a TypeScript-to-Go transpiler, it turns TypeScript into Go code and compiles it to a single-file native executable — no Node.js runtime, no bundler, just a binary. Write TypeScript, ship native binaries.
+TypeNative is a TypeScript-to-Go transpiler, it turns TypeScript into Go code and compiles it to a single-file native executable, no Node.js runtime, no bundler, just a binary. Write TypeScript, ship native binaries.
 
 ```ts
 // hello.ts
@@ -18,6 +18,7 @@ npx typenative --source hello.ts --script
 
 ## Contents
 
+- [Why use TypeNative](#why-use-typenative)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -28,6 +29,17 @@ npx typenative --source hello.ts --script
 - [Testing and conformance](#testing-and-conformance)
 - [Self-hosted native compiler](#self-hosted-native-compiler)
 - [License](#license)
+
+## Why use TypeNative
+
+- **Ship one file.** The output is a single self-contained executable: no Node.js install, no `node_modules`, no bundler. Copy it to a server and run it, or cross-compile for Linux, macOS and Windows from any OS with `--target`.
+- **Start instantly.** There is no runtime to boot and no JIT to warm up: a hello world starts in ~15 ms vs ~100 ms under Node, which matters for CLI tools that run often.
+- **Run faster.** Code is compiled ahead of time to machine code through Go. CPU-bound work like recursive `fib(35)` runs ~1.9x faster than Node, and a `node:http` JSON server handles ~1.3x more requests per second with lower median latency.
+- **Keep your TypeScript.** Same syntax, same types, and Node's own APIs (`node:fs`, `node:http`, `node:crypto`, …) with Node's signatures. The [examples](examples/) run unchanged under both `node` and TypeNative.
+- **Reach into Go.** Import any Go package directly (`import { Println } from 'go:fmt'`) when you need something Node doesn't have.
+- **Know what works.** Type errors and unsupported syntax are reported against your `.ts` lines before anything builds, and every supported feature is backed by a runnable probe in [conformance.md](conformance.md).
+
+Numbers are medians from the [examples/](examples/) benchmarks (Windows 11, Ryzen 5 5500U, Node 24, Go 1.26); each example's README has the full methodology. TypeNative compiles a subset of TypeScript, so it fits best for CLIs, servers and tools where you control the code, rather than for running arbitrary existing npm projects.
 
 ## Requirements
 
@@ -112,22 +124,22 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 }
 ```
 
-`lib: []` disables the standard TypeScript libraries, so `typenative`'s own declarations are the entire type surface — the compiler only accepts what actually transpiles.
+`lib: []` disables the standard TypeScript libraries, so `typenative`'s own declarations are the entire type surface, the compiler only accepts what actually transpiles.
 
 ## CLI reference
 
-| Flag              | Mode           | Description                                                                                                                                          |
-| ----------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--source <file>` | build / script | TypeScript entry file. Relative imports (`./util`) and npm packages are resolved from its directory.                                                 |
-| `--output <path>` | build          | Where to copy the compiled binary. If omitted with `--script`, the temp binary in `dist/` is executed and kept there.                                |
-| `--script`        | run            | Build to `dist/native(.exe)` and execute immediately with inherited stdio. Combine with `--source`, or omit `--source` to type code into the prompt. |
-| `--new`           | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`).                                              |
-| `--no-typecheck`  | build / script | Skip the type-check that runs before transpiling.                                                                                                    |
-| `--target <os/arch>` | build       | Cross-compile for another platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, … — `go tool dist list` shows every pair). `--script` only runs host builds. |
-| `--release`       | build / script | Smaller binary: strips symbols and file paths (`-trimpath -ldflags="-s -w"`).                                                                        |
-| `--emit-go <dir>` | build          | Write the generated Go (`code.go`, `go.mod`, vendored modules) to `<dir>` instead of building; `go build -C <dir>` builds it.                       |
-| `-h`, `--help`    |                | Print the options.                                                                                                                                   |
-| `-v`, `--version` |                | Print the TypeNative version.                                                                                                                        |
+| Flag                 | Mode           | Description                                                                                                                                                                   |
+| -------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--source <file>`    | build / script | TypeScript entry file. Relative imports (`./util`) and npm packages are resolved from its directory.                                                                          |
+| `--output <path>`    | build          | Where to copy the compiled binary. If omitted with `--script`, the temp binary in `dist/` is executed and kept there.                                                         |
+| `--script`           | run            | Build to `dist/native(.exe)` and execute immediately with inherited stdio. Combine with `--source`, or omit `--source` to type code into the prompt.                          |
+| `--new`              | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`).                                                                       |
+| `--no-typecheck`     | build / script | Skip the type-check that runs before transpiling.                                                                                                                             |
+| `--target <os/arch>` | build          | Cross-compile for another platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, … `go tool dist list` shows every pair). `--script` only runs host builds. |
+| `--release`          | build / script | Smaller binary: strips symbols and file paths (`-trimpath -ldflags="-s -w"`).                                                                                                 |
+| `--emit-go <dir>`    | build          | Write the generated Go (`code.go`, `go.mod`, vendored modules) to `<dir>` instead of building; `go build -C <dir>` builds it.                                                 |
+| `-h`, `--help`       |                | Print the options.                                                                                                                                                            |
+| `-v`, `--version`    |                | Print the TypeNative version.                                                                                                                                                 |
 
 The entry file can also be the last argument (`typenative main.ts --script`), and every option accepts `--flag=value`. Unknown options are an error (exit code `2`). Before building, the CLI checks that Go 1.26 or newer is on the `PATH`.
 
@@ -142,7 +154,7 @@ Errors point at your TypeScript, not the generated Go: `dist/code.go` carries Go
 
 ## Writing TypeNative-compatible TypeScript
 
-TypeNative supports a growing subset of TypeScript, not the whole language. The source of truth is [conformance.md](conformance.md) — every supported feature links to a runnable probe in [conformance/](conformance/).
+TypeNative supports a growing subset of TypeScript, not the whole language. The source of truth is [conformance.md](conformance.md). Every supported feature links to a runnable probe in [conformance/](conformance/).
 
 **Language highlights that work today:**
 
@@ -169,7 +181,7 @@ TypeNative supports a growing subset of TypeScript, not the whole language. The 
 | `JSON`          | `parse` / `stringify`                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `RegExp`        | Literals + `new RegExp()`, `test()`, `exec()` with named groups (`.groups`), flags `i`/`m`/`s`/`g`/`y`/`u`, stateful `lastIndex` for `/g` loops, `source`/`flags`/`global`/... properties. Backreferences, lookahead and lookbehind run on a small backtracking engine (RE2 does not support them)                                                                                                                              |
 | Globals         | `setTimeout`/`clearTimeout`, `setInterval`/`clearInterval`, `queueMicrotask`, `structuredClone`, `globalThis`, `encodeURIComponent`/`decodeURIComponent`, `isNaN`/`isFinite`, `NaN`/`Infinity`                                                                                                                                                                                                                                  |
-| `process`       | `argv`, `platform` (→ Node-style names), `env`, `cwd`, `exit`, `exitCode`, `hrtime`, `stdout`/`stderr`/`stdin`, `on('exit')`, … (see [node:process](conformance.md#nodeprocess))                                                                                                                                                                                                                                      |
+| `process`       | `argv`, `platform` (→ Node-style names), `env`, `cwd`, `exit`, `exitCode`, `hrtime`, `stdout`/`stderr`/`stdin`, `on('exit')`, … (see [node:process](conformance.md#nodeprocess))                                                                                                                                                                                                                                                |
 
 **Node built-ins (import with the `node:` prefix, mapped to Go helpers):**
 
@@ -195,7 +207,7 @@ import { ToUpper } from 'go:strings';
 Println(Sprintf('hi %s', ToUpper('bob')));
 ```
 
-Any Go package can be imported this way (`import { X } from 'go:pkg'` → `pkg.X` with numeric conversion and throw-on-error results). The full standard library is declared for typechecking (`npm run gen:go`), with 154 packages probed — see [conformance.md](conformance.md#go-bridges-gostar).
+Any Go package can be imported this way (`import { X } from 'go:pkg'` → `pkg.X` with numeric conversion and throw-on-error results). The full standard library is declared for typechecking (`npm run gen:go`), with 154 packages probed, see [conformance.md](conformance.md#go-bridges-gostar).
 
 **npm packages:**
 
@@ -247,9 +259,8 @@ c.inc();
 console.log(`count=${c.count} seen=${seen.get('a')}`);
 ```
 
-Complete, runnable projects — including Node-vs-TypeNative benchmarks for
-each — live in [examples/](examples/): a hello world (startup), a recursive
-fibonacci (CPU), and a JSON web server (`node:http` GET/POST).
+Complete, runnable projects, including Node-vs-TypeNative benchmarks for
+each, live in [examples/](examples/).
 
 ## How it works
 
@@ -268,7 +279,7 @@ main.ts --(type-check)--(parse)--> normalized JSON AST --(transpileToNative)--> 
 
 CI (`.github/workflows/ci.yml`) runs `npm run build`, `npm run check:go-types` and the conformance suite on Ubuntu, Windows and macOS with Node 24 and Go 1.26, and a Linux job that builds the self-hosted compiler, checks the bootstrap fixpoint (`npm run bootstrap:check`) and runs the suite through it. Releases are cut from `TypeNative_*` tags via trusted publishing, from a fresh `npm run build`.
 
-When adding a feature: add a probe, link it from [conformance.md](conformance.md), and keep the ✅/❌ matrix honest — gaps are documented, not hidden.
+When adding a feature: add a probe, link it from [conformance.md](conformance.md), and keep the ✅/❌ matrix honest gaps are documented, not hidden.
 
 ## Self-hosted native compiler
 
@@ -284,4 +295,4 @@ native/typenative --source app.ts --script
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT [LICENSE](LICENSE).
