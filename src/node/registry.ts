@@ -22,6 +22,16 @@ export interface NodeCall {
   types: string[];
   // Visited receiver of an instance method ('' for functions)
   recv: string;
+  // The call expression itself (absent for property reads and setters)
+  site?: AstNode;
+}
+
+// Where a call is in the TypeScript source: an absolute path (forward
+// slashes) and the 1-based position of the called name
+export interface SourcePosition {
+  file: string;
+  line: number;
+  column: number;
 }
 
 export type NodeEmit = (call: NodeCall) => string;
@@ -92,6 +102,12 @@ export interface NodeRegistry {
   // new URL('./w.ts', import.meta.url), path.join(__dirname, 'w.ts')): the
   // file is compiled into the binary as a second entry point ('' otherwise)
   entryPoint: (node: AstNode) => string;
+  // The position of a call's callee name (test('x') → test, it.skip() → skip)
+  callSite: (node: AstNode) => SourcePosition;
+  // mock.method / getter / setter (call.nodes[0] the object, [1] the name):
+  // the Go call installing the mock through tracker, and the mock's Go type
+  mockMember: (call: NodeCall, tracker: string, kind: string) => string;
+  mockMemberType: (call: NodeCall, kind: string) => string;
 }
 
 // Services start as no-ops; the transpiler binds them before each run
@@ -126,7 +142,10 @@ export function createNodeRegistry(): NodeRegistry {
     visit: (_node: AstNode) => '',
     categoryOf: (_node: AstNode) => '',
     isArrayBuffer: (_node: AstNode) => false,
-    entryPoint: (_node: AstNode) => ''
+    entryPoint: (_node: AstNode) => '',
+    callSite: (_node: AstNode) => ({ file: '', line: 0, column: 0 }),
+    mockMember: (_call: NodeCall, _tracker: string, _kind: string) => '',
+    mockMemberType: (_call: NodeCall, _kind: string) => ''
   };
   return registry;
 }

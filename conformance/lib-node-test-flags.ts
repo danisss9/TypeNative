@@ -53,7 +53,10 @@ if (process.env.TN_TEST_FLAGS_CHILD) {
 
   const junit = run('--test-reporter=junit --test-name-pattern="inner beta"');
   assert(junit.startsWith('<?xml version="1.0" encoding="utf-8"?>\n<testsuites>'), 'junit header');
-  assert(/<testsuite name="group" time="[0-9.]+" disabled="0" errors="0" tests="1" failures="0" skipped="0" hostname="[^"]*">/.test(junit), 'junit suite');
-  assert(/<testcase name="inner beta" time="[0-9.]+" classname="test"\/>/.test(junit), 'junit test case');
+  assert(
+    /<testsuite name="group" time="[0-9.]+" disabled="0" errors="0" tests="1" failures="0" skipped="0" timestamp="\d{4}-\d\d-\d\dT[\d:.]+Z" hostname="[^"]*">/.test(junit),
+    'junit suite'
+  );
+  assert(/<testcase name="inner beta" time="[0-9.]+" classname="test" file="[^"]*lib-node-test-flags\.ts"\/>/.test(junit), 'junit test case');
   console.log('test flags ok');
 }

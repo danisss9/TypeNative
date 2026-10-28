@@ -1,11 +1,16 @@
 // node:test — test / it / describe / suite with hooks, subtests (t.test),
-// skip / todo, timeouts, async and callback-style tests, and mock.fn. Tests
-// are collected while the program runs and executed one after another once
-// the main module has finished (as in Node); the report uses Node's TAP
-// reporter, or the spec reporter when stdout is a terminal. A failure sets
-// the exit code to 1.
+// skip / todo, timeouts, async and callback-style tests, mocks and snapshots.
+// Tests are collected while the program runs and executed one after another
+// once the main module has finished (as in Node). The runner reports through
+// events (Node's test:start / test:pass / test:fail / …), which the
+// reporters in test_report.ts turn into TAP, spec, dot, junit or lcov text
+// for each --test-reporter / --test-reporter-destination pair. A failure
+// sets the exit code to 1.
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { registerTestReporters } from './test_report.js';
+import { registerTestRun } from './test_run.js';
+import { registerTestCoverage } from './test_coverage.js';
 
 const testHelper = `// node:test
 type TnTestNode struct {
@@ -27,25 +32,30 @@ type TnTestNode struct {
 	status      string
 	err         interface{}
 	failureType string
+	failure     *TnError
 	duration    float64
 	diagnostics []string
 	started     bool
-	headerShown bool
 	ctx         *TnTestContext
 	done        chan struct{}
+	// where test() / describe() was called
+	file   string
+	line   float64
+	column float64
 }
 
 var tnTestRoot = &TnTestNode{suite: true}
 var tnTestCurrent = tnTestRoot
 var tnTestRunning *TnTestNode
 var tnTestScheduled bool
-var tnTestSpec bool
-var tnTestTap bool
-var tnTestReporter string
-var tnTestColor bool
-var tnTestStart time.Time
+var tnTestStart float64
 var tnTestCounts = map[string]int{}
-var tnTestFailures []*TnTestNode
+
+// Hooks of the optional parts: a run() child sends its events to the parent;
+// coverage and snapshots finish when the run does
+var tnTestChildSink func(e *TnTestEvent)
+var tnTestCoverage func(cfg *tnTestConfig) *TnCoverageSummary
+var tnTestSnapshotsDone func()
 
 // TestContext (t)
 type TnTestContext struct {
@@ -67,7 +77,14 @@ func (t *TnTestContext) Get_fullName() string {
 }
 func (t *TnTestContext) Get_mock() *TnMockTracker  { return t.mock }
 func (t *TnTestContext) Get_signal() *TnAbortSignal { return t.signal }
+
+// The source file the test was declared in
 func (t *TnTestContext) Get_filePath() string {
+	for n := t.node; n != nil; n = n.parent {
+		if n.file != "" {
+			return n.file
+		}
+	}
 	if len(os.Args) > 0 {
 		return os.Args[0]
 	}
@@ -100,8 +117,9 @@ func (t *TnTestContext) plan(n float64, options ...interface{}) {
 func (t *TnTestContext) runOnly(flag bool) {}
 
 // t.test(name, [options], fn): runs the subtest now; resolves when it is done
-func (t *TnTestContext) test(args ...interface{}) chan struct{} {
+func (t *TnTestContext) test(file string, line float64, column float64, args ...interface{}) chan struct{} {
 	child := tnTestNew(false, args)
+	tnTestLocate(child, file, line, column)
 	child.parent = t.node
 	t.node.children = append(t.node.children, child)
 	t.asserts++
@@ -158,6 +176,14 @@ func tnTestNew(suite bool, args []interface{}) *TnTestNode {
 	return n
 }
 
+// The call site (a source path with forward slashes, as the compiler knows it)
+func tnTestLocate(n *TnTestNode, file string, line float64, column float64) {
+	if file != "" {
+		n.file = filepath.FromSlash(file)
+	}
+	n.line, n.column = line, column
+}
+
 func tnTestIsFunc(v interface{}) bool {
 	rv := reflect.ValueOf(v)
 	return rv.IsValid() && rv.Kind() == reflect.Func && !rv.IsNil()
@@ -172,8 +198,9 @@ func tnTestDepth(n *TnTestNode) int {
 }
 
 // test() / it(): registered with the enclosing describe (or the running test)
-func TnTestRegister(variant string, args ...interface{}) chan struct{} {
+func TnTestRegister(variant string, file string, line float64, column float64, args ...interface{}) chan struct{} {
 	n := tnTestNew(false, args)
+	tnTestLocate(n, file, line, column)
 	switch variant {
 	case "skip":
 		n.skip = true
@@ -200,8 +227,9 @@ func TnTestRegister(variant string, args ...interface{}) chan struct{} {
 }
 
 // describe() / suite(): the body runs now and registers the suite's tests
-func TnSuiteRegister(variant string, args ...interface{}) chan struct{} {
+func TnSuiteRegister(variant string, file string, line float64, column float64, args ...interface{}) chan struct{} {
 	n := tnTestNew(true, args)
+	tnTestLocate(n, file, line, column)
 	switch variant {
 	case "skip":
 		n.skip = true
@@ -249,12 +277,14 @@ func TnTestHook(kind string, fn interface{}, options ...interface{}) {
 	tnTestSchedule()
 }
 
-// The run starts once the main module has finished (a loop task)
+// The run starts once the main module has finished (a loop task); the
+// reporters are set up by the first test(), as Node does
 func tnTestSchedule() {
 	if tnTestScheduled {
 		return
 	}
 	tnTestScheduled = true
+	tnTestOpenReporters()
 	TnLoopRef()
 	TnLoopPost(func() {
 		TnStartAsync(func() {
@@ -282,7 +312,7 @@ func tnTestInvoke(fn interface{}, ctx *TnTestContext, timeoutMs float64) tnTestO
 	if timeoutMs > 0 && !math.IsInf(timeoutMs, 1) {
 		ms := timeoutMs
 		timer := time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() {
-			settle(tnTestOutcome{err: TnNodeError("Error", "ERR_TEST_FAILURE", "test timed out after "+strconv.FormatFloat(ms, 'f', -1, 64)+"ms"), failed: true, timedOut: true})
+			settle(tnTestOutcome{err: "test timed out after " + strconv.FormatFloat(ms, 'f', -1, 64) + "ms", failed: true, timedOut: true})
 		})
 		defer timer.Stop()
 	}
@@ -359,12 +389,21 @@ func tnTestAncestors(n *TnTestNode) []*TnTestNode {
 
 // The test runner's flags, from NODE_OPTIONS as Node reads them:
 // --test-name-pattern / --test-skip-pattern (repeatable, "/re/flags" or a
-// plain regular expression), --test-only and --test-reporter
+// plain regular expression), --test-only, --test-reporter /
+// --test-reporter-destination (repeatable, in pairs),
+// --test-update-snapshots and the coverage flags
 type tnTestConfig struct {
-	names    []*regexp.Regexp
-	skips    []*regexp.Regexp
-	only     bool
-	reporter string
+	names           []*regexp.Regexp
+	skips           []*regexp.Regexp
+	only            bool
+	reporters       []string
+	destinations    []string
+	updateSnapshots bool
+	coverage        bool
+	coverageInclude []string
+	coverageExclude []string
+	// --test-coverage-lines / -branches / -functions (0: no threshold)
+	thresholds map[string]float64
 }
 
 func (c *tnTestConfig) active() bool { return len(c.names) > 0 || len(c.skips) > 0 || c.only }
@@ -417,16 +456,21 @@ func tnTestPattern(s string) *regexp.Regexp {
 	return re
 }
 
+var tnTestValueFlags = map[string]bool{
+	"--test-name-pattern": true, "--test-skip-pattern": true, "--test-reporter": true, "--test-reporter-destination": true,
+	"--test-coverage-include": true, "--test-coverage-exclude": true,
+	"--test-coverage-lines": true, "--test-coverage-branches": true, "--test-coverage-functions": true,
+}
+
 func tnTestFilters() *tnTestConfig {
 	if tnTestCfg != nil {
 		return tnTestCfg
 	}
-	c := &tnTestConfig{}
+	c := &tnTestConfig{thresholds: map[string]float64{}}
 	words := tnNodeOptionWords(os.Getenv("NODE_OPTIONS"))
 	for i := 0; i < len(words); i++ {
 		name, value, hasValue := strings.Cut(words[i], "=")
-		takesValue := name == "--test-name-pattern" || name == "--test-skip-pattern" || name == "--test-reporter"
-		if takesValue && !hasValue && i+1 < len(words) {
+		if tnTestValueFlags[name] && !hasValue && i+1 < len(words) {
 			i++
 			value = words[i]
 		}
@@ -438,7 +482,21 @@ func tnTestFilters() *tnTestConfig {
 		case "--test-only":
 			c.only = true
 		case "--test-reporter":
-			c.reporter = value
+			c.reporters = append(c.reporters, value)
+		case "--test-reporter-destination":
+			c.destinations = append(c.destinations, value)
+		case "--test-update-snapshots":
+			c.updateSnapshots = true
+		case "--experimental-test-coverage":
+			c.coverage = true
+		case "--test-coverage-include":
+			c.coverageInclude = append(c.coverageInclude, value)
+		case "--test-coverage-exclude":
+			c.coverageExclude = append(c.coverageExclude, value)
+		case "--test-coverage-lines", "--test-coverage-branches", "--test-coverage-functions":
+			if n, err := strconv.ParseFloat(value, 64); err == nil {
+				c.thresholds[strings.TrimPrefix(name, "--test-coverage-")] = n
+			}
 		}
 	}
 	tnTestCfg = c
@@ -501,25 +559,137 @@ func tnTestPrune(n *TnTestNode) bool {
 	return len(kept) > 0
 }
 
-func tnRunRoot() {
-	tnTestStart = time.Now()
+// --- reporting ---
+
+// A reporter and where its text goes
+type tnTestSink struct {
+	reporter tnTestReporter
+	out      *os.File
+	file     bool
+}
+
+func (s *tnTestSink) write(text string) {
+	if text != "" {
+		s.out.WriteString(text)
+	}
+}
+
+var tnTestSinks []*tnTestSink
+
+// --test-reporter / --test-reporter-destination, paired as Node pairs them
+// (the default: spec on a terminal, else tap, to stdout)
+func tnTestOpenReporters() {
+	if tnTestChildSink != nil {
+		return
+	}
 	cfg := tnTestFilters()
-	tnTestReporter = cfg.reporter
-	if tnTestReporter != "spec" && tnTestReporter != "dot" && tnTestReporter != "junit" && tnTestReporter != "tap" {
-		tnTestReporter = "tap"
+	reporters, destinations := cfg.reporters, cfg.destinations
+	if len(reporters) == 0 && len(destinations) == 0 {
+		reporters = []string{"tap"}
 		if TnIsTTY(os.Stdout) {
-			tnTestReporter = "spec"
+			reporters = []string{"spec"}
 		}
 	}
-	tnTestSpec = tnTestReporter == "spec"
-	tnTestTap = tnTestReporter == "tap"
-	tnTestColor = (tnTestSpec || tnTestReporter == "dot") && TnIsTTY(os.Stdout) && os.Getenv("NO_COLOR") == ""
-	if tnTestTap {
-		fmt.Println("TAP version 13")
+	if len(reporters) == 1 && len(destinations) == 0 {
+		destinations = []string{"stdout"}
 	}
-	if tnTestReporter == "junit" {
-		fmt.Println("<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?>")
-		fmt.Println("<testsuites>")
+	if len(destinations) != len(reporters) {
+		received := make([]interface{}, len(reporters))
+		for i, r := range reporters {
+			received[i] = r
+		}
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument '--test-reporter' must match the number of specified '--test-reporter-destination'. Received "+TnInspect(received)))
+	}
+	for i, name := range reporters {
+		sink := &tnTestSink{}
+		colors := tnTestColorsOn()
+		switch destinations[i] {
+		case "stdout":
+			sink.out = os.Stdout
+		case "stderr":
+			sink.out = os.Stderr
+		default:
+			path := destinations[i]
+			os.MkdirAll(filepath.Dir(path), 0o755)
+			f, err := os.Create(path)
+			if err != nil {
+				panic(TnNodeError("Error", "ENOENT", err.Error()))
+			}
+			sink.out, sink.file, colors = f, true, false
+		}
+		sink.reporter = tnNewTestReporter(name, colors)
+		if sink.reporter == nil {
+			cwd, _ := os.Getwd()
+			panic(TnNodeError("Error", "ERR_MODULE_NOT_FOUND", "Cannot find package '"+name+"' imported from "+cwd))
+		}
+		tnTestSinks = append(tnTestSinks, sink)
+	}
+}
+
+func tnTestEmit(e *TnTestEvent) {
+	if tnTestChildSink != nil {
+		tnTestChildSink(e)
+		return
+	}
+	for _, s := range tnTestSinks {
+		s.write(s.reporter.report(e))
+	}
+}
+
+func tnTestNumber(n *TnTestNode) int {
+	if n.parent != nil {
+		for i, c := range n.parent.children {
+			if c == n {
+				return i + 1
+			}
+		}
+	}
+	return 1
+}
+
+func tnTestEventFor(kind string, n *TnTestNode, depth int) *TnTestEvent {
+	d := &TnTestEventData{name: n.name, nesting: float64(depth), file: n.file, line: n.line, column: n.column}
+	if kind != "test:start" {
+		d.testNumber = float64(tnTestNumber(n))
+		kindName := "test"
+		if n.suite {
+			kindName = "suite"
+		}
+		d.details = &TnTestEventDetails{duration_ms: math.Round(n.duration*1e6) / 1e6, type_: kindName, passed: n.status != "fail"}
+		if n.err != nil {
+			if n.failure == nil {
+				n.failure = tnTestFailure(n.err, n.failureType)
+			}
+			d.details.error_ = n.failure
+		}
+		if n.skip {
+			d.skip = true
+			if n.skipMsg != "" {
+				d.skip = n.skipMsg
+			}
+		} else if n.todo {
+			d.todo = true
+			if n.todoMsg != "" {
+				d.todo = n.todoMsg
+			}
+		}
+	}
+	return &TnTestEvent{type_: kind, data: d}
+}
+
+func tnTestNote(nesting int, message string, level string, n *TnTestNode) *TnTestEvent {
+	d := &TnTestEventData{nesting: float64(nesting), message: message, level: level}
+	if n != nil {
+		d.file, d.line, d.column = n.file, n.line, n.column
+	}
+	return &TnTestEvent{type_: "test:diagnostic", data: d}
+}
+
+func tnRunRoot() {
+	tnTestStart = tnTestNow()
+	cfg := tnTestFilters()
+	for _, s := range tnTestSinks {
+		s.write(s.reporter.begin())
 	}
 	root := tnTestRoot
 	if cfg.active() {
@@ -540,16 +710,12 @@ func tnRunRoot() {
 
 func tnRunTestNode(n *TnTestNode, depth int) {
 	n.started = true
-	tnTestShowParents(n)
-	indent := strings.Repeat("    ", depth)
-	if tnTestTap {
-		fmt.Println(indent + "# Subtest: " + n.name)
-	}
+	tnTestEmit(tnTestEventFor("test:start", n, depth))
 	// .only without --test-only: Node's notice, as the test's diagnostic
 	if n.only && !tnTestFilters().only {
 		n.diagnostics = append(n.diagnostics, "'only' and 'runOnly' require the --test-only command-line option.")
 	}
-	start := time.Now()
+	start := tnTestNow()
 	ctx := &TnTestContext{node: n, mock: TnNewMockTracker(), signal: TnNewAbortSignal()}
 	n.ctx = ctx
 	defer func() {
@@ -611,12 +777,12 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 				n.failureType = "testCodeFailure"
 			}
 		} else if ctx.planSet && ctx.planned != ctx.asserts {
-			n.err = TnNodeError("Error", "ERR_TEST_FAILURE", "plan expected "+strconv.FormatFloat(ctx.planned, 'f', -1, 64)+" assertions but received "+strconv.FormatFloat(ctx.asserts, 'f', -1, 64))
+			n.err = "plan expected " + strconv.FormatFloat(ctx.planned, 'f', -1, 64) + " assertions but received " + strconv.FormatFloat(ctx.asserts, 'f', -1, 64)
 			n.failureType = "testCodeFailure"
 		}
 		tnTestRunning = prev
 	}
-	n.duration = float64(time.Since(start).Nanoseconds()) / 1e6
+	n.duration = tnTestNow() - start
 	switch {
 	case n.skip:
 		n.status = "skip"
@@ -626,23 +792,20 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 		n.status = "fail"
 	default:
 		n.status = "pass"
-		for _, child := range n.children {
-			if child.status == "fail" {
-				n.status = "fail"
-				failed := 0
-				for _, c := range n.children {
-					if c.status == "fail" {
-						failed++
-					}
-				}
-				noun := "subtest"
-				if failed > 1 {
-					noun = "subtests"
-				}
-				n.err = TnNodeError("Error", "ERR_TEST_FAILURE", strconv.Itoa(failed)+" "+noun+" failed")
-				n.failureType = "subtestsFailed"
-				break
+		failed := 0
+		for _, c := range n.children {
+			if c.status == "fail" {
+				failed++
 			}
+		}
+		if failed > 0 {
+			n.status = "fail"
+			noun := "subtest"
+			if failed > 1 {
+				noun = "subtests"
+			}
+			n.err = strconv.Itoa(failed) + " " + noun + " failed"
+			n.failureType = "subtestsFailed"
 		}
 	}
 	if n.suite {
@@ -658,9 +821,6 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 			} else {
 				tnTestCounts["fail"]++
 			}
-			if n.failureType != "subtestsFailed" {
-				tnTestFailures = append(tnTestFailures, n)
-			}
 		case "skip":
 			tnTestCounts["skipped"]++
 		case "todo":
@@ -670,314 +830,69 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 	tnTestReport(n, depth)
 }
 
-// Spec reporter: a parent's ▶ line comes before its first child's output
-func tnTestShowParents(n *TnTestNode) {
-	if !tnTestSpec {
-		return
+// A finished test's events: complete, its subtests' plan, pass / fail, diagnostics
+func tnTestReport(n *TnTestNode, depth int) {
+	tnTestEmit(tnTestEventFor("test:complete", n, depth))
+	if len(n.children) > 0 {
+		tnTestEmit(&TnTestEvent{type_: "test:plan", data: &TnTestEventData{nesting: float64(depth + 1), count: float64(len(n.children)), file: n.file, line: n.line, column: n.column}})
 	}
-	chain := tnTestAncestors(n)
-	for i, p := range chain {
-		if p.parent == nil || p.headerShown {
-			continue
-		}
-		p.headerShown = true
-		fmt.Println(strings.Repeat("  ", i-1) + "\\u25b6 " + p.name)
+	kind := "test:pass"
+	if n.err != nil && !n.skip {
+		kind = "test:fail"
 	}
-}
-
-func tnTestColorize(code string, s string) string {
-	if !tnTestColor {
-		return s
+	tnTestEmit(tnTestEventFor(kind, n, depth))
+	for _, d := range n.diagnostics {
+		tnTestEmit(tnTestNote(depth, d, "info", n))
 	}
-	return "\\x1b[" + code + "m" + s + "\\x1b[39m"
 }
 
 func tnTestDuration(ms float64) string {
 	return strconv.FormatFloat(math.Round(ms*1e6)/1e6, 'f', -1, 64)
 }
 
-func tnTestErrorField(err interface{}, key string) interface{} {
-	if e, ok := err.(*TnError); ok {
-		if key == "message" {
-			return e.message
-		}
-		if key == "code" {
-			if e.code != "" {
-				return e.code
-			}
-		}
-		if key == "name" {
-			return e.Get_name()
-		}
-		return e.prop(key)
-	}
-	if key == "message" {
-		return TnJSString(err)
-	}
-	return nil
-}
-
-func tnTestYamlString(s string, indent string) string {
-	if strings.Contains(s, "\\n") {
-		lines := strings.Split(s, "\\n")
-		for i, l := range lines {
-			lines[i] = indent + "    " + l
-		}
-		return "|-\\n" + strings.Join(lines, "\\n")
-	}
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
-func tnTestReport(n *TnTestNode, depth int) {
-	switch tnTestReporter {
-	case "spec":
-		tnTestReportSpec(n, depth)
-		return
-	case "dot":
-		mark := "."
-		if n.status == "fail" {
-			mark = tnTestColorize("31", "X")
-		}
-		fmt.Print(mark)
-		return
-	case "junit":
-		return
-	}
-	indent := strings.Repeat("    ", depth)
-	if len(n.children) > 0 {
-		fmt.Println(indent + "    1.." + strconv.Itoa(len(n.children)))
-	}
-	number := 1
-	if n.parent != nil {
-		for i, c := range n.parent.children {
-			if c == n {
-				number = i + 1
-			}
-		}
-	}
-	line := "ok"
-	if n.status == "fail" {
-		line = "not ok"
-	}
-	line = indent + line + " " + strconv.Itoa(number) + " - " + n.name
-	switch n.status {
-	case "skip":
-		line += " # SKIP"
-		if n.skipMsg != "" {
-			line += " " + n.skipMsg
-		}
-	case "todo":
-		line += " # TODO"
-		if n.todoMsg != "" {
-			line += " " + n.todoMsg
-		}
-	}
-	fmt.Println(line)
-	fmt.Println(indent + "  ---")
-	fmt.Println(indent + "  duration_ms: " + tnTestDuration(n.duration))
-	kind := "test"
-	if n.suite {
-		kind = "suite"
-	}
-	fmt.Println(indent + "  type: '" + kind + "'")
-	if n.status == "fail" || (n.status == "todo" && n.err != nil) {
-		fmt.Println(indent + "  failureType: '" + n.failureType + "'")
-		msg := TnJSString(tnTestErrorField(n.err, "message"))
-		if e, ok := n.err.(*TnError); ok && e.Get_name() == "AssertionError" && !strings.HasSuffix(msg, "\\n") && strings.Contains(msg, "\\n") {
-			msg += "\\n"
-		}
-		fmt.Println(indent + "  error: " + tnTestYamlString(msg, indent))
-		code, _ := tnTestErrorField(n.err, "code").(string)
-		if code == "" {
-			code = "ERR_TEST_FAILURE"
-		}
-		fmt.Println(indent + "  code: '" + code + "'")
-		if e, isTnErr := n.err.(*TnError); isTnErr && n.failureType == "testCodeFailure" && e.Get_name() == "AssertionError" {
-			fmt.Println(indent + "  name: '" + TnJSString(tnTestErrorField(n.err, "name")) + "'")
-			for _, key := range []string{"expected", "actual", "operator"} {
-				if e, ok := n.err.(*TnError); ok {
-					if v, has := e.props[key]; has {
-						fmt.Println(indent + "  " + key + ": " + TnInspect(v))
-					}
-				}
-			}
-		}
-	}
-	fmt.Println(indent + "  ...")
-	for _, d := range n.diagnostics {
-		fmt.Println(indent + "# " + d)
-	}
-}
-
-func tnTestReportSpec(n *TnTestNode, depth int) {
-	indent := strings.Repeat("  ", depth)
-	dur := " (" + tnTestDuration(n.duration) + "ms)"
-	var line string
-	switch n.status {
-	case "pass":
-		line = tnTestColorize("32", "\\u2714 "+n.name+dur)
-	case "fail":
-		line = tnTestColorize("31", "\\u2716 "+n.name+dur)
-	case "skip":
-		msg := "SKIP"
-		if n.skipMsg != "" {
-			msg = n.skipMsg
-		}
-		line = tnTestColorize("90", "\\ufe63 "+n.name+dur+" # "+msg)
-	case "todo":
-		msg := "TODO"
-		if n.todoMsg != "" {
-			msg = n.todoMsg
-		}
-		mark := "\\u2714 "
-		if n.err != nil {
-			mark = "\\u2716 "
-		}
-		line = tnTestColorize("33", mark+n.name+dur+" # "+msg)
-	}
-	fmt.Println(indent + line)
-	for _, d := range n.diagnostics {
-		fmt.Println(indent + tnTestColorize("34", "\\u2139 "+d))
-	}
-}
-
-// dot: the failures after the line of dots, in the spec reporter's format
-func tnTestFailureLines(n *TnTestNode) {
-	fmt.Println("\\n" + tnTestColorize("31", "\\u2716 "+n.name+" ("+tnTestDuration(n.duration)+"ms)"))
-	name := TnJSString(tnTestErrorField(n.err, "name"))
-	head := name
-	if code, ok := tnTestErrorField(n.err, "code").(string); ok && code != "" {
-		head += " [" + code + "]"
-	}
-	for _, l := range strings.Split(head+": "+TnJSString(tnTestErrorField(n.err, "message")), "\\n") {
-		fmt.Println("  " + l)
-	}
-}
-
-func tnXMLEscape(s string, attr bool) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	if attr {
-		s = strings.ReplaceAll(s, "\\"", "&quot;")
-		s = strings.ReplaceAll(s, "\\n", "")
-	}
-	return s
-}
-
-// junit: Node's layout (testcase / testsuite elements, diagnostics and the
-// counters as comments); failure bodies show the error, without a stack
-func tnTestJunit(n *TnTestNode, depth int) {
-	indent := strings.Repeat("\\t", depth+1)
-	dur := strconv.FormatFloat(n.duration/1000, 'f', 6, 64)
-	if n.suite {
-		tests, failures, skipped := 0, 0, 0
-		for _, c := range n.children {
-			if !c.suite {
-				tests++
-				if c.status == "fail" {
-					failures++
-				}
-				if c.status == "skip" || c.status == "todo" {
-					skipped++
-				}
-			}
-		}
-		host, _ := os.Hostname()
-		fmt.Printf("%s<testsuite name=\\"%s\\" time=\\"%s\\" disabled=\\"0\\" errors=\\"0\\" tests=\\"%d\\" failures=\\"%d\\" skipped=\\"%d\\" hostname=\\"%s\\">\\n", indent, tnXMLEscape(n.name, true), dur, tests, failures, skipped, tnXMLEscape(host, true))
-		for _, c := range n.children {
-			tnTestJunit(c, depth+1)
-		}
-		fmt.Println(indent + "</testsuite>")
-	} else {
-		open := fmt.Sprintf("%s<testcase name=\\"%s\\" time=\\"%s\\" classname=\\"test\\"", indent, tnXMLEscape(n.name, true), dur)
-		switch {
-		case n.status == "fail":
-			msg := tnXMLEscape(TnJSString(tnTestErrorField(n.err, "message")), true)
-			fmt.Printf("%s failure=\\"%s\\">\\n", open, msg)
-			fmt.Printf("%s\\t<failure type=\\"%s\\" message=\\"%s\\">\\n", indent, n.failureType, msg)
-			// Node wraps the error in an ERR_TEST_FAILURE whose cause it is
-			cause := strings.ReplaceAll(TnInspect(n.err), "\\n", "\\n  ")
-			raw := strings.TrimSuffix(TnJSString(tnTestErrorField(n.err, "message")), "\\n")
-			fmt.Println(tnXMLEscape("[Error [ERR_TEST_FAILURE]: "+raw+"\\n] {\\n  code: 'ERR_TEST_FAILURE',\\n  failureType: '"+n.failureType+"',\\n  cause: "+cause+"\\n}", false))
-			fmt.Println(indent + "\\t</failure>")
-			fmt.Println(indent + "</testcase>")
-		case n.status == "skip" || n.status == "todo":
-			kind := "skipped"
-			msg := n.skipMsg
-			if n.status == "todo" {
-				kind, msg = "todo", n.todoMsg
-			}
-			if msg == "" {
-				msg = "true"
-			}
-			fmt.Println(open + ">")
-			fmt.Printf("%s\\t<skipped type=\\"%s\\" message=\\"%s\\"/>\\n", indent, kind, tnXMLEscape(msg, true))
-			fmt.Println(indent + "</testcase>")
-		default:
-			fmt.Println(open + "/>")
-		}
-		for _, c := range n.children {
-			tnTestJunit(c, depth+1)
-		}
-	}
-	for _, d := range n.diagnostics {
-		fmt.Println(indent + "<!-- " + d + " -->")
-	}
-}
-
+// The root's report: the plan, the counters as diagnostics, coverage, the summary
 func tnTestFinish() {
+	cfg := tnTestFilters()
+	duration := tnTestNow() - tnTestStart
 	stats := []string{"tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"}
-	duration := "duration_ms " + tnTestDuration(float64(time.Since(tnTestStart).Nanoseconds())/1e6)
-	switch tnTestReporter {
-	case "dot":
-		fmt.Println()
-		if len(tnTestFailures) > 0 {
-			fmt.Println("\\n" + tnTestColorize("31", "Failed tests:"))
-			for _, n := range tnTestFailures {
-				tnTestFailureLines(n)
-			}
-		}
-		tnTestExitCode()
-		return
-	case "junit":
-		for _, n := range tnTestRoot.children {
-			tnTestJunit(n, 0)
-		}
+	if tnTestChildSink == nil {
+		tnTestEmit(&TnTestEvent{type_: "test:plan", data: &TnTestEventData{count: float64(len(tnTestRoot.children))}})
 		for _, key := range stats {
-			fmt.Println("\\t<!-- " + key + " " + strconv.Itoa(tnTestCounts[key]) + " -->")
+			tnTestEmit(tnTestNote(0, key+" "+strconv.Itoa(tnTestCounts[key]), "info", nil))
 		}
-		fmt.Println("\\t<!-- " + duration + " -->")
-		fmt.Println("</testsuites>")
-		tnTestExitCode()
-		return
+		tnTestEmit(tnTestNote(0, "duration_ms "+tnTestDuration(duration), "info", nil))
 	}
-	if tnTestTap {
-		fmt.Println("1.." + strconv.Itoa(len(tnTestRoot.children)))
-	}
-	for _, key := range stats {
-		line := key + " " + strconv.Itoa(tnTestCounts[key])
-		if tnTestSpec {
-			fmt.Println(tnTestColorize("34", "\\u2139 "+line))
-		} else {
-			fmt.Println("# " + line)
-		}
-	}
-	if tnTestSpec {
-		fmt.Println(tnTestColorize("34", "\\u2139 "+duration))
-		if len(tnTestFailures) > 0 {
-			fmt.Println("\\n" + tnTestColorize("31", "\\u2716 failing tests:"))
-			for _, n := range tnTestFailures {
-				tnTestFailureLines(n)
+	success := tnTestCounts["fail"] == 0 && tnTestCounts["cancelled"] == 0
+	if cfg.coverage && tnTestCoverage != nil {
+		if summary := tnTestCoverage(cfg); summary != nil {
+			totals := map[string]float64{"line": summary.totals.coveredLinePercent, "branch": summary.totals.coveredBranchPercent, "function": summary.totals.coveredFunctionPercent}
+			for _, kind := range []string{"lines", "branches", "functions"} {
+				threshold, set := cfg.thresholds[kind]
+				name := map[string]string{"lines": "line", "branches": "branch", "functions": "function"}[kind]
+				if set && totals[name] < threshold {
+					success = false
+					tnTestEmit(tnTestNote(0, "Error: "+strconv.FormatFloat(totals[name], 'f', 2, 64)+"% "+name+" coverage does not meet threshold of "+TnNumStr(threshold)+"%.", "error", nil))
+				}
 			}
+			tnTestEmit(&TnTestEvent{type_: "test:coverage", data: &TnTestEventData{summary: summary}})
 		}
-	} else {
-		fmt.Println("# " + duration)
 	}
-	tnTestExitCode()
-}
-
-func tnTestExitCode() {
-	if tnTestCounts["fail"] > 0 || tnTestCounts["cancelled"] > 0 {
+	if tnTestSnapshotsDone != nil {
+		tnTestSnapshotsDone()
+	}
+	counts := &TnTestCounts{
+		tests: float64(tnTestCounts["tests"]), failed: float64(tnTestCounts["fail"]), passed: float64(tnTestCounts["pass"]),
+		cancelled: float64(tnTestCounts["cancelled"]), skipped: float64(tnTestCounts["skipped"]), todo: float64(tnTestCounts["todo"]),
+		topLevel: float64(len(tnTestRoot.children)), suites: float64(tnTestCounts["suites"]),
+	}
+	tnTestEmit(&TnTestEvent{type_: "test:summary", data: &TnTestEventData{success: success, counts: counts, duration_ms: math.Round(duration*1e6) / 1e6}})
+	for _, s := range tnTestSinks {
+		s.write(s.reporter.end())
+		if s.file {
+			s.out.Close()
+		}
+	}
+	if !success {
 		TnSetExitCode(1)
 	}
 }
@@ -998,6 +913,8 @@ type TnMockFunctionContext struct {
 	impl     interface{}
 	original interface{}
 	once     map[int]interface{}
+	// mock.method & co.: puts the original back where the mock was
+	unmock func()
 }
 
 func (m *TnMockFunctionContext) Get_calls() []*TnMockCall { return m.calls }
@@ -1011,7 +928,13 @@ func (m *TnMockFunctionContext) mockImplementationOnce(fn interface{}, onCall ..
 	}
 	m.once[index] = fn
 }
-func (m *TnMockFunctionContext) restore() { m.impl = m.original }
+func (m *TnMockFunctionContext) restore() {
+	m.impl = m.original
+	if m.unmock != nil {
+		m.unmock()
+		m.unmock = nil
+	}
+}
 
 var tnMocks = map[uintptr]*TnMockFunctionContext{}
 
@@ -1237,6 +1160,134 @@ func TnMockFnEmpty(tracker *TnMockTracker) func(...interface{}) interface{} {
 	return TnMockFn(tracker, func(args ...interface{}) interface{} { return nil })
 }
 
+// The implementation argument of mock.method / getter / setter (options objects aside)
+func tnMockImplementation(rest []interface{}) interface{} {
+	for _, r := range rest {
+		if tnTestIsFunc(r) {
+			return r
+		}
+	}
+	return nil
+}
+
+func tnMockNotAMethod(name string) *TnError {
+	return TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'methodName' must be a method. Received '"+name+"'")
+}
+
+// mock.method(object, name, implementation?) on a function-valued field (an
+// object literal's method or accessor): the field holds the mock until restore()
+func TnMockMethod[F any](tracker *TnMockTracker, name string, slot *F, rest ...interface{}) F {
+	original := *slot
+	if !tnTestIsFunc(original) {
+		panic(tnMockNotAMethod(name))
+	}
+	fn := TnMockFn(tracker, original)
+	ctx := tnMocks[tnFuncID(fn)]
+	if impl := tnMockImplementation(rest); impl != nil {
+		ctx.impl = impl
+	}
+	*slot = fn
+	ctx.unmock = func() { *slot = original }
+	return fn
+}
+
+// mock.method on a class instance: the method's override slot holds the mock
+// (the method calls it while it is set); original is the method's own body
+func TnMockSlot[F any](tracker *TnMockTracker, slot *F, original F, rest ...interface{}) F {
+	fn := TnMockFn(tracker, original)
+	ctx := tnMocks[tnFuncID(fn)]
+	if impl := tnMockImplementation(rest); impl != nil {
+		ctx.impl = impl
+	}
+	*slot = fn
+	ctx.unmock = func() {
+		var none F
+		*slot = none
+	}
+	return fn
+}
+
+// mock.method(console, 'log') & co.: calls of a namespace's function check
+// for a mock by name (TnMockedCall)
+var tnMockedGlobals = map[string]*TnMockFunctionContext{}
+
+func TnMockGlobal(tracker *TnMockTracker, key string, rest ...interface{}) func(...interface{}) interface{} {
+	ctx := &TnMockFunctionContext{once: map[int]interface{}{}, impl: tnMockImplementation(rest)}
+	tracker.mocks = append(tracker.mocks, ctx)
+	tnMockedGlobals[key] = ctx
+	ctx.unmock = func() {
+		if tnMockedGlobals[key] == ctx {
+			delete(tnMockedGlobals, key)
+		}
+	}
+	fn := func(args ...interface{}) interface{} {
+		return tnMockedCallVia(ctx, args, func() interface{} { return nil })
+	}
+	tnMocks[tnFuncID(fn)] = ctx
+	return fn
+}
+
+func tnMockedCallVia(ctx *TnMockFunctionContext, args []interface{}, original func() interface{}) interface{} {
+	call := &TnMockCall{arguments: args}
+	impl := ctx.impl
+	if once, ok := ctx.once[len(ctx.calls)]; ok {
+		impl = once
+		delete(ctx.once, len(ctx.calls))
+	}
+	ctx.calls = append(ctx.calls, call)
+	defer func() {
+		if r := recover(); r != nil {
+			call.error_ = r
+			panic(r)
+		}
+	}()
+	var result interface{}
+	if impl == nil {
+		result = original()
+	} else {
+		result = TnInvoke(impl, args...)
+	}
+	call.result = result
+	return result
+}
+
+// A call of a namespace function that a mock may replace (args evaluate only then)
+func TnMockedCall[R any](key string, args func() []interface{}, original func() R) R {
+	ctx, mocked := tnMockedGlobals[key]
+	if !mocked {
+		return original()
+	}
+	result := tnMockedCallVia(ctx, args(), func() interface{} { return original() })
+	if r, ok := result.(R); ok {
+		return r
+	}
+	var zero R
+	if result == nil {
+		return zero
+	}
+	return tnInvokeArg(result, reflect.TypeOf(&zero).Elem()).Interface().(R)
+}
+
+func TnMockedCallVoid(key string, args func() []interface{}, original func()) {
+	ctx, mocked := tnMockedGlobals[key]
+	if !mocked {
+		original()
+		return
+	}
+	tnMockedCallVia(ctx, args(), func() interface{} {
+		original()
+		return nil
+	})
+}
+
+// console.log.mock: the record of a namespace function's mock
+func TnMockedContext(key string) *TnMockFunctionContext {
+	if ctx, ok := tnMockedGlobals[key]; ok {
+		return ctx
+	}
+	panic(TnNodeError("TypeError", "", "not a mock function"))
+}
+
 // fn.mock: the call record of a mock function
 func TnMockOf(fn interface{}) *TnMockFunctionContext {
 	if ctx, ok := tnMocks[tnFuncID(fn)]; ok {
@@ -1261,6 +1312,220 @@ func (t *TnMockTracker) restoreAll() {
 	}
 }`;
 
+const snapshotHelper = `// node:test snapshots: t.assert.snapshot (one <test file>.snapshot file per
+// test file, Node's format) and t.assert.fileSnapshot; --test-update-snapshots
+// writes them, otherwise they are compared
+const tnSnapshotTip = "Missing snapshots can be generated by rerunning the command with the --test-update-snapshots flag."
+
+type tnSnapshotFile struct {
+	path      string
+	snapshots map[string]string
+	counts    map[string]int
+	loaded    bool
+}
+
+var tnSnapshotFiles = map[string]*tnSnapshotFile{}
+var tnSnapshotOrder []*tnSnapshotFile
+var tnSnapshotSerializers []interface{}
+var tnSnapshotResolve interface{}
+
+func init() {
+	tnTestSnapshotsDone = tnSnapshotWriteAll
+}
+
+// snapshot.setDefaultSnapshotSerializers / setResolveSnapshotPath
+func TnSetDefaultSnapshotSerializers(list interface{}) { tnSnapshotSerializers = tnTestList(list) }
+func TnSetResolveSnapshotPath(fn interface{})          { tnSnapshotResolve = fn }
+
+func tnSnapshotEscape(s string) string {
+	s = strings.ReplaceAll(s, "\\\\", "\\\\\\\\")
+	s = strings.ReplaceAll(s, "\`", "\\\\\`")
+	return strings.ReplaceAll(s, "\${", "\\\\\${")
+}
+
+func tnSnapshotUnescape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func tnSnapshotState(msg string, file string) *TnError {
+	e := tnMockTimersState(msg)
+	e.props["filename"] = file
+	return e
+}
+
+func tnSnapshotFor(testFile string) *tnSnapshotFile {
+	if f, ok := tnSnapshotFiles[testFile]; ok {
+		return f
+	}
+	path := testFile + ".snapshot"
+	if tnSnapshotResolve != nil {
+		resolved, ok := TnInvoke(tnSnapshotResolve, testFile).(string)
+		if !ok {
+			panic(tnSnapshotState("Invalid snapshot filename.", ""))
+		}
+		path = resolved
+	}
+	f := &tnSnapshotFile{path: path, snapshots: map[string]string{}, counts: map[string]int{}, loaded: tnTestFilters().updateSnapshots}
+	tnSnapshotFiles[testFile] = f
+	tnSnapshotOrder = append(tnSnapshotOrder, f)
+	return f
+}
+
+func (f *tnSnapshotFile) nextID(name string) string {
+	count := f.counts[name]
+	if count == 0 {
+		count = 1
+	}
+	f.counts[name] = count + 1
+	return name + " " + strconv.Itoa(count)
+}
+
+// exports[\`name 1\`] = \`value\`; entries, keeping the values escaped as written
+func tnSnapshotParse(src string) (map[string]string, bool) {
+	out := map[string]string{}
+	i := 0
+	literal := func() (string, bool) {
+		start := i
+		for i < len(src) {
+			switch src[i] {
+			case '\\\\':
+				i += 2
+				continue
+			case '\`':
+				text := src[start:i]
+				i++
+				return text, true
+			}
+			i++
+		}
+		return "", false
+	}
+	for {
+		at := strings.Index(src[i:], "exports[\`")
+		if at < 0 {
+			return out, true
+		}
+		i += at + len("exports[\`")
+		key, ok := literal()
+		if !ok || !strings.HasPrefix(src[i:], "] = \`") {
+			return nil, false
+		}
+		i += len("] = \`")
+		value, ok := literal()
+		if !ok {
+			return nil, false
+		}
+		out[tnSnapshotUnescape(key)] = value
+	}
+}
+
+func (f *tnSnapshotFile) read() {
+	if f.loaded {
+		return
+	}
+	data, err := os.ReadFile(f.path)
+	msg := "Cannot read snapshot file '" + f.path + ".'"
+	if err != nil {
+		if os.IsNotExist(err) {
+			msg += " " + tnSnapshotTip
+		}
+		panic(tnSnapshotState(msg, f.path))
+	}
+	snapshots, ok := tnSnapshotParse(string(data))
+	if !ok {
+		panic(tnSnapshotState(msg, f.path))
+	}
+	f.snapshots = snapshots
+	f.loaded = true
+}
+
+// The serializers (default: JSON.stringify(value, null, 2)), then String()
+func tnSnapshotSerialize(value interface{}, options []interface{}) string {
+	serializers := tnSnapshotSerializers
+	if len(options) > 0 && options[0] != nil {
+		if list := TnGet(options[0], "serializers"); list != nil {
+			serializers = tnTestList(list)
+		}
+	}
+	if len(serializers) == 0 {
+		return TnJSONStringify(value, "  ")
+	}
+	for _, fn := range serializers {
+		value = TnInvoke(fn, value)
+	}
+	return tnTestStr(value)
+}
+
+func (a *TnTestAssert) snapshot(value interface{}, options ...interface{}) {
+	a.ctx.asserts++
+	file := tnSnapshotFor(a.ctx.Get_filePath())
+	serialized := "\\n" + tnSnapshotEscape(tnSnapshotSerialize(value, options)) + "\\n"
+	id := file.nextID(a.ctx.Get_fullName())
+	if tnTestFilters().updateSnapshots {
+		file.snapshots[id] = serialized
+		return
+	}
+	file.read()
+	expected, ok := file.snapshots[id]
+	if !ok {
+		e := tnSnapshotState("Snapshot '"+id+"' not found in '"+file.path+".' "+tnSnapshotTip, file.path)
+		e.props["snapshot"] = id
+		panic(e)
+	}
+	TnAssertStrictEqual(serialized, expected)
+}
+
+func (a *TnTestAssert) fileSnapshot(value interface{}, path string, options ...interface{}) {
+	a.ctx.asserts++
+	serialized := tnSnapshotSerialize(value, options)
+	if tnTestFilters().updateSnapshots {
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(serialized), 0o644); err != nil {
+			panic(tnSnapshotState("Cannot write snapshot file '"+path+".'", path))
+		}
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		msg := "Cannot read snapshot file '" + path + ".'"
+		if os.IsNotExist(err) {
+			msg += " " + tnSnapshotTip
+		}
+		panic(tnSnapshotState(msg, path))
+	}
+	TnAssertStrictEqual(serialized, string(data))
+}
+
+// --test-update-snapshots: each snapshot file, its entries sorted by name
+func tnSnapshotWriteAll() {
+	if !tnTestFilters().updateSnapshots {
+		return
+	}
+	for _, f := range tnSnapshotOrder {
+		keys := make([]string, 0, len(f.snapshots))
+		for k := range f.snapshots {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		entries := make([]string, len(keys))
+		for i, k := range keys {
+			entries[i] = "exports[\`" + tnSnapshotEscape(k) + "\`] = \`" + f.snapshots[k] + "\`;\\n"
+		}
+		os.MkdirAll(filepath.Dir(f.path), 0o755)
+		if err := os.WriteFile(f.path, []byte(strings.Join(entries, "\\n")), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "Cannot write snapshot file '"+f.path+".'")
+			TnSetExitCode(1)
+		}
+	}
+}`;
+
 function eventFn(nodes: any[]): string[] {
   void nodes;
   return ['*TnTestContext', 'func(...interface{})'];
@@ -1271,11 +1536,20 @@ export function registerTest(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeTest',
-    ['fmt', 'math', 'os', 'reflect', 'regexp', 'strconv', 'strings', 'time'],
-    ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error', 'timerWait', 'clock'],
+    ['fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'time'],
+    ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'],
     testHelper
   );
+  defineHelper(r, 'nodeTestSnapshot', ['fmt', 'os', 'path/filepath', 'sort', 'strconv', 'strings'], ['nodeTest', 'nodeAssert', 'jsonStringify'], snapshotHelper);
+  registerTestReporters(r);
+  registerTestRun(r);
+  registerTestCoverage(r);
   const use = () => r.helper('nodeTest');
+  // "file", line, column of a test() call: where Node's reports point
+  const site = (c: NodeCall): string => {
+    const position = r.callSite(c.site);
+    return `${JSON.stringify(position.file)}, ${position.line}, ${position.column}`;
+  };
   defineClass(
     r,
     'test.TestContext',
@@ -1286,11 +1560,21 @@ export function registerTest(r: NodeRegistry): void {
     'name=string; fullName=string; mock=*TnMockTracker; signal=*TnAbortSignal; filePath=string; assert=*TnTestAssert',
     ''
   );
+  r.methods['test.TestContext#test'] = (c: NodeCall) => {
+    use();
+    return `${c.recv}.test(${site(c)}${c.args.length > 0 ? ', ' : ''}${c.args.join(', ')})`;
+  };
   r.classes['test.SuiteContext'] = r.classes['test.TestContext'];
   defineClass(r, 'test.MockTracker', '*TnMockTracker', 'class', 'reset=; restoreAll=', '', 'timers=*TnMockTimers', '');
   defineClass(r, 'test.MockTimers', '*TnMockTimers', 'class', 'enable=; tick=; runAll=; setTime=; reset=', '', '', '');
   // t.assert.x(...): node:assert's x, counted for t.plan()
-  defineClass(r, 'test.TestContextAssert', '*TnTestAssert', 'class', '', '', '', '');
+  defineClass(r, 'test.TestContextAssert', '*TnTestAssert', 'class', 'snapshot=; fileSnapshot=', '', '', '');
+  for (const name of ['snapshot', 'fileSnapshot']) {
+    r.methods[`test.TestContextAssert#${name}`] = (c: NodeCall) => {
+      r.helper('nodeTestSnapshot');
+      return `${c.recv}.${name}(${c.args.join(', ')})`;
+    };
+  }
   const assertNames = ['ok', 'equal', 'notEqual', 'strictEqual', 'notStrictEqual', 'deepEqual', 'notDeepEqual', 'deepStrictEqual', 'notDeepStrictEqual', 'throws', 'doesNotThrow', 'rejects', 'doesNotReject', 'match', 'doesNotMatch', 'fail', 'ifError'];
   for (const name of assertNames) {
     const key = `test.TestContextAssert#${name}`;
@@ -1321,7 +1605,7 @@ export function registerTest(r: NodeRegistry): void {
   const register = (name: string, goFn: string, variant: string) => {
     r.functions[`test.${name}`] = (c: NodeCall) => {
       use();
-      return `${goFn}(${JSON.stringify(variant)}${c.args.length > 0 ? ', ' : ''}${c.args.join(', ')})`;
+      return `${goFn}(${JSON.stringify(variant)}, ${site(c)}${c.args.length > 0 ? ', ' : ''}${c.args.join(', ')})`;
     };
     r.results[`test.${name}`] = 'chan struct{}';
     r.paramTypers[`test.${name}`] = eventFn;
@@ -1351,6 +1635,19 @@ export function registerTest(r: NodeRegistry): void {
     r.paramTypers[`test.${hook}`] = eventFn;
   }
 
+  // snapshot.setDefaultSnapshotSerializers / setResolveSnapshotPath
+  r.namespaces['test.default.snapshot'] = 'test.snapshot';
+  r.objects['test.snapshot'] = true;
+  r.functions['test.snapshot.setDefaultSnapshotSerializers'] = (c: NodeCall) => {
+    r.helper('nodeTestSnapshot');
+    return `TnSetDefaultSnapshotSerializers(${c.args[0]})`;
+  };
+  r.functions['test.snapshot.setResolveSnapshotPath'] = (c: NodeCall) => {
+    r.helper('nodeTestSnapshot');
+    return `TnSetResolveSnapshotPath(${c.args[0]})`;
+  };
+  r.paramTypers['test.snapshot.setResolveSnapshotPath'] = (_n: any[]) => ['string'];
+
   // mock.fn(original?, implementation?) / t.mock.fn(...)
   r.values['test.mock'] = (_c: NodeCall) => {
     use();
@@ -1368,6 +1665,19 @@ export function registerTest(r: NodeRegistry): void {
     return `TnMockFn(TnMock, ${c.args.join(', ')})`;
   };
   r.typers['test.mock.fn'] = (c: NodeCall) => (c.nodes.length === 0 || !c.types[0] ? 'func(...interface{}) interface{}' : c.types[0]);
+  // mock.method(object, name, implementation?, options?) / getter / setter
+  for (const kind of ['method', 'getter', 'setter']) {
+    r.methods[`test.MockTracker#${kind}`] = (c: NodeCall) => {
+      use();
+      return r.mockMember(c, c.recv, kind);
+    };
+    r.functions[`test.mock.${kind}`] = (c: NodeCall) => {
+      use();
+      return r.mockMember(c, 'TnMock', kind);
+    };
+    r.typers[`test.MockTracker#${kind}`] = (c: NodeCall) => r.mockMemberType(c, kind);
+    r.typers[`test.mock.${kind}`] = r.typers[`test.MockTracker#${kind}`];
+  }
   for (const method of ['reset', 'restoreAll']) {
     r.functions[`test.mock.${method}`] = (_c: NodeCall) => {
       use();

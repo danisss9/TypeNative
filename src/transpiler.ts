@@ -1,4 +1,4 @@
-import { createNodeRegistry, NodeCall, NodeRegistry } from './node/registry.js';
+import { createNodeRegistry, NodeCall, NodeRegistry, SourcePosition } from './node/registry.js';
 import { registerPath } from './node/path.js';
 import { registerFs } from './node/fs.js';
 import { registerUrl } from './node/url.js';
@@ -500,7 +500,10 @@ function isFieldNameIdentifier(node: AstNode): boolean {
     isPropertyAccessExpression(parent) ||
     isPropertyAssignment(parent) ||
     isPropertySignature(parent) ||
-    isPropertyDeclaration(parent)
+    isPropertyDeclaration(parent) ||
+    // Method names live in the receiver's scope, like fields: `copy()` shadows nothing
+    isMethodDeclaration(parent) ||
+    isMethodSignature(parent)
   );
 }
 const variableTypes = new Map<string, string>();
@@ -1155,6 +1158,9 @@ export type TranspileOptions = {
   goFile?: string;
   // GOOS the program is built for (default 'linux'): picks OS-specific helpers
   goos?: string;
+  // the absolute directory relative file names are relative to (forward
+  // slashes): node:test reports, snapshots and coverage name files absolutely
+  cwd?: string;
 };
 
 // GOOS of the current transpilation (see platformHelper)
@@ -1192,7 +1198,19 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   asyncFunctionNames.clear();
   generatorFunctionNames.clear();
   currentFileDir = null;
+  sourceRoot = options?.cwd ?? '';
+  mockedCallKeys.clear();
+  mockedMemberNames.clear();
+  structGetterFields.clear();
+  structMethodFields.clear();
+  // Programs that import node:test count what runs, for --experimental-test-coverage
+  coverageOn = /['"]node:test['"]/.test(code);
+  coverageCounters = 0;
+  coverageEmitted.clear();
+  coverageFiles.length = 0;
   const sourceFile = parseSource(code);
+  collectMockTargets(sourceFile);
+  instrumentCoverage(sourceFile, code);
   importedPackages.clear();
   goSideEffectImports.clear();
   outsideNodes = [];
@@ -1253,7 +1271,8 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   // (a method's result type, a param type needing no conversion) would be
   // unused imports, which Go rejects.
   const emitted = stripEmbedDirectives(stripGoStrings(`${mainCode}\n${outsideCode}\n${packageVariables.join('\n')}`));
-  const helpersCode = emitGoHelpers();
+  const coverageCode = coverageFiles.length > 0 ? `\n\n${coverageTables()}` : '';
+  const helpersCode = emitGoHelpers() + coverageCode;
   const mainImports = [...importedPackages].filter((pkg) => {
     if (!hasGoPackage(pkg)) return true;
     const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop()!;
@@ -1270,9 +1289,10 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
       : goImportLine(pkg);
   // process.on('uncaughtException'): a throw in the top-level code is handed to it too
   // With second entry points, TN_ENTRY runs one of them instead of the program
+  const mainBody = `${coverageLoaded(sourceFile)}${mainCode.trim()}`;
   const programCode = usedHelpers.has('entryPoints')
-    ? `if __entry := tnEntryPoints[tnCurrentEntry]; __entry != nil {\n\t__entry()\n\t} else {\n\t${mainCode.trim()}\n\t}`
-    : mainCode.trim();
+    ? `if __entry := tnEntryPoints[tnCurrentEntry]; __entry != nil {\n\t__entry()\n\t} else {\n\t${mainBody}\n\t}`
+    : mainBody;
   const body = usedHelpers.has('nodeUncaught') ? `func() {\n\tdefer TnMainRecover()\n\t${programCode}\n\t}()` : programCode;
   const main = `${GENERATED_HEADER}
 
@@ -1334,7 +1354,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
 
   if (isSourceFile(node)) {
     return (node.statements ?? [])
-      .map((n) => withLineMarker(n, visit(n, { addFunctionOutside: true })))
+      .map((n) => withLineMarker(n, visit(n, { addFunctionOutside: true })) + coverageAfter(n))
       .filter((n) => !!n)
       .join(options.inline ? '' : '\n\t');
   } else if (isJsxNode(node)) {
@@ -1451,7 +1471,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     return `[]${type} {${(node.elements ?? []).map((e) => visit(e)).join(', ')}}`;
   } else if (isBlock(node)) {
-    return `{\n\t\t${options.prefixBlockContent ?? ''}${visitBlockStatements(
+    return `{\n\t\t${coverageEnter(node)}${options.prefixBlockContent ?? ''}${visitBlockStatements(
       node.statements ?? []
     )}${options.extraBlockContent ?? ''}${fallbackReturn(node)}}${options.inline ? '' : '\n\t'}`;
   } else if (isElementAccessExpression(node)) {
@@ -1520,7 +1540,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isPropertyAccessExpression(node)) {
     if (isMockAccess(node)) {
       nodeRegistry.helper('nodeTest');
-      return `TnMockOf(${visit(node.expression)})`;
+      return visitMockAccess(node);
     }
     if (isProcessEnv(node.expression) && !isCallee(node) && !isAssignmentTarget(node)) {
       useHelper('getenv');
@@ -1589,8 +1609,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     if (isIdentifier(node.expression)) {
       const memberName = memberKey(node.name);
       const owner = staticMemberOwner(node.expression.text, memberName);
-      // the declaration's name (Go builtins such as `make` are renamed)
-      if (owner) return `${owner}_${node.name.kind === 'PrivateIdentifier' ? visit(node.name) : getSafeName(memberName)}`;
+      // the declaration's name (member names only rename Go keywords)
+      if (owner) return `${owner}_${node.name.kind === 'PrivateIdentifier' ? visit(node.name) : goFieldName(memberName)}`;
     }
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
@@ -1608,7 +1628,11 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       !isCallee(node) &&
       getStructFieldGoType(leftGoType.replace(/^\*/, ''), node.name.text)?.startsWith('func')
     ) {
-      return `${leftSide}.${rightSide}()`;
+      // Getters invoke on read; a method read is the function value itself
+      if (!isStructMethodField(leftGoType, node.name.text) || isStructGetterField(leftGoType, node.name.text)) {
+        return `${leftSide}.${rightSide}()`;
+      }
+      return `${leftSide}.${rightSide}`;
     }
     // Class getter reads are accessor calls: c.v → c.Get_v()
     if (
@@ -1679,6 +1703,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         const defaultVal = el.initializer;
         if (!defaultVal && classGetterMethods.has(`${structName}.${propName}`)) {
           parts.push(`${localName} := (${initExpr}).Get_${goFieldName(propName)}()`);
+        } else if (!defaultVal && isStructGetterField(structName, propName)) {
+          parts.push(`${localName} := (${initExpr}).${goFieldName(propName)}()`);
         } else if (defaultVal) {
           // Missing property (nil) takes the default
           const defType = inferExpressionType(defaultVal) ?? fieldType ?? 'interface{}';
@@ -1893,6 +1919,8 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       type === ':' ? '' : ' '
     }${initializer}`;
   } else if (isCallExpression(node)) {
+    const mockableCall = visitMockableCall(node);
+    if (mockableCall !== undefined) return mockableCall;
     if (
       hasQuestionDot(node) ||
       (isPropertyAccessExpression(node.expression) && hasQuestionDot(node.expression))
@@ -2582,12 +2610,12 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         lastCaseStatement.kind === 'ContinueStatement');
     const isFallThrough =
       !caseStatements.some((c) => isBreakStatement(c)) && !endsInJump && siblingClauses[siblingClauses.length - 1] !== node;
-    return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${(node.statements ?? [])
+    return `case ${visit(node.expression, { inline: true })}: \n\t\t\t${coverageEnter(node)}${(node.statements ?? [])
       .filter((n) => !isBreakStatement(n))
       .map((s) => visit(s))
       .join('')}${isFallThrough ? 'fallthrough\n\t' : ''}`;
   } else if (isDefaultClause(node)) {
-    return `default: \n\t\t\t${(node.statements ?? [])
+    return `default: \n\t\t\t${coverageEnter(node)}${(node.statements ?? [])
       .filter((n) => !isBreakStatement(n))
       .map((s) => visit(s))
       .join('')}`;
@@ -2733,7 +2761,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
     const inferredRetType = inferFunctionBodyReturnType(node);
     const returnType = inferredRetType ? ` ${inferredRetType}` : '';
     if (parameterInfo.prefixBlockContent && !isBlock(node.body)) {
-      return `func(${parameterInfo.signature})${returnType} {\n\t\t${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
+      return `func(${parameterInfo.signature})${returnType} {\n\t\t${coverageEnter(node)}${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
     }
     if (!isBlock(node.body)) {
       // void-style calls (console.*, assert) emit statements, not values
@@ -2741,9 +2769,9 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
         // `(c) => (body += c)`: the parenthesized expression is a statement
         let statement: AstNode = node.body;
         while (statement.kind === 'ParenthesizedExpression') statement = statement.expression;
-        return `func(${parameterInfo.signature})${returnType} { ${visit(statement)}; }`;
+        return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}${visit(statement)}; }`;
       }
-      return `func(${parameterInfo.signature})${returnType} { return ${visit(node.body as AstNode)}; }`;
+      return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}return ${visit(node.body as AstNode)}; }`;
     }
     return `func(${parameterInfo.signature})${returnType} ${visit(node.body, {
       prefixBlockContent: parameterInfo.prefixBlockContent
@@ -3008,6 +3036,9 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       fields.push(`\t${goFieldName(param.name.text)} ${getParameterGoType(param)}`);
     }
 
+    // fields of the methods mock.method may replace (see emitMockableMethod)
+    const mockSlots: string[] = [];
+    if (mockedMemberNames.size > 0) fields.push(MOCK_SLOTS_MARK);
     let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\n`;
 
     const ctor = (node.members ?? []).find((m) => isConstructorDeclaration(m)) as
@@ -3045,7 +3076,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
           ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, [])}\n\t\t`
           : '';
       const leadingInit = superCalledInCtor ? '' : `${parentInit}${instanceInit}`;
-      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${leadingInit}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
+      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${coverageEnter(ctor.body)}${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${leadingInit}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
       result += emitConstructor(name, typeParams, typeParamNames, ctorParameterInfo.signature, ctorBody);
     } else if (extendsError) {
       // class X extends Error {} — the constructor takes the message
@@ -3112,7 +3143,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
             const accessorKey = `${isGetAccessor(member) ? 'get' : 'set'}:${memberKey(member.name)}`;
             if (ownAccessorKeys.has(accessorKey)) continue;
             ownAccessorKeys.add(accessorKey);
-            copiedMethods.push(emitAccessor(member, `${name}${typeParamNames}`));
+            copiedMethods.push(emitAccessor(member, `${name}${typeParamNames}`, mockSlots));
             continue;
           }
           if (!isMethodDeclaration(member)) continue;
@@ -3123,12 +3154,13 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
             memberKey(member.name);
           if (!methodName || ownMethodNames.has(methodName)) continue;
           ownMethodNames.add(methodName);
+          const goMethodName = goFieldName(methodName);
           if (getDecorators(member).length > 0) {
             copiedMethods.push(emitDecoratedMethod(name, typeParamNames, member, visit(ancestor.name)));
             continue;
           }
           if ((member.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) {
-            copiedMethods.push(`${lineMarker(member)}${emitChannelFunction(member, true, `func (self *${name}${typeParamNames}) ${methodName}`)}\n`);
+            copiedMethods.push(`${lineMarker(member)}${emitChannelFunction(member, true, `func (self *${name}${typeParamNames}) ${goMethodName}`)}\n`);
             continue;
           }
           const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
@@ -3138,11 +3170,15 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
             inheritedReturnType = `*${name}${typeParamNames}`;
           }
           const returnType = inheritedReturnType ? ` ${inheritedReturnType}` : '';
+          const copiedBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
+          const copiedSlotKey = mockSlotKey('method', methodName);
+          const copiedMockable = mockedMemberNames.has(copiedSlotKey)
+            ? emitMockableMethod(`${name}${typeParamNames}`, goMethodName, copiedSlotKey, methodParameterInfo.signature, returnType, copiedBody, mockSlots)
+            : '';
           copiedMethods.push(
-            `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
-              member.body,
-              { prefixBlockContent: methodParameterInfo.prefixBlockContent }
-            )}\n`
+            copiedMockable
+              ? `${lineMarker(member)}${copiedMockable}\n`
+              : `${lineMarker(member)}func (self *${name}${typeParamNames}) ${goMethodName}(${methodParameterInfo.signature})${returnType} ${copiedBody}\n`
           );
         }
         ancestorIndex--;
@@ -3205,13 +3241,17 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
             { prefixBlockContent: methodParameterInfo.prefixBlockContent }
           )}\n\n`;
         } else {
-          result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${visit(
-            member.body!,
-            { prefixBlockContent: methodParameterInfo.prefixBlockContent }
-          )}\n\n`;
+          const body = visit(member.body!, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
+          const slotKey = mockSlotKey('method', memberKey(member.name) ?? methodName);
+          const mockable = mockedMemberNames.has(slotKey)
+            ? emitMockableMethod(`${name}${typeParamNames}`, methodName, slotKey, methodParameterInfo.signature, returnType, body, mockSlots)
+            : '';
+          result += mockable
+            ? `${lineMarker(member)}${mockable}\n\n`
+            : `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${methodParameterInfo.signature})${returnType} ${body}\n\n`;
         }
       } else if (isGetAccessor(member) || isSetAccessor(member)) {
-        result += emitAccessor(member, `${name}${typeParamNames}`);
+        result += emitAccessor(member, `${name}${typeParamNames}`, mockSlots);
       }
     }
     result += copiedMethods.join('\n');
@@ -3238,7 +3278,7 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
       }
     }
 
-    return result.trim();
+    return result.replace(MOCK_SLOTS_MARK, mockSlots.join('\n')).trim();
   } else if (isNewExpression(node)) {
     const nodeNew = visitNodeNew(node);
     if (nodeNew !== undefined) return nodeNew;
@@ -3706,7 +3746,7 @@ function visitBlockStatements(statements: AstNode[]): string {
       parts.push(withLineMarker(statement, visitUsingDeclaration(statement, statements.slice(index + 1))));
       break;
     }
-    parts.push(withLineMarker(statement, visit(statement)));
+    parts.push(withLineMarker(statement, visit(statement)) + coverageAfter(statement));
     if (isIfStatement(statement) && !statement.elseStatement && alwaysExits(statement.thenStatement)) {
       for (const name of getNarrowedNames(statement.expression, false)) {
         if (!narrowedVariables.has(name)) {
@@ -4176,7 +4216,8 @@ function emitConstructor(name: string, typeParams: string, typeParamNames: strin
 }
 
 function fieldInitializers(classNode: AstNode): string {
-  return (classNode.members ?? [])
+  const counted = typeof classNode.covFields === 'number' ? `${coverageCount(classNode.covFields)}\n\t\t` : '';
+  return counted + (classNode.members ?? [])
     .filter(
       (m: AstNode) =>
         isPropertyDeclaration(m) &&
@@ -4382,14 +4423,23 @@ const goInterfaceAdapters = new Set<string>();
 
 // get prop() { … } → func (self *T) Get_prop() RetType { … };
 // set prop(val) { … } → func (self *T) Set_prop(val ValType) { … }
-function emitAccessor(member: AstNode, receiver: string): string {
+function emitAccessor(member: AstNode, receiver: string, mockSlots: string[] = []): string {
   const accessorName = visit(member.name);
+  const tsName: string = memberKey(member.name) ?? accessorName;
   if (isGetAccessor(member)) {
     const returnType = member.type ? ` ${getType(member.type)}` : ' interface{}';
-    return `${lineMarker(member)}func (self *${receiver}) Get_${accessorName}()${returnType} ${visit(member.body!)}\n\n`;
+    const body = visit(member.body!);
+    const slotKey = mockSlotKey('get', tsName);
+    const mockable = mockedMemberNames.has(slotKey) ? emitMockableMethod(receiver, `Get_${accessorName}`, slotKey, '', returnType, body, mockSlots) : '';
+    if (mockable) return `${lineMarker(member)}${mockable}\n\n`;
+    return `${lineMarker(member)}func (self *${receiver}) Get_${accessorName}()${returnType} ${body}\n\n`;
   }
   const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-  return `${lineMarker(member)}func (self *${receiver}) Set_${accessorName}(${parameterInfo.signature}) ${visit(member.body!, { prefixBlockContent: parameterInfo.prefixBlockContent })}\n\n`;
+  const body = visit(member.body!, { prefixBlockContent: parameterInfo.prefixBlockContent });
+  const slotKey = mockSlotKey('set', tsName);
+  const mockable = mockedMemberNames.has(slotKey) ? emitMockableMethod(receiver, `Set_${accessorName}`, slotKey, parameterInfo.signature, '', body, mockSlots) : '';
+  if (mockable) return `${lineMarker(member)}${mockable}\n\n`;
+  return `${lineMarker(member)}func (self *${receiver}) Set_${accessorName}(${parameterInfo.signature}) ${body}\n\n`;
 }
 
 // arr[i] = v through a pointer to the slice, so a write past the end can grow
@@ -4915,6 +4965,34 @@ function isDynamicObjectLiteral(node: AstNode): boolean {
   );
 }
 
+// Object-literal accessors by anonymous-struct type: a getter's read invokes
+// its closure, while a method's read is the function value itself (as in Node).
+// Unregistered func fields (spread copies & co.) keep the read-invoke default.
+const structGetterFields = new Map<string, Set<string>>();
+const structMethodFields = new Map<string, Set<string>>();
+
+function registerStructAccessors(structType: string, node: AstNode): void {
+  for (const p of node.properties ?? []) {
+    const isGetter = isGetAccessor(p);
+    if ((!isGetter && !isMethodDeclaration(p)) || !isIdentifier(p.name)) continue;
+    const registry = isGetter ? structGetterFields : structMethodFields;
+    let names = registry.get(structType);
+    if (!names) {
+      names = new Set();
+      registry.set(structType, names);
+    }
+    names.add(goFieldName(p.name.text));
+  }
+}
+
+function isStructGetterField(structType: string, field: string): boolean {
+  return structGetterFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+}
+
+function isStructMethodField(structType: string, field: string): boolean {
+  return structMethodFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+}
+
 function getObjectLiteralGoType(node: AstNode): string {
   if (isDynamicObjectLiteral(node)) return 'interface{}';
   const contextualType = resolveTypeNode(getContextualTypeNode(node));
@@ -4944,7 +5022,9 @@ function getObjectLiteralGoType(node: AstNode): string {
     const value = isPropertyAssignment(p) ? p.initializer : p.name;
     fields.set(goFieldName(p.name.text), toFieldGoType(inferExpressionType(value)));
   }
-  return `*struct{ ${structFieldsBody(fields)} }`;
+  const structType = `struct{ ${structFieldsBody(fields)} }`;
+  registerStructAccessors(structType, node);
+  return `*${structType}`;
 }
 
 // Values typed `any`/`unknown` are handled at runtime (TnGet/TnSet/...),
@@ -5211,6 +5291,7 @@ function visitAnonymousStructLiteral(node: AstNode): string {
     }
   }
   const structType = `struct{ ${structFieldsBody(fields)} }`;
+  registerStructAccessors(structType, node);
   if (steps.length === 0) {
     return `&${structType}${compositeBody(values)}`;
   }
@@ -5906,7 +5987,8 @@ function inferArrowFunctionGoType(node: AstNode | AstNode): string {
 // fn.mock on a function value: the call record of a node:test mock (functions have no fields in Go)
 function isMockAccess(node: AstNode): boolean {
   if (!isPropertyAccessExpression(node) || node.name.text !== 'mock' || !nodeRegistry.modules['test']) return false;
-  return !!inferExpressionType(node.expression)?.startsWith('func(');
+  if (mockedMemberAccess(node.expression)) return true;
+  return !!inferExpressionType(mockedMemberTarget(node.expression))?.startsWith('func(');
 }
 
 function inferExpressionType(expr: AstNode): string | undefined {
@@ -7013,7 +7095,9 @@ function visitConditionalExpression(node: AstNode): string {
     toGoValueOfType(node.whenFalse, resultType)
   );
 
-  return `func() ${resultType} { if ${toGoCondition(node.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
+  const countThen = typeof node.covThen === 'number' ? `${coverageCount(node.covThen)}; ` : '';
+  const countElse = typeof node.covElse === 'number' ? `${coverageCount(node.covElse)}; ` : '';
+  return `func() ${resultType} { if ${toGoCondition(node.condition)} { ${countThen}return ${whenTrue} }; ${countElse}return ${whenFalse} }()`;
 }
 
 // Type of `a ?? b`: NonNullable<A> | B — nullable only when b can be null too
@@ -7364,6 +7448,7 @@ function buildArrayCallbackInfo(
           ? `{ ${visit(unwrapParentheses(callback.body))}; }`
           : `{ return ${visit(callback.body)}; }`;
     if (prefix) body = `{ ${prefix}${body.slice(body.indexOf('{') + 1)}`;
+    if (!isBlock(callback.body)) body = `{ ${coverageEnter(callback)}${body.slice(body.indexOf('{') + 1)}`;
 
     return {
       fnExpr: `func(${params.join(', ')}) ${callbackReturnType} ${body}`,
@@ -7905,6 +7990,10 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (name === 'Promise' && typeNode.typeArguments && typeNode.typeArguments.length > 0) {
       const inner = getType(typeNode.typeArguments[0]);
       return `chan ${inner || 'struct{}'}`;
+    }
+    // async generators are channels of what they yield
+    if ((name === 'AsyncGenerator' || name === 'AsyncIterable' || name === 'AsyncIterableIterator') && (typeNode.typeArguments ?? []).length > 0) {
+      return `chan ${getType(typeNode.typeArguments[0]) || 'interface{}'}`;
     }
     if (name === 'RegExp') {
       return '*regexp.Regexp';
@@ -10063,7 +10152,10 @@ const goPackageIdentifiers = new Set([
   // Go builtins: a package-level `var copy` would shadow copy() in the helpers
   'append', 'cap', 'clear', 'close', 'complex', 'copy', 'imag', 'len', 'make', 'max', 'min', 'panic',
   'print', 'println', 'real', 'recover', 'any', 'byte', 'error', 'float64', 'int', 'int64', 'rune',
-  'uint', 'uint8', 'uint32', 'nil', 'iota'
+  'uint', 'uint8', 'uint32', 'nil', 'iota',
+  // Predeclared types: a `string` parameter would shadow the type in its own signature and body
+  'bool', 'string', 'float32', 'int8', 'int16', 'int32', 'uint16', 'uint64', 'uintptr', 'complex64',
+  'complex128', 'comparable'
 ]);
 // Local names of `go:` package imports (`import * as strings from 'go:strings'`)
 const goPackageLocalNames = new Set<string>();
@@ -10351,6 +10443,8 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   helperProvidedPackages.clear();
 
   const sf = parseSource(code);
+  collectMockTargets(sf);
+  instrumentCoverage(sf, code);
   const isDeclarationLine = (line: string) => /^(var|const|type|func|import)\b|^\/\/go:embed /.test(line.trim());
   const declarationLines: string[] = [];
   const statementLines: string[] = [];
@@ -10359,10 +10453,12 @@ function includeLocalImport(code: string, dir: string | null, goFileName?: strin
   for (const stmt of sf.statements) {
     const result = visit(stmt, { addFunctionOutside: true });
     if (!result.trim()) continue;
-    const line = withLineMarker(stmt, localizeGoPaths(result));
+    const line = withLineMarker(stmt, localizeGoPaths(result)) + coverageAfter(stmt);
     if (isDeclarationLine(result)) declarationLines.push(line);
     else statementLines.push(line);
   }
+  const loaded = coverageLoaded(sf);
+  if (loaded) statementLines.unshift(loaded.trim());
   emittingModuleFile = prevEmittingModuleFile;
 
   const fileOutside = localizeGoPaths(
@@ -10459,11 +10555,15 @@ function compileEntryPoint(id: string, file: ResolvedSourceFile): void {
 
   const varsBefore = mainPackageVariables.length;
   const sf = parseSource(file.content);
+  collectMockTargets(sf);
+  instrumentCoverage(sf, file.content);
   const statements: string[] = [];
+  const loaded = coverageLoaded(sf);
+  if (loaded) statements.push(loaded.trim());
   for (const stmt of sf.statements) {
     const result = visit(stmt, { addFunctionOutside: true });
     if (!result.trim()) continue;
-    statements.push(withLineMarker(stmt, localizeGoPaths(result)));
+    statements.push(withLineMarker(stmt, localizeGoPaths(result)) + coverageAfter(stmt));
   }
   const fileOutside = localizeGoPaths(
     outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n')
@@ -10800,6 +10900,541 @@ function useHelper(id: string): void {
 // referring to visit() would be an initialization cycle)
 const nodeRegistry: NodeRegistry = createNodeRegistry();
 
+// --- node:test: call sites, mock.method targets, coverage counters ---
+
+// The directory relative source names are resolved against (TranspileOptions.cwd)
+let sourceRoot = '';
+
+// A source file's absolute path, with forward slashes
+function absoluteSourcePath(fileIndex: number): string {
+  const name = fileIndex >= 0 && fileIndex < sourceFileNames.length ? sourceFileNames[fileIndex] : currentFileName;
+  if (!name || !sourceRoot || name.startsWith('/') || /^[A-Za-z]:\//.test(name)) return name;
+  return sourceRoot.endsWith('/') ? sourceRoot + name : `${sourceRoot}/${name}`;
+}
+
+// test('x') / it.skip() / t.test(): the called name's position, where Node's reports point
+function callSitePosition(site: AstNode): SourcePosition {
+  if (!site) return { file: '', line: 0, column: 0 };
+  let target: AstNode = site.expression ?? site;
+  if (isPropertyAccessExpression(target)) target = target.name;
+  const line: number = target.line ?? site.line ?? 0;
+  const column: number = target.column ?? site.column ?? 0;
+  return { file: absoluteSourcePath(sourceFileIndexOf(site)), line: line, column: column };
+}
+
+// mock.method / getter / setter targets: calls through a namespace that a mock
+// may replace ('console.log'), and the member names whose class methods get an
+// override slot ('inc', 'get_value', 'set_value')
+const mockedCallKeys = new Set<string>();
+const mockedMemberNames = new Set<string>();
+// Namespaces whose functions mock.method can replace (besides imported modules and classes)
+const MOCKABLE_GLOBALS = new Set(['console', 'Math', 'Date', 'JSON', 'process', 'Object', 'Number', 'String', 'Array', 'Reflect', 'performance', 'crypto']);
+// Marks where a class struct gets its override slots
+const MOCK_SLOTS_MARK = '\t/*tn-mock-slots*/';
+
+// 'method', 'get' or 'set': mock.getter, mock.setter, or mock.method's { getter: true } option
+function mockAccessorKind(kind: string, args: AstNode[]): string {
+  if (kind === 'getter') return 'get';
+  if (kind === 'setter') return 'set';
+  for (const arg of args.slice(2)) {
+    if (!isObjectLiteralExpression(arg)) continue;
+    for (const p of arg.properties ?? []) {
+      if (isPropertyAssignment(p) && isIdentifier(p.name) && p.initializer?.kind === 'TrueKeyword') {
+        if (p.name.text === 'getter') return 'get';
+        if (p.name.text === 'setter') return 'set';
+      }
+    }
+  }
+  return 'method';
+}
+
+function mockSlotKey(accessor: string, name: string): string {
+  let safe = '';
+  for (const ch of name) safe += /[A-Za-z0-9_]/.test(ch) ? ch : '_';
+  return accessor === 'method' ? safe : `${accessor}_${safe}`;
+}
+
+// mock.method(object, 'name') calls of a file, noted before its code compiles
+function collectMockTargets(root: AstNode): void {
+  const walk = (node: AstNode): void => {
+    if (isCallExpression(node) && isPropertyAccessExpression(node.expression)) {
+      const kind: string = node.expression.name.text;
+      const tracker = node.expression.expression;
+      const args: AstNode[] = node.arguments ?? [];
+      const isTracker =
+        (isIdentifier(tracker) && tracker.text === 'mock') || (isPropertyAccessExpression(tracker) && tracker.name.text === 'mock');
+      if ((kind === 'method' || kind === 'getter' || kind === 'setter') && isTracker && args.length >= 2 && isStringLiteral(args[1])) {
+        const name = String(args[1].text);
+        mockedMemberNames.add(mockSlotKey(mockAccessorKind(kind, args), name));
+        if (isIdentifier(args[0])) mockedCallKeys.add(`${args[0].text}.${name}`);
+      }
+    }
+    for (const child of childNodes(node)) walk(child);
+  };
+  walk(root);
+}
+
+// console / Math / an imported module / a class (its statics): calls go by name
+function isMockNamespace(node: AstNode): boolean {
+  if (!isIdentifier(node)) return false;
+  const name: string = node.text;
+  if (classNames.has(name) || nodeLocalNames.has(name) || importAliases.has(name)) return true;
+  return MOCKABLE_GLOBALS.has(name) && !variableGoTypes.has(name);
+}
+
+// '*Counter' / '*Box[float64]' → the class name ('' for other types)
+function classNameOfGoType(goType: string): string {
+  if (!goType.startsWith('*')) return '';
+  let name = goType.slice(1);
+  const bracket = name.indexOf('[');
+  if (bracket > 0) name = name.slice(0, bracket);
+  return classNames.has(name) ? name : '';
+}
+
+// The method / accessor declaration a class (or an ancestor) has for a member
+function classMember(className: string, accessor: string, name: string): AstNode | undefined {
+  const seen = new Set<string>();
+  let current = className;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    const decl = declaredClasses.get(current);
+    for (const member of decl?.members ?? []) {
+      if (!member.body || memberKey(member.name) !== name) continue;
+      if (accessor === 'method' && isMethodDeclaration(member)) return member;
+      if (accessor === 'get' && isGetAccessor(member)) return member;
+      if (accessor === 'set' && isSetAccessor(member)) return member;
+    }
+    current = classParentNames.get(current) ?? '';
+  }
+  return undefined;
+}
+
+// mock.method / getter / setter: installs the mock where calls will find it
+function emitMockMember(call: NodeCall, tracker: string, kind: string): string {
+  const objectNode = call.nodes[0];
+  const nameNode = call.nodes[1];
+  if (!objectNode || !nameNode || !isStringLiteral(nameNode)) {
+    reportError(call.site ?? objectNode, `mock.${kind}() needs the member name as a string literal`);
+    return 'nil';
+  }
+  const name = String(nameNode.text);
+  const accessor = mockAccessorKind(kind, call.nodes);
+  const slotKey = mockSlotKey(accessor, name);
+  const rest = call.args.slice(2).map((a) => `, ${a}`).join('');
+  const object = call.args[0];
+  const objectType = inferExpressionType(objectNode) ?? '';
+  const className = classNameOfGoType(objectType);
+  if (className && classMember(className, accessor, name)) {
+    mockedMemberNames.add(slotKey);
+    return `TnMockSlot(${tracker}, &${object}.tnMock_${slotKey}, ${object}.tnRaw_${slotKey}${rest})`;
+  }
+  if (objectType.startsWith('*struct{') && accessor !== 'set') {
+    const field = parseStructFields(objectType.slice(1)).find((f) => f[0] === goFieldName(name));
+    if (field && field[1].startsWith('func(')) return `TnMockMethod(${tracker}, ${JSON.stringify(name)}, &${object}.${field[0]}${rest})`;
+  }
+  if (isMockNamespace(objectNode) && accessor === 'method') {
+    const key = `${objectNode.text}.${name}`;
+    mockedCallKeys.add(key);
+    return `TnMockGlobal(${tracker}, ${JSON.stringify(key)}${rest})`;
+  }
+  reportError(
+    objectNode,
+    `mock.${kind}(): '${name}' can't be mocked on this object (object-literal methods and getters, class instances' methods and accessors, and functions of namespaces such as console can)`
+  );
+  return 'nil';
+}
+
+// The Go type of the mock mock.method & co. return
+function mockMemberType(call: NodeCall, kind: string): string {
+  const fallback = 'func(...interface{}) interface{}';
+  const objectNode = call.nodes[0];
+  const nameNode = call.nodes[1];
+  if (!objectNode || !nameNode || !isStringLiteral(nameNode)) return fallback;
+  const name = String(nameNode.text);
+  const accessor = mockAccessorKind(kind, call.nodes);
+  const objectType = inferExpressionType(objectNode) ?? '';
+  const className = classNameOfGoType(objectType);
+  const member = className ? classMember(className, accessor, name) : undefined;
+  if (member) return methodFuncType(member);
+  if (objectType.startsWith('*struct{')) {
+    const field = parseStructFields(objectType.slice(1)).find((f) => f[0] === goFieldName(name));
+    if (field && field[1].startsWith('func(')) return field[1];
+  }
+  return fallback;
+}
+
+// The member a .mock read is on, through casts: (console.log as any).mock
+function mockedMemberTarget(node: AstNode): AstNode {
+  let target = node;
+  while (target && (target.kind === 'ParenthesizedExpression' || isAsExpression(target) || target.kind === 'NonNullExpression')) target = target.expression;
+  return target;
+}
+
+// instance.method.mock / console.log.mock: 'slot', 'global' or ''
+function mockedMemberAccess(node: AstNode): string {
+  const target = mockedMemberTarget(node);
+  if (!isPropertyAccessExpression(target) || mockedMemberNames.size + mockedCallKeys.size === 0) return '';
+  const name: string = target.name.text;
+  const className = classNameOfGoType(inferExpressionType(target.expression) ?? '');
+  if (className && mockedMemberNames.has(mockSlotKey('method', name)) && classMember(className, 'method', name)) return 'slot';
+  if (isIdentifier(target.expression) && mockedCallKeys.has(`${target.expression.text}.${name}`) && isMockNamespace(target.expression)) return 'global';
+  return '';
+}
+
+function visitMockAccess(node: AstNode): string {
+  const target = mockedMemberTarget(node.expression);
+  const access = mockedMemberAccess(target);
+  if (access === 'slot') return `TnMockOf(${visit(target.expression)}.tnMock_${mockSlotKey('method', target.name.text)})`;
+  if (access === 'global') return `TnMockedContext(${JSON.stringify(`${target.expression.text}.${target.name.text}`)})`;
+  return `TnMockOf(${visit(target)})`;
+}
+
+// A call through a namespace a mock may replace: TnMockedCall runs the mock
+// while one is in place (the arguments are evaluated for it), else the call
+let routingMockedCall: AstNode | null = null;
+function visitMockableCall(node: AstNode): string | undefined {
+  if (mockedCallKeys.size === 0 || node === routingMockedCall) return undefined;
+  const callee = node.expression;
+  if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression)) return undefined;
+  const key = `${callee.expression.text}.${callee.name.text}`;
+  if (!mockedCallKeys.has(key) || !isMockNamespace(callee.expression)) return undefined;
+  const args: AstNode[] = node.arguments ?? [];
+  if (args.some((a) => isSpreadElement(a))) return undefined;
+  const type = inferExpressionType(node) ?? '';
+  const isStatement = isExpressionStatement(node.parent);
+  if (!type && !isStatement) return undefined;
+  nodeRegistry.helper('nodeTest');
+  const saved = routingMockedCall;
+  routingMockedCall = node;
+  const original = visit(node).trim();
+  routingMockedCall = saved;
+  const values = `func() []interface{} { return []interface{}{${args.map((a) => visit(a)).join(', ')}} }`;
+  if (!type || type === 'void') return `TnMockedCallVoid(${JSON.stringify(key)}, ${values}, func() { ${original} })`;
+  return `TnMockedCall[${type}](${JSON.stringify(key)}, ${values}, func() ${type} { return ${original} })`;
+}
+
+// A class method a mock may replace (see mock.method): the body moves to
+// tnRaw_<key>, and the method calls the instance's tnMock_<key> while it is
+// set; slots collects the struct fields. '' when the parameters can't be forwarded
+function emitMockableMethod(receiver: string, goName: string, slotKey: string, signature: string, returnType: string, body: string, slots: string[]): string {
+  const params = splitGoParameters(signature);
+  if (params.some((p) => p.indexOf(' ') <= 0)) return '';
+  const types = params.map((p) => p.slice(p.indexOf(' ') + 1).trim()).join(', ');
+  const args = params.map((p) => {
+    const name = p.slice(0, p.indexOf(' '));
+    return p.slice(p.indexOf(' ') + 1).trim().startsWith('...') ? `${name}...` : name;
+  }).join(', ');
+  const field = `tnMock_${slotKey}`;
+  if (!slots.some((s) => s.startsWith(`\t${field} `))) slots.push(`\t${field} func(${types})${returnType}`);
+  const forward = returnType ? `return self.${field}(${args})` : `self.${field}(${args})\n\t\t\treturn`;
+  const raw = `${returnType ? 'return ' : ''}self.tnRaw_${slotKey}(${args})`;
+  return `func (self *${receiver}) tnRaw_${slotKey}(${signature})${returnType} ${body.trimEnd()}\n\nfunc (self *${receiver}) ${goName}(${signature})${returnType} {\n\t\tif self.${field} != nil {\n\t\t\t${forward}\n\t\t}\n\t\t${raw}\n\t}`;
+}
+
+// Coverage (node:test, --experimental-test-coverage): programs that import
+// node:test count what runs. Each counted range is described like V8's
+// (the script, its functions, their blocks), so the runtime can report
+// lines, branches and functions as Node does (src/node/test_coverage.ts)
+let coverageOn = false;
+let coverageCounters = 0;
+// Counters some generated code increments (the others stand for their enclosing range)
+const coverageEmitted = new Set<number>();
+
+// kind 0 the script, 1 a function, 2 a block; parent / fn index the file's ranges
+interface CoverageRange {
+  kind: number;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+  counter: number;
+  name: string;
+  parent: number;
+  fn: number;
+}
+
+interface CoverageFile {
+  path: string;
+  lines: number;
+  lineLengths: number[];
+  ignore: number[];
+  loaded: number;
+  ranges: CoverageRange[];
+}
+
+const coverageFiles: CoverageFile[] = [];
+const COVERAGE_LOOPS = new Set(['ForStatement', 'ForInStatement', 'ForOfStatement', 'WhileStatement', 'DoStatement']);
+const COVERAGE_FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunction', 'MethodDeclaration', 'GetAccessor', 'SetAccessor', 'Constructor']);
+
+// Lines a node:coverage comment excludes (ignore next [n], disable / enable), as Node reads them
+function coverageIgnoredLines(lines: string[], count: number): number[] {
+  const out: number[] = [];
+  const nextMarker = '/* node:coverage ignore next';
+  let ignoreCount = 0;
+  let disabled = false;
+  for (let i = 0; i < count; i++) {
+    const line = lines[i];
+    let ignore = false;
+    if (ignoreCount > 0) {
+      ignoreCount--;
+      ignore = true;
+    } else if (disabled) {
+      ignore = true;
+    }
+    if (!ignore) {
+      const at = line.indexOf(nextMarker);
+      if (at >= 0) {
+        const match = /^ (\d+ )?\*\//.exec(line.slice(at + nextMarker.length));
+        if (match) ignoreCount = match[1] ? parseInt(match[1], 10) : 1;
+      }
+    }
+    if (line.includes('/* node:coverage disable */')) {
+      ignoreCount = 0;
+      disabled = true;
+    } else if (line.includes('/* node:coverage enable */')) {
+      ignoreCount = 0;
+      disabled = false;
+    }
+    if (ignore) out.push(i + 1);
+  }
+  return out;
+}
+
+// A function's name as V8 reports it: declared, or taken from what it's assigned to
+function coverageFunctionName(node: AstNode): string {
+  if (node.name && (isIdentifier(node.name) || isStringLiteral(node.name))) {
+    const base = String(node.name.text);
+    if (isGetAccessor(node)) return `get ${base}`;
+    if (isSetAccessor(node)) return `set ${base}`;
+    return base;
+  }
+  const parent = node.parent;
+  if (isConstructorDeclaration(node)) return parent?.name && isIdentifier(parent.name) ? String(parent.name.text) : '';
+  if (parent && isVariableDeclaration(parent) && isIdentifier(parent.name)) return String(parent.name.text);
+  if (parent && (isPropertyAssignment(parent) || isPropertyDeclaration(parent)) && parent.name && isIdentifier(parent.name)) {
+    return String(parent.name.text);
+  }
+  return '';
+}
+
+function coverageRange(file: CoverageFile, kind: number, node: AstNode, counter: number, name: string, parent: number, fn: number): number {
+  let startColumn: number = node.column ?? 1;
+  // `export function f`: V8's range starts at `function`
+  if (kind === 1 && (node.modifiers ?? []).length > 0 && startColumn < 2) startColumn = 2;
+  file.ranges.push({
+    kind: kind,
+    startLine: node.line ?? 1,
+    startColumn: startColumn,
+    endLine: node.endLine ?? node.line ?? 1,
+    endColumn: node.endColumn ?? 1,
+    counter: counter,
+    name: name,
+    parent: parent,
+    fn: fn
+  });
+  return file.ranges.length - 1;
+}
+
+// Counts a source file's code (the AST gets counters and, for branches that
+// are single statements, a block around them)
+function instrumentCoverage(sf: AstNode, code: string): void {
+  const first: AstNode = (sf.statements ?? [])[0];
+  if (!coverageOn || !first || first.endLine === undefined) return;
+  const text = code.split('\r\n').join('\n');
+  const lines = text.split('\n');
+  const lineCount = text.endsWith('\n') ? lines.length - 1 : lines.length;
+  const file: CoverageFile = {
+    path: absoluteSourcePath(sf.fileIndex),
+    lines: lineCount,
+    lineLengths: lines.map((l) => l.length),
+    ignore: coverageIgnoredLines(lines, lineCount),
+    loaded: coverageCounters++,
+    ranges: []
+  };
+  sf.covLoaded = file.loaded;
+  coverageFiles.push(file);
+  file.ranges.push({ kind: 0, startLine: 1, startColumn: 1, endLine: lineCount + 1, endColumn: 1, counter: -1, name: '', parent: -1, fn: 0 });
+  coverageStatements(sf.statements ?? [], file, 0, 0);
+}
+
+function coverageWalk(node: AstNode, file: CoverageFile, parent: number, fn: number): void {
+  if (!node || typeof node !== 'object') return;
+  if (COVERAGE_FUNCTIONS.has(node.kind) && node.body) {
+    const r = coverageRange(file, 1, node, coverageCounters++, coverageFunctionName(node), parent, -1);
+    file.ranges[r].fn = r;
+    if (isBlock(node.body)) node.body.covEnter = file.ranges[r].counter;
+    else node.covEnter = file.ranges[r].counter;
+    for (const child of childNodes(node)) coverageWalk(child, file, r, r);
+    return;
+  }
+  if ((node.kind === 'ClassDeclaration' || node.kind === 'ClassExpression') && !node.covFields) {
+    // V8 runs instance field initializers as a function of their own
+    const fields = (node.members ?? []).filter(
+      (m: AstNode) => isPropertyDeclaration(m) && m.initializer && !(m.modifiers ?? []).some((mod: AstNode) => mod.kind === 'StaticKeyword')
+    );
+    if (fields.length > 0) {
+      const last = fields[fields.length - 1];
+      const r = coverageRange(file, 1, fields[0], coverageCounters++, '<instance_members_initializer>', parent, -1);
+      file.ranges[r].fn = r;
+      file.ranges[r].endLine = last.endLine ?? file.ranges[r].endLine;
+      file.ranges[r].endColumn = last.endColumn ?? file.ranges[r].endColumn;
+      node.covFields = file.ranges[r].counter;
+      for (const m of fields) coverageWalk(m.initializer, file, r, r);
+    }
+    for (const child of childNodes(node)) {
+      if (!fields.includes(child)) coverageWalk(child, file, parent, fn);
+    }
+    return;
+  }
+  if (isIfStatement(node)) {
+    coverageWalk(node.expression, file, parent, fn);
+    node.thenStatement = coverageBranch(node, node.thenStatement, file, parent, fn);
+    if (node.elseStatement) node.elseStatement = coverageBranch(node, node.elseStatement, file, parent, fn);
+    return;
+  }
+  if (COVERAGE_LOOPS.has(node.kind) && node.statement) {
+    for (const child of childNodes(node)) {
+      if (child !== node.statement) coverageWalk(child, file, parent, fn);
+    }
+    node.statement = coverageBranch(node, node.statement, file, parent, fn);
+    return;
+  }
+  if (node.kind === 'CaseClause' || node.kind === 'DefaultClause') {
+    if (node.expression) coverageWalk(node.expression, file, parent, fn);
+    const r = coverageRange(file, 2, node, coverageCounters++, '', parent, fn);
+    node.covEnter = file.ranges[r].counter;
+    coverageStatements(node.statements ?? [], file, r, fn);
+    return;
+  }
+  if (isTryStatement(node)) {
+    coverageWalk(node.tryBlock, file, parent, fn);
+    const blocks: AstNode[] = [node.catchClause?.block, node.finallyBlock];
+    for (const block of blocks) {
+      if (!block) continue;
+      const r = coverageRange(file, 2, block, coverageCounters++, '', parent, fn);
+      block.covEnter = file.ranges[r].counter;
+      coverageStatements(block.statements ?? [], file, r, fn);
+    }
+    return;
+  }
+  if (isConditionalExpression(node)) {
+    coverageWalk(node.condition, file, parent, fn);
+    const t = coverageRange(file, 2, node.whenTrue, coverageCounters++, '', parent, fn);
+    node.covThen = file.ranges[t].counter;
+    coverageWalk(node.whenTrue, file, t, fn);
+    const e = coverageRange(file, 2, node.whenFalse, coverageCounters++, '', parent, fn);
+    node.covElse = file.ranges[e].counter;
+    coverageWalk(node.whenFalse, file, e, fn);
+    return;
+  }
+  if (isBlock(node) || node.kind === 'ModuleBlock') {
+    coverageStatements(node.statements ?? [], file, parent, fn);
+    return;
+  }
+  for (const child of childNodes(node)) coverageWalk(child, file, parent, fn);
+}
+
+// A branch's body (then / else / a loop's statement): a block range it enters
+function coverageBranch(owner: AstNode, body: AstNode, file: CoverageFile, parent: number, fn: number): AstNode {
+  let block = body;
+  if (!isBlock(body)) {
+    block = { kind: 'Block', statements: [body], parent: owner };
+    body.parent = block;
+  }
+  const r = coverageRange(file, 2, body, coverageCounters++, '', parent, fn);
+  block.covEnter = file.ranges[r].counter;
+  coverageStatements(block.statements ?? [], file, r, fn);
+  return block;
+}
+
+// A statement list; after a statement that can jump, the rest of the
+// enclosing range is a continuation range (never reached after a return)
+function coverageStatements(statements: AstNode[], file: CoverageFile, parent: number, fn: number): void {
+  for (let i = 0; i < statements.length; i++) {
+    const s = statements[i];
+    coverageWalk(s, file, parent, fn);
+    if (i === statements.length - 1 || s.endLine === undefined) continue;
+    const jump = isReturnStatement(s) || isThrowStatement(s) || isBreakStatement(s) || s.kind === 'ContinueStatement';
+    const compound = isIfStatement(s) || COVERAGE_LOOPS.has(s.kind) || isTryStatement(s) || isSwitchStatement(s) || s.kind === 'LabeledStatement';
+    if (!jump && !compound) continue;
+    const p = file.ranges[parent];
+    const counter = jump ? -1 : coverageCounters++;
+    file.ranges.push({ kind: 2, startLine: s.endLine, startColumn: s.endColumn, endLine: p.endLine, endColumn: p.endColumn, counter: counter, name: '', parent: parent, fn: fn });
+    if (!jump) s.covAfter = counter;
+  }
+}
+
+function coverageCount(counter: number): string {
+  coverageEmitted.add(counter);
+  return `tnCov[${counter}]++`;
+}
+
+// At a function body / branch block / case: its counter
+function coverageEnter(node: AstNode): string {
+  const counter = node?.covEnter;
+  return typeof counter === 'number' ? `${coverageCount(counter)}\n\t\t` : '';
+}
+
+// After a statement that can jump: its continuation's counter
+function coverageAfter(node: AstNode): string {
+  const counter = node?.covAfter;
+  return typeof counter === 'number' ? `\n\t${coverageCount(counter)}\n\t` : '';
+}
+
+// A file's top-level code ran (its report needs that)
+function coverageLoaded(sf: AstNode): string {
+  const counter = sf?.covLoaded;
+  return typeof counter === 'number' ? `${coverageCount(counter)}\n\t` : '';
+}
+
+// An expression-bodied arrow's func code: the counter right inside its body
+function withCoverageEntry(fn: AstNode, code: string, header: string): string {
+  const enter = coverageEnter(fn);
+  if (!enter || !code.startsWith(header)) return code;
+  const brace = code.indexOf('{', header.length);
+  if (brace < 0) return code;
+  return `${code.slice(0, brace + 1)} ${enter}${code.slice(brace + 1)}`;
+}
+
+// The counters and the ranges they count, for the runtime
+function coverageTables(): string {
+  useHelper('nodeTestCoverage');
+  const files: string[] = [];
+  const ranges: string[] = [];
+  for (let fi = 0; fi < coverageFiles.length; fi++) {
+    const f = coverageFiles[fi];
+    files.push(`{${JSON.stringify(f.path)}, ${f.lines}, []int{${f.ignore.join(', ')}}, ${f.loaded}}`);
+    const ignored = new Set<number>(f.ignore);
+    // Node's order: the script and its blocks, then each function and its blocks
+    const order: number[] = [];
+    for (let i = 0; i < f.ranges.length; i++) {
+      if (f.ranges[i].kind > 1) continue;
+      order.push(i);
+      for (let j = 0; j < f.ranges.length; j++) {
+        if (f.ranges[j].kind === 2 && f.ranges[j].fn === i) order.push(j);
+      }
+    }
+    const positions: number[] = [];
+    for (let j = 0; j < order.length; j++) positions[order[j]] = ranges.length + j;
+    for (const index of order) {
+      const r = f.ranges[index];
+      // a counter no code increments stands for the range around it
+      const counter = r.counter >= 0 && !coverageEmitted.has(r.counter) ? -2 : r.counter;
+      const firstLine = r.startColumn <= 1 ? r.startLine : r.startLine + 1;
+      let lastLine = r.endLine;
+      if (r.endLine > f.lines) lastLine = f.lines;
+      else if (r.endColumn <= 1 || r.endColumn - 1 < (f.lineLengths[r.endLine - 1] ?? 0)) lastLine = r.endLine - 1;
+      let allIgnored = true;
+      for (let l = r.startLine; l <= Math.min(r.endLine, f.lines); l++) {
+        if (!ignored.has(l)) allIgnored = false;
+      }
+      const parent = r.parent < 0 ? -1 : positions[r.parent];
+      ranges.push(`{${fi}, ${parent}, ${positions[r.fn]}, ${r.kind}, ${counter}, ${JSON.stringify(r.name)}, ${r.startLine}, ${firstLine}, ${lastLine}, ${allIgnored}}`);
+    }
+  }
+  return `var tnCov = make([]uint32, ${Math.max(coverageCounters, 1)})\n\nvar tnCovFiles = []tnCovFile{\n\t${files.join(',\n\t')},\n}\n\nvar tnCovRanges = []tnCovRange{\n\t${ranges.join(',\n\t')},\n}`;
+}
+
 function bindNodeRegistryServices(): void {
   nodeRegistry.pkg = needPkg;
   nodeRegistry.helper = useHelper;
@@ -10809,6 +11444,9 @@ function bindNodeRegistryServices(): void {
   nodeRegistry.categoryOf = (node: AstNode) => resolveExpressionType(node) ?? '';
   nodeRegistry.isArrayBuffer = (node: AstNode) => isArrayBufferExpression(node);
   nodeRegistry.entryPoint = (node: AstNode) => registerEntryPoint(node);
+  nodeRegistry.callSite = (node: AstNode) => callSitePosition(node);
+  nodeRegistry.mockMember = (call: NodeCall, tracker: string, kind: string) => emitMockMember(call, tracker, kind);
+  nodeRegistry.mockMemberType = (call: NodeCall, kind: string) => mockMemberType(call, kind);
   bindConvertServices({
     pkg: needPkg,
     helper: useHelper,
@@ -15334,8 +15972,11 @@ func TnLoopReceive[T any](ch chan T) (T, bool) {
 	}
 }
 
-// (baton holder) Receives from a channel of raw sends (generator yields),
-// running loop tasks while waiting
+// (baton holder, possibly the loop goroutine itself) Receives from a promise
+// or a channel of raw sends (generator yields), running loop tasks while
+// waiting. Parks like TnLoopReceive, so promise continuations resume in
+// settlement order, while a stand-in goroutine drains the loop (this one may be
+// the goroutine that would)
 func tnRawReceive[T any](ch chan T) (T, bool) {
 	ctx := tnAsyncCtx
 	defer func() { tnAsyncCtx = ctx }()
@@ -15349,14 +15990,63 @@ func tnRawReceive[T any](ch chan T) (T, bool) {
 		if TnLoopRunPending() {
 			continue
 		}
+		tok := make(chan struct{})
+		tnWakeMu.Lock()
+		select {
+		case v, ok := <-ch:
+			tnWakeMu.Unlock()
+			return v, ok
+		default:
+			tnAwaiting[any(ch)] = tok
+		}
+		tnWakeMu.Unlock()
+		stop := make(chan struct{})
+		go tnLoopStandIn(stop)
 		tnRelease()
 		select {
 		case v, ok := <-ch:
-			tnAcquire()
+			// A raw send leaves the token registered: take the baton ourselves;
+			// a promise wake was queued: wait for its hand-over (the stand-in
+			// keeps draining until then — it may be what delivers it)
+			tnWakeMu.Lock()
+			_, raw := tnAwaiting[any(ch)]
+			if raw {
+				delete(tnAwaiting, any(ch))
+			}
+			tnWakeMu.Unlock()
+			if raw {
+				close(stop)
+				tnAcquire()
+			} else {
+				<-tok
+				close(stop)
+			}
 			return v, ok
-		case <-tnLoopSignal:
-			tnAcquire()
+		case <-tok:
+			close(stop)
 		}
+	}
+}
+
+// Drains the loop for a parked inline await until stop closes: the awaiter is
+// handed the baton by a delivery like any parked await
+func tnLoopStandIn(stop chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tnLoopSignal:
+		}
+		select {
+		case <-stop:
+			// Pass on the wake this goroutine took
+			tnLoopNotify()
+			return
+		case <-tnBaton:
+		}
+		TnRunMicrotasks()
+		TnLoopRunPending()
+		tnRelease()
 	}
 }
 
@@ -16126,7 +16816,7 @@ function makeNodeCall(node: AstNode, recv: string): NodeCall {
   const hasSpread = nodes.some((a) => isSpreadElement(a));
   const args = hasSpread ? visitSpreadCallArguments(node) : nodes.map((a) => visit(a));
   const types = nodes.map((a) => inferExpressionType(a) ?? '');
-  return { args, nodes, types, recv };
+  return { args: args, nodes: nodes, types: types, recv: recv, site: node };
 }
 
 // Calls of Node APIs: imported functions, statics (Buffer.from) and methods of
@@ -16803,13 +17493,13 @@ function visitReturningTryStatement(node: AstNode, fn: AstNode, options: VisitNo
   const doneVar = getTempName('trydone');
   const blockCode = (block: AstNode, inCatch: boolean) => {
     tryReturn = { fn, hasValue, inCatch, retVar, doneVar };
-    const code = (block.statements ?? []).map((s: AstNode) => visit(s)).join('\t');
+    const code = coverageEnter(block) + (block.statements ?? []).map((s: AstNode) => visit(s)).join('\t');
     tryReturn = saved;
     return code;
   };
   const deferreds: string[] = [];
   if (node.finallyBlock) {
-    const finallyBody = (node.finallyBlock.statements ?? []).map((s: AstNode) => visit(s)).join('\t');
+    const finallyBody = coverageEnter(node.finallyBlock) + (node.finallyBlock.statements ?? []).map((s: AstNode) => visit(s)).join('\t');
     deferreds.push(`defer func() {\n\t\t\t${finallyBody}\t\t\t}()`);
   }
   if (node.catchClause) {
@@ -16878,7 +17568,7 @@ function visitTryStatement(node: AstNode, options: VisitNodeOptions): string {
 
   // Register finally first (LIFO: runs last after catch)
   if (node.finallyBlock) {
-    const finallyBody = (node.finallyBlock.statements ?? []).map((s) => visit(s)).join('\t');
+    const finallyBody = coverageEnter(node.finallyBlock) + (node.finallyBlock.statements ?? []).map((s) => visit(s)).join('\t');
     deferreds.push(`defer func() {\n\t\t\t${finallyBody}\t\t\t}()`);
   }
 
@@ -16889,7 +17579,7 @@ function visitTryStatement(node: AstNode, options: VisitNodeOptions): string {
     if (varDecl && isIdentifier(varDecl.name)) {
       registerLocalVariable(varDecl.name.text, 'interface{}');
     }
-    const catchBody = (node.catchClause.block.statements ?? []).map((s) => visit(s)).join('\t');
+    const catchBody = coverageEnter(node.catchClause.block) + (node.catchClause.block.statements ?? []).map((s) => visit(s)).join('\t');
     deferreds.push(
       `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := r\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
     );

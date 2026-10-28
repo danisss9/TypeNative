@@ -404,7 +404,8 @@ export function run(opts) {
         tsx: !!sourcePath && sourcePath.endsWith('.tsx'),
         fileName: displayPath(entryPath),
         goFile: goFile,
-        goos: targetOs
+        goos: targetOs,
+        cwd: process.cwd().split('\\').join('/')
     };
     if (sourceDir) {
         transpileOptions.readFile = (specifier, fromDir) => {

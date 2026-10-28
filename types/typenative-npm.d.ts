@@ -1247,6 +1247,8 @@ declare module 'node:stream' {
       resume(): this;
       isPaused(): boolean;
       pipe<T extends Writable>(destination: T, options?: { end?: boolean }): T;
+      /** A stream to pipe into, or a function given this stream (an async generator over its chunks, a node:test reporter) */
+      compose(stream: Duplex | ((source: any) => any)): Duplex;
       destroy(error?: Error): this;
       [Symbol.asyncIterator](): AsyncIterator<any>;
       static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
@@ -2463,6 +2465,7 @@ declare module 'node:async_hooks' {
 }
 
 declare module 'node:test' {
+  import { Readable } from 'node:stream';
   function test(name?: string, fn?: test.TestFn): Promise<void>;
   function test(name?: string, options?: test.TestOptions, fn?: test.TestFn): Promise<void>;
   function test(fn?: test.TestFn): Promise<void>;
@@ -2499,9 +2502,22 @@ declare module 'node:test' {
       restore(): void;
     }
     export type Mock<F extends (...args: any[]) => any> = F & { mock: MockFunctionContext<F> };
+    export interface MockFunctionOptions {
+      times?: number;
+    }
+    export interface MockMethodOptions extends MockFunctionOptions {
+      getter?: boolean;
+      setter?: boolean;
+    }
+    type MockedMember<T> = T extends (...args: any[]) => any ? T : (...args: any[]) => any;
     export interface MockTracker {
       fn<F extends (...args: any[]) => any = (...args: any[]) => undefined>(original?: F): Mock<F>;
       fn<F extends (...args: any[]) => any, Implementation extends (...args: any[]) => any = F>(original: F, implementation: Implementation): Mock<F | Implementation>;
+      /** Replaces object[methodName] (an object-literal method, a class instance's method, a namespace function such as console.log) until restore() */
+      method<O extends object, K extends keyof O>(object: O, methodName: K, options?: MockMethodOptions): Mock<MockedMember<O[K]>>;
+      method<O extends object, K extends keyof O>(object: O, methodName: K, implementation: (...args: any[]) => any, options?: MockMethodOptions): Mock<MockedMember<O[K]>>;
+      getter<O extends object, K extends keyof O>(object: O, methodName: K, implementation?: (...args: any[]) => any, options?: MockFunctionOptions): Mock<() => O[K]>;
+      setter<O extends object, K extends keyof O>(object: O, methodName: K, implementation?: (...args: any[]) => any, options?: MockFunctionOptions): Mock<(value: O[K]) => void>;
       reset(): void;
       restoreAll(): void;
       readonly timers: MockTimers;
@@ -2536,6 +2552,13 @@ declare module 'node:test' {
       doesNotMatch(value: string, regExp: RegExp, message?: string | Error): void;
       fail(message?: string | Error): never;
       ifError(value: unknown): void;
+      /** Compares with (or, with --test-update-snapshots, writes) the test file's <file>.snapshot entry */
+      snapshot(value: any, options?: AssertSnapshotOptions): void;
+      /** Compares with (or, with --test-update-snapshots, writes) the file at path */
+      fileSnapshot(value: any, path: string, options?: AssertSnapshotOptions): void;
+    }
+    export interface AssertSnapshotOptions {
+      serializers?: ReadonlyArray<(value: any) => any>;
     }
     export interface TestContext {
       readonly name: string;
@@ -2592,8 +2615,112 @@ declare module 'node:test' {
     export function after(fn?: HookFn, options?: TestOptions): void;
     export function beforeEach(fn?: HookFn, options?: TestOptions): void;
     export function afterEach(fn?: HookFn, options?: TestOptions): void;
+    export namespace snapshot {
+      function setDefaultSnapshotSerializers(serializers: ReadonlyArray<(value: any) => any>): void;
+      function setResolveSnapshotPath(fn: (path: string | undefined) => string): void;
+    }
+    /** Runs each file (a literal path, compiled into the program) in a child process */
+    export function run(options?: RunOptions): TestsStream;
+    export interface RunOptions {
+      files?: readonly string[];
+      concurrency?: number | boolean;
+      timeout?: number;
+      only?: boolean;
+      testNamePatterns?: string | RegExp | ReadonlyArray<string | RegExp>;
+      testSkipPatterns?: string | RegExp | ReadonlyArray<string | RegExp>;
+      coverage?: boolean;
+      updateSnapshots?: boolean;
+      cwd?: string;
+      argv?: readonly string[];
+      setup?: (reporter: TestsStream) => void | Promise<void>;
+    }
+    export interface TestsStream extends Readable {
+      on(event: 'test:pass' | 'test:fail' | 'test:start' | 'test:complete' | 'test:enqueue' | 'test:dequeue', listener: (data: EventData.Test) => void): this;
+      on(event: 'test:plan', listener: (data: EventData.TestPlan) => void): this;
+      on(event: 'test:diagnostic' | 'test:stdout' | 'test:stderr', listener: (data: EventData.TestMessage) => void): this;
+      on(event: 'test:summary', listener: (data: EventData.TestSummary) => void): this;
+      on(event: 'test:coverage', listener: (data: EventData.TestCoverage) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+      once(event: 'test:pass' | 'test:fail' | 'test:start' | 'test:complete', listener: (data: EventData.Test) => void): this;
+      once(event: 'test:summary', listener: (data: EventData.TestSummary) => void): this;
+      once(event: string, listener: (...args: any[]) => void): this;
+    }
+    export namespace EventData {
+      interface Location {
+        file?: string;
+        line?: number;
+        column?: number;
+      }
+      interface Test extends Location {
+        name: string;
+        nesting: number;
+        testNumber: number;
+        details: { duration_ms: number; type: 'suite' | 'test'; error?: Error; passed?: boolean };
+        skip?: string | boolean;
+        todo?: string | boolean;
+      }
+      interface TestPlan extends Location {
+        nesting: number;
+        count: number;
+      }
+      interface TestMessage extends Location {
+        nesting: number;
+        message: string;
+        level?: 'info' | 'warn' | 'error';
+      }
+      interface TestSummary {
+        counts: { tests: number; failed: number; passed: number; cancelled: number; skipped: number; todo: number; topLevel: number; suites: number };
+        duration_ms: number;
+        file: string | undefined;
+        success: boolean;
+      }
+      interface CoverageCounts {
+        totalLineCount: number;
+        totalBranchCount: number;
+        totalFunctionCount: number;
+        coveredLineCount: number;
+        coveredBranchCount: number;
+        coveredFunctionCount: number;
+        coveredLinePercent: number;
+        coveredBranchPercent: number;
+        coveredFunctionPercent: number;
+      }
+      interface CoverageFile extends CoverageCounts {
+        path: string;
+        functions: { name: string; line: number; count: number }[];
+        branches: { line: number; count: number }[];
+        lines: { line: number; count: number }[];
+      }
+      interface TestCoverage {
+        nesting: number;
+        summary: { files: CoverageFile[]; totals: CoverageCounts; workingDirectory: string };
+      }
+    }
   }
   export = test;
+}
+
+// The reporters of node:test (--test-reporter), over run() streams and event sources
+declare module 'node:test/reporters' {
+  import { Duplex } from 'node:stream';
+  import { EventData } from 'node:test';
+  type TestEvent =
+    | { type: 'test:pass' | 'test:fail' | 'test:start' | 'test:complete' | 'test:enqueue' | 'test:dequeue'; data: EventData.Test }
+    | { type: 'test:plan'; data: EventData.TestPlan }
+    | { type: 'test:diagnostic' | 'test:stdout' | 'test:stderr'; data: EventData.TestMessage }
+    | { type: 'test:summary'; data: EventData.TestSummary }
+    | { type: 'test:coverage'; data: EventData.TestCoverage };
+  type TestEventSource = AsyncIterable<TestEvent> | Iterable<TestEvent>;
+  function tap(source: TestEventSource): AsyncGenerator<string, void>;
+  function dot(source: TestEventSource): AsyncGenerator<string, void>;
+  function junit(source: TestEventSource): AsyncGenerator<string, void>;
+  interface ReporterConstructor {
+    new (): Duplex;
+    (): Duplex;
+  }
+  const spec: ReporterConstructor;
+  const lcov: ReporterConstructor;
+  export { tap, dot, junit, spec, lcov, TestEvent };
 }
 
 declare module 'node:worker_threads' {

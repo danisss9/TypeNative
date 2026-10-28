@@ -330,6 +330,17 @@ func (s *TnStream) once(event string, fn interface{}) *TnEventEmitter {
 	return &s.TnEventEmitter
 }
 
+// stream.on(…) / once(…) in TypeScript: the stream itself, for chaining (as in Node)
+func (s *TnStream) onChain(event string, fn interface{}) *TnStream {
+	s.on(event, fn)
+	return s
+}
+
+func (s *TnStream) onceChain(event string, fn interface{}) *TnStream {
+	s.once(event, fn)
+	return s
+}
+
 func (s *TnStream) listening(event string) {
 	if event == "readable" && s.readableSide {
 		s.readableListening = true
@@ -792,6 +803,46 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 	return s
 }
 
+// readable.compose(stream | fn): the source piped into a stream, or handed to
+// a function (an async generator over the chunks, a node:test reporter) whose
+// output becomes a readable
+func (s *TnStream) compose(target interface{}, options ...interface{}) *TnStream {
+	if dst, ok := target.(tnStreamLike); ok {
+		return TnPipe(s, dst.tnStream())
+	}
+	fv := reflect.ValueOf(target)
+	if fv.Kind() != reflect.Func || fv.IsNil() {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"stream\\" argument must be of type function or an instance of Stream, Iterable, or AsyncIterable. Received "+TnJSString(target)))
+	}
+	ft := fv.Type()
+	var out []reflect.Value
+	if ft.NumIn() == 0 {
+		// a stream factory (node:test/reporters' spec / lcov)
+		out = fv.Call(nil)
+	} else if in := ft.In(0); in.Kind() == reflect.Chan {
+		// an async generator function: the chunks as a channel of its element type
+		src := s.tnIterator()
+		ch := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, in.Elem()), 65536)
+		go func() {
+			for v := range src {
+				ch.Send(tnInvokeArg(v, in.Elem()))
+			}
+			ch.Close()
+		}()
+		out = fv.Call([]reflect.Value{ch})
+	} else {
+		out = fv.Call([]reflect.Value{tnInvokeArg(s, in)})
+	}
+	if len(out) == 0 {
+		return s
+	}
+	result := out[0].Interface()
+	if dst, ok := result.(tnStreamLike); ok {
+		return TnPipe(s, dst.tnStream())
+	}
+	return TnReadableFrom(result)
+}
+
 // for await (const chunk of readable)
 func (s *TnStream) tnIterator() chan interface{} {
 	ch := make(chan interface{}, 65536)
@@ -1165,7 +1216,7 @@ func TnZlibStream(format string, decompress bool, options ...interface{}) *TnStr
 // Go parameter types of option / override methods
 // Method and getter specs of TnStream, shared with classes that embed it (net.Socket, http messages)
 export const STREAM_METHODS =
-  'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
+  'on=*TnStream; once=*TnStream; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; compose=*TnStream; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
 export const STREAM_GETTERS =
   'readable=bool; writable=bool; readableEnded=bool; writableEnded=bool; writableFinished=bool; destroyed=bool; closed=bool; errored=interface{}; readableLength=float64; writableLength=float64; readableObjectMode=bool; writableObjectMode=bool; readableFlowing=interface{}; bytesRead=float64; bytesWritten=float64; path=string';
 
@@ -1245,6 +1296,12 @@ func tnStdin() *bufio.Reader {
   };
   r.typers['stream.Duplex#pipe'] = (c: NodeCall) => c.types[0] || '*TnStream';
   r.paramTypers['stream.Duplex#on'] = (nodes: any[]) => streamListenerTypes(nodes);
+  for (const method of ['on', 'once']) {
+    r.methods[`stream.Duplex#${method}`] = (c: NodeCall) => {
+      use();
+      return `${c.recv}.${method}Chain(${c.args.join(', ')})`;
+    };
+  }
   r.paramTypers['stream.Duplex#once'] = r.paramTypers['stream.Duplex#on'];
 
   r.functions['stream.Readable.from'] = (call: NodeCall) => {

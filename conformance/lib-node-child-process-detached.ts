@@ -24,8 +24,11 @@ if (process.platform === 'linux') {
 }
 
 // unref(): this program exits right away, while the sleeper is killed
-const sleeper = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
-sleeper.unref();
-sleeper.ref();
-sleeper.unref();
-setTimeout(() => sleeper.kill(), 10);
+// ('sleep' is a Unix command; unhandled 'error' events throw, as in Node)
+if (process.platform !== 'win32') {
+  const sleeper = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  sleeper.unref();
+  sleeper.ref();
+  sleeper.unref();
+  setTimeout(() => sleeper.kill(), 10);
+}

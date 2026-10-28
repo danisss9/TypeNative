@@ -221,6 +221,10 @@ func setPosition(n *ast.Node, obj map[string]any) {
 	line, character := scanner.GetECMALineAndUTF16CharacterOfPosition(parsedFile, scanner.GetTokenPosOfNode(n, parsedFile, false))
 	obj["line"] = line + 1
 	obj["column"] = int(character) + 1
+	// where it ends (exclusive): node:test coverage ranges
+	endLine, endCharacter := scanner.GetECMALineAndUTF16CharacterOfPosition(parsedFile, n.End())
+	obj["endLine"] = endLine + 1
+	obj["endColumn"] = int(endCharacter) + 1
 }
 
 // collectFields serializes a typed data struct's fields into obj, recursing

@@ -5,17 +5,62 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.2] - 2026-10-28
+
+`node:test` reporters, `run()`, coverage, snapshots and member mocks; four runnable examples
+with Node-vs-TypeNative benchmarks, examples type-checked and built by the conformance suite,
+and compiler fixes for names that shadow Go types, rest destructuring, number formatting, and
+`Number()` on optional values.
 
 ### Added
 
+- **`node:test`:**
+  - `run({ files })`: files with literal paths compile in as entry points and run as child
+    processes; their events stream back on a TestsStream — top-level numbering continues across
+    files, child output becomes `test:stdout` / `test:stderr`, per-file summaries and coverage
+    merge, and listeners get typed data (`run(…).on('test:fail', (data) => …)`)
+  - coverage with `--experimental-test-coverage`: counters compiled into the program map back
+    through the `//line` directives as V8-style ranges (functions, branches — class field
+    initializers included), with `node:coverage ignore` comments, `--test-coverage-include` /
+    `-exclude` and the `-lines` / `-branches` / `-functions` thresholds; the lcov records and
+    the tap / spec coverage table match Node's output
+  - snapshots: `t.assert.snapshot` / `t.assert.fileSnapshot` with `--test-update-snapshots`
+    (Node's `<test file>.snapshot` format), `snapshot.setDefaultSnapshotSerializers` /
+    `setResolveSnapshotPath`; a missing file or entry names the update flag
+  - `mock.method` / `mock.getter` / `mock.setter` on object literals, class instances
+    (inherited members included, other instances unaffected) and namespace functions
+    (`console.log`, `Math.random`, …); `.mock` reads the call record, `t.mock` restores after
+    each test
+  - failing tests report their `location` (`file:line:col`) in TAP, spec and junit
+  - `--test-reporter-destination` pairs with `--test-reporter` (a file, `stdout` or `stderr`)
+- **`node:test/reporters`:** `tap` / `dot` / `junit` as generator functions over an event
+  source (an array, an async generator, a stream such as `run()`'s) and `spec` / `lcov` as
+  Transform streams for `compose()` — Node's output, byte for byte
+- **Streams:** `compose()` (pipe into a stream, or hand the source to a function — an async
+  generator over the chunks, a reporter), and `.on()` / `.once()` return the stream, for
+  chaining as in Node
+- **Types:** `AsyncIterable<T>` / `AsyncIterableIterator<T>` / `AsyncGenerator<T>` map to
+  channels (like `Promise<T>`), so async-iterable parameters type-check
 - **Examples:** `todo-cli`, `dupe-finder`, `mandelbrot-png` and `desktop-notes` (a notes app in an
   Edge/Chrome app window), each with a Node-vs-TypeNative benchmark
 - **Conformance:** every `examples/*/main.ts` is type-checked and built by the suite as
   `example-<name>`
 
+### Changed
+
+- `conformance.md` lists npm packages published only as JavaScript/CommonJS as 🚫 (their
+  implementations have no types to compile from), not ❌
+
 ### Fixed
 
+- **Object-literal methods:** reading one as a value (`const f = obj.method`) no longer calls
+  it; getters still run on read, including when destructured (`const { double } = calc`)
+- **`node:stream`:** programs that use streams but not `util.inspect` compile again (a
+  `compose()` error message referenced `util.inspect`'s helper)
+- **Names:** variables and parameters named like Go types (`string`, `bool`, `int32`, ...) no
+  longer shadow the type; methods named like Go builtins (`copy()`, `len()`, `static make`) are
+  callable (the declaration was renamed, the call wasn't), and inherited methods named like Go
+  keywords (`range()`) compile
 - **Destructuring:** `const [a, ...rest] = arr` gives `rest` the remaining elements (it compiled to
   a single element)
 - **Numbers:** `String(n)`, templates and `JSON.stringify` print non-integers in plain notation
@@ -23,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without padding (`1e-7`, not `1e-07`)
 - **`Number()`:** converts optional strings and booleans (`Number(s)` with `s: string | undefined`
   gave `NaN`)
+- **Conformance:** the detached child-process probe no longer spawns Unix `sleep` on Windows
 
 ## [0.4.1] - 2026-10-24
 

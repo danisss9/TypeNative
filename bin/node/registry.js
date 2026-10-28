@@ -41,7 +41,10 @@ export function createNodeRegistry() {
         visit: (_node) => '',
         categoryOf: (_node) => '',
         isArrayBuffer: (_node) => false,
-        entryPoint: (_node) => ''
+        entryPoint: (_node) => '',
+        callSite: (_node) => ({ file: '', line: 0, column: 0 }),
+        mockMember: (_call, _tracker, _kind) => '',
+        mockMemberType: (_call, _kind) => ''
     };
     return registry;
 }

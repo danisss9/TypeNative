@@ -93,6 +93,10 @@ function convertNode(node) {
         const start = currentSourceFile.getLineAndCharacterOfPosition(node.getStart(currentSourceFile));
         obj.line = start.line + 1;
         obj.column = start.character + 1;
+        // where it ends (exclusive): node:test coverage ranges
+        const end = currentSourceFile.getLineAndCharacterOfPosition(node.end);
+        obj.endLine = end.line + 1;
+        obj.endColumn = end.character + 1;
     }
     if (TEXT_KINDS.has(node.kind)) {
         obj.text = node.text ?? node.escapedText;
