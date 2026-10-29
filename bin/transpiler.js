@@ -10203,9 +10203,10 @@ function isNilLiteral(node) {
 }
 function getAcessString(leftSide, rightSide, objectType) {
     if (rightSide === 'length' && objectType === 'string') {
-        // JS .length counts UTF-16 code units; rune count matches for the BMP
-        importedPackages.add('unicode/utf8');
-        return `float64(utf8.RuneCountInString(${leftSide}))`;
+        // JS .length counts UTF-16 code units; code points match for the BMP
+        // (O(1) for ASCII and recently indexed strings)
+        useHelper('strIndex');
+        return `TnStrLength(${leftSide})`;
     }
     if (rightSide === 'length' && objectType !== 'class') {
         return `float64(len(${leftSide}))`;
@@ -10786,14 +10787,15 @@ const stringMethodHandlers = {
         importedPackages.add('strings');
         return `strings.ToLower(${obj})`;
     },
+    // (string positions are code points: see the strIndex helpers)
     indexOf: (obj, args) => {
-        importedPackages.add('strings');
-        if (args.length < 2)
-            return `float64(strings.Index(${obj}, ${args[0]}))`;
-        // indexOf(x, from): search from the clamped position, index into the whole string
-        return `func() float64 { __s := ${obj}; __f := int(${args[1]}); if __f < 0 { __f = 0 }; if __f > len(__s) { __f = len(__s) }; __i := strings.Index(__s[__f:], ${args[0]}); if __i < 0 { return -1 }; return float64(__i + __f) }()`;
+        useHelper('strIndex');
+        return `TnStrIndexOf(${obj}, ${args[0]}, ${args[1] ?? '0'})`;
     },
-    charCodeAt: (obj, args) => `float64(${obj}[int(${args[0]})])`,
+    charCodeAt: (obj, args) => {
+        useHelper('strIndex');
+        return `TnCharCodeAt(${obj}, ${args[0] ?? '0'})`;
+    },
     localeCompare: (obj, args) => {
         importedPackages.add('strings');
         return `float64(strings.Compare(${obj}, ${args[0]}))`;
@@ -10822,16 +10824,17 @@ const stringMethodHandlers = {
         importedPackages.add('strings');
         return `strings.Repeat(${obj}, int(${args[0]}))`;
     },
-    charAt: (obj, args) => `string(${obj}[int(${args[0]})])`,
+    charAt: (obj, args) => {
+        useHelper('strIndex');
+        return `TnCharAt(${obj}, ${args[0] ?? '0'})`;
+    },
     substring: (obj, args) => {
-        if (args.length >= 2)
-            return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
-        return `${obj}[${sliceIndex(obj, args[0])}:]`;
+        useHelper('strIndex');
+        return `TnSubstring(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     slice: (obj, args) => {
-        if (args.length >= 2)
-            return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
-        return `${obj}[${sliceIndex(obj, args[0])}:]`;
+        useHelper('strIndex');
+        return `TnStrSlice(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
     // normalize('NFC' | 'NFD' | 'NFKC' | 'NFKD')
@@ -10844,14 +10847,12 @@ const stringMethodHandlers = {
         return `func() string { switch ${form} { case "NFD": return tnnorm.NFD.String(${obj}); case "NFKC": return tnnorm.NFKC.String(${obj}); case "NFKD": return tnnorm.NFKD.String(${obj}) }; return tnnorm.NFC.String(${obj}) }()`;
     },
     padStart: (obj, args) => {
-        importedPackages.add('strings');
-        const pad = args[1] ?? '" "';
-        return `func() string { __s := ${obj}; __n := int(${args[0]}) - len(__s); if __n > 0 { __s = strings.Repeat(${pad}, __n)[:__n] + __s }; return __s }()`;
+        useHelper('strIndex');
+        return `TnStrPad(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '" "'}, true)`;
     },
     padEnd: (obj, args) => {
-        importedPackages.add('strings');
-        const pad = args[1] ?? '" "';
-        return `func() string { __s := ${obj}; __n := int(${args[0]}) - len(__s); if __n > 0 { __s = __s + strings.Repeat(${pad}, __n)[:__n] }; return __s }()`;
+        useHelper('strIndex');
+        return `TnStrPad(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '" "'}, false)`;
     },
     match: (obj, args) => {
         if (isTnRegexArg(args[0])) {
@@ -10879,19 +10880,15 @@ const stringMethodHandlers = {
         return `func() float64 { __s := ${obj}; return TnMatchCharIndex(__s, ${toGoRegexp(args[0])}.FindStringIndex(__s)) }()`;
     },
     lastIndexOf: (obj, args) => {
-        importedPackages.add('strings');
-        if (args.length >= 2) {
-            useHelper('builtins');
-            return `TnLastIndexFrom(${obj}, ${args[0]}, ${args[1]})`;
-        }
-        return `float64(strings.LastIndex(${obj}, ${args[0]}))`;
+        useHelper('strIndex');
+        return `TnStrLastIndexOf(${obj}, ${args[0]}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     codePointAt: (obj, args) => {
-        useHelper('builtins');
+        useHelper('strIndex');
         return `TnCodePointAt(${obj}, ${args[0] ?? '0'})`;
     },
     substr: (obj, args) => {
-        useHelper('builtins');
+        useHelper('strIndex');
         return `TnSubstr(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     trimLeft: (obj) => {
@@ -10919,7 +10916,8 @@ const stringMethodHandlers = {
         return `strings.ToValidUTF8(${obj}, "\\uFFFD")`;
     },
     at: (obj, args) => {
-        return `func() string { __i := int(${args[0]}); if __i < 0 { __i = len(${obj}) + __i }; return string(${obj}[__i]) }()`;
+        useHelper('strIndex');
+        return `TnStrAt(${obj}, ${args[0] ?? '0'})`;
     },
     toString: (obj) => {
         importedPackages.add('fmt');
@@ -14050,7 +14048,8 @@ const helperRequires = {
     globalThis: ['dynamic'],
     namedGroups: ['orderedMap', 'regexMatch'],
     fancyRegex: ['orderedMap', 'regexMatch'],
-    dynamic: ['error'],
+    dynamic: ['error', 'strIndex'],
+    regexMatch: ['strIndex'],
     classes: ['dynamic', 'error', 'orderedMap'],
     arraySubclass: ['dynamic', 'classes'],
     moduleUrl: ['pathToFileURL'],
@@ -14734,9 +14733,10 @@ const helperPackages = {
     error: ['runtime', 'strings', 'fmt'],
     bigint: ['math/big', 'math'],
     symbol: [],
-    fancyRegex: ['regexp', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8'],
+    fancyRegex: ['regexp', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8', 'unicode'],
     namedGroups: ['regexp', 'unicode/utf8'],
     regexMatch: ['regexp', 'strings', 'strconv', 'math', 'unicode/utf8'],
+    strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings'],
     moduleUrl: ['os'],
     asyncWait: [],
     timerWait: ['sort', 'sync', 'sync/atomic', 'time'],
@@ -15071,30 +15071,6 @@ func TnBigIntAsN(bits float64, x *tnbig.Int, signed bool) *tnbig.Int {
 }
 
 // s.codePointAt(i): NaN past the end (JS: undefined)
-func TnCodePointAt(s string, i float64) float64 {
-	runes := []rune(s)
-	if i < 0 || int(i) >= len(runes) {
-		return math.NaN()
-	}
-	return float64(runes[int(i)])
-}
-
-// s.substr(start, length?)
-func TnSubstr(s string, start float64, length float64, hasLength bool) string {
-	n := float64(len(s))
-	if start < 0 {
-		start = math.Max(0, n+start)
-	}
-	start = math.Min(start, n)
-	end := n
-	if hasLength {
-		end = math.Min(n, start+math.Max(0, length))
-	}
-	if end <= start {
-		return ""
-	}
-	return s[int(start):int(end)]
-}
 
 // s.lastIndexOf(search, fromIndex)
 func TnLastIndexFrom(s, search string, from float64) float64 {
@@ -15354,7 +15330,7 @@ func TnGet(obj interface{}, key string) interface{} {
 		}
 	case string:
 		if key == "length" {
-			return float64(len(o))
+			return float64(tnStrCount(o))
 		}
 	case interface{ TnProp(string) (interface{}, bool) }:
 		if v, ok := o.TnProp(key); ok || key != "length" {
@@ -15582,8 +15558,8 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 			return o[int(i)]
 		}
 	case string:
-		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
-			return string(o[int(i)])
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < tnStrCount(o) {
+			return TnCharAt(o, i)
 		}
 	case []byte:
 		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) {
@@ -15726,17 +15702,10 @@ func TnAt[T any](s []T, i float64) T {
 	return s[int(i)]
 }
 
-func TnCharAt(s string, i float64) string {
-	if i < 0 || int(i) >= len(s) {
-		return ""
-	}
-	return string(s[int(i)])
-}
-
 func TnLength(v interface{}) float64 {
 	switch t := v.(type) {
 	case string:
-		return float64(len(t))
+		return float64(tnStrCount(t))
 	case []interface{}:
 		return float64(len(t))
 	case interface{ TnItems() *[]interface{} }:
@@ -16243,7 +16212,7 @@ func TnSlice(v interface{}, bounds ...float64) interface{} {
 	length := 0
 	switch t := v.(type) {
 	case string:
-		length = len(t)
+		length = tnStrCount(t)
 	case []interface{}:
 		length = len(t)
 	default:
@@ -16267,7 +16236,7 @@ func TnSlice(v interface{}, bounds ...float64) interface{} {
 		start = end
 	}
 	if s, ok := v.(string); ok {
-		return s[start:end]
+		return s[tnStrByte(s, start):tnStrByte(s, end)]
 	}
 	return v.([]interface{})[start:end]
 }
@@ -16730,6 +16699,278 @@ func TnArraySubclassFrom(cls *TnClass, v interface{}, fn ...interface{}) interfa
 		*a.TnItems() = items
 	}
 	return inst
+}`,
+    strIndex: `// String positions are code points (JS indices: UTF-16 units for the BMP).
+// An ASCII string indexes by byte; another goes through a table of the byte
+// offset of each code point, kept for the strings indexed most recently, so
+// a scan over one string (s.charCodeAt(i), s.slice(a, b), re.lastIndex)
+// costs O(1) per step after the first
+type tnStrIdx struct {
+	p     *byte
+	n     int
+	ascii bool
+	offs  []int  // offs[i]: byte offset of code point i; offs[count] == n
+	runes []rune // the code points (built on demand, for the regex engine)
+}
+
+var tnStrIdxCache [8]atomic.Pointer[tnStrIdx]
+var tnStrIdxNext atomic.Uint32
+
+func tnStrIsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func tnStrIndexOf(s string) *tnStrIdx {
+	p := unsafe.StringData(s)
+	for i := range tnStrIdxCache {
+		if c := tnStrIdxCache[i].Load(); c != nil && c.p == p && c.n == len(s) {
+			return c
+		}
+	}
+	c := &tnStrIdx{p: p, n: len(s), ascii: tnStrIsASCII(s)}
+	if !c.ascii {
+		c.offs = make([]int, 0, len(s)+1)
+		for b := 0; b < len(s); {
+			c.offs = append(c.offs, b)
+			_, size := utf8.DecodeRuneInString(s[b:])
+			b += size
+		}
+		c.offs = append(c.offs, len(s))
+	}
+	if len(s) >= 32 {
+		tnStrIdxCache[tnStrIdxNext.Add(1)%uint32(len(tnStrIdxCache))].Store(c)
+	}
+	return c
+}
+
+// The number of code points
+func tnStrCount(s string) int {
+	if len(s) < 32 && tnStrIsASCII(s) {
+		return len(s)
+	}
+	c := tnStrIndexOf(s)
+	if c.ascii {
+		return len(s)
+	}
+	return len(c.offs) - 1
+}
+
+// The byte offset of code point i (clamped to the string)
+func tnStrByte(s string, i int) int {
+	if i <= 0 {
+		return 0
+	}
+	if len(s) < 32 && tnStrIsASCII(s) {
+		return min(i, len(s))
+	}
+	c := tnStrIndexOf(s)
+	if c.ascii {
+		return min(i, len(s))
+	}
+	if i >= len(c.offs) {
+		return len(s)
+	}
+	return c.offs[i]
+}
+
+// The code point index of byte offset b
+func tnStrRune(s string, b int) int {
+	if b <= 0 {
+		return 0
+	}
+	if len(s) < 32 && tnStrIsASCII(s) {
+		return b
+	}
+	c := tnStrIndexOf(s)
+	if c.ascii {
+		return b
+	}
+	lo, hi := 0, len(c.offs)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if c.offs[mid] < b {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// The code points of s and their byte offsets (shared: read-only)
+func tnStrRunes(s string) ([]rune, []int) {
+	c := tnStrIndexOf(s)
+	if c.runes == nil {
+		runes := make([]rune, 0, len(s))
+		for b := 0; b < len(s); {
+			r, size := utf8.DecodeRuneInString(s[b:])
+			runes = append(runes, r)
+			b += size
+		}
+		c.runes = runes
+		if c.ascii {
+			c.offs = make([]int, len(s)+1)
+			for i := range c.offs {
+				c.offs[i] = i
+			}
+		}
+	}
+	return c.runes, c.offs
+}
+
+// A JS index argument as an int (NaN is 0, ±Infinity clamps)
+func tnStrPos(f float64) int {
+	if f != f {
+		return 0
+	}
+	if f > 1<<53 {
+		return 1 << 53
+	}
+	if f < -(1 << 53) {
+		return -(1 << 53)
+	}
+	return int(f)
+}
+
+func TnStrLength(s string) float64 { return float64(tnStrCount(s)) }
+
+// s[i] / s.charAt(i): "" out of range
+func TnCharAt(s string, i float64) string {
+	n := tnStrPos(i)
+	if i < 0 || n >= tnStrCount(s) {
+		return ""
+	}
+	b := tnStrByte(s, n)
+	if s[b] < 0x80 {
+		return s[b : b+1]
+	}
+	_, size := utf8.DecodeRuneInString(s[b:])
+	return s[b : b+size]
+}
+
+// s.charCodeAt(i): NaN out of range
+func TnCharCodeAt(s string, i float64) float64 {
+	n := tnStrPos(i)
+	if i < 0 || n >= tnStrCount(s) {
+		return math.NaN()
+	}
+	b := tnStrByte(s, n)
+	if s[b] < 0x80 {
+		return float64(s[b])
+	}
+	r, _ := utf8.DecodeRuneInString(s[b:])
+	return float64(r)
+}
+
+// s.at(i): from the end when negative
+func TnStrAt(s string, i float64) string {
+	n := tnStrPos(i)
+	if n < 0 {
+		n += tnStrCount(s)
+	}
+	if n < 0 {
+		return ""
+	}
+	return TnCharAt(s, float64(n))
+}
+
+// s.slice(start, end?)
+func TnStrSlice(s string, start float64, end float64, hasEnd bool) string {
+	count := tnStrCount(s)
+	a, b := tnStrPos(start), count
+	if hasEnd {
+		b = tnStrPos(end)
+	}
+	if a < 0 {
+		a = max(0, count+a)
+	}
+	if b < 0 {
+		b = max(0, count+b)
+	}
+	a, b = min(a, count), min(b, count)
+	if a >= b {
+		return ""
+	}
+	return s[tnStrByte(s, a):tnStrByte(s, b)]
+}
+
+// s.substring(start, end?): clamped, swapped when reversed
+func TnSubstring(s string, start float64, end float64, hasEnd bool) string {
+	count := tnStrCount(s)
+	a, b := min(max(tnStrPos(start), 0), count), count
+	if hasEnd {
+		b = min(max(tnStrPos(end), 0), count)
+	}
+	if a > b {
+		a, b = b, a
+	}
+	return s[tnStrByte(s, a):tnStrByte(s, b)]
+}
+
+// s.substr(start, length?)
+func TnSubstr(s string, start float64, length float64, hasLength bool) string {
+	count := tnStrCount(s)
+	a := tnStrPos(start)
+	if a < 0 {
+		a = max(0, count+a)
+	}
+	a = min(a, count)
+	b := count
+	if hasLength {
+		b = min(count, a+max(0, tnStrPos(length)))
+	}
+	if b <= a {
+		return ""
+	}
+	return s[tnStrByte(s, a):tnStrByte(s, b)]
+}
+
+// s.indexOf(search, from?)
+func TnStrIndexOf(s string, search string, from float64) float64 {
+	b := tnStrByte(s, max(0, tnStrPos(from)))
+	i := strings.Index(s[b:], search)
+	if i < 0 {
+		return -1
+	}
+	return float64(tnStrRune(s, b+i))
+}
+
+// s.lastIndexOf(search, from?)
+func TnStrLastIndexOf(s string, search string, from float64, hasFrom bool) float64 {
+	end := len(s)
+	if hasFrom && from == from {
+		end = min(len(s), tnStrByte(s, max(0, tnStrPos(from)))+len(search))
+	}
+	i := strings.LastIndex(s[:end], search)
+	if i < 0 {
+		return -1
+	}
+	return float64(tnStrRune(s, i))
+}
+
+// s.codePointAt(i)
+func TnCodePointAt(s string, i float64) float64 {
+	return TnCharCodeAt(s, i)
+}
+
+// s.padStart / padEnd(length, pad?): lengths in code points
+func TnStrPad(s string, length float64, pad string, atStart bool) string {
+	missing := tnStrPos(length) - tnStrCount(s)
+	if missing <= 0 || pad == "" {
+		return s
+	}
+	unit := tnStrCount(pad)
+	fill := strings.Repeat(pad, missing/unit+1)
+	fill = fill[:tnStrByte(fill, missing)]
+	if atStart {
+		return fill + s
+	}
+	return s + fill
 }`,
     iterable: `// Symbol.iterator in x: arrays, strings, Maps, Sets, generators and
 // classes with a [Symbol.iterator]() method
@@ -17669,7 +17910,7 @@ func TnMatchCharIndex(s string, loc []int) float64 {
 	if loc == nil {
 		return -1
 	}
-	return float64(utf8.RuneCountInString(s[:loc[0]]))
+	return float64(tnStrRune(s, loc[0]))
 }
 
 func TnRegexpExec(re *regexp.Regexp, s string) []string {
@@ -17677,7 +17918,7 @@ func TnRegexpExec(re *regexp.Regexp, s string) []string {
 	if loc == nil {
 		return nil
 	}
-	return tnMatchArray(s, loc, utf8.RuneCountInString(s[:loc[0]]))
+	return tnMatchArray(s, loc, tnStrRune(s, loc[0]))
 }
 
 func TnRegexpMatchAll(re *regexp.Regexp, s string) [][]string {
@@ -17759,7 +18000,7 @@ func TnRegexExecNamed(re *regexp.Regexp, s string) *TnMatch {
 	if loc == nil {
 		return nil
 	}
-	res := &TnMatch{groups: TnNewMap[string, string](), index: float64(utf8.RuneCountInString(s[:loc[0]]))}
+	res := &TnMatch{groups: TnNewMap[string, string](), index: float64(tnStrRune(s, loc[0]))}
 	for i, name := range re.SubexpNames() {
 		if name != "" && 2*i < len(loc) {
 			group := ""
@@ -17776,6 +18017,7 @@ func TnRegexExecNamed(re *regexp.Regexp, s string) *TnMatch {
 // backtracking engine).
 type TnRegex struct {
 	re        *regexp.Regexp
+	anchored  *regexp.Regexp
 	bt        *tnBt
 	lastIndex float64
 	global    bool
@@ -17797,8 +18039,17 @@ func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
 	}
 	if re, err := regexp.Compile(prefix + pattern); err == nil {
 		r.re = re
+		// /y matches only at lastIndex: anchored, so a miss costs no scan
+		if r.sticky {
+			r.anchored = regexp.MustCompile(prefix + "\\\\A(?:" + pattern + ")")
+		}
 	} else {
 		r.bt = tnBtCompile(pattern)
+		if r.bt != nil {
+			r.bt.icase = strings.Contains(flags, "i")
+			r.bt.multiline = strings.Contains(flags, "m")
+			r.bt.dotAll = strings.Contains(flags, "s")
+		}
 	}
 	return r
 }
@@ -17831,7 +18082,7 @@ func (r *TnRegex) Find(s string) []string {
 	groups, loc := r.find(s)
 	// find tags /g and /y matches with their index as it moves lastIndex
 	if groups != nil && !r.global && !r.sticky {
-		tnSetMatchIndex(groups, utf8.RuneCountInString(s[:loc[0]]))
+		tnSetMatchIndex(groups, tnStrRune(s, loc[0]))
 	}
 	return groups
 }
@@ -17850,7 +18101,7 @@ func (r *TnRegex) FindSub(s string) []string {
 	}
 	groups, loc := r.matchAt(&tnRegexInput{s: s}, 0, false)
 	if groups != nil {
-		tnSetMatchIndex(groups, utf8.RuneCountInString(s[:loc[0]]))
+		tnSetMatchIndex(groups, tnStrRune(s, loc[0]))
 	}
 	return groups
 }
@@ -17949,8 +18200,8 @@ type tnRegexInput struct {
 
 func (in *tnRegexInput) runes() ([]rune, []int) {
 	if in.offs == nil {
-		in.runs = []rune(in.s)
-		in.offs = tnByteOffsets(in.runs)
+		// (shared with the string's index: not rebuilt per match)
+		in.runs, in.offs = tnStrRunes(in.s)
 	}
 	return in.runs, in.offs
 }
@@ -17979,7 +18230,11 @@ func (r *TnRegex) scan(s string, yield func(groups []string, loc []int) bool) {
 // sticky); loc holds byte offsets
 func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, []int) {
 	if r.bt == nil {
-		loc := r.re.FindStringSubmatchIndex(in.s[start:])
+		re := r.re
+		if sticky && r.anchored != nil {
+			re = r.anchored
+		}
+		loc := re.FindStringSubmatchIndex(in.s[start:])
 		if loc == nil || (sticky && loc[0] != 0) {
 			return nil, nil
 		}
@@ -17997,7 +18252,7 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 		for i := range caps {
 			caps[i] = -1
 		}
-		m := &tnBtMatchState{runs: runs, caps: caps}
+		m := &tnBtMatchState{runs: runs, caps: caps, bt: r.bt}
 		end := -1
 		if m.match(r.bt.root, pos, func(e int) bool { end = e; return true }) {
 			caps[0], caps[1] = pos, end
@@ -18025,24 +18280,20 @@ func (r *TnRegex) find(s string) ([]string, []int) {
 	if !r.global && !r.sticky {
 		return r.matchAt(in, 0, false)
 	}
-	start, skipped := 0, 0
-	for skipped < int(r.lastIndex) && start < len(s) {
-		_, size := utf8.DecodeRuneInString(s[start:])
-		start += size
-		skipped++
-	}
-	if skipped < int(r.lastIndex) {
+	// (lastIndex is a code point index: its byte offset from the string's index)
+	if r.lastIndex < 0 || int(r.lastIndex) > tnStrCount(s) {
 		r.lastIndex = 0
 		return nil, nil
 	}
+	start := tnStrByte(s, int(r.lastIndex))
 	groups, loc := r.matchAt(in, start, r.sticky)
 	if groups == nil {
 		r.lastIndex = 0
 		return nil, nil
 	}
-	index := int(r.lastIndex) + utf8.RuneCountInString(s[start:loc[0]])
+	index := tnStrRune(s, loc[0])
 	tnSetMatchIndex(groups, index)
-	next := float64(index + utf8.RuneCountInString(s[loc[0]:loc[1]]))
+	next := float64(tnStrRune(s, loc[1]))
 	if loc[1] == loc[0] {
 		next++
 	}
@@ -18080,8 +18331,11 @@ type tnBtNode struct {
 }
 
 type tnBt struct {
-	root    *tnBtNode
-	ngroups int
+	root      *tnBtNode
+	ngroups   int
+	icase     bool
+	multiline bool
+	dotAll    bool
 }
 
 type tnBtParser struct {
@@ -18467,6 +18721,12 @@ func (p *tnBtParser) peekAt(offset int) (rune, bool) {
 type tnBtMatchState struct {
 	runs []rune
 	caps []int
+	bt   *tnBt
+}
+
+// Line terminators for . and multiline ^ $ (as JS defines them)
+func tnBtLineEnd(r rune) bool {
+	return r == '\\n' || r == '\\r' || r == 0x2028 || r == 0x2029
 }
 
 func (m *tnBtMatchState) seq(nodes []*tnBtNode, pos int, k func(int) bool) bool {
@@ -18485,28 +18745,35 @@ func tnBtWord(r rune) bool {
 func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 	switch node.op {
 	case "char":
-		if pos < len(m.runs) && m.runs[pos] == node.ch {
+		if pos < len(m.runs) && (m.runs[pos] == node.ch || m.bt.icase && unicode.ToLower(m.runs[pos]) == unicode.ToLower(node.ch)) {
 			return k(pos + 1)
 		}
 		return false
 	case "any":
-		if pos < len(m.runs) && m.runs[pos] != '\\n' {
+		if pos < len(m.runs) && (m.bt.dotAll || !tnBtLineEnd(m.runs[pos])) {
 			return k(pos + 1)
 		}
 		return false
 	case "class":
-		if pos < len(m.runs) && node.cls(m.runs[pos]) != node.negCls {
-			return k(pos + 1)
+		if pos < len(m.runs) {
+			r := m.runs[pos]
+			in := node.cls(r)
+			if !in && m.bt.icase {
+				in = node.cls(unicode.ToLower(r)) || node.cls(unicode.ToUpper(r))
+			}
+			if in != node.negCls {
+				return k(pos + 1)
+			}
 		}
 		return false
 	case "anchor":
 		switch node.anchor {
 		case '^':
-			if pos == 0 {
+			if pos == 0 || m.bt.multiline && tnBtLineEnd(m.runs[pos-1]) {
 				return k(pos)
 			}
 		case '$':
-			if pos == len(m.runs) {
+			if pos == len(m.runs) || m.bt.multiline && tnBtLineEnd(m.runs[pos]) {
 				return k(pos)
 			}
 		case 'b':
