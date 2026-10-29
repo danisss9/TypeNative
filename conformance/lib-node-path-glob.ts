@@ -18,9 +18,14 @@ const cases: [string, string][] = [
   ['x/y', 'x/y'],
   ['x/y', 'x'],
   ['lib/deep/nested/mod.js', '**/*.js'],
-  ['mod.js', '**/*.js']
+  ['mod.js', '**/*.js'],
+  ['/home/a/x.ts', '**/x.ts'],
+  ['/x.ts', '**/x.ts'],
+  ['/home/a/x.ts', '**'],
+  ['/home/a/x.ts', '*/a/x.ts'],
+  ['../a/x.ts', '**/x.ts']
 ];
-const expected = [true, false, true, true, true, false, true, true, true, false, true, false, true, true, true, false, true, true];
+const expected = [true, false, true, true, true, false, true, true, true, false, true, false, true, true, true, false, true, true, true, true, true, false, false];
 for (let i = 0; i < cases.length; i++) {
   const p = cases[i][0];
   const g = cases[i][1];
