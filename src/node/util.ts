@@ -269,8 +269,30 @@ func (ins *tnInspector) format(v interface{}, depth int) string {
 }
 
 func (ins *tnInspector) formatError(e *TnError, name string, fields []tnField, depth int) string {
-	base := name + ": " + e.message
-	if e.message == "" {
+	// an Error subclass's own name / message fields (set after super()) are
+	// the ones its stack shows, as in Node
+	message := e.message
+	own := fields[:0:0]
+	for _, f := range fields {
+		switch f.name {
+		case "name":
+			if s, ok := f.value.(string); ok {
+				name = s
+			}
+			continue
+		case "message":
+			if s, ok := f.value.(string); ok {
+				message = s
+			}
+			continue
+		case "stack":
+			continue
+		}
+		own = append(own, f)
+	}
+	fields = own
+	base := name + ": " + message
+	if message == "" {
 		base = name
 	}
 	out := []string{}

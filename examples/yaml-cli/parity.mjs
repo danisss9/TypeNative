@@ -4,7 +4,8 @@
 // main.ts to a native binary with the TypeNative CLI from this repo checkout,
 // then feeds every test's in.yaml to both, in each mode: default (re-emit the
 // YAML), --json, valid and lex. stdout, stderr and the exit code must match
-// byte for byte. Failures are written to .cache/failures/.
+// byte for byte (stack frames aside: see withoutStackFrames). Failures are
+// written to .cache/failures/.
 //
 // Usage:  node parity.mjs [filter]     (filter: a test id substring or a mode)
 
@@ -75,8 +76,25 @@ function exec(command, args, input) {
   });
 }
 
+// Node prints an error's stack ("    at …" lines, the frames of the JS call
+// stack); a native binary has no JS frames to show. The frames are dropped
+// (an inspected error's own properties, which follow the last frame as " {",
+// stay where they are); warnings' process ids differ too
+function withoutStackFrames(buffer) {
+  const out = [];
+  for (const line of buffer.toString().split('\n')) {
+    if (/^ {4}at /.test(line)) {
+      if (line.endsWith(' {')) out[out.length - 1] += ' {';
+      continue;
+    }
+    // (and process warnings name the process id)
+    out.push(line.replace(/^\(node:\d+\) /, '(node) '));
+  }
+  return Buffer.from(out.join('\n'));
+}
+
 function sameOutput(a, b) {
-  return a.code === b.code && a.stdout.equals(b.stdout) && a.stderr.equals(b.stderr);
+  return a.code === b.code && a.stdout.equals(b.stdout) && withoutStackFrames(a.stderr).equals(withoutStackFrames(b.stderr));
 }
 
 function report(failure) {

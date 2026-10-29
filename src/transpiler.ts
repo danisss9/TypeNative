@@ -759,6 +759,7 @@ function parseAndLower(code: string): AstNode {
   lowerNestedDestructuring(sourceFile);
   lowerPrototypeCalls(sourceFile);
   lowerConstructorCalls(sourceFile);
+  lowerForOfAssignments(sourceFile);
   lowerExpandoFunctions(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
@@ -1261,6 +1262,32 @@ function lowerNestedDestructuring(node: AstNode): void {
 
 // Built-ins that construct when called without `new`: RegExp(…), Error(…)
 const CONSTRUCTING_BUILTINS = new Set(['RegExp', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'Array']);
+
+// for (x of xs) / for (obj.k of xs) with an existing target: a fresh loop
+// variable assigned to it, so the target keeps the last element after the loop
+//   for (const __fo of xs) { x = __fo; … }
+let forOfTargetCount = 0;
+function lowerForOfAssignments(node: AstNode): void {
+  for (const child of childNodes(node)) lowerForOfAssignments(child);
+  if (node.kind !== 'ForOfStatement' || !node.initializer || isVariableDeclarationList(node.initializer)) return;
+  const target = node.initializer;
+  if (!isIdentifier(target) && !isPropertyAccessExpression(target) && !isElementAccessExpression(target)) return;
+  const at = { line: node.line, column: node.column };
+  const name = `__fo${++forOfTargetCount}`;
+  const loopVar: AstNode = { kind: 'Identifier', text: name, ...at };
+  node.initializer = {
+    kind: 'VariableDeclarationList', declarationKind: 'const', ...at,
+    declarations: [{ kind: 'VariableDeclaration', name: loopVar, ...at }]
+  };
+  const assign: AstNode = {
+    kind: 'ExpressionStatement', ...at,
+    expression: { kind: 'BinaryExpression', left: target, operatorToken: { kind: 'EqualsToken' }, right: { kind: 'Identifier', text: name, ...at }, ...at }
+  };
+  const body = node.statement;
+  node.statement = isBlock(body)
+    ? { ...body, statements: [assign, ...(body.statements ?? [])] }
+    : { kind: 'Block', statements: [assign, body], ...at };
+}
 
 function lowerConstructorCalls(node: AstNode): void {
   for (const child of childNodes(node)) lowerConstructorCalls(child);
@@ -1938,7 +1965,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // constructor function is expected (make(Box) for a construct signature)
     // its NewBox function
     if (classNames.has(node.text) && isClassValueReference(node) && !isTypeParameterInScope(node.text, node)) {
-      return expectsConstructorFunction(node) ? `New${getSafeName(node.text)}` : classValue(node.text);
+      return expectsConstructorFunction(node) ? `TnCtorOf(${classValue(node.text)}, New${getSafeName(node.text)})` : classValue(node.text);
     }
     // Array references: reads go through the shared slice-header pointer
     // (`arr === null` tests the reference itself)
@@ -4419,7 +4446,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       const names = params.map((_t: string, i: number) => `__a${i}`);
       const created = `TnNew(${[classValue(classRef.text), ...names].join(', ')})`;
       const body = !result ? created : result === 'interface{}' ? `return ${created}` : `return TnAs[${result}](${created})`;
-      return `func(${params.map((t: string, i: number) => `${names[i]} ${t}`).join(', ')})${result ? ` ${result}` : ''} { ${body} }`;
+      return `TnCtorOf(${classValue(classRef.text)}, func(${params.map((t: string, i: number) => `${names[i]} ${t}`).join(', ')})${result ? ` ${result}` : ''} { ${body} })`;
     }
   }
   // T | undefined into an any slot: its value, or nil (not a typed nil pointer)
@@ -4481,6 +4508,12 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (isDynamicValue(castSource) || dynamicElements) {
         useHelper('dynamic');
         return `func() ${goType} { __v := TnAs[${goType.slice(1)}](${visit(castSource)}); return &__v }()`;
+      }
+      // an object's array field (it.sep): its address, so the callee's
+      // pushes and splices change the field (the array is shared, as in JS)
+      if (isPropertyAccessExpression(unwrapParentheses(expr)) && !hasQuestionDot(unwrapParentheses(expr)) && inferExpressionType(expr) === goType.slice(1)) {
+        const field = visit(expr);
+        if (/^[\w.()*]+$/.test(field) && !field.endsWith(')')) return `&${field}`;
       }
       // re.exec(s) / s.match(re): no match is null, not an empty array
       const call = unwrapParentheses(expr);
@@ -6238,12 +6271,63 @@ function arrayElementTypeNode(typeNode: AstNode | undefined): AstNode | undefine
   return undefined;
 }
 
+// The object type literals a union consists of (aliases resolved), or
+// undefined when it has other members
+function objectLiteralUnionMembers(types: AstNode[]): AstNode[] | undefined {
+  const members = types.map((t: AstNode) => {
+    const r = resolveTypeNode(t);
+    if (isTypeReferenceNode(r) && isIdentifier(r.typeName)) {
+      const alias = declaredTypeAliases.get(r.typeName.text);
+      if (alias?.kind === 'TypeLiteral') return alias;
+    }
+    return r;
+  });
+  if (members.length < 2 || !members.every((m: AstNode | undefined) => m?.kind === 'TypeLiteral')) return undefined;
+  if (members.some((m: AstNode) => (m.members ?? []).some((f: AstNode) => !isPropertySignature(f) || !isIdentifier(f.name)))) return undefined;
+  return members as AstNode[];
+}
+
+// A union of object type literals as one struct: each field is the members'
+// common type (one present in only some of them is optional; one whose
+// types differ is any; never contributes nothing)
+function mergedObjectUnionType(types: AstNode[]): string | undefined {
+  const members = objectLiteralUnionMembers(types);
+  if (!members) return undefined;
+  const order: string[] = [];
+  const fieldTypes = new Map<string, Set<string>>();
+  const presence = new Map<string, number>();
+  for (const member of members) {
+    for (const f of member.members ?? []) {
+      const name: string = f.name.text;
+      if (!fieldTypes.has(name)) {
+        fieldTypes.set(name, new Set());
+        presence.set(name, 0);
+        order.push(name);
+      }
+      presence.set(name, (presence.get(name) ?? 0) + 1);
+      if (f.type?.kind === 'NeverKeyword') continue;
+      fieldTypes.get(name)!.add(getOptionalNodeType(f.type, !!f.questionToken));
+    }
+  }
+  const fields = order.map((name) => {
+    const typesOf = [...fieldTypes.get(name)!];
+    // (T and *T: the nullable one)
+    const bare = new Set(typesOf.map((t) => (NULLABLE_PRIMITIVE_TYPES.includes(t) ? t.slice(1) : t)));
+    let goType = typesOf.length === 0 ? 'interface{}' : bare.size === 1 ? typesOf.find((t) => t.startsWith('*')) ?? typesOf[0] : 'interface{}';
+    if (presence.get(name)! < members.length) goType = makeNullableType(goType);
+    return `${goFieldName(name)} ${goType}`;
+  });
+  return `*struct{ ${fields.join('; ')} }`;
+}
+
 // An object literal's contextual type; of a union of object types (a
 // discriminated union), the member the literal is: the one its `type: '…'`
 // (any string-literal-typed key) selects, else the first with all its keys
 function objectLiteralContextualType(node: AstNode): AstNode | undefined {
   const contextual = resolveTypeNode(getContextualTypeNode(node));
   if (!contextual || !isUnionTypeNode(contextual)) return contextual;
+  // (a union of object type literals is one merged object type)
+  if (objectLiteralUnionMembers((contextual.types ?? []).filter((t: AstNode) => t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword'))) return contextual;
   const members = (contextual.types ?? [])
     .map((t: AstNode) => resolveTypeNode(t))
     .filter((t: AstNode | undefined) => !!t && t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword') as AstNode[];
@@ -6692,6 +6776,15 @@ function getMemberTypeNode(typeNode: AstNode, name: string): AstNode | undefined
     return found;
   }
   if (isRecordTypeNode(resolved)) return resolved.typeArguments[1];
+  // a union of object type literals: the member type the field has (not never)
+  if (isUnionTypeNode(resolved)) {
+    const members = objectLiteralUnionMembers((resolved.types ?? []).filter((t: AstNode) => t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword'));
+    for (const member of members ?? []) {
+      const field = (member.members ?? []).find((f: AstNode) => f.name.text === name && f.type?.kind !== 'NeverKeyword');
+      if (field) return field.type;
+    }
+    return undefined;
+  }
   // an anonymous Go object type: its field's Go type
   if (resolved.kind === 'TnGoType') {
     const fieldType = getStructFieldGoType(resolved.goType, name);
@@ -7588,6 +7681,11 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     return `[]${getArrayLiteralElementType(expr)}`;
   }
   if (isObjectLiteralExpression(expr)) return recordSpreadType(expr) ?? getObjectLiteralGoType(expr);
+  // new f(…) where f holds a constructor function: its result
+  if (isNewExpression(expr) && !(isIdentifier(expr.expression) && classNames.has(expr.expression.text))) {
+    const ctorType = expr.expression.kind === 'ThisKeyword' ? '' : (inferExpressionType(expr.expression) ?? '');
+    if (ctorType.startsWith('func(')) return goFuncReturnType(ctorType) ?? 'interface{}';
+  }
   // new (expr)(…) / new x(…) where x holds a class value: any instance
   if (isNewExpression(expr) && (!isIdentifier(expr.expression) && expr.expression.kind !== 'ThisKeyword' && !isPropertyAccessExpression(expr.expression) || (isIdentifier(expr.expression) && variableGoTypes.get(expr.expression.text) === 'interface{}'))) {
     return 'interface{}';
@@ -8808,7 +8906,7 @@ function objectAssignTargetType(call: AstNode): string | undefined {
     !!t && (t.startsWith('*TnMap[') || (t.startsWith('*') && (isStructGoType(t.slice(1)) || classNames.has(t.slice(1)))));
   if (!isObjectLiteralExpression(target)) {
     const t = inferExpressionType(target);
-    return assignable(t) ? t : undefined;
+    return assignable(t) ? t : 'interface{}';
   }
   const contextual = getContextualTypeNode(call);
   let expected = contextual ? getType(contextual) : undefined;
@@ -9803,6 +9901,10 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       // Pointer/interface types already support nil
       return innerType;
     }
+    // { kind: 'a', … } | { kind: 'b', … }: one object type with every
+    // member's fields (JS objects of these shapes are interchangeable)
+    const merged = mergedObjectUnionType(nonNullTypes);
+    if (merged) return merged;
     // Non-nullable union or multi-type union → interface{}
     return 'interface{}';
   }
@@ -10464,12 +10566,14 @@ const callHandlers: Record<string, CallHandler> = {
   'Object.assign': (_caller, args) => {
     const call = currentCallNode;
     const targetType = call ? objectAssignTargetType(call) : undefined;
-    if (call && targetType) {
+    // (an existing object is updated in place and returned, whatever its type)
+    const existingTarget = !!call && (call.arguments ?? []).length > 0 && !isObjectLiteralExpression(unwrapParentheses(call.arguments[0])) && !(call.arguments ?? []).some((a: AstNode) => isSpreadElement(a));
+    if (call && (targetType || existingTarget)) {
       useHelper('objectAssignTo');
       const target = unwrapParentheses(call.arguments[0]);
       // a literal target: a fresh value of the type, its own properties first
       const literal = isObjectLiteralExpression(target);
-      const head = literal ? newGoValueOf(targetType) : args[0];
+      const head = literal ? newGoValueOf(targetType ?? "") : args[0];
       const sources = literal && (target.properties ?? []).length > 0 ? [dynamicObjectLiteral(target), ...args.slice(1)] : args.slice(1);
       return `TnAssignTo(${[head, ...sources].join(', ')})`;
     }
@@ -15187,6 +15291,28 @@ func TnIsArray(v interface{}) bool {
 }`,
   dynamic: `// Dynamic (any) values: JSON-like objects are map[string]interface{},
 // arrays []interface{}, numbers float64
+// A nullable primitive (*T) as the JS value it holds: its T, or undefined
+func tnPlainValue(v interface{}) interface{} {
+	switch p := v.(type) {
+	case *string:
+		if p == nil {
+			return nil
+		}
+		return *p
+	case *float64:
+		if p == nil {
+			return nil
+		}
+		return *p
+	case *bool:
+		if p == nil {
+			return nil
+		}
+		return *p
+	}
+	return v
+}
+
 func TnGet(obj interface{}, key string) interface{} {
 	switch o := obj.(type) {
 	case map[string]interface{}:
@@ -15226,7 +15352,8 @@ func TnGet(obj interface{}, key string) interface{} {
 		for _, name := range []string{key, key + "_"} {
 			if f := rv.Elem().FieldByName(name); f.IsValid() {
 				// Unexported field: read it through a pointer to bypass the flag
-				return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
+				// (a T | undefined field reads as its value, or undefined)
+				return tnPlainValue(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface())
 			}
 		}
 		// a getter (get x() → Get_x)
@@ -15405,6 +15532,22 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 				*items = append(*items, nil)
 			}
 			(*items)[int(i)] = value
+			return
+		}
+	}
+	// a typed array (a slice, or an array reference that can grow)
+	if i, ok := key.(float64); ok && i >= 0 && i == float64(int(i)) {
+		rv := reflect.ValueOf(obj)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+			sv := rv.Elem()
+			for sv.Len() <= int(i) {
+				sv.Set(reflect.Append(sv, reflect.Zero(sv.Type().Elem())))
+			}
+			sv.Index(int(i)).Set(tnConvertTo(value, sv.Type().Elem()))
+			return
+		}
+		if rv.Kind() == reflect.Slice && int(i) < rv.Len() {
+			rv.Index(int(i)).Set(tnConvertTo(value, rv.Type().Elem()))
 			return
 		}
 	}
@@ -16387,8 +16530,20 @@ func TnClassOf(v interface{}) interface{} {
 }
 
 // x instanceof C, with C a class value
+// Classes passed where a constructor function is expected: the function,
+// remembered as the class (so x instanceof fn still finds it)
+var tnCtorClasses = map[uintptr]*TnClass{}
+
+func TnCtorOf[F any](cls *TnClass, fn F) F {
+	tnCtorClasses[reflect.ValueOf(fn).Pointer()] = cls
+	return fn
+}
+
 func TnInstanceOf(v interface{}, cls interface{}) bool {
 	c, ok := cls.(*TnClass)
+	if fv := reflect.ValueOf(cls); !ok && fv.Kind() == reflect.Func && !fv.IsNil() {
+		c, ok = tnCtorClasses[fv.Pointer()]
+	}
 	if !ok || v == nil {
 		return false
 	}
