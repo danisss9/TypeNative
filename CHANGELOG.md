@@ -19,9 +19,9 @@ and compiler fixes for names that shadow Go types, rest destructuring, number fo
     processes; their events stream back on a TestsStream — top-level numbering continues across
     files, child output becomes `test:stdout` / `test:stderr`, per-file summaries and coverage
     merge, and listeners get typed data (`run(…).on('test:fail', (data) => …)`)
-  - coverage with `--experimental-test-coverage`: counters compiled into the program map back
-    through the `//line` directives as V8-style ranges (functions, branches — class field
-    initializers included), with `node:coverage ignore` comments, `--test-coverage-include` /
+  - coverage with `--experimental-test-coverage`: programs that import `node:test` count what
+    runs over V8-style source ranges (functions, blocks, ternary arms, `&&` / `||` / `??`
+    operands, class field initializers), with `node:coverage ignore` comments, `--test-coverage-include` /
     `-exclude` and the `-lines` / `-branches` / `-functions` thresholds; the lcov records and
     the tap / spec coverage table match Node's output
   - snapshots: `t.assert.snapshot` / `t.assert.fileSnapshot` with `--test-update-snapshots`

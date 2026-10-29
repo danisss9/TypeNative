@@ -1343,6 +1343,7 @@ function collectInterfaceProperties(iface: AstNode, into: Map<string, string>, s
 
 function visit(node: AstNode, options: VisitNodeOptions = {}): string {
   let code: string = '';
+  if (typeof node?.covExpr === 'number' && !options.skipCoverage) return visitCountedOperand(node, options);
 
   // Reads of a narrowed nullable property path dereference it
   if (narrowedVariables.size > 0 && isPropertyAccessExpression(node) && !options.skipNarrowing) {
@@ -3505,6 +3506,8 @@ export type VisitNodeOptions = {
   addFunctionOutside?: boolean;
   isOutside?: boolean;
   skipNarrowing?: boolean;
+  // the right operand of && / || / ?? without its coverage counter
+  skipCoverage?: boolean;
 };
 
 // Renders composite literal entries; multi-line entries need trailing commas
@@ -4978,7 +4981,7 @@ function registerStructAccessors(structType: string, node: AstNode): void {
     const registry = isGetter ? structGetterFields : structMethodFields;
     let names = registry.get(structType);
     if (!names) {
-      names = new Set();
+      names = new Set<string>();
       registry.set(structType, names);
     }
     names.add(goFieldName(p.name.text));
@@ -11163,6 +11166,7 @@ interface CoverageFile {
 }
 
 const coverageFiles: CoverageFile[] = [];
+const COVERAGE_LOGICAL = new Set(['AmpersandAmpersandToken', 'BarBarToken', 'QuestionQuestionToken']);
 const COVERAGE_LOOPS = new Set(['ForStatement', 'ForInStatement', 'ForOfStatement', 'WhileStatement', 'DoStatement']);
 const COVERAGE_FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunction', 'MethodDeclaration', 'GetAccessor', 'SetAccessor', 'Constructor']);
 
@@ -11221,12 +11225,15 @@ function coverageRange(file: CoverageFile, kind: number, node: AstNode, counter:
   let startColumn: number = node.column ?? 1;
   // `export function f`: V8's range starts at `function`
   if (kind === 1 && (node.modifiers ?? []).length > 0 && startColumn < 2) startColumn = 2;
+  const startLine: number = node.line ?? 1;
+  const endLine: number = node.endLine ?? startLine;
+  const endColumn: number = node.endColumn ?? 1;
   file.ranges.push({
     kind: kind,
-    startLine: node.line ?? 1,
+    startLine: startLine,
     startColumn: startColumn,
-    endLine: node.endLine ?? node.line ?? 1,
-    endColumn: node.endColumn ?? 1,
+    endLine: endLine,
+    endColumn: endColumn,
     counter: counter,
     name: name,
     parent: parent,
@@ -11276,8 +11283,10 @@ function coverageWalk(node: AstNode, file: CoverageFile, parent: number, fn: num
       const last = fields[fields.length - 1];
       const r = coverageRange(file, 1, fields[0], coverageCounters++, '<instance_members_initializer>', parent, -1);
       file.ranges[r].fn = r;
-      file.ranges[r].endLine = last.endLine ?? file.ranges[r].endLine;
-      file.ranges[r].endColumn = last.endColumn ?? file.ranges[r].endColumn;
+      const lastLine: number = last.endLine ?? file.ranges[r].endLine;
+      const lastColumn: number = last.endColumn ?? file.ranges[r].endColumn;
+      file.ranges[r].endLine = lastLine;
+      file.ranges[r].endColumn = lastColumn;
       node.covFields = file.ranges[r].counter;
       for (const m of fields) coverageWalk(m.initializer, file, r, r);
     }
@@ -11317,6 +11326,14 @@ function coverageWalk(node: AstNode, file: CoverageFile, parent: number, fn: num
     }
     return;
   }
+  if (isBinaryExpression(node) && COVERAGE_LOGICAL.has(node.operatorToken?.kind)) {
+    // V8 counts the right operand of && / || / ?? (it may not run)
+    coverageWalk(node.left, file, parent, fn);
+    const r = coverageRange(file, 2, node.right, coverageCounters++, '', parent, fn);
+    node.right.covExpr = file.ranges[r].counter;
+    coverageWalk(node.right, file, r, fn);
+    return;
+  }
   if (isConditionalExpression(node)) {
     coverageWalk(node.condition, file, parent, fn);
     const t = coverageRange(file, 2, node.whenTrue, coverageCounters++, '', parent, fn);
@@ -11336,10 +11353,11 @@ function coverageWalk(node: AstNode, file: CoverageFile, parent: number, fn: num
 
 // A branch's body (then / else / a loop's statement): a block range it enters
 function coverageBranch(owner: AstNode, body: AstNode, file: CoverageFile, parent: number, fn: number): AstNode {
-  let block = body;
+  let block: AstNode = body;
   if (!isBlock(body)) {
-    block = { kind: 'Block', statements: [body], parent: owner };
-    body.parent = block;
+    const wrapper: AstNode = { kind: 'Block', statements: [body], parent: owner };
+    body.parent = wrapper;
+    block = wrapper;
   }
   const r = coverageRange(file, 2, body, coverageCounters++, '', parent, fn);
   block.covEnter = file.ranges[r].counter;
@@ -11359,7 +11377,9 @@ function coverageStatements(statements: AstNode[], file: CoverageFile, parent: n
     if (!jump && !compound) continue;
     const p = file.ranges[parent];
     const counter = jump ? -1 : coverageCounters++;
-    file.ranges.push({ kind: 2, startLine: s.endLine, startColumn: s.endColumn, endLine: p.endLine, endColumn: p.endColumn, counter: counter, name: '', parent: parent, fn: fn });
+    const startLine: number = s.endLine;
+    const startColumn: number = s.endColumn ?? 1;
+    file.ranges.push({ kind: 2, startLine: startLine, startColumn: startColumn, endLine: p.endLine, endColumn: p.endColumn, counter: counter, name: '', parent: parent, fn: fn });
     if (!jump) s.covAfter = counter;
   }
 }
@@ -11385,6 +11405,19 @@ function coverageAfter(node: AstNode): string {
 function coverageLoaded(sf: AstNode): string {
   const counter = sf?.covLoaded;
   return typeof counter === 'number' ? `${coverageCount(counter)}\n\t` : '';
+}
+
+// The right operand of && / || / ??: tnCovAt counts it and passes the value
+// through with its own Go type. Not where the value isn't used (`ok && log()`
+// can be a void call) nor for an untyped nil
+function visitCountedOperand(node: AstNode, options: VisitNodeOptions): string {
+  const code = visit(node, { ...options, skipCoverage: true });
+  let statement = node.parent;
+  while (statement && (isBinaryExpression(statement) || statement.kind === 'ParenthesizedExpression')) statement = statement.parent;
+  const type = inferExpressionType(node) ?? '';
+  if (!code.trim() || code.trim() === 'nil' || !type || type === 'nil' || type === 'void' || isExpressionStatement(statement)) return code;
+  coverageEmitted.add(node.covExpr);
+  return `tnCovAt(${node.covExpr}, ${code})`;
 }
 
 // An expression-bodied arrow's func code: the counter right inside its body
@@ -11432,7 +11465,7 @@ function coverageTables(): string {
       ranges.push(`{${fi}, ${parent}, ${positions[r.fn]}, ${r.kind}, ${counter}, ${JSON.stringify(r.name)}, ${r.startLine}, ${firstLine}, ${lastLine}, ${allIgnored}}`);
     }
   }
-  return `var tnCov = make([]uint32, ${Math.max(coverageCounters, 1)})\n\nvar tnCovFiles = []tnCovFile{\n\t${files.join(',\n\t')},\n}\n\nvar tnCovRanges = []tnCovRange{\n\t${ranges.join(',\n\t')},\n}`;
+  return `var tnCov = make([]uint32, ${Math.max(coverageCounters, 1)})\n\n// A counted operand's value\nfunc tnCovAt[T any](counter int, value T) T {\n\ttnCov[counter]++\n\treturn value\n}\n\nvar tnCovFiles = []tnCovFile{\n\t${files.join(',\n\t')},\n}\n\nvar tnCovRanges = []tnCovRange{\n\t${ranges.join(',\n\t')},\n}`;
 }
 
 function bindNodeRegistryServices(): void {
