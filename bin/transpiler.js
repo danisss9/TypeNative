@@ -377,6 +377,8 @@ function setVarGoType(name, goType) {
 }
 // Struct field / member names: Go keywords get a trailing underscore
 function goFieldName(name) {
+    if (goIdentifierChars(name) !== name)
+        return goFieldName(goIdentifierChars(name));
     return name !== 'main' && dangerousNames.has(name) ? `${name}_` : name;
 }
 function isFieldNameIdentifier(node) {
@@ -487,6 +489,7 @@ function parseSource(code) {
     lowerClassExpressions(sourceFile);
     lowerWeakCollections(sourceFile);
     lowerGlobalThis(sourceFile);
+    lowerSetPrototypeIdiom(sourceFile);
     linkParents(sourceFile, undefined);
     sourceFile.fileIndex = sourceFileNames.length;
     sourceFileNames.push(currentFileName);
@@ -947,6 +950,22 @@ function lowerWeakCollections(node) {
     if (isIdentifier(name) && (name.text === 'WeakMap' || name.text === 'WeakSet'))
         name.text = name.text.slice(4);
 }
+// `Object.setPrototypeOf(this, X.prototype)` in a constructor: the workaround for
+// subclassing Error under ES5 targets. A class is already its own Go type, so it's dropped.
+function isSetPrototypeOfCall(node) {
+    return (node?.kind === 'CallExpression' &&
+        node.expression?.kind === 'PropertyAccessExpression' &&
+        node.expression.expression?.kind === 'Identifier' &&
+        node.expression.expression.text === 'Object' &&
+        node.expression.name?.text === 'setPrototypeOf');
+}
+function lowerSetPrototypeIdiom(node) {
+    for (const child of childNodes(node))
+        lowerSetPrototypeIdiom(child);
+    if (node.kind !== 'Constructor' || !Array.isArray(node.body?.statements))
+        return;
+    node.body.statements = node.body.statements.filter((s) => !(s.kind === 'ExpressionStatement' && isSetPrototypeOfCall(s.expression) && s.expression.arguments?.[0]?.kind === 'ThisKeyword'));
+}
 // globalThis.x (typed) is the global x itself; (globalThis as any) stays a dynamic object
 function lowerGlobalThis(node) {
     for (const key of Object.keys(node)) {
@@ -1235,6 +1254,11 @@ function visit(node, options = {}) {
     }
     else if (isJsxNode(node)) {
         return visitJsx(node);
+    }
+    else if (isIdentifier(node) && node.text === 'Function' && !isFieldNameIdentifier(node) && !importAliases.has('Function')) {
+        // `Function` as a value (`const Type = Function`): a sentinel; `instanceof Function` is handled above
+        useHelper('functionValue');
+        return 'TnFunction';
     }
     else if (isIdentifier(node) && node.text === 'globalThis') {
         useHelper('globalThis');
@@ -2037,6 +2061,9 @@ function visit(node, options = {}) {
         return visitConditionalExpression(node);
     }
     else if (isBinaryExpression(node)) {
+        if (isAssignmentOperatorKind(node.operatorToken.kind) && !isStatementPosition(node)) {
+            return visitAssignmentValue(node);
+        }
         if (node.operatorToken.kind === 'QuestionQuestionToken') {
             return visitNullishCoalescingExpression(node);
         }
@@ -2093,19 +2120,22 @@ function visit(node, options = {}) {
             if (logical)
                 return logical;
         }
-        // x ??= v → assign only when x is nil
-        if (node.operatorToken.kind === 'BarBarEqualsToken' || node.operatorToken.kind === 'AmpersandAmpersandEqualsToken') {
-            // a ||= b assigns when a is falsy; a &&= b when a is truthy
-            const target = visit(node.left);
-            const condition = toGoCondition(node.left);
-            const value = toGoValueOfType(node.right, inferExpressionType(node.left));
-            const test = node.operatorToken.kind === 'BarBarEqualsToken' ? `!${wrapCondition(condition)}` : condition;
-            return `if ${test} { ${target} = ${value} }`;
-        }
-        if (node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
-            const target = visit(node.left);
-            const value = toGoValueOfType(node.right, inferExpressionType(node.left));
-            return `if ${target} == nil { ${target} = ${value} }`;
+        // x ??= v → assign only when x is nil; a ||= b when a is falsy; a &&= b when a is truthy
+        // (the write goes through `a = b`, so map elements and dynamic objects are set properly)
+        if (node.operatorToken.kind === 'BarBarEqualsToken' ||
+            node.operatorToken.kind === 'AmpersandAmpersandEqualsToken' ||
+            node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
+            const kind = node.operatorToken.kind;
+            const test = kind === 'QuestionQuestionEqualsToken'
+                ? nullishTargetTest(node.left)
+                : kind === 'BarBarEqualsToken'
+                    ? `!${wrapCondition(toGoCondition(node.left))}`
+                    : toGoCondition(node.left);
+            const operator = { kind: 'EqualsToken' };
+            const plain = { kind: 'BinaryExpression', left: node.left, operatorToken: operator, right: node.right, parent: node.parent };
+            const statement = { kind: 'ExpressionStatement', expression: plain, parent: node.parent };
+            plain.parent = statement;
+            return `if ${test} { ${visit(plain).trim()} }`;
         }
         let op = operatorTokenText(node.operatorToken);
         if (op === '===')
@@ -3635,6 +3665,51 @@ function nullableKeys(exprs) {
 }
 // Identifier occurrences that read the variable (not declarations, member
 // names, or assignment targets)
+// The ??= test: a map element is missing (or a nil value), anything else is nil
+function nullishTargetTest(target) {
+    if (isElementAccessExpression(target)) {
+        const mapType = inferExpressionType(target.expression);
+        if (mapType?.startsWith('*TnMap[')) {
+            const map = visit(target.expression);
+            const key = toGoValueOfType(target.argumentExpression, extractMapKeyType(mapType));
+            const missing = `!${map}.Has(${key})`;
+            return isNilableGoType(extractMapValueType(mapType)) ? `(${missing} || ${map}.Get(${key}) == nil)` : missing;
+        }
+    }
+    return `${visit(target)} == nil`;
+}
+function isAssignmentOperatorKind(kind) {
+    return kind === 'EqualsToken' || (kind.endsWith('EqualsToken') && !['EqualsEqualsToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsToken', 'ExclamationEqualsEqualsToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind));
+}
+// Whether an expression's value is unused: an expression statement, a for header's
+// initializer / update, a void arrow's body, or a part of a comma list in one of those
+function isStatementPosition(node) {
+    const parent = node.parent;
+    if (!parent)
+        return true;
+    if (isExpressionStatement(parent))
+        return true;
+    if (isForStatement(parent) && (parent.initializer === node || parent.incrementor === node))
+        return true;
+    if (isParenthesizedExpression(parent) || parent.kind === 'VoidExpression')
+        return isStatementPosition(parent);
+    if (isBinaryExpression(parent) && parent.operatorToken.kind === 'CommaToken') {
+        return parent.left === node || isStatementPosition(parent);
+    }
+    if (isArrowFunction(parent) && parent.body === node)
+        return !inferFunctionBodyReturnType(parent);
+    return false;
+}
+// (target = value) used as a value: assign, then read the target back
+function visitAssignmentValue(node) {
+    const statement = { kind: 'ExpressionStatement', expression: node, parent: node.parent };
+    const savedParent = node.parent;
+    node.parent = statement;
+    const write = visit(node).trim();
+    node.parent = savedParent;
+    const goType = inferExpressionType(node.left) ?? 'interface{}';
+    return `func() ${goType} { ${write}; return ${visit(node.left)} }()`;
+}
 function isNarrowableReference(node) {
     const parent = node.parent;
     if (!parent)
@@ -4714,6 +4789,10 @@ function privateNameOwner(node, privateName) {
 }
 // x instanceof Map / Set / Date / Array on built-in values
 function builtinInstanceOf(value, name) {
+    if (name === 'Function') {
+        importedPackages.add('reflect');
+        return `func() bool { v := interface{}(${value}); return v != nil && reflect.TypeOf(v).Kind() == reflect.Func }()`;
+    }
     if (name === 'Map' || name === 'WeakMap' || name === 'Set' || name === 'WeakSet') {
         useHelper('orderedMap');
         const kind = name.endsWith('Map') ? 1 : 2;
@@ -5439,6 +5518,10 @@ function getContextualTypeNode(node) {
         }
     }
     if (isAsExpression(parent) || isTypeAssertionExpression(parent) || parent.kind === 'SatisfiesExpression') {
+        // `x as const` only narrows literals: the context is the as-expression's own
+        if (isTypeReferenceNode(parent.type) && isIdentifier(parent.type.typeName) && parent.type.typeName.text === 'const') {
+            return getContextualTypeNode(parent);
+        }
         return parent.type;
     }
     if ((isVariableDeclaration(parent) || isPropertyDeclaration(parent) || parent.kind === 'Parameter') &&
@@ -5975,6 +6058,9 @@ function inferExpressionType(expr) {
         return '*TnMockFunctionContext';
     if (expr?.kind === 'ThisKeyword')
         return thisGoType(expr);
+    // (target = value) is the target, after the write
+    if (isBinaryExpression(expr) && isAssignmentOperatorKind(expr.operatorToken.kind))
+        return inferExpressionType(expr.left);
     if (isAwaitExpression(expr)) {
         // await unwraps the promise channel
         const inner = inferExpressionType(expr.expression);
@@ -6689,6 +6775,8 @@ function inferObjectCallType(expr) {
         return inferExpressionType(expr.arguments?.[0]);
     if (OBJECT_INTEGRITY_CHECKS[name] || name === 'hasOwn')
         return 'bool';
+    if (name === 'create')
+        return 'interface{}';
     if (name === 'getOwnPropertyNames')
         return inferExpressionType({ ...expr, expression: { ...expr.expression, name: { kind: 'Identifier', text: 'keys' } } });
     return undefined;
@@ -6697,6 +6785,18 @@ function visitObjectCall(node) {
     const name = getObjectCallName(node);
     if (!name)
         return undefined;
+    if (name === 'setPrototypeOf') {
+        reportError(node, 'Object.setPrototypeOf: prototypes are fixed (only setPrototypeOf(this, …) in a constructor is accepted, as a no-op)');
+        return 'nil';
+    }
+    // Object.create(null): a prototype-less dictionary — an empty dynamic object
+    if (name === 'create') {
+        if ((node.arguments ?? [])[0]?.kind !== 'NullKeyword') {
+            reportError(node, 'Object.create: prototypes are fixed (only Object.create(null) is accepted, as an empty object)');
+            return 'nil';
+        }
+        return 'map[string]interface{}{}';
+    }
     const args = node.arguments ?? [];
     if (OBJECT_INTEGRITY_LEVELS[name]) {
         useHelper('objectIntegrity');
@@ -10116,7 +10216,14 @@ const goPackageIdentifiers = new Set([
 ]);
 // Local names of `go:` package imports (`import * as strings from 'go:strings'`)
 const goPackageLocalNames = new Set();
+// `$` isn't valid in a Go identifier: ǂ (U+01C2, a letter to Go) stands in for it
+function goIdentifierChars(name) {
+    // only a bare identifier: callers also pass whole expressions (a callee like re.MatchString)
+    return /^[A-Za-z_$][\w$]*$/.test(name) && name.includes('$') ? name.split('$').join('ǂ') : name;
+}
 function getSafeName(name) {
+    if (goIdentifierChars(name) !== name)
+        return getSafeName(goIdentifierChars(name));
     if (!dangerousNames.has(name) && !(goPackageIdentifiers.has(name) && !goPackageLocalNames.has(name))) {
         return name;
     }
@@ -10773,6 +10880,7 @@ const helperRequires = {
     objectAssign: ['orderedMap'],
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
     promise: ['error', 'eventLoop', 'asyncWait'],
+    functionValue: [],
     goMust: ['error'],
     goMaps: ['orderedMap'],
     bigint: ['error'],
@@ -11508,6 +11616,7 @@ const helperPackages = {
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
     promise: ['sync'],
+    functionValue: [],
     goMust: [],
     goNums: [],
     goMaps: [],
@@ -13197,7 +13306,7 @@ func tnJSONFieldName(name string) string {
 	if strings.HasSuffix(name, "_") && tnGoKeywords[strings.TrimSuffix(name, "_")] {
 		return strings.TrimSuffix(name, "_")
 	}
-	return name
+	return strings.ReplaceAll(name, "ǂ", "$")
 }
 
 // Writes one value; false when it serializes to undefined (functions)
@@ -16275,6 +16384,10 @@ func TnDecorateClass(result interface{}) {
 		panic("class decorators cannot replace the class")
 	}
 }`,
+    functionValue: `// The global Function used as a value: an opaque sentinel
+type tnFunctionConstructor struct{}
+
+var TnFunction interface{} = &tnFunctionConstructor{}`,
     promise: `// Promises are channels; a rejected promise is a closed channel with a reason
 var tnRejections sync.Map
 

@@ -18,6 +18,10 @@ interface Function {
 interface CallableFunction extends Function {}
 interface NewableFunction extends Function {}
 
+/** The global `Function` as a value: an opaque constructor (`x instanceof Function` checks for a function); calling it compiles code, which a native binary cannot */
+interface FunctionConstructor extends Function {}
+declare var Function: FunctionConstructor;
+
 interface IArguments {
   [index: number]: any;
   length: number;
@@ -574,6 +578,10 @@ interface JSON {
 declare var JSON: JSON;
 
 interface ObjectConstructor {
+  /** Only `Object.create(null)`: an empty, prototype-less dictionary */
+  create(proto: null): any;
+  /** Only `Object.setPrototypeOf(this, …)` in a constructor (the Error-subclassing idiom), as a no-op */
+  setPrototypeOf(o: any, proto: object | null): any;
   /** SameValue: NaN is NaN, +0 is not -0 */
   is(a: any, b: any): boolean;
   groupBy<T>(items: T[], keySelector: (item: T, index: number) => string | number): Record<string, T[]>;
