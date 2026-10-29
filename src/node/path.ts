@@ -101,6 +101,10 @@ func tnGlobRegexp(g string, escapes bool) string {
 		segStart = false
 		switch {
 		case c == '*' && i+1 < len(g) && g[i+1] == '*' && wasStart && (i+2 == len(g) || g[i+2] == '/'):
+			// a leading ** also matches an absolute path's root ('**/a.ts' matches '/x/a.ts')
+			if i == 0 {
+				b.WriteString("/?")
+			}
 			if i+2 == len(g) {
 				b.WriteString("(?:[^/.][^/]*(?:/[^/.][^/]*)*)?")
 				i++
