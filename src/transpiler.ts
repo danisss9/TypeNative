@@ -2254,19 +2254,19 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           const primitive = genericMemberPrimitive(node.initializer, rawProp)!;
           useHelper('dynamic');
           parts.push(`${localName} := TnAs[${primitive}]((${initExpr}).${goFieldName(propName)})`);
-          registerLocalVariable(localName, primitive);
+          registerLocalVariable(bindingName(el, localName), primitive);
           continue;
         } else {
           parts.push(`${localName} := (${initExpr}).${goFieldName(propName)}`);
         }
         registerLocalVariable(
-          localName,
+          bindingName(el, localName),
           defaultVal ? (inferExpressionType(defaultVal) ?? fieldType) : (fieldType ?? (!initType || initType === 'interface{}' ? 'interface{}' : undefined))
         );
         // the member's declared type (its function type's optional parameters …)
         const sourceTypeNode = getExpressionTypeNode(node.initializer);
         const memberTypeNode = sourceTypeNode && isIdentifier(rawProp) ? getMemberTypeNode(sourceTypeNode, rawProp.text) : undefined;
-        if (memberTypeNode) variableTypeNodes.set(localName, memberTypeNode);
+        if (memberTypeNode) variableTypeNodes.set(bindingName(el, localName), memberTypeNode);
       }
       return parts.concat(destructuredUseMarks(node)).join(';\n\t');
     }
@@ -2291,7 +2291,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           }
           ensureGoTypePackages(tupleType);
           parts.push(`${localName} := ${tmpVar}[${idx}].(${goLocalType(tupleType)})`);
-          registerLocalVariable(localName, tupleType);
+          registerLocalVariable(bindingName(el, localName), tupleType);
           return;
         }
         if (isOmittedExpression(el)) return;
@@ -2301,7 +2301,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           // `...rest` copies the remaining elements (empty past the end)
           importedPackages.add('slices');
           parts.push(`${localName} := slices.Clone(${tmpVar}[min(${idx}, len(${tmpVar})):])`);
-          registerLocalVariable(localName, initGoType?.startsWith('[]') ? initGoType : undefined);
+          registerLocalVariable(bindingName(el, localName), initGoType?.startsWith('[]') ? initGoType : undefined);
           return;
         }
         const defaultVal = bindEl.initializer;
@@ -2319,7 +2319,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           parts.push(`${localName} := TnAt(${tmpVar}, float64(${idx}))`);
         }
         registerLocalVariable(
-          localName,
+          bindingName(el, localName),
           defaultVal ? inferExpressionType(defaultVal) : elemType
         );
       });
@@ -2869,9 +2869,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // a dynamic value, or a typed object (a class instance, a struct): by
       // property name (an unset field is absent)
       const rightType = inferExpressionType(node.right) ?? '';
-      if (isDynamicValue(node.right) || (!rightType.startsWith('*TnMap[') && rightType.startsWith('*'))) {
+      if (isDynamicValue(node.right) || !rightType.startsWith('*TnMap[')) {
         useHelper('dynamic');
-        return `TnHas(${visit(node.right)}, ${visit(node.left)})`;
+        return `TnHas(interface{}(${visit(node.right)}), ${visit(node.left)})`;
       }
       return `${visit(node.right)}.Has(${visit(node.left)})`;
     }
@@ -3464,8 +3464,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const enclosingFn = getEnclosingFunction(node);
     const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
+    // (the function's result type as its signature declares it: computed
+    // without the narrowing in effect here)
     const returnGoType =
-      enclosingFn && !isAsync ? inferFunctionBodyReturnType(enclosingFn) : undefined;
+      enclosingFn && !isAsync ? withoutNarrowing(() => inferFunctionBodyReturnType(enclosingFn)) : undefined;
     // TS closures passed as Go callbacks return the Go result type
     const goCallbackResult = enclosingFn ? goCallbackResultType(enclosingFn) : undefined;
     const value = !node.expression
@@ -3551,7 +3553,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const inferredRetType = inferFunctionBodyReturnType(node);
     const returnType = inferredRetType ? ` ${inferredRetType}` : '';
     if (parameterInfo.prefixBlockContent && !isBlock(node.body)) {
-      return `func(${parameterInfo.signature})${returnType} {\n\t\t${coverageEnter(node)}${parameterInfo.prefixBlockContent}return ${visit(node.body)};\n\t}`;
+      return `func(${parameterInfo.signature})${returnType} {\n\t\t${coverageEnter(node)}${parameterInfo.prefixBlockContent}return ${toGoValueOfType(node.body, inferredRetType)};\n\t}`;
     }
     if (!isBlock(node.body)) {
       // void-style calls (console.*, assert) emit statements, not values
@@ -3562,7 +3564,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         discardedExpressions.add(statement);
         return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}${visit(statement)}; }`;
       }
-      return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}return ${visit(node.body as AstNode)}; }`;
+      // (the result converts to the declared or contextual result type)
+      return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}return ${toGoValueOfType(node.body as AstNode, inferredRetType)}; }`;
     }
     return `func(${parameterInfo.signature})${returnType} ${visit(node.body, {
       prefixBlockContent: parameterInfo.prefixBlockContent
@@ -4483,6 +4486,15 @@ function getNarrowingKey(expr: AstNode): string | undefined {
   return undefined;
 }
 
+// Runs compute with no variable narrowed
+function withoutNarrowing<T>(compute: () => T): T {
+  const saved = [...narrowedVariables];
+  narrowedVariables.clear();
+  const result = compute();
+  for (const name of saved) narrowedVariables.add(name);
+  return result;
+}
+
 // Emits `emit()` with `names` narrowed
 function withNarrowing(names: string[], emit: () => string): string {
   const added = names.filter((n) => !narrowedVariables.has(n));
@@ -4762,7 +4774,7 @@ function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
   if (isCompound && leftDynamic) {
     const binOp = op.slice(0, -1);
     const converted = isConcat
-      ? `${visit(node.left)} + ${visit(node.right)}`
+      ? `TnDynamicAdd(${visit(node.left)}, ${visit(node.right)})`
       : `TnAs[float64](${visit(node.left)}) ${binOp} ${operand(node.right, rightDynamic)}`;
     useHelper('dynamic');
     return `${visit(node.left)} = ${converted}`;
@@ -5265,10 +5277,15 @@ function getPropertyDeclarationType(member: AstNode): string {
 function sortArray(obj: string, args: string[]): string {
   importedPackages.add('sort');
   const arrayType = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType : '[]interface{}';
-  let less = `(${args[0]})(__s[i], __s[j]) < 0`;
+  // (elements converted to the comparator's parameter types)
+  const comparatorType = currentCallArgTypes[0] ?? '';
+  const paramTypes = comparatorType.startsWith('func(') ? goFuncParamTypes(comparatorType) : [];
+  const element = (v: string, i: number) => (paramTypes[i] && !paramTypes[i].startsWith('...') ? convertBetweenGoTypes(v, arrayType.slice(2), paramTypes[i]) : v);
+  let less = `(${args[0]})(${element('__s[i]', 0)}, ${element('__s[j]', 1)}) < 0`;
   if (!args[0]) {
-    importedPackages.add('fmt');
-    less = `fmt.Sprintf("%v", __s[i]) < fmt.Sprintf("%v", __s[j])`;
+    // the default order compares the elements as strings
+    useHelper('dynamic');
+    less = `TnJSString(__s[i]) < TnJSString(__s[j])`;
   }
   return `func() ${arrayType} { __s := ${obj}; sort.SliceStable(__s, func(i, j int) bool { return ${less} }); return __s }()`;
 }
@@ -6725,6 +6742,9 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
   if (isArrayLiteralExpression(parent)) {
     const arrayType = resolveTypeNode(getContextualTypeNode(parent));
     if (isArrayTypeNode(arrayType)) return arrayType.elementType;
+    if (isTypeReferenceNode(arrayType) && isIdentifier(arrayType.typeName) && ['Array', 'ReadonlyArray'].includes(arrayType.typeName.text) && (arrayType.typeArguments ?? []).length === 1) {
+      return arrayType.typeArguments[0];
+    }
     // a Go array type: its element (a named object type, or an anonymous one)
     if (arrayType?.kind === 'TnGoType' && /^\*?\[\]/.test(arrayType.goType)) {
       const elementGoType = arrayType.goType.replace(/^\*?\[\]/, '');
@@ -7318,6 +7338,16 @@ function isMockAccess(node: AstNode): boolean {
 }
 
 function inferExpressionType(expr: AstNode): string | undefined {
+  const inferred = inferExpressionTypeOf(expr);
+  if (inferred !== undefined) return inferred;
+  // a method called on a dynamic value goes through a dispatcher: any result
+  if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && !hasQuestionDot(expr.expression) && expr.expression.expression.kind !== 'SuperKeyword' && isDynamicValue(expr.expression.expression)) {
+    return 'interface{}';
+  }
+  return undefined;
+}
+
+function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
   // an Array subclass's elements are any (its type parameters are erased)
   if (isElementAccessExpression(expr) && expr.expression.kind !== 'TnArrayItems' && arraySubclassOf(expr.expression) && !isStringLiteral(expr.argumentExpression)) {
@@ -7397,6 +7427,10 @@ function inferExpressionType(expr: AstNode): string | undefined {
     return `[]${getArrayLiteralElementType(expr)}`;
   }
   if (isObjectLiteralExpression(expr)) return recordSpreadType(expr) ?? getObjectLiteralGoType(expr);
+  // new (expr)(…) / new x(…) where x holds a class value: any instance
+  if (isNewExpression(expr) && (!isIdentifier(expr.expression) && expr.expression.kind !== 'ThisKeyword' && !isPropertyAccessExpression(expr.expression) || (isIdentifier(expr.expression) && variableGoTypes.get(expr.expression.text) === 'interface{}'))) {
+    return 'interface{}';
+  }
   // new this(…) in a static method: an instance of the class declaring it
   if (isNewExpression(expr) && expr.expression.kind === 'ThisKeyword') {
     const owner = getEnclosingClassName(expr);
@@ -8144,24 +8178,26 @@ function visitObjectCall(node: AstNode): string | undefined {
       return `TnDefineProperty(${visit(args[0])}, ${toGoValueOfType(key, 'string')}, ${isObjectLiteralExpression(descriptor) ? 'nil' : visit(descriptor)})`;
     }
     const target = visit(args[0]);
+    // (a property key as JS converts it: a string)
+    const keyString = jsStringOf(visit(key), inferExpressionType(key));
     if (isDynamicValue(args[0])) {
       useHelper('dynamic');
-      return `TnSet(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+      return `TnSet(${target}, ${keyString}, ${visit(valueProp.initializer)})`;
     }
     if (objectType.startsWith('*TnMap[')) {
-      return `${target}.Set(${visit(key)}, ${toGoValueOfType(valueProp.initializer, extractMapValueType(objectType))})`;
+      return `${target}.Set(${toGoValueOfType(key, extractMapKeyType(objectType))}, ${toGoValueOfType(valueProp.initializer, extractMapValueType(objectType))})`;
     }
     if (!isStringLiteral(key)) {
       const fieldNames = objectFieldNames(objectType);
       if (fieldNames.length === 0) {
         useHelper('dynamic');
-        return `TnSet(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+        return `TnSet(${target}, ${keyString}, ${visit(valueProp.initializer)})`;
       }
       useHelper('dynamic');
       const cases = fieldNames.map(
         (f) => `case ${toGoStringLiteral(f)}: o.${goFieldName(f)} = TnAs[${getObjectFieldGoType(objectType, f) ?? 'interface{}'}](v)`
       );
-      return `func(o ${objectType}, k string, v interface{}) { switch k { ${cases.join('; ')} } }(${target}, ${visit(key)}, ${visit(valueProp.initializer)})`;
+      return `func(o ${objectType}, k string, v interface{}) { switch k { ${cases.join('; ')} } }(${target}, ${keyString}, ${visit(valueProp.initializer)})`;
     }
     return `${target}.${goFieldName(key.text)} = ${toGoValueOfType(valueProp.initializer, getObjectFieldGoType(objectType, key.text))}`;
   }
@@ -8916,7 +8952,7 @@ function visitOptionalCall(node: AstNode): string {
       useHelper('error');
       const callee = node.expression;
       const fnValue =
-        isPropertyAccessExpression(callee) && hasDynamicProperties(callee.expression) && !hasQuestionDot(callee)
+        isPropertyAccessExpression(callee) && hasDynamicProperties(callee.expression) && (!hasQuestionDot(callee) || isDynamicValue(callee.expression))
           ? `TnGet(${visit(callee.expression)}, ${toGoStringLiteral(callee.name.text)})`
           : visit(callee);
       return `func() interface{} { ${fn} := ${fnValue}; if TnIsNil(${fn}) { return nil }; return TnCallValue(${[fn, args].filter((a) => a).join(', ')}) }()`;
@@ -9063,6 +9099,16 @@ function buildArrayCallbackInfo(
     };
   }
 
+  // a predicate (some / filter / find …) whose result isn't a boolean: its truthiness
+  const callbackType = functionValueGoType(callback) ?? '';
+  const callbackResult = callbackType.startsWith('func(') ? goFuncReturnType(callbackType) : undefined;
+  if (forcedReturnType === 'bool' && callbackType.startsWith('func(') && callbackResult !== 'bool' && !(isIdentifier(callback) && callback.text === 'Boolean')) {
+    const arity = Math.min(goFuncParamTypes(callbackType).length, paramTypes.length);
+    const names = ['__v', '__i', '__a'].slice(0, arity);
+    const params = names.map((n, i) => `${n} ${paramTypes[i]}`).join(', ');
+    const call = `(${visit(callback)})(${names.map((n, i) => convertBetweenGoTypes(n, paramTypes[i], goFuncParamTypes(callbackType)[i])).join(', ')})`;
+    return { fnExpr: `func(${params}) bool { return ${truthinessCheck(call, callbackResult)} }`, paramCount: arity, returnType: 'bool' };
+  }
   // (String / Number / Boolean as callbacks return their primitive)
   const builtinResult = isIdentifier(callback) && !variableGoTypes.has(callback.text)
     ? ({ String: 'string', Number: 'float64', Boolean: 'bool' } as Record<string, string>)[callback.text]
@@ -9799,10 +9845,21 @@ function getTypeCategory(typeNode: AstNode | undefined): string | undefined {
     if (name === 'Map') return 'Map';
     if (name === 'Set') return 'Set';
     if (classNames.has(name)) return 'class';
+    if ((name === 'Array' || name === 'ReadonlyArray') && !classNames.has(name)) return 'array';
+    // an alias: its target's category
+    const alias = declaredTypeAliases.get(name);
+    if (alias && alias.kind !== 'TypeLiteral' && !aliasCategoryCheck.has(name)) {
+      aliasCategoryCheck.add(name);
+      const category = getTypeCategory(alias);
+      aliasCategoryCheck.delete(name);
+      return category;
+    }
     return name;
   }
   return undefined;
 }
+
+const aliasCategoryCheck = new Set<string>();
 
 function getClassNameFromTypeNode(typeNode: AstNode): string | undefined {
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
@@ -10739,9 +10796,16 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
   // concat(a, [b, c], d): arrays are flattened one level, other values appended
   concat: (obj, args) => {
-    const parts = args.map((arg, i) =>
-      currentCallArgTypes[i]?.startsWith('[]') ? `__r = append(__r, ${arg}...)` : `__r = append(__r, ${arg})`
-    );
+    const parts = args.map((arg, i) => {
+      if (currentCallArgTypes[i]?.startsWith('[]')) return `__r = append(__r, ${arg}...)`;
+      // a dynamic value: flattened when it is an array at run time
+      if (currentCallArgTypes[i] === 'interface{}' && receiverElementType() === 'interface{}') {
+        useHelper('isArray');
+        useHelper('arraySubclass');
+        return `if __c := ${arg}; TnIsArray(__c) { __r = append(__r, TnToArray(__c)...) } else { __r = append(__r, __c) }`;
+      }
+      return `__r = append(__r, ${arg})`;
+    });
     return `func() []${receiverElementType()} { __r := append([]${receiverElementType()}{}, ${obj}...); ${parts.join('; ')}; return __r }()`;
   },
   toSorted: (obj, args) => {
@@ -12131,6 +12195,13 @@ function genericMemberPrimitive(source: AstNode, name: AstNode): string | undefi
   return ['string', 'float64', 'bool'].includes(goType) ? goType : undefined;
 }
 
+// The TS name a binding element declares (type tables are keyed by it, not
+// by its Go name: `type` is emitted as a renamed identifier)
+function bindingName(element: AstNode, goName: string): string {
+  const name = element?.name ?? element;
+  return isIdentifier(name) ? name.text : goName;
+}
+
 // `_ = x` for each name a destructuring declaration binds in a function
 // (JS allows locals that are never read; Go does not)
 function destructuredUseMarks(declaration: AstNode): string[] {
@@ -12217,7 +12288,10 @@ const voidCallCheck = new Set<AstNode>();
 function getCalleeSignature(call: AstNode): AstNode | undefined {
   // obj.m(…) on a class instance: the method's declaration
   if (isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.name)) {
-    const receiverClass = classNameOfGoType(inferExpressionType(call.expression.expression) ?? '');
+    // (super.m(…): the parent class's method)
+    const receiverClass = call.expression.expression.kind === 'SuperKeyword'
+      ? classParentNames.get(getEnclosingClassName(call) ?? '') ?? ''
+      : classNameOfGoType(inferExpressionType(call.expression.expression) ?? '');
     const method = receiverClass ? findClassMethod(receiverClass, call.expression.name.text) : undefined;
     if (method?.body) return method;
     // a function-typed member of the receiver's declared type (or of the
