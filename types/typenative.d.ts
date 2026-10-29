@@ -342,10 +342,12 @@ interface Array<T> extends IterableIterator<T> {
 
 interface ArrayConstructor {
   new <T>(length: number): T[];
+  new <T>(...items: T[]): T[];
   isArray(arg: any): arg is any[];
-  from<T>(arrayLike: ArrayLike<T>): T[];
-  from<T, U>(arrayLike: ArrayLike<T>, mapFn: (value: T, index: number) => U): U[];
+  from<T>(arrayLike: ArrayLike<T> | Iterable<T>): T[];
+  from<T, U>(arrayLike: ArrayLike<T> | Iterable<T>, mapFn: (value: T, index: number) => U): U[];
   of<T>(...items: T[]): T[];
+  readonly prototype: any[];
 }
 
 declare var Array: ArrayConstructor;
@@ -573,7 +575,24 @@ interface JSON {
 }
 declare var JSON: JSON;
 
+interface PropertyDescriptor {
+  value?: any;
+  writable?: boolean;
+  enumerable?: boolean;
+  configurable?: boolean;
+  get?(): any;
+  set?(v: any): void;
+}
+interface PropertyDescriptorMap {
+  [key: string]: PropertyDescriptor;
+}
+
 interface ObjectConstructor {
+  /** Object(x) returns x (primitives are not boxed) */
+  (value?: any): any;
+  new (value?: any): any;
+  /** A class value stands in for its prototype (Object.create(C.prototype)) */
+  readonly prototype: Object;
   /** SameValue: NaN is NaN, +0 is not -0 */
   is(a: any, b: any): boolean;
   groupBy<T>(items: T[], keySelector: (item: T, index: number) => string | number): Record<string, T[]>;
@@ -583,11 +602,14 @@ interface ObjectConstructor {
   assign(target: any, ...sources: any[]): any;
   fromEntries(entries: Iterable<readonly [string, any]>): any;
   hasOwn(obj: any, key: string): boolean;
-  defineProperty<T>(
-    obj: T,
-    key: string,
-    descriptor: { value: any; enumerable?: boolean; writable?: boolean; configurable?: boolean }
-  ): T;
+  /** Data descriptors set the value; attributes and accessors have no effect */
+  defineProperty<T>(obj: T, key: string, descriptor: PropertyDescriptor): T;
+  defineProperties<T>(obj: T, descriptors: PropertyDescriptorMap): T;
+  /** An instance of the prototype's class without running its constructor */
+  create(proto: object | null, descriptors?: PropertyDescriptorMap): any;
+  /** An instance's class (null for other values) */
+  getPrototypeOf(obj: any): any;
+  getOwnPropertyDescriptors<T>(obj: T): { [P in keyof T]: PropertyDescriptor } & { [key: string]: PropertyDescriptor };
   getOwnPropertyNames(obj: any): string[];
   freeze<T>(obj: T): T;
   seal<T>(obj: T): T;
