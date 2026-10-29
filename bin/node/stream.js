@@ -317,6 +317,8 @@ func (s *TnStream) errorLater(err interface{}) {
 func (s *TnStream) on(event string, fn interface{}) *TnEventEmitter {
 	s.TnEventEmitter.on(event, fn)
 	s.listening(event)
+	// (process.stdin, used through any reference: alive while flowing)
+	s.stdinRef(s.flowing == 1)
 	return &s.TnEventEmitter
 }
 
@@ -325,6 +327,7 @@ func (s *TnStream) addListener(event string, fn interface{}) *TnEventEmitter { r
 func (s *TnStream) once(event string, fn interface{}) *TnEventEmitter {
 	s.TnEventEmitter.once(event, fn)
 	s.listening(event)
+	s.stdinRef(s.flowing == 1)
 	return &s.TnEventEmitter
 }
 
@@ -337,6 +340,13 @@ func (s *TnStream) onChain(event string, fn interface{}) *TnStream {
 func (s *TnStream) onceChain(event string, fn interface{}) *TnStream {
 	s.once(event, fn)
 	return s
+}
+
+// process.stdin holds the event loop while it flows (a no-op for other streams)
+func (s *TnStream) stdinRef(flowing bool) {
+	if fn, ok := s.hooks["_stdinRef"].(func(bool)); ok {
+		fn(flowing)
+	}
 }
 
 func (s *TnStream) listening(event string) {
@@ -358,11 +368,13 @@ func (s *TnStream) listening(event string) {
 func (s *TnStream) resume() *TnStream {
 	s.flowing = 1
 	s.scheduleFlow()
+	s.stdinRef(true)
 	return s
 }
 
 func (s *TnStream) pause() *TnStream {
 	s.flowing = 0
+	s.stdinRef(false)
 	return s
 }
 
@@ -1063,12 +1075,6 @@ func TnStdin() *TnStream {
 		}
 	}
 	return s
-}
-
-func (s *TnStream) stdinRef(flowing bool) {
-	if fn, ok := s.hooks["_stdinRef"].(func(bool)); ok {
-		fn(flowing)
-	}
 }`;
 const fileStreamHelper = `// fs.createReadStream / createWriteStream
 func TnCreateReadStream(path string, options ...interface{}) *TnStream {

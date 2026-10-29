@@ -364,6 +364,9 @@ let asyncChannelIsAsync = false;
 // Variables holding JS arrays: stored as *[]T so aliasing shares the slice
 // header (push/splice through any alias are visible everywhere)
 const referenceArrays = new Set();
+// Calls whose result may be missing (null / undefined): a regex match, a Map
+// lookup, an array search or removal
+const MAYBE_MISSING_METHODS = new Set(['exec', 'match', 'get', 'find', 'findLast', 'at', 'pop', 'shift']);
 // Whether the array variable `ref` names may hold null: declared nullable, or
 // given a regex match (null when nothing matches) or null
 const nullableArrayCache = new Map();
@@ -382,7 +385,7 @@ function mayHoldNullArray(ref) {
             const u = unwrapParentheses(e);
             if (isNilLiteral(u))
                 return true;
-            return isCallExpression(u) && isPropertyAccessExpression(u.expression) && ['exec', 'match'].includes(u.expression.name.text);
+            return isCallExpression(u) && isPropertyAccessExpression(u.expression) && MAYBE_MISSING_METHODS.has(u.expression.name.text);
         };
         const walk = (n) => {
             if (n.kind === 'VariableDeclaration' && isIdentifier(n.name)) {
@@ -1881,6 +1884,11 @@ function visitNode(node, options = {}) {
         }
         const typeofNarrowed = typeofNarrowedType(node.text);
         if (typeofNarrowed && isNarrowableReference(node) && !isAssignmentTarget(node) && (variableGoTypes.get(node.text) ?? 'interface{}') === 'interface{}') {
+            // (a primitive may be held as a *T: a nullable field read dynamically)
+            if (['float64', 'string', 'bool'].includes(typeofNarrowed)) {
+                useHelper('dynamic');
+                return `TnNarrow[${typeofNarrowed}](${getSafeName(node.text)})`;
+            }
             return `interface{}(${getSafeName(node.text)}).(${typeofNarrowed})`;
         }
         return getSafeName(node.text);
@@ -4434,7 +4442,7 @@ function toGoValueOfType(expr, goType) {
         }
         // re.exec(s) / s.match(re): no match is null, not an empty array
         const call = unwrapParentheses(expr);
-        if (isCallExpression(call) && isPropertyAccessExpression(call.expression) && ['exec', 'match'].includes(call.expression.name.text)) {
+        if (isCallExpression(call) && isPropertyAccessExpression(call.expression) && MAYBE_MISSING_METHODS.has(call.expression.name.text)) {
             return `func() ${goType} { __v := ${visit(expr)}; if __v == nil { return nil }; return &__v }()`;
         }
         return `func() ${goType} { __v := ${visit(expr)}; return &__v }()`;
@@ -6233,6 +6241,10 @@ function objectLiteralContextualType(node) {
         .map((t) => resolveTypeNode(t))
         .filter((t) => !!t && t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword');
     const objectMembers = members.filter((t) => t.kind === 'TypeLiteral' || (isTypeReferenceNode(t) && isIdentifier(t.typeName) && declaredInterfaces.has(t.typeName.text)));
+    // (Map | Record<string, T>: an object literal is the Record)
+    const record = members.find((t) => isRecordTypeNode(t));
+    if (record && objectMembers.length === 0)
+        return record;
     if (objectMembers.length === 0 || objectMembers.length !== members.length)
         return contextual;
     const props = (node.properties ?? []).filter((p) => (isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && (isIdentifier(p.name) || isStringLiteral(p.name)));
@@ -9037,7 +9049,9 @@ function visitNullishCoalescingExpression(node) {
             steps.push(`if ${tmp}, ok := ${lookup.map}.Lookup(${lookup.key}); ok { return ${convertGoValue(tmp, valueType, resultType)} }`);
         }
         else if (!isLast && operandType && isNilableGoType(operandType)) {
-            steps.push(`if ${tmp} := ${visit(operand)}; ${tmp} != nil { return ${convertGoValue(tmp, operandType, resultType)} }`);
+            // (an any value may hold a nil pointer: unset too)
+            const present = operandType === 'interface{}' ? (useHelper('dynamic'), `!TnIsNil(${tmp})`) : `${tmp} != nil`;
+            steps.push(`if ${tmp} := ${visit(operand)}; ${present} { return ${convertGoValue(tmp, operandType, resultType)} }`);
         }
         else if (!isLast && !operandType) {
             // an operand of unknown type: missing when nil (or a nil pointer)
@@ -9066,9 +9080,12 @@ function convertGoValue(variable, fromType, toType) {
         return `&${variable}`;
     if (fromType === `*${toType}`)
         return `*${variable}`;
-    // dynamic (any) values hold the concrete type at runtime
-    if (fromType === 'interface{}' && toType !== 'interface{}')
-        return `${variable}.(${toType})`;
+    // dynamic (any) values hold the concrete type at runtime (a primitive may
+    // be held as a *T)
+    if (fromType === 'interface{}' && toType !== 'interface{}') {
+        useHelper('dynamic');
+        return ['float64', 'string', 'bool'].includes(toType) ? `TnNarrow[${toType}](${variable})` : `TnAs[${toType}](${variable})`;
+    }
     return variable;
 }
 // Map lookups (m.get(k) on a Map, m[k] on a Record): Go code of the map and key
@@ -10608,6 +10625,9 @@ const callHandlers = {
     },
     'Number.isNaN': (_caller, args) => {
         importedPackages.add('math');
+        if (currentCallArgTypes[0] !== 'float64') {
+            return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && math.IsNaN(__n) }()`;
+        }
         return `math.IsNaN(${args[0]})`;
     },
     isNaN: (_caller, args) => {
@@ -10618,14 +10638,14 @@ const callHandlers = {
     'Number.isFinite': (_caller, args) => {
         importedPackages.add('math');
         if (currentCallArgTypes[0] !== 'float64') {
-            return `func() bool { __n, __ok := interface{}(${args[0]}).(float64); return __ok && !math.IsInf(__n, 0) && !math.IsNaN(__n) }()`;
+            return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && !math.IsInf(__n, 0) && !math.IsNaN(__n) }()`;
         }
         return `!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]})`;
     },
     'Number.isInteger': (_caller, args) => {
         importedPackages.add('math');
         if (currentCallArgTypes[0] !== 'float64') {
-            return `func() bool { __n, __ok := interface{}(${args[0]}).(float64); return __ok && __n == math.Trunc(__n) && !math.IsInf(__n, 0) }()`;
+            return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && __n == math.Trunc(__n) && !math.IsInf(__n, 0) }()`;
         }
         return `(${args[0]} == math.Trunc(${args[0]}) && !math.IsInf(${args[0]}, 0))`;
     },
@@ -10633,6 +10653,14 @@ const callHandlers = {
     'Object': (_caller, args) => `interface{}(${args[0] ?? 'map[string]interface{}{}'})`,
     'Boolean': (_caller, args) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
 };
+// The argument of Number.isInteger & co. as a value to test (a number | undefined
+// is its number, or nil)
+function numberCheckArgument(arg) {
+    if (!NULLABLE_PRIMITIVE_TYPES.includes(currentCallArgTypes[0] ?? ''))
+        return arg;
+    useHelper('dynamic');
+    return `TnPtrValue(${arg})`;
+}
 // Built-in Error subclasses (TnErrors carrying their name)
 const BUILTIN_ERROR_NAMES = new Set(['TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'AggregateError']);
 // Whether the program uses console.group (then every console line is
@@ -11353,8 +11381,15 @@ function visitTypeOf(node) {
     const known = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined' };
     if (goType && known[goType])
         return toGoStringLiteral(known[goType]);
-    if (goType?.startsWith('func'))
-        return '"function"';
+    // (a function or object value held in a variable or field may be unset)
+    const mayBeUnset = !isArrowFunction(operand) && !isFunctionExpression(operand) && !isObjectLiteralExpression(operand) && !isNewExpression(operand) &&
+        !(isIdentifier(operand) && (declaredFunctions.has(operand.text) || classNames.has(operand.text)));
+    if (goType?.startsWith('func')) {
+        return mayBeUnset ? `func() string { if ${visit(node.expression)} == nil { return "undefined" }; return "function" }()` : '"function"';
+    }
+    if (goType?.startsWith('*') && !NULLABLE_PRIMITIVE_TYPES.includes(goType) && mayBeUnset) {
+        return `func() string { if ${visit(node.expression)} == nil { return "undefined" }; return "object" }()`;
+    }
     if (goType && goType !== 'interface{}' && !NULLABLE_PRIMITIVE_TYPES.includes(goType))
         return '"object"';
     useHelper('typeOf');
@@ -15624,6 +15659,14 @@ func TnIsSlice(v interface{}) bool {
 	return rv.Kind() == reflect.Slice
 }
 
+// A dynamic value a typeof test found to be a T (a T, or a non-nil *T)
+func TnNarrow[T any](v interface{}) T {
+	if p, ok := v.(*T); ok && p != nil {
+		return *p
+	}
+	return v.(T)
+}
+
 // *arr of an array reference that may be nil (null): a nil slice then
 func TnDerefSlice[T any](p *[]T) []T {
 	if p == nil {
@@ -15968,6 +16011,20 @@ func TnDelete(obj interface{}, key interface{}) bool {
 	}
 	o, ok := obj.(map[string]interface{})
 	k, isString := key.(string)
+	if !ok && isString {
+		// a typed object's field: unset (undefined) again
+		rv := reflect.ValueOf(obj)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+			f := rv.Elem().FieldByName(k)
+			if !f.IsValid() {
+				f = rv.Elem().FieldByName(k + "_")
+			}
+			if f.IsValid() && f.CanAddr() {
+				reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.Zero(f.Type()))
+			}
+		}
+		return true
+	}
 	if !ok || !isString {
 		return false
 	}
@@ -16706,8 +16763,18 @@ func TnDeref[T any](p *T) T {
 		}
 		return "boolean"
 	}
-	if reflect.ValueOf(v).Kind() == reflect.Func {
+	// (an unset function or object field is undefined)
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Func:
+		if rv.IsNil() {
+			return "undefined"
+		}
 		return "function"
+	case reflect.Pointer, reflect.Map, reflect.Chan:
+		if rv.IsNil() {
+			return "undefined"
+		}
 	}
 	return "object"
 }`,
@@ -18833,6 +18900,15 @@ func TnIsErrorOf(v interface{}, name string) bool {
 }
 
 // A Node error: name ('TypeError', 'AssertionError'), code and message
+// A recovered panic as the value a JS catch receives: a Go runtime failure
+// (nil dereference, failed assertion …) is a TypeError
+func TnCaught(r interface{}) interface{} {
+	if e, ok := r.(runtime.Error); ok {
+		return TnNodeError("TypeError", "", e.Error())
+	}
+	return r
+}
+
 func TnNodeError(name string, code string, message string) *TnError {
 	e := &TnError{message: message, code: code, props: map[string]interface{}{"name": name}}
 	e.tnCapture(3)
@@ -21308,7 +21384,8 @@ function visitReturningTryStatement(node, fn, options) {
         if (varDecl && isIdentifier(varDecl.name))
             registerLocalVariable(varDecl.name.text, 'interface{}');
         const catchBody = blockCode(node.catchClause.block, true);
-        deferreds.push(`defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := r\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`);
+        useHelper('error');
+        deferreds.push(`defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`);
     }
     const tryBody = blockCode(node.tryBlock, false);
     const results = hasValue
@@ -21370,7 +21447,8 @@ function visitTryStatement(node, options) {
             registerLocalVariable(varDecl.name.text, 'interface{}');
         }
         const catchBody = coverageEnter(node.catchClause.block) + (node.catchClause.block.statements ?? []).map((s) => visit(s)).join('\t');
-        deferreds.push(`defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := r\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`);
+        useHelper('error');
+        deferreds.push(`defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`);
     }
     const tryBody = (node.tryBlock.statements ?? []).map((s) => visit(s)).join('\t');
     const body = [...deferreds, tryBody].join('\n\t\t\t');
