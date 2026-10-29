@@ -174,6 +174,8 @@ func (ins *tnInspector) format(v interface{}, depth int) string {
 	switch x := v.(type) {
 	case nil:
 		return "undefined"
+	case interface{ TnIsNullValue() }:
+		return "null"
 	case string:
 		return tnQuoteJS(x)
 	case float64:

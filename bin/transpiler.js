@@ -368,6 +368,35 @@ const referenceArrays = new Set();
 function isHeritageType(node) {
     return node.parent?.kind === 'HeritageClause';
 }
+// Whether a null literal goes into the program's own data (an object's
+// field, an array, an argument of its own function or class, a variable):
+// there JS null stays distinct from undefined. Values handed to the runtime
+// (callback results, Node / Go arguments) stay nil.
+function storesJsNull(expr) {
+    let node = expr;
+    while (node.parent && isParenthesizedExpression(node.parent))
+        node = node.parent;
+    const parent = node.parent;
+    if (!parent)
+        return false;
+    if (isPropertyAssignment(parent) || isArrayLiteralExpression(parent) || isVariableDeclaration(parent) || isPropertyDeclaration(parent))
+        return true;
+    if (isBinaryExpression(parent) && parent.right === node && parent.operatorToken.kind === 'EqualsToken')
+        return true;
+    if (isNewExpression(parent) && isIdentifier(parent.expression))
+        return classNames.has(parent.expression.text);
+    if (isCallExpression(parent) && (parent.arguments ?? []).includes(node)) {
+        const callee = parent.expression;
+        if (isIdentifier(callee))
+            return declaredFunctions.has(callee.text);
+        if (isPropertyAccessExpression(callee)) {
+            if (['set', 'add', 'push', 'unshift'].includes(callee.name.text))
+                return true;
+            return !!classNameOfGoType(inferExpressionType(callee.expression) ?? '');
+        }
+    }
+    return false;
+}
 // Calls whose result may be missing (null / undefined): a regex match, a Map
 // lookup, an array search or removal
 const MAYBE_MISSING_METHODS = new Set(['exec', 'match', 'get', 'find', 'findLast', 'at', 'pop', 'shift']);
@@ -2130,7 +2159,7 @@ function visitNode(node, options = {}) {
         }
         if (hasDynamicProperties(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
             useHelper('dynamic');
-            return `TnGet(${visit(node.expression)}, "${node.name.text}")`;
+            return `TnGetRef(${visit(node.expression)}, "${node.name.text}")`;
         }
         if (hasQuestionDot(node)) {
             return visitOptionalPropertyAccess(node);
@@ -2288,7 +2317,7 @@ function visitNode(node, options = {}) {
                 else if (!initType || initType === 'interface{}') {
                     // a dynamic source: its property by name (undefined when missing)
                     useHelper('dynamic');
-                    parts.push(`${localName} := TnGet(${initExpr}, ${toGoStringLiteral(propName)})`);
+                    parts.push(`${localName} := TnGetRef(${initExpr}, ${toGoStringLiteral(propName)})`);
                 }
                 else if (fieldType === 'interface{}' && genericMemberPrimitive(node.initializer, rawProp)) {
                     // a member typed by a class type parameter that the source's type
@@ -3137,7 +3166,11 @@ function visitNode(node, options = {}) {
             const optionalChain = !!nilOther && (hasQuestionDot(nilOther) || (isCallExpression(nilOther) && hasQuestionDot(nilOther.expression)));
             if (nilOther && !isNilLiteral(nilOther) && (optionalChain || inferExpressionType(nilOther) === 'interface{}')) {
                 useHelper('dynamic');
-                return `${op === '!=' ? '!' : ''}TnIsNil(${visit(nilOther)})`;
+                // (x === undefined is false for null)
+                const strict = node.operatorToken.kind === 'EqualsEqualsEqualsToken' || node.operatorToken.kind === 'ExclamationEqualsEqualsToken';
+                const nilNode = nilOther === node.left ? node.right : node.left;
+                const test = strict && unwrapParentheses(nilNode).kind !== 'NullKeyword' ? 'TnIsUndefined' : 'TnIsNil';
+                return `${op === '!=' ? '!' : ''}${test}(${visit(nilOther)})`;
             }
             const nullableComparison = visitNullableComparison(node, op);
             if (nullableComparison)
@@ -3260,7 +3293,7 @@ function visitNode(node, options = {}) {
         if (op === '=' && isPropertyAccessExpression(node.left) && !isDynamicValue(node.left.expression) && !hasQuestionDot(node.left)) {
             const target = visit(node.left);
             // (a member the emitter reads dynamically is written dynamically)
-            if (target.startsWith('TnGet(')) {
+            if ((target.startsWith('TnGet(') || target.startsWith('TnGetRef('))) {
                 useHelper('dynamic');
                 return `TnSet(${visit(node.left.expression)}, ${toGoStringLiteral(node.left.name.text)}, ${visit(node.right)})`;
             }
@@ -3426,7 +3459,9 @@ function visitNode(node, options = {}) {
         // while ((x = next()) !== null) → for { x = next(); if !(x != nil) { break }; … }
         const hoisted = getHoistedConditionAssignment(node.expression);
         if (hoisted) {
-            const condition = { ...node.expression, left: hoisted.left };
+            // (the variable, now read in the test)
+            const condition = { ...node.expression };
+            condition.left = { ...hoisted.left, parent: condition };
             const prefix = `${visit(hoisted, { inline: true })};\n\t\tif !(${visit(condition, {
                 inline: true
             })}) {\n\t\t\tbreak\n\t\t}\n\t\t`;
@@ -4453,6 +4488,11 @@ function toGoValueOfType(expr, goType) {
             const body = !result ? created : result === 'interface{}' ? `return ${created}` : `return TnAs[${result}](${created})`;
             return `TnCtorOf(${classValue(classRef.text)}, func(${params.map((t, i) => `${names[i]} ${t}`).join(', ')})${result ? ` ${result}` : ''} { ${body} })`;
         }
+    }
+    // null into an any slot: JS null (distinct from undefined there)
+    if (goType === 'interface{}' && unwrapParentheses(expr).kind === 'NullKeyword' && storesJsNull(expr)) {
+        useHelper('dynamic');
+        return 'TnNull';
     }
     // T | undefined into an any slot: its value, or nil (not a typed nil pointer)
     if (goType === 'interface{}' && NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(expr) ?? '')) {
@@ -7144,6 +7184,9 @@ function getArrayLiteralElementType(node) {
                 firstElementType = elementType;
         }
     }
+    // [null, 1]: null has no place in a []float64
+    if (firstElementType && ['float64', 'string', 'bool'].includes(firstElementType) && (node.elements ?? []).some((e) => isNilLiteral(e)))
+        return 'interface{}';
     return firstElementType ?? 'interface{}';
 }
 // A Go type that is a generic type parameter of the enclosing function (T)
@@ -9574,7 +9617,7 @@ function destructureCallbackParam(pattern, source, goType) {
             }
             else if (goType === 'interface{}' || goType === '') {
                 useHelper('dynamic');
-                value = `TnGet(${source}, ${JSON.stringify(field)})`;
+                value = `TnGetRef(${source}, ${JSON.stringify(field)})`;
             }
             else {
                 value = `${source}.${goFieldName(field)}`;
@@ -10979,6 +11022,12 @@ const stringMethodHandlers = {
         return `TnSubstring(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     slice: (obj, args) => {
+        // (a Go array or slice of an unknown receiver slices as it is)
+        if (currentReceiverGoType && currentReceiverGoType !== 'string') {
+            if (args.length >= 2)
+                return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
+            return `${obj}[${sliceIndex(obj, args[0] ?? '0')}:]`;
+        }
         useHelper('strIndex');
         const end = optionalEndArgument(args);
         if (end)
@@ -12641,8 +12690,11 @@ function coerceBuiltinMethodArguments(node, objectType, args, argTypes) {
 // An array literal element that is dynamic, or of another object type, where
 // the literal's elements are typed
 function arrayElementNeedsConversion(element, elementType) {
-    if (elementType === 'interface{}' || isSpreadElement(element))
+    if (isSpreadElement(element))
         return false;
+    // (null among any values is JS null)
+    if (elementType === 'interface{}')
+        return unwrapParentheses(element).kind === 'NullKeyword';
     const t = inferExpressionType(element);
     return t === 'interface{}' || (!!t && t !== elementType && t.startsWith('*') && elementType.startsWith('*'));
 }
@@ -12796,7 +12848,7 @@ function arrayReferenceOf(expr, sliceType) {
     // (a field of a struct pointer is addressable, whatever the pointer's expression)
     if (isPropertyAccessExpression(u) && !hasQuestionDot(u) && inferExpressionType(u) === goType && (inferExpressionType(u.expression) ?? '').startsWith('*')) {
         const field = visit(u);
-        if (!field.endsWith(')') && !field.startsWith('TnGet('))
+        if (!field.endsWith(')') && !field.startsWith('TnGet'))
             return `&(${field})`;
     }
     if (isBinaryExpression(u) && u.operatorToken.kind === 'QuestionQuestionToken') {
@@ -13056,7 +13108,7 @@ function getParameterDestructuring(parameters) {
                         classPropertyTypes.get(structName)?.get(field) ??
                         getStructFieldGoType(structName, field) ??
                         (paramType === 'interface{}' ? 'interface{}' : undefined);
-                value = paramType === 'interface{}' ? `TnGet(${source}, ${toGoStringLiteral(field)})` : `${source}.${goFieldName(field)}`;
+                value = paramType === 'interface{}' ? `TnGetRef(${source}, ${toGoStringLiteral(field)})` : `${source}.${goFieldName(field)}`;
                 if (paramType === 'interface{}')
                     useHelper('dynamic');
                 memberTypeNode = param.type ? getMemberTypeNode(param.type, field) : undefined;
@@ -13123,7 +13175,7 @@ function getFunctionParametersInfo(parameters) {
         // to the parameter's type
         useHelper('dynamic');
         const value = paramType === 'interface{}' ? `__defaultArgs[${index}]` : `TnAs[${paramType}](__defaultArgs[${index}])`;
-        return `var ${paramName} ${paramType}\n\t\tif len(__defaultArgs) > ${index} && !TnIsNil(__defaultArgs[${index}]) {\n\t\t\t${paramName} = ${value}\n\t\t} else {\n\t\t\t${paramName} = ${defaultValue}\n\t\t}\n\t\t`;
+        return `var ${paramName} ${paramType}\n\t\tif len(__defaultArgs) > ${index} && !TnIsUndefined(__defaultArgs[${index}]) {\n\t\t\t${paramName} = ${value}\n\t\t} else {\n\t\t\t${paramName} = ${defaultValue}\n\t\t}\n\t\t`;
     })
         .join('');
     return {
@@ -15570,6 +15622,27 @@ func tnPlainValue(v interface{}) interface{} {
 	return v
 }
 
+// obj.key read by the program: as TnGet, but an array field reads as a
+// reference to it — JS arrays are shared, so a push or splice through the
+// value read changes the field
+func TnGetRef(obj interface{}, key string) interface{} {
+	rv := reflect.ValueOf(obj)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+		for _, name := range []string{key, key + "_"} {
+			if f := rv.Elem().FieldByName(name); f.IsValid() && f.CanAddr() {
+				if f.Kind() == reflect.Slice && f.Type().Elem().Kind() != reflect.Uint8 {
+					if f.IsNil() {
+						return nil
+					}
+					return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Interface()
+				}
+				break
+			}
+		}
+	}
+	return TnGet(obj, key)
+}
+
 func TnGet(obj interface{}, key string) interface{} {
 	switch o := obj.(type) {
 	case map[string]interface{}:
@@ -15609,17 +15682,8 @@ func TnGet(obj interface{}, key string) interface{} {
 		for _, name := range []string{key, key + "_"} {
 			if f := rv.Elem().FieldByName(name); f.IsValid() {
 				// Unexported field: read it through a pointer to bypass the flag
-				// (a T | undefined field reads as its value, or undefined; an
-				// array field as a reference to it — JS arrays are shared, so
-				// a push or splice through this value changes the field)
-				ref := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr()))
-				if f.Kind() == reflect.Slice && f.Type().Elem().Kind() != reflect.Uint8 {
-					if f.IsNil() {
-						return nil
-					}
-					return ref.Interface()
-				}
-				return tnPlainValue(ref.Elem().Interface())
+				// (a T | undefined field reads as its value, or undefined)
+				return tnPlainValue(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface())
 			}
 		}
 		// a getter (get x() → Get_x)
@@ -15973,7 +16037,7 @@ func TnDynamicAdd(a interface{}, b interface{}) interface{} {
 // a == b (JS loose equality): null == undefined; a number, string or boolean
 // compares with another primitive by ToNumber; two strings compare as strings
 func TnLooseEqual(a interface{}, b interface{}) bool {
-	if TnSame(a, b) {
+	if TnSame(a, b) || TnIsNil(a) && TnIsNil(b) {
 		return true
 	}
 	if a == nil || b == nil {
@@ -16114,6 +16178,9 @@ func TnDateString(t time.Time) string {
 }
 
 func TnJSString(v interface{}) string {
+	if v == TnNull {
+		return "null"
+	}
 	switch x := v.(type) {
 	case interface{ TnToString() string }:
 		return x.TnToString()
@@ -16244,6 +16311,8 @@ func TnNumber(v interface{}) float64 {
 	switch t := v.(type) {
 	case float64:
 		return t
+	case *tnNullValue:
+		return 0
 	case bool:
 		if t {
 			return 1
@@ -16660,6 +16729,9 @@ func TnAs[T any](v interface{}) T {
 // Go type: structs (and pointers to them) field by field, slices element by
 // element, numbers between kinds
 func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
+	if _, isNull := v.(interface{ TnIsNullValue() }); isNull && t.Kind() != reflect.Interface {
+		v = nil
+	}
 	if v == nil {
 		return reflect.Zero(t), true
 	}
@@ -16789,7 +16861,7 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 
 func TnTruthy(v interface{}) bool {
 	switch t := v.(type) {
-	case nil:
+	case nil, *tnNullValue:
 		return false
 	case bool:
 		return t
@@ -16818,8 +16890,22 @@ func TnArguments(required int, named []interface{}, extra ...interface{}) []inte
 	return append(named, extra...)
 }
 
+// JS null held in a dynamic (any) slot: nullish like undefined (nil), but a
+// value of its own — null !== undefined, typeof null is "object", JSON null
+type tnNullValue struct{}
+
+func (*tnNullValue) TnIsNullValue()          {}
+func (*tnNullValue) TnToJSON(string) interface{} { return nil }
+
+var TnNull interface{} = &tnNullValue{}
+
+// x === undefined: unset, not null
+func TnIsUndefined(v interface{}) bool {
+	return v != TnNull && TnIsNil(v)
+}
+
 func TnIsNil(v interface{}) bool {
-	if v == nil {
+	if v == nil || v == TnNull {
 		return true
 	}
 	rv := reflect.ValueOf(v)
@@ -17420,6 +17506,9 @@ func TnDeref[T any](p *T) T {
 	return *p
 }`,
     typeOf: `func TnTypeOf(v interface{}) string {
+	if _, isNull := v.(interface{ TnIsNullValue() }); isNull {
+		return "object"
+	}
 	// an unset nullable primitive (*T nil) is undefined
 	switch t := v.(type) {
 	case nil:
@@ -17580,7 +17669,7 @@ func tnJSONFieldName(name string) string {
 func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 	v = tnJSONToJSON(v)
 	switch t := v.(type) {
-	case nil:
+	case nil, interface{ TnIsNullValue() }:
 		w.buf.WriteString("null")
 		return true
 	case bool:
@@ -19291,29 +19380,24 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 		}
 		return k(pos + n)
 	case "look":
-		if !node.behind {
-			matched := false
-			saved := append([]int(nil), m.caps...)
-			if m.match(node.child, pos, func(int) bool { return true }) {
-				matched = true
-			}
-			copy(m.caps, saved)
-			if matched != node.negative {
-				return k(pos)
-			}
-			return false
-		}
-		matched := false
+		// a positive lookaround keeps its captures (as in JS); a negative one,
+		// or one the rest of the pattern backtracks out of, does not
 		saved := append([]int(nil), m.caps...)
-		for start := 0; start <= pos && !matched; start++ {
-			if m.match(node.child, start, func(end int) bool { return end == pos }) {
-				matched = true
+		matched := false
+		if !node.behind {
+			matched = m.match(node.child, pos, func(int) bool { return true })
+		} else {
+			for start := 0; start <= pos && !matched; start++ {
+				matched = m.match(node.child, start, func(end int) bool { return end == pos })
 			}
+		}
+		if !matched || node.negative {
+			copy(m.caps, saved)
+		}
+		if matched != node.negative && k(pos) {
+			return true
 		}
 		copy(m.caps, saved)
-		if matched != node.negative {
-			return k(pos)
-		}
 		return false
 	case "rep":
 		return m.rep(node, pos, 0, k)
