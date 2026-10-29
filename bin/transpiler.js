@@ -1725,6 +1725,16 @@ function visit(node, options = {}) {
         restore();
         return code;
     }
+    // and a block's (a case clause's) own variables only inside the block
+    if (node && (node.kind === 'Block' || node.kind === 'CaseClause' || node.kind === 'DefaultClause')) {
+        const names = blockScopeNames(node);
+        if (names.length > 0) {
+            const restore = saveVariableTypes(names);
+            const code = visitNode(node, options);
+            restore();
+            return code;
+        }
+    }
     return visitNode(node, options);
 }
 function visitNode(node, options = {}) {
@@ -1941,7 +1951,7 @@ function visitNode(node, options = {}) {
         if (targetType === 'string') {
             // s[i] in JS is a one-character string ("" when out of range)
             useHelper('dynamic');
-            return `TnCharAt(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
+            return `TnCharAt(${visit(node.expression)}, ${numericIndex(node.argumentExpression)})`;
         }
         if (targetType?.startsWith('*TnMap[')) {
             return `${visit(node.expression)}.Get(${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))})`;
@@ -1968,14 +1978,14 @@ function visitNode(node, options = {}) {
         const tupleElement = tupleElementGoType(node);
         if (tupleElement && !isAssignmentTarget(node)) {
             useHelper('dynamic');
-            return `TnAs[${tupleElement}](TnAt(${visit(node.expression)}, ${visit(node.argumentExpression)}))`;
+            return `TnAs[${tupleElement}](TnAt(${visit(node.expression)}, ${numericIndex(node.argumentExpression)}))`;
         }
         // Reading past the end of an array gives undefined in JS: the zero value here
         if (targetType?.startsWith('[]') && !isAssignmentTarget(node)) {
             useHelper('dynamic');
-            return `TnAt(${visit(node.expression)}, ${visit(node.argumentExpression)})`;
+            return `TnAt(${visit(node.expression)}, ${numericIndex(node.argumentExpression)})`;
         }
-        return `${visit(node.expression)}[int(${visit(node.argumentExpression)})]`;
+        return `${visit(node.expression)}[int(${numericIndex(node.argumentExpression)})]`;
     }
     else if (isPropertyAccessExpression(node)) {
         // seq.length on an Array subclass
@@ -3094,16 +3104,26 @@ function visitNode(node, options = {}) {
         // obj.field = v: the value converts to the field's type (boxed into a
         // nullable field, asserted from a dynamic value)
         if (op === '=' && isPropertyAccessExpression(node.left) && !isDynamicValue(node.left.expression) && !hasQuestionDot(node.left)) {
-            const fieldType = inferExpressionType(node.left);
-            if (fieldType && fieldType !== 'interface{}' && (NULLABLE_PRIMITIVE_TYPES.includes(fieldType) || isDynamicValue(node.right))) {
-                return `${visit(node.left)} = ${toGoValueOfType(node.right, fieldType)}`;
+            const target = visit(node.left);
+            // (a member the emitter reads dynamically is written dynamically)
+            if (target.startsWith('TnGet(')) {
+                useHelper('dynamic');
+                return `TnSet(${visit(node.left.expression)}, ${toGoStringLiteral(node.left.name.text)}, ${visit(node.right)})`;
             }
+            const fieldType = inferExpressionType(node.left);
+            if (fieldType && fieldType !== 'interface{}')
+                return `${target} = ${toGoValueOfType(node.right, fieldType)}`;
         }
-        // Assigning to a nullable primitive (*T) boxes the value
+        // Assigning to a typed variable converts the value (boxes it into a
+        // nullable primitive, asserts a dynamic one …)
         if (op === '=' && isIdentifier(node.left)) {
-            const leftType = variableGoTypes.get(node.left.text);
-            if (leftType && (leftType.startsWith('*') || isDynamicValue(node.right))) {
-                return `${getSafeName(node.left.text)} = ${toGoValueOfType(node.right, leftType)}`;
+            let leftType = variableGoTypes.get(node.left.text);
+            // (an array variable that is not an array reference holds the slice)
+            if (leftType?.startsWith('*[]') && !referenceArrays.has(node.left.text))
+                leftType = leftType.slice(1);
+            if (leftType && leftType !== 'interface{}' && leftType !== ':') {
+                const target = referenceArrays.has(node.left.text) ? getSafeName(node.left.text) : visit(node.left);
+                return `${target} = ${toGoValueOfType(node.right, leftType)}`;
             }
         }
         if (op === '&&' || op === '||') {
@@ -3119,6 +3139,11 @@ function visitNode(node, options = {}) {
             if (rightType === 'string' && leftType !== 'string') {
                 return `${jsStringOf(visit(node.left), leftType)} + ${visit(node.right)}`;
             }
+        }
+        // x += y on a dynamic (any) variable: JS's + (concatenation or sum)
+        if (op === '+=' && isIdentifier(node.left) && variableGoTypes.get(node.left.text) === 'interface{}') {
+            useHelper('dynamic');
+            return `${visit(node.left)} = TnDynamicAdd(${visit(node.left)}, ${visit(node.right)})`;
         }
         // s += n on a string: the value converts as JS renders it
         if (op === '+=' && inferExpressionType(node.left) === 'string') {
@@ -3153,6 +3178,12 @@ function visitNode(node, options = {}) {
         const awaitFn = asyncChannelVar && asyncChannelIsAsync && getEnclosingFunction(node) === asyncFunctionNode
             ? 'TnAwait'
             : 'TnAwaitInline';
+        // a value that may or may not be a promise (any): awaited when it is one
+        const awaitedType = inferExpressionType(node.expression);
+        if (awaitedType && !awaitedType.startsWith('chan ')) {
+            useHelper('dynamic');
+            return `TnAwaitValue(interface{}(${visit(node.expression)}), ${awaitFn === 'TnAwaitInline'})`;
+        }
         return `${awaitFn}(${visit(node.expression)})`;
     }
     else if (isVariableDeclarationList(node)) {
@@ -4300,6 +4331,14 @@ function toGoValueOfType(expr, goType) {
         if (goType.startsWith('*'))
             return `TnAsPtr[${goType.slice(1)}](${code})`;
         return `TnAs[${goType}](${code})`;
+    }
+    // a Map of other key / value types: converted entry by entry (a copy)
+    if (goType?.startsWith('*TnMap[') && !isNilLiteral(expr)) {
+        const exprType = inferExpressionType(expr) ?? '';
+        if (exprType.startsWith('*TnMap[') && exprType !== goType) {
+            useHelper('dynamic');
+            return `TnAs[${goType}](interface{}(${visit(expr)}))`;
+        }
     }
     // an array of another element type ([]*Token where any[] is expected):
     // converted element by element (a copy)
@@ -7124,6 +7163,26 @@ function saveVariableTypes(names) {
         }
     };
 }
+// The variables a block declares directly
+function blockScopeNames(block) {
+    const names = [];
+    const addBinding = (name) => {
+        if (!name)
+            return;
+        if (isIdentifier(name))
+            names.push(name.text);
+        else
+            for (const el of name.elements ?? [])
+                if (!isOmittedExpression(el))
+                    addBinding(el.name);
+    };
+    for (const statement of block.statements ?? []) {
+        if (isVariableStatement(statement))
+            for (const d of statement.declarationList?.declarations ?? [])
+                addBinding(d.name);
+    }
+    return names;
+}
 // The names a function binds itself: its parameters and the variables its
 // body declares (not those of nested functions)
 function functionScopeNames(fn) {
@@ -7254,7 +7313,7 @@ function inferArrowFunctionGoType(node) {
     // a variadic `...interface{}`
     const parameters = node.parameters ?? [];
     const firstDefaultIndex = parameters.findIndex((p) => !!p.initializer);
-    const hasTrailingDefaults = firstDefaultIndex > -1 && !parameters.slice(firstDefaultIndex).some((p) => !p.initializer);
+    const hasTrailingDefaults = firstDefaultIndex > -1 && !parameters.slice(firstDefaultIndex).some((p) => !p.initializer && !(p.questionToken && !p.dotDotDotToken));
     const paramTypes = (hasTrailingDefaults ? parameters.slice(0, firstDefaultIndex) : parameters).map((p) => getParameterGoType(p));
     if (hasTrailingDefaults)
         paramTypes.push('...interface{}');
@@ -7590,6 +7649,22 @@ function inferExpressionType(expr) {
         isIdentifier(expr.expression.expression) &&
         expr.expression.expression.text === 'Array' &&
         expr.expression.name.text === 'from') {
+        // as its emitter builds it: [...source], or its mapped values
+        const source = (expr.arguments ?? [])[0];
+        const callback = (expr.arguments ?? [])[1];
+        const sourceType = (source ? inferExpressionType(source) ?? '' : '').replace(/^\*\[\]/, '[]');
+        if (callback) {
+            const result = goFuncReturnType(functionValueGoType(callback) ?? '');
+            return result && (sourceType.startsWith('[]') || sourceType.startsWith('*TnMap[') || sourceType === 'string') ? `[]${result}` : '[]interface{}';
+        }
+        if (sourceType.startsWith('[]') && !arraySubclassOf(source))
+            return sourceType;
+        if (isTypedArrayGoType(sourceType))
+            return '[]float64';
+        if (sourceType === 'string')
+            return '[]string';
+        if (sourceType.startsWith('*TnMap['))
+            return extractMapValueType(sourceType) === 'struct{}' ? `[]${extractMapKeyType(sourceType)}` : '[][]interface{}';
         return '[]interface{}';
     }
     if (isCallExpression(expr) && isObjectKeysOfDynamic(expr))
@@ -8621,6 +8696,17 @@ function objectAssignTargetType(call) {
         const t = inferExpressionType(args[1]);
         if (assignable(t) && (args.length === 2 || t.startsWith('*TnMap[')))
             return t;
+    }
+    // Object.assign({ defaults }, options): options' object type, when it has
+    // every key of the defaults
+    if (args.length === 2) {
+        const t = inferExpressionType(args[1]);
+        if (assignable(t) && !t.startsWith('*TnMap[')) {
+            const fields = new Set(objectFieldNames(t));
+            const keys = (target.properties ?? []).map((p) => (p.name && (isIdentifier(p.name) || isStringLiteral(p.name)) ? p.name.text : undefined));
+            if (keys.every((k) => !!k && fields.has(k)))
+                return t;
+        }
     }
     return undefined;
 }
@@ -10798,6 +10884,9 @@ function getDynamicCallHandler(caller, objectType) {
         // objects; a class's own toString(…) is its method
         if (methodName === 'toString' && objectType === 'class')
             return null;
+        const receiverClassName = classNameOfGoType(currentReceiverGoType ?? '');
+        if (receiverClassName && findClassMethod(receiverClassName, methodName))
+            return null;
         if (methodName === 'toString') {
             return (c, args) => {
                 const obj = c.substring(0, dotIndex);
@@ -12025,6 +12114,20 @@ function visitFirstIteration(node) {
     useHelper('arraySubclass');
     return `TnIterFirst(TnToArray(${visit(source)}))`;
 }
+// An array / string index as a number: a dynamic one converted (Number(x)),
+// an undefined one NaN
+function numericIndex(index) {
+    const indexType = inferExpressionType(index);
+    if (indexType === 'interface{}') {
+        useHelper('dynamic');
+        return `TnNumber(${visit(index)})`;
+    }
+    if (indexType === '*float64') {
+        useHelper('numTruthy');
+        return `TnNumPtr(${visit(index)})`;
+    }
+    return visit(index);
+}
 // `_ = x` for each name a destructuring declaration binds in a function
 // (JS allows locals that are never read; Go does not)
 function destructuredUseMarks(declaration) {
@@ -12312,7 +12415,8 @@ function getFunctionParametersInfo(parameters) {
             prefixBlockContent: destructuring
         };
     }
-    const hasRequiredAfterDefault = parameters.slice(firstDefaultIndex).some((p) => !p.initializer);
+    // (optional parameters after a defaulted one are passed the same way)
+    const hasRequiredAfterDefault = parameters.slice(firstDefaultIndex).some((p) => !p.initializer && !(p.questionToken && !p.dotDotDotToken));
     if (hasRequiredAfterDefault) {
         return {
             signature: parameters.map((p) => `${getParameterName(p, parameters)} ${getParameterGoType(p)}`).join(', '),
@@ -12328,10 +12432,13 @@ function getFunctionParametersInfo(parameters) {
         // (a destructured parameter's value is __paramN, destructured after)
         const paramName = getParameterName(param, parameters);
         const paramType = getParameterGoType(param);
-        // Array-reference parameters need the default boxed to *[]T
-        const defaultValue = paramType.startsWith('*[]')
-            ? toGoValueOfType(param.initializer, paramType)
-            : visit(param.initializer);
+        // Array-reference parameters need the default boxed to *[]T (an
+        // optional parameter's default is undefined)
+        const defaultValue = !param.initializer
+            ? `*new(${paramType})`
+            : paramType.startsWith('*[]')
+                ? toGoValueOfType(param.initializer, paramType)
+                : visit(param.initializer);
         // a missing or undefined argument takes the default; others convert
         // to the parameter's type
         useHelper('dynamic');
@@ -14157,7 +14264,7 @@ const helperPackages = {
     eventLoop: ['sync', 'sync/atomic', 'time'],
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
-    promise: ['sync'],
+    promise: ['sync', 'reflect'],
     goMust: [],
     goNums: [],
     goMaps: [],
@@ -19631,6 +19738,21 @@ func TnAwait[T any](ch chan T) T {
 	v, reason, rejected := tnSettled(ch, received, ok)
 	if rejected {
 		panic(reason)
+	}
+	return v
+}
+
+// await v on a value that may be a promise: its result, else v itself
+func TnAwaitValue(v interface{}, inline bool) interface{} {
+	if ch, ok := v.(chan interface{}); ok {
+		if inline {
+			return TnAwaitInline(ch)
+		}
+		return TnAwait(ch)
+	}
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Chan {
+		received, _ := rv.Recv()
+		return received.Interface()
 	}
 	return v
 }
