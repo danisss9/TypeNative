@@ -480,6 +480,38 @@ let asyncChannelIsAsync = false;
 // header (push/splice through any alias are visible everywhere)
 const referenceArrays = new Set<string>();
 
+// Whether the array variable `ref` names may hold null: declared nullable, or
+// given a regex match (null when nothing matches) or null
+const nullableArrayCache = new Map<AstNode, Set<string>>();
+function mayHoldNullArray(ref: AstNode): boolean {
+  let scope = ref.parent;
+  while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
+  if (!scope) return false;
+  let names = nullableArrayCache.get(scope);
+  if (!names) {
+    const found = new Set<string>();
+    const nullish = (e: AstNode | undefined): boolean => {
+      if (!e) return false;
+      const u = unwrapParentheses(e);
+      if (isNilLiteral(u)) return true;
+      return isCallExpression(u) && isPropertyAccessExpression(u.expression) && ['exec', 'match'].includes(u.expression.name.text);
+    };
+    const walk = (n: AstNode): void => {
+      if (n.kind === 'VariableDeclaration' && isIdentifier(n.name)) {
+        const t = n.type;
+        const nullableType = !!t && isUnionTypeNode(t) && (t.types ?? []).some((m: AstNode) => m.kind === 'NullKeyword' || m.kind === 'UndefinedKeyword' || (isLiteralTypeNode(m) && m.literal?.kind === 'NullKeyword'));
+        if (nullableType || nullish(n.initializer)) found.add(n.name.text);
+      }
+      if (isBinaryExpression(n) && n.operatorToken.kind === 'EqualsToken' && isIdentifier(n.left) && nullish(n.right)) found.add(n.left.text);
+      for (const child of childNodes(n)) if (!FUNCTION_LIKE_KINDS.has(child.kind)) walk(child);
+    };
+    walk(scope.body ?? scope);
+    names = found;
+    nullableArrayCache.set(scope, names);
+  }
+  return names.has(ref.text);
+}
+
 // Registers a variable's Go type; array-typed variables become *[]T references
 // (dynamic []interface{} arrays stay plain: they flow through runtime helpers)
 function setVarGoType(name: string, goType: string | undefined): void {
@@ -1543,6 +1575,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   goSafeIdSeed = 1;
   consoleGroupsUsed = code.includes('console.group');
   declaredFunctions.clear();
+  nullableArrayCache.clear();
   declaredVariables.clear();
   declaredInterfaces.clear();
   declaredTypeAliases.clear();
@@ -1897,7 +1930,20 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       return expectsConstructorFunction(node) ? `New${getSafeName(node.text)}` : classValue(node.text);
     }
     // Array references: reads go through the shared slice-header pointer
+    // (`arr === null` tests the reference itself)
     if (referenceArrays.has(node.text)) {
+      const parent = node.parent;
+      const comparedToNil =
+        parent && isBinaryExpression(parent) &&
+        ['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken', 'EqualsEqualsToken', 'ExclamationEqualsToken'].includes(parent.operatorToken.kind) &&
+        isNilLiteral(parent.left === node ? parent.right : parent.left);
+      if (comparedToNil) return getSafeName(node.text);
+      // (one that may hold null — a regex match — reads as a nil slice then)
+      const mutated = isAssignmentTarget(node) || (isPropertyAccessExpression(parent) && parent.expression === node && MUTATING_ARRAY_METHODS.has(parent.name.text));
+      if (!mutated && mayHoldNullArray(node)) {
+        useHelper('dynamic');
+        return `TnDerefSlice(${getSafeName(node.text)})`;
+      }
       return `(*${getSafeName(node.text)})`;
     }
     if (narrowedVariables.has(node.text) && isNarrowableReference(node)) {
@@ -2313,6 +2359,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           );
         } else if (localName === '_' || localName.startsWith('_')) {
           parts.push(`_ = ${tmpVar}`);
+        } else if (elemType && ['string', 'float64', 'bool'].includes(elemType) && isIdentifier(bindEl.name) && comparedToNullish(bindEl.name.text, node)) {
+          // a primitive the code tests for undefined: nil past the end
+          useHelper('dynamic');
+          parts.push(`${localName} := TnAtPtr(${tmpVar}, float64(${idx}))`);
+          registerLocalVariable(bindingName(el, localName), `*${elemType}`);
+          return;
         } else {
           // Reading past the end gives undefined in JS: the zero value here
           useHelper('dynamic');
@@ -2802,7 +2854,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const statement = visit(node);
       discardedExpressions.delete(node);
       const targetType = inferExpressionType(node.left) ?? 'interface{}';
-      return `func() ${targetType} { ${statement}; return ${visit(node.left)} }()`;
+      // (an array reference that may now hold null reads as a nil slice)
+      const read = isIdentifier(node.left) && referenceArrays.has(node.left.text) && mayHoldNullArray(node.left)
+        ? (useHelper('dynamic'), `TnDerefSlice(${getSafeName(node.left.text)})`)
+        : visit(node.left);
+      return `func() ${targetType} { ${statement}; return ${read} }()`;
     }
     if (
       node.operatorToken.kind === 'InstanceOfKeyword' &&
@@ -4161,7 +4217,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const recordSpread = visitRecordSpreadLiteral(node);
     if (recordSpread) return recordSpread;
-    const contextualType = resolveTypeNode(getContextualTypeNode(node));
+    const contextualType = objectLiteralContextualType(node);
     if (isRecordTypeNode(contextualType)) {
       return visitMapLiteral(node, contextualType);
     }
@@ -4331,6 +4387,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       return `func(${params.map((t: string, i: number) => `${names[i]} ${t}`).join(', ')})${result ? ` ${result}` : ''} { ${body} }`;
     }
   }
+  // T | undefined into an any slot: its value, or nil (not a typed nil pointer)
+  if (goType === 'interface{}' && NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(expr) ?? '')) {
+    useHelper('dynamic');
+    return `TnPtrValue(${visit(expr)})`;
+  }
   // a && b / a || b where a boolean is expected: its truthiness
   const logical = unwrapParentheses(expr);
   if (goType === 'bool' && isBinaryExpression(logical) && isLogicalOperator(logical.operatorToken)) return toGoCondition(logical);
@@ -4385,6 +4446,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (isDynamicValue(castSource) || dynamicElements) {
         useHelper('dynamic');
         return `func() ${goType} { __v := TnAs[${goType.slice(1)}](${visit(castSource)}); return &__v }()`;
+      }
+      // re.exec(s) / s.match(re): no match is null, not an empty array
+      const call = unwrapParentheses(expr);
+      if (isCallExpression(call) && isPropertyAccessExpression(call.expression) && ['exec', 'match'].includes(call.expression.name.text)) {
+        return `func() ${goType} { __v := ${visit(expr)}; if __v == nil { return nil }; return &__v }()`;
       }
       return `func() ${goType} { __v := ${visit(expr)}; return &__v }()`;
     }
@@ -4987,7 +5053,12 @@ function visitSpreadCallArguments(node: AstNode): string[] {
     if (!isSpreadElement(arg)) {
       result.push(visit(arg));
     } else if (isVariadic) {
-      result.push(`${visit(arg.expression)}...`);
+      // xs.push(...typed) on an array of any values: the elements boxed
+      const receiverType = isPropertyAccessExpression(node.expression) ? (inferExpressionType(node.expression.expression) ?? '') : '';
+      const sourceType = (inferExpressionType(arg.expression) ?? '').replace(/^\*\[\]/, '[]');
+      const boxed = !fn && receiverType.replace(/^\*\[\]/, '[]') === '[]interface{}' && sourceType !== '[]interface{}' && (sourceType.startsWith('[]') || sourceType === 'interface{}' || !sourceType);
+      if (boxed) useHelper('arraySubclass');
+      result.push(boxed ? `TnToArray(${visit(arg.expression)})...` : `${visit(arg.expression)}...`);
     } else {
       useHelper('dynamic');
       const source = visit(arg.expression);
@@ -6122,9 +6193,51 @@ function isStructMethodField(structType: string, field: string): boolean {
   return structMethodFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
 }
 
+// The element type node of T[] / Array<T> / ReadonlyArray<T>
+function arrayElementTypeNode(typeNode: AstNode | undefined): AstNode | undefined {
+  if (!typeNode) return undefined;
+  if (isArrayTypeNode(typeNode)) return typeNode.elementType;
+  if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName) && ['Array', 'ReadonlyArray'].includes(typeNode.typeName.text) && (typeNode.typeArguments ?? []).length === 1 && !classNames.has(typeNode.typeName.text)) {
+    return typeNode.typeArguments[0];
+  }
+  return undefined;
+}
+
+// An object literal's contextual type; of a union of object types (a
+// discriminated union), the member the literal is: the one its `type: '…'`
+// (any string-literal-typed key) selects, else the first with all its keys
+function objectLiteralContextualType(node: AstNode): AstNode | undefined {
+  const contextual = resolveTypeNode(getContextualTypeNode(node));
+  if (!contextual || !isUnionTypeNode(contextual)) return contextual;
+  const members = (contextual.types ?? [])
+    .map((t: AstNode) => resolveTypeNode(t))
+    .filter((t: AstNode | undefined) => !!t && t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword') as AstNode[];
+  const objectMembers = members.filter((t) => t.kind === 'TypeLiteral' || (isTypeReferenceNode(t) && isIdentifier(t.typeName) && declaredInterfaces.has(t.typeName.text)));
+  if (objectMembers.length === 0 || objectMembers.length !== members.length) return contextual;
+  const props = (node.properties ?? []).filter((p: AstNode) => (isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && (isIdentifier(p.name) || isStringLiteral(p.name)));
+  if (props.length !== (node.properties ?? []).length) return contextual;
+  const literalValue = (p: AstNode): string | undefined =>
+    isPropertyAssignment(p) && (isStringLiteral(p.initializer) || isNoSubstitutionTemplateLiteral(p.initializer)) ? p.initializer.text : undefined;
+  const literalTypes = (t: AstNode | undefined): string[] => {
+    const r = resolveTypeNode(t);
+    if (!r) return [];
+    if (isLiteralTypeNode(r) && isStringLiteral(r.literal)) return [r.literal.text];
+    if (isUnionTypeNode(r)) return (r.types ?? []).flatMap((m: AstNode) => literalTypes(m));
+    return [];
+  };
+  const fits = (member: AstNode) => props.every((p: AstNode) => {
+    const memberType = getMemberTypeNode(member, p.name.text);
+    if (!memberType || memberType.kind === 'NeverKeyword') return false;
+    const tags = literalTypes(memberType);
+    const value = literalValue(p);
+    return tags.length === 0 || value === undefined || tags.includes(value);
+  });
+  return objectMembers.find(fits) ?? contextual;
+}
+
 function getObjectLiteralGoType(node: AstNode): string {
   if (isDynamicObjectLiteral(node)) return 'interface{}';
-  const contextualType = resolveTypeNode(getContextualTypeNode(node));
+  const contextualType = objectLiteralContextualType(node);
   if (isRecordTypeNode(contextualType)) return getType(contextualType);
   const typeName = contextualType ? getType(contextualType) : '';
   if (typeName && typeName !== 'interface{}' && typeName !== ':') return typeName;
@@ -6708,7 +6821,8 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
     ['push', 'unshift'].includes(parent.expression.name.text) && (parent.arguments ?? []).includes(node)
   ) {
     const arrayType = resolveTypeNode(getExpressionTypeNode(parent.expression.expression));
-    if (isArrayTypeNode(arrayType)) return arrayType.elementType;
+    const declaredElement = arrayElementTypeNode(arrayType);
+    if (declaredElement) return declaredElement;
     const goType = inferExpressionType(parent.expression.expression) ?? '';
     const element = goType.replace(/^\*?\[\]\*?/, '');
     if (/^[A-Za-z_]\w*$/.test(element) && (declaredInterfaces.has(element) || declaredTypeAliases.has(element))) {
@@ -6744,15 +6858,13 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
     parent.initializer === node &&
     (isIdentifier(parent.name) || isStringLiteral(parent.name))
   ) {
-    const objectType = getContextualTypeNode(parent.parent);
+    const objectType = isObjectLiteralExpression(parent.parent) ? objectLiteralContextualType(parent.parent) : getContextualTypeNode(parent.parent);
     return objectType ? getMemberTypeNode(objectType, parent.name.text) : undefined;
   }
   if (isArrayLiteralExpression(parent)) {
     const arrayType = resolveTypeNode(getContextualTypeNode(parent));
-    if (isArrayTypeNode(arrayType)) return arrayType.elementType;
-    if (isTypeReferenceNode(arrayType) && isIdentifier(arrayType.typeName) && ['Array', 'ReadonlyArray'].includes(arrayType.typeName.text) && (arrayType.typeArguments ?? []).length === 1) {
-      return arrayType.typeArguments[0];
-    }
+    const declaredElement = arrayElementTypeNode(arrayType);
+    if (declaredElement) return declaredElement;
     // a Go array type: its element (a named object type, or an anonymous one)
     if (arrayType?.kind === 'TnGoType' && /^\*?\[\]/.test(arrayType.goType)) {
       const elementGoType = arrayType.goType.replace(/^\*?\[\]/, '');
@@ -7442,7 +7554,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   // new this(…) in a static method: an instance of the class declaring it
   if (isNewExpression(expr) && expr.expression.kind === 'ThisKeyword') {
     const owner = getEnclosingClassName(expr);
-    if (owner) return isPolymorphicClass(owner) ? 'interface{}' : `*${owner}`;
+    // (NewC's result, even for a class with subclasses)
+    if (owner) return `*${getSafeName(owner)}`;
   }
   if (isNewExpression(expr) && isIdentifier(expr.expression)) {
     const ctorName = expr.expression.text;
@@ -10784,8 +10897,10 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     if (args.length === 1) {
       return `func() []${elementType} { __rm := append([]${elementType}{}, ${obj}[${start}:]...); ${obj} = ${obj}[:${start}]; return __rm }()`;
     }
-    const insert = args.slice(2).join(', ');
-    return `func() []${elementType} { __rm := append([]${elementType}{}, ${obj}[${start}:(int(${args[1]}))+(${start})]...); __tail := append([]${elementType}{}, ${obj}[(int(${args[1]}))+(${start}):]...); ${obj} = append(${obj}[:${start}], ${insert}); ${obj} = append(${obj}, __tail...); return __rm }()`;
+    const insert = args.slice(2);
+    // (the deleted count is clamped to the elements after start)
+    const inserted = insert.length > 0 ? appendArguments(`${obj}[:__start]`, insert) : `${obj}[:__start]`;
+    return `func() []${elementType} { __start := ${start}; __end := __start + max(0, int(${args[1]})); if __end > len(${obj}) { __end = len(${obj}) }; __rm := append([]${elementType}{}, ${obj}[__start:__end]...); __tail := append([]${elementType}{}, ${obj}[__end:]...); ${obj} = ${inserted}; ${obj} = append(${obj}, __tail...); return __rm }()`;
   },
   fill: (obj, args) => {
     const elementType = receiverElementType();
@@ -11170,6 +11285,8 @@ function isObjectKeysOfDynamic(node: AstNode): boolean {
 }
 
 // Array methods that change the array (on an any value they write it back)
+// Calls being emitted both ways (array method / class method dispatch)
+const dynamicArrayOrDispatch = new Set<AstNode>();
 const MUTATING_ARRAY_METHODS = new Set(['push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse', 'fill', 'copyWithin']);
 
 // An identifier or property access (something a value can be written back to)
@@ -11200,8 +11317,21 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
   }
   const method = node.expression.name.text;
   // a mutating array method on an any value: on its elements, written back
-  // (a class declaring the method — an Array subclass's own push — dispatches)
-  if (MUTATING_ARRAY_METHODS.has(method) && isAssignableExpression(node.expression.expression) && !classMethodNamed(method)) {
+  // (a class declaring the method — an Array subclass's own push — dispatches;
+  // when the value may be either, it is decided at run time)
+  if (MUTATING_ARRAY_METHODS.has(method) && isAssignableExpression(node.expression.expression) && classMethodNamed(method) && !dynamicArrayOrDispatch.has(node)) {
+    dynamicArrayOrDispatch.add(node);
+    const dispatched = visitDynamicDispatch(node);
+    const arrayPath = visitDynamicMethodCall(node);
+    dynamicArrayOrDispatch.delete(node);
+    if (dispatched && arrayPath) {
+      useHelper('dynamic');
+      const receiverCode = visit(node.expression.expression);
+      if (isDiscardedValue(node)) return `func() { if TnIsSlice(${receiverCode}) { ${arrayPath} } else { ${dispatched} } }()`;
+      return `func() interface{} { if TnIsSlice(${receiverCode}) { return ${arrayPath} }; return ${dispatched} }()`;
+    }
+  }
+  if (MUTATING_ARRAY_METHODS.has(method) && isAssignableExpression(node.expression.expression) && (!classMethodNamed(method) || dynamicArrayOrDispatch.has(node))) {
     useHelper('dynamic');
     const receiver = node.expression.expression;
     const elements = getTempName('arr');
@@ -12222,6 +12352,29 @@ function genericMemberPrimitive(source: AstNode, name: AstNode): string | undefi
 function bindingName(element: AstNode, goName: string): string {
   const name = element?.name ?? element;
   return isIdentifier(name) ? name.text : goName;
+}
+
+// Whether the code around a declaration tests variable `name` for undefined
+// or null (x === undefined, x ?? y, switch (…x…) { case undefined: })
+function comparedToNullish(name: string, declaration: AstNode): boolean {
+  let scope = declaration.parent;
+  while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
+  if (!scope) return false;
+  const mentions = (n: AstNode | undefined) => !!n && containsNode(n, (m) => isIdentifier(m) && m.text === name);
+  const isNameRef = (n: AstNode) => isIdentifier(unwrapParentheses(n)) && unwrapParentheses(n).text === name;
+  return containsNode(scope.body ?? scope, (n) => {
+    if (isBinaryExpression(n)) {
+      const op = n.operatorToken.kind;
+      if (op === 'QuestionQuestionToken' || op === 'QuestionQuestionEqualsToken') return isNameRef(n.left);
+      if (['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken', 'EqualsEqualsToken', 'ExclamationEqualsToken'].includes(op)) {
+        return (isNameRef(n.left) && isNilLiteral(n.right)) || (isNameRef(n.right) && isNilLiteral(n.left));
+      }
+    }
+    if (n.kind === 'SwitchStatement' && mentions(n.expression)) {
+      return (n.caseBlock?.clauses ?? []).some((c: AstNode) => c.kind === 'CaseClause' && isNilLiteral(c.expression));
+    }
+    return false;
+  });
 }
 
 // `_ = x` for each name a destructuring declaration binds in a function
@@ -13547,7 +13700,7 @@ function stripEmbedDirectives(code: string): string {
 // own code names them; embed blank when only //go:embed directives need it
 function goFileImportLines(fileCode: string): string {
   const code = stripEmbedDirectives(stripGoStrings(fileCode));
-  const referenced = (pkg: string) => code.includes(`${goPathAliases[pkg] ?? pkg.split('/').pop()!}.`);
+  const referenced = (pkg: string) => new RegExp(`(^|[^.\\w])${goPathAliases[pkg] ?? pkg.split('/').pop()!}\\.`).test(code);
   // (a standard package the code no longer references — its use was in a
   // branch emitted another way — is left out, as Go requires)
   const isStd = (pkg: string) => !pkg.split('/')[0].includes('.');
@@ -15143,7 +15296,7 @@ func TnSet(obj interface{}, key string, value interface{}) {
 	if tnSetMember(obj, key, value) {
 		return
 	}
-	panic("TnSet: cannot set property " + key)
+	panic(fmt.Sprintf("TnSet: cannot set property %s of %T", key, obj))
 }
 
 // obj.key = value on a typed value held as any: a setter (Set_key), a
@@ -15327,6 +15480,32 @@ func tnIsPrimitive(v interface{}) bool {
 		return true
 	}
 	return false
+}
+
+// Whether a dynamic value is a plain array (a slice or a reference to one)
+func TnIsSlice(v interface{}) bool {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+		rv = rv.Elem()
+	}
+	return rv.Kind() == reflect.Slice
+}
+
+// *arr of an array reference that may be nil (null): a nil slice then
+func TnDerefSlice[T any](p *[]T) []T {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// s[i] as T | undefined (nil past the end)
+func TnAtPtr[T any](s []T, i float64) *T {
+	if i < 0 || int(i) >= len(s) {
+		return nil
+	}
+	v := s[int(i)]
+	return &v
 }
 
 func TnAt[T any](s []T, i float64) T {
@@ -18158,7 +18337,7 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 			if m.match(node.child, pos, func(int) bool { return true }) {
 				matched = true
 			}
-			m.caps = saved
+			copy(m.caps, saved)
 			if matched != node.negative {
 				return k(pos)
 			}
@@ -18171,7 +18350,7 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 				matched = true
 			}
 		}
-		m.caps = saved
+		copy(m.caps, saved)
 		if matched != node.negative {
 			return k(pos)
 		}

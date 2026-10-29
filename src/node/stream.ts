@@ -1254,6 +1254,8 @@ func tnStdin() *bufio.Reader {
   const cls = defineClass(r, 'stream.Duplex', '*TnStream', 'class', methods, 'tnSelf=interface{}', getters, '');
   for (const name of ['Readable', 'Writable', 'Transform', 'PassThrough', 'Stream']) r.classes[`stream.${name}`] = cls;
   for (const name of ['ReadStream', 'WriteStream']) r.classes[`fs.${name}`] = cls;
+  // the global stream interfaces of Node's typings (process.stdin is one)
+  for (const name of ['ReadableStream', 'WritableStream', 'ReadWriteStream']) r.classes[`NodeJS.${name}`] = cls;
   r.classes['stream.default'] = cls;
   r.iterators['*TnStream'] = 'tnIterator';
   cls.methods['tnIterator'] = 'chan interface{}';
