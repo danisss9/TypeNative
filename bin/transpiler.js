@@ -1522,6 +1522,7 @@ export function transpileToNative(code, options) {
     declaredFunctions.clear();
     nullableArrayCache.clear();
     declaredVariables.clear();
+    arrayReferenceCache.clear();
     declaredInterfaces.clear();
     declaredTypeAliases.clear();
     variableTypeNodes.clear();
@@ -2553,6 +2554,13 @@ function visitNode(node, options = {}) {
         const spec = specifier ? jsStringOf(visit(specifier), inferExpressionType(specifier)) : '"undefined"';
         return `TnPromiseReject[interface{}](TnNodeError("Error", "ERR_UNSUPPORTED_DYNAMIC_IMPORT", "Cannot import " + ${spec} + ": import() of a module not known at compile time is not supported in native builds"))`;
     }
+    else if (isCallExpression(node) && !node.tnArrayReference && isIdentifier(node.expression) && returnsArrayReference(declaredFunctions.get(node.expression.text))) {
+        // a call of an array reference function: the array, where a value is read
+        node.tnArrayReference = true;
+        const code = visit(node);
+        node.tnArrayReference = false;
+        return `(*${code})`;
+    }
     else if (isCallExpression(node)) {
         // obj.fn!(…): the non-null assertion has no run-time effect
         while (node.expression?.kind === 'NonNullExpression') {
@@ -3572,9 +3580,13 @@ function visitNode(node, options = {}) {
                 ? toGoType(visit(node.expression), inferExpressionType(node.expression) ?? '', goCallbackResult)
                 : toGoValueOfType(node.expression, returnGoType);
         const terminator = options.inline ? '' : ';\n\t';
+        // (an array reference function returns the array it found, by reference)
+        const returned = node.expression && enclosingFn && returnGoType && returnsArrayReference(enclosingFn)
+            ? arrayReferenceOf(node.expression, returnGoType)
+            : value;
         if (tryReturn && enclosingFn === tryReturn.fn)
-            return tryAwareReturn(value) + terminator;
-        return `return ${value}` + terminator;
+            return tryAwareReturn(returned) + terminator;
+        return `return ${returned}` + terminator;
     }
     else if (isFunctionDeclaration(node) || isFunctionExpression(node)) {
         // overload signatures have no body: only the implementation is emitted
@@ -3594,7 +3606,9 @@ function visitNode(node, options = {}) {
         const inferredRetType = node.body && isBlock(node.body) && !node.type
             ? withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined
             : inferFunctionBodyReturnType(node);
-        const returnType = inferredRetType ? ` ${inferredRetType}` : '';
+        // (a function returning one of its arguments' array fields returns a
+        // reference to it: see returnsArrayReference)
+        const returnType = inferredRetType ? ` ${returnsArrayReference(node) ? '*' : ''}${inferredRetType}` : '';
         if (options.isOutside) {
             // async functions run their body in a goroutine sending over a channel
             const isAsync = (node.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
@@ -4496,11 +4510,22 @@ function toGoValueOfType(expr, goType) {
         const dynamicElements = goType !== '*[]interface{}' && inferExpressionType(castSource) === '[]interface{}';
         if (isDynamicValue(castSource) || dynamicElements) {
             useHelper('dynamic');
-            return `func() ${goType} { __v := TnAs[${goType.slice(1)}](${visit(castSource)}); return &__v }()`;
+            // (a reference to an array of this type is shared, not copied)
+            return `TnArrayRef[${goType.slice(3)}](${visit(castSource)})`;
+        }
+        // a call of an array reference function: the reference itself
+        const refCall = unwrapParentheses(expr);
+        if (isCallExpression(refCall) && isIdentifier(refCall.expression) && returnsArrayReference(declaredFunctions.get(refCall.expression.text))) {
+            refCall.tnArrayReference = true;
+            const code = visit(refCall);
+            refCall.tnArrayReference = false;
+            return code;
         }
         // an object's array field (it.sep): its address, so the callee's
         // pushes and splices change the field (the array is shared, as in JS)
-        if (isPropertyAccessExpression(unwrapParentheses(expr)) && !hasQuestionDot(unwrapParentheses(expr)) && inferExpressionType(expr) === goType.slice(1)) {
+        // (as an argument only: a variable keeps the array, not the field slot)
+        const passed = isCallExpression(expr.parent) && (expr.parent.arguments ?? []).includes(expr);
+        if (passed && isPropertyAccessExpression(unwrapParentheses(expr)) && !hasQuestionDot(unwrapParentheses(expr)) && inferExpressionType(expr) === goType.slice(1)) {
             const field = visit(expr);
             if (/^[\w.()*]+$/.test(field) && !field.endsWith(')'))
                 return `&${field}`;
@@ -12693,6 +12718,64 @@ function comparedToNullish(name, declaration) {
         return false;
     });
 }
+// A top-level function whose result is an array it found in its arguments
+// (`return parent.start`, `return it.sep ?? it.start`): JS returns that very
+// array, so a caller's push / splice changes it. Go slices are values, so the
+// function returns a *[]T reference to the field instead (and its calls read
+// through it). Only for functions never used as values.
+const arrayReferenceCache = new Map();
+function returnsArrayReference(fn) {
+    if (!fn || !isFunctionDeclaration(fn) || !fn.body || !isBlock(fn.body) || fn.asteriskToken || !fn.name)
+        return false;
+    const cached = arrayReferenceCache.get(fn);
+    if (cached !== undefined)
+        return cached;
+    arrayReferenceCache.set(fn, false);
+    if ((fn.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword'))
+        return false;
+    const returns = collectReturnStatements(fn.body).map((r) => r.expression).filter((e) => !!e);
+    const isField = (e) => {
+        const u = unwrapParentheses(e);
+        if (isPropertyAccessExpression(u))
+            return !hasQuestionDot(u);
+        if (isBinaryExpression(u) && u.operatorToken.kind === 'QuestionQuestionToken')
+            return isField(u.left) && isField(u.right);
+        return false;
+    };
+    if (!returns.some(isField))
+        return false;
+    const supported = (e) => {
+        const u = unwrapParentheses(e);
+        return isField(u) || (isArrayLiteralExpression(u) && !(u.elements ?? []).some((el) => isSpreadElement(el)));
+    };
+    if (!returns.every(supported))
+        return false;
+    const name = fn.name.text;
+    const usedAsValue = [...linkedModules.values()].some((m) => containsNode(m.ast, (n) => isIdentifier(n) && n.text === name && n !== fn.name && !(isCallExpression(n.parent) && n.parent.expression === n) && !isFieldNameIdentifier(n) &&
+        !['ImportSpecifier', 'ExportSpecifier'].includes(n.parent?.kind)));
+    if (usedAsValue)
+        return false;
+    const resultType = withFunctionScopeTypes(fn, () => inferFunctionBodyReturnType(fn) ?? '');
+    const result = resultType.startsWith('[]') && resultType !== '[]byte';
+    arrayReferenceCache.set(fn, result);
+    return result;
+}
+// A returned array as a reference: a field's address, a new array's
+function arrayReferenceOf(expr, sliceType) {
+    const u = unwrapParentheses(expr);
+    const goType = sliceType.replace(/^\*/, '');
+    // (a field of a struct pointer is addressable, whatever the pointer's expression)
+    if (isPropertyAccessExpression(u) && !hasQuestionDot(u) && inferExpressionType(u) === goType && (inferExpressionType(u.expression) ?? '').startsWith('*')) {
+        const field = visit(u);
+        if (!field.endsWith(')') && !field.startsWith('TnGet('))
+            return `&(${field})`;
+    }
+    if (isBinaryExpression(u) && u.operatorToken.kind === 'QuestionQuestionToken') {
+        // (a ?? b: a when it is set)
+        return `func() *${goType} { if __r := ${arrayReferenceOf(u.left, goType)}; *__r != nil { return __r }; return ${arrayReferenceOf(u.right, goType)} }()`;
+    }
+    return `func() *${goType} { __v := ${toGoValueOfType(u, goType)}; return &__v }()`;
+}
 // `_ = x` for each name a destructuring declaration binds in a function
 // (JS allows locals that are never read; Go does not)
 function destructuredUseMarks(declaration) {
@@ -15496,8 +15579,17 @@ func TnGet(obj interface{}, key string) interface{} {
 		for _, name := range []string{key, key + "_"} {
 			if f := rv.Elem().FieldByName(name); f.IsValid() {
 				// Unexported field: read it through a pointer to bypass the flag
-				// (a T | undefined field reads as its value, or undefined)
-				return tnPlainValue(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface())
+				// (a T | undefined field reads as its value, or undefined; an
+				// array field as a reference to it — JS arrays are shared, so
+				// a push or splice through this value changes the field)
+				ref := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr()))
+				if f.Kind() == reflect.Slice && f.Type().Elem().Kind() != reflect.Uint8 {
+					if f.IsNil() {
+						return nil
+					}
+					return ref.Interface()
+				}
+				return tnPlainValue(ref.Elem().Interface())
 			}
 		}
 		// a getter (get x() → Get_x)
@@ -15831,6 +15923,18 @@ func TnNarrow[T any](v interface{}) T {
 	return v.(T)
 }
 
+// A dynamic array as a *[]T: the reference it is, else a converted copy
+func TnArrayRef[T any](v interface{}) *[]T {
+	if p, ok := v.(*[]T); ok {
+		return p
+	}
+	if v == nil {
+		return nil
+	}
+	s := TnAs[[]T](v)
+	return &s
+}
+
 // *arr of an array reference that may be nil (null): a nil slice then
 func TnDerefSlice[T any](p *[]T) []T {
 	if p == nil {
@@ -15865,7 +15969,11 @@ func TnLength(v interface{}) float64 {
 	case interface{ TnItems() *[]interface{} }:
 		return float64(len(*t.TnItems()))
 	}
-	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		rv = rv.Elem()
+	}
+	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map {
 		return float64(rv.Len())
 	}
 	return 0
@@ -16464,6 +16572,11 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		return reflect.Zero(t), true
 	}
 	rv := reflect.ValueOf(v)
+	// an array reference where an array is expected: its elements
+	if rv.Kind() == reflect.Pointer && t.Kind() == reflect.Slice && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		rv = rv.Elem()
+		v = rv.Interface()
+	}
 	if rv.Type().AssignableTo(t) {
 		return rv, true
 	}
