@@ -656,6 +656,12 @@ export function registerBuffer(r: NodeRegistry): void {
     'from=[]byte; alloc=[]byte; allocUnsafe=[]byte; allocUnsafeSlow=[]byte; concat=[]byte; byteLength=float64; isBuffer=bool; isEncoding=bool; compare=float64'
   );
   r.results['globals.Uint8Array.from'] = '[]byte';
+  // Uint8Array.fromBase64(s) / u8.toBase64() (ES2026)
+  r.functions['globals.Uint8Array.fromBase64'] = (call: NodeCall) => {
+    use();
+    return `TnBufferFromString(${call.args[0]}, "base64")`;
+  };
+  r.results['globals.Uint8Array.fromBase64'] = '[]byte';
   r.functions['buffer.atob'] = (call: NodeCall) => {
     use();
     return `TnAtob(${call.args[0]})`;
@@ -731,6 +737,7 @@ export function registerBuffer(r: NodeRegistry): void {
     if (result) r.results[`buffer.Buffer#${name}`] = result;
   };
   method('toString', 'string', (c: NodeCall) => `TnBufferToString(${c.recv}, ${encArg(c, 0)}${boundsArgs(c, 1)})`);
+  method('toBase64', 'string', (c: NodeCall) => `TnBufferToString(${c.recv}, "base64")`);
   method('toJSON', 'map[string]interface{}', (c: NodeCall) => `TnBufferToJSON(${c.recv})`);
   method('equals', 'bool', (c: NodeCall) => `bytes.Equal(${c.recv}, ${c.args[0]})`);
   method('compare', 'float64', (c: NodeCall) => `float64(bytes.Compare(${c.recv}, ${c.args[0]}))`);

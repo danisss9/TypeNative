@@ -210,31 +210,33 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Returns the elements of an array that meet the condition specified in a callback function.
    */
-  filter(callback: (value: T, index?: number, array?: T[]) => boolean): T[];
+  filter<S extends T>(callback: (value: T, index: number, array: T[]) => value is S): S[];
+  filter(callback: (value: T, index: number, array: T[]) => unknown): T[];
   /**
    * Determines whether the specified callback function returns true for any element of an array.
    */
-  some(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  some(callback: (value: T, index: number, array: T[]) => unknown): boolean;
   /**
    * Returns the value of the first element in the array where callback is true, and undefined otherwise.
    */
-  find(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
+  find<S extends T>(callback: (value: T, index: number, array: T[]) => value is S): S | undefined;
+  find(callback: (value: T, index: number, array: T[]) => unknown): T | undefined;
   /**
    * Returns the index of the first element that satisfies the callback, or -1.
    */
-  findIndex(callback: (value: T, index?: number, array?: T[]) => boolean): number;
+  findIndex(callback: (value: T, index: number, array: T[]) => unknown): number;
   /**
    * Returns the value of the last element where callback is true, and undefined otherwise.
    */
-  findLast(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
+  findLast(callback: (value: T, index: number, array: T[]) => unknown): T | undefined;
   /**
    * Returns the index of the last element that satisfies the callback, or -1.
    */
-  findLastIndex(callback: (value: T, index?: number, array?: T[]) => boolean): number;
+  findLastIndex(callback: (value: T, index: number, array: T[]) => unknown): number;
   /**
    * Determines whether all elements satisfy the callback.
    */
-  every(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  every(callback: (value: T, index: number, array: T[]) => unknown): boolean;
   /**
    * Performs the callback for each element.
    */
@@ -1060,6 +1062,8 @@ interface Uint8Array {
   slice(start?: number, end?: number): Uint8Array;
   set(array: ArrayLike<number>, offset?: number): void;
   at(index: number): number | undefined;
+  /** Base64 of the bytes (ES2026) */
+  toBase64(): string;
   [Symbol.iterator](): IterableIterator<number>;
 }
 
@@ -1069,6 +1073,8 @@ interface Uint8ArrayConstructor {
   // A view sharing the buffer's memory
   new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
   from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
+  /** The bytes a base64 string encodes (ES2026) */
+  fromBase64(base64: string): Uint8Array;
 }
 
 declare var Uint8Array: Uint8ArrayConstructor;
