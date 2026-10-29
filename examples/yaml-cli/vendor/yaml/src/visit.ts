@@ -1,0 +1,365 @@
+import { Document } from './doc/Document.ts'
+import { Alias } from './nodes/Alias.ts'
+import { isCollection, isNode } from './nodes/identity.ts'
+import type { Node, Primitive } from './nodes/types.ts'
+import { Pair } from './nodes/Pair.ts'
+import { Scalar } from './nodes/Scalar.ts'
+import { YAMLMap } from './nodes/YAMLMap.ts'
+import { YAMLSeq } from './nodes/YAMLSeq.ts'
+import { YAMLSet } from './nodes/YAMLSet.ts'
+
+const BREAK = Symbol('break visit')
+const SKIP = Symbol('skip children')
+const REMOVE = Symbol('remove node')
+
+export type visitorFn<T> = (
+  key: number | 'key' | 'value' | null,
+  node: T,
+  path: readonly (Document | Node | Pair)[]
+) => void | symbol | number | Node | Pair
+
+export type visitor =
+  | visitorFn<Node | Pair | null>
+  | {
+      Alias?: visitorFn<Alias>
+      Collection?: visitorFn<YAMLMap | YAMLSeq | YAMLSet>
+      Map?: visitorFn<YAMLMap | YAMLSet>
+      Node?: visitorFn<Alias | Scalar | YAMLMap | YAMLSeq | YAMLSet>
+      Pair?: visitorFn<Pair>
+      Scalar?: visitorFn<Scalar>
+      Seq?: visitorFn<YAMLSeq>
+      Value?: visitorFn<Scalar | YAMLMap | YAMLSeq | YAMLSet>
+    }
+
+export type asyncVisitorFn<T> = (
+  key: number | 'key' | 'value' | null,
+  node: T,
+  path: readonly (Document | Node | Pair)[]
+) =>
+  | void
+  | symbol
+  | number
+  | Node
+  | Pair
+  | Promise<void | symbol | number | Node | Pair>
+
+export type asyncVisitor =
+  | asyncVisitorFn<Node | Pair | null>
+  | {
+      Alias?: asyncVisitorFn<Alias>
+      Collection?: asyncVisitorFn<YAMLMap | YAMLSeq | YAMLSet>
+      Map?: asyncVisitorFn<YAMLMap | YAMLSet>
+      Node?: asyncVisitorFn<Alias | Scalar | YAMLMap | YAMLSeq | YAMLSet>
+      Pair?: asyncVisitorFn<Pair>
+      Scalar?: asyncVisitorFn<Scalar>
+      Seq?: asyncVisitorFn<YAMLSeq>
+      Value?: asyncVisitorFn<Scalar | YAMLMap | YAMLSeq | YAMLSet>
+    }
+
+/**
+ * Apply a visitor to an AST node or document.
+ *
+ * Walks through the tree (depth-first) starting from `node`, calling a
+ * `visitor` function with three arguments:
+ *   - `key`: For sequence values and map `Pair`, the node's index in the
+ *     collection. Within a `Pair`, `'key'` or `'value'`, correspondingly.
+ *     `null` for the root node.
+ *   - `node`: The current node.
+ *   - `path`: The ancestry of the current node.
+ *
+ * The return value of the visitor may be used to control the traversal:
+ *   - `undefined` (default): Do nothing and continue
+ *   - `visit.SKIP`: Do not visit the children of this node, continue with next
+ *     sibling
+ *   - `visit.BREAK`: Terminate traversal completely
+ *   - `visit.REMOVE`: Remove the current node, then continue with the next one
+ *   - `Node`: Replace the current node, then continue by visiting it
+ *   - `number`: While iterating the items of a sequence or map, set the index
+ *     of the next step. This is useful especially if the index of the current
+ *     node has changed.
+ *
+ * If `visitor` is a single function, it will be called with all values
+ * encountered in the tree, including e.g. `null` values. Alternatively,
+ * separate visitor functions may be defined for each `Map`, `Pair`, `Seq`,
+ * `Alias` and `Scalar` node. To define the same visitor function for more than
+ * one node type, use the `Collection` (map and seq), `Value` (map, seq & scalar)
+ * and `Node` (alias, map, seq & scalar) targets. Of all these, only the most
+ * specific defined one will be used for each node.
+ */
+export const visit: {
+  (node: Node | Document | null, visitor: visitor): void
+
+  /** Terminate visit traversal completely */
+  BREAK: symbol
+
+  /** Do not visit the children of the current node */
+  SKIP: symbol
+
+  /** Remove the current node */
+  REMOVE: symbol
+} = function visit(node, visitor) {
+  const visitor_ = initVisitor(visitor)
+  if (node instanceof Document) {
+    const cd = visit_(null, node.value, visitor_, [node])
+    if (cd === REMOVE) node.value = new Scalar(null)
+  } else visit_(null, node, visitor_, [])
+}
+
+visit.BREAK = BREAK
+visit.SKIP = SKIP
+visit.REMOVE = REMOVE
+
+function visit_(
+  key: number | 'key' | 'value' | null,
+  node: Node | Pair | null,
+  visitor: visitor,
+  path: readonly (Document | Node | Pair)[]
+): number | symbol | void {
+  const ctrl = callVisitor(key, node, visitor, path)
+
+  if (isNode(ctrl) || ctrl instanceof Pair) {
+    replaceNode(key, path, ctrl)
+    return visit_(key, ctrl, visitor, path)
+  }
+
+  if (typeof ctrl !== 'symbol') {
+    if (node instanceof YAMLSeq) {
+      path = [...path, node]
+      for (let i = 0; i < node.length; ++i) {
+        const ci = visit_(i, node[i], visitor, path)
+        if (typeof ci === 'number') i = ci - 1
+        else if (ci === BREAK) return BREAK
+        else if (ci === REMOVE) {
+          node.splice(i, 1)
+          i -= 1
+        }
+      }
+    } else if (node instanceof YAMLMap || node instanceof YAMLSet) {
+      path = [...path, node]
+      const entries = Array.from(
+        node.values as Iterable<[symbol | Primitive, Node | Pair]>
+      )
+      const delKeys = []
+      for (let i = 0; i < entries.length; ++i) {
+        const ci = visit_(i, entries[i][1], visitor, path)
+        if (typeof ci === 'number') i = ci - 1
+        else if (ci === BREAK) return BREAK
+        else if (ci === REMOVE) delKeys.push(entries[i][0])
+      }
+      for (const dk of delKeys) node.values.delete(dk)
+    } else if (node instanceof Pair) {
+      path = [...path, node]
+      const ck = visit_('key', node.key, visitor, path)
+      if (ck === BREAK) return BREAK
+      else if (ck === REMOVE) node.key = new Scalar(null)
+      const cv = visit_('value', node.value, visitor, path)
+      if (cv === BREAK) return BREAK
+      else if (cv === REMOVE) node.value = null
+    }
+  }
+
+  return ctrl
+}
+
+/**
+ * Apply an async visitor to an AST node or document.
+ *
+ * Walks through the tree (depth-first) starting from `node`, calling a
+ * `visitor` function with three arguments:
+ *   - `key`: For sequence values and map `Pair`, the node's index in the
+ *     collection. Within a `Pair`, `'key'` or `'value'`, correspondingly.
+ *     `null` for the root node.
+ *   - `node`: The current node.
+ *   - `path`: The ancestry of the current node.
+ *
+ * The return value of the visitor may be used to control the traversal:
+ *   - `Promise`: Must resolve to one of the following values
+ *   - `undefined` (default): Do nothing and continue
+ *   - `visitAsync.SKIP`: Do not visit the children of this node,
+ *     continue with next sibling
+ *   - `visitAsync.BREAK`: Terminate traversal completely
+ *   - `visitAsync.REMOVE`: Remove the current node,
+ *     then continue with the next one
+ *   - `Node`: Replace the current node, then continue by visiting it
+ *   - `number`: While iterating the items of a sequence or map, set the index
+ *     of the next step. This is useful especially if the index of the current
+ *     node has changed.
+ *
+ * If `visitor` is a single function, it will be called with all values
+ * encountered in the tree, including e.g. `null` values. Alternatively,
+ * separate visitor functions may be defined for each `Map`, `Pair`, `Seq`,
+ * `Alias` and `Scalar` node. To define the same visitor function for more than
+ * one node type, use the `Collection` (map and seq), `Value` (map, seq & scalar)
+ * and `Node` (alias, map, seq & scalar) targets. Of all these, only the most
+ * specific defined one will be used for each node.
+ */
+export const visitAsync: {
+  (node: Node | Document | null, visitor: asyncVisitor): Promise<void>
+
+  /** Terminate visit traversal completely */
+  BREAK: symbol
+
+  /** Do not visit the children of the current node */
+  SKIP: symbol
+
+  /** Remove the current node */
+  REMOVE: symbol
+} = async function visitAsync(node, visitor) {
+  const visitor_ = initVisitor(visitor)
+  if (node instanceof Document) {
+    const cd = await visitAsync_(null, node.value, visitor_, [node])
+    if (cd === REMOVE) node.value = new Scalar(null)
+  } else await visitAsync_(null, node, visitor_, [])
+}
+
+visitAsync.BREAK = BREAK
+visitAsync.SKIP = SKIP
+visitAsync.REMOVE = REMOVE
+
+async function visitAsync_(
+  key: number | 'key' | 'value' | null,
+  node: Node | Pair | null,
+  visitor: asyncVisitor,
+  path: readonly (Document | Node | Pair)[]
+): Promise<number | symbol | void> {
+  const ctrl = await callVisitor(key, node, visitor, path)
+
+  if (isNode(ctrl) || ctrl instanceof Pair) {
+    replaceNode(key, path, ctrl)
+    return visitAsync_(key, ctrl, visitor, path)
+  }
+
+  if (typeof ctrl !== 'symbol') {
+    if (node instanceof YAMLSeq) {
+      path = [...path, node]
+      for (let i = 0; i < node.length; ++i) {
+        const ci = await visitAsync_(i, node[i], visitor, path)
+        if (typeof ci === 'number') i = ci - 1
+        else if (ci === BREAK) return BREAK
+        else if (ci === REMOVE) {
+          node.splice(i, 1)
+          i -= 1
+        }
+      }
+    } else if (node instanceof YAMLMap || node instanceof YAMLSet) {
+      path = [...path, node]
+      const entries = Array.from(
+        node.values as Iterable<[symbol | Primitive, Node | Pair]>
+      )
+      const delKeys = []
+      for (let i = 0; i < entries.length; ++i) {
+        const ci = await visitAsync_(i, entries[i][1], visitor, path)
+        if (typeof ci === 'number') i = ci - 1
+        else if (ci === BREAK) return BREAK
+        else if (ci === REMOVE) delKeys.push(entries[i][0])
+      }
+      for (const dk of delKeys) node.values.delete(dk)
+    } else if (node instanceof Pair) {
+      path = [...path, node]
+      const ck = await visitAsync_('key', node.key, visitor, path)
+      if (ck === BREAK) return BREAK
+      else if (ck === REMOVE) node.key = new Scalar(null)
+      const cv = await visitAsync_('value', node.value, visitor, path)
+      if (cv === BREAK) return BREAK
+      else if (cv === REMOVE) node.value = null
+    }
+  }
+
+  return ctrl
+}
+
+function initVisitor<V extends visitor | asyncVisitor>(visitor: V) {
+  if (
+    typeof visitor === 'object' &&
+    (visitor.Collection || visitor.Node || visitor.Value)
+  ) {
+    return Object.assign(
+      {
+        Alias: visitor.Node,
+        Map: visitor.Node,
+        Scalar: visitor.Node,
+        Seq: visitor.Node
+      },
+      visitor.Value && {
+        Map: visitor.Value,
+        Scalar: visitor.Value,
+        Seq: visitor.Value
+      },
+      visitor.Collection && {
+        Map: visitor.Collection,
+        Seq: visitor.Collection
+      },
+      visitor
+    )
+  }
+
+  return visitor
+}
+
+function callVisitor(
+  key: number | 'key' | 'value' | null,
+  node: Node | Pair | null,
+  visitor: visitor,
+  path: readonly (Document | Node | Pair)[]
+): ReturnType<visitorFn<unknown>>
+function callVisitor(
+  key: number | 'key' | 'value' | null,
+  node: Node | Pair | null,
+  visitor: asyncVisitor,
+  path: readonly (Document | Node | Pair)[]
+): ReturnType<asyncVisitorFn<unknown>>
+function callVisitor(
+  key: number | 'key' | 'value' | null,
+  node: Node | Pair | null,
+  visitor: visitor | asyncVisitor,
+  path: readonly (Document | Node | Pair)[]
+): ReturnType<visitorFn<unknown>> | ReturnType<asyncVisitorFn<unknown>> {
+  if (typeof visitor === 'function') return visitor(key, node, path)
+  if (node instanceof YAMLMap || node instanceof YAMLSet)
+    return visitor.Map?.(key, node, path)
+  if (node instanceof YAMLSeq) return visitor.Seq?.(key, node, path)
+  if (node instanceof Pair) return visitor.Pair?.(key, node, path)
+  if (node instanceof Scalar) return visitor.Scalar?.(key, node, path)
+  if (node instanceof Alias) return visitor.Alias?.(key, node, path)
+  return undefined
+}
+
+function replaceNode(
+  key: number | 'key' | 'value' | null,
+  path: readonly (Document | Node | Pair)[],
+  node: Node | Pair
+): number | symbol | void {
+  const parent = path[path.length - 1]
+  if (parent instanceof YAMLSeq) {
+    parent[key as number] = node
+  } else if (parent instanceof YAMLMap) {
+    if (node instanceof Pair) {
+      const entries = Array.from(parent.values)
+      entries[key as number] = [parent.keyOf(node, true), node]
+      parent.values = new Map(entries)
+    } else {
+      throw new Error('Cannot replace map pair with non-pair value')
+    }
+  } else if (parent instanceof YAMLSet) {
+    if (isNode(node)) {
+      const entries = Array.from(parent.values)
+      entries[key as number] = [parent.keyOf(node, true), node]
+      parent.values = new Map(entries)
+    } else {
+      throw new Error('Cannot replace set value with non-node value')
+    }
+  } else if (parent instanceof Pair) {
+    if (isNode(node)) {
+      if (key === 'key') parent.key = node
+      else parent.value = node
+    } else {
+      throw new Error(`Cannot replace pair ${key} with non-node value`)
+    }
+  } else if (parent instanceof Document) {
+    if (node instanceof Scalar || isCollection(node)) parent.value = node
+    else throw new Error('Cannot replace Document value with non-node value')
+  } else {
+    const pt = parent instanceof Alias ? 'alias' : 'scalar'
+    throw new Error(`Cannot replace node with ${pt} parent`)
+  }
+}

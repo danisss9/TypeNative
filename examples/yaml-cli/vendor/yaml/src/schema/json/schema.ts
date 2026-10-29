@@ -1,0 +1,73 @@
+import { Scalar } from '../../nodes/Scalar.ts'
+import { map } from '../common/map.ts'
+import { seq } from '../common/seq.ts'
+import type { CollectionTag, ScalarTag } from '../types.ts'
+
+function intIdentify(value: unknown): value is number | bigint {
+  return typeof value === 'bigint' || Number.isInteger(value)
+}
+
+const stringifyJSON = ({ value }: Scalar) => JSON.stringify(value)
+
+const jsonScalars: ScalarTag[] = [
+  {
+    identify: value => typeof value === 'string',
+    default: true,
+    tag: 'tag:yaml.org,2002:str',
+    resolve: str => str,
+    stringify: stringifyJSON
+  },
+  {
+    identify: value => value == null,
+    createNode: () => new Scalar(null),
+    default: true,
+    tag: 'tag:yaml.org,2002:null',
+    test: str => str === 'null',
+    resolve: () => null,
+    stringify: stringifyJSON
+  },
+  {
+    identify: value => typeof value === 'boolean',
+    default: true,
+    tag: 'tag:yaml.org,2002:bool',
+    test: str => str === 'true' || str === 'false',
+    resolve: str => str === 'true',
+    stringify: stringifyJSON
+  },
+  {
+    identify: intIdentify,
+    default: true,
+    tag: 'tag:yaml.org,2002:int',
+    test: str => /^-?(?:0|[1-9][0-9]*)$/.test(str),
+    resolve: (str, _onError, { intAsBigInt }) =>
+      intAsBigInt ? BigInt(str) : parseInt(str, 10),
+    stringify: ({ value }) =>
+      intIdentify(value) ? value.toString() : JSON.stringify(value)
+  },
+  {
+    identify: value => typeof value === 'number',
+    default: true,
+    tag: 'tag:yaml.org,2002:float',
+    test: str =>
+      /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?$/.test(str),
+    resolve: str => parseFloat(str),
+    stringify: stringifyJSON
+  }
+]
+
+const jsonError: ScalarTag = {
+  default: true,
+  tag: '',
+  test: () => true,
+  resolve(str, onError) {
+    onError(`Unresolved plain scalar ${JSON.stringify(str)}`)
+    return str
+  }
+}
+
+export const schema: (CollectionTag | ScalarTag)[] = [
+  map,
+  seq,
+  ...jsonScalars,
+  jsonError
+]
