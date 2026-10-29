@@ -2892,6 +2892,7 @@ function visitNode(node, options = {}) {
                 return `${bl}.Cmp(${br}) <= 0`;
             if (op === '>=')
                 return `${bl}.Cmp(${br}) >= 0`;
+            useHelper('bigint');
             if (op === '+')
                 return `new(tnbig.Int).Add(${bl}, ${br})`;
             if (op === '-')
@@ -3486,6 +3487,9 @@ function visitNode(node, options = {}) {
                 prefixBlockContent: parameterInfo.prefixBlockContent
             })}`;
         }
+        // an async function expression kept as a value returns a promise
+        if (isFunctionExpression(node) && isPromiseReturningArrow(node) && !node.asteriskToken)
+            return emitAsyncArrow(node);
         if (!node.name) {
             return `func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body, {
                 prefixBlockContent: parameterInfo.prefixBlockContent
@@ -5869,6 +5873,11 @@ function builtinInstanceOf(value, name) {
     if (name === 'Date') {
         importedPackages.add('time');
         return `func() bool { _, ok := interface{}(${value}).(time.Time); return ok }()`;
+    }
+    // (bigint primitives are *big.Int values; there are no BigInt objects)
+    if (name === 'BigInt') {
+        useHelper('bigint');
+        return `func() bool { _, ok := interface{}(${value}).(*tnbig.Int); return ok }()`;
     }
     if (name === 'Array') {
         useHelper('isArray');
@@ -11191,6 +11200,22 @@ const GLOBAL_TYPEOF = {
 };
 function visitTypeOf(node) {
     const operand = unwrapParentheses(node.expression);
+    // typeof process.emitWarning / Uint8Array.fromBase64 / buf.toBase64: a
+    // function the runtime provides (or 'undefined' when it has none)
+    if (isPropertyAccessExpression(operand) && !hasQuestionDot(operand)) {
+        const key = resolveNodeKey(operand);
+        if (key && nodeRegistry.functions[key])
+            return toGoStringLiteral('function');
+        const receiverType = inferExpressionType(operand.expression) ?? '';
+        const classKey = nodeRegistry.classByGoType[receiverType];
+        if (classKey && nodeRegistry.methods[`${classKey}#${operand.name.text}`])
+            return toGoStringLiteral('function');
+        // a global object's member the runtime lacks
+        const baseKey = resolveNodeKey(operand.expression);
+        if (baseKey && isIdentifier(operand.expression) && GLOBAL_TYPEOF[operand.expression.text] && !inferExpressionType(operand)) {
+            return toGoStringLiteral('undefined');
+        }
+    }
     if (isIdentifier(operand) && GLOBAL_TYPEOF[operand.text] && !variableGoTypes.has(operand.text) && !classNames.has(operand.text)) {
         return toGoStringLiteral(GLOBAL_TYPEOF[operand.text]);
     }
@@ -12695,6 +12720,13 @@ function getPromiseChannelType(node) {
                     return getType(parent.type.typeArguments[0]) || 'struct{}';
                 }
             }
+            // an unannotated function value: the Promise<T> its context expects
+            if (!parent.type && (isFunctionExpression(parent) || isArrowFunction(parent))) {
+                const contextual = resolveTypeNode(getContextualFunctionType(parent)?.type);
+                if (isTypeReferenceNode(contextual) && isIdentifier(contextual.typeName) && contextual.typeName.text === 'Promise' && (contextual.typeArguments ?? []).length > 0) {
+                    return getType(contextual.typeArguments[0]) || 'struct{}';
+                }
+            }
             break;
         }
         parent = parent.parent;
@@ -13621,12 +13653,19 @@ function stripEmbedDirectives(code) {
 // own code names them; embed blank when only //go:embed directives need it
 function goFileImportLines(fileCode) {
     const code = stripEmbedDirectives(stripGoStrings(fileCode));
+    const referenced = (pkg) => code.includes(`${goPathAliases[pkg] ?? pkg.split('/').pop()}.`);
+    // (a standard package the code no longer references — its use was in a
+    // branch emitted another way — is left out, as Go requires)
+    const isStd = (pkg) => !pkg.split('/')[0].includes('.');
     const imports = [...importedPackages].filter((pkg) => {
-        if (!helperProvidedPackages.has(pkg))
+        if (!helperProvidedPackages.has(pkg) && !(isStd(pkg) && pkg !== 'embed' && pkg !== 'C'))
             return true;
-        const pkgName = goPathAliases[pkg] ?? pkg.split('/').pop();
-        return code.includes(`${pkgName}.`);
+        return referenced(pkg);
     });
+    // and a helper package the code uses whose helper another file registered first
+    for (const pkg of allHelperPackages())
+        if (!imports.includes(pkg) && referenced(pkg))
+            imports.push(pkg);
     const blankEmbed = hasEmbedDirective(fileCode) && !referencesQualifier(code, 'embed');
     if (blankEmbed && !imports.includes('embed'))
         imports.push('embed');
@@ -13634,6 +13673,17 @@ function goFileImportLines(fileCode) {
         .sort()
         .map((pkg) => (pkg === 'embed' && blankEmbed ? 'import _ "embed"' : goImportLine(pkg)))
         .join('\n');
+}
+// Every Go package some helper imports
+function allHelperPackages() {
+    const all = new Set();
+    for (const pkgs of Object.values(helperPackages))
+        for (const pkg of pkgs)
+            all.add(pkg);
+    for (const pkgs of Object.values(nodeRegistry.helperPackages))
+        for (const pkg of pkgs)
+            all.add(pkg);
+    return all;
 }
 // Whether Object.keys & co.'s argument is a Map / Record (an ordered map)
 function isOrderedMapArg(node) {
