@@ -33,6 +33,8 @@ interface Number {
 interface Object {
   constructor: Function;
   toString(): string;
+  valueOf(): Object;
+  hasOwnProperty(v: PropertyKey): boolean;
 }
 
 // --- Iteration protocol (also unlocks for..of / spread over Map, Set, string) ---
@@ -140,6 +142,8 @@ type NonNullable<T> = T & {};
 type Record<K extends keyof any, T> = { [P in K]: T };
 type Parameters<T extends (...args: any) => any> = T extends (...args: infer P) => any ? P : never;
 type ReturnType<T extends (...args: any) => any> = T extends (...args: any) => infer R ? R : any;
+type Exclude<T, U> = T extends U ? never : T;
+type Extract<T, U> = T extends U ? T : never;
 
 // --- RegExp ---
 
@@ -284,7 +288,7 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Reverses the elements of an array in place.
    */
-  reverse(): T[];
+  reverse(): this;
   /**
    * Returns a reversed copy of the array.
    */
@@ -292,7 +296,7 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Sorts the elements of an array in place.
    */
-  sort(compareFn?: (a: T, b: T) => number): T[];
+  sort(compareFn?: (a: T, b: T) => number): this;
   /**
    * Returns a sorted copy of the array.
    */
@@ -317,11 +321,11 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Returns a copy of a section of an array with the fill value applied.
    */
-  fill(value: T, start?: number, end?: number): T[];
+  fill(value: T, start?: number, end?: number): this;
   /**
    * Copies within the array in place (overlap-safe) and returns it.
    */
-  copyWithin(target: number, start: number, end?: number): T[];
+  copyWithin(target: number, start: number, end?: number): this;
   /**
    * Merges two or more arrays (array arguments are flattened one level).
    */
@@ -442,9 +446,9 @@ declare var String: StringConstructor;
 
 interface NumberConstructor {
   (value?: any): number;
-  isNaN(value: number): boolean;
-  isFinite(value: number): boolean;
-  isInteger(value: number): boolean;
+  isNaN(value: unknown): boolean;
+  isFinite(value: unknown): boolean;
+  isInteger(value: unknown): boolean;
   readonly MAX_SAFE_INTEGER: number;
   readonly MIN_SAFE_INTEGER: number;
   readonly MAX_VALUE: number;
@@ -915,7 +919,7 @@ interface Map<K, V> {
 
 interface MapConstructor {
   new <K, V>(): Map<K, V>;
-  new <K, V>(entries: [K, V][]): Map<K, V>;
+  new <K, V>(entries?: readonly (readonly [K, V])[] | Iterable<readonly [K, V]> | null): Map<K, V>;
   groupBy<K, T>(items: T[], keySelector: (item: T, index: number) => K): Map<K, T[]>;
 }
 
@@ -949,7 +953,7 @@ interface Set<T> {
 
 interface SetConstructor {
   new <T>(): Set<T>;
-  new <T>(values?: T[] | Set<T>): Set<T>;
+  new <T>(values?: readonly T[] | Set<T> | Iterable<T> | null): Set<T>;
 }
 
 declare var Set: SetConstructor;
@@ -1267,6 +1271,8 @@ interface Buffer extends Uint8Array {
 }
 
 interface BufferConstructor {
+  /** @deprecated use Buffer.alloc / Buffer.from (lets `typeof Buffer === 'function'` narrow) */
+  new (size: number): Buffer;
   from(data: string, encoding?: BufferEncoding): Buffer;
   from(data: ArrayLike<number> | Uint8Array | ArrayBuffer): Buffer;
   alloc(size: number, fill?: string | number | Uint8Array, encoding?: BufferEncoding): Buffer;
@@ -1655,6 +1661,22 @@ declare function setImmediate<A extends any[]>(callback: (...args: A) => void, .
 declare function clearImmediate(immediate?: NodeJS.Immediate | number): void;
 
 declare namespace NodeJS {
+  // A readable stream, as Node's typings describe it (process.stdin is one)
+  interface ReadableStream {
+    readonly readable: boolean;
+    read(size?: number): any;
+    setEncoding(encoding: BufferEncoding): this;
+    pause(): this;
+    resume(): this;
+    isPaused(): boolean;
+    on(event: string, listener: (...args: any[]) => void): this;
+    once(event: string, listener: (...args: any[]) => void): this;
+  }
+  interface WritableStream {
+    readonly writable: boolean;
+    write(chunk: any, callback?: (error?: Error | null) => void): boolean;
+    on(event: string, listener: (...args: any[]) => void): this;
+  }
   // Timer handles: an unref'ed timer does not keep the process alive
   interface Timeout {
     ref(): this;

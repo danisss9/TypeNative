@@ -3,6 +3,14 @@
 // the platform's flavour, as in Node.
 import { defineClass, defineHelper, defineModule, setResults, isObjectLiteral, getOption } from './registry.js';
 const pathHelper = `// node:path — Node's posix and win32 algorithms (path is the platform's)
+// A path argument held as any: a string, else Node's TypeError
+func TnPathArg(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"path\\" argument must be of type string. Received "+TnTypeOf(v)))
+}
+
 type tnPathStyle struct {
 	win bool
 	sep string
@@ -713,14 +721,16 @@ const PATH_STYLES = {
     'path/win32': 'TnPathWin32'
 };
 export function registerPath(r) {
-    defineHelper(r, 'nodePath', ['os', 'regexp', 'runtime', 'strings'], ['dynamic'], pathHelper);
+    defineHelper(r, 'nodePath', ['os', 'regexp', 'runtime', 'strings'], ['dynamic', 'error', 'typeOf'], pathHelper);
     defineClass(r, 'path.ParsedPath', '*TnParsedPath', 'class', '', 'root=string; dir=string; base=string; ext=string; name=string', '', '');
     for (const mod of Object.keys(PATH_STYLES)) {
         const style = PATH_STYLES[mod];
         defineModule(r, mod);
         const fn = (name) => (call) => {
             r.helper('nodePath');
-            return `${style}.${name}(${call.args.join(', ')})`;
+            // (a dynamic argument must hold a string, as Node checks)
+            const args = call.args.map((a, i) => (call.types[i] === 'interface{}' ? `TnPathArg(${a})` : a));
+            return `${style}.${name}(${args.join(', ')})`;
         };
         for (const name of ['join', 'resolve', 'normalize', 'relative', 'dirname', 'basename', 'extname', 'isAbsolute', 'parse', 'toNamespacedPath', 'matchesGlob']) {
             r.functions[`${mod}.${name}`] = fn(name);

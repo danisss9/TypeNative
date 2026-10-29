@@ -480,6 +480,11 @@ let asyncChannelIsAsync = false;
 // header (push/splice through any alias are visible everywhere)
 const referenceArrays = new Set<string>();
 
+// An ExpressionWithTypeArguments in an extends / implements clause (a type)
+function isHeritageType(node: AstNode): boolean {
+  return node.parent?.kind === 'HeritageClause';
+}
+
 // Calls whose result may be missing (null / undefined): a regex match, a Map
 // lookup, an array search or removal
 const MAYBE_MISSING_METHODS = new Set(['exec', 'match', 'get', 'find', 'findLast', 'at', 'pop', 'shift']);
@@ -626,7 +631,9 @@ function isClassValueReference(node: AstNode): boolean {
   if (isPropertyAccessExpression(parent) && parent.expression === node) return false;
   if (isPropertyAccessExpression(parent) && parent.name === node) return false;
   if (isBinaryExpression(parent) && parent.operatorToken.kind === 'InstanceOfKeyword' && parent.right === node) return false;
-  if (parent.kind === 'ExpressionWithTypeArguments' || parent.kind === 'HeritageClause') return false;
+  // (f<T> as a value is f; in extends / implements it is a type)
+  if (parent.kind === 'ExpressionWithTypeArguments') return !isHeritageType(parent);
+  if (parent.kind === 'HeritageClause') return false;
   if (isClassDeclaration(parent) || parent.kind === 'ClassExpression') return parent.name !== node;
   if (parent.kind === 'TypeQuery' || parent.kind === 'TypeReference' || parent.kind === 'QualifiedName') return false;
   if (['ImportSpecifier', 'ExportSpecifier', 'ImportClause', 'NamespaceImport', 'ExportAssignment'].includes(parent.kind)) return false;
@@ -2551,6 +2558,19 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     return `${type === ':' ? '' : 'var '}${declName} ${emitType}${
       type === ':' ? '' : ' '
     }${initializer}${markUsed}`;
+  } else if (node.kind === 'ExpressionWithTypeArguments' && !isHeritageType(node)) {
+    // f<T> as a value (an instantiation expression): f
+    return visit(node.expression);
+  } else if (isCallExpression(node) && node.expression?.kind === 'ImportKeyword') {
+    // import(specifier) of a module not known at compile time: modules are
+    // linked into the binary, so the promise rejects (a literal specifier is
+    // a static import, see lowerDynamicImports)
+    useHelper('promise');
+    useHelper('error');
+    useHelper('dynamic');
+    const specifier = (node.arguments ?? [])[0];
+    const spec = specifier ? jsStringOf(visit(specifier), inferExpressionType(specifier)) : '"undefined"';
+    return `TnPromiseReject[interface{}](TnNodeError("Error", "ERR_UNSUPPORTED_DYNAMIC_IMPORT", "Cannot import " + ${spec} + ": import() of a module not known at compile time is not supported in native builds"))`;
   } else if (isCallExpression(node)) {
     // obj.fn!(…): the non-null assertion has no run-time effect
     while (node.expression?.kind === 'NonNullExpression') {
@@ -4252,18 +4272,24 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         : '';
     const structName = typeName.replace(/^\*/, '') + (typeName.endsWith(']') ? '' : typeArgs);
     if (isMethodInterfaceName(typeName.replace(/^\*/, ''))) return visitInterfaceLiteral(node, typeName.replace(/^\*/, ''), typeArgs);
-    // { ...base, x: 1 } → a copy of *base with fields set
+    // { ...base, x: 1, ...more } → a fresh object of the type, each source's
+    // properties copied in order (unset fields of a typed source are absent)
     if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
-      const steps = (node.properties ?? []).map((p) => {
-        if (p.kind === 'SpreadAssignment') return `__obj = *(${visit(p.expression)})`;
-        if (isShorthandPropertyAssignment(p)) return `__obj.${goFieldName(p.name.text)} = ${visit(p.name)}`;
-        const spreadFieldType = isIdentifier(p.name)
-          ? (interfacePropertyTypes.get(structName)?.get(p.name.text) ??
-            getStructFieldGoType(structName, p.name.text))
-          : undefined;
-        return `__obj.${visit(p.name)} = ${toGoValueOfType(p.initializer, spreadFieldType)}`;
-      });
-      return `func() *${structName} { var __obj ${structName}; ${steps.join('; ')}; return &__obj }()`;
+      useHelper('objectAssignTo');
+      const sources: string[] = [];
+      let run: AstNode[] = [];
+      const flush = () => {
+        if (run.length > 0) sources.push(dynamicObjectLiteral({ kind: 'ObjectLiteralExpression', properties: run, parent: node }));
+        run = [];
+      };
+      for (const p of node.properties ?? []) {
+        if (p.kind === 'SpreadAssignment') {
+          flush();
+          sources.push(visit(p.expression));
+        } else run.push(p);
+      }
+      flush();
+      return `TnAssignTo(new(${structName}), ${sources.join(', ')})`;
     }
 
     const fieldTypes = typeArgs ? undefined : (interfacePropertyTypes.get(structName) ?? classPropertyTypes.get(structName));
@@ -7487,6 +7513,9 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
   if (isMockAccess(expr)) return '*TnMockFunctionContext';
   if (expr?.kind === 'ThisKeyword') return thisGoType(expr);
+  if (isCallExpression(expr) && expr.expression?.kind === 'ImportKeyword') return 'chan interface{}';
+  // f<T> as a value (an instantiation expression): f
+  if (expr?.kind === 'ExpressionWithTypeArguments' && !isHeritageType(expr)) return inferExpressionType(expr.expression);
   if (isAwaitExpression(expr)) {
     // await unwraps the promise channel
     const inner = inferExpressionType(expr.expression);

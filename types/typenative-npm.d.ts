@@ -513,8 +513,15 @@ declare module 'node:util' {
       value?: string;
       inlineValue?: boolean;
     }
-    function parseArgs(config?: ParseArgsConfig): {
-      values: Record<string, string | boolean | (string | boolean)[] | undefined>;
+    // The parsed value of an option: its type, an array of them when multiple
+    type ParseArgsOptionValue<O extends ParseArgsOptionConfig> = O['type'] extends 'string'
+      ? O['multiple'] extends true ? string[] : string
+      : O['multiple'] extends true ? boolean[] : boolean;
+    type ParseArgsValues<T extends ParseArgsConfig> = T['options'] extends Record<string, ParseArgsOptionConfig>
+      ? { -readonly [K in keyof T['options']]?: ParseArgsOptionValue<T['options'][K]> }
+      : Record<string, string | boolean | (string | boolean)[] | undefined>;
+    function parseArgs<T extends ParseArgsConfig>(config?: T): {
+      values: ParseArgsValues<T>;
       positionals: string[];
       tokens?: ParseArgsToken[];
     };
