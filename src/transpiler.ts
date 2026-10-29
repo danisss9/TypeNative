@@ -2406,7 +2406,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         } else if (elemType && ['string', 'float64', 'bool'].includes(elemType) && isIdentifier(bindEl.name) && comparedToNullish(bindEl.name.text, node)) {
           // a primitive the code tests for undefined: nil past the end
           useHelper('dynamic');
-          parts.push(`${localName} := TnAtPtr(${tmpVar}, float64(${idx}))`);
+          // (a regex match's unmatched groups are undefined too)
+          if (elemType === 'string') useHelper('regexMatch');
+          parts.push(`${localName} := ${elemType === 'string' ? 'TnMatchGroup' : 'TnAtPtr'}(${tmpVar}, float64(${idx}))`);
           registerLocalVariable(bindingName(el, localName), `*${elemType}`);
           return;
         } else {
@@ -10838,10 +10840,14 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
   },
   substring: (obj, args) => {
     useHelper('strIndex');
+    const end = optionalEndArgument(args);
+    if (end) return `func() string { __e := ${end}; return TnSubstring(${obj}, ${args[0] ?? '0'}, TnDeref(__e), __e != nil) }()`;
     return `TnSubstring(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
   slice: (obj, args) => {
     useHelper('strIndex');
+    const end = optionalEndArgument(args);
+    if (end) return `func() string { __e := ${end}; return TnStrSlice(${obj}, ${args[0] ?? '0'}, TnDeref(__e), __e != nil) }()`;
     return `TnStrSlice(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
   concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
@@ -11597,7 +11603,9 @@ function isRegexReplacerCallback(fn: AstNode): boolean {
 // JS replacement patterns → Go: $& (whole match) → ${0}, $1 → ${1}
 function jsReplacementToGo(replacement: AstNode): string {
   if (!isStringLiteral(replacement) && !isNoSubstitutionTemplateLiteral(replacement)) {
-    return visit(replacement);
+    // (computed at run time: its $ patterns converted then)
+    useHelper('jsReplacement');
+    return `TnJSReplacement(${toGoValueOfType(replacement, 'string')})`;
   }
   const text: string = replacement.text;
   let goPattern = '';
@@ -12429,6 +12437,21 @@ function registerParameterType(param: AstNode): void {
   narrowedVariables.delete(name);
   if (param.type) variableTypeNodes.set(name, param.type);
   else variableTypeNodes.delete(name);
+}
+
+// s.slice(a, xs[i]) / substring: an end read past an array's end is
+// undefined (the string's end), not 0 — the end as a *float64, nil then
+function optionalEndArgument(args: string[]): string | undefined {
+  const endNode = currentCallArgNodes[1];
+  if (!endNode || args.length < 2) return undefined;
+  const u = unwrapParentheses(endNode);
+  if (inferExpressionType(endNode) === '*float64') return args[1];
+  if (!isElementAccessExpression(u) || hasQuestionDot(u)) return undefined;
+  const arrayType = (inferExpressionType(u.expression) ?? '').replace(/^\*\[\]/, '[]');
+  if (arrayType !== '[]float64') return undefined;
+  useHelper('dynamic');
+  useHelper('numTruthy');
+  return `TnAtPtr(${visit(u.expression)}, ${numericIndex(u.argumentExpression)})`;
 }
 
 // Parameter kinds of built-in string / array methods: s(tring), n(umber)
@@ -14784,6 +14807,7 @@ const helperPackages: Record<string, string[]> = {
   namedGroups: ['regexp', 'unicode/utf8'],
   regexMatch: ['regexp', 'strings', 'strconv', 'math', 'unicode/utf8'],
   strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings'],
+  jsReplacement: ['strings'],
   moduleUrl: ['os'],
   asyncWait: [],
   timerWait: ['sort', 'sync', 'sync/atomic', 'time'],
@@ -15488,11 +15512,73 @@ func TnRestArgsAs[T any](args []interface{}, i int) []T {
 // obj.name(…args) on a dynamic value whose class has no such method: a
 // function-valued property (an object literal's method, a record's function)
 func TnCallMember(obj interface{}, name string, args ...interface{}) interface{} {
+	// a Map / Set's methods (Get, Set, Has … on the ordered map)
+	if kind, ok := obj.(interface{ TnJSKind() uint8 }); ok {
+		if v, handled := tnCallCollection(obj, kind.TnJSKind() == 2, name, args); handled {
+			return v
+		}
+	}
 	fn := TnGet(obj, name)
 	if fn == nil {
 		panic(TnNodeError("TypeError", "", fmt.Sprintf("%s is not a function", name)))
 	}
 	return TnCallValue(fn, args...)
+}
+
+func tnCallCollection(obj interface{}, isSet bool, name string, args []interface{}) (interface{}, bool) {
+	rv := reflect.ValueOf(obj)
+	call := func(method string, in ...interface{}) interface{} {
+		m := rv.MethodByName(method)
+		vals := make([]reflect.Value, m.Type().NumIn())
+		for i := range vals {
+			var a interface{}
+			if i < len(in) {
+				a = in[i]
+			}
+			vals[i] = tnConvertTo(a, m.Type().In(i))
+		}
+		out := m.Call(vals)
+		if len(out) == 0 {
+			return nil
+		}
+		return out[0].Interface()
+	}
+	arg := func(i int) interface{} {
+		if i < len(args) {
+			return args[i]
+		}
+		return nil
+	}
+	switch name {
+	case "get":
+		return call("Get", arg(0)), true
+	case "has":
+		return call("Has", arg(0)), true
+	case "delete":
+		return call("Delete", arg(0)), true
+	case "clear":
+		call("Clear")
+		return nil, true
+	case "set":
+		call("Set", arg(0), arg(1))
+		return obj, true
+	case "add":
+		if isSet {
+			m := rv.MethodByName("Set")
+			m.Call([]reflect.Value{tnConvertTo(arg(0), m.Type().In(0)), reflect.Zero(m.Type().In(1))})
+			return obj, true
+		}
+	case "keys":
+		return call("Keys"), true
+	case "values":
+		if isSet {
+			return call("Keys"), true
+		}
+		return call("Values"), true
+	case "entries":
+		return call("Entries"), true
+	}
+	return nil, false
 }
 
 // Calls a function value held as any, converting the arguments to its
@@ -17101,6 +17187,43 @@ func TnStrPad(s string, length float64, pad string, atStart bool) string {
 	}
 	return s + fill
 }`,
+  jsReplacement: `// A JS replacement string's patterns in Go's expansion syntax: $& → \${0},
+// $1 → \${1}, $$ → $$; any other $ is literal
+func TnJSReplacement(s string) string {
+	if strings.IndexByte(s, '$') < 0 {
+		return s
+	}
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '$' {
+			out.WriteByte(c)
+			continue
+		}
+		next := byte(0)
+		if i+1 < len(s) {
+			next = s[i+1]
+		}
+		switch {
+		case next == '$':
+			out.WriteString("$$")
+			i++
+		case next == '&':
+			out.WriteString("\${0}")
+			i++
+		case next >= '0' && next <= '9':
+			j := i + 1
+			for j < len(s) && j < i+3 && s[j] >= '0' && s[j] <= '9' {
+				j++
+			}
+			out.WriteString("\${" + s[i+1:j] + "}")
+			i = j - 1
+		default:
+			out.WriteString("$$")
+		}
+	}
+	return out.String()
+}`,
   iterable: `// Symbol.iterator in x: arrays, strings, Maps, Sets, generators and
 // classes with a [Symbol.iterator]() method
 func TnIsIterable(v interface{}) bool {
@@ -18006,7 +18129,46 @@ func tnMatchGroups(s string, loc []int) []string {
 			groups[i] = s[loc[2*i]:loc[2*i+1]]
 		}
 	}
+	tnMarkUnmatched(groups, loc)
 	return groups
+}
+
+// A match array's hidden tag (past its length): "\\x00index:<index>|<groups
+// that did not participate>" — those are undefined in JS, "" here
+func tnMarkUnmatched(groups []string, loc []int) {
+	if cap(groups) <= len(groups) {
+		return
+	}
+	var miss []string
+	for i := 0; i < len(groups) && 2*i < len(loc); i++ {
+		if loc[2*i] < 0 {
+			miss = append(miss, strconv.Itoa(i))
+		}
+	}
+	if len(miss) > 0 {
+		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + "-1|" + strings.Join(miss, ",")
+	}
+}
+
+// m[i] of a match array as string | undefined (an unmatched group, or past the end)
+func TnMatchGroup(m []string, i float64) *string {
+	n := int(i)
+	if i < 0 || n >= len(m) {
+		return nil
+	}
+	if cap(m) > len(m) {
+		if tag := m[:len(m)+1][len(m)]; strings.HasPrefix(tag, tnMatchIndexTag) {
+			if bar := strings.IndexByte(tag, '|'); bar >= 0 {
+				for _, g := range strings.Split(tag[bar+1:], ",") {
+					if g == strconv.Itoa(n) {
+						return nil
+					}
+				}
+			}
+		}
+	}
+	v := m[n]
+	return &v
 }
 
 // The groups of the match at loc, tagged with its character index
@@ -18018,7 +18180,14 @@ func tnMatchArray(s string, loc []int, index int) []string {
 
 func tnSetMatchIndex(groups []string, index int) {
 	if cap(groups) > len(groups) {
-		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + strconv.Itoa(index)
+		// (keeping the unmatched groups the tag records)
+		unmatched := ""
+		if tag := groups[:len(groups)+1][len(groups)]; strings.HasPrefix(tag, tnMatchIndexTag) {
+			if bar := strings.IndexByte(tag, '|'); bar >= 0 {
+				unmatched = tag[bar:]
+			}
+		}
+		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + strconv.Itoa(index) + unmatched
 	}
 }
 
@@ -18026,7 +18195,11 @@ func tnSetMatchIndex(groups []string, index int) {
 func TnMatchIndex(m []string) float64 {
 	if cap(m) > len(m) {
 		if tag := m[:len(m)+1][len(m)]; strings.HasPrefix(tag, tnMatchIndexTag) {
-			if n, err := strconv.Atoi(tag[len(tnMatchIndexTag):]); err == nil {
+			index := tag[len(tnMatchIndexTag):]
+			if bar := strings.IndexByte(index, '|'); bar >= 0 {
+				index = index[:bar]
+			}
+			if n, err := strconv.Atoi(index); err == nil && n >= 0 {
 				return float64(n)
 			}
 		}
@@ -18397,6 +18570,7 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 					loc[2*i], loc[2*i+1] = -1, -1
 				}
 			}
+			tnMarkUnmatched(groups, loc)
 			return groups, loc
 		}
 	}

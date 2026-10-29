@@ -156,7 +156,14 @@ func TnProcessEmitWarning(warning interface{}) {
 		msg = e.message
 	}
 	fmt.Fprintf(os.Stderr, "(node:%d) Warning: %s\\n", os.Getpid(), msg)
+	// (Node's hint, after the first warning)
+	if !tnWarningHinted {
+		tnWarningHinted = true
+		fmt.Fprintln(os.Stderr, "(Use \`node --trace-warnings ...\` to show where the warning was created)")
+	}
 }
+
+var tnWarningHinted bool
 
 func TnProcessVersions() *TnMap[string, string] {
 	m := TnNewMap[string, string]()
