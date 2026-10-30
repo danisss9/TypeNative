@@ -537,6 +537,12 @@ function mayHoldNullArray(ref: AstNode): boolean {
       if (isBinaryExpression(n) && n.operatorToken.kind === 'EqualsToken' && isIdentifier(n.left) && nullish(n.right)) found.add(n.left.text);
       for (const child of childNodes(n)) if (!FUNCTION_LIKE_KINDS.has(child.kind)) walk(child);
     };
+    // (optional and nullable parameters may be absent)
+    for (const p of scope.parameters ?? []) {
+      const t = p.type;
+      const nullableType = !!t && isUnionTypeNode(t) && (t.types ?? []).some((m: AstNode) => m.kind === 'NullKeyword' || m.kind === 'UndefinedKeyword' || (isLiteralTypeNode(m) && m.literal?.kind === 'NullKeyword'));
+      if (isIdentifier(p.name) && !p.initializer && (p.questionToken || nullableType)) found.add(p.name.text);
+    }
     walk(scope.body ?? scope);
     names = found;
     nullableArrayCache.set(scope, names);
@@ -1396,6 +1402,8 @@ function lowerExpandoFunctions(sourceFile: AstNode): void {
     const fnName: string = target.expression.text;
     if (!functions.has(fnName)) return statement;
     const names = props.get(fnName) ?? new Set<string>();
+    // (a later assignment stays one: rewritten below to the variable)
+    if (names.has(target.name.text)) return statement;
     names.add(target.name.text);
     props.set(fnName, names);
     const declaration: AstNode = {
@@ -1407,7 +1415,7 @@ function lowerExpandoFunctions(sourceFile: AstNode): void {
     };
     return {
       kind: 'VariableStatement',
-      declarationList: { kind: 'VariableDeclarationList', declarationKind: 'const', declarations: [declaration] },
+      declarationList: { kind: 'VariableDeclarationList', declarationKind: 'let', declarations: [declaration] },
       exported: true,
       line: statement.line,
       column: statement.column,
@@ -2024,6 +2032,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
   } else if (isAsExpression(node)) {
+    // (returned from a method typed to return any value: see methodReturnGoType)
+    const forced = node.parent && isReturnStatement(node.parent) ? forcedCastSource(node) : undefined;
+    if (forced) return visit(forced);
     return toGoValueOfType(node.expression, getAsExpressionType(node));
   } else if (isTypeAssertionExpression(node)) {
     // <T>x: like `x as T`
@@ -3170,7 +3181,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         useHelper('dynamic');
         // == / != coerce primitives; === / !== don't
         const loose = node.operatorToken.kind === 'EqualsEqualsToken' || node.operatorToken.kind === 'ExclamationEqualsToken';
-        const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${visit(node.left)}, ${visit(node.right)})`;
+        // (a T | undefined operand compares as its value)
+        const operand = (side: AstNode) => (NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(side) ?? '') ? toGoValueOfType(side, 'interface{}') : visit(side));
+        const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${operand(node.left)}, ${operand(node.right)})`;
         return op === '==' ? same : `!${same}`;
       }
       // x == null on an interface{} value or an optional chain (emitted as
@@ -3190,6 +3203,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // A value type (string, number, struct…) is never null/undefined
       const otherSide = isNilLiteral(node.right) ? node.left : isNilLiteral(node.left) ? node.right : undefined;
       const otherType = otherSide ? inferExpressionType(otherSide) : undefined;
+      // (xs[i] of a primitive array is undefined past the end, and a regex
+      // match's unmatched groups are undefined too)
+      const element = otherSide ? unwrapParentheses(otherSide) : undefined;
+      if (element && isElementAccessExpression(element) && !hasQuestionDot(element) && (otherType === 'string' || otherType === 'float64' || otherType === 'bool')) {
+        const arrayType = (inferExpressionType(element.expression) ?? '').replace(/^\*/, '');
+        if (arrayType === `[]${otherType}`) {
+          useHelper('dynamic');
+          if (otherType === 'string') useHelper('regexMatch');
+          const items = toGoValueOfType(element.expression, arrayType);
+          return `${otherType === 'string' ? 'TnMatchGroup' : 'TnAtPtr'}(${items}, ${numericIndex(element.argumentExpression)}) ${op} nil`;
+        }
+      }
       if (otherType && otherType !== 'nil' && !isNilableGoType(otherType)) {
         return op === '!=' ? 'true' : 'false';
       }
@@ -3262,6 +3287,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
       useHelper('dynamic');
       return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${visit(node.right)})`;
+    }
+    // record.key = v on a Record (an ordered map): a key write
+    if (op === '=' && isPropertyAccessExpression(node.left) && !hasQuestionDot(node.left)) {
+      const recordType = inferExpressionType(node.left.expression) ?? '';
+      if (recordType.startsWith('*TnMap[') && extractMapKeyType(recordType) === 'string' && extractMapValueType(recordType) !== 'struct{}') {
+        return `${visit(node.left.expression)}.Set(${toGoStringLiteral(node.left.name.text)}, ${toGoValueOfType(node.right, extractMapValueType(recordType))})`;
+      }
     }
     // Class setter writes are accessor calls: c.v = x → c.Set_v(x)
     if (op === '=' && isPropertyAccessExpression(node.left)) {
@@ -3463,10 +3495,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const varInfo = getForOfVarNames(node.initializer);
       registerLocalVariable(varInfo[0], extractMapKeyType(iterType));
       if (varInfo.length >= 2 && !isSet) registerLocalVariable(varInfo[1], valueType);
+      // (JS allows bindings the body never reads)
+      const uses = (names: string[]) => names.filter((n) => n !== '_').map((n) => `_ = ${n}\n\t\t`).join('');
       if (varInfo.length >= 2 && !isSet) {
-        return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}.All()${visitLoopBody(node.statement)}`;
+        return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0], varInfo[1]]))}`;
       }
-      return `for ${varInfo[0]} := range ${iterExpr}.All()${visitLoopBody(node.statement)}`;
+      return `for ${varInfo[0]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0]]))}`;
     }
     return visitForOfSequence(node, iterExpr, iterType);
   } else if (isWhileStatement(node)) {
@@ -3901,7 +3935,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // fields of the methods mock.method may replace (see emitMockableMethod)
     const mockSlots: string[] = [];
     if (mockedMemberNames.size > 0) fields.push(MOCK_SLOTS_MARK);
-    let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\n`;
+    // (the marker keeps an instance from being converted to another
+    // object type, which would copy it: see TnConvertDynamic)
+    let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\nfunc (*${name}${typeParamNames}) TnClassInstance() {}\n\n`;
 
     const ctor = (node.members ?? []).find((m) => isConstructorDeclaration(m) && !!m.body) as
       | AstNode
@@ -3932,6 +3968,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
               const parentParams = !nodeParentClassKeys.has(parentClass ?? '') && parentClass ? constructorParameterNodes(parentClass) : [];
               const args = (s.expression.arguments ?? []).map((a: AstNode, i: number) => {
                 const param = parentParams[i];
+                // (an optional array passes its reference: nil is undefined)
+                if (param?.initializer && isIdentifier(a) && referenceArrays.has(a.text)) return getSafeName(a.text);
                 return param && !param.dotDotDotToken && !param.initializer && !isSpreadElement(a) ? toGoValueOfType(a, getParameterGoType(param)) : visit(a);
               });
               for (let i = args.length; i < parentParams.length; i++) {
@@ -4177,6 +4215,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (className === 'RegExp') {
       importedPackages.add('regexp');
       const nodeArgs = node.arguments ?? [];
+      // g / y need lastIndex state: the JS-semantics regex
+      if (newRegExpIsStateful(node)) {
+        useHelper('fancyRegex');
+        const pattern = toGoValueOfType(nodeArgs[0], 'string');
+        return `func() *TnRegex { __p := ${pattern}; return TnRegexCompile(__p, ${toGoValueOfType(nodeArgs[1], 'string')}, __p) }()`;
+      }
       if (nodeArgs.length >= 2 && isStringLiteral(nodeArgs[1])) {
         const pattern = visit(nodeArgs[0]);
         const flags = jsRegexFlagsToGo(nodeArgs[1].text);
@@ -4542,6 +4586,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (isIdentifier(expr) && referenceArrays.has(expr.text)) {
         return getSafeName(expr.text);
       }
+      // (null / undefined: the nil reference)
+      if (isNilLiteral(unwrapParentheses(expr))) return `(${goType})(nil)`;
       if (isArrayLiteralExpression(expr) && (expr.elements ?? []).length === 0) return `&${goType.slice(1)}{}`;
       if (isArrayLiteralExpression(expr)) {
         const code = visit(expr);
@@ -5432,7 +5478,8 @@ function emitDynamicDispatchers(): string {
     const suffix = dispatcherSuffix(method);
     const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
     // (toString on any other value: its JS string form)
-    const fallback = method === 'toString' ? 'TnJSString(__recv)' : `TnCallMember(__recv, ${toGoStringLiteral(method)}, __args...)`;
+    // (a number's toString(radix) in that radix)
+    const fallback = method === 'toString' ? 'TnToStringOf(__recv, __args...)' : `TnCallMember(__recv, ${toGoStringLiteral(method)}, __args...)`;
     out.push(`func TnCall_${suffix}(__recv interface{}, __args ...interface{}) interface{} {\n${body}\treturn ${fallback}\n}`);
   }
   return out.join('\n\n');
@@ -5553,7 +5600,7 @@ function visitMultiForHeader(node: AstNode): string | undefined {
   };
   collect(node.incrementor);
   if (declarations.length < 2 && updates.length < 2) return undefined;
-  let init = visit(node.initializer!, { inline: true });
+  let init = node.initializer ? forHeaderInit(visit(node.initializer, { inline: true })) : '';
   if (declarations.length >= 2) {
     for (const d of declarations) {
       if (isIdentifier(d.name) && d.initializer) registerLocalVariable(d.name.text, inferExpressionType(d.initializer));
@@ -7113,7 +7160,8 @@ function getArrayLiteralElementType(node: AstNode): string {
       continue;
     }
     // mixed element types ([['a', 1]]) make an interface{} array
-    const elementType = inferExpressionType(element);
+    // (a call through a function value: its signature's result)
+    const elementType = inferExpressionType(element) ?? (isCallExpression(element) ? goFuncReturnType(functionValueGoType(element.expression) ?? '') : undefined);
     if (elementType && elementType !== 'nil' && !isUnboundGoType(elementType)) {
       if (firstElementType && firstElementType !== elementType) return 'interface{}';
       if (!firstElementType) firstElementType = elementType;
@@ -7444,11 +7492,32 @@ function inferFunctionBodyReturnType(
 // body's locals are typed only for the inference (variable types are global),
 // so classes registered ahead of other code don't leak them.
 function methodReturnGoType(member: AstNode): string {
-  if (member.type) return getType(member.type);
+  if (member.type) {
+    const declared = getType(member.type);
+    // (a forced cast returned as the declared array type: any value)
+    if (declared.startsWith('[]') && member.body && isBlock(member.body) && Array.isArray(member.body.statements)) {
+      const forced = withFunctionScopeTypes(member, () => (collectReturnStatements(member.body).some((r: AstNode) => !!r.expression && !!forcedCastSource(r.expression)) ? 'y' : ''));
+      if (forced) return 'interface{}';
+    }
+    return declared;
+  }
   if ((member.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return '';
   if (!member.body || !isBlock(member.body)) return '';
   if (!Array.isArray(member.body.statements)) return inferFunctionBodyReturnType(member) ?? '';
   return withFunctionScopeTypes(member, () => inferFunctionBodyReturnType(member) ?? '');
+}
+
+// `x as unknown as T[]` where x is a value no array holds (a Map passed
+// off as an array): the cast only satisfies the checker, the value stays x
+function forcedCastSource(node: AstNode): AstNode | undefined {
+  const u = unwrapParentheses(node);
+  if (!isAsExpression(u) || !u.type) return undefined;
+  const inner = unwrapParentheses(u.expression);
+  if (!isAsExpression(inner) || !['UnknownKeyword', 'AnyKeyword'].includes(inner.type?.kind)) return undefined;
+  if (!getType(u.type).startsWith('[]')) return undefined;
+  const source = inferExpressionType(inner.expression);
+  if (!source || source === 'interface{}' || source.startsWith('[]') || source.startsWith('*[]')) return undefined;
+  return inner.expression;
 }
 
 // Runs compute with a function's parameters and locals typed from their
@@ -7719,7 +7788,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     return '*regexp.Regexp';
   }
   if (isNewExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'RegExp') {
-    return '*regexp.Regexp';
+    return newRegExpIsStateful(expr) ? '*TnRegex' : '*regexp.Regexp';
   }
   if (expr.kind === 'TrueKeyword' || expr.kind === 'FalseKeyword')
     return 'bool';
@@ -7785,9 +7854,11 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     // as visitNewMap emits it: from a contextual type, else interface{} keys and values
     if (ctorName === 'Map' && !classNames.has(ctorName)) {
       const contextual = getCollectionTypeArguments(expr);
-      return contextual.length === 2
-        ? mapGoType(getType(contextual[0]), getType(contextual[1]))
-        : mapGoType('interface{}', 'interface{}');
+      if (contextual.length === 2) return mapGoType(getType(contextual[0]), getType(contextual[1]));
+      // (a copy of another Map: its key and value types)
+      const source = expr.arguments?.[0] && !isArrayLiteralExpression(expr.arguments[0]) ? inferExpressionType(expr.arguments[0]) ?? '' : '';
+      if (source.startsWith('*TnMap[') && extractMapValueType(source) !== 'struct{}') return source;
+      return mapGoType('interface{}', 'interface{}');
     }
     if (ctorName === 'Set' && typeArguments.length === 1) {
       return mapGoType(getType(typeArguments[0]), 'struct{}');
@@ -8977,9 +9048,23 @@ function objectAssignTargetType(call: AstNode): string | undefined {
     expected = inferExpressionType(parent.left);
   }
   if (assignable(expected)) return expected;
+  // Object.assign({}, dynamic, …) where any value fits: a copy of the
+  // source's own runtime type (a struct stays a struct)
+  if (contextual && expected === 'interface{}' && (target.properties ?? []).length === 0 && args.length >= 2) {
+    const t = inferExpressionType(args[1]);
+    if (!t || t === 'interface{}') return 'interface{}';
+  }
   if ((target.properties ?? []).length === 0 && args.length >= 2) {
     const t = inferExpressionType(args[1]);
     if (assignable(t) && (args.length === 2 || t.startsWith('*TnMap['))) return t;
+    // Object.assign({}, typed, { overrides }): the copy keeps the type when
+    // the overrides only set its fields
+    if (assignable(t)) {
+      const fields = new Set(objectFieldNames(t));
+      const overrides = args.slice(2).map(unwrapParentheses);
+      const keyOf = (p: AstNode) => (p.name && (isIdentifier(p.name) || isStringLiteral(p.name)) ? p.name.text : undefined);
+      if (overrides.every((o: AstNode) => isObjectLiteralExpression(o) && (o.properties ?? []).every((p: AstNode) => isPropertyAssignment(p) && fields.has(keyOf(p) ?? '')))) return t;
+    }
   }
   // Object.assign({ defaults }, options): options' object type, when it has
   // every key of the defaults
@@ -10635,8 +10720,11 @@ const callHandlers: Record<string, CallHandler> = {
       const target = unwrapParentheses(call.arguments[0]);
       // a literal target: a fresh value of the type, its own properties first
       const literal = isObjectLiteralExpression(target);
-      const head = literal ? newGoValueOf(targetType ?? "") : args[0];
-      const sources = literal && (target.properties ?? []).length > 0 ? [dynamicObjectLiteral(target), ...args.slice(1)] : args.slice(1);
+      const head = !literal ? args[0] : targetType === 'interface{}' ? `TnEmptyLike(${args[1]})` : newGoValueOf(targetType ?? '');
+      // (a literal source's explicit undefined properties are copied too)
+      const setsUndefined = (a: AstNode) => isObjectLiteralExpression(a) && (a.properties ?? []).some((p: AstNode) => isPropertyAssignment(p) && isIdentifier(p.initializer) && p.initializer.text === 'undefined');
+      const rest = args.slice(1).map((code, i) => (setsUndefined(unwrapParentheses(call.arguments[i + 1])) ? dynamicObjectLiteral(unwrapParentheses(call.arguments[i + 1])) : code));
+      const sources = literal && (target.properties ?? []).length > 0 ? [dynamicObjectLiteral(target), ...rest] : rest;
       return `TnAssignTo(${[head, ...sources].join(', ')})`;
     }
     useHelper('objectAssign');
@@ -10858,12 +10946,21 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     importedPackages.add('strings');
     return `strings.HasSuffix(${obj}, ${args[0]})`;
   },
+  // (a replacement with $ patterns — $$, $&, $`, $' — is expanded like JS)
   replace: (obj, args) => {
     importedPackages.add('strings');
+    if (replacementHasPatterns(currentCallArgNodes[1])) {
+      useHelper('regexReplaceFunc');
+      return `TnStringReplaceJS(${obj}, ${args[0]}, ${args[1]}, false)`;
+    }
     return `strings.Replace(${obj}, ${args[0]}, ${args[1]}, 1)`;
   },
   replaceAll: (obj, args) => {
     importedPackages.add('strings');
+    if (replacementHasPatterns(currentCallArgNodes[1])) {
+      useHelper('regexReplaceFunc');
+      return `TnStringReplaceJS(${obj}, ${args[0]}, ${args[1]}, true)`;
+    }
     return `strings.ReplaceAll(${obj}, ${args[0]}, ${args[1]})`;
   },
   repeat: (obj, args) => {
@@ -11669,11 +11766,49 @@ function jsReplacementToGo(replacement: AstNode): string {
         i++;
       }
       goPattern += '${' + digits + '}';
+    } else if (next === '<' && text.indexOf('>', i + 2) > i + 2) {
+      // $<name>: the named group
+      const end = text.indexOf('>', i + 2);
+      goPattern += '${' + text.slice(i + 2, end) + '}';
+      i = end;
     } else {
       goPattern += '$$';
     }
   }
   return toGoStringLiteral(goPattern);
+}
+
+// new RegExp(pattern, flags) with the g or y flag (or flags only known at
+// run time): stateful, a *TnRegex
+function newRegExpIsStateful(node: AstNode): boolean {
+  const args = node.arguments ?? [];
+  if (args.length < 2 || inferExpressionType(args[0]) !== 'string') return false;
+  const flags = unwrapParentheses(args[1]);
+  if (isStringLiteral(flags) || isNoSubstitutionTemplateLiteral(flags)) return /[gy]/.test(flags.text);
+  return inferExpressionType(flags) === 'string';
+}
+
+// A replacement string that may hold $ patterns (a literal containing $,
+// or a computed string)
+function replacementHasPatterns(node: AstNode | undefined): boolean {
+  if (!node) return false;
+  if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) return node.text.includes('$');
+  return inferExpressionType(node) === 'string' && !isArrowFunction(node) && !isFunctionExpression(node);
+}
+
+// The capture groups of a JS regex pattern: ( but not (?: or lookarounds,
+// outside character classes and escapes
+function regexCaptureGroupCount(pattern: string): number {
+  let count = 0;
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '\\') i++;
+    else if (inClass) inClass = c !== ']';
+    else if (c === '[') inClass = true;
+    else if (c === '(' && (pattern[i + 1] !== '?' || (pattern[i + 2] === '<' && pattern[i + 3] !== '=' && pattern[i + 3] !== '!'))) count++;
+  }
+  return count;
 }
 
 // str.replace(/re/g, x) → re.ReplaceAllString; without g only the first match is
@@ -11682,31 +11817,54 @@ function visitRegexReplace(node: AstNode): string | undefined {
   if (!isRegexReplaceCall(node)) return undefined;
   const pattern = node.arguments[0];
   const replacement = node.arguments[1];
-  const isGlobal =
-    node.expression.name.text === 'replaceAll' ||
-    (isRegularExpressionLiteral(pattern) &&
-      pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g'));
   const target = toGoValueOfType(node.expression.expression, 'string');
   const reIsWrapper = inferExpressionType(pattern) === '*TnRegex';
   const re = visit(pattern);
+  // (a RegExp object's g flag is known at run time)
+  const isGlobal: boolean | string =
+    node.expression.name.text === 'replaceAll' ||
+    (isRegularExpressionLiteral(pattern)
+      ? pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g')
+      : reIsWrapper && /^[\w.]+$/.test(re)
+        ? `${re}.global`
+        : false);
   importedPackages.add('regexp');
 
   if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {
     useHelper('regexReplaceFunc');
     const callback = visit(replacement);
-    const groupArgs = (replacement.parameters ?? [])
-      .map((_p: AstNode, index: number) => `TnGroup(__m, ${index})`)
+    // (match, ...groups, offset, string): a literal's group count places the
+    // offset; otherwise a number parameter takes it
+    const groups = isRegularExpressionLiteral(pattern) ? regexCaptureGroupCount(pattern.text.slice(1, pattern.text.lastIndexOf('/'))) : undefined;
+    const params = replacement.parameters ?? [];
+    const groupArgs = params
+      .map((p: AstNode, index: number) => {
+        if (p.dotDotDotToken) return '';
+        const numeric = p.type ? getType(p.type) === 'float64' : false;
+        if (groups !== undefined ? index === groups + 1 : index > 0 && numeric) return 'float64(__at)';
+        if (groups !== undefined && index === groups + 2) return '__s';
+        return `TnGroup(__m, ${index})`;
+      })
+      .filter((a: string) => a)
       .join(', ');
-    if (reIsWrapper) {
-      useHelper('fancyRegex');
-      return `TnRegexReplaceFuncW(${re}, ${target}, func(__m []string) string { return (${callback})(${groupArgs}) }, ${isGlobal})`;
-    }
-    return `TnRegexReplaceFunc(${re}, ${target}, func(__m []string) string { return (${callback})(${groupArgs}) }, ${isGlobal})`;
+    const fn = `func(__m []string, __at int) string { return (${callback})(${groupArgs}) }`;
+    const subject = groupArgs.includes('__s') ? `func() string { __s := ${target}; return ${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, __s, ${fn}, ${isGlobal}) }()` : '';
+    if (reIsWrapper) useHelper('fancyRegex');
+    if (subject) return subject;
+    return `${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, ${target}, ${fn}, ${isGlobal})`;
   }
 
+  // $` and $' (the text before / after the match): expanded per match
+  if ((isStringLiteral(replacement) || isNoSubstitutionTemplateLiteral(replacement)) && /\$[`']/.test(replacement.text)) {
+    useHelper('regexReplaceFunc');
+    if (reIsWrapper) useHelper('fancyRegex');
+    const fn = `func(__m []string, __at int) string { return TnJSExpandAround(${toGoStringLiteral(replacement.text)}, __m, __s, tnStrByte(__s, __at)) }`;
+    return `func() string { __s := ${target}; return ${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, __s, ${fn}, ${isGlobal}) }()`;
+  }
   const goReplacement = jsReplacementToGo(replacement);
   if (reIsWrapper) {
     useHelper('fancyRegex');
+    if (typeof isGlobal === 'string') return `${re}.replace(${target}, ${goReplacement}, ${isGlobal})`;
     return isGlobal
       ? `TnRegexWrapReplaceAll(${re}, ${target}, ${goReplacement})`
       : `TnRegexWrapReplaceFirst(${re}, ${target}, ${goReplacement})`;
@@ -12679,6 +12837,8 @@ function returnsArrayReference(fn: AstNode | undefined): boolean {
 function arrayReferenceOf(expr: AstNode, sliceType: string): string {
   const u = unwrapParentheses(expr);
   const goType = sliceType.replace(/^\*/, '');
+  // (null / undefined: no array, the nil reference)
+  if (isNilLiteral(u)) return `(*${goType})(nil)`;
   // (a field of a struct pointer is addressable, whatever the pointer's expression)
   if (isPropertyAccessExpression(u) && !hasQuestionDot(u) && inferExpressionType(u) === goType && (inferExpressionType(u.expression) ?? '').startsWith('*')) {
     const field = visit(u);
@@ -13230,6 +13390,22 @@ function visitNewMap(node: AstNode): string {
     valueType = getType(typeArguments[1]);
   }
   const args = node.arguments ?? [];
+  // new Map(otherMap / entries() / a generator / Object.entries(o)): the
+  // pairs copied at run time
+  if (args.length > 0 && !isNilLiteral(args[0]) && (!isArrayLiteralExpression(args[0]) || (args[0].elements ?? []).some((e: AstNode) => isSpreadElement(e)))) {
+    const sourceType = inferExpressionType(args[0]) ?? '';
+    if (typeArguments.length !== 2 && sourceType.startsWith('*TnMap[') && extractMapValueType(sourceType) !== 'struct{}') {
+      const [k, v] = splitMapTypeArgs(sourceType) ?? ['interface{}', 'interface{}'];
+      keyType = k;
+      valueType = v;
+    }
+    useHelper('orderedMap');
+    useHelper('dynamic');
+    useHelper('arraySubclass');
+    const key = keyType === 'interface{}' ? '__e[0]' : `TnAs[${keyType}](__e[0])`;
+    const value = valueType === 'interface{}' ? '__e[1]' : `TnAs[${valueType}](__e[1])`;
+    return `func() *TnMap[${keyType}, ${valueType}] { __m := TnNewMap[${keyType}, ${valueType}](); for _, __p := range TnToArray(${visit(args[0])}) { __e := append(TnToArray(__p), nil, nil); __m.Set(${key}, ${value}) }; return __m }()`;
+  }
   const entries: string[] =
     args.length > 0 && isArrayLiteralExpression(args[0])
       ? args[0].elements
@@ -14144,8 +14320,9 @@ function needPkg(pkg: string): void {
 // Marks a Go helper as used; also registers the packages the helper needs,
 // since the import list is serialized before helpers are emitted.
 const helperRequires: Record<string, string[]> = {
+  regexReplaceFunc: ['strIndex'],
   objectAssign: ['orderedMap'],
-  objectAssignTo: ['dynamic'],
+  objectAssignTo: ['dynamic', 'orderedMap'],
   promiseAll: ['orderedMap', 'asyncWait', 'promise'],
   promise: ['error', 'eventLoop', 'asyncWait'],
   goMust: ['error'],
@@ -14825,7 +15002,7 @@ const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
   dynamicSpread: ['sort'],
   entryPoints: ['os'],
-  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect'],
+  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort'],
   jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time', 'sync', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
   objectAssignTo: ['reflect', 'unsafe', 'sort', 'fmt', 'strings'],
@@ -14840,7 +15017,7 @@ const helperPackages: Record<string, string[]> = {
   arraySubclass: ['reflect'],
   numTruthy: ['math'],
   iterable: ['reflect'],
-  regexReplaceFunc: ['regexp'],
+  regexReplaceFunc: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
   pathToFileURL: ['net/url', 'path/filepath', 'strings'],
   osPlatform: ['runtime'],
   error: ['runtime', 'strings', 'fmt'],
@@ -15906,6 +16083,16 @@ func TnIsSlice(v interface{}) bool {
 	return rv.Kind() == reflect.Slice
 }
 
+// x.toString(radix?) on any value: a number in the radix, else its string form
+func TnToStringOf(v interface{}, args ...interface{}) string {
+	if n, ok := v.(float64); ok && len(args) > 0 {
+		if radix, ok := args[0].(float64); ok && radix != 10 && n == math.Trunc(n) && !math.IsInf(n, 0) {
+			return strconv.FormatInt(int64(n), int(radix))
+		}
+	}
+	return TnJSString(v)
+}
+
 // A dynamic value a typeof test found to be a T (a T, or a non-nil *T)
 func TnNarrow[T any](v interface{}) T {
 	if p, ok := v.(*T); ok && p != nil {
@@ -16571,10 +16758,16 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		return reflect.Zero(t), true
 	}
 	rv := reflect.ValueOf(v)
-	// an array reference where an array is expected: its elements
+	// an array reference where an array is expected: its elements; a T | undefined
+	// (*T) where a T is: its value (the zero value when unset)
 	if rv.Kind() == reflect.Pointer && t.Kind() == reflect.Slice && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
 		rv = rv.Elem()
 		v = rv.Interface()
+	} else if rv.Kind() == reflect.Pointer && t.Kind() != reflect.Pointer && t.Kind() != reflect.Interface && rv.Type().Elem().AssignableTo(t) {
+		if rv.IsNil() {
+			return reflect.Zero(t), true
+		}
+		return rv.Elem(), true
 	}
 	if rv.Type().AssignableTo(t) {
 		return rv, true
@@ -16626,7 +16819,10 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		m, ok := v.(map[string]interface{})
 		// another object type (TS types are structural): field by field
 		_, isEntries := v.(interface{ Entries() [][]interface{} })
-		if src := reflect.Indirect(rv); !ok && !isEntries && src.Kind() == reflect.Struct && t.NumField() > 0 {
+		// (one class instance is never copied into another class: it is not one)
+		_, isInstance := v.(interface{ TnClassInstance() })
+		toClass := reflect.PointerTo(t).Implements(reflect.TypeOf((*interface{ TnClassInstance() })(nil)).Elem())
+		if src := reflect.Indirect(rv); !ok && !isEntries && !(isInstance && toClass) && src.Kind() == reflect.Struct && t.NumField() > 0 {
 			if !src.CanAddr() {
 				copied := reflect.New(src.Type()).Elem()
 				copied.Set(src)
@@ -16958,6 +17154,17 @@ func TnToArray(v interface{}) []interface{} {
 			out[i] = rv.Index(i).Interface()
 		}
 		return out
+	}
+	// (a generator: its values until it returns)
+	if rv.Kind() == reflect.Chan {
+		out := []interface{}{}
+		for {
+			x, ok := rv.Recv()
+			if !ok {
+				return out
+			}
+			out = append(out, x.Interface())
+		}
 	}
 	n := int(TnNumber(TnGet(v, "length")))
 	out := make([]interface{}, n)
@@ -17524,6 +17731,16 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 	case string:
 		tnJSONQuote(&w.buf, t)
 		return true
+	case []byte:
+		// a Buffer serializes through its toJSON(): { type, data }
+		return w.object(depth, func(emit func(string, interface{})) {
+			data := make([]float64, len(t))
+			for i, c := range t {
+				data[i] = float64(c)
+			}
+			emit("type", "Buffer")
+			emit("data", data)
+		})
 	}
 	rv := reflect.ValueOf(v)
 	if rv.Type().String() == "*big.Int" {
@@ -17844,6 +18061,9 @@ func tnJSONDecodeOrdered(dec *json.Decoder) (interface{}, error) {
 		return nil, err
 	}
 	delim, isDelim := tok.(json.Delim)
+	if tok == nil {
+		return TnNull, nil // (null in the data: not undefined)
+	}
 	if !isDelim {
 		return tok, nil
 	}
@@ -17944,9 +18164,28 @@ func tnJSONMarshal(v interface{}) ([]byte, error) {
 }`,
   orderedMap: `// TnMap: JS Map/Set/object semantics — keys iterate in insertion order
 type TnMap[K comparable, V any] struct {
-	keys   []K
-	values map[K]V
-	jsKind uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
+	keys      []K
+	values    map[K]V
+	jsKind    uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
+	indexKeys bool  // some key is an array index ("2"): see orderedKeys
+}
+
+// The keys in iteration order: insertion order, except that a plain object
+// (not a Map or Set) lists its array-index keys first, ascending, as JS does
+func (m *TnMap[K, V]) orderedKeys() []K {
+	if !m.indexKeys || m.jsKind != 0 {
+		return m.keys
+	}
+	keys := append([]K{}, m.keys...)
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, aIndex := tnIndexKey(any(keys[i]))
+		b, bIndex := tnIndexKey(any(keys[j]))
+		if aIndex && bIndex {
+			return a < b
+		}
+		return aIndex && !bIndex
+	})
+	return keys
 }
 
 func TnJSCollection[K comparable, V any](m *TnMap[K, V], kind uint8) *TnMap[K, V] {
@@ -17987,9 +18226,28 @@ func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, 
 func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
 	if _, ok := m.values[k]; !ok {
 		m.keys = append(m.keys, k)
+		if _, isIndex := tnIndexKey(any(k)); isIndex {
+			m.indexKeys = true
+		}
 	}
 	m.values[k] = v
 	return m
+}
+
+// A string key that is an array index ("0", "23"; not "01" or "-1")
+func tnIndexKey(k interface{}) (uint64, bool) {
+	s, ok := k.(string)
+	if !ok || s == "" || len(s) > 10 || (len(s) > 1 && s[0] == '0') {
+		return 0, false
+	}
+	var n uint64
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + uint64(s[i]-'0')
+	}
+	return n, n < 4294967295
 }
 
 func (m *TnMap[K, V]) Get(k K) V {
@@ -18103,7 +18361,7 @@ func (m *TnMap[K, V]) Keys() []K {
 	if m == nil {
 		return nil
 	}
-	return append([]K{}, m.keys...)
+	return append([]K{}, m.orderedKeys()...)
 }
 
 func (m *TnMap[K, V]) Values() []V {
@@ -18111,7 +18369,7 @@ func (m *TnMap[K, V]) Values() []V {
 		return nil
 	}
 	values := make([]V, 0, len(m.keys))
-	for _, k := range m.keys {
+	for _, k := range m.orderedKeys() {
 		values = append(values, m.values[k])
 	}
 	return values
@@ -18171,9 +18429,10 @@ func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
 
 // JSON objects keep insertion order
 func (m *TnMap[K, V]) MarshalJSON() ([]byte, error) {
+	keys := m.orderedKeys()
 	var buf bytes.Buffer
 	buf.WriteByte('{')
-	for i, k := range m.keys {
+	for i, k := range keys {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
@@ -18525,12 +18784,12 @@ func TnRegexWrapReplaceFirst(r *TnRegex, s string, repl string) string {
 	return r.replace(s, repl, false)
 }
 
-func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string) string, all bool) string {
+func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string, int) string, all bool) string {
 	var out strings.Builder
 	last := 0
 	r.scan(s, func(groups []string, loc []int) bool {
 		out.WriteString(s[last:loc[0]])
-		out.WriteString(fn(groups))
+		out.WriteString(fn(groups, tnStrRune(s, loc[0])))
 		last = loc[1]
 		return all
 	})
@@ -18543,7 +18802,7 @@ func (r *TnRegex) replace(s string, repl string, all bool) string {
 	last := 0
 	r.scan(s, func(groups []string, loc []int) bool {
 		out.WriteString(s[last:loc[0]])
-		out.WriteString(tnExpandGroups(repl, groups))
+		out.WriteString(tnExpandGroups(repl, groups, r.groupNames(repl)))
 		last = loc[1]
 		return all
 	})
@@ -18552,15 +18811,60 @@ func (r *TnRegex) replace(s string, repl string, all bool) string {
 }
 
 // Replaces the numeric group placeholders in the replacement with captures
-func tnExpandGroups(repl string, groups []string) string {
+// The capture group numbers of the pattern's named groups (only when the
+// replacement names one)
+func (r *TnRegex) groupNames(repl string) map[string]int {
+	if !strings.Contains(repl, "\${") {
+		return nil
+	}
+	names := map[string]int{}
+	src := r.source
+	n, inClass := 0, false
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case c == '\\\\':
+			i++
+		case inClass:
+			inClass = c != ']'
+		case c == '[':
+			inClass = true
+		case c == '(' && (i+1 >= len(src) || src[i+1] != '?'):
+			n++
+		case c == '(' && i+2 < len(src) && src[i+2] == '<' && i+3 < len(src) && src[i+3] != '=' && src[i+3] != '!':
+			n++
+			if end := strings.IndexByte(src[i+3:], '>'); end >= 0 {
+				names[src[i+3:i+3+end]] = n
+			}
+		case c == '(' && i+2 < len(src) && src[i+2] == 'P' && i+3 < len(src) && src[i+3] == '<':
+			n++
+			if end := strings.IndexByte(src[i+4:], '>'); end >= 0 {
+				names[src[i+4:i+4+end]] = n
+			}
+		}
+	}
+	return names
+}
+
+func tnExpandGroups(repl string, groups []string, names map[string]int) string {
 	if strings.IndexByte(repl, '$') < 0 {
 		return repl
 	}
 	var out strings.Builder
 	for i := 0; i < len(repl); i++ {
+		if repl[i] == '$' && i+1 < len(repl) && repl[i+1] == '$' {
+			out.WriteByte('$')
+			i++
+			continue
+		}
 		if repl[i] == '$' && i+1 < len(repl) && repl[i+1] == '{' {
 			if j := strings.IndexByte(repl[i+2:], '}'); j >= 0 {
 				if n, err := strconv.Atoi(repl[i+2 : i+2+j]); err == nil && n < len(groups) {
+					out.WriteString(groups[n])
+					i = i + 2 + j
+					continue
+				}
+				if n, ok := names[repl[i+2:i+2+j]]; ok && n < len(groups) {
 					out.WriteString(groups[n])
 					i = i + 2 + j
 					continue
@@ -19279,6 +19583,18 @@ func TnAssignTo[T any](target T, sources ...interface{}) T {
 	return target
 }
 
+// A fresh empty value shaped like v: a struct of the same type, else an
+// ordered record (Object.assign({}, v, …) where any value fits)
+func TnEmptyLike(v interface{}) interface{} {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct && rv.Elem().Type().Name() != "" {
+		if _, ok := v.(interface{ Entries() [][]interface{} }); !ok {
+			return reflect.New(rv.Elem().Type()).Interface()
+		}
+	}
+	return TnNewMap[string, interface{}]()
+}
+
 type tnProp struct {
 	key   string
 	value interface{}
@@ -19403,6 +19719,13 @@ func tnAssignProps(target reflect.Value, src interface{}) {
 		if !ok {
 			continue
 		}
+		if p.value == nil {
+			switch field.Kind() {
+			case reflect.Pointer, reflect.Interface, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan:
+				field.Set(reflect.Zero(field.Type()))
+			}
+			continue
+		}
 		if converted, cok := TnConvertDynamic(p.value, field.Type()); cok {
 			field.Set(converted)
 		}
@@ -19459,7 +19782,8 @@ func tnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
 		}
 	}
 }`,
-  regexReplaceFunc: `func TnRegexReplaceFunc(re *regexp.Regexp, s string, fn func([]string) string, all bool) string {
+  regexReplaceFunc: `// fn gets the match and its groups, and the match's index
+func TnRegexReplaceFunc(re *regexp.Regexp, s string, fn func([]string, int) string, all bool) string {
 	limit := 1
 	if all {
 		limit = -1
@@ -19473,10 +19797,83 @@ func tnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
 				groups[i] = s[loc[2*i]:loc[2*i+1]]
 			}
 		}
-		result += s[last:loc[0]] + fn(groups)
+		result += s[last:loc[0]] + fn(groups, tnStrRune(s, loc[0]))
 		last = loc[1]
 	}
 	return result + s[last:]
+}
+
+// A JS replacement string for one match at byte offset at of s:
+// $$ $& $\` $' and $n
+func TnJSExpandAround(repl string, groups []string, s string, at int) string {
+	var out strings.Builder
+	for i := 0; i < len(repl); i++ {
+		c := repl[i]
+		if c != '$' || i+1 >= len(repl) {
+			out.WriteByte(c)
+			continue
+		}
+		switch next := repl[i+1]; {
+		case next == '$':
+			out.WriteByte('$')
+			i++
+		case next == '&':
+			out.WriteString(groups[0])
+			i++
+		case next == '\x60':
+			out.WriteString(s[:at])
+			i++
+		case next == '\\'':
+			out.WriteString(s[at+len(groups[0]):])
+			i++
+		case next >= '0' && next <= '9':
+			j := i + 2
+			if j < len(repl) && repl[j] >= '0' && repl[j] <= '9' {
+				if n := int(next-'0')*10 + int(repl[j]-'0'); n < len(groups) {
+					j++
+				}
+			}
+			if n, _ := strconv.Atoi(repl[i+1 : j]); n > 0 && n < len(groups) {
+				out.WriteString(groups[n])
+				i = j - 1
+			} else {
+				out.WriteByte(c)
+			}
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
+}
+
+// s.replace(search, repl) with a string search: repl's $ patterns expanded
+func TnStringReplaceJS(s string, search string, repl string, all bool) string {
+	var out strings.Builder
+	last := 0
+	for {
+		i := strings.Index(s[last:], search)
+		if i < 0 {
+			break
+		}
+		at := last + i
+		out.WriteString(s[last:at])
+		out.WriteString(TnJSExpandAround(repl, []string{search}, s, at))
+		last = at + len(search)
+		if !all {
+			break
+		}
+		if search == "" {
+			if last >= len(s) {
+				out.WriteString(s[last:])
+				return out.String()
+			}
+			_, size := utf8.DecodeRuneInString(s[last:])
+			out.WriteString(s[last : last+size])
+			last += size
+		}
+	}
+	out.WriteString(s[last:])
+	return out.String()
 }
 
 func TnGroup(groups []string, i int) string {
