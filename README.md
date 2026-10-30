@@ -260,7 +260,9 @@ console.log(`count=${c.count} seen=${seen.get('a')}`);
 ```
 
 Complete, runnable projects, including Node-vs-TypeNative benchmarks for
-each, live in [examples/](examples/).
+each, live in [examples/](examples/). The flagship is
+[yaml-cli](examples/yaml-cli/): the `yaml` package's own CLI compiled from its
+unmodified source, matching Node's output on all 1,608 yaml-test-suite cases.
 
 ## How it works
 

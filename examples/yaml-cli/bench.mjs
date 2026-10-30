@@ -204,7 +204,7 @@ function stats(samples) {
 }
 
 function fmt(ms) {
-  return `${ms.toFixed(2)} ms`.padStart(12);
+  return `${ms.toFixed(2)} ms`.padStart(13);
 }
 
 function runOnce(command, args, input) {

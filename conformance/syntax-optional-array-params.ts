@@ -27,3 +27,11 @@ assert(new Sub([1, 2]).items.length === 2 && new Sub([], 'x').label === 'x', 'su
 assert(relay() === 1 && relay([1, 2, 3]) === 3, 'a call gets the default');
 assert(orEmpty() === 0 && orEmpty(null) === 0 && orEmpty([4]) === 1, '?? on an absent array');
 console.log(new Sub().items.length, relay(), orEmpty([4]));
+function splitPair(s: string): [string, string] | undefined {
+  const i = s.indexOf(',');
+  return i < 0 ? undefined : [s.slice(0, i), s.slice(i + 1)];
+}
+const none = splitPair('ab');
+const pair = splitPair('a,b');
+assert(!none && none === undefined, 'a function result of T[] | undefined stays undefined');
+assert(!!pair && pair.join('|') === 'a|b', 'and a set result is the array');

@@ -660,7 +660,7 @@ interface Process {
   };
   nextTick<A extends any[]>(callback: (...args: A) => void, ...args: A): void;
   kill(pid: number, signal?: string | number): true;
-  emitWarning(warning: string | Error): void;
+  emitWarning(warning: string | Error, type?: string): void;
   getuid(): number;
   getgid(): number;
   geteuid(): number;

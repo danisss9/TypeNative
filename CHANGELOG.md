@@ -5,6 +5,51 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The `yaml` package's own CLI, compiled from its unmodified TypeScript source, as the first
+flagship example: 100% output parity with Node on the yaml-test-suite in all four modes. Getting
+there took transpiler fixes across the board, each with a conformance probe.
+
+### Added
+
+- **examples/yaml-cli:** yaml v3.0.0-2 vendored unpatched (`vendor/yaml/VENDOR.md`), `main.ts`
+  porting upstream's `bin.js`, `parity.mjs` (1,608 cases from yaml-test-suite data-2022-01-17
+  in default, `--json`, `valid` and `lex` modes, compared byte for byte with Node) and
+  `bench.mjs` (per-call latency on a docker-compose.yml, throughput on ~10 MB of generated
+  Kubernetes manifests)
+- `new Map(iterable)` from Maps, iterators, generators and `Object.entries`; generic type aliases
+  (`type WithId<T> = T & { id: number }`); instantiation expressions (`g<number>`) and explicit
+  type arguments in call results; `typeof f` as a function type
+- `emitWarning(warning, type)`; `JSON.stringify(buffer)` as `{ type: 'Buffer', data }`
+
+### Fixed
+
+- **Regexes:** unmatched groups are `undefined`; `new RegExp(src, 'g' | 'y')` keeps its flags;
+  `$&`, `` $` ``, `$'`, `$<name>` and `$$` replacements; replacer callbacks get the match offset
+  and the input
+- **Objects:** `Object.assign({}, typed, overrides)` keeps the type and its function fields, and
+  an explicit `undefined` override clears; integer-like keys of plain objects come first;
+  `x.constructor` on any values; `null` in JSON and `any` data stays `null` (not `undefined`)
+- **Classes:** a class picked at run time or passed as `new (…) => T` constructs; `this.name` in
+  an Error subclass; optional array parameters passed on to defaulted ones (`super(items)`);
+  `x as unknown as T[]` returns the value as is
+- **Numbers:** `toFixed` rounds ties away from zero, also on `any` values and in callbacks
+- **Control flow:** `for (; …; a, b)` with no initializer; function properties assigned twice;
+  unread `for (const [k, v] of map)` bindings; `instanceof Date` narrowing
+- **Type inference:** user-defined type guards (`(t): t is string`) narrow their argument; a
+  conditional's branches are typed with the condition's narrowing; array callbacks' locals are
+  typed from their own declarations; `o?.m()` and `o?.push(x)` on any values don't call through
+  a nullish `o`; `flatMap` callbacks returning any values; a function declared to return
+  `T[] | undefined` keeps `undefined` (it was an empty array); object literals assigned into any
+  slots stay extensible
+- **Self-hosting:** the native compiler builds again (`npm run build:native`; it also failed on
+  0.4.2's coverage code) and `npm run bootstrap:check` holds: it turns its own source into the
+  same Go as the Node CLI. The compiler's code no longer reads missing `Map` / `Record` keys
+  as `undefined` (natively they read as `''`)
+- **Performance:** string positions on long inputs no longer rebuild their code-point index per
+  regex match (quadratic lexing); struct field lookups and struct-to-struct copies are cached
+
 ## [0.4.2] - 2026-10-28
 
 `node:test` reporters, `run()`, coverage, snapshots and member mocks; four runnable examples
