@@ -1,0 +1,16 @@
+const re = /\d/g;
+let match: RegExpExecArray | null;
+let found = 0;
+while ((match = re.exec('a1b2c3'))) found++;
+let a: number;
+let b: number;
+a = b = 5;
+const totals: Record<string, number> = {};
+const first = (totals['k'] ??= 7);
+const again = (totals['k'] ??= 9);
+let count = 0;
+const next = (count += 2);
+let label = '';
+const shown = (label ||= 'none');
+assert(found === 3 && a === 5 && b === 5, 'assignment as condition / chained');
+assert(first === 7 && again === 7 && totals['k'] === 7 && next === 2 && count === 2 && shown === 'none', 'logical / compound assignment values');

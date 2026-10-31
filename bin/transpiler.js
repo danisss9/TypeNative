@@ -475,6 +475,8 @@ function setVarGoType(name, goType) {
 }
 // Struct field / member names: Go keywords get a trailing underscore
 function goFieldName(name) {
+    if (goIdentifierChars(name) !== name)
+        return goFieldName(goIdentifierChars(name));
     return name !== 'main' && dangerousNames.has(name) ? `${name}_` : name;
 }
 function isFieldNameIdentifier(node) {
@@ -712,6 +714,7 @@ function parseAndLower(code) {
     lowerClassExpressions(sourceFile);
     lowerWeakCollections(sourceFile);
     lowerGlobalThis(sourceFile);
+    lowerSetPrototypeIdiom(sourceFile);
     return sourceFile;
 }
 // Links parents, numbers the file for line markers and records its top-level
@@ -1484,6 +1487,22 @@ function lowerWeakCollections(node) {
     if (isIdentifier(name) && (name.text === 'WeakMap' || name.text === 'WeakSet'))
         name.text = name.text.slice(4);
 }
+// `Object.setPrototypeOf(this, X.prototype)` in a constructor: the workaround for
+// subclassing Error under ES5 targets. A class is already its own Go type, so it's dropped.
+function isSetPrototypeOfCall(node) {
+    return (node?.kind === 'CallExpression' &&
+        node.expression?.kind === 'PropertyAccessExpression' &&
+        node.expression.expression?.kind === 'Identifier' &&
+        node.expression.expression.text === 'Object' &&
+        node.expression.name?.text === 'setPrototypeOf');
+}
+function lowerSetPrototypeIdiom(node) {
+    for (const child of childNodes(node))
+        lowerSetPrototypeIdiom(child);
+    if (node.kind !== 'Constructor' || !Array.isArray(node.body?.statements))
+        return;
+    node.body.statements = node.body.statements.filter((s) => !(s.kind === 'ExpressionStatement' && isSetPrototypeOfCall(s.expression) && s.expression.arguments?.[0]?.kind === 'ThisKeyword'));
+}
 // globalThis.x (typed) is the global x itself; (globalThis as any) stays a dynamic object
 function lowerGlobalThis(node) {
     for (const key of Object.keys(node)) {
@@ -1896,6 +1915,8 @@ function visit(node, options = {}) {
 }
 function visitNode(node, options = {}) {
     let code = '';
+    if (typeof node?.covExpr === 'number' && !options.skipCoverage)
+        return visitCountedOperand(node, options);
     // Reads of a narrowed nullable property path dereference it
     if (narrowedVariables.size > 0 && isPropertyAccessExpression(node) && !options.skipNarrowing) {
         const key = getNarrowingKey(node);
@@ -1911,6 +1932,11 @@ function visitNode(node, options = {}) {
     }
     else if (isJsxNode(node)) {
         return visitJsx(node);
+    }
+    else if (isIdentifier(node) && node.text === 'Function' && !isFieldNameIdentifier(node) && !importAliases.has('Function')) {
+        // `Function` as a value (`const Type = Function`): a sentinel; `instanceof Function` is handled above
+        useHelper('functionValue');
+        return 'TnFunction';
     }
     else if (isIdentifier(node) && node.text === 'globalThis') {
         useHelper('globalThis');
@@ -2939,6 +2965,9 @@ function visitNode(node, options = {}) {
         return visitConditionalExpression(node);
     }
     else if (isBinaryExpression(node)) {
+        if (isAssignmentOperatorKind(node.operatorToken.kind) && !isStatementPosition(node)) {
+            return visitAssignmentValue(node);
+        }
         if (node.operatorToken.kind === 'QuestionQuestionToken') {
             return visitNullishCoalescingExpression(node);
         }
@@ -3052,19 +3081,22 @@ function visitNode(node, options = {}) {
             if (logical)
                 return logical;
         }
-        // x ??= v → assign only when x is nil
-        if (node.operatorToken.kind === 'BarBarEqualsToken' || node.operatorToken.kind === 'AmpersandAmpersandEqualsToken') {
-            // a ||= b assigns when a is falsy; a &&= b when a is truthy
-            const target = visit(node.left);
-            const condition = toGoCondition(node.left);
-            const value = toGoValueOfType(node.right, inferExpressionType(node.left));
-            const test = node.operatorToken.kind === 'BarBarEqualsToken' ? `!${wrapCondition(condition)}` : condition;
-            return `if ${test} { ${target} = ${value} }`;
-        }
-        if (node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
-            const target = visit(node.left);
-            const value = toGoValueOfType(node.right, inferExpressionType(node.left));
-            return `if ${target} == nil { ${target} = ${value} }`;
+        // x ??= v → assign only when x is nil; a ||= b when a is falsy; a &&= b when a is truthy
+        // (the write goes through `a = b`, so map elements and dynamic objects are set properly)
+        if (node.operatorToken.kind === 'BarBarEqualsToken' ||
+            node.operatorToken.kind === 'AmpersandAmpersandEqualsToken' ||
+            node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
+            const kind = node.operatorToken.kind;
+            const test = kind === 'QuestionQuestionEqualsToken'
+                ? nullishTargetTest(node.left)
+                : kind === 'BarBarEqualsToken'
+                    ? `!${wrapCondition(toGoCondition(node.left))}`
+                    : toGoCondition(node.left);
+            const operator = { kind: 'EqualsToken' };
+            const plain = { kind: 'BinaryExpression', left: node.left, operatorToken: operator, right: node.right, parent: node.parent };
+            const statement = { kind: 'ExpressionStatement', expression: plain, parent: node.parent };
+            plain.parent = statement;
+            return `if ${test} { ${visit(plain).trim()} }`;
         }
         let op = operatorTokenText(node.operatorToken);
         if (op === '===')
@@ -4968,6 +5000,57 @@ function nullableKeys(exprs) {
 }
 // Identifier occurrences that read the variable (not declarations, member
 // names, or assignment targets)
+// The ??= test: a map element is missing (or a nil value), anything else is nil
+function nullishTargetTest(target) {
+    if (isElementAccessExpression(target)) {
+        const mapType = inferExpressionType(target.expression);
+        if (mapType?.startsWith('*TnMap[')) {
+            const map = visit(target.expression);
+            const key = toGoValueOfType(target.argumentExpression, extractMapKeyType(mapType));
+            const missing = `!${map}.Has(${key})`;
+            return isNilableGoType(extractMapValueType(mapType)) ? `(${missing} || ${map}.Get(${key}) == nil)` : missing;
+        }
+    }
+    return `${visit(target)} == nil`;
+}
+function isAssignmentOperatorKind(kind) {
+    return kind === 'EqualsToken' || (kind.endsWith('EqualsToken') && !['EqualsEqualsToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsToken', 'ExclamationEqualsEqualsToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken'].includes(kind));
+}
+// Whether an expression's value is unused: an expression statement, a for header's
+// initializer / update, a void arrow's body, or a part of a comma list in one of those
+function isStatementPosition(node) {
+    const parent = node.parent;
+    if (!parent)
+        return true;
+    if (isExpressionStatement(parent))
+        return true;
+    if (isForStatement(parent) && (parent.initializer === node || parent.incrementor === node))
+        return true;
+    if (isParenthesizedExpression(parent) || parent.kind === 'VoidExpression')
+        return isStatementPosition(parent);
+    if (isBinaryExpression(parent) && parent.operatorToken.kind === 'CommaToken') {
+        return parent.left === node || isStatementPosition(parent);
+    }
+    if (isArrowFunction(parent) && parent.body === node)
+        return !inferFunctionBodyReturnType(parent);
+    return false;
+}
+// (target = value) used as a value: assign, then read the target back
+function visitAssignmentValue(node) {
+    const statement = { kind: 'ExpressionStatement', expression: node, parent: node.parent };
+    const savedParent = node.parent;
+    node.parent = statement;
+    const write = visit(node).trim();
+    node.parent = savedParent;
+    const goType = inferExpressionType(node.left) ?? 'interface{}';
+    // (an array reference may have been set to null: read it nil-safely)
+    const left = unwrapParentheses(node.left);
+    if (isIdentifier(left) && referenceArrays.has(left.text)) {
+        useHelper('dynamic');
+        return `func() ${goType} { ${write}; return TnDerefSlice(${getSafeName(left.text)}) }()`;
+    }
+    return `func() ${goType} { ${write}; return ${visit(node.left)} }()`;
+}
 function isNarrowableReference(node) {
     const parent = node.parent;
     if (!parent)
@@ -6224,6 +6307,10 @@ function privateNameOwner(node, privateName) {
 }
 // x instanceof Map / Set / Date / Array on built-in values
 function builtinInstanceOf(value, name) {
+    if (name === 'Function') {
+        importedPackages.add('reflect');
+        return `func() bool { v := interface{}(${value}); return v != nil && reflect.TypeOf(v).Kind() == reflect.Func }()`;
+    }
     if (name === 'Map' || name === 'WeakMap' || name === 'Set' || name === 'WeakSet') {
         useHelper('orderedMap');
         const kind = name.endsWith('Map') ? 1 : 2;
@@ -7970,6 +8057,9 @@ function inferExpressionTypeOf(expr) {
             inst.params.forEach((p, i) => (fnType = fnType.replace(new RegExp(`\\b${p}\\b`, 'g'), inst.args[i])));
         return fnType;
     }
+    // (target = value) is the target, after the write
+    if (isBinaryExpression(expr) && isAssignmentOperatorKind(expr.operatorToken.kind))
+        return inferExpressionType(expr.left);
     if (isAwaitExpression(expr)) {
         // await unwraps the promise channel
         const inner = inferExpressionType(expr.expression);
@@ -8820,6 +8910,8 @@ function inferObjectCallType(expr) {
         return inferExpressionType(expr.arguments?.[0]);
     if (OBJECT_INTEGRITY_CHECKS[name] || name === 'hasOwn')
         return 'bool';
+    if (name === 'create')
+        return 'interface{}';
     if (name === 'getOwnPropertyNames')
         return inferExpressionType({ ...expr, expression: { ...expr.expression, name: { kind: 'Identifier', text: 'keys' } } });
     return undefined;
@@ -8828,6 +8920,15 @@ function visitObjectCall(node) {
     const name = getObjectCallName(node);
     if (!name)
         return undefined;
+    if (name === 'setPrototypeOf') {
+        reportError(node, 'Object.setPrototypeOf: prototypes are fixed (only setPrototypeOf(this, …) in a constructor is accepted, as a no-op)');
+        return 'nil';
+    }
+    // Object.create(null): a prototype-less dictionary — an empty dynamic object
+    // (Object.create(proto) is a class instance: see below)
+    if (name === 'create' && (node.arguments ?? [])[0]?.kind === 'NullKeyword' && (node.arguments ?? []).length === 1) {
+        return 'map[string]interface{}{}';
+    }
     const args = node.arguments ?? [];
     if (OBJECT_INTEGRITY_LEVELS[name]) {
         useHelper('objectIntegrity');
@@ -13675,7 +13776,14 @@ const goPackageIdentifiers = new Set([
 ]);
 // Local names of `go:` package imports (`import * as strings from 'go:strings'`)
 const goPackageLocalNames = new Set();
+// `$` isn't valid in a Go identifier: ǂ (U+01C2, a letter to Go) stands in for it
+function goIdentifierChars(name) {
+    // only a bare identifier: callers also pass whole expressions (a callee like re.MatchString)
+    return /^[A-Za-z_$][\w$]*$/.test(name) && name.includes('$') ? name.split('$').join('ǂ') : name;
+}
 function getSafeName(name) {
+    if (goIdentifierChars(name) !== name)
+        return getSafeName(goIdentifierChars(name));
     if (!dangerousNames.has(name) && !(goPackageIdentifiers.has(name) && !goPackageLocalNames.has(name))) {
         return name;
     }
@@ -14797,6 +14905,7 @@ const helperRequires = {
     objectAssignTo: ['dynamic', 'orderedMap'],
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
     promise: ['error', 'eventLoop', 'asyncWait'],
+    functionValue: [],
     goMust: ['error'],
     goMaps: ['orderedMap'],
     bigint: ['error'],
@@ -15108,6 +15217,7 @@ let coverageCounters = 0;
 // Counters some generated code increments (the others stand for their enclosing range)
 const coverageEmitted = new Set();
 const coverageFiles = [];
+const COVERAGE_LOGICAL = new Set(['AmpersandAmpersandToken', 'BarBarToken', 'QuestionQuestionToken']);
 const COVERAGE_LOOPS = new Set(['ForStatement', 'ForInStatement', 'ForOfStatement', 'WhileStatement', 'DoStatement']);
 const COVERAGE_FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunction', 'MethodDeclaration', 'GetAccessor', 'SetAccessor', 'Constructor']);
 // Lines a node:coverage comment excludes (ignore next [n], disable / enable), as Node reads them
@@ -15172,12 +15282,15 @@ function coverageRange(file, kind, node, counter, name, parent, fn) {
     // `export function f`: V8's range starts at `function`
     if (kind === 1 && (node.modifiers ?? []).length > 0 && startColumn < 2)
         startColumn = 2;
+    const startLine = node.line ?? 1;
+    const endLine = node.endLine ?? startLine;
+    const endColumn = node.endColumn ?? 1;
     file.ranges.push({
         kind: kind,
-        startLine: node.line ?? 1,
+        startLine: startLine,
         startColumn: startColumn,
-        endLine: node.endLine ?? node.line ?? 1,
-        endColumn: node.endColumn ?? 1,
+        endLine: endLine,
+        endColumn: endColumn,
         counter: counter,
         name: name,
         parent: parent,
@@ -15228,8 +15341,10 @@ function coverageWalk(node, file, parent, fn) {
             const last = fields[fields.length - 1];
             const r = coverageRange(file, 1, fields[0], coverageCounters++, '<instance_members_initializer>', parent, -1);
             file.ranges[r].fn = r;
-            file.ranges[r].endLine = last.endLine ?? file.ranges[r].endLine;
-            file.ranges[r].endColumn = last.endColumn ?? file.ranges[r].endColumn;
+            const lastLine = last.endLine ?? file.ranges[r].endLine;
+            const lastColumn = last.endColumn ?? file.ranges[r].endColumn;
+            file.ranges[r].endLine = lastLine;
+            file.ranges[r].endColumn = lastColumn;
             node.covFields = file.ranges[r].counter;
             for (const m of fields)
                 coverageWalk(m.initializer, file, r, r);
@@ -15275,6 +15390,14 @@ function coverageWalk(node, file, parent, fn) {
         }
         return;
     }
+    if (isBinaryExpression(node) && COVERAGE_LOGICAL.has(node.operatorToken?.kind)) {
+        // V8 counts the right operand of && / || / ?? (it may not run)
+        coverageWalk(node.left, file, parent, fn);
+        const r = coverageRange(file, 2, node.right, coverageCounters++, '', parent, fn);
+        node.right.covExpr = file.ranges[r].counter;
+        coverageWalk(node.right, file, r, fn);
+        return;
+    }
     if (isConditionalExpression(node)) {
         coverageWalk(node.condition, file, parent, fn);
         const t = coverageRange(file, 2, node.whenTrue, coverageCounters++, '', parent, fn);
@@ -15296,8 +15419,9 @@ function coverageWalk(node, file, parent, fn) {
 function coverageBranch(owner, body, file, parent, fn) {
     let block = body;
     if (!isBlock(body)) {
-        block = { kind: 'Block', statements: [body], parent: owner };
-        body.parent = block;
+        const wrapper = { kind: 'Block', statements: [body], parent: owner };
+        body.parent = wrapper;
+        block = wrapper;
     }
     const r = coverageRange(file, 2, body, coverageCounters++, '', parent, fn);
     block.covEnter = file.ranges[r].counter;
@@ -15318,7 +15442,9 @@ function coverageStatements(statements, file, parent, fn) {
             continue;
         const p = file.ranges[parent];
         const counter = jump ? -1 : coverageCounters++;
-        file.ranges.push({ kind: 2, startLine: s.endLine, startColumn: s.endColumn, endLine: p.endLine, endColumn: p.endColumn, counter: counter, name: '', parent: parent, fn: fn });
+        const startLine = s.endLine;
+        const startColumn = s.endColumn ?? 1;
+        file.ranges.push({ kind: 2, startLine: startLine, startColumn: startColumn, endLine: p.endLine, endColumn: p.endColumn, counter: counter, name: '', parent: parent, fn: fn });
         if (!jump)
             s.covAfter = counter;
     }
@@ -15341,6 +15467,20 @@ function coverageAfter(node) {
 function coverageLoaded(sf) {
     const counter = sf?.covLoaded;
     return typeof counter === 'number' ? `${coverageCount(counter)}\n\t` : '';
+}
+// The right operand of && / || / ??: tnCovAt counts it and passes the value
+// through with its own Go type. Not where the value isn't used (`ok && log()`
+// can be a void call) nor for an untyped nil
+function visitCountedOperand(node, options) {
+    const code = visit(node, { ...options, skipCoverage: true });
+    let statement = node.parent;
+    while (statement && (isBinaryExpression(statement) || statement.kind === 'ParenthesizedExpression'))
+        statement = statement.parent;
+    const type = inferExpressionType(node) ?? '';
+    if (!code.trim() || code.trim() === 'nil' || !type || type === 'nil' || type === 'void' || isExpressionStatement(statement))
+        return code;
+    coverageEmitted.add(node.covExpr);
+    return `tnCovAt(${node.covExpr}, ${code})`;
 }
 // An expression-bodied arrow's func code: the counter right inside its body
 function withCoverageEntry(fn, code, header) {
@@ -15394,7 +15534,7 @@ function coverageTables() {
             ranges.push(`{${fi}, ${parent}, ${positions[r.fn]}, ${r.kind}, ${counter}, ${JSON.stringify(r.name)}, ${r.startLine}, ${firstLine}, ${lastLine}, ${allIgnored}}`);
         }
     }
-    return `var tnCov = make([]uint32, ${Math.max(coverageCounters, 1)})\n\nvar tnCovFiles = []tnCovFile{\n\t${files.join(',\n\t')},\n}\n\nvar tnCovRanges = []tnCovRange{\n\t${ranges.join(',\n\t')},\n}`;
+    return `var tnCov = make([]uint32, ${Math.max(coverageCounters, 1)})\n\n// A counted operand's value\nfunc tnCovAt[T any](counter int, value T) T {\n\ttnCov[counter]++\n\treturn value\n}\n\nvar tnCovFiles = []tnCovFile{\n\t${files.join(',\n\t')},\n}\n\nvar tnCovRanges = []tnCovRange{\n\t${ranges.join(',\n\t')},\n}`;
 }
 function bindNodeRegistryServices() {
     nodeRegistry.pkg = needPkg;
@@ -15512,6 +15652,7 @@ const helperPackages = {
     uri: ['strings', 'fmt', 'net/url'],
     promiseAll: [],
     promise: ['sync', 'reflect'],
+    functionValue: [],
     goMust: [],
     goNums: [],
     goMaps: [],
@@ -18338,7 +18479,7 @@ func tnJSONFieldName(name string) string {
 	if strings.HasSuffix(name, "_") && tnGoKeywords[strings.TrimSuffix(name, "_")] {
 		return strings.TrimSuffix(name, "_")
 	}
-	return name
+	return strings.ReplaceAll(name, "ǂ", "$")
 }
 
 // Writes one value; false when it serializes to undefined (functions)
@@ -21894,6 +22035,10 @@ func TnDecorateClass(result interface{}) {
 		panic("class decorators cannot replace the class")
 	}
 }`,
+    functionValue: `// The global Function used as a value: an opaque sentinel
+type tnFunctionConstructor struct{}
+
+var TnFunction interface{} = &tnFunctionConstructor{}`,
     promise: `// Promises are channels; a rejected promise is a closed channel with a reason
 var tnRejections sync.Map
 
