@@ -57,3 +57,18 @@ const spec: any = './mod.ts';
 const padded: any = '  x  ';
 assert(spec.startsWith('.') && !spec.startsWith('/') && padded.trim() === 'x', 'string methods on any strings');
 assert(prefixes.startsWith('p') && prefixes.trim() === 'object', "the object's own functions");
+
+// Functions with array parameters stored where a function type is expected:
+// a declared function, an arrow and a function expression
+const typers: Record<string, (nodes: any[]) => string[]> = {};
+function named(nodes: any[]): string[] {
+  const out = nodes.map((n) => String(n));
+  out.push('x');
+  return out;
+}
+typers.a = named;
+typers.b = (nodes: any[]) => nodes.map((n) => typeof n);
+typers['c'] = function (nodes: any[]) {
+  return [String(nodes.length)];
+};
+assert(typers.a([1]).join() === '1,x' && typers.b([1, 's']).join() === 'number,string' && typers.c([1, 2]).join() === '2', 'array parameters through function types');
