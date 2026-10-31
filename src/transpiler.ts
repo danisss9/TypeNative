@@ -1872,7 +1872,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
         const properties = new Map<string, string>();
         for (const member of statement.type.members ?? []) {
           if (isPropertySignature(member) && isIdentifier(member.name)) {
-            properties.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
+            properties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
           }
         }
         if (properties.size > 0) interfacePropertyTypes.set(statement.name.text, properties);
@@ -1978,7 +1978,7 @@ function collectInterfaceProperties(iface: AstNode, into: Map<string, string>, s
   const withMethods = interfaceHasProperties(iface);
   for (const member of (iface.members ?? [])) {
     if (isPropertySignature(member) && isIdentifier(member.name)) {
-      into.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
+      into.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
     } else if (withMethods && isMethodSignature(member) && isIdentifier(member.name)) {
       into.set(member.name.text, methodSignatureFieldType(member));
     }
@@ -2063,6 +2063,19 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
 }
 
 function visitScoped(node: AstNode, options: VisitNodeOptions = {}): string {
+  // an object's array field holds a *[]T: reads see the array (nil-safe),
+  // mutations go through the reference, assignments and nil tests use it
+  if (node && !options.rawArrayField && isReferenceFieldAccess(node)) {
+    const raw = inferRawExpressionType(node);
+    if (raw?.startsWith('*[]')) {
+      const code = visitScoped(node, { ...options, rawArrayField: true });
+      const use = referenceFieldUse(node);
+      if (use === 'reference') return code;
+      if (use === 'mutated') return `(*${code})`;
+      useHelper('dynamic');
+      return `TnDerefSlice(${code})`;
+    }
+  }
   // a function's own variables shadow same-named outer ones only inside it
   if (node && node.body && FUNCTION_LIKE_KINDS.has(node.kind)) {
     const restore = saveVariableTypes(functionScopeNames(node));
@@ -2810,11 +2823,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const specifier = (node.arguments ?? [])[0];
     const spec = specifier ? jsStringOf(visit(specifier), inferExpressionType(specifier)) : '"undefined"';
     return `TnPromiseReject[interface{}](TnNodeError("Error", "ERR_UNSUPPORTED_DYNAMIC_IMPORT", "Cannot import " + ${spec} + ": import() of a module not known at compile time is not supported in native builds"))`;
-  } else if (isCallExpression(node) && !node.tnArrayReference && isIdentifier(node.expression) && returnsArrayReference(declaredFunctions.get(node.expression.text))) {
+  } else if (isCallExpression(node) && !node.tnArrayReference && returnsArrayReference(calledDeclaration(node))) {
     // a call of an array reference function: the array, where a value is read
     node.tnArrayReference = true;
     const code = visit(node);
     node.tnArrayReference = false;
+    // (a call as a statement: its result unused)
+    if (isExpressionStatement(node.parent) || discardedExpressions.has(node)) return code;
     return `(*${code})`;
   } else if (isCallExpression(node)) {
     // obj.fn!(…): the non-null assertion has no run-time effect
@@ -3553,7 +3568,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         useHelper('dynamic');
         return `TnSet(${visit(node.left.expression)}, ${toGoStringLiteral(node.left.name.text)}, ${visit(node.right)})`;
       }
-      const fieldType = inferExpressionType(node.left);
+      // (an array field takes a reference to the array: inferRawExpressionType)
+      const fieldType = inferRawExpressionType(node.left);
       if (fieldType && fieldType !== 'interface{}') return `${target} = ${toGoValueOfType(node.right, fieldType)}`;
     }
     // Assigning to a typed variable converts the value (boxes it into a
@@ -3878,7 +3894,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const resultType = goCallbackResult !== undefined
         ? goCallbackResult
         : isMethodDeclaration(enclosingFn) ? methodReturnGoType(enclosingFn) : returnGoType;
-      if (resultType) returned = `*new(${isMethodDeclaration(enclosingFn) || !returnsArrayReference(enclosingFn) ? '' : '*'}${resultType})`;
+      if (resultType) returned = `*new(${returnsArrayReference(enclosingFn) ? '*' : ''}${resultType})`;
     }
     if (tryReturn && enclosingFn === tryReturn.fn) return tryAwareReturn(returned) + terminator;
     return `return ${returned}` + terminator;
@@ -4025,7 +4041,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const properties = new Map<string, string>();
       for (const member of node.type.members ?? []) {
         if (isPropertySignature(member) && isIdentifier(member.name)) {
-          properties.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
+          properties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
         }
       }
       if (properties.size > 0) interfacePropertyTypes.set(visit(node.name), properties);
@@ -4034,13 +4050,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const localProperties = new Map<string, string>();
     for (const member of node.type.members ?? []) {
       if (isPropertySignature(member) && isIdentifier(member.name)) {
-        localProperties.set(member.name.text, getOptionalNodeType(member.type, !!member.questionToken));
+        localProperties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
       }
     }
     if (localProperties.size > 0) interfacePropertyTypes.set(visit(node.name), localProperties);
     const fields = (node.type.members ?? [])
       .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
-      .map((m) => `\t${goFieldName(m.name.text)} ${getOptionalNodeType(m.type, !!m.questionToken)}`);
+      .map((m) => `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}`);
     const terminator = options.isOutside ? '' : ';\n\t';
     return `type ${visit(node.name)} struct {\n${fields.join('\n')}\n}${terminator}`;
   } else if (isInterfaceDeclaration(node)) {
@@ -4082,7 +4098,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         methods.push(`\t${methodName}(${params})${returnType}`);
       } else if (isPropertySignature(member) && isIdentifier(member.name)) {
         properties.push(
-          `\t${goFieldName(member.name.text)} ${getOptionalNodeType(member.type, !!member.questionToken)}`
+          `\t${goFieldName(member.name.text)} ${getObjectFieldNodeType(member.type, !!member.questionToken)}`
         );
       }
     }
@@ -4374,7 +4390,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         let methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
         if (usesArgumentsObject(member)) methodParameterInfo = withArgumentsObject(member, methodParameterInfo, false);
         const ownReturnType = methodReturnGoType(member);
-        const returnType = ownReturnType ? ` ${ownReturnType}` : '';
+        // (a method returning one of its array arguments returns a reference)
+        const returnType = ownReturnType ? ` ${returnsArrayReference(member) ? '*' : ''}${ownReturnType}` : '';
         const isStatic = member.modifiers?.some((m) => m.kind === 'StaticKeyword');
         if (!member.body) continue; // abstract method — implemented by subclasses
         if (isAbstractClass && !isStatic) continue; // only reachable via subclasses
@@ -4727,6 +4744,8 @@ export type VisitNodeOptions = {
   skipNarrowing?: boolean;
   // the right operand of && / || / ?? without its coverage counter
   skipCoverage?: boolean;
+  // an object's array field as its *[]T reference (not the array it holds)
+  rawArrayField?: boolean;
 };
 
 // Renders composite literal entries; multi-line entries need trailing commas
@@ -4844,8 +4863,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     if (goType && goType.startsWith('*[]')) {
       // Go bridge element types are qualified (*[]io/fs.DirEntry)
       goType = goLocalType(goType);
-      if (isIdentifier(expr) && referenceArrays.has(expr.text)) {
+      if (isIdentifier(expr) && isReferenceArrayRead(expr)) {
         return getSafeName(expr.text);
+      }
+      // an object's array field: the reference it holds (shared, as in JS)
+      const field = unwrapParentheses(expr);
+      if (isReferenceFieldAccess(field) && !hasQuestionDot(field) && inferRawExpressionType(field) === goType) {
+        return visit(field, { rawArrayField: true });
       }
       // (null / undefined: the nil reference)
       if (isNilLiteral(unwrapParentheses(expr))) return `(${goType})(nil)`;
@@ -4868,7 +4892,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       }
       // a call of an array reference function: the reference itself
       const refCall = unwrapParentheses(expr);
-      if (isCallExpression(refCall) && isIdentifier(refCall.expression) && returnsArrayReference(declaredFunctions.get(refCall.expression.text))) {
+      if (isCallExpression(refCall) && returnsArrayReference(calledDeclaration(refCall))) {
         refCall.tnArrayReference = true;
         const code = visit(refCall);
         refCall.tnArrayReference = false;
@@ -6862,7 +6886,7 @@ function mergedObjectUnionType(types: AstNode[]): string | undefined {
       }
       presence.set(name, (presence.get(name) ?? 0) + 1);
       if (f.type?.kind === 'NeverKeyword') continue;
-      fieldTypes.get(name)!.add(getOptionalNodeType(f.type, !!f.questionToken));
+      fieldTypes.get(name)!.add(getObjectFieldNodeType(f.type, !!f.questionToken));
     }
   }
   const fields = order.map((name) => {
@@ -6953,7 +6977,7 @@ function getObjectLiteralGoType(node: AstNode): string {
     }
     if (!isPropertyAssignment(p) && !isShorthandPropertyAssignment(p)) continue;
     const value = isPropertyAssignment(p) ? p.initializer : p.name;
-    fields.set(goFieldName(p.name.text), toFieldGoType(inferExpressionType(value)));
+    fields.set(goFieldName(p.name.text), objectFieldGoType(toFieldGoType(inferExpressionType(value))));
   }
   const structType = `struct{ ${structFieldsBody(fields)} }`;
   registerStructAccessors(structType, node);
@@ -7216,13 +7240,13 @@ function visitAnonymousStructLiteral(node: AstNode): string {
     const field = goFieldName(p.name.text);
     const valueNode = isProp ? p.initializer : p.name;
     if (sawSpread) {
+      if (!fields.has(field)) fields.set(field, objectFieldGoType(toFieldGoType(inferExpressionType(valueNode))));
       steps.push(`__obj.${field} = ${toGoValueOfType(valueNode, fields.get(field))}`);
     } else {
-      fields.set(field, toFieldGoType(inferExpressionType(valueNode)));
-      values.push(`${field}: ${visit(valueNode)}`);
-    }
-    if (sawSpread && !fields.has(field)) {
-      fields.set(field, toFieldGoType(inferExpressionType(valueNode)));
+      const fieldType = objectFieldGoType(toFieldGoType(inferExpressionType(valueNode)));
+      fields.set(field, fieldType);
+      // (an array field holds a reference to the array)
+      values.push(`${field}: ${fieldType.startsWith('*[]') ? toGoValueOfType(valueNode, fieldType) : visit(valueNode)}`);
     }
   }
   const structType = `struct{ ${structFieldsBody(fields)} }`;
@@ -8275,7 +8299,43 @@ function inferMemoClear(): void {
   if (inferMemoDepth > 0) inferMemoLayers = inferMemoLayers.map(() => new Map<AstNode, string>());
 }
 
+// A property read of an object type's array field (a *[]T reference): the
+// array itself, []T — reads see the slice; inferRawExpressionType keeps the *
 function inferExpressionType(expr: AstNode): string | undefined {
+  const raw = inferRawExpressionType(expr);
+  return raw !== undefined && raw.startsWith('*[]') && isReferenceFieldAccess(expr) ? raw.slice(1) : raw;
+}
+
+// How an array field read is used: written as a whole or compared to null
+// ('reference'), changed in place — push, splice, length = n — ('mutated'),
+// else read ('read')
+function referenceFieldUse(node: AstNode): string {
+  let child = node;
+  let parent = node.parent;
+  while (parent && isParenthesizedExpression(parent)) {
+    child = parent;
+    parent = parent.parent;
+  }
+  if (!parent) return 'read';
+  if (isBinaryExpression(parent)) {
+    const op = parent.operatorToken.kind;
+    if (op === 'EqualsToken' && parent.left === child) return 'reference';
+    if (['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken', 'EqualsEqualsToken', 'ExclamationEqualsToken'].includes(op) &&
+      isNilLiteral(unwrapParentheses(parent.left === child ? parent.right : parent.left))) return 'reference';
+  }
+  if (isPropertyAccessExpression(parent) && parent.expression === child) {
+    const name = parent.name.text;
+    if (MUTATING_ARRAY_METHODS.has(name) && isCallExpression(parent.parent) && parent.parent.expression === parent) return 'mutated';
+    if (name === 'length' && isAssignmentTarget(parent)) return 'mutated';
+  }
+  return 'read';
+}
+
+function isReferenceFieldAccess(expr: AstNode): boolean {
+  return !!expr && (isPropertyAccessExpression(expr) || isElementAccessExpression(expr) && isStringLiteral(expr.argumentExpression));
+}
+
+function inferRawExpressionType(expr: AstNode): string | undefined {
   if (!expr) return inferExpressionTypeUncached(expr);
   if (inferMemoDepth === 0) inferMemoLayers = [new Map<AstNode, string>()];
   const layer = inferMemoLayers[inferMemoLayers.length - 1];
@@ -9752,7 +9812,7 @@ function getMappedTypeKeys(constraint: AstNode | undefined): string[] | undefine
 }
 
 function getMappedType(typeNode: AstNode): string {
-  const valueType = typeNode.type ? getOptionalNodeType(typeNode.type, !!typeNode.questionToken) : 'interface{}';
+  const valueType = typeNode.type ? getObjectFieldNodeType(typeNode.type, !!typeNode.questionToken) : 'interface{}';
   const keys = getMappedTypeKeys(typeNode.typeParameter?.constraint);
   if (keys) return `*struct{ ${keys.map((k) => `${k} ${valueType}`).join('; ')} }`;
   return 'interface{}';
@@ -9779,7 +9839,7 @@ function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
     else if (alias) return objectTypeFieldMap(alias);
   } else if (typeNode.kind === 'ParenthesizedType') return objectTypeFieldMap(typeNode.type);
   for (const m of members) {
-    if (isPropertySignature(m) && isIdentifier(m.name)) out.set(m.name.text, getOptionalNodeType(m.type, !!m.questionToken));
+    if (isPropertySignature(m) && isIdentifier(m.name)) out.set(m.name.text, getObjectFieldNodeType(m.type, !!m.questionToken));
     else if (isMethodSignature(m) && isIdentifier(m.name)) out.set(m.name.text, methodSignatureFieldType(m));
   }
   return out;
@@ -9796,7 +9856,7 @@ function getObjectTypeFields(typeNode: AstNode): string[] {
   }
   return members
     .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
-    .map((m) => `${goFieldName(m.name.text)} ${getOptionalNodeType(m.type, !!m.questionToken)}`);
+    .map((m) => `${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}`);
 }
 
 // Object.assign(target, …) result type, when it has one: a typed target's
@@ -10629,6 +10689,18 @@ function getAliasType(name: string, seen = new Set<string>()): AstNode | undefin
   return aliasType;
 }
 
+// An object type's field holding an array is a reference to it (*[]T), as
+// in JS where the object and every alias share one array: a token's tokens
+// filled in later through the queue entry that holds the same array
+function objectFieldGoType(goType: string): string {
+  return goType.startsWith('[]') && goType !== '[]byte' ? `*${goType}` : goType;
+}
+
+// A property's Go type in an object type (an interface, an object type literal)
+function getObjectFieldNodeType(typeNode: AstNode | undefined, isOptional: boolean): string {
+  return objectFieldGoType(getOptionalNodeType(typeNode, isOptional));
+}
+
 function getOptionalNodeType(typeNode: AstNode | undefined, isOptional: boolean): string {
   // a `never` (or void) field only ever holds undefined
   const baseType = (typeNode ? getType(typeNode) : 'interface{}') || 'interface{}';
@@ -11061,7 +11133,7 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     const fields = members
       .filter((m: AstNode) => isPropertySignature(m) || (hasProperties && isMethodSignature(m)))
       .map((m: AstNode) =>
-        `${goFieldName(m.name.text)} ${isMethodSignature(m) ? methodSignatureFieldType(m) : getOptionalNodeType(m.type, !!m.questionToken)}`
+        `${goFieldName(m.name.text)} ${isMethodSignature(m) ? methodSignatureFieldType(m) : getObjectFieldNodeType(m.type, !!m.questionToken)}`
       );
     return fields.length > 0 ? `*struct{ ${fields.join('; ')} }` : 'interface{}';
   }
@@ -13616,9 +13688,8 @@ function getParameterGoType(param: AstNode): string {
     let explicitType = getType(param.type);
     if (explicitType === ':') return 'interface{}';
     // Array parameters are references (mutations are visible to the caller) —
-    // except unbound type parameters (Go generics), template-tag arrays, and
-    // dynamic []interface{} (runtime helper arrays)
-    if (explicitType.startsWith('[]') && explicitType !== '[]interface{}' && explicitType !== '[]byte' && !param.dotDotDotToken) {
+    // except unbound type parameters (Go generics) and template-tag arrays
+    if (explicitType.startsWith('[]') && explicitType !== '[]byte' && !param.dotDotDotToken) {
       const isTaggedTemplateArray =
         isTypeReferenceNode(param.type) &&
         isIdentifier(param.type.typeName) &&
@@ -13875,15 +13946,26 @@ function comparedToNullish(name: string, declaration: AstNode): boolean {
 // through it). Only for functions never used as values.
 const arrayReferenceCache = new Map<AstNode, boolean>();
 function returnsArrayReference(fn: AstNode | undefined): boolean {
-  if (!fn || !isFunctionDeclaration(fn) || !fn.body || !isBlock(fn.body) || fn.asteriskToken || !fn.name) return false;
+  if (!fn || !fn.body || !isBlock(fn.body) || fn.asteriskToken || !fn.name) return false;
+  // (functions, and instance methods of a class without subclasses)
+  const isMethod = isMethodDeclaration(fn) && isIdentifier(fn.name) && isClassDeclaration(fn.parent) &&
+    !(fn.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword');
+  if (!isFunctionDeclaration(fn) && !isMethod) return false;
   if (arrayReferenceCache.has(fn)) return arrayReferenceCache.get(fn)!;
   arrayReferenceCache.set(fn, false);
   if ((fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return false;
+  if (isMethod) {
+    const owner = fn.parent.name && isIdentifier(fn.parent.name) ? fn.parent.name.text : '';
+    const parentClass = owner ? classParentNames.get(owner) : undefined;
+    if (!owner || isPolymorphicClass(owner) || (parentClass && findClassMethod(parentClass, fn.name.text))) return false;
+  }
   const returns = collectReturnStatements(fn.body).map((r: AstNode) => r.expression).filter((e: AstNode | undefined) => !!e) as AstNode[];
   const isField = (e: AstNode): boolean => {
     const u = unwrapParentheses(e);
     if (isPropertyAccessExpression(u)) return !hasQuestionDot(u);
     if (isBinaryExpression(u) && u.operatorToken.kind === 'QuestionQuestionToken') return isField(u.left) && isField(u.right);
+    // (an array parameter: the caller's array, as passed)
+    if (isIdentifier(u)) return (fn.parameters ?? []).some((p: AstNode) => isIdentifier(p.name) && p.name.text === u.text && !p.dotDotDotToken);
     return false;
   };
   if (!returns.some(isField)) return false;
@@ -13893,15 +13975,31 @@ function returnsArrayReference(fn: AstNode | undefined): boolean {
   };
   if (!returns.every(supported)) return false;
   const name = fn.name.text;
-  const usedAsValue = [...linkedModules.values()].some((m) => containsNode(m.ast, (n) =>
-    isIdentifier(n) && n.text === name && n !== fn.name && !(isCallExpression(n.parent) && n.parent.expression === n) && !isFieldNameIdentifier(n) &&
-    !['ImportSpecifier', 'ExportSpecifier'].includes(n.parent?.kind)
-  ));
+  const usedAsValue = isMethod
+    // (a method read as a value, obj.m without a call)
+    ? [...linkedModules.values()].some((m) => containsNode(m.ast, (n) =>
+      isPropertyAccessExpression(n) && n.name.text === name && !(isCallExpression(n.parent) && n.parent.expression === n)
+    ))
+    : [...linkedModules.values()].some((m) => containsNode(m.ast, (n) =>
+      isIdentifier(n) && n.text === name && n !== fn.name && !(isCallExpression(n.parent) && n.parent.expression === n) && !isFieldNameIdentifier(n) &&
+      !['ImportSpecifier', 'ExportSpecifier'].includes(n.parent?.kind)
+    ));
   if (usedAsValue) return false;
   const resultType = withFunctionScopeTypes(fn, () => inferFunctionBodyReturnType(fn) ?? '');
   const result = resultType.startsWith('[]') && resultType !== '[]byte';
   arrayReferenceCache.set(fn, result);
   return result;
+}
+
+// The function or class method a call runs (when known statically)
+function calledDeclaration(call: AstNode): AstNode | undefined {
+  const callee = call.expression;
+  if (isIdentifier(callee)) return variableGoTypes.has(callee.text) ? undefined : declaredFunctions.get(callee.text);
+  if (!isPropertyAccessExpression(callee) || hasQuestionDot(callee) || !isIdentifier(callee.name)) return undefined;
+  const receiverClass = callee.expression.kind === 'ThisKeyword'
+    ? getEnclosingClassName(callee) ?? ''
+    : classNameOfGoType(inferExpressionType(callee.expression) ?? '');
+  return receiverClass ? findClassMethod(receiverClass, callee.name.text) : undefined;
 }
 
 // A returned array as a reference: a field's address, a new array's
@@ -13910,6 +14008,8 @@ function arrayReferenceOf(expr: AstNode, sliceType: string): string {
   const goType = sliceType.replace(/^\*/, '');
   // (null / undefined: no array, the nil reference)
   if (isNilLiteral(u)) return `(*${goType})(nil)`;
+  // (an array reference variable: the reference itself)
+  if (isIdentifier(u) && isReferenceArrayRead(u)) return getSafeName(u.text);
   // (a field of a struct pointer is addressable, whatever the pointer's expression)
   if (isPropertyAccessExpression(u) && !hasQuestionDot(u) && inferExpressionType(u) === goType && (inferExpressionType(u.expression) ?? '').startsWith('*')) {
     const field = visit(u);
@@ -14009,6 +14109,18 @@ const voidCallCheck = new Set<AstNode>();
 // The declaration (or function type) of a called identifier: a declared
 // function, or a variable annotated with a function type
 function getCalleeSignature(call: AstNode): AstNode | undefined {
+  // Class.m(…): the static method's declaration
+  if (isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.name) && isIdentifier(call.expression.expression) &&
+    classNames.has(call.expression.expression.text) && !variableGoTypes.has(call.expression.expression.text)) {
+    const staticMethod = staticMethodDeclaration(call.expression.expression.text, call.expression.name.text);
+    if (staticMethod?.body) return staticMethod;
+  }
+  // this.#m(…): a private method's declaration
+  if (isPropertyAccessExpression(call.expression) && call.expression.name?.kind === 'PrivateIdentifier' && call.expression.expression.kind === 'ThisKeyword') {
+    const owner = getEnclosingClassName(call);
+    const method = owner ? findClassMethod(owner, call.expression.name.text) : undefined;
+    if (method?.body) return method;
+  }
   // obj.m(…) on a class instance: the method's declaration
   if (isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.name)) {
     // (super.m(…): the parent class's method)
