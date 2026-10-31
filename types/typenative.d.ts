@@ -15,7 +15,13 @@ interface Function {
   bind(thisArg: any, ...argArray: any[]): any;
 }
 
-interface CallableFunction extends Function {}
+// With strict, f.call / f.apply / f.bind are checked against f's signature
+// (strictBindCallApply), as in TypeScript's own lib
+interface CallableFunction extends Function {
+  apply<T, R>(this: (this: T) => R, thisArg: T): R;
+  apply<T, A extends any[], R>(this: (this: T, ...args: A) => R, thisArg: T, args: A): R;
+  call<T, A extends any[], R>(this: (this: T, ...args: A) => R, thisArg: T, ...args: A): R;
+}
 interface NewableFunction extends Function {}
 
 /** The global `Function` as a value: an opaque constructor (`x instanceof Function` checks for a function); calling it compiles code, which a native binary cannot */
@@ -115,11 +121,14 @@ interface Disposable {
   [Symbol.dispose](): void;
 }
 
-// await unwraps one thenable layer at a time
+// await unwraps one thenable layer at a time (TypeScript's own definition,
+// which the checker relates to T for generic T)
 type Awaited<T> = T extends null | undefined
   ? T
-  : T extends { then(onfulfilled: (value: infer U) => any): any }
-    ? Awaited<U>
+  : T extends object & { then(onfulfilled: infer F, ...args: infer _): any }
+    ? F extends (value: infer V, ...args: infer _) => any
+      ? Awaited<V>
+      : never
     : T;
 
 // Tagged template functions: tag`a${x}b`
@@ -214,7 +223,7 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Calls a defined callback function on each element of an array, and returns an array that contains the results.
    */
-  map<U>(callback: (value: T, index?: number, array?: T[]) => U): U[];
+  map<U>(callback: (value: T, index: number, array: T[]) => U): U[];
   /**
    * Returns the elements of an array that meet the condition specified in a callback function.
    */
@@ -546,6 +555,8 @@ declare function isNaN(number: number): boolean;
 declare function isFinite(number: number): boolean;
 declare function encodeURIComponent(uriComponent: string): string;
 declare function decodeURIComponent(uriComponent: string): string;
+declare function encodeURI(uri: string): string;
+declare function decodeURI(encodedURI: string): string;
 declare function structuredClone<T>(value: T): T;
 
 // The running program (a native binary has no separate script file)
@@ -861,12 +872,12 @@ interface PromiseLike<T> {
 
 interface PromiseConstructor {
   new <T>(
-    executor: (resolve: (value: T) => void, reject?: (reason?: any) => void) => void
+    executor: (resolve: (value: T) => void, reject: (reason?: any) => void) => void
   ): Promise<T>;
   resolve(): Promise<void>;
   resolve<T>(value: T): Promise<T>;
   reject(reason?: any): Promise<never>;
-  all<T>(values: Promise<T>[]): Promise<T[]>;
+  all<T>(values: (T | PromiseLike<T>)[]): Promise<Awaited<T>[]>;
   race<T>(values: Promise<T>[]): Promise<T>;
   any<T>(values: Promise<T>[]): Promise<T>;
   allSettled<T>(values: Promise<T>[]): Promise<{ status: string; value?: T; reason?: any }[]>;
