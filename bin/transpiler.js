@@ -383,6 +383,11 @@ function storesJsNull(expr) {
         return true;
     if (isBinaryExpression(parent) && parent.right === node && parent.operatorToken.kind === 'EqualsToken')
         return true;
+    // (an operand of a value || / ?? / ?: : where the whole is stored)
+    if (isBinaryExpression(parent) && parent.right === node && ['BarBarToken', 'QuestionQuestionToken'].includes(parent.operatorToken.kind))
+        return storesJsNull(parent);
+    if (isConditionalExpression(parent) && parent.condition !== node)
+        return storesJsNull(parent);
     if (isNewExpression(parent) && isIdentifier(parent.expression))
         return classNames.has(parent.expression.text);
     if (isCallExpression(parent) && (parent.arguments ?? []).includes(node)) {
@@ -9066,6 +9071,9 @@ function inferExpressionTypeOf(expr) {
             return 'float64';
         if (objectType?.startsWith('*TnMap['))
             return extractMapValueType(objectType);
+        // (an any object's element is read as any: TnIndex)
+        if (objectType === 'interface{}' && !isStringLiteral(expr.argumentExpression))
+            return 'interface{}';
         const declared = getExpressionTypeNode(expr);
         if (declared)
             return getType(declared);
@@ -11182,7 +11190,26 @@ function objectFieldGoType(goType) {
 }
 // A property's Go type in an object type (an interface, an object type literal)
 function getObjectFieldNodeType(typeNode, isOptional) {
+    // (T | null: an any field, as it holds a T, null — TnNull — or undefined,
+    // which JSON.stringify writes as null and leaves out)
+    // (a primitive's: an object or array field's nil stands for both)
+    if (typeIncludesNull(typeNode) && ['*string', '*float64', '*bool', 'string', 'float64', 'bool'].includes(getOptionalNodeType(typeNode, isOptional)))
+        return 'interface{}';
     return objectFieldGoType(getOptionalNodeType(typeNode, isOptional));
+}
+function typeIncludesNull(typeNode, depth = 0) {
+    if (!typeNode || depth > 5)
+        return false;
+    if (typeNode.kind === 'NullKeyword' || isLiteralTypeNode(typeNode) && typeNode.literal?.kind === 'NullKeyword')
+        return true;
+    if (typeNode.kind === 'ParenthesizedType')
+        return typeIncludesNull(typeNode.type, depth + 1);
+    if (isUnionTypeNode(typeNode))
+        return (typeNode.types ?? []).some((t) => typeIncludesNull(t, depth + 1));
+    if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName) && declaredTypeAliases.has(typeNode.typeName.text)) {
+        return typeIncludesNull(declaredTypeAliases.get(typeNode.typeName.text), depth + 1);
+    }
+    return false;
 }
 function getOptionalNodeType(typeNode, isOptional) {
     // a `never` (or void) field only ever holds undefined
@@ -12360,13 +12387,14 @@ const stringMethodHandlers = {
         useHelper('jsSpace');
         return `strings.TrimRightFunc(${obj}, TnIsJSSpace)`;
     },
+    // (JS's full case mapping: ß → SS, ﬁ → FI, final σ → ς)
     toUpperCase: (obj) => {
-        importedPackages.add('strings');
-        return `strings.ToUpper(${obj})`;
+        useHelper('jsCase');
+        return `TnToUpperJS(${obj})`;
     },
     toLowerCase: (obj) => {
-        importedPackages.add('strings');
-        return `strings.ToLower(${obj})`;
+        useHelper('jsCase');
+        return `TnToLowerJS(${obj})`;
     },
     // (string positions are code points: see the strIndex helpers)
     indexOf: (obj, args) => {
@@ -13158,7 +13186,7 @@ function visitDynamicMethodCall(node) {
         local.parent = call.expression;
         const resultType = inferExpressionType(call) ?? '';
         const writeBack = isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression)
-            ? `TnSet(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${elements})`
+            ? `TnSetArrayInPlace(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${elements})`
             : `${visit(receiver)} = ${elements}`;
         const op = visit(call);
         const read = `${elements} := TnAs[[]interface{}](${visit(receiver)})`;
@@ -13403,7 +13431,8 @@ function visitRegexReplace(node) {
         isGlobal = 'true';
     else if (isRegularExpressionLiteral(pattern))
         isGlobal = pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g') ? 'true' : 'false';
-    else if (reIsWrapper && /^[\w.]+$/.test(re))
+    // (an expression read twice must be pure: a name, fields, a Record lookup)
+    else if (reIsWrapper && /^[\w.]+(\.Get\("[^"\\]*"\))?[\w.]*$/.test(re))
         isGlobal = `${re}.global`;
     importedPackages.add('regexp');
     if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {
@@ -13761,6 +13790,17 @@ function visitFunctionCallApply(node) {
     if (method !== 'call' && method !== 'apply' && method !== 'bind')
         return undefined;
     const fnType = functionValueGoType(node.expression.expression);
+    // (a function held as any: called reflectively, thisArg dropped)
+    if (!fnType && method !== 'bind' && isDynamicValue(node.expression.expression) && !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
+        useHelper('dynamic');
+        useHelper('error');
+        const fnValue = visit(node.expression.expression);
+        const rest = (node.arguments ?? []).slice(1);
+        if (method === 'apply') {
+            return rest[0] ? `TnCallValue(${fnValue}, TnAs[[]interface{}](interface{}(${visit(rest[0])}))...)` : `TnCallValue(${fnValue})`;
+        }
+        return `TnCallValue(${[fnValue, ...rest.map((a) => visit(a))].join(', ')})`;
+    }
     if (!fnType)
         return undefined;
     const fn = visit(node.expression.expression);
@@ -16903,6 +16943,7 @@ const helperPackages = {
     regexReplaceFunc: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
     replaceAny: ['regexp'],
     jsSpace: [],
+    jsCase: ['strings', 'unicode'],
     regexObject: ['regexp', 'reflect'],
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
@@ -17500,6 +17541,10 @@ func TnIsArray(v interface{}) bool {
 // arrays []interface{}, numbers float64
 // A nullable primitive (*T) as the JS value it holds: its T, or undefined
 func tnPlainValue(v interface{}) interface{} {
+	// (an array field's reference, *[]T: nil is undefined)
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() && rv.Type().Elem().Kind() == reflect.Slice {
+		return nil
+	}
 	switch p := v.(type) {
 	case *string:
 		if p == nil {
@@ -17814,6 +17859,21 @@ func TnErrorWithOptions(e *TnError, options interface{}) *TnError {
 		e.props["cause"] = TnGet(options, "cause")
 	}
 	return e
+}
+
+// A mutating array method's elements written back to obj[key]: into the
+// array the field references (*[]T) when it holds one, so the array's other
+// holders see the change, as they share it in JS
+func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
+	rv := reflect.ValueOf(obj)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+		if f := tnFieldOf(rv.Elem(), key); f.IsValid() && f.Kind() == reflect.Pointer && !f.IsNil() && f.Type().Elem().Kind() == reflect.Slice {
+			f = reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+			f.Elem().Set(tnConvertTo(value, f.Type().Elem()))
+			return
+		}
+	}
+	TnSet(obj, key, value)
 }
 
 func TnSet(obj interface{}, key string, value interface{}) {
@@ -22653,6 +22713,82 @@ func init() {
 			return nil
 		}}, true
 	}
+}`,
+    jsCase: `// toUpperCase / toLowerCase as JS maps case: Unicode's full mappings
+// (SpecialCasing: ß → SS, ﬁ → FI, İ → i̇) and the final sigma (Σ → ς at a
+// word's end); Go's ToUpper / ToLower map one rune to one rune
+var tnUpperSpecial = map[rune]string{0xDF: "\\u0053\\u0053", 0x149: "\\u02BC\\u004E", 0x1F0: "\\u004A\\u030C", 0x390: "\\u0399\\u0308\\u0301", 0x3B0: "\\u03A5\\u0308\\u0301", 0x587: "\\u0535\\u0552", 0x1E96: "\\u0048\\u0331", 0x1E97: "\\u0054\\u0308", 0x1E98: "\\u0057\\u030A", 0x1E99: "\\u0059\\u030A", 0x1E9A: "\\u0041\\u02BE", 0x1F50: "\\u03A5\\u0313", 0x1F52: "\\u03A5\\u0313\\u0300", 0x1F54: "\\u03A5\\u0313\\u0301", 0x1F56: "\\u03A5\\u0313\\u0342", 0x1F80: "\\u1F08\\u0399", 0x1F81: "\\u1F09\\u0399", 0x1F82: "\\u1F0A\\u0399", 0x1F83: "\\u1F0B\\u0399", 0x1F84: "\\u1F0C\\u0399", 0x1F85: "\\u1F0D\\u0399", 0x1F86: "\\u1F0E\\u0399", 0x1F87: "\\u1F0F\\u0399", 0x1F88: "\\u1F08\\u0399", 0x1F89: "\\u1F09\\u0399", 0x1F8A: "\\u1F0A\\u0399", 0x1F8B: "\\u1F0B\\u0399", 0x1F8C: "\\u1F0C\\u0399", 0x1F8D: "\\u1F0D\\u0399", 0x1F8E: "\\u1F0E\\u0399", 0x1F8F: "\\u1F0F\\u0399", 0x1F90: "\\u1F28\\u0399", 0x1F91: "\\u1F29\\u0399", 0x1F92: "\\u1F2A\\u0399", 0x1F93: "\\u1F2B\\u0399", 0x1F94: "\\u1F2C\\u0399", 0x1F95: "\\u1F2D\\u0399", 0x1F96: "\\u1F2E\\u0399", 0x1F97: "\\u1F2F\\u0399", 0x1F98: "\\u1F28\\u0399", 0x1F99: "\\u1F29\\u0399", 0x1F9A: "\\u1F2A\\u0399", 0x1F9B: "\\u1F2B\\u0399", 0x1F9C: "\\u1F2C\\u0399", 0x1F9D: "\\u1F2D\\u0399", 0x1F9E: "\\u1F2E\\u0399", 0x1F9F: "\\u1F2F\\u0399", 0x1FA0: "\\u1F68\\u0399", 0x1FA1: "\\u1F69\\u0399", 0x1FA2: "\\u1F6A\\u0399", 0x1FA3: "\\u1F6B\\u0399", 0x1FA4: "\\u1F6C\\u0399", 0x1FA5: "\\u1F6D\\u0399", 0x1FA6: "\\u1F6E\\u0399", 0x1FA7: "\\u1F6F\\u0399", 0x1FA8: "\\u1F68\\u0399", 0x1FA9: "\\u1F69\\u0399", 0x1FAA: "\\u1F6A\\u0399", 0x1FAB: "\\u1F6B\\u0399", 0x1FAC: "\\u1F6C\\u0399", 0x1FAD: "\\u1F6D\\u0399", 0x1FAE: "\\u1F6E\\u0399", 0x1FAF: "\\u1F6F\\u0399", 0x1FB2: "\\u1FBA\\u0399", 0x1FB3: "\\u0391\\u0399", 0x1FB4: "\\u0386\\u0399", 0x1FB6: "\\u0391\\u0342", 0x1FB7: "\\u0391\\u0342\\u0399", 0x1FBC: "\\u0391\\u0399", 0x1FC2: "\\u1FCA\\u0399", 0x1FC3: "\\u0397\\u0399", 0x1FC4: "\\u0389\\u0399", 0x1FC6: "\\u0397\\u0342", 0x1FC7: "\\u0397\\u0342\\u0399", 0x1FCC: "\\u0397\\u0399", 0x1FD2: "\\u0399\\u0308\\u0300", 0x1FD3: "\\u0399\\u0308\\u0301", 0x1FD6: "\\u0399\\u0342", 0x1FD7: "\\u0399\\u0308\\u0342", 0x1FE2: "\\u03A5\\u0308\\u0300", 0x1FE3: "\\u03A5\\u0308\\u0301", 0x1FE4: "\\u03A1\\u0313", 0x1FE6: "\\u03A5\\u0342", 0x1FE7: "\\u03A5\\u0308\\u0342", 0x1FF2: "\\u1FFA\\u0399", 0x1FF3: "\\u03A9\\u0399", 0x1FF4: "\\u038F\\u0399", 0x1FF6: "\\u03A9\\u0342", 0x1FF7: "\\u03A9\\u0342\\u0399", 0x1FFC: "\\u03A9\\u0399", 0xFB00: "\\u0046\\u0046", 0xFB01: "\\u0046\\u0049", 0xFB02: "\\u0046\\u004C", 0xFB03: "\\u0046\\u0046\\u0049", 0xFB04: "\\u0046\\u0046\\u004C", 0xFB05: "\\u0053\\u0054", 0xFB06: "\\u0053\\u0054", 0xFB13: "\\u0544\\u0546", 0xFB14: "\\u0544\\u0535", 0xFB15: "\\u0544\\u053B", 0xFB16: "\\u054E\\u0546", 0xFB17: "\\u0544\\u053D"}
+
+func tnIsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func TnToUpperJS(s string) string {
+	if tnIsASCII(s) {
+		return strings.ToUpper(s)
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if special, ok := tnUpperSpecial[r]; ok {
+			b.WriteString(special)
+		} else {
+			b.WriteRune(unicode.ToUpper(r))
+		}
+	}
+	return b.String()
+}
+
+func tnCased(r rune) bool {
+	return unicode.IsUpper(r) || unicode.IsLower(r) || unicode.IsTitle(r)
+}
+
+func TnToLowerJS(s string) string {
+	if tnIsASCII(s) {
+		return strings.ToLower(s)
+	}
+	runes := []rune(s)
+	var b strings.Builder
+	for i, r := range runes {
+		switch r {
+		case 0x130:
+			b.WriteString("i\\u0307")
+		case 0x3A3:
+			// (final: after a cased letter, and no cased letter follows)
+			before := false
+			for j := i - 1; j >= 0; j-- {
+				if tnCased(runes[j]) {
+					before = true
+					break
+				}
+				if !unicode.Is(unicode.Mn, runes[j]) && runes[j] != '\\'' && runes[j] != 0x2019 {
+					break
+				}
+			}
+			after := false
+			for j := i + 1; j < len(runes); j++ {
+				if tnCased(runes[j]) {
+					after = true
+					break
+				}
+				if !unicode.Is(unicode.Mn, runes[j]) && runes[j] != '\\'' && runes[j] != 0x2019 {
+					break
+				}
+			}
+			if before && !after {
+				b.WriteRune(0x3C2)
+			} else {
+				b.WriteRune(0x3C3)
+			}
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
 }`,
     jsSpace: `// JS's whitespace (String.prototype.trim, \\s): ASCII whitespace, Unicode
 // space separators, line terminators and the BOM
