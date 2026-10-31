@@ -49,3 +49,11 @@ function exitCode(): number | undefined {
   return;
 }
 assert(exitCode() === undefined || exitCode() === 0, 'a bare return');
+
+// A string method's name that an object literal's function also has: called
+// on an any value holding a string, it's the string method
+const prefixes = { startsWith: (s: string) => s === 'p', trim: () => 'object' };
+const spec: any = './mod.ts';
+const padded: any = '  x  ';
+assert(spec.startsWith('.') && !spec.startsWith('/') && padded.trim() === 'x', 'string methods on any strings');
+assert(prefixes.startsWith('p') && prefixes.trim() === 'object', "the object's own functions");

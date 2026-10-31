@@ -20,3 +20,12 @@ function render(items: string[]): string {
   return html + '</ul>';
 }
 assert(render(['a', 'b']) === '<ul><li>a</li><li>b</li></ul>', 'accumulator returned');
+function joinAll(parts: string[][]): string {
+  let code = '';
+  for (const group of parts) code += '[';
+  parts.forEach((group) => {
+    code += group.join('+');
+  });
+  return code;
+}
+assert(joinAll([['a', 'b'], ['c']]) === '[[a+bc', 'appended to in a loop and in a closure');

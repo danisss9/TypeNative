@@ -1796,7 +1796,10 @@ function linkParents(node: AstNode, parent: AstNode | undefined): void {
   if (node.kind === 'TypeAliasDeclaration' && parent && parent.kind !== 'SourceFile' && parent.kind !== 'ModuleBlock' && node.name && !declaredTypeAliases.has(node.name.text)) {
     declaredTypeAliases.set(node.name.text, node.type);
   }
-  if (parent?.kind === 'ObjectLiteralExpression' && node.name && isIdentifier(node.name) &&
+  // (not a Record<K, F>'s: a dictionary of functions is looked up by key)
+  const declaredAs = parent?.parent?.kind === 'VariableDeclaration' ? parent.parent.type : undefined;
+  const dictionary = !!declaredAs && declaredAs.kind === 'TypeReference' && isIdentifier(declaredAs.typeName) && declaredAs.typeName.text === 'Record';
+  if (parent?.kind === 'ObjectLiteralExpression' && !dictionary && node.name && isIdentifier(node.name) &&
     (node.kind === 'MethodDeclaration' || node.kind === 'PropertyAssignment' && (node.initializer?.kind === 'ArrowFunction' || node.initializer?.kind === 'FunctionExpression'))) {
     objectLiteralMethodNames.add(node.name.text);
   }
@@ -4308,7 +4311,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (localProperties.size > 0) interfacePropertyTypes.set(visit(node.name), localProperties);
     const fields = (node.type.members ?? [])
       .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
-      .map((m) => `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}`);
+      .map((m) => `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}${nullFieldTag(m)}`);
     const terminator = options.isOutside ? '' : ';\n\t';
     return `type ${visit(node.name)} struct {\n${fields.join('\n')}\n\t__keys *[]string\n}${terminator}`;
   } else if (isInterfaceDeclaration(node)) {
@@ -4350,7 +4353,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         methods.push(`\t${methodName}(${params})${returnType}`);
       } else if (isPropertySignature(member) && isIdentifier(member.name)) {
         properties.push(
-          `\t${goFieldName(member.name.text)} ${getObjectFieldNodeType(member.type, !!member.questionToken)}`
+          `\t${goFieldName(member.name.text)} ${getObjectFieldNodeType(member.type, !!member.questionToken)}${nullFieldTag(member)}`
         );
       }
     }
@@ -5060,6 +5063,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       const body = !result ? created : result === 'interface{}' ? `return ${created}` : `return TnAs[${result}](${created})`;
       return `TnCtorOf(${classValue(classRef.text)}, func(${params.map((t: string, i: number) => `${names[i]} ${t}`).join(', ')})${result ? ` ${result}` : ''} { ${body} })`;
     }
+  }
+  // a function whose array parameters are references (func(*[]T)) where a
+  // function type's plain slices are expected (func([]T)): an adapter passing
+  // each array's address
+  if (goType?.startsWith('func(')) {
+    const adapted = adaptReferenceParams(expr, goType);
+    if (adapted) return adapted;
   }
   // null into an any slot: JS null (distinct from undefined there)
   if (goType === 'interface{}' && unwrapParentheses(expr).kind === 'NullKeyword' && storesJsNull(expr)) {
@@ -6164,7 +6174,23 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   const argList = hasSpread
     ? `${visit(receiver)}, append([]interface{}{${args.filter((a: string) => !a.endsWith('...')).join(', ')}}, TnAs[[]interface{}](${args.find((a: string) => a.endsWith('...'))!.slice(0, -3)})...)...`
     : [visit(receiver), ...args].join(', ');
-  const call = `TnCall_${dispatcherSuffix(method)}(${argList})`;
+  let call = `TnCall_${dispatcherSuffix(method)}(${argList})`;
+  // (a string method's name that some object literal's function has too: a
+  // string receiver runs the string method)
+  if (STRING_ONLY_METHODS.has(method) && objectLiteralMethodNames.has(method) && !hasSpread) {
+    const recvVar = getTempName('recv');
+    const strName = getTempName('str');
+    const ident: AstNode = { kind: 'Identifier', text: strName, line: node.line, column: node.column };
+    const access: AstNode = { kind: 'PropertyAccessExpression', expression: ident, name: node.expression.name, line: node.line, column: node.column };
+    const stringCall: AstNode = { kind: 'CallExpression', expression: access, arguments: node.arguments, parent: node.parent, line: node.line, column: node.column };
+    ident.parent = access;
+    access.parent = stringCall;
+    variableGoTypes.set(strName, 'string');
+    const stringCode = toGoValueOfType(stringCall, 'interface{}');
+    variableGoTypes.delete(strName);
+    const dynamicArgs = [recvVar, ...args].join(', ');
+    call = `func() interface{} { ${recvVar} := interface{}(${visit(receiver)}); if ${strName}, __isStr := ${recvVar}.(string); __isStr { return ${stringCode} }; return TnCall_${dispatcherSuffix(method)}(${dynamicArgs}) }()`;
+  }
   // a result type known statically (the receiver's declared class) is asserted
   const resultType = method === 'toString' ? 'string' : inferExpressionType(node);
   if (!resultType || resultType === 'interface{}' || resultType === 'any' || resultType === 'nil') return call;
@@ -8764,14 +8790,16 @@ function isStringAccumulator(decl: AstNode): boolean {
     if (other) return;
     if (isIdentifier(n) && n.text === name && n !== decl.name && !isFieldNameIdentifier(n)) {
       const parent = n.parent;
-      if (isBinaryExpression(parent) && parent.left === n && isAssignmentOperatorKind(parent.operatorToken.kind)) {
+      // (used in a closure — read or appended to there —: not an accumulator)
+      if (getEnclosingFunction(n) !== fn) other = true;
+      else if (isBinaryExpression(parent) && parent.left === n && isAssignmentOperatorKind(parent.operatorToken.kind)) {
         // (only `name += s;` as a statement)
         if (parent.operatorToken.kind !== 'PlusEqualsToken' || !isExpressionStatement(parent.parent)) other = true;
         else {
           for (let a = parent.parent; a && a !== fn; a = a.parent) if (loopKinds.has(a.kind)) appendsInLoop = true;
         }
-      } else if (isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent) || FUNCTION_LIKE_KINDS.has(getEnclosingFunction(n)?.kind ?? '') && getEnclosingFunction(n) !== fn) {
-        // (a closure reading it, or ++: not an accumulator)
+      } else if (isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent)) {
+        // (++: not an accumulator)
         other = true;
       } else if (parent?.kind === 'VariableDeclaration' && parent.name === n || parent?.kind === 'Parameter') {
         other = true;
@@ -11121,10 +11149,19 @@ function getObjectFieldNodeType(typeNode: AstNode | undefined, isOptional: boole
   // (T | null: an any field, as it holds a T, null — TnNull — or undefined,
   // which JSON.stringify writes as null and leaves out)
   // (a primitive's: an object or array field's nil stands for both)
-  if (typeIncludesNull(typeNode) && ['*string', '*float64', '*bool', 'string', 'float64', 'bool'].includes(getOptionalNodeType(typeNode, isOptional))) return 'interface{}';
+  // (only an optional one has three states: a value, null, absent; a
+  // required one is *T, nil for null: see nullFieldTag)
+  if (isOptional && typeIncludesNull(typeNode) && ['*string', '*float64', '*bool', 'string', 'float64', 'bool'].includes(getOptionalNodeType(typeNode, isOptional))) return 'interface{}';
   // (and one holding a regex match's group, which may be undefined)
   if (typeNode?.parent && undefinedPrimitiveFields.has(typeNode.parent)) return 'interface{}';
   return objectFieldGoType(getOptionalNodeType(typeNode, isOptional));
+}
+
+// A required T | null field of a primitive (a *T, nil for null): a struct tag
+// telling JSON.stringify to write its nil as null rather than leave it out
+function nullFieldTag(member: AstNode): string {
+  if (member.questionToken || !typeIncludesNull(member.type)) return '';
+  return NULLABLE_PRIMITIVE_TYPES.includes(getObjectFieldNodeType(member.type, false)) ? ' `tn:"null"`' : '';
 }
 
 function typeIncludesNull(typeNode: AstNode | undefined, depth = 0): boolean {
@@ -13336,7 +13373,8 @@ function visitRegexReplace(node: AstNode): string | undefined {
     // (match, ...groups, offset, string): a literal's group count places the
     // offset; otherwise a number parameter takes it
     const patternLiteral = resolveRegexLiteral(pattern);
-    const groups = patternLiteral ? regexCaptureGroupCount(patternLiteral.text.slice(1, patternLiteral.text.lastIndexOf('/'))) : undefined;
+    const patternText: string = patternLiteral ? patternLiteral.text : '';
+    const groups = patternLiteral ? regexCaptureGroupCount(patternText.slice(1, patternText.lastIndexOf('/'))) : undefined;
     const params = replacement.parameters ?? [];
     const groupArgs = params
       .map((p: AstNode, index: number) => {
@@ -14187,7 +14225,10 @@ function getParameterGoType(param: AstNode): string {
         isTypeReferenceNode(param.type) &&
         isIdentifier(param.type.typeName) &&
         param.type.typeName.text === 'TemplateStringsArray';
-      if (!isUnboundGoType(explicitType.slice(2)) && !isTaggedTemplateArray) {
+      // (a function literal stored where a function type is expected takes
+      // that type's parameter: a function type's arrays are plain slices)
+      const slotType = isArrowFunction(param.parent) || isFunctionExpression(param.parent) ? functionSlotParamType(param) : undefined;
+      if (!isUnboundGoType(explicitType.slice(2)) && !isTaggedTemplateArray && slotType !== explicitType) {
         explicitType = `*${explicitType}`;
       }
     }
@@ -14206,7 +14247,8 @@ function getParameterGoType(param: AstNode): string {
   if (param.parent && isRegexReplacerCallback(param.parent)) {
     const pattern = param.parent.parent.arguments[0];
     const literal = resolveRegexLiteral(pattern);
-    const groups = literal ? regexCaptureGroupCount(literal.text.slice(1, literal.text.lastIndexOf('/'))) : undefined;
+    const literalText: string = literal ? literal.text : '';
+    const groups = literal ? regexCaptureGroupCount(literalText.slice(1, literalText.lastIndexOf('/'))) : undefined;
     return groups !== undefined && param.parent.parameters.indexOf(param) === groups + 1 ? 'float64' : 'string';
   }
   const sortElementType = param.parent ? getSortComparatorElementType(param.parent) : undefined;
@@ -14243,6 +14285,42 @@ function getParameterGoType(param: AstNode): string {
   }
 
   return 'interface{}';
+}
+
+function adaptReferenceParams(expr: AstNode, goType: string): string | undefined {
+  const own = functionValueGoType(unwrapParentheses(expr));
+  if (!own?.startsWith('func(') || own === goType) return undefined;
+  const ownParams = goFuncParamTypes(own);
+  const slotParams = goFuncParamTypes(goType);
+  const result = goFuncReturnType(goType) ?? '';
+  if (ownParams.length !== slotParams.length || (goFuncReturnType(own) ?? '') !== result) return undefined;
+  let differs = false;
+  for (let i = 0; i < ownParams.length; i++) {
+    if (ownParams[i] === slotParams[i]) continue;
+    if (ownParams[i] !== `*${slotParams[i]}` || !slotParams[i].startsWith('[]')) return undefined;
+    differs = true;
+  }
+  if (!differs) return undefined;
+  const decl = slotParams.map((t, i) => `__p${i} ${t}`).join(', ');
+  const args = ownParams.map((t, i) => (t === slotParams[i] ? `__p${i}` : `&__p${i}`)).join(', ');
+  return `func() ${goType} { __f := ${visit(expr)}; return func(${decl})${result ? ` ${result}` : ''} { ${result ? 'return ' : ''}__f(${args}) } }()`;
+}
+
+// The Go type of a function literal's parameter in the function type its slot
+// expects: a contextual function type, or the type of what it's assigned to
+// (f = (x) => …, table[k] = (x) => …)
+function functionSlotParamType(param: AstNode): string | undefined {
+  const fn = param.parent;
+  const index = (fn?.parameters ?? []).indexOf(param);
+  const contextualFn = getContextualFunctionType(fn);
+  const contextualParam = contextualFn?.parameters?.[index];
+  if (contextualParam?.type) return getType(contextualParam.type);
+  const slot = fn?.parent && isBinaryExpression(fn.parent) && fn.parent.operatorToken.kind === 'EqualsToken' && fn.parent.right === fn
+    ? inferExpressionType(fn.parent.left)
+    : undefined;
+  if (!slot?.startsWith('func(')) return undefined;
+  const slotParam = goFuncParamTypes(slot)[index];
+  return slotParam && !slotParam.startsWith('...') ? slotParam : undefined;
 }
 
 // Parameters are variables of the function body: record their types (replacing
@@ -19930,8 +20008,12 @@ func (w *tnJSONWriter) structFieldsInOrder(rv reflect.Value, emit func(string, i
 		if value.Kind() == reflect.Func || strings.HasPrefix(f.Name, "__") {
 			continue
 		}
-		// (an unset field — a nil pointer or any — is undefined: no key, as in JS)
+		// (an unset field — a nil pointer or any — is undefined: no key, as in JS;
+		// a T | null field's is null)
 		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
+			if f.Tag.Get("tn") == "null" {
+				emit(tnJSONFieldName(f.Name), TnNull)
+			}
 			continue
 		}
 		emit(tnJSONFieldName(f.Name), value.Interface())
@@ -19996,6 +20078,7 @@ type tnJSONField struct {
 	name   string
 	key    string
 	kind   uint8
+	null   bool // (T | null: nil is null, not undefined)
 }
 
 var tnJSONPlans sync.Map
@@ -20032,7 +20115,7 @@ func tnJSONPlan(t reflect.Type) []tnJSONField {
 			case reflect.TypeOf(false):
 				kind = 3
 			}
-			fields = append(fields, tnJSONField{offset: base + f.Offset, typ: f.Type, name: name, key: key.String(), kind: kind})
+			fields = append(fields, tnJSONField{offset: base + f.Offset, typ: f.Type, name: name, key: key.String(), kind: kind, null: f.Tag.Get("tn") == "null"})
 		}
 	}
 	walk(t, 0)
@@ -20080,6 +20163,11 @@ func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
 			// (an unset field — a nil pointer or any — is undefined: no key, as in JS)
 			fv := reflect.NewAt(f.typ, p).Elem()
 			if (fv.Kind() == reflect.Pointer || fv.Kind() == reflect.Interface) && fv.IsNil() {
+				if f.null {
+					w.buf.WriteString("null")
+					wrote = true
+					continue
+				}
 				w.buf.Truncate(mark)
 				continue
 			}

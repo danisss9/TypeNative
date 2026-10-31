@@ -23,3 +23,17 @@ function sum(this: unknown, ...xs: number[]): number {
 }
 const f: any = sum;
 assert(f.apply(null, [1, 2, 3]) === 6, 'apply on a function value');
+
+// A required string | null field: null is written as null, a string as is,
+// and the field narrows to string after a check
+interface Image {
+  src: string;
+  title: string | null;
+}
+function image(src: string, title?: string): Image {
+  return { src, title: title || null };
+}
+assert(JSON.stringify(image('a.png')) === '{"src":"a.png","title":null}', 'required null written');
+const titled: Image = image('b.png', 'B');
+const caption: string = titled.title ?? 'none';
+assert(JSON.stringify(titled) === '{"src":"b.png","title":"B"}' && caption.toLowerCase() === 'b', 'required string');
