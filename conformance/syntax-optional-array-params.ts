@@ -35,3 +35,5 @@ const none = splitPair('ab');
 const pair = splitPair('a,b');
 assert(!none && none === undefined, 'a function result of T[] | undefined stays undefined');
 assert(!!pair && pair.join('|') === 'a|b', 'and a set result is the array');
+const slots: (string | undefined)[] = [undefined, 'b'];
+assert((slots[0] ?? 'dflt') === 'dflt' && (slots[1] ?? 'x') === 'b' && (slots[5] ?? 'oob') === 'oob', '?? over T | undefined elements');

@@ -13,7 +13,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [dupe-finder](dupe-finder/)       | Recursive directory walk, SHA-256 hashing, JSON report written to disk     | **1.6x faster scan** (412 ms vs 674 ms, 2,000 files)         |
 | [mandelbrot-png](mandelbrot-png/) | Fractal render + hand-written PNG encoder on `node:zlib`, no image library | **1.2x faster**, steadier (597 ms vs 744 ms)                 |
 | [desktop-notes](desktop-notes/)   | Notes app in an Edge/Chrome app window, UI compiled into one binary        | **5.6x faster launch, 4.7x less memory** (15 vs 72 MiB)      |
-| [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **26x faster per call** (8 vs 213 ms); 3.8x slower on 10 MB† |
+| [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **27x faster per call** (9 vs 250 ms); 3.6x slower on 10 MB† |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.4.0 (hello-world, fibonacci, json-server) and 0.4.1 (the rest). See each

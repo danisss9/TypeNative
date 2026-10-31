@@ -18,7 +18,8 @@ there took transpiler fixes across the board, each with a conformance probe.
   in default, `--json`, `valid` and `lex` modes, compared byte for byte with Node) and
   `bench.mjs` (per-call latency on a docker-compose.yml, throughput on ~10 MB of generated
   Kubernetes manifests)
-- `new Map(iterable)` from Maps, iterators, generators and `Object.entries`; generic type aliases
+- `new Map(iterable)` from Maps, iterators, generators and `Object.entries`; plain objects and
+  arrays as Map keys and Set members, by identity (they panicked as unhashable); generic type aliases
   (`type WithId<T> = T & { id: number }`); instantiation expressions (`g<number>`) and explicit
   type arguments in call results; `typeof f` as a function type
 - `emitWarning(warning, type)`; `JSON.stringify(buffer)` as `{ type: 'Buffer', data }`
@@ -41,7 +42,8 @@ there took transpiler fixes across the board, each with a conformance probe.
   conditional's branches are typed with the condition's narrowing; array callbacks' locals are
   typed from their own declarations; `o?.m()` and `o?.push(x)` on any values don't call through
   a nullish `o`; `flatMap` callbacks returning any values; a function declared to return
-  `T[] | undefined` keeps `undefined` (it was an empty array); object literals assigned into any
+  `T[] | undefined` keeps `undefined` (it was an empty array); `xs[i] ?? d` over
+  `(T | undefined)[]` elements; object literals assigned into any
   slots stay extensible
 - **Self-hosting:** the native compiler builds again (`npm run build:native`; it also failed on
   0.4.2's coverage code) and `npm run bootstrap:check` holds: it turns its own source into the

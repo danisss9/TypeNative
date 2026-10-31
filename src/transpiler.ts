@@ -532,6 +532,7 @@ function nullableArraysOf(scope: AstNode): Set<string> {
       if (!e) return false;
       const u = unwrapParentheses(e);
       if (isNilLiteral(u)) return true;
+      if (isConditionalExpression(u) && (isNilLiteral(unwrapParentheses(u.whenTrue)) || isNilLiteral(unwrapParentheses(u.whenFalse)))) return true;
       // (a function declared to return T[] | undefined)
       const result = isCallExpression(u) && isIdentifier(u.expression) ? declaredFunctions.get(u.expression.text)?.type : undefined;
       if (result && isUnionTypeNode(result) && (result.types ?? []).some((t: AstNode) => t.kind === 'UndefinedKeyword' || t.kind === 'NullKeyword' || (isLiteralTypeNode(t) && t.literal?.kind === 'NullKeyword'))) return true;
@@ -1403,10 +1404,10 @@ function lowerErrorNameFields(node: AstNode): void {
     !!m.body && containsNode(m.body, (n) => isBinaryExpression(n) && n.operatorToken.kind === 'EqualsToken' && isPropertyAccessExpression(n.left) && n.left.expression.kind === 'ThisKeyword' && n.left.name.text === 'name')
   );
   if (!assignsName) return;
-  node.members = [
-    { kind: 'PropertyDeclaration', name: { kind: 'Identifier', text: 'name', line: node.line, column: node.column }, type: { kind: 'StringKeyword' }, line: node.line, column: node.column },
-    ...members
-  ];
+  const name: AstNode = { kind: 'Identifier', text: 'name', line: node.line, column: node.column };
+  const type: AstNode = { kind: 'StringKeyword' };
+  const field: AstNode = { kind: 'PropertyDeclaration', name, type, line: node.line, column: node.column };
+  node.members = [field, ...members];
 }
 
 function lowerExpandoFunctions(sourceFile: AstNode): void {
@@ -2049,7 +2050,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       return `(*${getSafeName(node.text)})`;
     }
     const typeofNarrowed = typeofNarrowedType(node.text);
-    if (typeofNarrowed && isNarrowableReference(node) && !isAssignmentTarget(node) && (variableGoTypes.get(node.text) ?? 'interface{}') === 'interface{}') {
+    if (typeofNarrowed && isNarrowableReference(node) && !isAssignmentTarget(node) && untypedVariable(node.text)) {
       // (a primitive may be held as a *T: a nullable field read dynamically)
       if (['float64', 'string', 'bool'].includes(typeofNarrowed)) {
         useHelper('dynamic');
@@ -4597,7 +4598,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     !!goType && (unwrappedExpr.parameters ?? []).every((p: AstNode) => !!p.type && !p.dotDotDotToken) &&
     (unwrappedExpr.parameters ?? []).length === goFuncParamTypes(goType).length;
   if (goType?.startsWith('func(') && !goType.includes('[') && (!isLiteral || annotatedLiteral)) {
-    const exprType = inferExpressionType(expr) ?? (isIdentifier(unwrappedExpr) && declaredFunctions.has(unwrappedExpr.text) ? functionValueGoType(unwrappedExpr) : undefined);
+    // (|| not ??: natively an unknown type reads as '')
+    const exprType = inferExpressionType(expr) || (isIdentifier(unwrappedExpr) && declaredFunctions.has(unwrappedExpr.text) ? functionValueGoType(unwrappedExpr) : undefined);
     if (exprType?.startsWith('func(') && exprType.replace(/\s+/g, '') !== goType.replace(/\s+/g, '') && !exprType.includes('[')) {
       return adaptFunctionValue(visit(expr), exprType, goType);
     }
@@ -4663,9 +4665,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (isCallExpression(call) && isPropertyAccessExpression(call.expression) && MAYBE_MISSING_METHODS.has(call.expression.name.text)) {
         return `func() ${goType} { __v := ${visit(expr)}; if __v == nil { return nil }; return &__v }()`;
       }
-      // f() declared to return T[] | undefined: undefined stays nil
+      // f() declared to return T[] | undefined, c ? xs : undefined: undefined stays nil
       const declaredResult = isCallExpression(call) && isIdentifier(call.expression) ? declaredFunctions.get(call.expression.text)?.type : undefined;
-      if (declaredResult && isUnionTypeNode(declaredResult) && (declaredResult.types ?? []).some((t: AstNode) => t.kind === 'UndefinedKeyword' || t.kind === 'NullKeyword' || (isLiteralTypeNode(t) && t.literal?.kind === 'NullKeyword'))) {
+      const nullableResult = !!declaredResult && isUnionTypeNode(declaredResult) && (declaredResult.types ?? []).some((t: AstNode) => t.kind === 'UndefinedKeyword' || t.kind === 'NullKeyword' || (isLiteralTypeNode(t) && t.literal?.kind === 'NullKeyword'));
+      const nullishBranch = isConditionalExpression(call) && (isNilLiteral(unwrapParentheses(call.whenTrue)) || isNilLiteral(unwrapParentheses(call.whenFalse)));
+      if (nullableResult || nullishBranch) {
         return `func() ${goType} { __v := ${visit(expr)}; if __v == nil { return nil }; return &__v }()`;
       }
       return `func() ${goType} { __v := ${visit(expr)}; return &__v }()`;
@@ -4882,12 +4886,12 @@ function getNarrowedNames(condition: AstNode, whenTrue: boolean): string[] {
     const className = isIdentifier(condition.right) ? condition.right.text : '';
     if (
       whenTrue && isIdentifier(operand) && classNames.has(className) && !isPolymorphicClass(className) &&
-      (variableGoTypes.get(operand.text) ?? 'interface{}') === 'interface{}' && !referenceArrays.has(operand.text)
+      untypedVariable(operand.text) && !referenceArrays.has(operand.text)
     ) {
       return [typeofNarrowingKey(operand.text, `*${getSafeName(className)}`)];
     }
     // (x instanceof Date: a time.Time)
-    if (whenTrue && isIdentifier(operand) && className === 'Date' && !classNames.has('Date') && (variableGoTypes.get(operand.text) ?? 'interface{}') === 'interface{}') {
+    if (whenTrue && isIdentifier(operand) && className === 'Date' && !classNames.has('Date') && untypedVariable(operand.text)) {
       return [typeofNarrowingKey(operand.text, 'time.Time')];
     }
     return [];
@@ -4908,7 +4912,7 @@ function getNarrowedNames(condition: AstNode, whenTrue: boolean): string[] {
       // typeof x === 'number' on a dynamic variable: x is that type
       const operand = unwrapParentheses(typeOfSide.expression);
       const tagType = ({ number: 'float64', string: 'string', boolean: 'bool' } as Record<string, string>)[tagSide.text];
-      if (tagType && isIdentifier(operand) && (variableGoTypes.get(operand.text) ?? 'interface{}') === 'interface{}' && !referenceArrays.has(operand.text) && !declaredFunctions.has(operand.text)) {
+      if (tagType && isIdentifier(operand) && untypedVariable(operand.text) && !referenceArrays.has(operand.text) && !declaredFunctions.has(operand.text)) {
         return [typeofNarrowingKey(operand.text, tagType)];
       }
       // typeof x === 'string' (any tag but 'undefined'): x is set
@@ -6502,7 +6506,9 @@ function mergedObjectUnionType(types: AstNode[]): string | undefined {
     const typesOf = [...fieldTypes.get(name)!];
     // (T and *T: the nullable one)
     const bare = new Set(typesOf.map((t) => (NULLABLE_PRIMITIVE_TYPES.includes(t) ? t.slice(1) : t)));
-    let goType = typesOf.length === 0 ? 'interface{}' : bare.size === 1 ? typesOf.find((t) => t.startsWith('*')) ?? typesOf[0] : 'interface{}';
+    // (filter, not find: a native find gives '' for no match)
+    const pointers = typesOf.filter((t) => t.startsWith('*'));
+    let goType = typesOf.length === 0 ? 'interface{}' : bare.size === 1 ? (pointers.length > 0 ? pointers[0] : typesOf[0]) : 'interface{}';
     if (presence.get(name)! < members.length) goType = makeNullableType(goType);
     return `${goFieldName(name)} ${goType}`;
   });
@@ -7635,6 +7641,12 @@ function withFunctionScopeTypes(fn: AstNode, compute: () => string): string {
 
 // Records the variable-table entries of `names`; the returned function puts
 // them back (variable types are global by name)
+// A variable without a Go type of its own, or an any one (has() first: a
+// native Map<string, string> gives '' for a missing key)
+function untypedVariable(name: string): boolean {
+  return !variableGoTypes.has(name) || variableGoTypes.get(name) === 'interface{}';
+}
+
 function saveVariableTypes(names: string[]): () => void {
   // (has() first: a native Map<string, string> gives '' for a missing key)
   const saved = names.map((name) => ({
@@ -7888,7 +7900,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     // of an arrow before it is visited)
     const enclosingParamType = getEnclosingParameterType(expr);
     if (enclosingParamType) return enclosingParamType;
-    let varType: string | undefined = variableGoTypes.get(expr.text);
+    // (has() first: a native Map<string, string> gives '' for a missing key)
+    let varType: string | undefined = variableGoTypes.has(expr.text) ? variableGoTypes.get(expr.text) : undefined;
     const typeofNarrowed = (varType ?? 'interface{}') === 'interface{}' ? typeofNarrowedType(expr.text) : undefined;
     if (typeofNarrowed && isNarrowableReference(expr) && !isAssignmentTarget(expr)) return typeofNarrowed;
     // Array references are read as the slice they point to
@@ -8203,8 +8216,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
 
     const resolvedLeftType = leftType?.replace(/^\*/, '').replace(/\[.*\]$/, '');
     const resolvedPropertyType = resolvedLeftType
-      ? (classPropertyTypes.get(resolvedLeftType)?.get(memberKey(expr.name)) ??
-        interfacePropertyTypes.get(resolvedLeftType)?.get(memberKey(expr.name)))
+      ? declaredMemberType(resolvedLeftType, memberKey(expr.name))
       : undefined;
 
     if (hasQuestionDot(expr)) {
@@ -8227,7 +8239,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     if (isIdentifier(expr.expression)) {
       const className = variableClassNames.get(expr.expression.text);
       const memberType = className
-        ? classPropertyTypes.get(className)?.get(memberKey(expr.name))
+        ? declaredMemberType(className, memberKey(expr.name), true)
         : undefined;
       if (memberType) return memberType;
     }
@@ -8559,13 +8571,26 @@ function getObjectCallName(node: AstNode): string | undefined {
 }
 
 // The Go type of a property of an object type (anonymous struct, interface or class)
+// A class's or interface's declared property type (has() first: a native
+// Map<string, string> gives '' for a missing key)
+function declaredMemberType(owner: string, field: string, classOnly = false, interfaceOnly = false): string | undefined {
+  const cls = interfaceOnly ? undefined : classPropertyTypes.get(owner);
+  if (cls?.has(field)) return cls.get(field);
+  const iface = classOnly ? undefined : interfacePropertyTypes.get(owner);
+  if (iface?.has(field)) return iface.get(field);
+  return undefined;
+}
+
 function getObjectFieldGoType(objectType: string, field: string): string | undefined {
   const base = objectType.replace(/^\*/, '').replace(/\[.*$/, '');
-  return (
-    getStructFieldGoType(objectType, field) ??
-    interfacePropertyTypes.get(base)?.get(field) ??
-    classPropertyTypes.get(base)?.get(field)
-  );
+  const structField = getStructFieldGoType(objectType, field);
+  if (structField !== undefined) return structField;
+  // (has() first: a native Map<string, string> gives '' for a missing key)
+  const iface = interfacePropertyTypes.get(base);
+  if (iface?.has(field)) return iface.get(field);
+  const cls = classPropertyTypes.get(base);
+  if (cls?.has(field)) return cls.get(field);
+  return undefined;
 }
 
 // The property names of a typed object (an object type literal, interface or
@@ -9253,8 +9278,11 @@ function visitNullishCoalescingExpression(node: AstNode): string {
       // arr[i] ?? x: out of range is undefined in JS
       const array = getTempName('arr');
       const index = getTempName('idx');
+      // (an element that may be nil — T | undefined — is unset then too)
+      const elementType = arrayType.slice(2);
+      const elementSet = isNilableGoType(elementType) ? ` && ${array}[${index}] != nil` : '';
       steps.push(
-        `if ${array}, ${index} := ${visit(operand.expression)}, int(${visit(operand.argumentExpression)}); ${index} >= 0 && ${index} < len(${array}) { return ${convertGoValue(`${array}[${index}]`, arrayType.slice(2), resultType)} }`
+        `if ${array}, ${index} := ${visit(operand.expression)}, int(${visit(operand.argumentExpression)}); ${index} >= 0 && ${index} < len(${array})${elementSet} { return ${convertGoValue(`${array}[${index}]`, elementType, resultType)} }`
       );
     } else if (lookup) {
       const valueType = extractMapValueType(inferExpressionType(lookup.mapNode) ?? '');
@@ -9363,8 +9391,7 @@ function visitOptionalPropertyAccess(node: AstNode): string {
 
   const className = baseType.replace(/^\*/, '').replace(/\[.*\]$/, '');
   const propertyType =
-    classPropertyTypes.get(className)?.get(node.name.text) ??
-    interfacePropertyTypes.get(className)?.get(node.name.text) ??
+    declaredMemberType(className, node.name.text) ??
     getStructFieldGoType(className, node.name.text) ??
     'interface{}';
   const nullableType = makeNullableType(propertyType);
@@ -9681,7 +9708,7 @@ function destructureCallbackParam(pattern: AstNode, source: string, goType: stri
       } else {
         value = `${source}.${goFieldName(field)}`;
         valueType =
-          interfacePropertyTypes.get(goType)?.get(field) ?? getStructFieldGoType(goType, field) ?? 'interface{}';
+          declaredMemberType(goType, field, false, true) ?? getStructFieldGoType(goType, field) ?? 'interface{}';
       }
     }
     registerLocalVariable(el.name.text, valueType);
@@ -11995,14 +12022,11 @@ function visitRegexReplace(node: AstNode): string | undefined {
   const target = toGoValueOfType(node.expression.expression, 'string');
   const reIsWrapper = inferExpressionType(pattern) === '*TnRegex';
   const re = visit(pattern);
-  // (a RegExp object's g flag is known at run time)
-  const isGlobal: boolean | string =
-    node.expression.name.text === 'replaceAll' ||
-    (isRegularExpressionLiteral(pattern)
-      ? pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g')
-      : reIsWrapper && /^[\w.]+$/.test(re)
-        ? `${re}.global`
-        : false);
+  // (a RegExp object's g flag is known at run time: Go code testing it)
+  let isGlobal = 'false';
+  if (node.expression.name.text === 'replaceAll') isGlobal = 'true';
+  else if (isRegularExpressionLiteral(pattern)) isGlobal = pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g') ? 'true' : 'false';
+  else if (reIsWrapper && /^[\w.]+$/.test(re)) isGlobal = `${re}.global`;
   importedPackages.add('regexp');
 
   if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {
@@ -12039,12 +12063,12 @@ function visitRegexReplace(node: AstNode): string | undefined {
   const goReplacement = jsReplacementToGo(replacement);
   if (reIsWrapper) {
     useHelper('fancyRegex');
-    if (typeof isGlobal === 'string') return `${re}.replace(${target}, ${goReplacement}, ${isGlobal})`;
-    return isGlobal
+    if (isGlobal !== 'true' && isGlobal !== 'false') return `${re}.replace(${target}, ${goReplacement}, ${isGlobal})`;
+    return isGlobal === 'true'
       ? `TnRegexWrapReplaceAll(${re}, ${target}, ${goReplacement})`
       : `TnRegexWrapReplaceFirst(${re}, ${target}, ${goReplacement})`;
   }
-  if (isGlobal) return `${re}.ReplaceAllString(${target}, ${goReplacement})`;
+  if (isGlobal === 'true') return `${re}.ReplaceAllString(${target}, ${goReplacement})`;
   useHelper('regexReplaceFirst');
   return `TnRegexReplaceFirst(${re}, ${target}, ${goReplacement})`;
 }
@@ -12919,6 +12943,8 @@ function arrayElementNeedsConversion(element: AstNode, elementType: string): boo
   // (null among any values is JS null)
   if (elementType === 'interface{}') return unwrapParentheses(element).kind === 'NullKeyword';
   const t = inferExpressionType(element);
+  // (a T among T | undefined elements is boxed)
+  if (NULLABLE_PRIMITIVE_TYPES.includes(elementType) && t === elementType.slice(1)) return true;
   return t === 'interface{}' || (!!t && t !== elementType && t.startsWith('*') && elementType.startsWith('*'));
 }
 
@@ -13030,8 +13056,7 @@ function comparedToNullish(name: string, declaration: AstNode): boolean {
 const arrayReferenceCache = new Map<AstNode, boolean>();
 function returnsArrayReference(fn: AstNode | undefined): boolean {
   if (!fn || !isFunctionDeclaration(fn) || !fn.body || !isBlock(fn.body) || fn.asteriskToken || !fn.name) return false;
-  const cached = arrayReferenceCache.get(fn);
-  if (cached !== undefined) return cached;
+  if (arrayReferenceCache.has(fn)) return arrayReferenceCache.get(fn)!;
   arrayReferenceCache.set(fn, false);
   if ((fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return false;
   const returns = collectReturnStatements(fn.body).map((r: AstNode) => r.expression).filter((e: AstNode | undefined) => !!e) as AstNode[];
@@ -13314,8 +13339,7 @@ function getParameterDestructuring(parameters: AstNode[]): string {
         const field = (el.propertyName ?? el.name).text;
         const structName = paramType.replace(/^\*/, '');
         valueType =
-          interfacePropertyTypes.get(structName)?.get(field) ??
-          classPropertyTypes.get(structName)?.get(field) ??
+          declaredMemberType(structName, field) ??
           getStructFieldGoType(structName, field) ??
           (paramType === 'interface{}' ? 'interface{}' : undefined);
         value = paramType === 'interface{}' ? `TnGetRef(${source}, ${toGoStringLiteral(field)})` : `${source}.${goFieldName(field)}`;
@@ -15228,7 +15252,7 @@ const helperPackages: Record<string, string[]> = {
   toFixed: ['math', 'strconv', 'strings'],
   dynamicSpread: ['sort'],
   entryPoints: ['os'],
-  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort'],
+  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort', 'unsafe'],
   jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time', 'sync', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
   objectAssignTo: ['reflect', 'unsafe', 'sort', 'fmt', 'strings'],
@@ -18589,6 +18613,32 @@ func TnNewMap[K comparable, V any]() *TnMap[K, V] {
 	return &TnMap[K, V]{values: map[K]V{}}
 }
 
+// A key as the map stores it. JS Maps key objects by identity, and a dynamic
+// object (a Go map) or array (a slice) isn't hashable: those are keyed by
+// their address (only maps with any keys can hold them)
+type tnIdentityKey struct {
+	p    unsafe.Pointer
+	kind uint8
+}
+
+func (m *TnMap[K, V]) hk(k K) K {
+	if reflect.TypeFor[K]().Kind() != reflect.Interface {
+		return k
+	}
+	switch any(k).(type) {
+	case nil, string, float64, bool:
+		return k
+	}
+	rv := reflect.ValueOf(any(k))
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Func:
+		if id, ok := any(tnIdentityKey{rv.UnsafePointer(), uint8(rv.Kind())}).(K); ok {
+			return id
+		}
+	}
+	return k
+}
+
 // Fills a new map from dynamic entries (a decoded record held as any),
 // converting keys and values with convert
 func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, reflect.Type) (reflect.Value, bool)) bool {
@@ -18609,13 +18659,13 @@ func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, 
 }
 
 func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
-	if _, ok := m.values[k]; !ok {
+	if _, ok := m.values[m.hk(k)]; !ok {
 		m.keys = append(m.keys, k)
 		if _, isIndex := tnIndexKey(any(k)); isIndex {
 			m.indexKeys = true
 		}
 	}
-	m.values[k] = v
+	m.values[m.hk(k)] = v
 	return m
 }
 
@@ -18640,7 +18690,7 @@ func (m *TnMap[K, V]) Get(k K) V {
 		var zero V
 		return zero
 	}
-	return m.values[k]
+	return m.values[m.hk(k)]
 }
 
 // A string key's value when the map is held in a dynamic value (a Record or a
@@ -18650,7 +18700,7 @@ func (m *TnMap[K, V]) TnProp(key string) (interface{}, bool) {
 	if !ok || m == nil {
 		return nil, false
 	}
-	v, present := m.values[k]
+	v, present := m.values[m.hk(k)]
 	return v, present
 }
 
@@ -18659,7 +18709,7 @@ func (m *TnMap[K, V]) Lookup(k K) (V, bool) {
 		var zero V
 		return zero, false
 	}
-	v, ok := m.values[k]
+	v, ok := m.values[m.hk(k)]
 	return v, ok
 }
 
@@ -18667,17 +18717,17 @@ func (m *TnMap[K, V]) Has(k K) bool {
 	if m == nil {
 		return false
 	}
-	_, ok := m.values[k]
+	_, ok := m.values[m.hk(k)]
 	return ok
 }
 
 func (m *TnMap[K, V]) Delete(k K) bool {
-	if _, ok := m.values[k]; !ok {
+	if _, ok := m.values[m.hk(k)]; !ok {
 		return false
 	}
-	delete(m.values, k)
+	delete(m.values, m.hk(k))
 	for i, key := range m.keys {
-		if key == k {
+		if m.hk(key) == m.hk(k) {
 			m.keys = append(m.keys[:i], m.keys[i+1:]...)
 			break
 		}
@@ -18689,10 +18739,10 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
 	for _, k := range m.keys {
-		r.Set(k, m.values[k])
+		r.Set(k, m.values[m.hk(k)])
 	}
 	for _, k := range o.keys {
-		r.Set(k, o.values[k])
+		r.Set(k, o.values[o.hk(k)])
 	}
 	return r
 }
@@ -18701,7 +18751,7 @@ func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
 	for _, k := range m.keys {
 		if o.Has(k) {
-			r.Set(k, m.values[k])
+			r.Set(k, m.values[m.hk(k)])
 		}
 	}
 	return r
@@ -18711,7 +18761,7 @@ func (m *TnMap[K, V]) Difference(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
 	for _, k := range m.keys {
 		if !o.Has(k) {
-			r.Set(k, m.values[k])
+			r.Set(k, m.values[m.hk(k)])
 		}
 	}
 	return r
@@ -18755,7 +18805,7 @@ func (m *TnMap[K, V]) Values() []V {
 	}
 	values := make([]V, 0, len(m.keys))
 	for _, k := range m.orderedKeys() {
-		values = append(values, m.values[k])
+		values = append(values, m.values[m.hk(k)])
 	}
 	return values
 }
@@ -18763,7 +18813,7 @@ func (m *TnMap[K, V]) Values() []V {
 func (m *TnMap[K, V]) Entries() [][]interface{} {
 	entries := make([][]interface{}, 0, m.Len())
 	for _, k := range m.Keys() {
-		entries = append(entries, []interface{}{k, m.values[k]})
+		entries = append(entries, []interface{}{k, m.values[m.hk(k)]})
 	}
 	return entries
 }
@@ -18771,7 +18821,7 @@ func (m *TnMap[K, V]) Entries() [][]interface{} {
 func (m *TnMap[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		for _, k := range m.Keys() {
-			if v, ok := m.values[k]; ok && !yield(k, v) {
+			if v, ok := m.values[m.hk(k)]; ok && !yield(k, v) {
 				return
 			}
 		}
@@ -18822,7 +18872,7 @@ func (m *TnMap[K, V]) MarshalJSON() ([]byte, error) {
 			buf.WriteByte(',')
 		}
 		key, _ := json.Marshal(fmt.Sprint(k))
-		value, err := json.Marshal(m.values[k])
+		value, err := json.Marshal(m.values[m.hk(k)])
 		if err != nil {
 			return nil, err
 		}
@@ -20599,7 +20649,7 @@ func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
 	}
 	out := make(map[K]V, len(m.keys))
 	for _, k := range m.keys {
-		out[k] = m.values[k]
+		out[k] = m.values[m.hk(k)]
 	}
 	return out
 }

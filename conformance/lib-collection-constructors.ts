@@ -24,3 +24,12 @@ typedCopy.set('y', 2);
 let sum = 0;
 for (const [key, value] of typedCopy) sum += value;
 assert(sum === 3 && typed.size === 1, 'typed Map copy; unread for-of bindings');
+// objects and arrays as keys: by identity
+const o1: any = { x: 1 };
+const o2: any = { x: 1 };
+const ids = new Map<any, string>([[o1, 'one'], [o2, 'two']]);
+const arrKey: any = [1, 2];
+const tags = new Set<any>([arrKey]);
+ids.delete(o1);
+assert(ids.size === 1 && ids.get(o2) === 'two' && !ids.has(o1), 'object keys by identity');
+assert(tags.has(arrKey) && !tags.has([1, 2]), 'array keys by identity');

@@ -84,28 +84,28 @@ and checks that the two JSON outputs are identical:
 
 **Environment:** Linux 6.18 container, 4 vCPUs of an Intel Xeon @ 2.80GHz,
 Node v24.22.2, Go 1.26.0, TypeNative 0.4.2 (unreleased changes), default
-(non-`--release`) build. The binary is 7.2 MB.
+(non-`--release`) build. The binary is 7.3 MB.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 189.77 ms | 213.05 ms | 218.10 ms | 264.74 ms |
-| TypeNative | 6.36 ms   | 8.07 ms   | 8.23 ms   | 12.28 ms  |
+| Node.js    | 214.80 ms | 249.92 ms | 248.16 ms | 305.68 ms |
+| TypeNative | 7.63 ms   | 9.16 ms   | 9.49 ms   | 12.83 ms  |
 
 (b) `yaml --json < manifests.yaml` (10.0 MB), 5 runs each:
 
 | Runtime    | min       | median    | mean      | max       | MB/s (median) |
 | ---------- | --------- | --------- | --------- | --------- | ------------- |
-| Node.js    | 3,226 ms  | 3,368 ms  | 3,403 ms  | 3,630 ms  | 2.97          |
-| TypeNative | 12,477 ms | 12,813 ms | 12,867 ms | 13,141 ms | 0.78          |
+| Node.js    | 3,916 ms  | 4,226 ms  | 4,137 ms  | 4,301 ms  | 2.37          |
+| TypeNative | 14,955 ms | 15,170 ms | 15,184 ms | 15,547 ms | 0.66          |
 
-**Per call, TypeNative is 26x faster** (8 ms vs 213 ms, median). Node's
+**Per call, TypeNative is 27x faster** (9 ms vs 250 ms, median). Node's
 cost here is mostly startup. It loads and type-strips the 78 TypeScript
 files on every run before it reads a byte of input. That's what you feel
 when a tool calls the converter once per file.
 
-**On bulk throughput, TypeNative is 3.8x slower.** Once V8's JIT has warmed
+**On bulk throughput, TypeNative is 3.6x slower.** Once V8's JIT has warmed
 up on a long input, it runs this code faster than the compiled Go does. The
 library passes its values around as structural object types and unions
 (`Scalar | YAMLMap | YAMLSeq | Pair`, CST tokens), which TypeNative holds as
@@ -117,10 +117,10 @@ native binary finishes first up to about 150–200 KB of YAML per process:
 
 | Input  | Node.js | TypeNative |
 | ------ | ------- | ---------- |
-| 16 KB  | 265 ms  | 32 ms      |
-| 64 KB  | 281 ms  | 98 ms      |
-| 128 KB | 313 ms  | 229 ms     |
-| 1 MB   | 648 ms  | 1,354 ms   |
+| 16 KB  | 284 ms  | 38 ms      |
+| 64 KB  | 311 ms  | 107 ms     |
+| 128 KB | 345 ms  | 253 ms     |
+| 1 MB   | 862 ms  | 1,599 ms   |
 
 (Medians of 5 full process runs each, same generator.)
 
@@ -130,7 +130,7 @@ general:
 - Long strings' code-point indexes were evicted by the many short slices a
   lexer takes, so every sticky-regex match rebuilt the index of the whole
   input. That made lexing quadratic: about 23 s for 1 MB before (measured on
-  a loaded machine), 1.4 s after.
+  a loaded machine), about 1.5 s after.
 - Struct field lookups by name are cached per type.
 - `typeof f` types are func types, so the composer's callbacks are called
   directly instead of through reflection.
