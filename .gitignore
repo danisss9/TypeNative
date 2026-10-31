@@ -84,3 +84,5 @@ disttsparser/tsparser.exe
 .zcode
 dist
 native
+# examples: downloaded test corpora (parity.mjs)
+examples/*/.cache

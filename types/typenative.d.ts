@@ -37,6 +37,8 @@ interface Number {
 interface Object {
   constructor: Function;
   toString(): string;
+  valueOf(): Object;
+  hasOwnProperty(v: PropertyKey): boolean;
 }
 
 // --- Iteration protocol (also unlocks for..of / spread over Map, Set, string) ---
@@ -144,6 +146,8 @@ type NonNullable<T> = T & {};
 type Record<K extends keyof any, T> = { [P in K]: T };
 type Parameters<T extends (...args: any) => any> = T extends (...args: infer P) => any ? P : never;
 type ReturnType<T extends (...args: any) => any> = T extends (...args: any) => infer R ? R : any;
+type Exclude<T, U> = T extends U ? never : T;
+type Extract<T, U> = T extends U ? T : never;
 
 // --- RegExp ---
 
@@ -214,31 +218,33 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Returns the elements of an array that meet the condition specified in a callback function.
    */
-  filter(callback: (value: T, index?: number, array?: T[]) => boolean): T[];
+  filter<S extends T>(callback: (value: T, index: number, array: T[]) => value is S): S[];
+  filter(callback: (value: T, index: number, array: T[]) => unknown): T[];
   /**
    * Determines whether the specified callback function returns true for any element of an array.
    */
-  some(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  some(callback: (value: T, index: number, array: T[]) => unknown): boolean;
   /**
    * Returns the value of the first element in the array where callback is true, and undefined otherwise.
    */
-  find(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
+  find<S extends T>(callback: (value: T, index: number, array: T[]) => value is S): S | undefined;
+  find(callback: (value: T, index: number, array: T[]) => unknown): T | undefined;
   /**
    * Returns the index of the first element that satisfies the callback, or -1.
    */
-  findIndex(callback: (value: T, index?: number, array?: T[]) => boolean): number;
+  findIndex(callback: (value: T, index: number, array: T[]) => unknown): number;
   /**
    * Returns the value of the last element where callback is true, and undefined otherwise.
    */
-  findLast(callback: (value: T, index?: number, array?: T[]) => boolean): T | undefined;
+  findLast(callback: (value: T, index: number, array: T[]) => unknown): T | undefined;
   /**
    * Returns the index of the last element that satisfies the callback, or -1.
    */
-  findLastIndex(callback: (value: T, index?: number, array?: T[]) => boolean): number;
+  findLastIndex(callback: (value: T, index: number, array: T[]) => unknown): number;
   /**
    * Determines whether all elements satisfy the callback.
    */
-  every(callback: (value: T, index?: number, array?: T[]) => boolean): boolean;
+  every(callback: (value: T, index: number, array: T[]) => unknown): boolean;
   /**
    * Performs the callback for each element.
    */
@@ -286,7 +292,7 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Reverses the elements of an array in place.
    */
-  reverse(): T[];
+  reverse(): this;
   /**
    * Returns a reversed copy of the array.
    */
@@ -294,7 +300,7 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Sorts the elements of an array in place.
    */
-  sort(compareFn?: (a: T, b: T) => number): T[];
+  sort(compareFn?: (a: T, b: T) => number): this;
   /**
    * Returns a sorted copy of the array.
    */
@@ -319,11 +325,11 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Returns a copy of a section of an array with the fill value applied.
    */
-  fill(value: T, start?: number, end?: number): T[];
+  fill(value: T, start?: number, end?: number): this;
   /**
    * Copies within the array in place (overlap-safe) and returns it.
    */
-  copyWithin(target: number, start: number, end?: number): T[];
+  copyWithin(target: number, start: number, end?: number): this;
   /**
    * Merges two or more arrays (array arguments are flattened one level).
    */
@@ -346,10 +352,12 @@ interface Array<T> extends IterableIterator<T> {
 
 interface ArrayConstructor {
   new <T>(length: number): T[];
+  new <T>(...items: T[]): T[];
   isArray(arg: any): arg is any[];
-  from<T>(arrayLike: ArrayLike<T>): T[];
-  from<T, U>(arrayLike: ArrayLike<T>, mapFn: (value: T, index: number) => U): U[];
+  from<T>(arrayLike: ArrayLike<T> | Iterable<T>): T[];
+  from<T, U>(arrayLike: ArrayLike<T> | Iterable<T>, mapFn: (value: T, index: number) => U): U[];
   of<T>(...items: T[]): T[];
+  readonly prototype: any[];
 }
 
 declare var Array: ArrayConstructor;
@@ -442,9 +450,9 @@ declare var String: StringConstructor;
 
 interface NumberConstructor {
   (value?: any): number;
-  isNaN(value: number): boolean;
-  isFinite(value: number): boolean;
-  isInteger(value: number): boolean;
+  isNaN(value: unknown): boolean;
+  isFinite(value: unknown): boolean;
+  isInteger(value: unknown): boolean;
   readonly MAX_SAFE_INTEGER: number;
   readonly MIN_SAFE_INTEGER: number;
   readonly MAX_VALUE: number;
@@ -577,9 +585,24 @@ interface JSON {
 }
 declare var JSON: JSON;
 
+interface PropertyDescriptor {
+  value?: any;
+  writable?: boolean;
+  enumerable?: boolean;
+  configurable?: boolean;
+  get?(): any;
+  set?(v: any): void;
+}
+interface PropertyDescriptorMap {
+  [key: string]: PropertyDescriptor;
+}
+
 interface ObjectConstructor {
-  /** Only `Object.create(null)`: an empty, prototype-less dictionary */
-  create(proto: null): any;
+  /** Object(x) returns x (primitives are not boxed) */
+  (value?: any): any;
+  new (value?: any): any;
+  /** A class value stands in for its prototype (Object.create(C.prototype)) */
+  readonly prototype: Object;
   /** Only `Object.setPrototypeOf(this, …)` in a constructor (the Error-subclassing idiom), as a no-op */
   setPrototypeOf(o: any, proto: object | null): any;
   /** SameValue: NaN is NaN, +0 is not -0 */
@@ -591,11 +614,14 @@ interface ObjectConstructor {
   assign(target: any, ...sources: any[]): any;
   fromEntries(entries: Iterable<readonly [string, any]>): any;
   hasOwn(obj: any, key: string): boolean;
-  defineProperty<T>(
-    obj: T,
-    key: string,
-    descriptor: { value: any; enumerable?: boolean; writable?: boolean; configurable?: boolean }
-  ): T;
+  /** Data descriptors set the value; attributes and accessors have no effect */
+  defineProperty<T>(obj: T, key: string, descriptor: PropertyDescriptor): T;
+  defineProperties<T>(obj: T, descriptors: PropertyDescriptorMap): T;
+  /** An instance of the prototype's class without running its constructor */
+  create(proto: object | null, descriptors?: PropertyDescriptorMap): any;
+  /** An instance's class (null for other values) */
+  getPrototypeOf(obj: any): any;
+  getOwnPropertyDescriptors<T>(obj: T): { [P in keyof T]: PropertyDescriptor } & { [key: string]: PropertyDescriptor };
   getOwnPropertyNames(obj: any): string[];
   freeze<T>(obj: T): T;
   seal<T>(obj: T): T;
@@ -640,7 +666,7 @@ interface Process {
   };
   nextTick<A extends any[]>(callback: (...args: A) => void, ...args: A): void;
   kill(pid: number, signal?: string | number): true;
-  emitWarning(warning: string | Error): void;
+  emitWarning(warning: string | Error, type?: string): void;
   getuid(): number;
   getgid(): number;
   geteuid(): number;
@@ -899,7 +925,7 @@ interface Map<K, V> {
 
 interface MapConstructor {
   new <K, V>(): Map<K, V>;
-  new <K, V>(entries: [K, V][]): Map<K, V>;
+  new <K, V>(entries?: readonly (readonly [K, V])[] | Iterable<readonly [K, V]> | null): Map<K, V>;
   groupBy<K, T>(items: T[], keySelector: (item: T, index: number) => K): Map<K, T[]>;
 }
 
@@ -933,7 +959,7 @@ interface Set<T> {
 
 interface SetConstructor {
   new <T>(): Set<T>;
-  new <T>(values?: T[] | Set<T>): Set<T>;
+  new <T>(values?: readonly T[] | Set<T> | Iterable<T> | null): Set<T>;
 }
 
 declare var Set: SetConstructor;
@@ -1046,6 +1072,8 @@ interface Uint8Array {
   slice(start?: number, end?: number): Uint8Array;
   set(array: ArrayLike<number>, offset?: number): void;
   at(index: number): number | undefined;
+  /** Base64 of the bytes (ES2026) */
+  toBase64(): string;
   [Symbol.iterator](): IterableIterator<number>;
 }
 
@@ -1055,6 +1083,8 @@ interface Uint8ArrayConstructor {
   // A view sharing the buffer's memory
   new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
   from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
+  /** The bytes a base64 string encodes (ES2026) */
+  fromBase64(base64: string): Uint8Array;
 }
 
 declare var Uint8Array: Uint8ArrayConstructor;
@@ -1247,6 +1277,8 @@ interface Buffer extends Uint8Array {
 }
 
 interface BufferConstructor {
+  /** @deprecated use Buffer.alloc / Buffer.from (lets `typeof Buffer === 'function'` narrow) */
+  new (size: number): Buffer;
   from(data: string, encoding?: BufferEncoding): Buffer;
   from(data: ArrayLike<number> | Uint8Array | ArrayBuffer): Buffer;
   alloc(size: number, fill?: string | number | Uint8Array, encoding?: BufferEncoding): Buffer;
@@ -1635,6 +1667,22 @@ declare function setImmediate<A extends any[]>(callback: (...args: A) => void, .
 declare function clearImmediate(immediate?: NodeJS.Immediate | number): void;
 
 declare namespace NodeJS {
+  // A readable stream, as Node's typings describe it (process.stdin is one)
+  interface ReadableStream {
+    readonly readable: boolean;
+    read(size?: number): any;
+    setEncoding(encoding: BufferEncoding): this;
+    pause(): this;
+    resume(): this;
+    isPaused(): boolean;
+    on(event: string, listener: (...args: any[]) => void): this;
+    once(event: string, listener: (...args: any[]) => void): this;
+  }
+  interface WritableStream {
+    readonly writable: boolean;
+    write(chunk: any, callback?: (error?: Error | null) => void): boolean;
+    on(event: string, listener: (...args: any[]) => void): this;
+  }
   // Timer handles: an unref'ed timer does not keep the process alive
   interface Timeout {
     ref(): this;

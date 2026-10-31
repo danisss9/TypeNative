@@ -427,12 +427,16 @@ func TnBufferWriteFloat(b []byte, value float64, offset float64, size int, littl
 	return float64(o + size)
 }
 
-func TnBufferToJSON(b []byte) map[string]interface{} {
+// { type: 'Buffer', data: [...] }, in that key order
+func TnBufferToJSON(b []byte) *TnMap[string, interface{}] {
 	data := make([]interface{}, len(b))
 	for i, c := range b {
 		data[i] = float64(c)
 	}
-	return map[string]interface{}{"type": "Buffer", "data": data}
+	m := TnNewMap[string, interface{}]()
+	m.Set("type", "Buffer")
+	m.Set("data", data)
+	return m
 }
 
 // <Buffer 68 69>, as console.log / util.inspect show a Buffer
@@ -595,7 +599,7 @@ export function registerBuffer(r: NodeRegistry): void {
     r,
     'buffer',
     ['bytes', 'encoding/base64', 'encoding/binary', 'encoding/hex', 'fmt', 'math', 'math/big', 'strconv', 'strings', 'unicode/utf16', 'unicode/utf8'],
-    ['error', 'dynamic'],
+    ['error', 'dynamic', 'orderedMap'],
     bufferHelper
   );
   // Uint8Array first: Buffer owns the []byte instance methods
@@ -656,6 +660,12 @@ export function registerBuffer(r: NodeRegistry): void {
     'from=[]byte; alloc=[]byte; allocUnsafe=[]byte; allocUnsafeSlow=[]byte; concat=[]byte; byteLength=float64; isBuffer=bool; isEncoding=bool; compare=float64'
   );
   r.results['globals.Uint8Array.from'] = '[]byte';
+  // Uint8Array.fromBase64(s) / u8.toBase64() (ES2026)
+  r.functions['globals.Uint8Array.fromBase64'] = (call: NodeCall) => {
+    use();
+    return `TnBufferFromString(${call.args[0]}, "base64")`;
+  };
+  r.results['globals.Uint8Array.fromBase64'] = '[]byte';
   r.functions['buffer.atob'] = (call: NodeCall) => {
     use();
     return `TnAtob(${call.args[0]})`;
@@ -731,7 +741,8 @@ export function registerBuffer(r: NodeRegistry): void {
     if (result) r.results[`buffer.Buffer#${name}`] = result;
   };
   method('toString', 'string', (c: NodeCall) => `TnBufferToString(${c.recv}, ${encArg(c, 0)}${boundsArgs(c, 1)})`);
-  method('toJSON', 'map[string]interface{}', (c: NodeCall) => `TnBufferToJSON(${c.recv})`);
+  method('toBase64', 'string', (c: NodeCall) => `TnBufferToString(${c.recv}, "base64")`);
+  method('toJSON', '*TnMap[string, interface{}]', (c: NodeCall) => `TnBufferToJSON(${c.recv})`);
   method('equals', 'bool', (c: NodeCall) => `bytes.Equal(${c.recv}, ${c.args[0]})`);
   method('compare', 'float64', (c: NodeCall) => `float64(bytes.Compare(${c.recv}, ${c.args[0]}))`);
   method('subarray', '[]byte', (c: NodeCall) => `TnBufferSlice(${c.recv}${boundsArgs(c, 0)})`);

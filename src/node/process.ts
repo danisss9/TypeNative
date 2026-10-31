@@ -152,13 +152,30 @@ func TnProcessKill(pid float64, signal ...interface{}) bool {
 	return true
 }
 
-func TnProcessEmitWarning(warning interface{}) {
+// process.emitWarning(warning, type = 'Warning'); an Error warning's own
+// name is its type
+func TnProcessEmitWarning(warning interface{}, typ string) {
 	msg := fmt.Sprint(warning)
 	if e, ok := warning.(*TnError); ok {
 		msg = e.message
+		if typ == "" {
+			if name, isString := e.prop("name").(string); isString && name != "" {
+				typ = name
+			}
+		}
 	}
-	fmt.Fprintf(os.Stderr, "(node:%d) Warning: %s\\n", os.Getpid(), msg)
+	if typ == "" {
+		typ = "Warning"
+	}
+	fmt.Fprintf(os.Stderr, "(node:%d) %s: %s\\n", os.Getpid(), typ, msg)
+	// (Node's hint, after the first warning)
+	if !tnWarningHinted {
+		tnWarningHinted = true
+		fmt.Fprintln(os.Stderr, "(Use \`node --trace-warnings ...\` to show where the warning was created)")
+	}
 }
+
+var tnWarningHinted bool
 
 func TnProcessVersions() *TnMap[string, string] {
 	m := TnNewMap[string, string]()
@@ -559,7 +576,7 @@ export function registerProcess(r: NodeRegistry): void {
   });
   fn('emitWarning', '', (call: NodeCall) => {
     use();
-    return `TnProcessEmitWarning(${call.args[0]})`;
+    return `TnProcessEmitWarning(${call.args[0]}, ${call.args[1] ?? '""'})`;
   });
   for (const id of ['getuid', 'getgid', 'geteuid', 'getegid']) {
     const goName = id === 'getuid' ? 'Getuid' : id === 'getgid' ? 'Getgid' : id === 'geteuid' ? 'Geteuid' : 'Getegid';

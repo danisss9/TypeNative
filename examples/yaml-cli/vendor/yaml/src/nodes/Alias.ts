@@ -1,0 +1,121 @@
+import { anchorIsValid } from '../doc/anchors.ts'
+import type { Document, DocValue } from '../doc/Document.ts'
+import type { FlowScalar } from '../parse/cst.ts'
+import type { StringifyContext } from '../stringify/stringify.ts'
+import { visit } from '../visit.ts'
+import type { Scalar } from './Scalar.ts'
+import { ToJSContext } from './toJS.ts'
+import type { Node, NodeBase, Range } from './types.ts'
+import type { YAMLMap } from './YAMLMap.ts'
+import type { YAMLSeq } from './YAMLSeq.ts'
+import type { YAMLSet } from './YAMLSet.ts'
+
+export class Alias implements NodeBase {
+  source: string
+
+  declare anchor?: never
+
+  /** A comment on or immediately after this node. */
+  declare comment?: string | null
+
+  /** A comment before this node. */
+  declare commentBefore?: string | null
+
+  /**
+   * The `[start, value-end, node-end]` character offsets for
+   * the part of the source parsed into this node (undefined if not parsed).
+   * The `value-end` and `node-end` positions are themselves not included in their respective ranges.
+   */
+  declare range?: Range | null
+
+  /** A blank line before this node and its commentBefore */
+  declare spaceBefore?: boolean
+
+  /** The CST token that was composed into this node.  */
+  declare srcToken?: FlowScalar & { type: 'alias' }
+
+  declare tag?: never
+
+  constructor(source: string) {
+    this.source = source
+    Object.defineProperty(this, 'tag', {
+      set() {
+        throw new Error('Alias nodes cannot have tags')
+      }
+    })
+  }
+
+  /** Create a copy of this node.  */
+  clone(): this {
+    const copy: this = Object.create(
+      Object.getPrototypeOf(this),
+      Object.getOwnPropertyDescriptors(this)
+    )
+    if (this.range) copy.range = [...this.range]
+    return copy
+  }
+
+  /**
+   * Resolve the value of this alias within `doc`, finding the last
+   * instance of the `source` anchor before this node.
+   */
+  resolve(
+    doc: Document,
+    ctx?: ToJSContext
+  ): Scalar | YAMLMap | YAMLSeq | YAMLSet | undefined {
+    if (ctx?.maxAliasCount === 0)
+      throw new ReferenceError('Alias resolution is disabled')
+
+    let nodes: Node[]
+    if (ctx?.aliasResolveCache) {
+      nodes = ctx.aliasResolveCache
+    } else {
+      nodes = []
+      visit(doc, {
+        Node: (_key: unknown, node: Node) => {
+          if (node instanceof Alias || node.anchor) nodes.push(node)
+        }
+      })
+      if (ctx) ctx.aliasResolveCache = nodes
+    }
+
+    let found: Scalar | YAMLMap | YAMLSeq | YAMLSet | undefined = undefined
+    for (const node of nodes) {
+      if (node === this) break
+      if (node.anchor === this.source) found = node
+    }
+
+    return found
+  }
+
+  /** A plain JavaScript representation of the resolved value of this alias. */
+  toJS(doc: Document<DocValue, boolean>, ctx?: ToJSContext): any {
+    if (!doc?.schema) throw new TypeError('A document argument is required')
+    ctx ??= new ToJSContext()
+
+    const source = this.resolve(doc, ctx)
+    if (!source) {
+      const msg = `Unresolved alias (the anchor must be set before the alias): ${this.source}`
+      throw new ReferenceError(msg)
+    }
+
+    return ctx.resolveAlias(doc, source)
+  }
+
+  toString(
+    ctx?: StringifyContext,
+    _onComment?: () => void,
+    _onChompKeep?: () => void
+  ): string {
+    const src = `*${this.source}`
+    if (ctx) {
+      anchorIsValid(this.source)
+      if (ctx.options.verifyAliasOrder && !ctx.anchors.has(this.source)) {
+        const msg = `Unresolved alias (the anchor must be set before the alias): ${this.source}`
+        throw new Error(msg)
+      }
+      if (ctx.implicitKey) return `${src} `
+    }
+    return src
+  }
+}
