@@ -14,9 +14,11 @@
 //
 // Differences from bin/main.js: --help prints the option summary below
 // instead of opening the man page, --version prints the vendored version
-// instead of reading package.json, and a config file (-c, ~/.marked.json)
-// must be JSON: a JavaScript config is a module Node would import and run,
-// which a native binary can't.
+// instead of reading package.json, a config file (-c, ~/.marked.json) must be
+// JSON (a JavaScript config is a module Node would import and run, which a
+// native binary can't), and the HTML is flushed before the process exits
+// (bin/main.js exits right after writing it, cutting output to a pipe off at
+// 64 KB).
 import { promises } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -234,7 +236,11 @@ export async function main() {
       }
     }
 
-    process.stdout.write(html + '\n');
+    // (flushed before main() exits the process: bin/main.js exits right after
+    // the write, which cuts output to a pipe off at 64 KB)
+    await new Promise<void>((resolve) => {
+      process.stdout.write(html + '\n', () => resolve());
+    });
   }
 
   /**

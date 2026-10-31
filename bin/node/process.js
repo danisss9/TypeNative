@@ -528,14 +528,20 @@ export function registerProcess(r) {
         use();
         return 'TnProcessMemoryUsage().rss';
     });
-    fn('stdout.write', 'bool', (call) => {
-        use();
-        return `TnProcessWrite(os.Stdout, ${call.args[0]})`;
-    });
-    fn('stderr.write', 'bool', (call) => {
-        use();
-        return `TnProcessWrite(os.Stderr, ${call.args[0]})`;
-    });
+    // write(data[, encoding][, callback]): the data is written at once; the
+    // callback runs as a later task, as Node calls it once the data is flushed
+    for (const [stream, file] of [['stdout', 'os.Stdout'], ['stderr', 'os.Stderr']]) {
+        fn(`${stream}.write`, 'bool', (call) => {
+            use();
+            const callback = call.nodes.length > 1 ? call.args[call.args.length - 1] : '';
+            const isCallback = call.nodes.length > 1 && (call.types[call.types.length - 1] ?? '').startsWith('func(');
+            if (!isCallback)
+                return `TnProcessWrite(${file}, ${call.args[0]})`;
+            r.helper('timerWait');
+            const takesError = (call.types[call.types.length - 1] ?? '').startsWith('func()') ? '' : 'nil';
+            return `func() bool { __ok := TnProcessWrite(${file}, ${call.args[0]}); __cb := ${callback}; TnSetImmediate(func() { __cb(${takesError}) }); return __ok }()`;
+        });
+    }
     for (const stream of ['stdout', 'stderr']) {
         const f = stream === 'stdout' ? 'os.Stdout' : 'os.Stderr';
         fn(`${stream}.getWindowSize`, '[]float64', (_c) => {

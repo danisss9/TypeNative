@@ -1767,6 +1767,7 @@ export function transpileToNative(code, options) {
     moduleInitOrder.length = 0;
     moduleInitAssignments = null;
     objectLiteralMethodNames.clear();
+    stringAccumulators.clear();
     topLevelGoTypes.clear();
     topLevelReferenceArrays.clear();
     // With a file resolver, the entry and every module it reaches are linked first
@@ -2216,6 +2217,9 @@ function visitNode(node, options = {}) {
         if (classNames.has(node.text) && isClassValueReference(node) && !isTypeParameterInScope(node.text, node)) {
             return expectsConstructorFunction(node) ? `TnCtorOf(${classValue(node.text)}, New${getSafeName(node.text)})` : classValue(node.text);
         }
+        // a string accumulator (a strings.Builder): its text so far
+        if (isStringAccumulatorRef(node))
+            return `${getSafeName(node.text)}.String()`;
         // Array references: reads go through the shared slice-header pointer
         // (`arr === null` tests the reference itself)
         if (isReferenceArrayRead(node)) {
@@ -2583,6 +2587,15 @@ function visitNode(node, options = {}) {
         return getAcessString(leftSide, rightSide, objectType);
     }
     else if (isVariableDeclaration(node)) {
+        // let out = ''; … out += s (in a loop): a strings.Builder (+= copies a Go string)
+        if (isStringAccumulator(node)) {
+            importedPackages.add('strings');
+            const name = getSafeName(node.name.text);
+            setVarGoType(node.name.text, 'string');
+            stringAccumulators.add(node);
+            const init = isStringLiteral(node.initializer) && node.initializer.text === '' ? '' : `\n\t\t${name}.WriteString(${toGoValueOfType(node.initializer, 'string')})`;
+            return `var ${name} strings.Builder${init}`;
+        }
         const requireDeclaration = visitRequireDeclaration(node);
         if (requireDeclaration !== undefined)
             return requireDeclaration;
@@ -3235,6 +3248,11 @@ function visitNode(node, options = {}) {
         const methodIdentity = methodIdentityComparison(node);
         if (methodIdentity !== undefined)
             return methodIdentity;
+        // out += s on a string accumulator: appended to its builder
+        if (node.operatorToken.kind === 'PlusEqualsToken' && isIdentifier(node.left) && isStringAccumulatorRef(node.left)) {
+            const rightType = inferExpressionType(node.right);
+            return `${getSafeName(node.left.text)}.WriteString(${rightType === 'string' ? visit(node.right) : jsStringOf(visit(node.right), rightType)})`;
+        }
         if (isAssignmentOperatorKind(node.operatorToken.kind) && !isStatementPosition(node)) {
             return visitAssignmentValue(node);
         }
@@ -8729,6 +8747,62 @@ function isInOwnInitializer(expr) {
     }
     return true;
 }
+// Local strings built up with += in a loop (let out = ''; … out += s): a
+// strings.Builder, as each += on a Go string copies all of it
+const stringAccumulators = new Set();
+function isStringAccumulator(decl) {
+    if (!isIdentifier(decl.name) || !decl.initializer || decl.type && decl.type.kind !== 'StringKeyword')
+        return false;
+    const list = decl.parent;
+    if (list?.declarationKind !== 'let' || (list.declarations ?? []).length !== 1)
+        return false;
+    const fn = getEnclosingFunction(decl);
+    if (!fn || !fn.body || !isBlock(fn.body) || inferExpressionType(decl.initializer) !== 'string')
+        return false;
+    const name = decl.name.text;
+    let appendsInLoop = false;
+    let other = false;
+    const loopKinds = new Set(['ForStatement', 'ForOfStatement', 'ForInStatement', 'WhileStatement', 'DoStatement']);
+    const walk = (n) => {
+        if (other)
+            return;
+        if (isIdentifier(n) && n.text === name && n !== decl.name && !isFieldNameIdentifier(n)) {
+            const parent = n.parent;
+            if (isBinaryExpression(parent) && parent.left === n && isAssignmentOperatorKind(parent.operatorToken.kind)) {
+                // (only `name += s;` as a statement)
+                if (parent.operatorToken.kind !== 'PlusEqualsToken' || !isExpressionStatement(parent.parent))
+                    other = true;
+                else {
+                    for (let a = parent.parent; a && a !== fn; a = a.parent)
+                        if (loopKinds.has(a.kind))
+                            appendsInLoop = true;
+                }
+            }
+            else if (isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent) || FUNCTION_LIKE_KINDS.has(getEnclosingFunction(n)?.kind ?? '') && getEnclosingFunction(n) !== fn) {
+                // (a closure reading it, or ++: not an accumulator)
+                other = true;
+            }
+            else if (parent?.kind === 'VariableDeclaration' && parent.name === n || parent?.kind === 'Parameter') {
+                other = true;
+            }
+        }
+        for (const child of childNodes(n))
+            walk(child);
+    };
+    walk(fn.body);
+    return appendsInLoop && !other;
+}
+// Whether an identifier names a string accumulator declared in its function
+function isStringAccumulatorRef(n) {
+    if (stringAccumulators.size === 0 || !isIdentifier(n))
+        return false;
+    const fn = getEnclosingFunction(n);
+    for (const decl of stringAccumulators) {
+        if (decl.name.text === n.text && getEnclosingFunction(decl) === fn)
+            return true;
+    }
+    return false;
+}
 // Go types of module-level variables, as declared (variableGoTypes is keyed
 // by name, so a local of the same name hides them while it is registered)
 const topLevelGoTypes = new Map();
@@ -12263,21 +12337,28 @@ const stringMethodHandlers = {
         }
         importedPackages.add('strings');
         // split(sep, limit): at most `limit` parts
+        // (only the first `limit` parts are split off: the rest of the string isn't scanned)
         if (args.length >= 2)
-            return `func() []string { __p := strings.Split(${obj}, ${args[0]}); return __p[:min(len(__p), max(0, int(${args[1]})))] }()`;
+            return `func() []string { __n := max(0, int(${args[1]})); if __n == 0 { return []string{} }; __p := strings.SplitN(${obj}, ${args[0]}, __n+1); return __p[:min(len(__p), __n)] }()`;
         return `strings.Split(${obj}, ${args[0]})`;
     },
     trim: (obj) => {
+        // (JS's whitespace: Unicode spaces, line terminators and the BOM)
         importedPackages.add('strings');
-        return `strings.TrimSpace(${obj})`;
+        useHelper('jsSpace');
+        return `strings.TrimFunc(${obj}, TnIsJSSpace)`;
     },
     trimStart: (obj) => {
+        // (JS's whitespace: Unicode spaces, line terminators and the BOM)
         importedPackages.add('strings');
-        return `strings.TrimLeft(${obj}, " \\t\\n\\r")`;
+        useHelper('jsSpace');
+        return `strings.TrimLeftFunc(${obj}, TnIsJSSpace)`;
     },
     trimEnd: (obj) => {
+        // (JS's whitespace: Unicode spaces, line terminators and the BOM)
         importedPackages.add('strings');
-        return `strings.TrimRight(${obj}, " \\t\\n\\r")`;
+        useHelper('jsSpace');
+        return `strings.TrimRightFunc(${obj}, TnIsJSSpace)`;
     },
     toUpperCase: (obj) => {
         importedPackages.add('strings');
@@ -12425,12 +12506,16 @@ const stringMethodHandlers = {
         return `TnSubstr(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
     trimLeft: (obj) => {
+        // (JS's whitespace: Unicode spaces, line terminators and the BOM)
         importedPackages.add('strings');
-        return `strings.TrimLeft(${obj}, " \\t\\n\\r")`;
+        useHelper('jsSpace');
+        return `strings.TrimLeftFunc(${obj}, TnIsJSSpace)`;
     },
     trimRight: (obj) => {
+        // (JS's whitespace: Unicode spaces, line terminators and the BOM)
         importedPackages.add('strings');
-        return `strings.TrimRight(${obj}, " \\t\\n\\r")`;
+        useHelper('jsSpace');
+        return `strings.TrimRightFunc(${obj}, TnIsJSSpace)`;
     },
     toLocaleUpperCase: (obj) => {
         importedPackages.add('strings');
@@ -16817,13 +16902,14 @@ const helperPackages = {
     iterable: ['reflect'],
     regexReplaceFunc: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
     replaceAny: ['regexp'],
+    jsSpace: [],
     regexObject: ['regexp', 'reflect'],
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
     error: ['runtime', 'strings', 'fmt'],
     bigint: ['math/big', 'math'],
     symbol: [],
-    fancyRegex: ['regexp', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8', 'unicode'],
+    fancyRegex: ['regexp', 'regexp/syntax', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8', 'unicode'],
     namedGroups: ['regexp', 'unicode/utf8'],
     regexMatch: ['regexp', 'strings', 'strconv', 'math', 'unicode/utf8'],
     strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings'],
@@ -20816,6 +20902,8 @@ type TnRegex struct {
 	pattern    string
 	contextual bool
 	btAfter    *tnBt
+	// the bytes an RE2 match can start with (nil: any)
+	first *tnFirstBytes
 	re        *regexp.Regexp
 	anchored  *regexp.Regexp
 	bt        *tnBt
@@ -20839,6 +20927,7 @@ func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
 	}
 	if re, err := regexp.Compile(prefix + pattern); err == nil {
 		r.re = re
+		r.first = tnComputeFirstBytes(prefix+pattern, syntax.Perl)
 		// /y matches only at lastIndex: anchored, so a miss costs no scan
 		if r.sticky {
 			r.anchored = regexp.MustCompile(prefix + "\\\\A(?:" + pattern + ")")
@@ -20968,6 +21057,109 @@ func tnPatternUsesContext(p string) bool {
 		}
 	}
 	return false
+}
+
+// The bytes a match can start with ([256]bool: a non-ASCII rune marks
+// 0x80-0xFF), when the pattern can't match the empty string: a regex whose
+// match must start at the input's start fails at once on any other byte
+type tnFirstBytes struct {
+	set      [256]bool
+	anchored bool
+}
+
+func tnComputeFirstBytes(pattern string, flags syntax.Flags) *tnFirstBytes {
+	re, err := syntax.Parse(pattern, flags)
+	if err != nil {
+		return nil
+	}
+	re = re.Simplify()
+	f := &tnFirstBytes{}
+	anchored, nullable := tnFirstOf(re, &f.set, false)
+	if nullable {
+		return nil
+	}
+	f.anchored = anchored
+	return f
+}
+
+// Adds the bytes re can start with to set; reports whether re begins with
+// \\A (^ without m) and whether it can match the empty string
+func tnFirstOf(re *syntax.Regexp, set *[256]bool, anchored bool) (bool, bool) {
+	addRune := func(r rune) {
+		if r < 0x80 {
+			set[r] = true
+		} else {
+			for b := 0x80; b < 0x100; b++ {
+				set[b] = true
+			}
+		}
+	}
+	switch re.Op {
+	case syntax.OpLiteral:
+		if len(re.Rune) == 0 {
+			return anchored, true
+		}
+		r := re.Rune[0]
+		addRune(r)
+		if re.Flags&syntax.FoldCase != 0 {
+			for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+				addRune(f)
+			}
+		}
+		return anchored, false
+	case syntax.OpCharClass:
+		for i := 0; i+1 < len(re.Rune); i += 2 {
+			lo, hi := re.Rune[i], re.Rune[i+1]
+			if lo >= 0x80 || hi >= 0x80 {
+				addRune(0x80)
+			}
+			for r := lo; r <= hi && r < 0x80; r++ {
+				set[r] = true
+			}
+		}
+		return anchored, false
+	case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+		for b := range set {
+			set[b] = true
+		}
+		return anchored, false
+	case syntax.OpBeginText:
+		return true, true
+	case syntax.OpEmptyMatch, syntax.OpBeginLine, syntax.OpEndLine, syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return anchored, true
+	case syntax.OpCapture:
+		return tnFirstOf(re.Sub[0], set, anchored)
+	case syntax.OpStar, syntax.OpQuest:
+		tnFirstOf(re.Sub[0], set, anchored)
+		return anchored, true
+	case syntax.OpPlus:
+		return tnFirstOf(re.Sub[0], set, anchored)
+	case syntax.OpRepeat:
+		a, nullable := tnFirstOf(re.Sub[0], set, anchored)
+		return a, nullable || re.Min == 0
+	case syntax.OpConcat:
+		for _, sub := range re.Sub {
+			a, nullable := tnFirstOf(sub, set, anchored)
+			anchored = a
+			if !nullable {
+				return anchored, false
+			}
+		}
+		return anchored, true
+	case syntax.OpAlternate:
+		all := true
+		nullable := false
+		for _, sub := range re.Sub {
+			a, n := tnFirstOf(sub, set, false)
+			all = all && a
+			nullable = nullable || n
+		}
+		return anchored || all, nullable
+	}
+	for b := range set {
+		set[b] = true
+	}
+	return anchored, true
 }
 
 // A plain RE2 regex as a TnRegex
@@ -21207,6 +21399,25 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 		if sticky && r.anchored != nil {
 			re = r.anchored
 		}
+		// (a match must start with one of these bytes: fail fast, skip ahead)
+		if f := r.first; f != nil {
+			if start >= len(in.s) {
+				return nil, nil
+			}
+			if f.anchored || sticky {
+				if !f.set[in.s[start]] {
+					return nil, nil
+				}
+			} else if !r.contextual {
+				// (only where the text before the match doesn't matter: RE2 sees s[start:])
+				for start < len(in.s) && !f.set[in.s[start]] {
+					start++
+				}
+				if start == len(in.s) {
+					return nil, nil
+				}
+			}
+		}
 		loc := re.FindStringSubmatchIndex(in.s[start:])
 		if loc == nil || (sticky && loc[0] != 0) {
 			return nil, nil
@@ -21218,14 +21429,17 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 		}
 		return tnMatchGroups(in.s, loc), loc
 	}
-	runs, offs := in.runes()
-	first := sort.SearchInts(offs, start)
-	for pos := first; pos <= len(runs) && (!sticky || pos == first); pos++ {
-		caps := make([]int, (bt.ngroups+1)*2)
+	s := in.s
+	caps := make([]int, (bt.ngroups+1)*2)
+	m := &tnBtMatchState{s: s, caps: caps, bt: bt}
+	for pos := start; pos <= len(s); {
+		// (a pattern starting with ^ only matches at the input's start)
+		if bt.anchored && !bt.multiline && pos > 0 {
+			break
+		}
 		for i := range caps {
 			caps[i] = -1
 		}
-		m := &tnBtMatchState{runs: runs, caps: caps, bt: bt}
 		end := -1
 		if m.match(bt.root, pos, func(e int) bool { end = e; return true }) {
 			caps[0], caps[1] = pos, end
@@ -21235,14 +21449,23 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 			for i := 0; i <= bt.ngroups; i++ {
 				si, ei := caps[2*i], caps[2*i+1]
 				if si >= 0 && ei >= si {
-					groups[i] = string(runs[si:ei])
-					loc[2*i], loc[2*i+1] = offs[si], offs[ei]
+					groups[i] = s[si:ei]
+					loc[2*i], loc[2*i+1] = si, ei
 				} else {
 					loc[2*i], loc[2*i+1] = -1, -1
 				}
 			}
 			tnMarkUnmatched(groups, loc)
 			return groups, loc
+		}
+		if sticky || pos == len(s) {
+			break
+		}
+		if s[pos] < utf8.RuneSelf {
+			pos++
+		} else {
+			_, w := utf8.DecodeRuneInString(s[pos:])
+			pos += w
 		}
 	}
 	return nil, nil
@@ -21316,6 +21539,8 @@ type tnBt struct {
 	icase     bool
 	multiline bool
 	dotAll    bool
+	// it begins with ^: only the input's start can match (without m)
+	anchored bool
 }
 
 type tnBtParser struct {
@@ -21331,7 +21556,7 @@ func tnBtCompile(pattern string) *tnBt {
 	if err != nil || p.pos < len(p.src) {
 		return nil
 	}
-	return &tnBt{root: root, ngroups: p.ngrp}
+	return &tnBt{root: root, ngroups: p.ngrp, anchored: tnBtStartAnchored(root)}
 }
 
 func (p *tnBtParser) peek() (rune, bool) {
@@ -21573,7 +21798,7 @@ func (p *tnBtParser) parseAtom() (*tnBtNode, error) {
 		case "noncap":
 			return body, nil
 		case "look":
-			return &tnBtNode{op: "look", child: body, behind: behind, negative: negative}, nil
+			return &tnBtNode{op: "look", child: body, behind: behind, negative: negative, max: tnBtMaxRunes(body)}, nil
 		default:
 			return &tnBtNode{op: "group", group: group, child: body}, nil
 		}
@@ -21849,9 +22074,31 @@ func (p *tnBtParser) peekAt(offset int) (rune, bool) {
 }
 
 type tnBtMatchState struct {
-	runs []rune
+	s    string
 	caps []int
 	bt   *tnBt
+}
+
+// The rune at byte offset pos and its width (0 at the end)
+func (m *tnBtMatchState) at(pos int) (rune, int) {
+	if pos >= len(m.s) {
+		return 0, 0
+	}
+	if c := m.s[pos]; c < utf8.RuneSelf {
+		return rune(c), 1
+	}
+	return utf8.DecodeRuneInString(m.s[pos:])
+}
+
+// The rune before byte offset pos and its width (0 at the start)
+func (m *tnBtMatchState) before(pos int) (rune, int) {
+	if pos <= 0 {
+		return 0, 0
+	}
+	if c := m.s[pos-1]; c < utf8.RuneSelf {
+		return rune(c), 1
+	}
+	return utf8.DecodeLastRuneInString(m.s[:pos])
 }
 
 // Line terminators for . and multiline ^ $ (as JS defines them)
@@ -21859,63 +22106,95 @@ func tnBtLineEnd(r rune) bool {
 	return r == '\\n' || r == '\\r' || r == 0x2028 || r == 0x2029
 }
 
-func (m *tnBtMatchState) seq(nodes []*tnBtNode, pos int, k func(int) bool) bool {
-	if len(nodes) == 0 {
-		return k(pos)
-	}
-	return m.match(nodes[0], pos, func(p2 int) bool {
-		return m.seq(nodes[1:], p2, k)
-	})
-}
-
 func tnBtWord(r rune) bool {
 	return r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
 
-func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
+func tnBtIsSingle(n *tnBtNode) bool {
+	return n.op == "char" || n.op == "any" || n.op == "class"
+}
+
+// The width of the one rune a char / any / class node matches at pos, or -1
+func (m *tnBtMatchState) single(node *tnBtNode, pos int) int {
+	r, size := m.at(pos)
+	if size == 0 {
+		return -1
+	}
 	switch node.op {
 	case "char":
-		if pos < len(m.runs) && (m.runs[pos] == node.ch || m.bt.icase && unicode.ToLower(m.runs[pos]) == unicode.ToLower(node.ch)) {
-			return k(pos + 1)
+		if r == node.ch || m.bt.icase && unicode.ToLower(r) == unicode.ToLower(node.ch) {
+			return size
 		}
-		return false
 	case "any":
-		if pos < len(m.runs) && (m.bt.dotAll || !tnBtLineEnd(m.runs[pos])) {
-			return k(pos + 1)
+		if m.bt.dotAll || !tnBtLineEnd(r) {
+			return size
 		}
-		return false
 	case "class":
-		if pos < len(m.runs) {
-			r := m.runs[pos]
-			in := node.cls(r)
-			if !in && m.bt.icase {
-				in = node.cls(unicode.ToLower(r)) || node.cls(unicode.ToUpper(r))
-			}
-			if in != node.negCls {
-				return k(pos + 1)
-			}
+		in := node.cls(r)
+		if !in && m.bt.icase {
+			in = node.cls(unicode.ToLower(r)) || node.cls(unicode.ToUpper(r))
+		}
+		if in != node.negCls {
+			return size
+		}
+	}
+	return -1
+}
+
+func (m *tnBtMatchState) seq(nodes []*tnBtNode, pos int, k func(int) bool) bool {
+	// (single runes in a row are matched in place, without a continuation each)
+	for len(nodes) > 0 && tnBtIsSingle(nodes[0]) {
+		w := m.single(nodes[0], pos)
+		if w < 0 {
+			return false
+		}
+		pos += w
+		nodes = nodes[1:]
+	}
+	if len(nodes) == 0 {
+		return k(pos)
+	}
+	if len(nodes) == 1 {
+		return m.match(nodes[0], pos, k)
+	}
+	rest := nodes[1:]
+	return m.match(nodes[0], pos, func(p2 int) bool {
+		return m.seq(rest, p2, k)
+	})
+}
+
+func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
+	switch node.op {
+	case "char", "any", "class":
+		if w := m.single(node, pos); w >= 0 {
+			return k(pos + w)
 		}
 		return false
 	case "anchor":
 		switch node.anchor {
 		case '^':
-			if pos == 0 || m.bt.multiline && tnBtLineEnd(m.runs[pos-1]) {
+			if pos == 0 {
 				return k(pos)
+			}
+			if m.bt.multiline {
+				if r, _ := m.before(pos); tnBtLineEnd(r) {
+					return k(pos)
+				}
 			}
 		case '$':
-			if pos == len(m.runs) || m.bt.multiline && tnBtLineEnd(m.runs[pos]) {
+			if pos == len(m.s) {
 				return k(pos)
 			}
-		case 'b':
-			before := pos > 0 && tnBtWord(m.runs[pos-1])
-			after := pos < len(m.runs) && tnBtWord(m.runs[pos])
-			if before != after {
-				return k(pos)
+			if m.bt.multiline {
+				if r, _ := m.at(pos); tnBtLineEnd(r) {
+					return k(pos)
+				}
 			}
-		case 'B':
-			before := pos > 0 && tnBtWord(m.runs[pos-1])
-			after := pos < len(m.runs) && tnBtWord(m.runs[pos])
-			if before == after {
+		case 'b', 'B':
+			rb, sb := m.before(pos)
+			ra, sa := m.at(pos)
+			boundary := (sb > 0 && tnBtWord(rb)) != (sa > 0 && tnBtWord(ra))
+			if boundary == (node.anchor == 'b') {
 				return k(pos)
 			}
 		}
@@ -21932,10 +22211,9 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 	case "group":
 		si, ei := node.group*2, node.group*2+1
 		savedS, savedE := m.caps[si], m.caps[ei]
-		m.caps[si] = pos
 		matched := m.match(node.child, pos, func(end int) bool {
 			ps, pe := m.caps[si], m.caps[ei]
-			m.caps[ei] = end
+			m.caps[si], m.caps[ei] = pos, end
 			if k(end) {
 				return true
 			}
@@ -21951,14 +22229,20 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 		if s < 0 || e < 0 {
 			return k(pos)
 		}
-		n := e - s
-		if pos+n > len(m.runs) {
-			return false
-		}
-		for i := 0; i < n; i++ {
-			if m.runs[pos+i] != m.runs[s+i] {
-				return false
+		if m.bt.icase {
+			p := pos
+			for _, r := range m.s[s:e] {
+				r2, w := m.at(p)
+				if w == 0 || unicode.ToLower(r) != unicode.ToLower(r2) {
+					return false
+				}
+				p += w
 			}
+			return k(p)
+		}
+		n := e - s
+		if pos+n > len(m.s) || m.s[pos:pos+n] != m.s[s:e] {
+			return false
 		}
 		return k(pos + n)
 	case "look":
@@ -21969,8 +22253,18 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 		if !node.behind {
 			matched = m.match(node.child, pos, func(int) bool { return true })
 		} else {
-			for start := 0; start <= pos && !matched; start++ {
-				matched = m.match(node.child, start, func(end int) bool { return end == pos })
+			// (a start from pos back, as far as the lookbehind's longest match)
+			start := pos
+			for steps := 0; ; steps++ {
+				if m.match(node.child, start, func(end int) bool { return end == pos }) {
+					matched = true
+					break
+				}
+				if start == 0 || (node.max >= 0 && steps >= node.max) {
+					break
+				}
+				_, w := m.before(start)
+				start -= w
 			}
 		}
 		if !matched || node.negative {
@@ -21982,7 +22276,49 @@ func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
 		copy(m.caps, saved)
 		return false
 	case "rep":
+		if tnBtIsSingle(node.child) {
+			return m.repSingle(node, pos, k)
+		}
 		return m.rep(node, pos, 0, k)
+	}
+	return false
+}
+
+// A repeat of one rune (a*, [^\\n]+?, .{2,5}): the runes are matched in a
+// loop, the rest of the pattern tried from the longest run back (greedy) or
+// from the shortest on (lazy)
+func (m *tnBtMatchState) repSingle(node *tnBtNode, pos int, k func(int) bool) bool {
+	if !node.greedy {
+		count := 0
+		for {
+			if count >= node.min && k(pos) {
+				return true
+			}
+			if node.max >= 0 && count >= node.max {
+				return false
+			}
+			w := m.single(node.child, pos)
+			if w < 0 {
+				return false
+			}
+			pos += w
+			count++
+		}
+	}
+	ends := make([]int, 1, 16)
+	ends[0] = pos
+	for node.max < 0 || len(ends)-1 < node.max {
+		w := m.single(node.child, pos)
+		if w < 0 {
+			break
+		}
+		pos += w
+		ends = append(ends, pos)
+	}
+	for i := len(ends) - 1; i >= node.min; i-- {
+		if k(ends[i]) {
+			return true
+		}
 	}
 	return false
 }
@@ -22014,6 +22350,67 @@ func (m *tnBtMatchState) rep(node *tnBtNode, pos, count int, k func(int) bool) b
 		return true
 	}
 	return tryMore()
+}
+
+// The most runes a node can match (-1: no bound), for lookbehinds
+func tnBtMaxRunes(n *tnBtNode) int {
+	switch n.op {
+	case "char", "any", "class":
+		return 1
+	case "anchor", "look":
+		return 0
+	case "cat":
+		total := 0
+		for _, c := range n.seq {
+			w := tnBtMaxRunes(c)
+			if w < 0 {
+				return -1
+			}
+			total += w
+		}
+		return total
+	case "alt":
+		most := 0
+		for _, br := range n.branches {
+			w := tnBtMaxRunes(&tnBtNode{op: "cat", seq: br})
+			if w < 0 {
+				return -1
+			}
+			if w > most {
+				most = w
+			}
+		}
+		return most
+	case "group":
+		return tnBtMaxRunes(n.child)
+	case "rep":
+		w := tnBtMaxRunes(n.child)
+		if w < 0 || n.max < 0 {
+			return -1
+		}
+		return w * n.max
+	}
+	return -1
+}
+
+// Whether a pattern only matches at the input's start (it begins with ^)
+func tnBtStartAnchored(n *tnBtNode) bool {
+	switch n.op {
+	case "anchor":
+		return n.anchor == '^'
+	case "cat":
+		return len(n.seq) > 0 && tnBtStartAnchored(n.seq[0])
+	case "group":
+		return tnBtStartAnchored(n.child)
+	case "alt":
+		for _, br := range n.branches {
+			if len(br) == 0 || !tnBtStartAnchored(br[0]) {
+				return false
+			}
+		}
+		return len(n.branches) > 0
+	}
+	return false
 }`,
     objectAssignTo: `// Object.assign(target, ...sources) on a typed target (a struct or a Map):
 // each source's properties are set on the target's fields / entries, and the
@@ -22256,6 +22653,15 @@ func init() {
 			return nil
 		}}, true
 	}
+}`,
+    jsSpace: `// JS's whitespace (String.prototype.trim, \\s): ASCII whitespace, Unicode
+// space separators, line terminators and the BOM
+func TnIsJSSpace(r rune) bool {
+	switch r {
+	case ' ', '\\t', '\\n', '\\r', '\\f', '\\v', 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200a
 }`,
     replaceAny: `// s.replace(pattern, repl) with a pattern typed string | RegExp: a regex's
 // flags decide (replaceAll needs /g, as in JS), a string is matched literally
