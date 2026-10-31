@@ -1683,6 +1683,7 @@ export function transpileToNative(code, options) {
     moduleInitOrder.length = 0;
     moduleInitAssignments = null;
     objectLiteralMethodNames.clear();
+    topLevelGoTypes.clear();
     // With a file resolver, the entry and every module it reaches are linked first
     const sourceFile = fileResolver
         ? linkModule(options?.fileName ?? currentFileName, code, null, currentFileIsTsx, currentFileName)
@@ -2714,6 +2715,10 @@ function visitNode(node, options = {}) {
         }
         // Package scope has no `:=`: module-level declarations need `var x = expr`
         const isTopLevelStatement = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
+        // (its type, for reads where no function binds the name: see topLevelGoTypes)
+        if (isTopLevelStatement && isIdentifier(node.name) && variableGoTypes.has(node.name.text)) {
+            topLevelGoTypes.set(node.name.text, variableGoTypes.get(node.name.text));
+        }
         const isPackageScope = emittingModuleFile && isTopLevelStatement;
         // A module's top-level variable is declared at package scope and set when
         // the module's code runs (in order, as in JS: a Go initializer would
@@ -2871,6 +2876,12 @@ function visitNode(node, options = {}) {
         const regexReplace = visitRegexReplace(node);
         if (regexReplace)
             return regexReplace;
+        // Object.prototype.toString.call(x): "[object Type]"
+        if (isObjectToStringCall(node)) {
+            useHelper('dynamic');
+            const arg = (node.arguments ?? [])[0];
+            return `TnObjectTypeTag(${arg ? (isNilLiteral(unwrapParentheses(arg)) && unwrapParentheses(arg).kind === 'NullKeyword' ? 'TnNull' : `interface{}(${visit(arg)})`) : 'nil'})`;
+        }
         // IIFE with named function expression: (function name() { ... })()
         if (isParenthesizedExpression(node.expression) &&
             isFunctionExpression(node.expression.expression)) {
@@ -2994,7 +3005,10 @@ function visitNode(node, options = {}) {
         // (explicit type arguments for erased type parameters are dropped)
         const calleeDeclaration = isIdentifier(node.expression) ? declaredFunctions.get(node.expression.text) : undefined;
         const erasedParams = calleeDeclaration ? erasedFunctionTypeParameters(calleeDeclaration) : undefined;
-        const keptTypeArgs = (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
+        // (a class's static or instance method: Go methods take no type parameters)
+        const classMethodCallee = isPropertyAccessExpression(node.expression) && (isIdentifier(node.expression.expression) && classNames.has(node.expression.expression.text) && !variableGoTypes.has(node.expression.expression.text) ||
+            !!classNameOfGoType(inferExpressionType(node.expression.expression) ?? ''));
+        const keptTypeArgs = classMethodCallee ? [] : (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
         const typeArgs = getTypeArguments(keptTypeArgs);
         // Handle spread arguments: fn(...arr) → fn(arr...)
         const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
@@ -3044,6 +3058,15 @@ function visitNode(node, options = {}) {
         if (node.operator === 'MinusToken' && inferExpressionType(node.operand) === '*tnbig.Int') {
             return `new(tnbig.Int).Neg(${visit(node.operand)})`;
         }
+        // +s / -s on a string, a boolean or an any value: its JS number (Number(s))
+        if (node.operator === 'PlusToken' || node.operator === 'MinusToken') {
+            const operandType = inferExpressionType(node.operand) ?? '';
+            if (['string', 'bool', 'interface{}', '*string', '*bool'].includes(operandType)) {
+                useHelper('dynamic');
+                const value = operandType.startsWith('*') ? `TnPtrValue(${visit(node.operand)})` : `interface{}(${visit(node.operand)})`;
+                return `${node.operator === 'MinusToken' ? '-' : ''}TnNumber(${value})`;
+            }
+        }
         // -0: Go constant arithmetic has no negative zero
         if (node.operator === 'MinusToken' && isNumericLiteral(node.operand) && Number(node.operand.text) === 0) {
             importedPackages.add('math');
@@ -3073,6 +3096,11 @@ function visitNode(node, options = {}) {
         return visitConditionalExpression(node);
     }
     else if (isBinaryExpression(node)) {
+        // inst.m === Class.prototype.m: whether the instance's class (with no
+        // own override) uses that very method; methods aren't per-instance in Go
+        const methodIdentity = methodIdentityComparison(node);
+        if (methodIdentity !== undefined)
+            return methodIdentity;
         if (isAssignmentOperatorKind(node.operatorToken.kind) && !isStatementPosition(node)) {
             return visitAssignmentValue(node);
         }
@@ -3840,9 +3868,17 @@ function visitNode(node, options = {}) {
                 : toGoValueOfType(node.expression, returnGoType);
         const terminator = options.inline ? '' : ';\n\t';
         // (an array reference function returns the array it found, by reference)
-        const returned = node.expression && enclosingFn && returnGoType && returnsArrayReference(enclosingFn)
+        let returned = node.expression && enclosingFn && returnGoType && returnsArrayReference(enclosingFn)
             ? arrayReferenceOf(node.expression, returnGoType)
             : value;
+        // a bare `return;` where the function has a result: undefined, its zero value
+        if (!node.expression && enclosingFn && !isAsync && !enclosingFn.asteriskToken) {
+            const resultType = goCallbackResult !== undefined
+                ? goCallbackResult
+                : isMethodDeclaration(enclosingFn) ? methodReturnGoType(enclosingFn) : returnGoType;
+            if (resultType)
+                returned = `*new(${isMethodDeclaration(enclosingFn) || !returnsArrayReference(enclosingFn) ? '' : '*'}${resultType})`;
+        }
         if (tryReturn && enclosingFn === tryReturn.fn)
             return tryAwareReturn(returned) + terminator;
         return `return ${returned}` + terminator;
@@ -3924,7 +3960,10 @@ function visitNode(node, options = {}) {
         if (isPromiseReturningArrow(node))
             return emitAsyncArrow(node);
         const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
-        const inferredRetType = inferFunctionBodyReturnType(node);
+        // (with the arrow's own locals typed, as its value's type is inferred)
+        const inferredRetType = isBlock(node.body) && !node.type && !getContextualFunctionType(node)?.type
+            ? withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined
+            : inferFunctionBodyReturnType(node);
         const returnType = inferredRetType ? ` ${inferredRetType}` : '';
         if (parameterInfo.prefixBlockContent && !isBlock(node.body)) {
             return `func(${parameterInfo.signature})${returnType} {\n\t\t${coverageEnter(node)}${parameterInfo.prefixBlockContent}return ${toGoValueOfType(node.body, inferredRetType)};\n\t}`;
@@ -4794,6 +4833,19 @@ function toGoValueOfType(expr, goType) {
         if (mapArgs)
             return orderedMapLiteral(mapArgs[0], mapArgs[1], []);
         return `${goType}{}`;
+    }
+    // an Array subclass instance where an array is expected: its elements
+    // (by reference for an any[] slot, so pushes reach the instance)
+    if (goType && /^\*?\[\]/.test(goType) && arraySubclassOf(unwrapParentheses(expr))) {
+        useHelper('arraySubclass');
+        const instance = visit(expr);
+        if (goType === '*[]interface{}')
+            return `${instance}.TnItems()`;
+        if (goType === '[]interface{}')
+            return `(*${instance}.TnItems())`;
+        useHelper('dynamic');
+        const converted = `TnAs[${goType.replace(/^\*/, '')}](*${instance}.TnItems())`;
+        return goType.startsWith('*') ? `func() ${goType} { __v := ${converted}; return &__v }()` : converted;
     }
     // Array reference slots (*[]T): literals take an address, aliases pass through
     if (goType && goType.startsWith('*[]')) {
@@ -7023,6 +7075,9 @@ function getAsExpressionType(node) {
     // (x as File): dynamic values holding Node class instances assert to them
     if (nodeRegistry.classByGoType[target])
         return target;
+    // (an object passed off as a RegExp: converted when stored as one)
+    if (target === '*TnRegex' && !['*TnRegex', '*regexp.Regexp'].includes(inferExpressionType(node.expression) ?? ''))
+        useHelper('regexObject');
     if (isDynamicValue(node.expression) && (isStructGoType(target) || target.startsWith('*'))) {
         return 'interface{}';
     }
@@ -7127,7 +7182,7 @@ function visitRecordSpreadLiteral(node) {
             return `{ __src := ${visit(p.expression)}; for _, __k := range __src.Keys() { __obj.Set(__k, __src.Get(__k)) } }`;
         }
         if (isShorthandPropertyAssignment(p))
-            return `__obj.Set(${mapKeyText(p.name)}, ${visit(p.name)})`;
+            return `__obj.Set(${mapKeyText(p.name)}, ${toGoValueOfType(p.name, valueType)})`;
         if (isPropertyAssignment(p))
             return `__obj.Set(${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)})`;
         return '';
@@ -7142,7 +7197,7 @@ function visitMapLiteral(node, recordType) {
         if (isPropertyAssignment(p))
             entries.push(`${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)}`);
         else if (isShorthandPropertyAssignment(p))
-            entries.push(`${mapKeyText(p.name)}, ${visit(p.name)}`);
+            entries.push(`${mapKeyText(p.name)}, ${toGoValueOfType(p.name, valueType)}`);
     }
     return orderedMapLiteral(keyType, valueType, entries);
 }
@@ -8420,6 +8475,27 @@ function isInOwnInitializer(expr) {
     }
     return true;
 }
+// Go types of module-level variables, as declared (variableGoTypes is keyed
+// by name, so a local of the same name hides them while it is registered)
+const topLevelGoTypes = new Map();
+// Whether an enclosing function (or catch clause) binds this identifier's name
+function isLocallyBound(expr) {
+    for (let n = expr.parent; n; n = n.parent) {
+        if (FUNCTION_LIKE_KINDS.has(n.kind)) {
+            if (!n.tnScopeNames)
+                n.tnScopeNames = functionScopeNames(n);
+            if (n.tnScopeNames.includes(expr.text))
+                return true;
+            if (isFunctionExpression(n) && n.name && n.name.text === expr.text)
+                return true;
+            if (n.body && isBlock(n.body) && (n.body.statements ?? []).some((st) => isNestedFunctionDeclaration(st) && st.name.text === expr.text))
+                return true;
+        }
+        if (n.kind === 'CatchClause' && n.variableDeclaration && isIdentifier(n.variableDeclaration.name) && n.variableDeclaration.name.text === expr.text)
+            return true;
+    }
+    return false;
+}
 function inferExpressionTypeOf(expr) {
     if (expr?.kind === 'TnArrayItems')
         return '[]interface{}';
@@ -8437,6 +8513,8 @@ function inferExpressionTypeOf(expr) {
         return thisGoType(expr);
     if (isCallExpression(expr) && expr.expression?.kind === 'ImportKeyword')
         return 'chan interface{}';
+    if (isCallExpression(expr) && isObjectToStringCall(expr))
+        return 'string';
     // f<T> as a value (an instantiation expression): f
     if (expr?.kind === 'ExpressionWithTypeArguments' && !isHeritageType(expr)) {
         const inst = genericInstantiation(expr);
@@ -8531,12 +8609,23 @@ function inferExpressionTypeOf(expr) {
             return enclosingParamType;
         // (has() first: a native Map<string, string> gives '' for a missing key)
         let varType = variableGoTypes.has(expr.text) ? variableGoTypes.get(expr.text) : undefined;
+        // a module-level variable read where no enclosing function binds its name
+        // (the table may hold a same-named local of code being inferred elsewhere)
+        if (topLevelGoTypes.has(expr.text) && varType !== topLevelGoTypes.get(expr.text) && !isLocallyBound(expr)) {
+            varType = topLevelGoTypes.get(expr.text);
+        }
         // a module's annotated top-level variable, read before that module is
         // visited (an importer emitted first): its declared type
         if (varType === undefined && declaredVariables.has(expr.text)) {
             const declared = declaredVariables.get(expr.text);
             if (declared.type && sourceFileIndexOf(declared) !== sourceFileIndexOf(expr))
                 varType = getType(declared.type);
+            // (const f = g of a declared function g, as f.prop = g lowers expandos)
+            const init = declared.type ? undefined : declared.initializer;
+            const fn = init && isIdentifier(init) && declaredFunctions.has(init.text) ? declaredFunctions.get(init.text) : undefined;
+            if (fn && !fn.asteriskToken && !(fn.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword') && sourceFileIndexOf(declared) !== sourceFileIndexOf(expr)) {
+                varType = inferArrowFunctionGoType(fn);
+            }
         }
         const typeofNarrowed = (varType ?? 'interface{}') === 'interface{}' ? typeofNarrowedType(expr.text) : undefined;
         if (typeofNarrowed && isNarrowableReference(expr) && !isAssignmentTarget(expr))
@@ -8676,6 +8765,17 @@ function inferExpressionTypeOf(expr) {
         const promiseType = inferPromiseCallType(expr);
         if (promiseType)
             return promiseType;
+        // f.call(thisArg, …) / f.apply(thisArg, args) on a function value: its result
+        if (isPropertyAccessExpression(expr.expression) && ['call', 'apply'].includes(expr.expression.name.text) && !isObjectToStringCall(expr)) {
+            const fnType = functionValueGoType(expr.expression.expression);
+            if (fnType.startsWith('func('))
+                return goFuncReturnType(fnType) ?? undefined;
+        }
+        // (async () => { … })(): the promise channel of the function called in place
+        const iife = unwrapParentheses(expr.expression);
+        if ((isArrowFunction(iife) || isFunctionExpression(iife)) && !iife.asteriskToken && (iife.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
+            return `chan ${getPromiseChannelType(iife)}`;
+        }
         const objectCallType = inferObjectCallType(expr);
         if (objectCallType)
             return objectCallType;
@@ -9056,7 +9156,9 @@ function inferExpressionTypeOf(expr) {
                 return 'bool';
             if (['indexOf', 'lastIndexOf', 'findIndex'].includes(methodName))
                 return 'float64';
-            if (['pop', 'shift', 'at'].includes(methodName))
+            if (methodName === 'at')
+                return ['string', 'float64', 'bool'].includes(elementType) ? `*${elementType}` : elementType;
+            if (['pop', 'shift'].includes(methodName))
                 return elementType;
             if (['concat', 'toSorted', 'toReversed', 'with', 'copyWithin', 'toSpliced'].includes(methodName))
                 return arrayOwnerType;
@@ -9224,6 +9326,7 @@ const BUILTIN_CALL_TYPES = {
     isFinite: 'bool',
     encodeURIComponent: 'string',
     decodeURIComponent: 'string',
+    encodeURI: 'string',
     'Object.fromEntries': 'interface{}',
     'Date.UTC': 'float64',
     'Date.parse': 'float64',
@@ -9489,8 +9592,19 @@ function visitPromiseCall(node) {
     if (node.expression.name.text === 'finally')
         return `TnPromiseFinally(${receiver}, ${cb})`;
     // .catch(() => …) ignores the reason; .catch((e) => value) settles with the value
-    const handler = callback && (callback.parameters ?? []).length === 0 ? `func(_ interface{}) { (${cb})() }` : cb;
+    const isLiteral = !!callback && (isArrowFunction(callback) || isFunctionExpression(callback));
     const returnsValue = callback && !/\)$/.test(inferExpressionType(callback) ?? ')');
+    // (a function value: adapted to take the reason as any and settle with
+    // the promise's value type)
+    if (callback && !isLiteral) {
+        const cbType = inferExpressionType(callback) ?? '';
+        const valueType = (inferExpressionType(node.expression.expression) ?? 'chan interface{}').slice(5) || 'struct{}';
+        if (cbType.startsWith('func(')) {
+            const target = returnsValue ? `func(interface{}) ${valueType}` : 'func(interface{})';
+            return `TnPromiseCatch${returnsValue ? 'Value' : ''}(${receiver}, ${adaptFunctionValue(cb, cbType, target)})`;
+        }
+    }
+    const handler = callback && isLiteral && (callback.parameters ?? []).length === 0 ? `func(_ interface{}) { (${cb})() }` : cb;
     return `TnPromiseCatch${returnsValue ? 'Value' : ''}(${receiver}, ${handler})`;
 }
 // Element type of `await Promise.all([...])` from the first promise channel
@@ -9734,7 +9848,72 @@ function inferEvolvingLetType(declaration) {
     if (types.size !== 1)
         return 'interface{}';
     const only = [...types][0];
+    // (assigned on every path before any read: never undefined when read)
+    if (assignedBeforeRead(declaration))
+        return only;
     return makeNullableType(only);
+}
+// `let x;` whose block assigns x on every path (x = …; a for loop's
+// initializer; both branches of an if / else) before any statement reads it;
+// a loop whose body assigns x before reading it reads no undefined either
+function assignedBeforeRead(declaration) {
+    const name = declaration.name.text;
+    const statement = declaration.parent?.parent;
+    const block = statement?.parent;
+    if (!statement || !block || !Array.isArray(block.statements))
+        return false;
+    const mentions = (n) => !!n && containsNode(n, (c) => isIdentifier(c) && c.text === name && !isFieldNameIdentifier(c));
+    const isAssignment = (n) => !!n && isBinaryExpression(n) && n.operatorToken.kind === 'EqualsToken' && isIdentifier(n.left) && n.left.text === name && !mentions(n.right);
+    // 'assigns': x is set afterwards; 'safe': x isn't read (maybe set); 'reads'
+    const check = (n) => {
+        if (!n || !mentions(n))
+            return 'safe';
+        if (isExpressionStatement(n))
+            return isAssignment(unwrapParentheses(n.expression)) ? 'assigns' : 'reads';
+        if (isBlock(n)) {
+            for (const st of n.statements ?? []) {
+                const r = check(st);
+                if (r !== 'safe')
+                    return r;
+            }
+            return 'safe';
+        }
+        if (isIfStatement(n)) {
+            if (mentions(n.expression))
+                return 'reads';
+            const a = check(n.thenStatement);
+            const b = check(n.elseStatement);
+            if (a === 'reads' || b === 'reads')
+                return 'reads';
+            return a === 'assigns' && b === 'assigns' ? 'assigns' : 'safe';
+        }
+        if (n.kind === 'ForStatement') {
+            if (n.initializer && isAssignment(n.initializer))
+                return 'assigns';
+            if (mentions(n.initializer) || mentions(n.condition))
+                return 'reads';
+            const body = check(n.statement);
+            return body === 'assigns' || (body === 'safe' && !mentions(n.incrementor)) ? 'safe' : 'reads';
+        }
+        if (n.kind === 'WhileStatement' || n.kind === 'DoStatement' || n.kind === 'ForOfStatement' || n.kind === 'ForInStatement') {
+            if (mentions(n.expression) || mentions(n.initializer))
+                return 'reads';
+            return check(n.statement) === 'reads' ? 'reads' : 'safe';
+        }
+        return 'reads';
+    };
+    const index = block.statements.indexOf(statement);
+    if (index < 0)
+        return false;
+    for (const st of block.statements.slice(index + 1)) {
+        const r = check(st);
+        if (r === 'assigns')
+            return true;
+        if (r === 'reads')
+            return false;
+    }
+    // (never read)
+    return true;
 }
 function makeNullableType(typeName) {
     if (!typeName || typeName === 'interface{}' || typeName.startsWith('*'))
@@ -11445,6 +11624,10 @@ const callHandlers = {
         useHelper('uri');
         return `TnEncodeURIComponent(${args[0]})`;
     },
+    encodeURI: (_caller, args) => {
+        useHelper('uri');
+        return `TnEncodeURI(${args[0]})`;
+    },
     decodeURIComponent: (_caller, args) => {
         useHelper('uri');
         return `TnDecodeURIComponent(${args[0]})`;
@@ -11628,6 +11811,12 @@ const callHandlers = {
     // Promise.all: drain every promise channel, collect the results
     'Promise.all': (_caller, args) => {
         useHelper('promiseAll');
+        // (values that may or may not be promises, an any[]: each awaited when it is one)
+        const listNode = currentCallArgNodes[0];
+        if (listNode && !isArrayLiteralExpression(unwrapParentheses(listNode)) && inferExpressionType(listNode) === '[]interface{}') {
+            useHelper('dynamic');
+            return `TnPromiseAllValues(${args[0]})`;
+        }
         return `TnPromiseAll(${args[0] ?? '[]chan interface{}{}'})`;
     },
     'Math.log': (_caller, args) => {
@@ -11982,11 +12171,22 @@ const stringMethodHandlers = {
         return `fmt.Sprintf("%v", ${obj})`;
     }
 };
+// re.test(x) / re.exec(x) on a value that isn't a string (an any token
+// field): its string form, as JS converts it
+function regexSubject(arg) {
+    const node = currentCallArgNodes[0];
+    const argType = node ? inferExpressionType(node) ?? '' : 'string';
+    if (argType === 'string')
+        return arg;
+    useHelper('dynamic');
+    return argType === '*string' ? `TnJSString(TnPtrValue(${arg}))` : `TnJSString(interface{}(${arg}))`;
+}
 const regexpMethodHandlers = {
     test: (obj, args) => currentReceiverGoType === '*TnRegex'
-        ? `${obj}.Test(${args[0]})`
-        : `${obj}.MatchString(${args[0]})`,
+        ? `${obj}.Test(${regexSubject(args[0])})`
+        : `${obj}.MatchString(${regexSubject(args[0])})`,
     exec: (obj, args) => {
+        args = [regexSubject(args[0])];
         if (currentReceiverGoType === '*TnRegex')
             return `${obj}.Find(${args[0]})`;
         // Named groups come back as a match object with a .groups record
@@ -12204,8 +12404,13 @@ const arrayMethodHandlers = {
         return `TnJSString(${obj})`;
     },
     // padStart / padEnd for string arrays (rarely used, but added for completeness)
+    // (undefined past either end: a primitive element is T | undefined, *T)
     at: (obj, args) => {
-        return `func() interface{} { __i := int(${args[0]}); if __i < 0 { __i = len(${obj}) + __i }; if __i < 0 || __i >= len(${obj}) { return nil }; return ${obj}[__i] }()`;
+        const element = receiverElementType();
+        const primitive = ['string', 'float64', 'bool'].includes(element);
+        const resultType = primitive ? `*${element}` : element;
+        const found = primitive ? `__v := __a[__i]; return &__v` : `return __a[__i]`;
+        return `func() ${resultType} { __a := ${obj}; __i := int(${args[0]}); if __i < 0 { __i = len(__a) + __i }; if __i < 0 || __i >= len(__a) { return nil }; ${found} }()`;
     },
 };
 function receiverElementType() {
@@ -12624,6 +12829,13 @@ function visitDynamicMethodCall(node) {
     const args = (node.arguments ?? []).map((a) => visit(a));
     return `${helper}(${[visit(node.expression.expression), ...args].join(', ')})`;
 }
+function isObjectToStringCall(node) {
+    const callee = node.expression;
+    return isPropertyAccessExpression(callee) && callee.name.text === 'call' &&
+        isPropertyAccessExpression(callee.expression) && callee.expression.name.text === 'toString' &&
+        isPropertyAccessExpression(callee.expression.expression) && callee.expression.expression.name.text === 'prototype' &&
+        isIdentifier(callee.expression.expression.expression) && callee.expression.expression.expression.text === 'Object';
+}
 function isRegexReplaceCall(node) {
     if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression))
         return false;
@@ -12651,6 +12863,30 @@ function getSortComparatorElementType(fn) {
     }
     const arrayType = inferExpressionType(call.expression.expression);
     return arrayType?.startsWith('[]') ? arrayType.slice(2) : undefined;
+}
+// The regex literal an expression stands for: the literal itself, or one a
+// module-level const holds, directly or as an object literal's property
+// (other.findPipe with const other = { findPipe: /\|/g })
+function resolveRegexLiteral(node, depth = 0) {
+    if (!node || depth > 5)
+        return undefined;
+    const u = unwrapParentheses(node);
+    if (isRegularExpressionLiteral(u))
+        return u;
+    const constInitializer = (name) => {
+        const d = declaredVariables.has(name) ? declaredVariables.get(name) : undefined;
+        return d && d.parent?.declarationKind === 'const' ? d.initializer : undefined;
+    };
+    if (isIdentifier(u))
+        return resolveRegexLiteral(constInitializer(u.text), depth + 1);
+    if (isPropertyAccessExpression(u) && isIdentifier(u.expression) && isIdentifier(u.name)) {
+        const holder = constInitializer(u.expression.text);
+        if (!holder || !isObjectLiteralExpression(holder))
+            return undefined;
+        const prop = (holder.properties ?? []).filter((p) => isPropertyAssignment(p) && isIdentifier(p.name) && p.name.text === u.name.text)[0];
+        return prop ? resolveRegexLiteral(prop.initializer, depth + 1) : undefined;
+    }
+    return undefined;
 }
 function isRegexReplacerCallback(fn) {
     if (!isArrowFunction(fn) && !isFunctionExpression(fn))
@@ -12801,7 +13037,8 @@ function visitRegexReplace(node) {
         const callback = visit(replacement);
         // (match, ...groups, offset, string): a literal's group count places the
         // offset; otherwise a number parameter takes it
-        const groups = isRegularExpressionLiteral(pattern) ? regexCaptureGroupCount(pattern.text.slice(1, pattern.text.lastIndexOf('/'))) : undefined;
+        const patternLiteral = resolveRegexLiteral(pattern);
+        const groups = patternLiteral ? regexCaptureGroupCount(patternLiteral.text.slice(1, patternLiteral.text.lastIndexOf('/'))) : undefined;
         const params = replacement.parameters ?? [];
         const groupArgs = params
             .map((p, index) => {
@@ -12812,6 +13049,12 @@ function visitRegexReplace(node) {
                 return 'float64(__at)';
             if (groups !== undefined && index === groups + 2)
                 return '__s';
+            // (an optional group parameter, string | undefined: undefined when
+            // the group didn't take part in the match)
+            if (getParameterGoType(p) === '*string') {
+                useHelper('regexMatch');
+                return `TnMatchGroup(__m, float64(${index}))`;
+            }
             return `TnGroup(__m, ${index})`;
         })
             .filter((a) => a)
@@ -12823,6 +13066,27 @@ function visitRegexReplace(node) {
         if (subject)
             return subject;
         return `${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, ${target}, ${fn}, ${isGlobal})`;
+    }
+    // a function value as the replacer (s.replace(re, escapeChar)): called
+    // with the match (one parameter), or with (match, ...groups, offset, string)
+    const replacerType = inferExpressionType(replacement) ?? '';
+    if (replacerType.startsWith('func(')) {
+        useHelper('regexReplaceFunc');
+        if (reIsWrapper)
+            useHelper('fancyRegex');
+        const replacerParams = goFuncParamTypes(replacerType);
+        const callback = visit(replacement);
+        let fn;
+        if (replacerParams.length === 1 && replacerParams[0] === 'string') {
+            fn = `func(__m []string, __at int) string { return ${convertBetweenGoTypes(`__f(TnGroup(__m, 0))`, goFuncReturnType(replacerType) ?? 'interface{}', 'string')} }`;
+        }
+        else {
+            useHelper('regexMatch');
+            useHelper('dynamic');
+            useHelper('error');
+            fn = `func(__m []string, __at int) string { return TnJSString(TnCallValue(__f, TnReplacerArgs(__m, __at, __s)...)) }`;
+        }
+        return `func() string { __s := ${target}; _ = __s; __f := ${callback}; return ${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, __s, ${fn}, ${isGlobal}) }()`;
     }
     // $` and $' (the text before / after the match): expanded per match
     if ((isStringLiteral(replacement) || isNoSubstitutionTemplateLiteral(replacement)) && /\$[`']/.test(replacement.text)) {
@@ -13207,7 +13471,11 @@ function isStringRawTag(tag) {
 }
 // Whether a visited regex argument is the stateful wrapper type
 function isTnRegexArg(arg) {
-    return arg.startsWith('TnRegexCompile(') || variableGoTypes.get(arg) === '*TnRegex';
+    if (arg.startsWith('TnRegexCompile(') || variableGoTypes.get(arg) === '*TnRegex')
+        return true;
+    // (any expression of the JS-semantics regex type: a RegExp property, a call)
+    const node = currentCallArgNodes[0];
+    return !!node && inferExpressionType(node) === '*TnRegex';
 }
 // Built-in type names → Go types ([]interface{}: Array<T> takes T)
 const BUILTIN_TYPE_NAMES = {
@@ -13614,8 +13882,14 @@ function getParameterGoType(param) {
             return inferredType;
         }
     }
-    if (param.parent && isRegexReplacerCallback(param.parent))
-        return 'string';
+    // (match, ...groups, offset, string): the offset is a number, when the
+    // pattern's group count is known
+    if (param.parent && isRegexReplacerCallback(param.parent)) {
+        const pattern = param.parent.parent.arguments[0];
+        const literal = resolveRegexLiteral(pattern);
+        const groups = literal ? regexCaptureGroupCount(literal.text.slice(1, literal.text.lastIndexOf('/'))) : undefined;
+        return groups !== undefined && param.parent.parameters.indexOf(param) === groups + 1 ? 'float64' : 'string';
+    }
     const sortElementType = param.parent ? getSortComparatorElementType(param.parent) : undefined;
     if (sortElementType)
         return sortElementType;
@@ -13991,6 +14265,10 @@ function isVoidCall(expr) {
     expr = unwrapParentheses(expr);
     if (!isCallExpression(expr))
         return false;
+    // process.exit() / process.abort() return nothing (they never return)
+    if (isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) && expr.expression.expression.text === 'process' &&
+        !variableGoTypes.has('process') && ['exit', 'abort'].includes(expr.expression.name.text))
+        return true;
     const fn = getCalleeSignature(expr);
     if (!fn)
         return false;
@@ -14067,6 +14345,14 @@ function visitCallArguments(node) {
         const calleeType = isIdentifier(node.expression) || isPropertyAccessExpression(node.expression)
             ? inferExpressionType(node.expression)
             : undefined;
+        // (a variadic function value: its rest arguments converted to the element type)
+        if (calleeType?.startsWith('func(') && calleeType.includes('...') && !args.some((a) => isSpreadElement(a))) {
+            const paramTypes = goFuncParamTypes(calleeType);
+            const last = paramTypes[paramTypes.length - 1] ?? '';
+            if (last.startsWith('...') && !paramTypes.slice(0, -1).some((t) => t.includes('...'))) {
+                return args.map((arg, index) => toGoValueOfType(arg, index < paramTypes.length - 1 ? paramTypes[index] : last.slice(3)));
+            }
+        }
         if (calleeType?.startsWith('func(') && !calleeType.includes('...')) {
             const paramTypes = goFuncParamTypes(calleeType);
             const converted = args.map((arg, index) => paramTypes[index] && !isSpreadElement(arg) ? toGoValueOfType(arg, paramTypes[index]) : visit(arg));
@@ -15398,6 +15684,7 @@ function needPkg(pkg) {
 const helperRequires = {
     regexReplaceFunc: ['strIndex'],
     replaceAny: ['fancyRegex', 'regexReplaceFunc', 'dynamic'],
+    regexObject: ['fancyRegex', 'dynamic', 'error'],
     objectAssign: ['orderedMap'],
     objectAssignTo: ['dynamic', 'orderedMap'],
     promiseAll: ['orderedMap', 'asyncWait', 'promise'],
@@ -15545,6 +15832,37 @@ function isMockNamespace(node) {
     return MOCKABLE_GLOBALS.has(name) && !variableGoTypes.has(name);
 }
 // '*Counter' / '*Box[float64]' → the class name ('' for other types)
+// a === b where one side is Class.prototype.m and the other inst.m (inst a
+// class instance of a known Go type): 'true' / 'false', else undefined
+function methodIdentityComparison(node) {
+    const op = node.operatorToken.kind;
+    const equal = op === 'EqualsEqualsEqualsToken' || op === 'EqualsEqualsToken';
+    if (!equal && op !== 'ExclamationEqualsEqualsToken' && op !== 'ExclamationEqualsToken')
+        return undefined;
+    const prototypeMethod = (n) => {
+        const u = unwrapParentheses(n);
+        if (!isPropertyAccessExpression(u) || !isPropertyAccessExpression(u.expression) || u.expression.name.text !== 'prototype')
+            return undefined;
+        const cls = u.expression.expression;
+        return isIdentifier(cls) && classNames.has(cls.text) ? findClassMethod(cls.text, u.name.text) : undefined;
+    };
+    const instanceMethod = (n) => {
+        const u = unwrapParentheses(n);
+        if (!isPropertyAccessExpression(u))
+            return undefined;
+        const cls = classNameOfGoType(inferExpressionType(u.expression) ?? '');
+        return cls && !isPolymorphicClass(cls) ? findClassMethod(cls, u.name.text) : undefined;
+    };
+    let a = prototypeMethod(node.right);
+    let b = a ? instanceMethod(node.left) : undefined;
+    if (!a || !b) {
+        a = prototypeMethod(node.left);
+        b = a ? instanceMethod(node.right) : undefined;
+    }
+    if (!a || !b)
+        return undefined;
+    return String((a === b) === equal);
+}
 function classNameOfGoType(goType) {
     if (!goType.startsWith('*'))
         return '';
@@ -16132,6 +16450,7 @@ const helperPackages = {
     iterable: ['reflect'],
     regexReplaceFunc: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
     replaceAny: ['regexp'],
+    regexObject: ['regexp', 'reflect'],
     pathToFileURL: ['net/url', 'path/filepath', 'strings'],
     osPlatform: ['runtime'],
     error: ['runtime', 'strings', 'fmt'],
@@ -16148,7 +16467,7 @@ const helperPackages = {
     clock: ['time'],
     eventLoop: ['sync', 'sync/atomic', 'time'],
     uri: ['strings', 'fmt', 'net/url'],
-    promiseAll: [],
+    promiseAll: ['reflect'],
     promise: ['sync', 'reflect'],
     functionValue: [],
     goMust: [],
@@ -17505,6 +17824,38 @@ func TnNumStr(f float64) string {
 }
 
 // Number(x) like JS: "" → 0, invalid → NaN, booleans → 0/1
+// Object.prototype.toString.call(v): "[object Type]" by the value's JS type
+func TnObjectTypeTag(v interface{}) string {
+	if v == nil {
+		return "[object Undefined]"
+	}
+	if v == TnNull {
+		return "[object Null]"
+	}
+	switch v.(type) {
+	case float64:
+		return "[object Number]"
+	case string:
+		return "[object String]"
+	case bool:
+		return "[object Boolean]"
+	case time.Time:
+		return "[object Date]"
+	case *TnError:
+		return "[object Error]"
+	}
+	if _, ok := v.(interface{ TnProp(string) (interface{}, bool) }); ok && strings.HasSuffix(fmt.Sprintf("%T", v), "TnRegex") {
+		return "[object RegExp]"
+	}
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.Slice:
+		return "[object Array]"
+	case reflect.Func:
+		return "[object Function]"
+	}
+	return "[object Object]"
+}
+
 func TnNumber(v interface{}) float64 {
 	switch t := v.(type) {
 	case float64:
@@ -17945,9 +18296,18 @@ func tnStructCopyPlan(from, to reflect.Type) [][2]int {
 	return plan
 }
 
+// Conversions other helpers register for their types (an object standing in
+// for a regex: see regexObject)
+var tnTypeConverters = map[reflect.Type]func(interface{}) (interface{}, bool){}
+
 func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 	if _, isNull := v.(interface{ TnIsNullValue() }); isNull && t.Kind() != reflect.Interface {
 		v = nil
+	}
+	if convert, ok := tnTypeConverters[t]; ok && v != nil {
+		if converted, cok := convert(v); cok {
+			return reflect.ValueOf(converted), true
+		}
 	}
 	if v == nil {
 		return reflect.Zero(t), true
@@ -19841,6 +20201,20 @@ func tnMarkUnmatched(groups []string, loc []int) {
 }
 
 // m[i] of a match array as string | undefined (an unmatched group, or past the end)
+// A replacer function's arguments: (match, ...groups, offset, string), an
+// unmatched group undefined
+func TnReplacerArgs(m []string, at int, s string) []interface{} {
+	out := make([]interface{}, 0, len(m)+2)
+	for i := range m {
+		if g := TnMatchGroup(m, float64(i)); g != nil {
+			out = append(out, *g)
+		} else {
+			out = append(out, nil)
+		}
+	}
+	return append(out, float64(at), s)
+}
+
 func TnMatchGroup(m []string, i float64) *string {
 	n := int(i)
 	if i < 0 || n >= len(m) {
@@ -20008,6 +20382,9 @@ func TnRegexExecNamed(re *regexp.Regexp, s string) *TnMatch {
 // /g state (lastIndex) and backreference/lookaround patterns (a small
 // backtracking engine).
 type TnRegex struct {
+	// an object cast to RegExp ({ exec: () => null } as unknown as RegExp):
+	// its exec (see regexObject)
+	customExec func(string) []string
 	re        *regexp.Regexp
 	anchored  *regexp.Regexp
 	bt        *tnBt
@@ -20387,6 +20764,12 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 
 // find: leftmost match at or after lastIndex (which /g advances in runes)
 func (r *TnRegex) find(s string) ([]string, []int) {
+	if r.customExec != nil {
+		if m := r.customExec(s); m != nil {
+			return m, []int{0, 0}
+		}
+		return nil, nil
+	}
 	in := &tnRegexInput{s: s}
 	if !r.global && !r.sticky {
 		return r.matchAt(in, 0, false)
@@ -21204,6 +21587,34 @@ func tnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
 			}
 			dst.Set(rt.Field(i).Name, rv.Field(i).Interface())
 		}
+	}
+}`,
+    regexObject: `// An object cast to RegExp (marked's { exec: () => null } as unknown as
+// RegExp): a TnRegex whose matching is the object's exec
+func init() {
+	tnTypeConverters[reflect.TypeOf((*TnRegex)(nil))] = func(v interface{}) (interface{}, bool) {
+		switch x := v.(type) {
+		case *TnRegex:
+			return x, true
+		case *regexp.Regexp:
+			return TnRegexWrap(x), true
+		}
+		if TnGet(v, "exec") == nil {
+			return nil, false
+		}
+		return &TnRegex{source: "(?:)", customExec: func(s string) []string {
+			switch m := TnCallMember(v, "exec", s).(type) {
+			case []string:
+				return m
+			case []interface{}:
+				out := make([]string, len(m))
+				for i, g := range m {
+					out[i] = TnJSString(g)
+				}
+				return out
+			}
+			return nil
+		}}, true
 	}
 }`,
     replaceAny: `// s.replace(pattern, repl) with a pattern typed string | RegExp: a regex's
@@ -22418,6 +22829,19 @@ func TnEncodeURIComponent(s string) string {
 	return b.String()
 }
 
+// encodeURI: also leaves the URI's reserved characters ; , / ? : @ & = + $ #
+func TnEncodeURI(s string) string {
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.IndexByte("-_.!~*'();,/?:@&=+$#", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
 func TnDecodeURIComponent(s string) string {
 	decoded, err := tnurl.PathUnescape(s)
 	if err != nil {
@@ -22930,7 +23354,33 @@ func TnPromiseAny[T any](chs []chan T) chan T {
 	}()
 	return out
 }`,
-    promiseAll: `// Promise.all: every channel drained in order, results collected
+    promiseAll: `// Promise.all over values of any kind: promises awaited, others kept
+func TnPromiseAllValues(values []interface{}) chan []interface{} {
+	out := make(chan []interface{}, 1)
+	go func() {
+		results := make([]interface{}, len(values))
+		for i, v := range values {
+			if ch, ok := v.(chan interface{}); ok {
+				r, reason, rejected := tnSettle(ch)
+				if rejected {
+					TnReject(out, reason)
+					return
+				}
+				results[i] = r
+			} else if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Chan {
+				r, _ := rv.Recv()
+				results[i] = r.Interface()
+			} else {
+				results[i] = v
+			}
+		}
+		TnAsyncSend(out, results)
+		TnAsyncClose(out)
+	}()
+	return out
+}
+
+// Promise.all: every channel drained in order, results collected
 func TnPromiseAll[T any](chs []chan T) chan []T {
 	out := make(chan []T, 1)
 	go func() {

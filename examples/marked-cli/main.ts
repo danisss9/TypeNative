@@ -172,7 +172,7 @@ export async function main() {
     }
 
     function resolveFile(file: string): string {
-      return resolve(file.replace(/^~/, homedir));
+      return resolve(file.replace(/^~/, () => homedir()));
     }
 
     async function fileExists(file: string): Promise<boolean> {
