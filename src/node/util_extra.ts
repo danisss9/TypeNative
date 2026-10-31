@@ -41,24 +41,24 @@ func TnParseArgs(config ...interface{}) *TnParsedArgs {
 		args = append(args, os.Args[1:]...)
 	}
 	strict := true
-	if b, ok := TnGet(cfg, "strict").(bool); ok {
+	if b, ok := TnGetValue(cfg, "strict").(bool); ok {
 		strict = b
 	}
 	allowPositionals := !strict
-	if b, ok := TnGet(cfg, "allowPositionals").(bool); ok {
+	if b, ok := TnGetValue(cfg, "allowPositionals").(bool); ok {
 		allowPositionals = b
 	}
-	allowNegative, _ := TnGet(cfg, "allowNegative").(bool)
-	wantTokens, _ := TnGet(cfg, "tokens").(bool)
+	allowNegative, _ := TnGetValue(cfg, "allowNegative").(bool)
+	wantTokens, _ := TnGetValue(cfg, "tokens").(bool)
 	options := []tnArgOption{}
 	if opts := TnGet(cfg, "options"); opts != nil {
 		for _, e := range tnArgEntries(opts) {
 			o := tnArgOption{name: fmt.Sprint(e[0]), kind: "boolean"}
-			if k, ok := TnGet(e[1], "type").(string); ok {
+			if k, ok := TnGetValue(e[1], "type").(string); ok {
 				o.kind = k
 			}
-			o.short, _ = TnGet(e[1], "short").(string)
-			o.multiple, _ = TnGet(e[1], "multiple").(bool)
+			o.short, _ = TnGetValue(e[1], "short").(string)
+			o.multiple, _ = TnGetValue(e[1], "multiple").(bool)
 			o.def = TnGet(e[1], "default")
 			options = append(options, o)
 		}

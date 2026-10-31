@@ -121,7 +121,7 @@ func TnErrorText(e interface{}) string {
 	if s, ok := e.(string); ok {
 		return s
 	}
-	if msg, ok := TnGet(e, "message").(string); ok {
+	if msg, ok := TnGetValue(e, "message").(string); ok {
 		return "Error: " + msg
 	}
 	return fmt.Sprint(e)
@@ -133,7 +133,7 @@ func TnErrorMatches(e interface{}, expected map[string]interface{}) bool {
 		got := TnGet(e, key)
 		if key == "message" {
 			if _, ok := e.(*TnError); !ok {
-				if m, ok := TnGet(e, "message").(string); ok {
+				if m, ok := TnGetValue(e, "message").(string); ok {
 					got = m
 				}
 			}

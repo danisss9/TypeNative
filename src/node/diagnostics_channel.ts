@@ -125,7 +125,7 @@ func TnNewTracingChannel(nameOrChannels interface{}) *TnTracingChannel {
 	for i, event := range tnTracingEvents {
 		if name, ok := nameOrChannels.(string); ok {
 			channels[i] = TnDiagnosticsChannel("tracing:" + name + ":" + event)
-		} else if c, ok := TnGet(nameOrChannels, event).(*TnChannel); ok {
+		} else if c, ok := TnGetValue(nameOrChannels, event).(*TnChannel); ok {
 			channels[i] = c
 		} else {
 			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"channels."+event+"\\" property must be an instance of Channel"))
@@ -397,10 +397,10 @@ func TnNewConsole(stdout interface{}, rest ...interface{}) *TnConsole {
 			}
 		}
 	} else if stdout != nil {
-		if s, ok := TnGet(stdout, "stdout").(tnStreamLike); ok {
+		if s, ok := TnGetValue(stdout, "stdout").(tnStreamLike); ok {
 			c.stdout = s.tnStream()
 		}
-		if s, ok := TnGet(stdout, "stderr").(tnStreamLike); ok {
+		if s, ok := TnGetValue(stdout, "stderr").(tnStreamLike); ok {
 			c.stderr = s.tnStream()
 		}
 	}

@@ -42,7 +42,7 @@ func TnPerfTimeOrigin() float64 {
 func TnPerfMark(name string, options ...interface{}) *TnPerformanceEntry {
 	entry := &TnPerformanceEntry{name: name, entryType: "mark", startTime: TnPerfNow()}
 	if len(options) > 0 && options[0] != nil {
-		if t, ok := TnGet(options[0], "startTime").(float64); ok {
+		if t, ok := TnGetValue(options[0], "startTime").(float64); ok {
 			entry.startTime = t
 		}
 		entry.detail = TnGet(options[0], "detail")
@@ -74,10 +74,10 @@ func TnPerfMeasure(name string, marks ...interface{}) *TnPerformanceEntry {
 		if s, ok := marks[0].(string); ok {
 			start = tnPerfMarkTime(s)
 		} else if marks[0] != nil {
-			if s, ok := TnGet(marks[0], "start").(string); ok {
+			if s, ok := TnGetValue(marks[0], "start").(string); ok {
 				start = tnPerfMarkTime(s)
 			}
-			if e, ok := TnGet(marks[0], "end").(string); ok {
+			if e, ok := TnGetValue(marks[0], "end").(string); ok {
 				end = tnPerfMarkTime(e)
 			}
 		}
@@ -124,7 +124,7 @@ func TnPerfClear(entryType string, name ...string) {
 const timerPromisesHelper = `// node:timers/promises
 func tnTimerSignal(options []interface{}) *TnAbortSignal {
 	if len(options) > 0 && options[0] != nil {
-		if s, ok := TnGet(options[0], "signal").(*TnAbortSignal); ok {
+		if s, ok := TnGetValue(options[0], "signal").(*TnAbortSignal); ok {
 			return s
 		}
 	}

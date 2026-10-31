@@ -895,7 +895,7 @@ func TnNewHttpAgent(options ...interface{}) *TnHttpAgent {
 	a := &TnHttpAgent{maxSockets: math.Inf(1)}
 	if len(options) > 0 && options[0] != nil {
 		a.options = options[0]
-		a.keepAlive, _ = TnGet(options[0], "keepAlive").(bool)
+		a.keepAlive, _ = TnGetValue(options[0], "keepAlive").(bool)
 		if n, ok := tnNetNumber(TnGet(options[0], "maxSockets")); ok {
 			a.maxSockets = n
 		}
@@ -1409,11 +1409,11 @@ func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
 			cr.timeoutMs = n
 		}
 		cr.store.setAll(TnGet(options, "headers"))
-		if b, ok := TnGet(options, "rejectUnauthorized").(bool); ok && !b {
+		if b, ok := TnGetValue(options, "rejectUnauthorized").(bool); ok && !b {
 			insecure = true
 		}
 		ca = tnPemStrings(TnGet(options, "ca"))
-		if sig, ok := TnGet(options, "signal").(*TnAbortSignal); ok && sig != nil {
+		if sig, ok := TnGetValue(options, "signal").(*TnAbortSignal); ok && sig != nil {
 			cr.signal = sig
 		}
 	}

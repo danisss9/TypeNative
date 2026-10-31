@@ -15,7 +15,7 @@ func tnZlibInput(v interface{}) []byte {
 
 func tnZlibLevel(options []interface{}) int {
 	if len(options) > 0 && options[0] != nil {
-		if level, ok := TnGet(options[0], "level").(float64); ok {
+		if level, ok := TnGetValue(options[0], "level").(float64); ok {
 			return int(level)
 		}
 	}
@@ -201,10 +201,10 @@ func tnBrotliCompress(data []byte, options []interface{}) []byte {
 	opts := brotli.WriterOptions{Quality: 11}
 	if len(options) > 0 && options[0] != nil {
 		if params := TnGet(options[0], "params"); params != nil {
-			if q, ok := TnGet(params, "1").(float64); ok {
+			if q, ok := TnGetValue(params, "1").(float64); ok {
 				opts.Quality = min(max(int(q), 0), 11)
 			}
-			if w, ok := TnGet(params, "2").(float64); ok {
+			if w, ok := TnGetValue(params, "2").(float64); ok {
 				opts.LGWin = min(max(int(w), 10), 24)
 			}
 		}

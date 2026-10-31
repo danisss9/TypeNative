@@ -75,7 +75,7 @@ func TnTestRun(options interface{}, files ...[]string) *TnStream {
 		r.files = append(r.files, &tnTestRunFile{entry: f[0], path: f[1]})
 	}
 	if options != nil {
-		switch c := TnGet(options, "concurrency").(type) {
+		switch c := TnGetValue(options, "concurrency").(type) {
 		case float64:
 			if c > 1 {
 				r.concurrency = int(c)
@@ -150,13 +150,13 @@ func (r *tnTestRun) childOptions() string {
 	for _, p := range tnTestRunPatterns(TnGet(r.options, "testSkipPatterns")) {
 		words = append(words, tnTestOptionWord("--test-skip-pattern", p))
 	}
-	if only, _ := TnGet(r.options, "only").(bool); only {
+	if only, _ := TnGetValue(r.options, "only").(bool); only {
 		words = append(words, "--test-only")
 	}
-	if coverage, _ := TnGet(r.options, "coverage").(bool); coverage {
+	if coverage, _ := TnGetValue(r.options, "coverage").(bool); coverage {
 		words = append(words, "--experimental-test-coverage")
 	}
-	if update, _ := TnGet(r.options, "updateSnapshots").(bool); update || tnTestFilters().updateSnapshots {
+	if update, _ := TnGetValue(r.options, "updateSnapshots").(bool); update || tnTestFilters().updateSnapshots {
 		words = append(words, "--test-update-snapshots")
 	}
 	return strings.Join(words, " ")
@@ -229,7 +229,7 @@ func (r *tnTestRun) startFile(f *tnTestRunFile) {
 		}
 	}
 	cmd := exec.Command(exe, args...)
-	if cwd, ok := TnGet(r.options, "cwd").(string); ok && cwd != "" {
+	if cwd, ok := TnGetValue(r.options, "cwd").(string); ok && cwd != "" {
 		cmd.Dir = cwd
 	}
 	env := os.Environ()
@@ -251,7 +251,7 @@ func (r *tnTestRun) startFile(f *tnTestRunFile) {
 	r.emit(&TnTestEvent{type_: "test:dequeue", data: &TnTestEventData{name: f.path, file: f.path, line: 1, column: 1}})
 	var timer *time.Timer
 	if r.options != nil {
-		if ms, ok := TnGet(r.options, "timeout").(float64); ok && ms > 0 && !math.IsInf(ms, 1) {
+		if ms, ok := TnGetValue(r.options, "timeout").(float64); ok && ms > 0 && !math.IsInf(ms, 1) {
 			timer = time.AfterFunc(time.Duration(ms*float64(time.Millisecond)), func() { cmd.Process.Kill() })
 		}
 	}

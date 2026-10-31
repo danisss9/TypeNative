@@ -751,7 +751,7 @@ func TnPipe[D tnStreamLike](source tnStreamLike, dest D, options ...interface{})
 	dst := dest.tnStream()
 	end := true
 	if len(options) > 0 && options[0] != nil {
-		if e, ok := TnGet(options[0], "end").(bool); ok {
+		if e, ok := TnGetValue(options[0], "end").(bool); ok {
 			end = e
 		}
 	}
@@ -773,7 +773,7 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 	s := TnNewReadable(options...)
 	s.objectMode = true
 	if len(options) > 0 && options[0] != nil {
-		if b, ok := TnGet(options[0], "objectMode").(bool); ok {
+		if b, ok := TnGetValue(options[0], "objectMode").(bool); ok {
 			s.objectMode = b
 		}
 	}
@@ -1090,16 +1090,16 @@ func TnCreateReadStream(path string, options ...interface{}) *TnStream {
 		if enc, ok := opts.(string); ok {
 			s.setEncoding(enc)
 		} else {
-			if enc, ok := TnGet(opts, "encoding").(string); ok && enc != "" {
+			if enc, ok := TnGetValue(opts, "encoding").(string); ok && enc != "" {
 				s.setEncoding(enc)
 			}
-			if v, ok := TnGet(opts, "start").(float64); ok {
+			if v, ok := TnGetValue(opts, "start").(float64); ok {
 				start = int64(v)
 			}
-			if v, ok := TnGet(opts, "end").(float64); ok {
+			if v, ok := TnGetValue(opts, "end").(float64); ok {
 				end = int64(v)
 			}
-			if v, ok := TnGet(opts, "highWaterMark").(float64); ok && v > 0 {
+			if v, ok := TnGetValue(opts, "highWaterMark").(float64); ok && v > 0 {
 				chunkSize = int(v)
 			}
 		}
@@ -1160,10 +1160,10 @@ func TnCreateWriteStream(path string, options ...interface{}) *TnStream {
 	s.path = path
 	flags := "w"
 	if len(options) > 0 && options[0] != nil {
-		if f, ok := TnGet(options[0], "flags").(string); ok && f != "" {
+		if f, ok := TnGetValue(options[0], "flags").(string); ok && f != "" {
 			flags = f
 		}
-		if enc, ok := TnGet(options[0], "encoding").(string); ok && enc != "" {
+		if enc, ok := TnGetValue(options[0], "encoding").(string); ok && enc != "" {
 			s.decodeStrings = true
 		}
 	}

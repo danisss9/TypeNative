@@ -49,25 +49,25 @@ func tnSpawnOpts(options []interface{}) tnSpawnOptions {
 		return o
 	}
 	opts := options[0]
-	if s, ok := TnGet(opts, "cwd").(string); ok {
+	if s, ok := TnGetValue(opts, "cwd").(string); ok {
 		o.cwd = s
 	}
 	if env := TnGet(opts, "env"); env != nil {
 		o.env = tnEnvList(env)
 	}
-	switch sh := TnGet(opts, "shell").(type) {
+	switch sh := TnGetValue(opts, "shell").(type) {
 	case bool:
 		o.shell = sh
 	case string:
 		o.shell = sh != ""
 	}
-	switch in := TnGet(opts, "input").(type) {
+	switch in := TnGetValue(opts, "input").(type) {
 	case string:
 		o.input = []byte(in)
 	case []byte:
 		o.input = in
 	}
-	switch st := TnGet(opts, "stdio").(type) {
+	switch st := TnGetValue(opts, "stdio").(type) {
 	case string:
 		o.stdio = st
 	case []interface{}:
@@ -81,10 +81,10 @@ func tnSpawnOpts(options []interface{}) tnSpawnOptions {
 			o.stdio = st[1]
 		}
 	}
-	if e, ok := TnGet(opts, "encoding").(string); ok {
+	if e, ok := TnGetValue(opts, "encoding").(string); ok {
 		o.encoding = e
 	}
-	if d, ok := TnGet(opts, "detached").(bool); ok {
+	if d, ok := TnGetValue(opts, "detached").(bool); ok {
 		o.detached = d
 	}
 	return o
@@ -440,7 +440,7 @@ func tnExecCollect(cp *TnChildProcess, display string, encoding string, cb inter
 
 func tnExecEncoding(options []interface{}) string {
 	if len(options) > 0 && options[0] != nil {
-		if e, ok := TnGet(options[0], "encoding").(string); ok {
+		if e, ok := TnGetValue(options[0], "encoding").(string); ok {
 			return e
 		}
 	}

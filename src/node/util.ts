@@ -20,21 +20,21 @@ func tnNewInspector(options ...interface{}) *tnInspector {
 	ins := &tnInspector{depth: 2, breakLength: 80, compact: 3, circular: map[uintptr]int{}}
 	if len(options) > 0 && options[0] != nil {
 		opts := options[0]
-		if d, ok := TnGet(opts, "depth").(float64); ok {
+		if d, ok := TnGetValue(opts, "depth").(float64); ok {
 			ins.depth = d
 		} else if TnHas(opts, "depth") && TnGet(opts, "depth") == nil {
 			ins.depth = math.Inf(1)
 		}
-		if b, ok := TnGet(opts, "breakLength").(float64); ok {
+		if b, ok := TnGetValue(opts, "breakLength").(float64); ok {
 			if math.IsInf(b, 1) {
 				ins.breakLength = math.MaxInt32
 			} else {
 				ins.breakLength = int(b)
 			}
 		}
-		if c, ok := TnGet(opts, "compact").(float64); ok {
+		if c, ok := TnGetValue(opts, "compact").(float64); ok {
 			ins.compact = int(c)
-		} else if c, ok := TnGet(opts, "compact").(bool); ok && !c {
+		} else if c, ok := TnGetValue(opts, "compact").(bool); ok && !c {
 			ins.compact = 0
 		}
 	}
@@ -1257,7 +1257,7 @@ func TnStyleText(format interface{}, text string, options ...interface{}) string
 	}
 	validate := true
 	if len(options) > 0 && options[0] != nil {
-		if v, ok := TnGet(options[0], "validateStream").(bool); ok {
+		if v, ok := TnGetValue(options[0], "validateStream").(bool); ok {
 			validate = v
 		}
 	}

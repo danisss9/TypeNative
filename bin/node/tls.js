@@ -131,9 +131,9 @@ func tnTLSServerConfig(options interface{}) (*tls.Config, error) {
 	}
 	cfg.Certificates = certs
 	cfg.ClientCAs = tnCertPool(tnPemStrings(TnGet(options, "ca")))
-	if b, ok := TnGet(options, "requestCert").(bool); ok && b {
+	if b, ok := TnGetValue(options, "requestCert").(bool); ok && b {
 		cfg.ClientAuth = tls.RequestClientCert
-		if r, ok := TnGet(options, "rejectUnauthorized").(bool); (!ok || r) && cfg.ClientCAs != nil {
+		if r, ok := TnGetValue(options, "rejectUnauthorized").(bool); (!ok || r) && cfg.ClientCAs != nil {
 			cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		}
 	}
@@ -337,7 +337,7 @@ func TnCheckServerIdentity(hostname string, cert interface{}) *TnError {
 	} else {
 		altNames = tnNetString(TnGet(cert, "subjectaltname"))
 		subject := TnGet(cert, "subject")
-		switch cn := TnGet(subject, "CN").(type) {
+		switch cn := TnGetValue(subject, "CN").(type) {
 		case string:
 			cns = []string{cn}
 		case []interface{}:
@@ -419,7 +419,7 @@ func tnTLSClientConfig(options interface{}, host string, verified func(err *TnEr
 		}
 		cfg.Certificates = certs
 		roots = tnCertPool(tnPemStrings(TnGet(options, "ca")))
-		if b, ok := TnGet(options, "rejectUnauthorized").(bool); ok {
+		if b, ok := TnGetValue(options, "rejectUnauthorized").(bool); ok {
 			reject = b
 		}
 		if sn := tnNetString(TnGet(options, "servername")); sn != "" {
@@ -617,7 +617,7 @@ func TnTLSCreateServer(args ...interface{}) *TnNetServer {
 	}
 	requestCert := false
 	if options != nil {
-		requestCert, _ = TnGet(options, "requestCert").(bool)
+		requestCert, _ = TnGetValue(options, "requestCert").(bool)
 	}
 	srv.wrapConn = func(conn net.Conn) (net.Conn, error) {
 		tc := tls.Server(conn, cfg)

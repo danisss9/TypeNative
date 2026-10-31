@@ -34,7 +34,7 @@ func TnCreateDgramSocket(kind interface{}, listener ...interface{}) *TnDgramSock
 			if t := tnNetString(TnGet(kind, "type")); t == "udp6" {
 				s.network = "udp6"
 			}
-			s.reuseAddr, _ = TnGet(kind, "reuseAddr").(bool)
+			s.reuseAddr, _ = TnGetValue(kind, "reuseAddr").(bool)
 		}
 	}
 	if len(listener) > 0 && tnIsFunc(listener[0]) {

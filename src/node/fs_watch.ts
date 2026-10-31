@@ -47,10 +47,10 @@ func tnFsWatchStart(path string, options interface{}, events chan *TnFsWatchEven
 	w := &TnFSWatcher{asyncCtx: TnAsyncSnapshot(), root: filepath.Clean(path), events: events}
 	persistent := true
 	if _, isString := options.(string); options != nil && !isString {
-		if p, ok := TnGet(options, "persistent").(bool); ok {
+		if p, ok := TnGetValue(options, "persistent").(bool); ok {
 			persistent = p
 		}
-		w.recursive, _ = TnGet(options, "recursive").(bool)
+		w.recursive, _ = TnGetValue(options, "recursive").(bool)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -71,7 +71,7 @@ func tnFsWatchStart(path string, options interface{}, events chan *TnFsWatchEven
 		TnLoopRef()
 	}
 	if options != nil {
-		if signal, ok := TnGet(options, "signal").(*TnAbortSignal); ok && signal != nil {
+		if signal, ok := TnGetValue(options, "signal").(*TnAbortSignal); ok && signal != nil {
 			if signal.aborted {
 				TnLoopPost(func() { w.close() })
 			} else {
@@ -269,10 +269,10 @@ func TnWatchFile(path string, rest ...interface{}) *TnStatWatcher {
 			continue
 		}
 		if a != nil {
-			if n, ok := TnGet(a, "interval").(float64); ok && n > 0 {
+			if n, ok := TnGetValue(a, "interval").(float64); ok && n > 0 {
 				interval = n
 			}
-			if p, ok := TnGet(a, "persistent").(bool); ok {
+			if p, ok := TnGetValue(a, "persistent").(bool); ok {
 				persistent = p
 			}
 		}

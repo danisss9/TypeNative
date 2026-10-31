@@ -151,22 +151,22 @@ func tnTestNew(suite bool, args []interface{}) *TnTestNode {
 				n.fn = a
 				continue
 			}
-			switch s := TnGet(a, "skip").(type) {
+			switch s := TnGetValue(a, "skip").(type) {
 			case bool:
 				n.skip = s
 			case string:
 				n.skip, n.skipMsg = true, s
 			}
-			switch td := TnGet(a, "todo").(type) {
+			switch td := TnGetValue(a, "todo").(type) {
 			case bool:
 				n.todo = td
 			case string:
 				n.todo, n.todoMsg = true, td
 			}
-			if ms, ok := TnGet(a, "timeout").(float64); ok {
+			if ms, ok := TnGetValue(a, "timeout").(float64); ok {
 				n.timeoutMs = ms
 			}
-			if only, ok := TnGet(a, "only").(bool); ok {
+			if only, ok := TnGetValue(a, "only").(bool); ok {
 				n.only = only
 			}
 		}
@@ -974,7 +974,7 @@ func (m *TnMockTimers) enable(options ...interface{}) {
 	apis := map[string]bool{"setTimeout": true, "setInterval": true, "setImmediate": true, "Date": true}
 	m.now = 0
 	if len(options) > 0 && options[0] != nil {
-		switch list := TnGet(options[0], "apis").(type) {
+		switch list := TnGetValue(options[0], "apis").(type) {
 		case []string:
 			apis = map[string]bool{}
 			for _, a := range list {
@@ -986,7 +986,7 @@ func (m *TnMockTimers) enable(options ...interface{}) {
 				apis[fmt.Sprint(a)] = true
 			}
 		}
-		switch now := TnGet(options[0], "now").(type) {
+		switch now := TnGetValue(options[0], "now").(type) {
 		case float64:
 			m.now = now
 		case time.Time:

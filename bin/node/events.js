@@ -38,7 +38,7 @@ var TnDefaultMaxListeners = 10.0
 func TnNewEventEmitter(options ...interface{}) *TnEventEmitter {
 	e := &TnEventEmitter{state: &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}, captureRejections: TnCaptureRejections}}
 	if len(options) > 0 && options[0] != nil {
-		if b, ok := TnGet(options[0], "captureRejections").(bool); ok {
+		if b, ok := TnGetValue(options[0], "captureRejections").(bool); ok {
 			e.state.captureRejections = b
 		}
 	}
@@ -380,7 +380,7 @@ type TnEvent struct {
 func TnNewEvent(eventType string, options ...interface{}) *TnEvent {
 	ev := &TnEvent{eventType: eventType, timeStamp: float64(time.Now().UnixNano()) / 1e6}
 	if len(options) > 0 && options[0] != nil {
-		if c, ok := TnGet(options[0], "cancelable").(bool); ok {
+		if c, ok := TnGetValue(options[0], "cancelable").(bool); ok {
 			ev.cancelable = c
 		}
 	}
@@ -418,7 +418,7 @@ func (t *TnEventTarget) addEventListener(eventType string, fn interface{}, optio
 	}
 	once := false
 	if len(options) > 0 && options[0] != nil {
-		if o, ok := TnGet(options[0], "once").(bool); ok {
+		if o, ok := TnGetValue(options[0], "once").(bool); ok {
 			once = o
 		}
 	}

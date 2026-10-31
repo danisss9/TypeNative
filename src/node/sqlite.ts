@@ -115,7 +115,7 @@ func tnSqliteFlag(options interface{}, key string, def bool) bool {
 	if options == nil {
 		return def
 	}
-	switch v := TnGet(options, key).(type) {
+	switch v := TnGetValue(options, key).(type) {
 	case bool:
 		return v
 	case *bool:
@@ -130,7 +130,7 @@ func tnSqliteNumber(options interface{}, key string, def float64) float64 {
 	if options == nil {
 		return def
 	}
-	switch v := TnGet(options, key).(type) {
+	switch v := TnGetValue(options, key).(type) {
 	case float64:
 		return v
 	case *float64:
@@ -145,7 +145,7 @@ func tnSqliteString(options interface{}, key string, def string) string {
 	if options == nil {
 		return def
 	}
-	switch v := TnGet(options, key).(type) {
+	switch v := TnGetValue(options, key).(type) {
 	case string:
 		return v
 	case *string:
@@ -186,7 +186,7 @@ func TnNewSqliteDb(path interface{}, opts ...interface{}) *TnSqliteDb {
 	case []byte:
 		db.path = string(p)
 	default:
-		if href, ok := TnGet(path, "href").(string); ok && path != nil {
+		if href, ok := TnGetValue(path, "href").(string); ok && path != nil {
 			db.path = href
 		} else {
 			panic(tnSqliteArgType("The \\"path\\" argument must be a string, Uint8Array, or URL without null bytes."))
@@ -266,7 +266,7 @@ func (db *TnSqliteDb) open() {
 	}
 	if db.limitOptions != nil {
 		for i, name := range tnSqliteLimitNames {
-			if v, ok := TnGet(db.limitOptions, name).(float64); ok {
+			if v, ok := TnGetValue(db.limitOptions, name).(float64); ok {
 				db.limits.set(i, v)
 			}
 		}
@@ -669,7 +669,7 @@ func (db *TnSqliteDb) deserialize(data []byte, options ...interface{}) {
 	db.requireOpen()
 	schema := "main"
 	if len(options) > 0 && options[0] != nil {
-		if s, ok := TnGet(options[0], "dbName").(string); ok {
+		if s, ok := TnGetValue(options[0], "dbName").(string); ok {
 			schema = s
 		}
 	}

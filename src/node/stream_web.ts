@@ -257,7 +257,7 @@ func TnNewReadableStream(args ...interface{}) *TnReadableStream {
 		s.startWith(nil)
 		return s
 	}
-	if t, _ := TnGet(source, "type").(string); t == "bytes" {
+	if t, _ := TnGetValue(source, "type").(string); t == "bytes" {
 		s.strategy.bytes = true
 		if len(rest) == 0 {
 			s.strategy.hwm = 0
@@ -825,7 +825,7 @@ func (s *TnReadableStream) pipeTo(dest *TnWritableStream, options ...interface{}
 	ch := make(chan struct{})
 	opts := tnWebArg(options)
 	flag := func(name string) bool {
-		b, _ := TnGet(opts, name).(bool)
+		b, _ := TnGetValue(opts, name).(bool)
 		return b
 	}
 	preventClose, preventAbort, preventCancel := flag("preventClose"), flag("preventAbort"), flag("preventCancel")
@@ -849,7 +849,7 @@ func (s *TnReadableStream) pipeTo(dest *TnWritableStream, options ...interface{}
 		}
 		close(ch)
 	}
-	if signal, ok := TnGet(opts, "signal").(*TnAbortSignal); ok && signal != nil {
+	if signal, ok := TnGetValue(opts, "signal").(*TnAbortSignal); ok && signal != nil {
 		onAbort := func() {
 			reason := tnWebAbortReason(signal)
 			if !preventAbort {
@@ -934,8 +934,8 @@ func (s *TnReadableStream) pipeThrough(transform interface{}, options ...interfa
 	if t, ok := transform.(*TnTransformStream); ok {
 		writable, readable = t.writable, t.readable
 	} else {
-		writable, _ = TnGet(transform, "writable").(*TnWritableStream)
-		readable, _ = TnGet(transform, "readable").(*TnReadableStream)
+		writable, _ = TnGetValue(transform, "writable").(*TnWritableStream)
+		readable, _ = TnGetValue(transform, "readable").(*TnReadableStream)
 	}
 	if writable == nil || readable == nil {
 		panic(tnWebTypeError("ERR_INVALID_ARG_TYPE", "The \\"transform\\" argument must have readable and writable streams"))
@@ -1535,8 +1535,8 @@ func TnNewTextDecoderStream(args ...interface{}) *TnTransformStream {
 		ts.encoding = "utf-8"
 	}
 	if len(args) > 1 && args[1] != nil {
-		ts.fatal, _ = TnGet(args[1], "fatal").(bool)
-		ts.ignoreBOM, _ = TnGet(args[1], "ignoreBOM").(bool)
+		ts.fatal, _ = TnGetValue(args[1], "fatal").(bool)
+		ts.ignoreBOM, _ = TnGetValue(args[1], "ignoreBOM").(bool)
 	}
 	return ts
 }
@@ -1749,8 +1749,8 @@ func TnDuplexFromWeb(pair interface{}, options ...interface{}) *TnStream {
 	if t, ok := pair.(*TnTransformStream); ok {
 		readable, writable = t.readable, t.writable
 	} else {
-		readable, _ = TnGet(pair, "readable").(*TnReadableStream)
-		writable, _ = TnGet(pair, "writable").(*TnWritableStream)
+		readable, _ = TnGetValue(pair, "readable").(*TnReadableStream)
+		writable, _ = TnGetValue(pair, "writable").(*TnWritableStream)
 	}
 	r := TnReadableFromWeb(readable, options...)
 	w := TnWritableFromWeb(writable, options...)
@@ -1857,7 +1857,7 @@ func tnBlobParts(parts interface{}) []byte {
 }
 
 func tnBlobType(options interface{}) string {
-	t, _ := TnGet(options, "type").(string)
+	t, _ := TnGetValue(options, "type").(string)
 	for _, c := range t {
 		if c < 0x20 || c > 0x7e {
 			return ""

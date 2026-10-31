@@ -331,7 +331,7 @@ func (st *TnHttp2Stream) respond(args ...interface{}) {
 	st.headersSent = true
 	st.sentHeaders = sent
 	if len(args) > 1 && args[1] != nil {
-		if end, _ := TnGet(args[1], "endStream").(bool); end {
+		if end, _ := TnGetValue(args[1], "endStream").(bool); end {
 			st.end()
 		}
 	}
@@ -463,7 +463,7 @@ func TnHttp2CreateServer(secure bool, args ...interface{}) *TnHttpServer {
 		allowHTTP1 := false
 		for _, a := range args {
 			if a != nil && !tnIsFunc(a) {
-				allowHTTP1, _ = TnGet(a, "allowHTTP1").(bool)
+				allowHTTP1, _ = TnGetValue(a, "allowHTTP1").(bool)
 			}
 		}
 		if hs.tlsConfig == nil {
@@ -521,7 +521,7 @@ func (s *TnHttp2Session) request(headers interface{}, options ...interface{}) *T
 	}
 	endStream := false
 	if len(options) > 0 && options[0] != nil {
-		endStream, _ = TnGet(options[0], "endStream").(bool)
+		endStream, _ = TnGetValue(options[0], "endStream").(bool)
 	}
 	// Requests without a body go out right away, as Node sends their headers at once
 	if endStream || st.method == "GET" || st.method == "HEAD" {

@@ -169,13 +169,13 @@ func tnTestEventOf(v interface{}) *TnTestEvent {
 	d.message = tnTestStr(TnGet(raw, "message"))
 	d.level = tnTestStr(TnGet(raw, "level"))
 	d.duration_ms = tnTestNum(TnGet(raw, "duration_ms"))
-	d.success, _ = TnGet(raw, "success").(bool)
+	d.success, _ = TnGetValue(raw, "success").(bool)
 	if det := TnGet(raw, "details"); det != nil {
 		if typed, ok := det.(*TnTestEventDetails); ok {
 			d.details = typed
 		} else {
 			d.details = &TnTestEventDetails{duration_ms: tnTestNum(TnGet(det, "duration_ms")), type_: tnTestStr(TnGet(det, "type")), error_: TnGet(det, "error")}
-			d.details.passed, _ = TnGet(det, "passed").(bool)
+			d.details.passed, _ = TnGetValue(det, "passed").(bool)
 		}
 	}
 	if c := TnGet(raw, "counts"); c != nil {

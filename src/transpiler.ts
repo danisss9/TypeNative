@@ -1225,6 +1225,24 @@ function rewriteNamespaceAccess(nodes: AstNode[], namespaces: Set<string>): void
   for (let i = 0; i < nodes.length; i++) nodes[i] = rewrite(nodes[i]);
 }
 
+// &struct{ a T; b U }{a: …, b: …} as &Named{a: …, b: …} (its keyed fields are
+// the named type's too); a conversion when the literal isn't of that shape
+function retypeStructLiteral(code: string, pointerType: string): string {
+  let depth = 0;
+  for (let i = '&struct'.length; i < code.length; i++) {
+    const c = code[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        const rest = code.slice(i + 1);
+        return rest.startsWith('{') ? `&${pointerType.slice(1)}${rest}` : `(${pointerType})(${code})`;
+      }
+    }
+  }
+  return `(${pointerType})(${code})`;
+}
+
 // Fields of a primitive type (string, number, boolean) that an object literal
 // fills with a value TypeScript types as that primitive but which may be
 // undefined at run time: a regex match's group (m[1] of an exec or match
@@ -2377,7 +2395,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (comparedToNil) return getSafeName(node.text);
       // (one that may hold null — a regex match — reads as a nil slice then)
       const mutated = isAssignmentTarget(node) || (isPropertyAccessExpression(parent) && parent.expression === node && MUTATING_ARRAY_METHODS.has(parent.name.text));
-      if (!mutated && mayHoldNullArray(node)) {
+      // (x?.[i] / x?.length: the reference may be nil)
+      // (and x ?? d, x || d: x may be absent)
+      const optionalRead = !!parent && (
+        ((isElementAccessExpression(parent) || isPropertyAccessExpression(parent)) && parent.expression === node && hasQuestionDot(parent)) ||
+        (isBinaryExpression(parent) && parent.left === node && ['QuestionQuestionToken', 'BarBarToken'].includes(parent.operatorToken.kind)));
+      if (!mutated && (optionalRead || mayHoldNullArray(node))) {
         useHelper('dynamic');
         return `TnDerefSlice(${getSafeName(node.text)})`;
       }
@@ -5043,6 +5066,20 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     useHelper('dynamic');
     return 'TnNull';
   }
+  // x || null / x ?? null into an any slot: x, or JS null (not undefined)
+  const orNull = unwrapParentheses(expr);
+  if (goType === 'interface{}' && isBinaryExpression(orNull) && ['BarBarToken', 'QuestionQuestionToken'].includes(orNull.operatorToken.kind) && unwrapParentheses(orNull.right).kind === 'NullKeyword' && storesJsNull(orNull.right)) {
+    useHelper('dynamic');
+    const test = orNull.operatorToken.kind === 'BarBarToken' ? 'TnTruthy(__l)' : '!TnIsNil(__l)';
+    return `func() interface{} { __l := ${toGoValueOfType(orNull.left, 'interface{}')}; if ${test} { return __l }; return TnNull }()`;
+  }
+  // c ? null : x into an any slot: each branch as an any (null stays null)
+  if (goType === 'interface{}' && isConditionalExpression(orNull) && [orNull.whenTrue, orNull.whenFalse].some((b: AstNode) => unwrapParentheses(b).kind === 'NullKeyword') && storesJsNull(orNull.whenTrue)) {
+    useHelper('dynamic');
+    const whenTrue = withNarrowing(getNarrowedNames(orNull.condition, true), () => toGoValueOfType(orNull.whenTrue, 'interface{}'));
+    const whenFalse = withNarrowing(getNarrowedNames(orNull.condition, false), () => toGoValueOfType(orNull.whenFalse, 'interface{}'));
+    return `func() interface{} { if ${toGoCondition(orNull.condition)} { return ${whenTrue} }; return ${whenFalse} }()`;
+  }
   // T | undefined into an any slot: its value, or nil (not a typed nil pointer)
   if (goType === 'interface{}' && NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(expr) ?? '')) {
     useHelper('dynamic');
@@ -5111,11 +5148,19 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     if (goType && goType.startsWith('*[]')) {
       // Go bridge element types are qualified (*[]io/fs.DirEntry)
       goType = goLocalType(goType);
-      if (isIdentifier(expr) && isReferenceArrayRead(expr)) {
-        return getSafeName(expr.text);
+      // (x! is x)
+      let field = unwrapParentheses(expr);
+      while (field && field.kind === 'NonNullExpression') field = unwrapParentheses(field.expression);
+      if (isIdentifier(field) && isReferenceArrayRead(field)) {
+        const own = (inferExpressionType(field) ?? '').replace(/^\*/, '');
+        // (of another element type, as a SourceToken[] where Token[] is
+        // expected: a converted copy)
+        if (own.startsWith('[]') && `*${own}` !== goType && goType === '*[]interface{}') {
+          return `func() ${goType} { if ${getSafeName(field.text)} == nil { return nil }; __v := ${toGoValueOfType(field, goType.slice(1))}; return &__v }()`;
+        }
+        return getSafeName(field.text);
       }
       // an object's array field: the reference it holds (shared, as in JS)
-      const field = unwrapParentheses(expr);
       if (isReferenceFieldAccess(field) && !hasQuestionDot(field) && inferRawExpressionType(field) === goType) {
         return visit(field, { rawArrayField: true });
       }
@@ -5232,7 +5277,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   // *Struct slot: take the address (shares the value, like a JS object reference)
   if (goType?.startsWith('*') && isStructGoType(goType.slice(1)) && !isNilLiteral(expr)) {
     // an untyped literal (&struct{...}) converts to the named pointer type
-    if (isObjectLiteralExpression(expr)) return code.startsWith('&struct{') ? `(${goType})(${code})` : code;
+    // (as a literal of that type: the named type has fields of its own, __keys)
+    if (isObjectLiteralExpression(expr)) return code.startsWith('&struct{') ? retypeStructLiteral(code, goType) : code;
     if (inferExpressionType(expr) !== goType.slice(1)) return code;
     // the element itself (not a bounds-checked copy), so mutations are shared
     if (isElementAccessExpression(expr) && inferExpressionType(expr.expression)?.startsWith('[]')) {
@@ -5829,6 +5875,12 @@ function jsStringOf(code: string, goType: string | undefined): string {
     useHelper('dynamic');
     useHelper('error');
     return `TnJSString(${code})`;
+  }
+  // (string | undefined and the like: the value, or "undefined")
+  if (goType === '*string' || goType === '*float64' || goType === '*bool') {
+    useHelper('dynamic');
+    useHelper('error');
+    return `TnJSString(TnPtrValue(${code}))`;
   }
   if (goType === 'time.Time') {
     useHelper('date');
@@ -13584,6 +13636,12 @@ function functionValueGoType(expr: AstNode): string {
       return inferArrowFunctionGoType(declared);
     }
   }
+  // (const f: any = fn: a function under another name)
+  if (isIdentifier(expr) && !inferred) {
+    const declaration = findLocalConst(expr);
+    const init = declaration?.initializer ? unwrapParentheses(declaration.initializer) : undefined;
+    if (init && isIdentifier(init) && init.text !== expr.text) return functionValueGoType(init);
+  }
   return '';
 }
 
@@ -14448,6 +14506,8 @@ function arrayReferenceOf(expr: AstNode, sliceType: string): string {
   if (isNilLiteral(u)) return `(*${goType})(nil)`;
   // (an array reference variable: the reference itself)
   if (isIdentifier(u) && isReferenceArrayRead(u)) return getSafeName(u.text);
+  // (an object type's array field: the reference it holds)
+  if (isReferenceFieldAccess(u) && !hasQuestionDot(u) && inferRawExpressionType(u) === `*${goType}`) return visit(u, { rawArrayField: true });
   // (a field of a struct pointer is addressable, whatever the pointer's expression)
   if (isPropertyAccessExpression(u) && !hasQuestionDot(u) && inferExpressionType(u) === goType && (inferExpressionType(u.expression) ?? '').startsWith('*')) {
     const field = visit(u);
@@ -14455,7 +14515,7 @@ function arrayReferenceOf(expr: AstNode, sliceType: string): string {
   }
   if (isBinaryExpression(u) && u.operatorToken.kind === 'QuestionQuestionToken') {
     // (a ?? b: a when it is set)
-    return `func() *${goType} { if __r := ${arrayReferenceOf(u.left, goType)}; *__r != nil { return __r }; return ${arrayReferenceOf(u.right, goType)} }()`;
+    return `func() *${goType} { if __r := ${arrayReferenceOf(u.left, goType)}; __r != nil && *__r != nil { return __r }; return ${arrayReferenceOf(u.right, goType)} }()`;
   }
   return `func() *${goType} { __v := ${toGoValueOfType(u, goType)}; return &__v }()`;
 }
@@ -17417,6 +17477,19 @@ func tnFieldOf(sv reflect.Value, key string) reflect.Value {
 		return reflect.Value{}
 	}
 	return f
+}
+
+// TnGet for the runtime's own option readers: an array field's reference
+// (*[]T, an object type's array) read as its array
+func TnGetValue(obj interface{}, key string) interface{} {
+	v := TnGet(obj, key)
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.Type().Elem().Kind() == reflect.Slice {
+		if rv.IsNil() {
+			return nil
+		}
+		return rv.Elem().Interface()
+	}
+	return v
 }
 
 func TnGet(obj interface{}, key string) interface{} {

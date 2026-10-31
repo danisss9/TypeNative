@@ -519,7 +519,7 @@ func (d *TnTextDecoder) decode(args ...interface{}) string {
 	}
 	stream := false
 	if len(args) > 1 && args[1] != nil {
-		stream, _ = TnGet(args[1], "stream").(bool)
+		stream, _ = TnGetValue(args[1], "stream").(bool)
 	}
 	data := b
 	if len(d.pending) > 0 {

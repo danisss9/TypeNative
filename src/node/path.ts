@@ -714,7 +714,7 @@ func TnParsedPathOf(v interface{}) *TnParsedPath {
 		return p
 	}
 	str := func(key string) string {
-		if s, ok := TnGet(v, key).(string); ok {
+		if s, ok := TnGetValue(v, key).(string); ok {
 			return s
 		}
 		return ""

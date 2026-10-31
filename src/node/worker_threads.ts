@@ -533,7 +533,7 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 		opts = options[0]
 	}
 	if opts != nil {
-		if b, ok := TnGet(opts, "eval").(bool); ok && b {
+		if b, ok := TnGetValue(opts, "eval").(bool); ok && b {
 			panic(TnNodeError("Error", "ERR_WORKER_UNSUPPORTED_OPERATION", "eval workers are not supported by TypeNative"))
 		}
 	}

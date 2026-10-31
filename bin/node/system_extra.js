@@ -303,9 +303,9 @@ func (o *TnPerformanceObserver) observe(options interface{}) {
 			o.types[TnJSString(rv.Index(i).Interface())] = true
 		}
 	}
-	if t, ok := TnGet(options, "type").(string); ok {
+	if t, ok := TnGetValue(options, "type").(string); ok {
 		o.types[t] = true
-		if buffered, _ := TnGet(options, "buffered").(bool); buffered {
+		if buffered, _ := TnGetValue(options, "buffered").(bool); buffered {
 			for _, e := range TnPerfEntries("", t) {
 				o.queue(e)
 			}
@@ -516,7 +516,7 @@ func (h *TnHistogram) reset() {
 func TnMonitorEventLoopDelay(options ...interface{}) *TnHistogram {
 	h := &TnHistogram{interval: 10}
 	if len(options) > 0 && options[0] != nil {
-		if n, ok := TnGet(options[0], "resolution").(float64); ok && n > 0 {
+		if n, ok := TnGetValue(options[0], "resolution").(float64); ok && n > 0 {
 			h.interval = n
 		}
 	}

@@ -234,11 +234,11 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 		}
 	}
 	stdio := "inherit"
-	if silent, _ := TnGet(opts, "silent").(bool); silent {
+	if silent, _ := TnGetValue(opts, "silent").(bool); silent {
 		stdio = "pipe"
 	}
 	spawnOpts := map[string]interface{}{"env": envMap, "stdio": stdio}
-	if cwd, ok := TnGet(opts, "cwd").(string); ok && cwd != "" {
+	if cwd, ok := TnGetValue(opts, "cwd").(string); ok && cwd != "" {
 		spawnOpts["cwd"] = cwd
 	}
 	cp := TnSpawn(exe, argv, spawnOpts)
@@ -532,7 +532,7 @@ func (c *TnCluster) setupPrimary(settings ...interface{}) {
 			}
 		}
 	}
-	if b, ok := TnGet(s, "silent").(bool); ok {
+	if b, ok := TnGetValue(s, "silent").(bool); ok {
 		c.silent = b
 	}
 	for _, key := range []string{"args", "silent", "exec", "execArgv", "cwd"} {

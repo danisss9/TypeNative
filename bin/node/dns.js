@@ -44,14 +44,14 @@ func tnLookupOptions(options interface{}) (float64, bool) {
 	if n, ok := tnNetNumber(TnGet(options, "family")); ok {
 		family = n
 	}
-	if s, ok := TnGet(options, "family").(string); ok {
+	if s, ok := TnGetValue(options, "family").(string); ok {
 		if s == "IPv4" {
 			family = 4
 		} else if s == "IPv6" {
 			family = 6
 		}
 	}
-	all, _ := TnGet(options, "all").(bool)
+	all, _ := TnGetValue(options, "all").(bool)
 	return family, all
 }
 

@@ -545,13 +545,13 @@ func TnReadSync(fd float64, buf []byte, args ...interface{}) float64 {
 		if n, ok := a.(float64); ok {
 			nums = append(nums, n)
 		} else if a != nil {
-			if p, ok := TnGet(a, "position").(float64); ok {
+			if p, ok := TnGetValue(a, "position").(float64); ok {
 				position = int64(p)
 			}
-			if o, ok := TnGet(a, "offset").(float64); ok {
+			if o, ok := TnGetValue(a, "offset").(float64); ok {
 				offset = int(o)
 			}
-			if l, ok := TnGet(a, "length").(float64); ok {
+			if l, ok := TnGetValue(a, "length").(float64); ok {
 				length = int(l)
 			}
 		}

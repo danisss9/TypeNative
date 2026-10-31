@@ -28,7 +28,7 @@ func TnCreateInterface(options interface{}, rest ...interface{}) *TnReadline {
 	} else if options != nil {
 		input = TnGet(options, "input")
 		output = TnGet(options, "output")
-		if p, ok := TnGet(options, "prompt").(string); ok {
+		if p, ok := TnGetValue(options, "prompt").(string); ok {
 			rl.promptText = p
 		}
 	}

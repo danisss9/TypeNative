@@ -272,19 +272,19 @@ func tnReadKeyInput(v interface{}) tnKeyInput {
 	if v == nil || TnIsNil(v) {
 		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"key\\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received undefined"))
 	}
-	if f, ok := TnGet(v, "format").(string); ok && f != "" {
+	if f, ok := TnGetValue(v, "format").(string); ok && f != "" {
 		in.format = f
 	}
-	if t, ok := TnGet(v, "type").(string); ok {
+	if t, ok := TnGetValue(v, "type").(string); ok {
 		in.typ = t
 	}
-	switch k := TnGet(v, "key").(type) {
+	switch k := TnGetValue(v, "key").(type) {
 	case *TnKeyObject:
 		in.object = k
 	case *TnCryptoKey:
 		in.object = k.key
 	case string:
-		enc, _ := TnGet(v, "encoding").(string)
+		enc, _ := TnGetValue(v, "encoding").(string)
 		if enc != "" && in.format != "pem" {
 			in.data = TnBufferFromString(k, enc)
 		} else {
@@ -577,7 +577,7 @@ func tnJWK(pub tncrypto.PublicKey, priv tncrypto.PrivateKey) map[string]interfac
 }
 
 func tnJWKBytes(jwk interface{}, key string) []byte {
-	s, _ := TnGet(jwk, key).(string)
+	s, _ := TnGetValue(jwk, key).(string)
 	if s == "" {
 		return nil
 	}
@@ -604,7 +604,7 @@ func tnBigFrom(b []byte) *tnbig.Int { return new(tnbig.Int).SetBytes(b) }
 
 // Keys from a JWK object (RSA, EC, OKP Ed25519 / X25519)
 func tnKeyFromJWK(jwk interface{}) (tncrypto.PublicKey, tncrypto.PrivateKey) {
-	kty, _ := TnGet(jwk, "kty").(string)
+	kty, _ := TnGetValue(jwk, "kty").(string)
 	switch kty {
 	case "RSA":
 		pub := &rsa.PublicKey{N: tnBigFrom(tnJWKBytes(jwk, "n")), E: int(tnBigFrom(tnJWKBytes(jwk, "e")).Int64())}
@@ -616,7 +616,7 @@ func tnKeyFromJWK(jwk interface{}) (tncrypto.PublicKey, tncrypto.PrivateKey) {
 		priv.Precompute()
 		return &priv.PublicKey, priv
 	case "EC":
-		crv, _ := TnGet(jwk, "crv").(string)
+		crv, _ := TnGetValue(jwk, "crv").(string)
 		pub := &ecdsa.PublicKey{Curve: tnNamedCurve(crv), X: tnBigFrom(tnJWKBytes(jwk, "x")), Y: tnBigFrom(tnJWKBytes(jwk, "y"))}
 		d := tnJWKBytes(jwk, "d")
 		if d == nil {
@@ -625,7 +625,7 @@ func tnKeyFromJWK(jwk interface{}) (tncrypto.PublicKey, tncrypto.PrivateKey) {
 		priv := &ecdsa.PrivateKey{PublicKey: *pub, D: tnBigFrom(d)}
 		return &priv.PublicKey, priv
 	case "OKP":
-		crv, _ := TnGet(jwk, "crv").(string)
+		crv, _ := TnGetValue(jwk, "crv").(string)
 		x, d := tnJWKBytes(jwk, "x"), tnJWKBytes(jwk, "d")
 		switch crv {
 		case "Ed25519":
@@ -662,8 +662,8 @@ func tnKeyEncodingError(typ string) *TnError {
 // export({ format: 'pem' | 'der' | 'jwk', type: 'spki' | 'pkcs1' | 'pkcs8' | 'sec1' })
 func (k *TnKeyObject) export(options ...interface{}) interface{} {
 	opts := tnCryptoArg(options)
-	format, _ := TnGet(opts, "format").(string)
-	typ, _ := TnGet(opts, "type").(string)
+	format, _ := TnGetValue(opts, "format").(string)
+	typ, _ := TnGetValue(opts, "type").(string)
 	switch k.type_ {
 	case "secret":
 		if format == "jwk" {
@@ -756,7 +756,7 @@ func tnGenerateAsymmetric(kind string, options interface{}) tncrypto.PrivateKey 
 		}
 		return k
 	case "ec":
-		name, _ := TnGet(options, "namedCurve").(string)
+		name, _ := TnGetValue(options, "namedCurve").(string)
 		k, err := ecdsa.GenerateKey(tnNamedCurve(name), cryptorand.Reader)
 		if err != nil {
 			panic(tnCryptoErr(err))
@@ -937,7 +937,7 @@ func tnReadSignOptions(key interface{}) tnSignOptions {
 		o.saltLength = int(v)
 		o.hasSalt = true
 	}
-	if s, ok := TnGet(key, "dsaEncoding").(string); ok && s != "" {
+	if s, ok := TnGetValue(key, "dsaEncoding").(string); ok && s != "" {
 		o.dsaEncoding = s
 	}
 	return o
@@ -1120,7 +1120,7 @@ func tnRSAPadding(key interface{}, def int) (int, tncrypto.Hash, []byte) {
 	if v, ok := tnCryptoNumber(TnGet(key, "padding")); ok {
 		padding = int(v)
 	}
-	if s, ok := TnGet(key, "oaepHash").(string); ok && s != "" {
+	if s, ok := TnGetValue(key, "oaepHash").(string); ok && s != "" {
 		h = tnCryptoHash(s)
 	}
 	if l := TnGet(key, "oaepLabel"); l != nil && !TnIsNil(l) {
@@ -1332,8 +1332,8 @@ func (e *TnECDH) computeSecret(other interface{}, args ...string) interface{} {
 
 // diffieHellman({ privateKey, publicKey }): ec and x25519 KeyObjects
 func TnDiffieHellman(options interface{}) []byte {
-	priv, _ := TnGet(options, "privateKey").(*TnKeyObject)
-	pub, _ := TnGet(options, "publicKey").(*TnKeyObject)
+	priv, _ := TnGetValue(options, "privateKey").(*TnKeyObject)
+	pub, _ := TnGetValue(options, "publicKey").(*TnKeyObject)
 	if priv == nil || pub == nil {
 		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.privateKey\\" and \\"options.publicKey\\" properties must be KeyObjects"))
 	}
@@ -1507,7 +1507,7 @@ func TnGeneratePrimeBig(size float64, options ...interface{}) *tnbig.Int {
 		panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"size\\" is out of range. It must be >= 2."))
 	}
 	opts := tnCryptoArg(options)
-	safe, _ := TnGet(opts, "safe").(bool)
+	safe, _ := TnGetValue(opts, "safe").(bool)
 	add := tnPrimeBig(TnGet(opts, "add"))
 	rem := tnPrimeBig(TnGet(opts, "rem"))
 	if add == nil && !safe {
@@ -1834,7 +1834,7 @@ func tnAlgName(alg interface{}) string {
 	if s, ok := alg.(string); ok {
 		return s
 	}
-	n, _ := TnGet(alg, "name").(string)
+	n, _ := TnGetValue(alg, "name").(string)
 	return n
 }
 
@@ -1961,7 +1961,7 @@ func tnSubtleGenerate(alg interface{}, extractable bool, usages interface{}) int
 			pubUsages, privUsages = tnFilterUsages(us, "verify"), tnFilterUsages(us, "sign")
 		}
 	case "ECDSA", "ECDH":
-		curve, _ := TnGet(alg, "namedCurve").(string)
+		curve, _ := TnGetValue(alg, "namedCurve").(string)
 		priv = tnGenerateAsymmetric("ec", map[string]interface{}{"namedCurve": curve})
 		algorithm["namedCurve"] = curve
 		if name == "ECDSA" {
@@ -2074,7 +2074,7 @@ func tnSubtleImport(format string, data interface{}, alg interface{}, extractabl
 		}
 		k = tnPrivateKeyObject(priv)
 	case "jwk":
-		if kty, _ := TnGet(data, "kty").(string); kty == "oct" {
+		if kty, _ := TnGetValue(data, "kty").(string); kty == "oct" {
 			k = &TnKeyObject{type_: "secret", secret: tnJWKBytes(data, "k")}
 		} else {
 			pub, priv := tnKeyFromJWK(data)
@@ -2134,7 +2134,7 @@ func tnSubtleExport(format string, key *TnCryptoKey) interface{} {
 		if length, ok := key.algorithm["length"].(float64); ok {
 			switch key.algorithm["name"] {
 			case "HMAC":
-				hash, _ := TnGet(key.algorithm["hash"], "name").(string)
+				hash, _ := TnGetValue(key.algorithm["hash"], "name").(string)
 				jwk["alg"] = "HS" + strings.TrimPrefix(hash, "SHA-")
 			case "AES-GCM":
 				jwk["alg"] = fmt.Sprintf("A%dGCM", int(length))
@@ -2352,7 +2352,7 @@ func tnSubtleDerive(alg interface{}, key *TnCryptoKey, length interface{}) []byt
 		}
 		return k
 	case "ECDH", "X25519":
-		pub, _ := TnGet(alg, "public").(*TnCryptoKey)
+		pub, _ := TnGetValue(alg, "public").(*TnCryptoKey)
 		if pub == nil {
 			panic(tnDOMError("InvalidAccessError", "algorithm.public must be a public CryptoKey"))
 		}

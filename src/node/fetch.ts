@@ -383,7 +383,7 @@ func tnResponseInit(r *TnResponse, init []interface{}) {
 		r.status = n
 		r.statusText = ""
 	}
-	if s, ok := TnGet(init[0], "statusText").(string); ok {
+	if s, ok := TnGetValue(init[0], "statusText").(string); ok {
 		r.statusText = s
 	}
 	if h := TnGet(init[0], "headers"); h != nil {
@@ -491,7 +491,7 @@ func TnNewRequest(input interface{}, init ...interface{}) *TnRequest {
 		if rd := tnNetString(TnGet(opts, "redirect")); rd != "" {
 			req.redirect = rd
 		}
-		if sig, ok := TnGet(opts, "signal").(*TnAbortSignal); ok && sig != nil {
+		if sig, ok := TnGetValue(opts, "signal").(*TnAbortSignal); ok && sig != nil {
 			req.signal = sig
 		}
 		if body := TnGet(opts, "body"); body != nil && !TnIsNil(body) {

@@ -268,7 +268,7 @@ func TnNewSocket(options ...interface{}) *TnSocket {
 	s.TnStream = *TnNewDuplex()
 	s.tnSelf = s
 	if len(options) > 0 && options[0] != nil {
-		if b, ok := TnGet(options[0], "allowHalfOpen").(bool); ok {
+		if b, ok := TnGetValue(options[0], "allowHalfOpen").(bool); ok {
 			s.allowHalfOpen = b
 		}
 	}
@@ -420,7 +420,7 @@ func (s *TnSocket) connect(args ...interface{}) *TnSocket {
 			if p := tnNetString(TnGet(a, "path")); p != "" {
 				path, network = p, "unix"
 			}
-			if b, ok := TnGet(a, "allowHalfOpen").(bool); ok {
+			if b, ok := TnGetValue(a, "allowHalfOpen").(bool); ok {
 				s.allowHalfOpen = b
 			}
 			if n, ok := tnNetNumber(TnGet(a, "timeout")); ok {
@@ -627,10 +627,10 @@ func TnNewNetServer(args ...interface{}) *TnNetServer {
 		if tnIsFunc(a) {
 			srv.on(srv.connectionEvent, a)
 		} else if a != nil {
-			if b, ok := TnGet(a, "allowHalfOpen").(bool); ok {
+			if b, ok := TnGetValue(a, "allowHalfOpen").(bool); ok {
 				srv.allowHalfOpen = b
 			}
-			if b, ok := TnGet(a, "pauseOnConnect").(bool); ok {
+			if b, ok := TnGetValue(a, "pauseOnConnect").(bool); ok {
 				srv.pauseOnConnect = b
 			}
 		}
@@ -872,7 +872,7 @@ func TnNewSocketAddress(options ...interface{}) *TnSocketAddress {
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	if f, ok := TnGet(opts, "family").(string); ok {
+	if f, ok := TnGetValue(opts, "family").(string); ok {
 		sa.family = strings.ToLower(f)
 	}
 	if sa.family != "ipv4" && sa.family != "ipv6" {
@@ -882,13 +882,13 @@ func TnNewSocketAddress(options ...interface{}) *TnSocketAddress {
 	if sa.family == "ipv6" {
 		sa.address = "::"
 	}
-	if a, ok := TnGet(opts, "address").(string); ok {
+	if a, ok := TnGetValue(opts, "address").(string); ok {
 		sa.address = a
 	}
-	if p, ok := TnGet(opts, "port").(float64); ok {
+	if p, ok := TnGetValue(opts, "port").(float64); ok {
 		sa.port = p
 	}
-	if fl, ok := TnGet(opts, "flowlabel").(float64); ok {
+	if fl, ok := TnGetValue(opts, "flowlabel").(float64); ok {
 		sa.flowlabel = fl
 	}
 	addr, err := netip.ParseAddr(sa.address)

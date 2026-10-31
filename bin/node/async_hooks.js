@@ -14,7 +14,7 @@ type TnAsyncLocalStorage struct {
 func TnNewAsyncLocalStorage(options ...interface{}) *TnAsyncLocalStorage {
 	als := &TnAsyncLocalStorage{}
 	if len(options) > 0 && options[0] != nil {
-		if n, ok := TnGet(options[0], "name").(string); ok {
+		if n, ok := TnGetValue(options[0], "name").(string); ok {
 			als.name = n
 		}
 	}
