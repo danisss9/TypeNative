@@ -1893,6 +1893,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   usedHelpers.clear();
   helperProvidedPackages.clear();
   mainPackageVariables.length = 0;
+  keyOrderTables.clear();
   goInterfaceAdapters.clear();
   classMethodSignatures.clear();
   dynamicMethodCalls.clear();
@@ -2108,6 +2109,8 @@ function heritageObjectType(type: AstNode): { base: AstNode; keys: string[] | un
   const name: string = type.expression.text;
   const args: AstNode[] = type.typeArguments ?? [];
   const named = (n: AstNode | undefined): AstNode | undefined => {
+    // (an object type literal: its members, Partial<{ depth: number }>)
+    if (n && n.kind === 'TypeLiteral') return n;
     if (!n || !isTypeReferenceNode(n) || !isIdentifier(n.typeName)) return undefined;
     const iface = declaredInterfaces.has(n.typeName.text) ? declaredInterfaces.get(n.typeName.text) : undefined;
     if (iface) return iface;
@@ -4153,7 +4156,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
       .map((m) => `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}`);
     const terminator = options.isOutside ? '' : ';\n\t';
-    return `type ${visit(node.name)} struct {\n${fields.join('\n')}\n}${terminator}`;
+    return `type ${visit(node.name)} struct {\n${fields.join('\n')}\n\t__keys *[]string\n}${terminator}`;
   } else if (isInterfaceDeclaration(node)) {
     if (options.addFunctionOutside) {
       outsideNodes.push(node);
@@ -4199,9 +4202,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
 
     // with properties (own or inherited) it is a struct; methods are func fields
+    // (and __keys: see literalKeyOrder)
     if (interfaceHasProperties(node)) {
       if (extendedInterfaces.length === 0 && methods.length === 0) {
-        return `type ${name}${typeParams} struct {\n${properties.join('\n')}\n}`;
+        return `type ${name}${typeParams} struct {\n${properties.join('\n')}\n\t__keys *[]string\n}`;
       }
       // Flattened inherited properties: literals can set every field directly
       const flattened = new Map<string, string>();
@@ -4210,6 +4214,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       flattened.forEach((propType, prop) => {
         fields.push(`\t${goFieldName(prop)} ${propType}`);
       });
+      fields.push('\t__keys *[]string');
       return `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}`;
     }
 
@@ -4778,6 +4783,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return '';
       })
       .filter((p) => p);
+    // (keys listed in another order than the type declares them: recorded
+    // for JSON.stringify, which keeps JS's creation order)
+    const keyOrder = objectTypeHasKeyOrder(structName) ? literalKeyOrder(node, fieldTypes) : '';
+    if (keyOrder) properties.push(`__keys: ${keyOrder}`);
     // m(x) { … } shorthand: a function field, assigned once the object
     // exists (`this` is the object); its type is the field's
     const methodSteps: string[] = [];
@@ -5024,6 +5033,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     // T | undefined: box the dynamic value (nil when missing or of another type)
     if (goType.startsWith('*')) return `TnAsPtr[${goType.slice(1)}](${code})`;
     return `TnAs[${goType}](${code})`;
+  }
+  // a promise of any value where a Promise<T> is expected: converted when it settles
+  if (goType?.startsWith('chan ') && goType !== 'chan interface{}' && inferExpressionType(expr) === 'chan interface{}') {
+    useHelper('promise');
+    useHelper('dynamic');
+    const element = goType.slice(5);
+    return `TnPromiseAs[${element}](${visit(expr)}, func(v interface{}) ${element} { return TnAs[${element}](v) })`;
   }
   // an RE2 regex where the JS-semantics regex type is expected: wrapped
   if (goType === '*TnRegex' && inferExpressionType(expr) === '*regexp.Regexp') {
@@ -7812,6 +7828,33 @@ function isUnboundGoType(goType: string | undefined): boolean {
 }
 
 // A field-name → type map rendered as a Go struct type body
+// Object types (property interfaces, object type aliases) carry a key order
+// field, __keys, for literals that list their keys in another order
+function objectTypeHasKeyOrder(name: string): boolean {
+  return !classNames.has(name) && (declaredInterfaces.has(name) || declaredTypeAliases.has(name)) && isObjectTypeName(name);
+}
+
+const keyOrderTables = new Map<string, string>();
+
+// &tnKeysN (a package-level []string of the literal's keys) when the
+// literal's keys aren't in the type's declared order, else ''
+function literalKeyOrder(node: AstNode, fieldTypes: Map<string, string> | undefined): string {
+  if (!fieldTypes || (node.properties ?? []).some((p: AstNode) => p.kind === 'SpreadAssignment')) return '';
+  const keys: string[] = [];
+  for (const p of node.properties ?? []) {
+    if ((isPropertyAssignment(p) || isShorthandPropertyAssignment(p) || isMethodDeclaration(p)) && isIdentifier(p.name)) keys.push(p.name.text);
+  }
+  const declared = [...fieldTypes.keys()].filter((k) => keys.includes(k));
+  if (declared.join(',') === keys.filter((k) => fieldTypes.has(k)).join(',')) return '';
+  const signature = keys.join(',');
+  if (!keyOrderTables.has(signature)) {
+    const name = `tnKeys${keyOrderTables.size + 1}`;
+    keyOrderTables.set(signature, name);
+    mainPackageVariables.push(`var ${name} = []string{${keys.map((k) => toGoStringLiteral(k)).join(', ')}}`);
+  }
+  return `&${keyOrderTables.get(signature)}`;
+}
+
 function structFieldsBody(fields: Map<string, string>): string {
   const parts: string[] = [];
   fields.forEach((fieldType, fieldName) => {
@@ -9080,7 +9123,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
       if (methodName === 'exec') {
         // Named-group patterns return a match object with a .groups record
         const receiver = expr.expression.expression;
-        if (isRegularExpressionLiteral(receiver) && /\(\?<[A-Za-z_]/.test(receiver.text ?? '')) {
+        // (on the RE2 path: the backtracking engine's exec gives the match array)
+        if (ownerType === '*regexp.Regexp' && isRegularExpressionLiteral(receiver) && /\(\?<[A-Za-z_]/.test(receiver.text ?? '')) {
           useHelper('namedGroups');
           return '*TnMatch';
         }
@@ -10089,6 +10133,9 @@ function getNullishResultType(expr: AstNode): string | undefined {
   if (rightType === leftValueType) return rightType;
   if (leftValueType && rightType === `*${leftValueType}`) return rightType;
   if (leftValueType === 'interface{}') return 'interface{}';
+  // (primitives of two types — a number ?? '' — is either)
+  const primitives = ['string', 'float64', 'bool'];
+  if (leftValueType && primitives.includes(leftValueType) && primitives.includes(rightType) && leftValueType !== rightType) return 'interface{}';
   // (an operand of unknown type may hold any value: only a primitive
   // fallback types the result)
   if (!leftValueType) return ['string', 'float64', 'bool'].includes(rightType) ? rightType : 'interface{}';
@@ -14330,7 +14377,7 @@ function visitCallArguments(node: AstNode): string[] {
   if (!fn) {
     // A function-valued variable or field without a declared type
     // (const f = (xs: number[]) => …): its Go func type's parameters
-    const calleeType = isIdentifier(node.expression) || isPropertyAccessExpression(node.expression)
+    const calleeType = isIdentifier(node.expression) || isPropertyAccessExpression(node.expression) || isCallExpression(node.expression) || isParenthesizedExpression(node.expression)
       ? inferExpressionType(node.expression)
       : undefined;
     // (a variadic function value: its rest arguments converted to the element type)
@@ -18353,6 +18400,9 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 								continue
 							}
 						}
+						if strings.HasPrefix(src.Type().Field(i).Name, "__") {
+							continue
+						}
 						entries = append(entries, []interface{}{strings.TrimSuffix(src.Type().Field(i).Name, "_"), f.Interface()})
 					}
 				} else if src, ok := v.(map[string]interface{}); ok {
@@ -19500,6 +19550,46 @@ func (w *tnJSONWriter) structFields(rv reflect.Value, emit func(string, interfac
 		rv = tmp
 	}
 	rt := rv.Type()
+	// an object type's literal that lists its keys in another order than the
+	// type declares them (__keys): those keys first, as JS keeps creation order
+	if tnHasKeyOrder(rt) {
+		if order := rv.FieldByName("__keys"); !order.IsNil() {
+			keys := *(*[]string)(unsafe.Pointer(order.Pointer()))
+			listed := map[string]bool{}
+			pending := map[string]interface{}{}
+			present := map[string]bool{}
+			w.structFieldsInOrder(rv, func(k string, v interface{}) { pending[k] = v; present[k] = true })
+			for _, k := range keys {
+				listed[k] = true
+				if present[k] {
+					emit(k, pending[k])
+				}
+			}
+			w.structFieldsInOrder(rv, func(k string, v interface{}) {
+				if !listed[k] {
+					emit(k, v)
+				}
+			})
+			return
+		}
+	}
+	w.structFieldsInOrder(rv, emit)
+}
+
+// Whether a struct type carries a key order (the __keys field)
+var tnKeyOrderTypes sync.Map
+
+func tnHasKeyOrder(t reflect.Type) bool {
+	if has, ok := tnKeyOrderTypes.Load(t); ok {
+		return has.(bool)
+	}
+	_, has := t.FieldByName("__keys")
+	tnKeyOrderTypes.Store(t, has)
+	return has
+}
+
+func (w *tnJSONWriter) structFieldsInOrder(rv reflect.Value, emit func(string, interface{})) {
+	rt := rv.Type()
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
 		value := reflect.NewAt(f.Type, unsafe.Pointer(rv.Field(i).UnsafeAddr())).Elem()
@@ -19625,6 +19715,12 @@ func tnJSONPlan(t reflect.Type) []tnJSONField {
 // A struct behind a pointer, written in place: no copy of the struct, no
 // boxing of its numbers, strings and booleans
 func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
+	// (an object whose keys were created in another order: see structFields)
+	if tnHasKeyOrder(rv.Elem().Type()) && !rv.Elem().FieldByName("__keys").IsNil() {
+		w.enter(rv.Pointer())
+		defer w.leave()
+		return w.object(depth, func(emit func(string, interface{})) { w.structFields(rv.Elem(), emit) })
+	}
 	w.enter(rv.Pointer())
 	defer w.leave()
 	base := rv.UnsafePointer()
@@ -20389,6 +20485,11 @@ type TnRegex struct {
 	// an object cast to RegExp ({ exec: () => null } as unknown as RegExp):
 	// its exec (see regexObject)
 	customExec func(string) []string
+	// RE2 matches s[start:], where ^, \\b and \\B can't see the text before
+	// start: a pattern using them runs on the backtracker past offset 0
+	pattern    string
+	contextual bool
+	btAfter    *tnBt
 	re        *regexp.Regexp
 	anchored  *regexp.Regexp
 	bt        *tnBt
@@ -20400,7 +20501,7 @@ type TnRegex struct {
 }
 
 func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
-	r := &TnRegex{global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags}
+	r := &TnRegex{global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags, pattern: pattern, contextual: tnPatternUsesContext(pattern)}
 	prefix := ""
 	for _, f := range "ims" {
 		if strings.ContainsRune(flags, f) {
@@ -20519,6 +20620,28 @@ func (r *TnRegex) TnProp(key string) (interface{}, bool) {
 		}, true
 	}
 	return nil, false
+}
+
+// Whether a pattern has ^, \\b, \\B or \\A outside a class (they look
+// at the text before the match)
+func tnPatternUsesContext(p string) bool {
+	inClass := false
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; {
+		case c == '\\\\' && i+1 < len(p):
+			if !inClass && (p[i+1] == 'b' || p[i+1] == 'B' || p[i+1] == 'A') {
+				return true
+			}
+			i++
+		case c == '[':
+			inClass = true
+		case c == ']':
+			inClass = false
+		case c == '^' && !inClass:
+			return true
+		}
+	}
+	return false
 }
 
 // A plain RE2 regex as a TnRegex
@@ -20741,7 +20864,19 @@ func (r *TnRegex) scan(s string, yield func(groups []string, loc []int) bool) {
 // matchAt: leftmost match at or after byte offset start (only at start when
 // sticky); loc holds byte offsets
 func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, []int) {
-	if r.bt == nil {
+	bt := r.bt
+	if bt == nil && start > 0 && r.contextual && r.pattern != "" {
+		if r.btAfter == nil {
+			r.btAfter = tnBtCompile(r.pattern)
+			if r.btAfter != nil {
+				r.btAfter.icase = strings.Contains(r.flags, "i")
+				r.btAfter.multiline = strings.Contains(r.flags, "m")
+				r.btAfter.dotAll = strings.Contains(r.flags, "s")
+			}
+		}
+		bt = r.btAfter
+	}
+	if bt == nil {
 		re := r.re
 		if sticky && r.anchored != nil {
 			re = r.anchored
@@ -20760,18 +20895,18 @@ func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, [
 	runs, offs := in.runes()
 	first := sort.SearchInts(offs, start)
 	for pos := first; pos <= len(runs) && (!sticky || pos == first); pos++ {
-		caps := make([]int, (r.bt.ngroups+1)*2)
+		caps := make([]int, (bt.ngroups+1)*2)
 		for i := range caps {
 			caps[i] = -1
 		}
-		m := &tnBtMatchState{runs: runs, caps: caps, bt: r.bt}
+		m := &tnBtMatchState{runs: runs, caps: caps, bt: bt}
 		end := -1
-		if m.match(r.bt.root, pos, func(e int) bool { end = e; return true }) {
+		if m.match(bt.root, pos, func(e int) bool { end = e; return true }) {
 			caps[0], caps[1] = pos, end
 			// room for the hidden .index slot (tnSetMatchIndex)
-			groups := make([]string, r.bt.ngroups+1, r.bt.ngroups+2)
-			loc := make([]int, (r.bt.ngroups+1)*2)
-			for i := 0; i <= r.bt.ngroups; i++ {
+			groups := make([]string, bt.ngroups+1, bt.ngroups+2)
+			loc := make([]int, (bt.ngroups+1)*2)
+			for i := 0; i <= bt.ngroups; i++ {
 				si, ei := caps[2*i], caps[2*i+1]
 				if si >= 0 && ei >= si {
 					groups[i] = string(runs[si:ei])
@@ -21625,6 +21760,10 @@ func tnOwnProps(src interface{}) []tnProp {
 				if f.Kind() == reflect.Struct {
 					walk(f)
 				}
+				continue
+			}
+			// (internal fields: __keys, #private names)
+			if strings.HasPrefix(t.Field(i).Name, "__") {
 				continue
 			}
 			if !f.CanInterface() {
@@ -23420,6 +23559,22 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 			TnLoopCall(func() { TnAsyncRun(ctx, func() { onRejected(e) }) })
 		}
 		TnAsyncSend(out, v)
+		TnAsyncClose(out)
+	}()
+	return out
+}
+
+// A promise of any value as a promise of T (an async arrow's chan
+// interface{} returned as Promise<T>): settles with the value converted
+func TnPromiseAs[T any](p chan interface{}, convert func(interface{}) T) chan T {
+	out := make(chan T, 1)
+	go func() {
+		v, reason, rejected := tnSettle(p)
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		TnAsyncSend(out, convert(v))
 		TnAsyncClose(out)
 	}()
 	return out

@@ -22,7 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
 const cli = path.join(repoRoot, 'bin', 'cli.js');
 const cache = path.join(here, '.cache');
-const upstream = path.join(cache, 'marked');
+const upstream = path.join(cache, 'marked-src');
 const specs = path.join(upstream, 'test', 'specs');
 const failuresDir = path.join(cache, 'failures');
 const exePath = path.join(cache, process.platform === 'win32' ? 'marked.exe' : 'marked');
