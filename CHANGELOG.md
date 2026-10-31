@@ -11,7 +11,23 @@ The `yaml` package's own CLI, compiled from its unmodified TypeScript source, as
 flagship example: 100% output parity with Node on the yaml-test-suite in all four modes. Getting
 there took transpiler fixes across the board, each with a conformance probe.
 
+The second flagship example is the `marked` package's own CLI, compiled from marked's unmodified
+TypeScript source: 100% output parity with Node on marked's spec suites (CommonMark, GFM and its
+own tests, ReDoS inputs included) in three modes. Its fixes are listed under **marked** below.
+
 ### Added
+
+- **examples/marked-cli:** marked v18.1.2 vendored unpatched (`vendor/marked/VENDOR.md`),
+  `main.ts` porting upstream's `bin/main.js`, `parity.mjs` (2,859 cases: marked's commonmark,
+  gfm, new, original and redos specs in default, `--no-gfm` and `--tokens` modes, compared byte
+  for byte with Node) and `bench.mjs` (per-call latency on marked's README, throughput on ~10 MB
+  of generated markdown)
+- **marked:** function declarations inside functions and blocks (hoisted; async and generator
+  ones too); `f.apply` / `f.call` on functions held as `any`; `Ns.T` of a namespace another
+  module declares; generic interfaces used without type arguments, interfaces extending
+  `Omit<>` / `Pick<>` / `Partial<>`, open object types and array types with properties
+  (`T[] & { links: L }`); `process.stdout.write(data, callback)`; `split(sep, limit)` with a
+  RegExp
 
 - **examples/yaml-cli:** yaml v3.0.0-2 vendored unpatched (`vendor/yaml/VENDOR.md`), `main.ts`
   porting upstream's `bin.js`, `parity.mjs` (1,608 cases from yaml-test-suite data-2022-01-17
@@ -26,6 +42,26 @@ there took transpiler fixes across the board, each with a conformance probe.
 
 ### Fixed
 
+- **marked — arrays:** arrays are shared as in JS: an object type's array field, an `any[]`
+  variable and a parameter holding one array see each other's pushes, also through `any`
+  (`tok.tokens.unshift(…)`); a method returning its array argument returns that array
+- **marked — regexes:** JS escapes (`\xHH`, `\u{…}`, `\cJ`, `\p{…}`, `\k<name>`) and JS's
+  Unicode `\s` in every pattern, also in the backtracking engine; RegExp values stored in
+  objects, built at run time and called through `any`; regexes that look behind the match
+  (`^`, `\b`) at a non-zero offset; unmatched groups stay `undefined` through consts,
+  conditionals and `string` fields (left out of JSON)
+- **marked — strings and objects:** `toUpperCase` / `toLowerCase` map case as JS does (`ß` →
+  `SS`, `İ` → `i̇`, final `ς`); `trim` uses JS's whitespace; `replace` with a `string | RegExp`
+  pattern or a function value; JSON key order of object literals that list keys in another
+  order than their type; `string | null` fields keep `null` and `undefined` apart
+- **marked — type inference:** `let x;` assigned on every path holds its value type; long call
+  chains on a fluent builder (`edit(re).replace(…).replace(…)…`) no longer take exponential time
+  (inference is memoized per query); module-level names a local shadows
+- **marked — performance:** the regex backtracker works on byte offsets (no rune conversion of
+  the input per match), repeats a single character class without allocating and tests ASCII
+  against a table; regexes skip ahead with a first-byte prefilter (an anchored one fails at
+  once) instead of running RE2 over the rest of a long input; strings built with `+=` in a loop
+  are `strings.Builder`s. Rendering is now linear in the input
 - **Regexes:** unmatched groups are `undefined`; `new RegExp(src, 'g' | 'y')` keeps its flags;
   `$&`, `` $` ``, `$'`, `$<name>` and `$$` replacements; replacer callbacks get the match offset
   and the input
