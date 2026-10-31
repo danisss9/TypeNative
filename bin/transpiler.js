@@ -462,7 +462,7 @@ function nullableArraysOf(scope) {
 function setVarGoType(name, goType) {
     if (!name)
         return;
-    if (goType && goType.startsWith('[]') && goType !== '[]interface{}' && goType !== '[]byte') {
+    if (goType && goType.startsWith('[]') && goType !== '[]byte') {
         variableGoTypes.set(name, `*${goType}`);
         referenceArrays.add(name);
         return;
@@ -1684,6 +1684,7 @@ export function transpileToNative(code, options) {
     moduleInitAssignments = null;
     objectLiteralMethodNames.clear();
     topLevelGoTypes.clear();
+    topLevelReferenceArrays.clear();
     // With a file resolver, the entry and every module it reaches are linked first
     const sourceFile = fileResolver
         ? linkModule(options?.fileName ?? currentFileName, code, null, currentFileIsTsx, currentFileName)
@@ -2105,7 +2106,7 @@ function visitNode(node, options = {}) {
         }
         // Array references: reads go through the shared slice-header pointer
         // (`arr === null` tests the reference itself)
-        if (referenceArrays.has(node.text)) {
+        if (isReferenceArrayRead(node)) {
             const parent = node.parent;
             const comparedToNil = parent && isBinaryExpression(parent) &&
                 ['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken', 'EqualsEqualsToken', 'ExclamationEqualsToken'].includes(parent.operatorToken.kind) &&
@@ -2718,6 +2719,10 @@ function visitNode(node, options = {}) {
         // (its type, for reads where no function binds the name: see topLevelGoTypes)
         if (isTopLevelStatement && isIdentifier(node.name) && variableGoTypes.has(node.name.text)) {
             topLevelGoTypes.set(node.name.text, variableGoTypes.get(node.name.text));
+            if (referenceArrays.has(node.name.text))
+                topLevelReferenceArrays.add(node.name.text);
+            else
+                topLevelReferenceArrays.delete(node.name.text);
         }
         const isPackageScope = emittingModuleFile && isTopLevelStatement;
         // A module's top-level variable is declared at package scope and set when
@@ -8457,16 +8462,21 @@ function inferExpressionTypeUncached(expr) {
 // (inside a function there: a read before the declaration completes is an error)
 function isInOwnInitializer(expr) {
     let insideFunction = false;
+    let insideObject = false;
     let declaration;
     for (let n = expr.parent; n && !declaration; n = n.parent) {
         if (n.kind === 'VariableDeclaration' && isIdentifier(n.name) && n.name.text === expr.text)
             declaration = n;
         else if (FUNCTION_LIKE_KINDS.has(n.kind))
             insideFunction = true;
+        else if (n.kind === 'ObjectLiteralExpression' && insideFunction)
+            insideObject = true;
         else if (n.kind === 'SourceFile' || n.kind === 'ClassDeclaration')
             return false;
     }
-    if (!declaration || !insideFunction || declaration.type)
+    // (a function referring to itself — const f = () => f() — has a Go type
+    // of its own; an object holding such functions doesn't)
+    if (!declaration || !insideObject || declaration.type)
         return false;
     // (unless a function in between binds the name itself)
     for (let n = expr.parent; n && n !== declaration; n = n.parent) {
@@ -8478,6 +8488,15 @@ function isInOwnInitializer(expr) {
 // Go types of module-level variables, as declared (variableGoTypes is keyed
 // by name, so a local of the same name hides them while it is registered)
 const topLevelGoTypes = new Map();
+// (and which of them are array references, *[]T)
+const topLevelReferenceArrays = new Set();
+// Whether an identifier reads an array reference variable (*[]T): a local
+// one, or a module-level one no enclosing function shadows
+function isReferenceArrayRead(node) {
+    if (topLevelReferenceArrays.has(node.text) && !isLocallyBound(node))
+        return true;
+    return referenceArrays.has(node.text) && !(topLevelGoTypes.has(node.text) && !topLevelReferenceArrays.has(node.text) && !isLocallyBound(node));
+}
 // Whether an enclosing function (or catch clause) binds this identifier's name
 function isLocallyBound(expr) {
     for (let n = expr.parent; n; n = n.parent) {
@@ -12975,6 +12994,9 @@ function isInlineRegexUse(node) {
     if (isCallExpression(parent) && (parent.arguments ?? [])[0] === child && isPropertyAccessExpression(parent.expression) && INLINE_REGEX_STRING_METHODS.has(parent.expression.name.text)) {
         return inferExpressionType(parent.expression.expression) === 'string';
     }
+    // (an argument of a Node built-in: assert.match(s, /re/) takes an RE2 regex)
+    if (isCallExpression(parent) && (parent.arguments ?? []).includes(child) && resolveNodeKey(parent.expression))
+        return true;
     return false;
 }
 function newRegExpIsStateful(node) {
