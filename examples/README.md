@@ -14,6 +14,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [mandelbrot-png](mandelbrot-png/) | Fractal render + hand-written PNG encoder on `node:zlib`, no image library | **1.2x faster**, steadier (597 ms vs 744 ms)                 |
 | [desktop-notes](desktop-notes/)   | Notes app in an Edge/Chrome app window, UI compiled into one binary        | **5.6x faster launch, 4.7x less memory** (15 vs 72 MiB)      |
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **27x faster per call** (9 vs 250 ms); 3.6x slower on 10 MB† |
+| [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **7.1x faster per call** (20 vs 143 ms); 5.3x slower on 10 MB‡ |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.4.0 (hello-world, fibonacci, json-server) and 0.4.1 (the rest). See each
@@ -23,6 +24,11 @@ example's README for full methodology and numbers.
 Go 1.26.0. The native binary is faster up to about 150–200 KB of input per run.
 yaml-cli's [parity.mjs](yaml-cli/parity.mjs) also checks every output against
 Node byte for byte on the yaml-test-suite (1,608 cases).
+
+‡ Measured on a Linux container (4 vCPUs, Xeon @ 2.10GHz), Node v24.22.1,
+Go 1.26.0. The native binary is faster up to about 150–200 KB of markdown per
+run. marked-cli's [parity.mjs](marked-cli/parity.mjs) checks every output
+against Node byte for byte on marked's spec suites (2,859 cases).
 
 ## Running an example
 
@@ -62,6 +68,7 @@ cd examples/dupe-finder && node bench.mjs
 cd examples/mandelbrot-png && node bench.mjs
 cd examples/desktop-notes  && node bench.mjs
 cd examples/yaml-cli       && node bench.mjs   # and node parity.mjs
+cd examples/marked-cli     && node bench.mjs   # and node parity.mjs
 ```
 
 TypeNative's clearest wins are process startup and memory. Startup is about

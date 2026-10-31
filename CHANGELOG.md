@@ -53,7 +53,8 @@ own tests, ReDoS inputs included) in three modes. Its fixes are listed under **m
 - **marked — strings and objects:** `toUpperCase` / `toLowerCase` map case as JS does (`ß` →
   `SS`, `İ` → `i̇`, final `ς`); `trim` uses JS's whitespace; `replace` with a `string | RegExp`
   pattern or a function value; JSON key order of object literals that list keys in another
-  order than their type; `string | null` fields keep `null` and `undefined` apart
+  order than their type; `string | null` fields keep `null` and `undefined` apart (an optional
+  one is an any field; a required one is written as `null` by `JSON.stringify`)
 - **marked — type inference:** `let x;` assigned on every path holds its value type; long call
   chains on a fluent builder (`edit(re).replace(…).replace(…)…`) no longer take exponential time
   (inference is memoized per query); module-level names a local shadows
@@ -62,6 +63,13 @@ own tests, ReDoS inputs included) in three modes. Its fixes are listed under **m
   against a table; regexes skip ahead with a first-byte prefilter (an anchored one fails at
   once) instead of running RE2 over the rest of a long input; strings built with `+=` in a loop
   are `strings.Builder`s. Rendering is now linear in the input
+- **marked — self-hosting:** the native compiler builds and `npm run bootstrap:check` holds
+  with this round's changes: a function literal stored where a function type is expected takes
+  that type's (plain slice) array parameters, and a function value with array-reference
+  parameters is adapted where plain slices are expected; a string-method name that some object
+  literal's function also has (`x.startsWith(…)` on an any value) runs the string method on a
+  string; functions in a `Record<K, F>` dictionary no longer count as such methods; a `+=`
+  string accumulator used in a closure stays a plain string
 - **Regexes:** unmatched groups are `undefined`; `new RegExp(src, 'g' | 'y')` keeps its flags;
   `$&`, `` $` ``, `$'`, `$<name>` and `$$` replacements; replacer callbacks get the match offset
   and the input

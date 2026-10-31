@@ -260,9 +260,12 @@ console.log(`count=${c.count} seen=${seen.get('a')}`);
 ```
 
 Complete, runnable projects, including Node-vs-TypeNative benchmarks for
-each, live in [examples/](examples/). The flagship is
+each, live in [examples/](examples/). The flagships are
 [yaml-cli](examples/yaml-cli/): the `yaml` package's own CLI compiled from its
-unmodified source, matching Node's output on all 1,608 yaml-test-suite cases.
+unmodified source, matching Node's output on all 1,608 yaml-test-suite cases,
+and [marked-cli](examples/marked-cli/): the `marked` markdown parser's CLI,
+also from unmodified source, matching Node on all 2,859 cases of marked's spec
+suites (CommonMark, GFM, its own tests and ReDoS inputs).
 
 ## How it works
 
