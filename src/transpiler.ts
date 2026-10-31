@@ -6177,7 +6177,9 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   let call = `TnCall_${dispatcherSuffix(method)}(${argList})`;
   // (a string method's name that some object literal's function has too: a
   // string receiver runs the string method)
-  if (STRING_ONLY_METHODS.has(method) && objectLiteralMethodNames.has(method) && !hasSpread) {
+  // (with primitive arguments only: a string method's own argument types)
+  const primitiveArgs = (node.arguments ?? []).every((a: AstNode) => ['string', 'float64', 'bool'].includes(inferExpressionType(a) ?? ''));
+  if (STRING_ONLY_METHODS.has(method) && objectLiteralMethodNames.has(method) && !hasSpread && primitiveArgs) {
     const recvVar = getTempName('recv');
     const strName = getTempName('str');
     const ident: AstNode = { kind: 'Identifier', text: strName, line: node.line, column: node.column };
@@ -25482,10 +25484,12 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
   } else if (binding && isIdentifier(binding)) {
     const name = visit(binding);
     registerLocalVariable(binding.text, elementType);
+    // (a binding the body never reads is still declared: `_ =` uses it)
     if (iterType === 'string') {
-      prefix = `${name} := string(${item})\n\t\t`;
+      prefix = `${name} := string(${item})\n\t\t_ = ${name}\n\t\t`;
     } else {
       loopVar = name;
+      prefix = `_ = ${name}\n\t\t`;
     }
   } else {
     loopVar = visit(node.initializer, { inline: true });
