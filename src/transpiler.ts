@@ -1225,6 +1225,109 @@ function rewriteNamespaceAccess(nodes: AstNode[], namespaces: Set<string>): void
   for (let i = 0; i < nodes.length; i++) nodes[i] = rewrite(nodes[i]);
 }
 
+// Fields of a primitive type (string, number, boolean) that an object literal
+// fills with a value TypeScript types as that primitive but which may be
+// undefined at run time: a regex match's group (m[1] of an exec or match
+// result is undefined when the group took no part in the match). Such a field
+// is an any field (see getObjectFieldNodeType), so it keeps the undefined —
+// which JSON.stringify leaves out — and so is a const holding the value
+const undefinedPrimitiveFields = new Set<AstNode>();
+
+function matchGroupSource(name: AstNode): boolean {
+  const declaration = findLocalConst(name);
+  let init = declaration?.initializer ? unwrapParentheses(declaration.initializer) : undefined;
+  while (init && init.kind === 'NonNullExpression') init = unwrapParentheses(init.expression);
+  return !!init && isCallExpression(init) && isPropertyAccessExpression(init.expression) && isIdentifier(init.expression.name) && ['exec', 'match'].includes(init.expression.name.text);
+}
+
+// The const (or let) declaring a name in the scopes around a node
+function findLocalConst(name: AstNode): AstNode | undefined {
+  if (!isIdentifier(name)) return undefined;
+  let scope = name.parent;
+  while (scope) {
+    if (scope.kind === 'Block' || scope.kind === 'SourceFile') {
+      for (const stmt of scope.statements ?? []) {
+        if (!isVariableStatement(stmt)) continue;
+        for (const d of stmt.declarationList?.declarations ?? []) {
+          if (isIdentifier(d.name) && d.name.text === name.text) return d;
+        }
+      }
+    }
+    if (getEnclosingFunction(name) === scope) return undefined;
+    scope = scope.parent;
+  }
+  return undefined;
+}
+
+function maybeUndefinedPrimitive(expr: AstNode, consts: AstNode[], depth = 0): boolean {
+  const e = unwrapParentheses(expr);
+  if (!e || depth > 4) return false;
+  if (isElementAccessExpression(e) && !hasQuestionDot(e)) {
+    const index = unwrapParentheses(e.argumentExpression);
+    return !!index && index.kind === 'NumericLiteral' && Number(index.text) >= 1 && isIdentifier(e.expression) && matchGroupSource(e.expression);
+  }
+  if (isConditionalExpression(e)) {
+    const t = maybeUndefinedPrimitive(e.whenTrue, consts, depth + 1);
+    const f = maybeUndefinedPrimitive(e.whenFalse, consts, depth + 1);
+    return t || f;
+  }
+  if (isIdentifier(e)) {
+    const declaration = findLocalConst(e);
+    if (!declaration || declaration.type || !declaration.initializer) return false;
+    if (!maybeUndefinedPrimitive(declaration.initializer, consts, depth + 1)) return false;
+    consts.push(declaration);
+    return true;
+  }
+  return false;
+}
+
+// The interfaces an object literal's type annotation names (a return type, a
+// variable's type; unions taken apart)
+function contextualInterfaces(literal: AstNode): AstNode[] {
+  let typeNode: AstNode | undefined;
+  const parent = literal.parent;
+  if (parent?.kind === 'ReturnStatement') typeNode = getEnclosingFunction(parent)?.type;
+  else if (parent && isArrowFunction(parent) && parent.body === literal) typeNode = parent.type;
+  else if (parent && isVariableDeclaration(parent) && parent.initializer === literal) typeNode = parent.type;
+  const out: AstNode[] = [];
+  const add = (t: AstNode | undefined, depth: number): void => {
+    if (!t || depth > 4) return;
+    if (t.kind === 'ParenthesizedType') add(t.type, depth + 1);
+    else if (isUnionTypeNode(t)) for (const member of t.types ?? []) add(member, depth + 1);
+    else if (isTypeReferenceNode(t) && isIdentifier(t.typeName) && declaredInterfaces.has(t.typeName.text)) out.push(declaredInterfaces.get(t.typeName.text));
+  };
+  add(typeNode, 0);
+  return out;
+}
+
+function collectUndefinedPrimitiveFields(asts: AstNode[]): void {
+  undefinedPrimitiveFields.clear();
+  const seen = new Set<AstNode>();
+  const walk = (node: AstNode): void => {
+    if (!node || seen.has(node)) return;
+    seen.add(node);
+    if (isObjectLiteralExpression(node)) {
+      for (const prop of node.properties ?? []) {
+        const isShorthand = prop.kind === 'ShorthandPropertyAssignment';
+        if (!(isShorthand || isPropertyAssignment(prop)) || !isIdentifier(prop.name)) continue;
+        const consts: AstNode[] = [];
+        if (!maybeUndefinedPrimitive(isShorthand ? prop.name : prop.initializer, consts)) continue;
+        for (const iface of contextualInterfaces(node)) {
+          for (const member of iface.members ?? []) {
+            if (!isPropertySignature(member) || !isIdentifier(member.name) || member.name.text !== prop.name.text) continue;
+            if (!['StringKeyword', 'NumberKeyword', 'BooleanKeyword'].includes(member.type?.kind ?? '')) continue;
+            undefinedPrimitiveFields.add(member);
+            // (the const in between holds the undefined too)
+            for (const d of consts) d.type = { kind: 'AnyKeyword', parent: d };
+          }
+        }
+      }
+    }
+    for (const child of childNodes(node)) walk(child);
+  };
+  for (const ast of asts) if (ast) walk(ast);
+}
+
 // Ns.T in a module importing a namespace another module declares (flattened
 // there to Ns_T): the flattened type, once every module is linked
 function linkFlattenedNamespaceTypes(asts: AstNode[]): void {
@@ -1855,6 +1958,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
     ? linkModule(options?.fileName ?? currentFileName, code, null, currentFileIsTsx, currentFileName)
     : parseSource(code);
   linkFlattenedNamespaceTypes([...[...linkedModules.values()].map((m) => m.ast), sourceFile]);
+  collectUndefinedPrimitiveFields([...[...linkedModules.values()].map((m) => m.ast), sourceFile]);
   collectMockTargets(sourceFile);
   instrumentCoverage(sourceFile, code);
   importedPackages.clear();
@@ -2449,6 +2553,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // Reading past the end of an array gives undefined in JS: the zero value here
     if (targetType?.startsWith('[]') && !isAssignmentTarget(node)) {
       useHelper('dynamic');
+      // (where an any is expected, undefined itself — a regex match's
+      // unmatched group too)
+      const elementType = targetType.slice(2);
+      if ((elementType === 'string' || elementType === 'float64' || elementType === 'bool') && !hasQuestionDot(node) && inferExpectedTypeFromContext(node) === 'interface{}') {
+        if (elementType === 'string') useHelper('regexMatch');
+        return `TnPtrValue(${elementType === 'string' ? 'TnMatchGroup' : 'TnAtPtr'}(${visit(node.expression)}, ${numericIndex(node.argumentExpression)}))`;
+      }
       return `TnAt(${visit(node.expression)}, ${numericIndex(node.argumentExpression)})`;
     }
     return `${visit(node.expression)}[int(${numericIndex(node.argumentExpression)})]`;
@@ -4936,6 +5047,19 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   if (goType === 'interface{}' && NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(expr) ?? '')) {
     useHelper('dynamic');
     return `TnPtrValue(${visit(expr)})`;
+  }
+  // xs[i] of a primitive array into an any slot: undefined past the end (and
+  // for a regex match's unmatched group)
+  const element = unwrapParentheses(expr);
+  if (goType === 'interface{}' && element && isElementAccessExpression(element) && !hasQuestionDot(element)) {
+    const elementType = inferExpressionType(element);
+    const arrayType = (inferExpressionType(element.expression) ?? '').replace(/^\*/, '');
+    if ((elementType === 'string' || elementType === 'float64' || elementType === 'bool') && arrayType === `[]${elementType}`) {
+      useHelper('dynamic');
+      if (elementType === 'string') useHelper('regexMatch');
+      const items = toGoValueOfType(element.expression, arrayType);
+      return `TnPtrValue(${elementType === 'string' ? 'TnMatchGroup' : 'TnAtPtr'}(${items}, ${numericIndex(element.argumentExpression)}))`;
+    }
   }
   // a && b / a || b where a boolean is expected: its truthiness
   const logical = unwrapParentheses(expr);
@@ -10946,6 +11070,8 @@ function getObjectFieldNodeType(typeNode: AstNode | undefined, isOptional: boole
   // which JSON.stringify writes as null and leaves out)
   // (a primitive's: an object or array field's nil stands for both)
   if (typeIncludesNull(typeNode) && ['*string', '*float64', '*bool', 'string', 'float64', 'bool'].includes(getOptionalNodeType(typeNode, isOptional))) return 'interface{}';
+  // (and one holding a regex match's group, which may be undefined)
+  if (typeNode?.parent && undefinedPrimitiveFields.has(typeNode.parent)) return 'interface{}';
   return objectFieldGoType(getOptionalNodeType(typeNode, isOptional));
 }
 
@@ -21238,6 +21364,8 @@ type tnBtNode struct {
 	op       string
 	ch       rune
 	cls      func(rune) bool
+	ascii    *[utf8.RuneSelf]bool // (a class's ASCII members)
+	single   uint8 // 1 char, 2 any, 3 class (see tnBtMarkSingles); 0 others
 	negCls   bool
 	seq      []*tnBtNode
 	branches [][]*tnBtNode
@@ -21273,7 +21401,32 @@ func tnBtCompile(pattern string) *tnBt {
 	if err != nil || p.pos < len(p.src) {
 		return nil
 	}
+	tnBtMarkSingles(root)
 	return &tnBt{root: root, ngroups: p.ngrp, anchored: tnBtStartAnchored(root)}
+}
+
+// The single-rune nodes' kinds as numbers (the matcher's hot paths test them)
+func tnBtMarkSingles(n *tnBtNode) {
+	if n == nil {
+		return
+	}
+	switch n.op {
+	case "char":
+		n.single = 1
+	case "any":
+		n.single = 2
+	case "class":
+		n.single = 3
+	}
+	for _, c := range n.seq {
+		tnBtMarkSingles(c)
+	}
+	for _, b := range n.branches {
+		for _, c := range b {
+			tnBtMarkSingles(c)
+		}
+	}
+	tnBtMarkSingles(n.child)
 }
 
 func (p *tnBtParser) peek() (rune, bool) {
@@ -21773,7 +21926,20 @@ func (p *tnBtParser) parseClass() (*tnBtNode, error) {
 		items = append(items, func(r rune) bool { return r == l })
 	}
 	matchers := items
-	return &tnBtNode{op: "class", cls: func(r rune) bool {
+	// (ASCII from a table)
+	var ascii [utf8.RuneSelf]bool
+	for c := rune(0); c < utf8.RuneSelf; c++ {
+		for _, m := range matchers {
+			if m(c) {
+				ascii[c] = true
+				break
+			}
+		}
+	}
+	return &tnBtNode{op: "class", ascii: &ascii, cls: func(r rune) bool {
+		if r >= 0 && r < utf8.RuneSelf {
+			return ascii[r]
+		}
 		for _, m := range matchers {
 			if m(r) {
 				return true
@@ -21828,7 +21994,7 @@ func tnBtWord(r rune) bool {
 }
 
 func tnBtIsSingle(n *tnBtNode) bool {
-	return n.op == "char" || n.op == "any" || n.op == "class"
+	return n.single != 0
 }
 
 // The width of the one rune a char / any / class node matches at pos, or -1
@@ -21837,16 +22003,16 @@ func (m *tnBtMatchState) single(node *tnBtNode, pos int) int {
 	if size == 0 {
 		return -1
 	}
-	switch node.op {
-	case "char":
+	switch node.single {
+	case 1:
 		if r == node.ch || m.bt.icase && unicode.ToLower(r) == unicode.ToLower(node.ch) {
 			return size
 		}
-	case "any":
+	case 2:
 		if m.bt.dotAll || !tnBtLineEnd(r) {
 			return size
 		}
-	case "class":
+	case 3:
 		in := node.cls(r)
 		if !in && m.bt.icase {
 			in = node.cls(unicode.ToLower(r)) || node.cls(unicode.ToUpper(r))
@@ -21881,12 +22047,13 @@ func (m *tnBtMatchState) seq(nodes []*tnBtNode, pos int, k func(int) bool) bool 
 }
 
 func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
-	switch node.op {
-	case "char", "any", "class":
+	if node.single != 0 {
 		if w := m.single(node, pos); w >= 0 {
 			return k(pos + w)
 		}
 		return false
+	}
+	switch node.op {
 	case "anchor":
 		switch node.anchor {
 		case '^':
@@ -22022,19 +22189,43 @@ func (m *tnBtMatchState) repSingle(node *tnBtNode, pos int, k func(int) bool) bo
 			count++
 		}
 	}
-	ends := make([]int, 1, 16)
-	ends[0] = pos
-	for node.max < 0 || len(ends)-1 < node.max {
-		w := m.single(node.child, pos)
+	// (each step matches one rune: giving one back steps back over the rune
+	// before, with nothing to remember on the way)
+	count := 0
+	child := node.child
+	table := child.ascii
+	if m.bt.icase {
+		table = nil
+	}
+	for node.max < 0 || count < node.max {
+		// (an ASCII byte against a class: its table)
+		if table != nil && pos < len(m.s) && m.s[pos] < utf8.RuneSelf {
+			if table[m.s[pos]] == child.negCls {
+				break
+			}
+			pos++
+			count++
+			continue
+		}
+		w := m.single(child, pos)
 		if w < 0 {
 			break
 		}
 		pos += w
-		ends = append(ends, pos)
+		count++
 	}
-	for i := len(ends) - 1; i >= node.min; i-- {
-		if k(ends[i]) {
+	for ; count >= node.min; count-- {
+		if k(pos) {
 			return true
+		}
+		if count == 0 {
+			break
+		}
+		if c := m.s[pos-1]; c < utf8.RuneSelf {
+			pos--
+		} else {
+			_, w := utf8.DecodeLastRuneInString(m.s[:pos])
+			pos -= w
 		}
 	}
 	return false
