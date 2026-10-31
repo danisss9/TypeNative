@@ -258,6 +258,8 @@ export async function main() {
       stdin.on('end', function() {
         resolve(buff);
       });
+
+      stdin.resume();
     });
   }
 

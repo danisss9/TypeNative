@@ -801,6 +801,7 @@ function parseAndLower(code: string): AstNode {
   lowerConstructorCalls(sourceFile);
   lowerForOfAssignments(sourceFile);
   lowerExpandoFunctions(sourceFile);
+  lowerArrayIntersectionAliases(sourceFile);
   lowerErrorNameFields(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
@@ -982,6 +983,21 @@ function lowerIndexSignatures(node: AstNode): void {
       delete node.heritageClauses;
       node.kind = 'TypeAliasDeclaration';
       node.type = fnType;
+    }
+    return;
+  }
+  // { [k: string]: any; type: string; … }: an open object, any property may
+  // be on it (values of other object types pass for it): a dynamic value
+  const openSignature = members.length > 1 && members.some((m: AstNode) => m.kind === 'IndexSignature' && isAnyTypeNode(m.type));
+  if (openSignature && (node.kind === 'TypeLiteral' || node.kind === 'InterfaceDeclaration')) {
+    if (node.kind === 'TypeLiteral') {
+      for (const key of Object.keys(node)) if (key !== 'parent' && key !== 'line' && key !== 'column') delete node[key];
+      node.kind = 'AnyKeyword';
+    } else {
+      delete node.members;
+      delete node.heritageClauses;
+      node.kind = 'TypeAliasDeclaration';
+      node.type = { kind: 'AnyKeyword' };
     }
     return;
   }
@@ -1206,6 +1222,28 @@ function rewriteNamespaceAccess(nodes: AstNode[], namespaces: Set<string>): void
   for (let i = 0; i < nodes.length; i++) nodes[i] = rewrite(nodes[i]);
 }
 
+// Ns.T in a module importing a namespace another module declares (flattened
+// there to Ns_T): the flattened type, once every module is linked
+function linkFlattenedNamespaceTypes(asts: AstNode[]): void {
+  const flattenedName = (n: AstNode): string => {
+    if (!n || n.kind !== 'QualifiedName' || !isIdentifier(n.left) || !isIdentifier(n.right)) return '';
+    const name = `${n.left.text}_${n.right.text}`;
+    return declaredInterfaces.has(name) || declaredTypeAliases.has(name) || declaredClasses.has(name) ? name : '';
+  };
+  const seen = new Set<AstNode>();
+  const walk = (node: AstNode): void => {
+    if (!node || seen.has(node)) return;
+    seen.add(node);
+    if (node.kind === 'TypeReference' || node.kind === 'ExpressionWithTypeArguments') {
+      const target = node.kind === 'TypeReference' ? node.typeName : undefined;
+      const name = flattenedName(target);
+      if (name) node.typeName = { kind: 'Identifier', text: name, parent: node, line: target.line, column: target.column };
+    }
+    for (const child of childNodes(node)) walk(child);
+  };
+  for (const ast of asts) if (ast) walk(ast);
+}
+
 function lowerNamespaces(sourceFile: AstNode): void {
   const flat = flattenNamespaces(sourceFile.statements ?? []);
   sourceFile.statements = flat.statements;
@@ -1410,6 +1448,42 @@ function lowerErrorNameFields(node: AstNode): void {
   const type: AstNode = { kind: 'StringKeyword' };
   const field: AstNode = { kind: 'PropertyDeclaration', name, type, line: node.line, column: node.column };
   node.members = [field, ...members];
+}
+
+// type List = T[] & { links: L }: an array with properties of its own, as
+// `class List extends Array<T> { links!: L }` (the elements live in the
+// Array subclass's TnArray, the properties in its fields)
+function lowerArrayIntersectionAliases(sourceFile: AstNode): void {
+  sourceFile.statements = (sourceFile.statements ?? []).map((statement: AstNode): AstNode => {
+    if (!isTypeAliasDeclaration(statement) || statement.type?.kind !== 'IntersectionType' || (statement.typeParameters ?? []).length > 0) return statement;
+    const parts: AstNode[] = statement.type.types ?? [];
+    const arrays = parts.filter((t: AstNode) => isArrayTypeNode(t) ||
+      isTypeReferenceNode(t) && isIdentifier(t.typeName) && t.typeName.text === 'Array' && (t.typeArguments ?? []).length === 1);
+    const literals = parts.filter((t: AstNode) => t.kind === 'TypeLiteral');
+    if (arrays.length !== 1 || literals.length + 1 !== parts.length) return statement;
+    const element = isArrayTypeNode(arrays[0]) ? arrays[0].elementType : arrays[0].typeArguments[0];
+    const members: AstNode[] = [];
+    for (const literal of literals) {
+      for (const m of literal.members ?? []) {
+        if (!isPropertySignature(m) || !isIdentifier(m.name)) continue;
+        members.push({ kind: 'PropertyDeclaration', name: m.name, type: m.type, questionToken: m.questionToken, exclamationToken: !m.questionToken, line: m.line, column: m.column });
+      }
+    }
+    const base: AstNode = { kind: 'ExpressionWithTypeArguments', expression: { kind: 'Identifier', text: 'Array' }, typeArguments: [element] };
+    return {
+      kind: 'ClassDeclaration',
+      name: statement.name,
+      modifiers: statement.modifiers,
+      exported: statement.exported,
+      heritageClauses: [{ kind: 'HeritageClause', token: 'ExtendsKeyword', types: [base] }],
+      members: members,
+      tnArrayIntersection: true,
+      line: statement.line,
+      column: statement.column,
+      endLine: statement.endLine,
+      endColumn: statement.endColumn
+    };
+  });
 }
 
 function lowerExpandoFunctions(sourceFile: AstNode): void {
@@ -1776,6 +1850,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   const sourceFile = fileResolver
     ? linkModule(options?.fileName ?? currentFileName, code, null, currentFileIsTsx, currentFileName)
     : parseSource(code);
+  linkFlattenedNamespaceTypes([...[...linkedModules.values()].map((m) => m.ast), sourceFile]);
   collectMockTargets(sourceFile);
   instrumentCoverage(sourceFile, code);
   importedPackages.clear();
@@ -1989,9 +2064,16 @@ function collectInterfaceProperties(iface: AstNode, into: Map<string, string>, s
 // visited, else collected from its declaration (a module emitted later)
 function objectTypeFields(name: string): Map<string, string> | undefined {
   if (interfacePropertyTypes.has(name)) return interfacePropertyTypes.get(name);
+  const properties = new Map<string, string>();
+  const alias = declaredTypeAliases.has(name) ? declaredTypeAliases.get(name) : undefined;
+  if (alias && alias.kind === 'TypeLiteral') {
+    for (const member of alias.members ?? []) {
+      if (isPropertySignature(member) && isIdentifier(member.name)) properties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
+    }
+    return properties.size > 0 ? properties : undefined;
+  }
   const iface = declaredInterfaces.has(name) ? declaredInterfaces.get(name) : undefined;
   if (!iface || !interfaceHasProperties(iface)) return undefined;
-  const properties = new Map<string, string>();
   collectInterfaceProperties(iface, properties);
   return properties;
 }
@@ -2204,6 +2286,19 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
     return toGoStringLiteral(node.text);
   } else if (isAsExpression(node)) {
+    // ([] as unknown as List) where List is an Array subclass: an instance
+    // holding the array's elements
+    const subclassTarget = node.type && !isAnyTypeNode(node.type) ? classNameOfGoType(getType(node.type)) : '';
+    if (subclassTarget && isArraySubclass(subclassTarget)) {
+      let source = unwrapParentheses(node.expression);
+      while (isAsExpression(source)) source = unwrapParentheses(source.expression);
+      const sourceType = inferExpressionType(source) ?? '';
+      if (/^\*?\[\]/.test(sourceType) && !arraySubclassOf(source)) {
+        useHelper('arraySubclass');
+        useHelper('dynamic');
+        return `func() *${getSafeName(subclassTarget)} { __c := New${getSafeName(subclassTarget)}(); *__c.TnItems() = TnAs[[]interface{}](interface{}(${visit(source)})); return __c }()`;
+      }
+    }
     // (returned from a method typed to return any value: see methodReturnGoType)
     const forced = node.parent && isReturnStatement(node.parent) ? forcedCastSource(node) : undefined;
     if (forced) return visit(forced);
@@ -4663,7 +4758,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       return `TnAssignTo(new(${structName}), ${sources.join(', ')})`;
     }
 
-    const fieldTypes = typeArgs ? undefined : (interfacePropertyTypes.get(structName) ?? classPropertyTypes.get(structName));
+    const fieldTypes = typeArgs ? undefined : (objectTypeFields(structName) ?? classPropertyTypes.get(structName));
     const properties = (node.properties ?? [])
       .map((p) => {
         if (isPropertyAssignment(p)) {
@@ -4996,7 +5091,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   if (!goType || !NULLABLE_PRIMITIVE_TYPES.includes(goType) || isNilLiteral(expr)) {
     return code;
   }
-  if (isConditionalExpression(expr)) return code;
+  // (a conditional emitted as the slot's type already, when its context says so)
+  if (isConditionalExpression(expr) && (inferExpectedTypeFromContext(expr) === goType || inferExpressionType(expr) !== goType.slice(1))) return code;
   if (
     isBinaryExpression(expr) &&
     expr.operatorToken.kind === 'QuestionQuestionToken' &&
@@ -7028,6 +7124,9 @@ function getAsExpressionType(node: AstNode): string {
   const target = getType(node.type);
   // (x as File): dynamic values holding Node class instances assert to them
   if (nodeRegistry.classByGoType[target]) return target;
+  // (an array passed off as an Array subclass becomes one: see the emitter)
+  const subclass = classNameOfGoType(target);
+  if (subclass && isArraySubclass(subclass)) return target;
   // (an object passed off as a RegExp: converted when stored as one)
   if (target === '*TnRegex' && !['*TnRegex', '*regexp.Regexp'].includes(inferExpressionType(node.expression) ?? '')) useHelper('regexObject');
   if (isDynamicValue(node.expression) && (isStructGoType(target) || target.startsWith('*'))) {
@@ -7143,6 +7242,27 @@ function visitRecordSpreadLiteral(node: AstNode): string | undefined {
 function visitMapLiteral(node: AstNode, recordType: AstNode): string {
   const keyType = getType(recordType.typeArguments[0]);
   const valueType = getType(recordType.typeArguments[1]);
+  // { ...source, k: v }: each source's entries copied in order (an object
+  // source's set fields, converted to the value type)
+  if ((node.properties ?? []).some((p: AstNode) => p.kind === 'SpreadAssignment')) {
+    useHelper('orderedMap');
+    const mapType = mapGoType(keyType, valueType);
+    const steps = (node.properties ?? []).map((p: AstNode) => {
+      if (p.kind === 'SpreadAssignment') {
+        const sourceType = inferExpressionType(p.expression) ?? '';
+        let source = visit(p.expression);
+        if (sourceType !== mapType) {
+          useHelper('dynamic');
+          source = `TnAs[${mapType}](interface{}(${source}))`;
+        }
+        return `if __src := ${source}; __src != nil { for _, __k := range __src.Keys() { __obj.Set(__k, __src.Get(__k)) } }`;
+      }
+      if (isShorthandPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${toGoValueOfType(p.name, valueType)})`;
+      if (isPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)})`;
+      return '';
+    });
+    return `func() ${mapType} { __obj := TnNewMap[${keyType}, ${valueType}](); ${steps.filter((x: string) => x).join('; ')}; return __obj }()`;
+  }
   const entries: string[] = [];
   for (const p of node.properties ?? []) {
     if (isPropertyAssignment(p)) entries.push(`${mapKeyText(p.name)}, ${toGoValueOfType(p.initializer, valueType)}`);
@@ -8400,6 +8520,14 @@ function isReferenceArrayRead(node: AstNode): boolean {
   return referenceArrays.has(node.text) && !(topLevelGoTypes.has(node.text) && !topLevelReferenceArrays.has(node.text) && !isLocallyBound(node));
 }
 
+// Whether an enclosing function has a parameter of this identifier's name
+function isBoundAsParameter(expr: AstNode): boolean {
+  for (let n = expr.parent; n; n = n.parent) {
+    if (FUNCTION_LIKE_KINDS.has(n.kind) && (n.parameters ?? []).some((p: AstNode) => isIdentifier(p.name) && p.name.text === expr.text)) return true;
+  }
+  return false;
+}
+
 // Whether an enclosing function (or catch clause) binds this identifier's name
 function isLocallyBound(expr: AstNode): boolean {
   for (let n = expr.parent; n; n = n.parent) {
@@ -9214,7 +9342,7 @@ function getObjectCallName(node: AstNode): string | undefined {
 function declaredMemberType(owner: string, field: string, classOnly = false, interfaceOnly = false): string | undefined {
   const cls = interfaceOnly ? undefined : classPropertyTypes.get(owner);
   if (cls?.has(field)) return cls.get(field);
-  const iface = classOnly ? undefined : interfacePropertyTypes.get(owner);
+  const iface = classOnly ? undefined : objectTypeFields(owner);
   if (iface?.has(field)) return iface.get(field);
   return undefined;
 }
@@ -9224,7 +9352,7 @@ function getObjectFieldGoType(objectType: string, field: string): string | undef
   const structField = getStructFieldGoType(objectType, field);
   if (structField !== undefined) return structField;
   // (has() first: a native Map<string, string> gives '' for a missing key)
-  const iface = interfacePropertyTypes.get(base);
+  const iface = objectTypeFields(base);
   if (iface?.has(field)) return iface.get(field);
   const cls = classPropertyTypes.get(base);
   if (cls?.has(field)) return cls.get(field);
@@ -9243,7 +9371,7 @@ function objectFieldNames(objectType: string): string[] {
       .map((f) => (f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
   }
   const base = bare.replace(/\[.*$/, '');
-  const props = interfacePropertyTypes.get(base) ?? classPropertyTypes.get(base);
+  const props = objectTypeFields(base) ?? classPropertyTypes.get(base);
   const names: string[] = [];
   if (!props) return names;
   for (const f of props.keys()) {
@@ -12961,8 +13089,34 @@ function jsRegexFlagsToGo(flags: string): string {
 
 // Escapes a JS regex pattern for a Go string literal and rewrites JS named
 // groups to RE2 syntax: (?<name> → (?P<name>
+// JS's \s (Unicode whitespace) in RE2 syntax, whose \s is ASCII only
+const JS_SPACE_CLASS = '\\t\\n\\v\\f\\r \\x{a0}\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}\\x{feff}';
+
+// \s / \S as JS reads them: [\t\n…] (inside a class its members; a \S inside
+// a class stays, as RE2's includes every non-ASCII space)
+function jsSpaceEscapes(pattern: string): string {
+  if (!pattern.includes('\\s') && !pattern.includes('\\S')) return pattern;
+  let out = '';
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '\\' && i + 1 < pattern.length) {
+      const next = pattern[i + 1];
+      if (next === 's') out += inClass ? JS_SPACE_CLASS : `[${JS_SPACE_CLASS}]`;
+      else if (next === 'S' && !inClass) out += `[^${JS_SPACE_CLASS}]`;
+      else out += c + next;
+      i++;
+      continue;
+    }
+    if (c === '[' && !inClass) inClass = true;
+    else if (c === ']' && inClass) inClass = false;
+    out += c;
+  }
+  return out;
+}
+
 function translateJsRegexPattern(pattern: string): string {
-  return pattern
+  return jsSpaceEscapes(pattern)
     // \u{1F600} / \u00e9 → RE2's \x{…}
     .replace(/\\u\{([0-9A-Fa-f]+)\}/g, '\\x{$1}')
     .replace(/\\u([0-9A-Fa-f]{4})/g, '\\x{$1}')
@@ -13978,7 +14132,10 @@ function returnsArrayReference(fn: AstNode | undefined): boolean {
   const usedAsValue = isMethod
     // (a method read as a value, obj.m without a call)
     ? [...linkedModules.values()].some((m) => containsNode(m.ast, (n) =>
-      isPropertyAccessExpression(n) && n.name.text === name && !(isCallExpression(n.parent) && n.parent.expression === n)
+      isPropertyAccessExpression(n) && n.name.text === name && !(isCallExpression(n.parent) && n.parent.expression === n) &&
+      // (on an instance of this class, or an any value)
+      (n.expression.kind === 'ThisKeyword' ? getEnclosingClassName(n) === fn.parent.name.text
+        : ['interface{}', `*${fn.parent.name.text}`].includes(inferExpressionType(n.expression) ?? ''))
     ))
     : [...linkedModules.values()].some((m) => containsNode(m.ast, (n) =>
       isIdentifier(n) && n.text === name && n !== fn.name && !(isCallExpression(n.parent) && n.parent.expression === n) && !isFieldNameIdentifier(n) &&
@@ -14308,7 +14465,7 @@ function getParameterDestructuring(parameters: AstNode[]): string {
       }
       registerLocalVariable(el.name.text, valueType);
       if (memberTypeNode) variableTypeNodes.set(el.name.text, memberTypeNode);
-      code += `${visit(el.name)} := ${value}\n\t\t_ = ${visit(el.name)}\n\t\t`;
+      code += `${getSafeName(el.name.text)} := ${value}\n\t\t_ = ${getSafeName(el.name.text)}\n\t\t`;
     });
   }
   return code;
@@ -19355,6 +19512,10 @@ func (w *tnJSONWriter) structFields(rv reflect.Value, emit func(string, interfac
 		if value.Kind() == reflect.Func || strings.HasPrefix(f.Name, "__") {
 			continue
 		}
+		// (an unset field — a nil pointer or any — is undefined: no key, as in JS)
+		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
+			continue
+		}
 		emit(tnJSONFieldName(f.Name), value.Interface())
 	}
 }
@@ -19492,7 +19653,13 @@ func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
 		case 3:
 			w.buf.WriteString(strconv.FormatBool(*(*bool)(p)))
 		default:
-			if !w.property(f.name, reflect.NewAt(f.typ, p).Elem().Interface(), depth+1) {
+			// (an unset field — a nil pointer or any — is undefined: no key, as in JS)
+			fv := reflect.NewAt(f.typ, p).Elem()
+			if (fv.Kind() == reflect.Pointer || fv.Kind() == reflect.Interface) && fv.IsNil() {
+				w.buf.Truncate(mark)
+				continue
+			}
+			if !w.property(f.name, fv.Interface(), depth+1) {
 				w.buf.Truncate(mark) // undefined values leave the key out
 				continue
 			}
@@ -20262,13 +20429,34 @@ func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
 
 // A JS pattern built at run time in RE2's syntax (what the transpiler does to
 // literals): \\u{…} / \\uXXXX → \\x{…}, (?<name> → (?P<name>
+const tnJSSpaceClass = "\\\\t\\\\n\\\\v\\\\f\\\\r \\\\x{a0}\\\\x{1680}\\\\x{2000}-\\\\x{200a}\\\\x{2028}\\\\x{2029}\\\\x{202f}\\\\x{205f}\\\\x{3000}\\\\x{feff}"
+
 func TnJSPatternToRE2(p string) string {
-	if !strings.Contains(p, "\\\\u") && !strings.Contains(p, "(?<") {
+	if !strings.Contains(p, "\\\\u") && !strings.Contains(p, "(?<") && !strings.Contains(p, "\\\\s") && !strings.Contains(p, "\\\\S") {
 		return p
 	}
 	var b strings.Builder
+	inClass := false
 	for i := 0; i < len(p); i++ {
 		c := p[i]
+		if c == '[' && !inClass {
+			inClass = true
+		} else if c == ']' && inClass {
+			inClass = false
+		}
+		// s / S escapes as JS reads them (RE2's is ASCII only)
+		if c == '\\\\' && i+1 < len(p) && (p[i+1] == 's' || p[i+1] == 'S' && !inClass) {
+			switch {
+			case p[i+1] == 'S':
+				b.WriteString("[^" + tnJSSpaceClass + "]")
+			case inClass:
+				b.WriteString(tnJSSpaceClass)
+			default:
+				b.WriteString("[" + tnJSSpaceClass + "]")
+			}
+			i++
+			continue
+		}
 		if c == '\\\\' && i+1 < len(p) {
 			if p[i+1] == 'u' && i+2 < len(p) && p[i+2] == '{' {
 				if end := strings.IndexByte(p[i+3:], '}'); end >= 0 {
@@ -20670,9 +20858,10 @@ type tnBt struct {
 }
 
 type tnBtParser struct {
-	src  []rune
-	pos  int
-	ngrp int
+	src   []rune
+	pos   int
+	ngrp  int
+	names map[string]int
 }
 
 func tnBtCompile(pattern string) *tnBt {
@@ -20809,6 +20998,15 @@ func (p *tnBtParser) parseBraces() (int, int, bool) {
 	return lo, hi, true
 }
 
+// JS's whitespace escape: ASCII whitespace, Unicode space separators, line terminators and the BOM
+func tnJSSpace(r rune) bool {
+	switch r {
+	case ' ', '\\t', '\\n', '\\r', '\\f', '\\v', 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200a
+}
+
 func tnCharClass(escape rune) func(rune) bool {
 	switch escape {
 	case 'd':
@@ -20824,9 +21022,9 @@ func tnCharClass(escape rune) func(rune) bool {
 			return !(r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'))
 		}
 	case 's':
-		return func(r rune) bool { return r == ' ' || r == '\\t' || r == '\\n' || r == '\\r' || r == '\\f' || r == '\\v' }
+		return tnJSSpace
 	case 'S':
-		return func(r rune) bool { return !(r == ' ' || r == '\\t' || r == '\\n' || r == '\\r' || r == '\\f' || r == '\\v') }
+		return func(r rune) bool { return !tnJSSpace(r) }
 	}
 	return nil
 }
@@ -20868,37 +21066,39 @@ func (p *tnBtParser) parseAtom() (*tnBtNode, error) {
 					behind = true
 					negative = c3 == '!'
 				} else {
-					for {
-						cn, okn := p.peek()
-						if !okn {
-							return nil, fmt.Errorf("unterminated group name")
-						}
-						p.pos++
-						if cn == '>' {
-							break
-						}
+					name := p.groupName()
+					if name == "" {
+						return nil, fmt.Errorf("unterminated group name")
 					}
+					if p.names == nil {
+						p.names = map[string]int{}
+					}
+					p.names[name] = p.ngrp + 1
 				}
 			case 'P':
 				p.pos++
 				if c3, ok3 := p.peek(); ok3 && c3 == '<' {
 					p.pos++
-					for {
-						cn, okn := p.peek()
-						if !okn {
-							return nil, fmt.Errorf("unterminated group name")
-						}
-						p.pos++
-						if cn == '>' {
-							break
-						}
+					name := p.groupName()
+					if name == "" {
+						return nil, fmt.Errorf("unterminated group name")
 					}
+					if p.names == nil {
+						p.names = map[string]int{}
+					}
+					p.names[name] = p.ngrp + 1
 				} else {
 					return nil, fmt.Errorf("bad (?P")
 				}
 			default:
 				return nil, fmt.Errorf("unsupported group")
 			}
+		}
+		// (a group's number is its opening parenthesis's position, as in JS)
+		group := 0
+		if kind == "group" {
+			p.ngrp++
+			group = p.ngrp
 		}
 		body, err := p.parseAlt()
 		if err != nil {
@@ -20914,8 +21114,7 @@ func (p *tnBtParser) parseAtom() (*tnBtNode, error) {
 		case "look":
 			return &tnBtNode{op: "look", child: body, behind: behind, negative: negative}, nil
 		default:
-			p.ngrp++
-			return &tnBtNode{op: "group", group: p.ngrp, child: body}, nil
+			return &tnBtNode{op: "group", group: group, child: body}, nil
 		}
 	case '[':
 		return p.parseClass()
@@ -20932,37 +21131,187 @@ func (p *tnBtParser) parseAtom() (*tnBtNode, error) {
 	}
 }
 
+// The name of a (?<name> group, after the '<', through the '>'
+func (p *tnBtParser) groupName() string {
+	start := p.pos
+	for p.pos < len(p.src) && p.src[p.pos] != '>' {
+		p.pos++
+	}
+	if p.pos >= len(p.src) {
+		return ""
+	}
+	name := string(p.src[start:p.pos])
+	p.pos++
+	return name
+}
+
+// The hex digits from the cursor (n of them, or {…} when n is 0): their value
+func (p *tnBtParser) hexValue(n int) (rune, bool) {
+	end := p.pos + n
+	if n == 0 {
+		if p.pos >= len(p.src) || p.src[p.pos] != '{' {
+			return 0, false
+		}
+		close := p.pos + 1
+		for close < len(p.src) && p.src[close] != '}' {
+			close++
+		}
+		if close >= len(p.src) {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(string(p.src[p.pos+1:close]), 16, 32)
+		if err != nil {
+			return 0, false
+		}
+		p.pos = close + 1
+		return rune(v), true
+	}
+	if end > len(p.src) {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(string(p.src[p.pos:end]), 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	p.pos = end
+	return rune(v), true
+}
+
+// The character or class an escape (after its backslash) stands for, as JS
+// reads it: d w s (JS whitespace), p{…} / P{…}, xHH, x{…}, uHHHH, u{…}, cX, 0,
+// n t r f v (and b, a backspace in a class)
+func (p *tnBtParser) escapeValue(inClass bool) (rune, func(rune) bool, bool) {
+	c, ok := p.peek()
+	if !ok {
+		return 0, nil, false
+	}
+	p.pos++
+	switch c {
+	case 'n':
+		return '\\n', nil, true
+	case 't':
+		return '\\t', nil, true
+	case 'r':
+		return '\\r', nil, true
+	case 'f':
+		return '\\f', nil, true
+	case 'v':
+		return '\\v', nil, true
+	case '0':
+		return 0, nil, true
+	case 'b':
+		if inClass {
+			return '\\b', nil, true
+		}
+	case 'x':
+		if v, ok := p.hexValue(2); ok {
+			return v, nil, true
+		}
+		if v, ok := p.hexValue(0); ok {
+			return v, nil, true
+		}
+		return 'x', nil, true
+	case 'u':
+		if v, ok := p.hexValue(4); ok {
+			return v, nil, true
+		}
+		if v, ok := p.hexValue(0); ok {
+			return v, nil, true
+		}
+		return 'u', nil, true
+	case 'c':
+		if n, ok := p.peek(); ok && ((n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z')) {
+			p.pos++
+			return n % 32, nil, true
+		}
+		return '\\\\', nil, true
+	case 'p', 'P':
+		if n, ok := p.peek(); ok && n == '{' {
+			close := p.pos + 1
+			for close < len(p.src) && p.src[close] != '}' {
+				close++
+			}
+			if close < len(p.src) {
+				if table := tnUnicodeProperty(string(p.src[p.pos+1 : close])); table != nil {
+					p.pos = close + 1
+					if c == 'P' {
+						return 0, func(r rune) bool { return !unicode.Is(table, r) }, true
+					}
+					return 0, func(r rune) bool { return unicode.Is(table, r) }, true
+				}
+			}
+		}
+	}
+	if cls := tnCharClass(c); cls != nil {
+		return 0, cls, true
+	}
+	return c, nil, true
+}
+
+// A p{…} property's table: a general category (L, Lu, P, Letter…), a
+// script (Greek, Script=Greek) or a binary property
+func tnUnicodeProperty(name string) *unicode.RangeTable {
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		name = name[eq+1:]
+	}
+	long := map[string]string{
+		"Letter": "L", "Lowercase_Letter": "Ll", "Uppercase_Letter": "Lu", "Titlecase_Letter": "Lt", "Modifier_Letter": "Lm", "Other_Letter": "Lo",
+		"Mark": "M", "Number": "N", "Decimal_Number": "Nd", "Letter_Number": "Nl", "Other_Number": "No",
+		"Punctuation": "P", "Connector_Punctuation": "Pc", "Dash_Punctuation": "Pd", "Open_Punctuation": "Ps", "Close_Punctuation": "Pe",
+		"Initial_Punctuation": "Pi", "Final_Punctuation": "Pf", "Other_Punctuation": "Po",
+		"Symbol": "S", "Math_Symbol": "Sm", "Currency_Symbol": "Sc", "Modifier_Symbol": "Sk", "Other_Symbol": "So",
+		"Separator": "Z", "Space_Separator": "Zs", "Line_Separator": "Zl", "Paragraph_Separator": "Zp",
+		"Other": "C", "Control": "Cc", "Format": "Cf", "Private_Use": "Co", "Surrogate": "Cs",
+	}
+	if short, ok := long[name]; ok {
+		name = short
+	}
+	if t, ok := unicode.Categories[name]; ok {
+		return t
+	}
+	if t, ok := unicode.Scripts[name]; ok {
+		return t
+	}
+	if t, ok := unicode.Properties[name]; ok {
+		return t
+	}
+	return nil
+}
+
 func (p *tnBtParser) parseEscape() (*tnBtNode, error) {
 	c, ok := p.peek()
 	if !ok {
 		return nil, fmt.Errorf("trailing backslash")
 	}
-	p.pos++
 	switch c {
 	case 'b':
+		p.pos++
 		return &tnBtNode{op: "anchor", anchor: 'b'}, nil
 	case 'B':
+		p.pos++
 		return &tnBtNode{op: "anchor", anchor: 'B'}, nil
-	case 'n':
-		return &tnBtNode{op: "char", ch: '\\n'}, nil
-	case 't':
-		return &tnBtNode{op: "char", ch: '\\t'}, nil
-	case 'r':
-		return &tnBtNode{op: "char", ch: '\\r'}, nil
-	case 'f':
-		return &tnBtNode{op: "char", ch: '\\f'}, nil
-	case 'v':
-		return &tnBtNode{op: "char", ch: '\\v'}, nil
-	case '0':
-		return &tnBtNode{op: "char", ch: 0}, nil
 	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		p.pos++
 		return &tnBtNode{op: "backref", group: int(c - '0')}, nil
-	default:
-		if cls := tnCharClass(c); cls != nil {
-			return &tnBtNode{op: "class", cls: cls}, nil
+	case 'k':
+		// k<name>: the named group's text
+		if n, ok := p.peekAt(1); ok && n == '<' {
+			p.pos += 2
+			name := p.groupName()
+			if index, found := p.names[name]; found {
+				return &tnBtNode{op: "backref", group: index}, nil
+			}
+			return nil, fmt.Errorf("unknown group name")
 		}
-		return &tnBtNode{op: "char", ch: c}, nil
 	}
+	ch, cls, ok := p.escapeValue(false)
+	if !ok {
+		return nil, fmt.Errorf("trailing backslash")
+	}
+	if cls != nil {
+		return &tnBtNode{op: "class", cls: cls}, nil
+	}
+	return &tnBtNode{op: "char", ch: ch}, nil
 }
 
 func (p *tnBtParser) parseClass() (*tnBtNode, error) {
@@ -20986,25 +21335,15 @@ func (p *tnBtParser) parseClass() (*tnBtNode, error) {
 		p.pos++
 		var lo rune
 		if c == '\\\\' {
-			c2, ok2 := p.peek()
+			ch, cls, ok2 := p.escapeValue(true)
 			if !ok2 {
 				return nil, fmt.Errorf("trailing backslash in class")
 			}
-			p.pos++
-			if cls := tnCharClass(c2); cls != nil {
+			if cls != nil {
 				items = append(items, cls)
 				continue
 			}
-			switch c2 {
-			case 'n':
-				lo = '\\n'
-			case 't':
-				lo = '\\t'
-			case 'r':
-				lo = '\\r'
-			default:
-				lo = c2
-			}
+			lo = ch
 		} else {
 			lo = c
 		}
@@ -21016,11 +21355,10 @@ func (p *tnBtParser) parseClass() (*tnBtNode, error) {
 				p.pos++
 				hi := hiChar
 				if hiChar == '\\\\' {
-					hc, ok5 := p.peek()
+					hc, _, ok5 := p.escapeValue(true)
 					if !ok5 {
 						return nil, fmt.Errorf("trailing backslash in class")
 					}
-					p.pos++
 					hi = hc
 				}
 				l, h := lo, hi
@@ -23305,6 +23643,9 @@ function nodeGlobalKey(name: string): string {
 function resolveNodeKey(expr: AstNode): string {
   if (!expr) return '';
   if (isIdentifier(expr)) {
+    // (a parameter or local of the same name shadows the import: resolve in
+    // new Promise((resolve) => …) beside path's resolve)
+    if (nodeLocalNames.has(expr.text) && isBoundAsParameter(expr)) return '';
     if (nodeLocalNames.has(expr.text)) return nodeLocalNames.get(expr.text) ?? '';
     return nodeGlobalKey(expr.text);
   }
@@ -23934,8 +24275,10 @@ function registerLocalVariable(name: string, goType: string | undefined): void {
   variableClassNames.delete(name);
   variableTypeNodes.delete(name);
   narrowedVariables.delete(name);
-  // Loop and binding variables hold plain values in our lowering
-  referenceArrays.delete(name);
+  // Loop and binding variables hold plain values in our lowering (one bound
+  // to an object's array field holds its *[]T: a reference)
+  if (goType?.startsWith('*[]')) referenceArrays.add(name);
+  else referenceArrays.delete(name);
   if (goType) variableGoTypes.set(name, goType);
   else variableGoTypes.delete(name);
 }
