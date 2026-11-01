@@ -100,22 +100,22 @@ Node v24.22.1, Go 1.26.0, TypeNative 0.4.2 (unreleased changes), default
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 127.45 ms | 142.92 ms | 143.80 ms | 176.68 ms |
-| TypeNative | 17.25 ms  | 20.00 ms  | 20.51 ms  | 29.36 ms  |
+| Node.js    | 129.00 ms | 148.15 ms | 148.71 ms | 191.32 ms |
+| TypeNative | 18.04 ms  | 19.46 ms  | 19.71 ms  | 25.27 ms  |
 
 (b) `marked < generated.md` (10.0 MB, 114,893 lines), 5 runs each:
 
 | Runtime    | min       | median    | mean      | max       | MB/s (median) |
 | ---------- | --------- | --------- | --------- | --------- | ------------- |
-| Node.js    | 1,868 ms  | 1,974 ms  | 2,153 ms  | 2,811 ms  | 5.07          |
-| TypeNative | 10,113 ms | 10,439 ms | 10,476 ms | 10,951 ms | 0.96          |
+| Node.js    | 1,969 ms  | 2,053 ms  | 2,056 ms  | 2,164 ms  | 4.87          |
+| TypeNative | 10,378 ms | 10,573 ms | 10,685 ms | 11,006 ms | 0.95          |
 
-**Per call, TypeNative is 7.1x faster** (20 ms vs 143 ms, median). Node's
+**Per call, TypeNative is 7.6x faster** (19 ms vs 148 ms, median). Node's
 cost here is mostly startup: it loads and type-strips the 13 TypeScript files
 and compiles marked's regexes on every run. That's what you feel when a docs
 build or a hook renders one file per process.
 
-**On bulk throughput, TypeNative is 5.3x slower.** On a long input V8's JIT
+**On bulk throughput, TypeNative is 5.2x slower.** On a long input V8's JIT
 and its regex engine (Irregexp compiles hot patterns to machine code) run
 marked faster than the compiled Go does. In a profile of the native run on
 1 MB, lexing takes half the CPU and TypeNative's backtracking regex engine
