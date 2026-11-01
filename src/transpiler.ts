@@ -1000,7 +1000,8 @@ function lowerIndexSignatures(node: AstNode): void {
       delete node.members;
       delete node.heritageClauses;
       node.kind = 'TypeAliasDeclaration';
-      node.type = { kind: 'AnyKeyword' };
+      const anyType: AstNode = { kind: 'AnyKeyword' };
+      node.type = anyType;
     }
     return;
   }
@@ -1336,7 +1337,10 @@ function collectUndefinedPrimitiveFields(asts: AstNode[]): void {
             if (!['StringKeyword', 'NumberKeyword', 'BooleanKeyword'].includes(member.type?.kind ?? '')) continue;
             undefinedPrimitiveFields.add(member);
             // (the const in between holds the undefined too)
-            for (const d of consts) d.type = { kind: 'AnyKeyword', parent: d };
+            for (const d of consts) {
+              const anyType: AstNode = { kind: 'AnyKeyword', parent: d };
+              d.type = anyType;
+            }
           }
         }
       }
@@ -1361,7 +1365,10 @@ function linkFlattenedNamespaceTypes(asts: AstNode[]): void {
     if (node.kind === 'TypeReference' || node.kind === 'ExpressionWithTypeArguments') {
       const target = node.kind === 'TypeReference' ? node.typeName : undefined;
       const name = flattenedName(target);
-      if (name) node.typeName = { kind: 'Identifier', text: name, parent: node, line: target.line, column: target.column };
+      if (name) {
+        const flattened: AstNode = { kind: 'Identifier', text: name, parent: node, line: target.line, column: target.column };
+        node.typeName = flattened;
+      }
     }
     for (const child of childNodes(node)) walk(child);
   };
@@ -1590,16 +1597,20 @@ function lowerArrayIntersectionAliases(sourceFile: AstNode): void {
     for (const literal of literals) {
       for (const m of literal.members ?? []) {
         if (!isPropertySignature(m) || !isIdentifier(m.name)) continue;
-        members.push({ kind: 'PropertyDeclaration', name: m.name, type: m.type, questionToken: m.questionToken, exclamationToken: !m.questionToken, line: m.line, column: m.column });
+        // (each synthesized node an AstNode: the self-hosted compiler links parents into it)
+        const field: AstNode = { kind: 'PropertyDeclaration', name: m.name, type: m.type, questionToken: m.questionToken, exclamationToken: !m.questionToken, line: m.line, column: m.column };
+        members.push(field);
       }
     }
-    const base: AstNode = { kind: 'ExpressionWithTypeArguments', expression: { kind: 'Identifier', text: 'Array' }, typeArguments: [element] };
-    return {
+    const arrayName: AstNode = { kind: 'Identifier', text: 'Array' };
+    const base: AstNode = { kind: 'ExpressionWithTypeArguments', expression: arrayName, typeArguments: [element] };
+    const clause: AstNode = { kind: 'HeritageClause', token: 'ExtendsKeyword', types: [base] };
+    const declaration: AstNode = {
       kind: 'ClassDeclaration',
       name: statement.name,
       modifiers: statement.modifiers,
       exported: statement.exported,
-      heritageClauses: [{ kind: 'HeritageClause', token: 'ExtendsKeyword', types: [base] }],
+      heritageClauses: [clause],
       members: members,
       tnArrayIntersection: true,
       line: statement.line,
@@ -1607,6 +1618,7 @@ function lowerArrayIntersectionAliases(sourceFile: AstNode): void {
       endLine: statement.endLine,
       endColumn: statement.endColumn
     };
+    return declaration;
   });
 }
 
@@ -1645,7 +1657,10 @@ function lowerExpandoFunctions(sourceFile: AstNode): void {
     for (let i = targets.length - 1; i >= 0; i--) {
       const assignment: AstNode = { kind: 'BinaryExpression', left: targets[i], operatorToken: { kind: 'EqualsToken' }, right: source, line: statement.line, column: statement.column };
       flattened.push({ ...statement, expression: assignment });
-      source = { kind: 'PropertyAccessExpression', expression: { ...targets[i].expression }, name: { ...targets[i].name }, line: targets[i].line, column: targets[i].column };
+      const object: AstNode = { ...targets[i].expression };
+      const property: AstNode = { ...targets[i].name };
+      const next: AstNode = { kind: 'PropertyAccessExpression', expression: object, name: property, line: targets[i].line, column: targets[i].column };
+      source = next;
     }
   }
   const props = new Map<string, Set<string>>();
@@ -8849,7 +8864,9 @@ function isLocallyBound(expr: AstNode): boolean {
   for (let n = expr.parent; n; n = n.parent) {
     if (FUNCTION_LIKE_KINDS.has(n.kind)) {
       if (!n.tnScopeNames) n.tnScopeNames = functionScopeNames(n);
-      if (n.tnScopeNames.includes(expr.text)) return true;
+      // (read back typed: an untyped string[] property is any natively)
+      const scopeNames: string[] = n.tnScopeNames;
+      if (scopeNames.includes(expr.text)) return true;
       if (isFunctionExpression(n) && n.name && n.name.text === expr.text) return true;
       if (n.body && isBlock(n.body) && (n.body.statements ?? []).some((st: AstNode) => isNestedFunctionDeclaration(st) && st.name.text === expr.text)) return true;
     }

@@ -130,6 +130,7 @@ declared there fails the type check before it reaches the transpiler. The
 | `with`                                                                                                                     |   🚫   | —                                                                                                              | Not allowed in strict mode (modules are strict)                                                             |
 | Assignments and compound assignments as values, comma expressions, `for (let x; …)` headers, several updates per iteration |   ✅   | [syntax-loop-lowerings.ts](conformance/syntax-loop-lowerings.ts)                                               | `(ch = s[i += 1])` in a condition, `a = b = 7`, `(k++, k * 10)`; Go-only statements are lowered to closures |
 | `continue` in `do…while`; `default` falling through to later cases; labeled `break` out of a `switch`                      |   ✅   | [syntax-loop-lowerings.ts](conformance/syntax-loop-lowerings.ts)                                               | `continue` re-tests the condition                                                                           |
+| `for…of` whose body never reads its variable (`for (const x of xs) n++`)                                                   |   ✅   | [lib-string-split-trim.ts](conformance/lib-string-split-trim.ts)                                               |                                                                                                             |
 
 ## Functions
 

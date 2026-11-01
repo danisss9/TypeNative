@@ -57,7 +57,8 @@ own tests, ReDoS inputs included) in three modes. Its fixes are listed under **m
   one is an any field; a required one is written as `null` by `JSON.stringify`)
 - **marked — type inference:** `let x;` assigned on every path holds its value type; long call
   chains on a fluent builder (`edit(re).replace(…).replace(…)…`) no longer take exponential time
-  (inference is memoized per query); module-level names a local shadows
+  (inference is memoized per query); module-level names a local shadows; a `for…of` whose body
+  never reads its variable compiles
 - **marked — performance:** the regex backtracker works on byte offsets (no rune conversion of
   the input per match), repeats a single character class without allocating and tests ASCII
   against a table; regexes skip ahead with a first-byte prefilter (an anchored one fails at
