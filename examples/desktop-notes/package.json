@@ -1,0 +1,9 @@
+{
+  "name": "desktop-notes-example",
+  "private": true,
+  "type": "module",
+  "description": "The Node.js side of the example: compiled builds don't use this package",
+  "dependencies": {
+    "@webviewjs/webview": "1.0.0-rc.4"
+  }
+}

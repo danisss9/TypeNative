@@ -363,6 +363,7 @@ End-to-end programs that combine many features the way real code does (they run 
 | `wc`-style CLI            | [app-cli-wordcount.ts](conformance/app-cli-wordcount.ts)     | `util.parseArgs`, `fs`, `path`, `os.EOL`, a class with a `Map` field, tuples sorted with a `\|\|` comparator, `reduce` into an object, `crypto`                    |
 | JSON API on HTTP + SQLite | [app-http-sqlite.ts](conformance/app-http-sqlite.ts)         | `http.createServer` routing, `URL`, `node:sqlite` prepared statements, `fetch` (POST / GET / DELETE), JSON bodies, status codes                                    |
 | Stream pipeline           | [app-stream-pipeline.ts](conformance/app-stream-pipeline.ts) | A generator through `Readable.from`, a CSV-aggregating `Transform`, `Float64Array` series, `stream/promises` `pipeline` to files, gzip and Brotli streams, SHA-256 |
+| Native window             | [app-webview-window.ts](conformance/app-webview-window.ts)   | A real `@webviewjs/webview` window whose page calls the program's own `http` server, then closes (runs with `TN_WEBVIEW_SMOKE=1`)                                  |
 
 ## Examples
 
@@ -378,7 +379,7 @@ them (`node scripts/conformance.mjs example`).
 | [todo-cli](examples/todo-cli/)             | [main.ts](examples/todo-cli/main.ts)                                             | `process.argv` destructuring with default and rest, `fs` atomic writes (`renameSync`), `os.homedir()`, `process.env`: per-command latency              |
 | [dupe-finder](examples/dupe-finder/)       | [main.ts](examples/dupe-finder/main.ts)                                          | Recursive `readdirSync` with `withFileTypes`, `statSync`, SHA-256 `createHash`, `Map` grouping, JSON report to disk: disk scan + hashing               |
 | [mandelbrot-png](examples/mandelbrot-png/) | [main.ts](examples/mandelbrot-png/main.ts)                                       | Float loop, tuple returns, `Uint8Array` / `DataView`, a PNG encoder on `zlib.deflateSync` + `zlib.crc32`: image rendering with no deps                 |
-| [desktop-notes](examples/desktop-notes/)   | [main.ts](examples/desktop-notes/main.ts), [ui.ts](examples/desktop-notes/ui.ts) | `node:http` REST routes, `fs` note files, UI compiled in from a `.ts` module, `spawn` `detached` / `unref` to open an app window: launch time + memory |
+| [desktop-notes](examples/desktop-notes/)   | [main.ts](examples/desktop-notes/main.ts), [ui.ts](examples/desktop-notes/ui.ts) | `node:http` REST routes, `fs` note files, UI compiled in from a `.ts` module, `@webviewjs/webview` window (own process under Node.js): launch time + memory |
 
 ## Standard library
 
@@ -1347,6 +1348,44 @@ Status: ✅ probed, 🚫 can't work in a TypeNative program (see [Known limitati
 | ------------------------------------------------- | :----: | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `import { x } from 'pkg'`                         |   ✅   | [syntax-import-npm.ts](conformance/syntax-import-npm.ts) | Mapped to Go module imports (fixture dep in [conformance/package.json](conformance/package.json))                                                                                                                                                   |
 | Packages published as plain JavaScript / CommonJS |   🚫   | —                                                        | Without TypeScript sources there are no types to compile from: untyped packages stop at the type check (TS7016), and typed ones whose code is CommonJS (`module.exports`, union-typed callbacks) don't lower. Packages that ship `.ts` sources work |
+
+### Native app windows (`@webviewjs/webview`)
+
+Programs open windows through the [`@webviewjs/webview`](https://www.npmjs.com/package/@webviewjs/webview)
+API, so the same source runs under Node.js (the real package) and compiled (a built-in
+implementation, no npm package needed). Build a windowed app with `--gui`. Anything not listed
+here is a type error when compiled.
+
+| API                                                                                                   | Status | Probe                                                | Notes                                                                                                        |
+| ----------------------------------------------------------------------------------------------------- | :----: | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `new Application()`, `run`, `exit`, `isReady`, `whenReady`                                            |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) | `ApplicationOptions` aren't accepted                                                                         |
+| `app.createWebContext({ dataDirectory })`                                                             |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) | Without one, compiled apps use the per-user cache folder                                                     |
+| `app.createBrowserWindow({ title, width, height, logical, resizable })`                               |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) | Sizes are physical pixels unless `logical`, as in the package                                                |
+| `win.createWebview({ url, html, enableDevtools, webContext })`                                        |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) | One webview per window, which opens once it has one. `enableDevtools` also enables the right-click menu      |
+| `win.setTitle`, `win.close`                                                                           |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) |                                                                                                              |
+| `view.loadUrl`, `loadHtml`, `evaluateScript`, `reload`                                              |   ✅   | [lib-webview-api.ts](conformance/lib-webview-api.ts) | Once a browser app window is open these throw `ERR_WEBVIEW_UNSUPPORTED`                                      |
+| Events `ready`, `window-close-requested`, `application-close-requested`, window `close`               |   ✅   | [app-webview-window.ts](conformance/app-webview-window.ts) | A close from the program skips `close` and `window-close-requested`, as in the package                       |
+| `event.preventDefault()` on `close`                                                                   |   🚫   | —                                                    | The window is already gone when `close` arrives: save before it, for example on the page's `beforeunload`    |
+| Menus, tray icons, notifications, IPC (`expose`, `onIpcMessage`), custom protocols, window controls   |   ❌   | —                                                    | Not implemented                                                                                              |
+
+How a window is hosted:
+
+| Platform                                 | Window                                 | Closing it is detected by             | Verified                                                   |
+| ---------------------------------------- | -------------------------------------- | ------------------------------------- | ---------------------------------------------------------- |
+| Windows                                  | Embedded WebView2, pure Go, no cgo     | The window's message loop ending      | Run end to end                                             |
+| Windows without the WebView2 runtime     | Edge or Chrome in app mode             | A job object emptying                 | Run end to end (`TYPENATIVE_WEBVIEW=browser` forces this)  |
+| macOS, Linux                             | Chrome, Edge or Chromium in app mode   | The DevTools pipe reporting the page closed | Builds in CI; **never run on these systems**, only the pipe's messages were checked on Windows |
+
+With no browser to open, opening the window throws `ERR_WEBVIEW_NO_BROWSER`. Run
+[app-webview-window.ts](conformance/app-webview-window.ts) with `TN_WEBVIEW_SMOKE=1` to open a real
+window: the suite skips it otherwise, since CI has no display.
+
+Under Node.js on Windows the package has a pitfall that compiled programs don't: while the window
+is idle, its event pump can hold the JS thread until a window message arrives (seen on 0.6.0 and
+1.0.0-rc.4, and `controlFlow` doesn't change it), which starves timers and an HTTP server in the
+same process. [desktop-notes](examples/desktop-notes/) gives the window its own process there. Its
+default profile folder is beside `node.exe`, which is read-only under Program Files, so pass a
+`dataDirectory`.
 
 ## Known limitations (🚫)
 

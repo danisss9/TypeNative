@@ -27,6 +27,7 @@ Options:
   --target <os/arch>   Cross-compile, e.g. linux/amd64, linux/arm64, darwin/arm64,
                        windows/amd64 ('go tool dist list' shows every pair)
   --release            Smaller binary: drop symbols and file paths
+  --gui                Windowed app: no console window on Windows (ignored elsewhere)
   --cover              Build with coverage counters, for go:runtime/coverage
                        (set GOCOVERDIR to also write a profile at exit)
   --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
@@ -49,6 +50,7 @@ export function parseCliArgs(argv) {
         script: false,
         noTypeCheck: false,
         release: false,
+        gui: false,
         cover: false,
         source: null,
         output: null,
@@ -76,6 +78,8 @@ export function parseCliArgs(argv) {
             args.noTypeCheck = true;
         else if (arg === '--release')
             args.release = true;
+        else if (arg === '--gui')
+            args.gui = true;
         else if (arg === '--cover')
             args.cover = true;
         else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
@@ -525,8 +529,14 @@ export function run(opts) {
     // is ~5 MB of Go) compile once, not again for every project directory
     if (opts.release || modules.length > 0)
         buildArgs.push('-trimpath');
+    // One value: go build keeps only the last -ldflags
+    const ldflags = [];
     if (opts.release)
-        buildArgs.push('-ldflags=-s -w');
+        ldflags.push('-s', '-w');
+    if (opts.gui && targetOs === 'windows')
+        ldflags.push('-H=windowsgui');
+    if (ldflags.length > 0)
+        buildArgs.push(`-ldflags=${ldflags.join(' ')}`);
     // atomic counters: coverage.ClearCounters refuses the default 'set' mode
     if (opts.cover)
         buildArgs.push('-cover', '-covermode=atomic');

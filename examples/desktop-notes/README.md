@@ -1,16 +1,19 @@
 # Desktop Notes
 
-A desktop notes app built as a local web app. It's a `node:http` server that
-edits plain Markdown files in a folder, and its UI opens in an **app window**:
-Edge or Chrome in `--app` mode, so there are no tabs or address bar. The HTML,
-CSS and JS live in [ui.ts](ui.ts) as a TypeScript string, so the compiled
-binary is the whole app. There is no Electron, no bundled Chromium and no Node
-runtime, and no asset folder to ship next to it.
+A desktop notes app in a native webview window. It's a `node:http` server that
+edits plain Markdown files in a folder, and its UI renders in a window opened
+with the [`@webviewjs/webview`](https://www.npmjs.com/package/@webviewjs/webview)
+API. The HTML, CSS and JS live in [ui.ts](ui.ts) as a TypeScript string, so the
+compiled binary is the whole app. There is no Electron, no bundled Chromium, no
+Node runtime and no asset folder to ship next to it.
 
-Demonstrates: `node:http` routing with GET / PUT / POST / DELETE, request
-bodies, `fs` reads, writes, listing and `statSync`, a local `.ts` module
-import, `child_process.spawn` with `detached` + `unref()` to launch the
-window, `setInterval`, `process.memoryUsage()` and `process.exit`.
+The same `main.ts` runs both ways. Under Node.js the import is the npm package.
+Compiled, it's TypeNative's built-in version, so the binary needs neither the
+package nor a C toolchain.
+
+Demonstrates: a webview window, `node:http` routing with GET / PUT / POST /
+DELETE, request bodies, `fs` reads, writes, listing and `statSync`, a local `.ts`
+module import, `setInterval`, `process.memoryUsage()` and `process.exit`.
 
 ## How it works
 
@@ -19,62 +22,87 @@ window, `setInterval`, `process.memoryUsage()` and `process.exit`.
   Note names are restricted to `[\w\- ]`, so they can't escape the folder.
 - The editor autosaves 400 ms after you stop typing. Notes are plain
   `<name>.md` files, so you can also edit them with any other tool.
-- When the window closes, the page sends `navigator.sendBeacon('/api/bye')`
-  (plus any unsaved text), and the app exits 3 s later unless a reload
-  reconnects. If the page stops polling for 90 s, the app also exits. That
-  timeout is long because Chromium throttles timers in hidden windows to one
-  per minute.
+- The window loads the page from that local server. Closing it ends the app. Text
+  the autosave hasn't reached goes out as a `navigator.sendBeacon` on
+  `beforeunload`, and the app waits 300 ms for it to arrive.
+- **Under Node.js the window gets a process of its own**, which is this script
+  run with `--window <url>`. On Windows the npm package's event pump can hold the
+  JS thread for as long as the window is idle, and the server needs that thread.
+  Compiled apps run the window on its own thread, so they stay one process.
+- The webview's profile lives in a folder the app chooses with
+  `createWebContext`. The default sits beside the executable, which is read-only
+  for `node.exe` under Program Files.
 
 ## Run it
 
+Under Node.js, install the webview package first. This example pins
+`1.0.0-rc.4`, because the `latest` tag (0.6.0) froze more readily in testing.
+
 ```sh
+npm install
 node main.ts                     # notes in ~/Notes, opens the window
 node main.ts --dir ./my-notes    # another folder
 node main.ts --no-open --port 8080   # server only: open http://127.0.0.1:8080
 ```
 
-With TypeNative, build once and ship the single file:
+With TypeNative, build once and ship the single file. `--gui` leaves out the
+console window on Windows:
 
 ```sh
-npx typenative --source main.ts --output dist/notes.exe --release
+npx typenative --source main.ts --output dist/notes.exe --gui --release
 ./dist/notes.exe
 ```
 
 From a checkout of this repository:
 
 ```sh
-node bin/cli.js --source examples/desktop-notes/main.ts --output dist/notes.exe
+node bin/cli.js --source examples/desktop-notes/main.ts --output dist/notes.exe --gui
 ```
 
-The window opens with `msedge --app=…` on Windows (always installed on
-Windows 10/11), `open -na "Google Chrome" --args --app=…` on macOS (falling
-back to the default browser), and `xdg-open` on Linux.
+## What the window is on each platform
+
+| Platform                             | Compiled with TypeNative             | Under Node.js        |
+|--------------------------------------|--------------------------------------|----------------------|
+| Windows                              | Embedded WebView2                    | Embedded WebView2    |
+| Windows without the WebView2 runtime | Edge or Chrome in app mode           | Not supported        |
+| macOS                                | Chrome, Edge or Chromium in app mode | Embedded WebKit      |
+| Linux                                | Chrome, Edge or Chromium in app mode | Embedded WebKitGTK   |
+
+**Only Windows has been run end to end.** The macOS and Linux builds compile, but
+neither column has been tried on those systems. TypeNative uses no cgo, which rules
+out WebKit on those platforms for now, so a compiled app there needs a browser
+installed and shows the browser's window frame. Node.js on Linux needs the WebKitGTK
+libraries.
 
 ## Benchmark: Node.js vs TypeNative
 
-Reproduce with `node bench.mjs [runs=10]`. The script compiles `main.ts`, fills
-a temp notes folder with 200 notes for each runtime, and then alternates
-between the runtimes. Each run starts the app headless (`--no-open`) and times
-**spawn until `GET /` answers 200**, which is what the user waits for before
-the window can paint. It then lists the notes, opens 20 of them, saves one,
-and reads the app's own **resident memory** from `/api/info`.
+Reproduce with `npm install`, then `node bench.mjs [runs=10]`. The script compiles
+`main.ts`, fills a temp notes folder with 200 notes for each runtime, and then
+alternates between the runtimes. Each run starts the app headless (`--no-open`) and
+times **spawn until `GET /` answers 200**, which is what the user waits for before
+the window can paint. It then lists the notes, opens 20 of them, saves one, and
+reads the app's own **resident memory** from `/api/info`.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.1, default (non-`--release`) build.
+TypeNative 0.4.2, default (non-`--release`) build.
 
 | Spawn → first page | min       | median    | mean      | max       |
 |--------------------|-----------|-----------|-----------|-----------|
-| Node.js            | 176.73 ms | 201.48 ms | 207.96 ms | 254.39 ms |
-| TypeNative         | 29.37 ms  | 35.73 ms  | 42.79 ms  | 94.59 ms  |
+| Node.js            | 212.53 ms | 246.86 ms | 241.53 ms | 273.47 ms |
+| TypeNative         | 42.59 ms  | 51.29 ms  | 119.99 ms | 719.02 ms |
 
 | Resident memory | min      | median   | mean     | max      |
 |-----------------|----------|----------|----------|----------|
-| Node.js         | 71.9 MiB | 72.3 MiB | 72.3 MiB | 72.7 MiB |
-| TypeNative      | 11.8 MiB | 15.3 MiB | 14.7 MiB | 15.8 MiB |
+| Node.js         | 71.4 MiB | 72.6 MiB | 72.6 MiB | 73.5 MiB |
+| TypeNative      | 11.1 MiB | 15.3 MiB | 13.4 MiB | 15.8 MiB |
 
-**TypeNative serves the first page 5.6x sooner and uses 4.7x less memory**
-(median). The whole app is a single 9.9 MiB binary, the UI included. An
-Electron build of the same app would ship about 100 MiB of Chromium and Node.
-This app uses the browser the OS already has, and its backend idles at about
-15 MiB. These figures cover the app process only. The Edge/Chrome window's
-own memory is the same for both runtimes.
+**TypeNative serves the first page 4.8x sooner and uses 4.7x less memory**
+(median). One TypeNative run took 719 ms, which is why its mean is so far above its
+median. The app is a single 12.4 MiB binary with the UI included, or 8.7 MiB with
+`--gui --release`. An Electron build of the same app would ship about 100 MiB of
+Chromium and Node. This app uses the webview the OS already has, and its backend
+idles at about 15 MiB.
+
+These figures cover the headless server process only. They leave out the webview's
+own processes, which are about the same for both runtimes, and the extra window
+process Node.js runs.

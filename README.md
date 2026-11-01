@@ -137,6 +137,7 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 | `--no-typecheck`     | build / script | Skip the type-check that runs before transpiling.                                                                                                                             |
 | `--target <os/arch>` | build          | Cross-compile for another platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, … `go tool dist list` shows every pair). `--script` only runs host builds. |
 | `--release`          | build / script | Smaller binary: strips symbols and file paths (`-trimpath -ldflags="-s -w"`).                                                                                                 |
+| `--gui`              | build / script | A windowed app: no console window on Windows (`-ldflags=-H=windowsgui`). Ignored for other targets.                                                                           |
 | `--emit-go <dir>`    | build          | Write the generated Go (`code.go`, `go.mod`, vendored modules) to `<dir>` instead of building; `go build -C <dir>` builds it.                                                 |
 | `-h`, `--help`       |                | Print the options.                                                                                                                                                            |
 | `-v`, `--version`    |                | Print the TypeNative version.                                                                                                                                                 |
@@ -258,6 +259,29 @@ const c: Counter = new Counter();
 c.inc();
 console.log(`count=${c.count} seen=${seen.get('a')}`);
 ```
+
+A desktop app with a webview window:
+
+```ts
+import { Application } from '@webviewjs/webview';
+
+const app = new Application();
+const win = app.createBrowserWindow({ title: 'Hello', width: 800, height: 600, logical: true });
+win.createWebview({ html: '<h1>Hello from a native window</h1>' });
+app.run();
+```
+
+```sh
+npx typenative --source app.ts --output hello.exe --gui --release
+```
+
+The same source runs under Node.js with the
+[`@webviewjs/webview`](https://www.npmjs.com/package/@webviewjs/webview) npm
+package; compiled programs need neither the package nor a C toolchain. On
+Windows the window embeds the system WebView2. On macOS and Linux, and on
+Windows without the WebView2 runtime, it's Chrome, Edge or Chromium in app mode.
+[conformance.md](conformance.md#native-app-windows-webviewjswebview) lists the
+supported API, and [desktop-notes](examples/desktop-notes/) is a complete app.
 
 Complete, runnable projects, including Node-vs-TypeNative benchmarks for
 each, live in [examples/](examples/). The flagships are

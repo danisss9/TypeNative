@@ -14,7 +14,8 @@ import path from 'node:path';
 const MODULES = [
   ['github.com/ncruces/go-sqlite3', 'v0.35.6'],
   ['github.com/andybalholm/brotli', 'v1.2.6'],
-  ['github.com/fsnotify/fsnotify', 'v1.10.1']
+  ['github.com/fsnotify/fsnotify', 'v1.10.1'],
+  ['github.com/jchv/go-webview2', 'v0.0.0-20260205173254-56598839c808']
 ];
 
 const root = path.resolve(import.meta.dirname, '..');

@@ -1,14 +1,16 @@
-// A desktop notes app: a local web server plus a browser app window, editing
+// A desktop notes app: a local web server plus a native webview window, editing
 // plain Markdown files in a folder on disk. The UI (./ui.ts) is compiled into
 // the binary, so the result is one small executable that opens a window: no
 // Electron, no Node runtime, no files next to it.
 //
-//   node main.ts [--dir <folder>] [--port N] [--no-open]
+//   node main.ts [--dir <folder>] [--port N] [--no-open]   (npm install first)
 //   ./notes [--dir <folder>] [--port N] [--no-open]
 //
-// Notes live in ~/Notes by default. The window is Edge or Chrome in --app mode
-// (no tabs or address bar), and the app quits a few seconds after it closes.
-// With --no-open it only serves http://127.0.0.1:<port> and runs until stopped.
+// Notes live in ~/Notes by default. The window comes from @webviewjs/webview:
+// the npm package under Node.js, TypeNative's built-in version when compiled,
+// and the app quits when it closes. With --no-open it only serves
+// http://127.0.0.1:<port> and runs until stopped.
+import { Application } from '@webviewjs/webview';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -52,12 +54,6 @@ function send(res: http.ServerResponse, status: number, type: string, body: stri
   res.end(body);
 }
 
-// Quit when the window is gone: right after it says goodbye (unless a reload
-// reconnects within 3 s), or when it stops polling for 90 s. Hidden windows
-// can be throttled to one timer per minute, hence the long backstop.
-let lastSeen = Date.now();
-let byeAt = 0;
-
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => {
@@ -69,15 +65,10 @@ const server = http.createServer((req, res) => {
     if (url === '/') {
       send(res, 200, 'text/html; charset=utf-8', page);
     } else if (url === '/api/info') {
-      lastSeen = Date.now();
-      byeAt = 0;
       const info = { dir: dir, runtime: path.basename(process.execPath), rss: process.memoryUsage().rss };
       send(res, 200, 'application/json', JSON.stringify(info));
     } else if (url === '/api/notes') {
       send(res, 200, 'application/json', JSON.stringify(listNotes()));
-    } else if (url === '/api/bye' && method === 'POST') {
-      byeAt = Date.now();
-      send(res, 204, 'text/plain', '');
     } else if (url.startsWith('/api/notes/')) {
       const file = noteFile(decodeURIComponent(url.slice('/api/notes/'.length)));
       if (!file) {
@@ -101,37 +92,40 @@ const server = http.createServer((req, res) => {
   });
 });
 
-function openAppWindow(url: string): void {
-  let command = 'xdg-open';
-  let commandArgs = [url];
-  if (process.platform === 'win32') {
-    // `start` finds msedge through the App Paths registry, even off PATH
-    command = 'cmd';
-    commandArgs = ['/c', 'start', '', 'msedge', `--app=${url}`];
-  } else if (process.platform === 'darwin') {
-    command = 'open';
-    commandArgs = ['-na', 'Google Chrome', '--args', `--app=${url}`];
-  }
-  const child = spawn(command, commandArgs, { detached: true, stdio: 'ignore' });
-  child.on('error', () => console.log(`Open ${url} in a browser`));
-  child.on('exit', (code) => {
-    // No Chrome on macOS: fall back to the default browser
-    if (code !== 0 && process.platform === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
-  });
-  child.unref();
+function openAppWindow(url: string, onClosed: () => void): void {
+  const app = new Application();
+  // The webview's profile folder: its default, beside the executable, is read-only
+  // for node.exe under Program Files
+  const profile = app.createWebContext({ dataDirectory: path.join(os.tmpdir(), 'desktop-notes-webview') });
+  const win = app.createBrowserWindow({ title: 'Notes', width: 1000, height: 700, logical: true });
+  win.createWebview({ url: url, webContext: profile });
+  app.on('application-close-requested', onClosed);
+  app.run();
 }
 
-server.listen(port, '127.0.0.1', () => {
-  const address = server.address() as { port: number };
-  const url = `http://127.0.0.1:${address.port}/`;
-  console.log(`Notes in ${dir} on ${url}`);
-  if (!openWindow) return;
-  openAppWindow(url);
-  setInterval(() => {
-    const now = Date.now();
-    if ((byeAt > 0 && now - byeAt > 3000) || now - lastSeen > 90000) {
-      console.log('Window closed, exiting');
-      process.exit(0);
+// The window's last save is a beacon sent as it closes: let it arrive
+function quit(): void {
+  setTimeout(() => process.exit(0), 300);
+}
+
+// On Windows the npm package's event pump can hold the JS thread for as long as
+// its window is idle, and the server needs that thread: under Node.js the window
+// gets a process of its own, this same script run with --window <url>
+const underNode = path.basename(process.execPath, '.exe') === 'node';
+const windowUrl = flag('--window');
+
+if (windowUrl) {
+  openAppWindow(windowUrl, () => process.exit(0));
+} else {
+  server.listen(port, '127.0.0.1', () => {
+    const address = server.address() as { port: number };
+    const url = `http://127.0.0.1:${address.port}/`;
+    console.log(`Notes in ${dir} on ${url}`);
+    if (!openWindow) return;
+    if (underNode) {
+      spawn(process.execPath, [process.argv[1], '--window', url], { stdio: 'inherit' }).on('exit', quit);
+    } else {
+      openAppWindow(url, quit);
     }
-  }, 1000);
-});
+  });
+}

@@ -2,7 +2,7 @@
 // a TypeScript string, so it is compiled into the binary (no files to ship
 // next to it) and works unchanged under Node.js.
 export const page = `<!doctype html>
-<html lang="en">
+<html lang="en" translate="no">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -164,12 +164,11 @@ export const page = `<!doctype html>
 
   loadList().then(() => notes.length && open(notes[0].name));
   refreshInfo();
-  // Polling doubles as the app's heartbeat
   setInterval(refreshInfo, 5000);
-  // Closing the window saves, then tells the app to quit
-  addEventListener('pagehide', () => {
+  // Closing the window saves what the autosave hasn't reached. Not pagehide:
+  // webviews can tear the page down without it.
+  addEventListener('beforeunload', () => {
     if (saveTimer) navigator.sendBeacon('/api/notes/' + encodeURIComponent(current), $('editor').value);
-    navigator.sendBeacon('/api/bye');
   });
 </script>
 </body>

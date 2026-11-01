@@ -76,6 +76,11 @@ async function measure(command, args, notesDir) {
   }
 }
 
+if (!fs.existsSync(path.join(here, 'node_modules', '@webviewjs', 'webview'))) {
+  console.error('Run npm install in this folder first: main.ts needs @webviewjs/webview under Node.js');
+  process.exit(1);
+}
+
 // 1. Compile the app to a native binary.
 fs.mkdirSync(path.join(here, 'dist'), { recursive: true });
 console.log('Compiling main.ts to a native binary with TypeNative...');

@@ -3027,3 +3027,57 @@ declare module 'async_hooks' { import m = require('node:async_hooks'); export = 
 declare module 'worker_threads' { import m = require('node:worker_threads'); export = m; }
 declare module 'cluster' { import m = require('node:cluster'); export = m; }
 declare module 'http2' { import m = require('node:http2'); export = m; }
+
+// The npm package's API for native app windows, as far as compiled programs
+// implement it (under Node.js the real package runs). The real 'close' event can
+// be cancelled; compiled, the window is already gone, so preventDefault is absent.
+declare module '@webviewjs/webview' {
+  interface ApplicationEvent {
+    event: string;
+  }
+  interface WebContextOptions {
+    // Where the webview keeps its profile. Needed under Node.js on Windows: the
+    // default is beside node.exe, which Program Files makes read-only
+    dataDirectory?: string;
+  }
+  interface BrowserWindowOptions {
+    title?: string;
+    width?: number;
+    height?: number;
+    // width and height in logical pixels, which follow the display's scaling, rather
+    // than physical ones
+    logical?: boolean;
+    resizable?: boolean;
+  }
+  interface WebviewOptions {
+    url?: string;
+    html?: string;
+    enableDevtools?: boolean;
+    webContext?: WebContext | null;
+  }
+  class WebContext {}
+  class Webview {
+    loadUrl(url: string): void;
+    loadHtml(html: string): void;
+    evaluateScript(js: string): void;
+    reload(): void;
+  }
+  class BrowserWindow {
+    createWebview(options?: WebviewOptions): Webview;
+    setTitle(title: string): void;
+    close(): void;
+    on(event: 'close', listener: (event: ApplicationEvent) => void): this;
+    once(event: 'close', listener: (event: ApplicationEvent) => void): this;
+  }
+  type ApplicationEventName = 'ready' | 'window-close-requested' | 'application-close-requested';
+  class Application {
+    createWebContext(options?: WebContextOptions): WebContext;
+    createBrowserWindow(options?: BrowserWindowOptions): BrowserWindow;
+    isReady(): boolean;
+    run(): void;
+    whenReady(): Promise<void>;
+    exit(): void;
+    on(event: ApplicationEventName, listener: (event: ApplicationEvent) => void): this;
+    once(event: ApplicationEventName, listener: (event: ApplicationEvent) => void): this;
+  }
+}

@@ -17,6 +17,13 @@ own tests, ReDoS inputs included) in three modes. Its fixes are listed under **m
 
 ### Added
 
+- **Native app windows:** programs can open webview windows through the
+  `@webviewjs/webview` API, so the same source runs under Node.js (the npm package) and compiled
+  (built in). Windows embeds the system WebView2 through the vendored, pure-Go
+  `jchv/go-webview2`; macOS and Linux, and Windows without the WebView2 runtime, open Chrome, Edge
+  or Chromium in app mode. No cgo, and cross-compiling still works. The macOS and Linux path builds
+  in CI but has not been run on those systems
+- **`--gui`:** builds a windowed app with no console window on Windows (ignored for other targets)
 - **examples/marked-cli:** marked v18.1.2 vendored unpatched (`vendor/marked/VENDOR.md`),
   `main.ts` porting upstream's `bin/main.js`, `parity.mjs` (2,859 cases: marked's commonmark,
   gfm, new, original and redos specs in default, `--no-gfm` and `--tokens` modes, compared byte
@@ -39,6 +46,13 @@ own tests, ReDoS inputs included) in three modes. Its fixes are listed under **m
   (`type WithId<T> = T & { id: number }`); instantiation expressions (`g<number>`) and explicit
   type arguments in call results; `typeof f` as a function type
 - `emitWarning(warning, type)`; `JSON.stringify(buffer)` as `{ type: 'Buffer', data }`
+
+### Changed
+
+- **examples/desktop-notes:** the UI now opens in a real webview window under both Node.js and
+  TypeNative, instead of launching Edge or Chrome with `--app`. Closing the window ends the app
+  directly, so the `/api/bye` beacon and the heartbeat timeout are gone. Running it under Node.js
+  now needs `npm install` in the example folder
 
 ### Fixed
 

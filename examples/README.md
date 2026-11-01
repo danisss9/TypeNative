@@ -12,13 +12,13 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [todo-cli](todo-cli/)             | A to-do CLI persisting to a JSON file, run many times a day                | **6.8x faster per command** (16.3 ms vs 111.4 ms)            |
 | [dupe-finder](dupe-finder/)       | Recursive directory walk, SHA-256 hashing, JSON report written to disk     | **1.6x faster scan** (412 ms vs 674 ms, 2,000 files)         |
 | [mandelbrot-png](mandelbrot-png/) | Fractal render + hand-written PNG encoder on `node:zlib`, no image library | **1.2x faster**, steadier (597 ms vs 744 ms)                 |
-| [desktop-notes](desktop-notes/)   | Notes app in an Edge/Chrome app window, UI compiled into one binary        | **5.6x faster launch, 4.7x less memory** (15 vs 72 MiB)      |
+| [desktop-notes](desktop-notes/)   | Notes app in a native webview window, UI compiled into one binary          | **4.8x faster launch, 4.7x less memory** (15 vs 73 MiB)      |
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **27x faster per call** (9 vs 250 ms); 3.6x slower on 10 MB† |
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **7.6x faster per call** (19 vs 148 ms); 5.2x slower on 10 MB‡ |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
-0.4.0 (hello-world, fibonacci, json-server) and 0.4.1 (the rest). See each
-example's README for full methodology and numbers.
+0.4.0 (hello-world, fibonacci, json-server), 0.4.2 (desktop-notes) and 0.4.1
+(the rest). See each example's README for full methodology and numbers.
 
 † Measured on a Linux container (4 vCPUs, Xeon @ 2.80GHz), Node v24.22.2,
 Go 1.26.0. The native binary is faster up to about 150–200 KB of input per run.
@@ -54,6 +54,9 @@ cd examples/fibonacci
 node main.ts 35
 ```
 
+desktop-notes also needs `npm install` in its folder first, for the webview
+package. Its compiled build doesn't.
+
 ## Reproducing the benchmarks
 
 Each example folder contains a self-contained harness that compiles the
@@ -66,7 +69,7 @@ cd examples/json-server && node bench.mjs
 cd examples/todo-cli    && node bench.mjs
 cd examples/dupe-finder && node bench.mjs
 cd examples/mandelbrot-png && node bench.mjs
-cd examples/desktop-notes  && node bench.mjs
+cd examples/desktop-notes  && npm install && node bench.mjs
 cd examples/yaml-cli       && node bench.mjs   # and node parity.mjs
 cd examples/marked-cli     && node bench.mjs   # and node parity.mjs
 ```
