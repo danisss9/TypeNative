@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-01
+
 The `yaml` package's own CLI, compiled from its unmodified TypeScript source, as the first
 flagship example: 100% output parity with Node on the yaml-test-suite in all four modes. Getting
 there took transpiler fixes across the board, each with a conformance probe.
