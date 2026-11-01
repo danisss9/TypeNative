@@ -15,6 +15,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [desktop-notes](desktop-notes/)   | Notes app in a native webview window, UI compiled into one binary          | **4.8x faster launch, 4.7x less memory** (15 vs 73 MiB)      |
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **27x faster per call** (9 vs 250 ms); 3.6x slower on 10 MB† |
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **7.6x faster per call** (19 vs 148 ms); 5.2x slower on 10 MB‡ |
+| [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.2x faster per answer** (716 vs 875 ms streamed)          |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.4.0 (hello-world, fibonacci, json-server), 0.4.2 (desktop-notes) and 0.4.1
@@ -72,6 +73,7 @@ cd examples/mandelbrot-png && node bench.mjs
 cd examples/desktop-notes  && npm install && node bench.mjs
 cd examples/yaml-cli       && node bench.mjs   # and node parity.mjs
 cd examples/marked-cli     && node bench.mjs   # and node parity.mjs
+cd examples/openai-chat    && node bench.mjs   # against a local mock API, no key needed
 ```
 
 TypeNative's clearest wins are process startup and memory. Startup is about

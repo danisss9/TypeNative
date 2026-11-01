@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **examples/openai-chat:** a chat client for any OpenAI-compatible
+  `/v1/chat/completions` API. Answers stream into the terminal token by token:
+  `fetch` with a streaming response body (`response.body.getReader()`),
+  hand-parsed server-sent events (`data:` lines, `[DONE]`, ignored keep-alive
+  comments), an `AbortController` timeout, Ctrl+C aborting the answer in flight,
+  and a `for await` readline REPL with `/clear` and `/system`. Targets the free
+  OpenRouter API by default (`google/gemma-4-31b-it:free`), and OpenAI, Ollama
+  or any other compatible server through `--base-url`. `bench.mjs` stands up a
+  local mock SSE API, checks Node and TypeNative stdout byte for byte, then
+  times full one-shot runs (1.2x faster per answer, 716 vs 875 ms median — both
+  runtimes mostly wait on the mock's paced chunks). The example works around
+  two catch-block sharp edges (`return`/`continue` inside `catch` compiles
+  wrong or not at all), documented in its README
+
 ## [0.5.0] - 2026-11-01
 
 The `yaml` package's own CLI, compiled from its unmodified TypeScript source, as the first
