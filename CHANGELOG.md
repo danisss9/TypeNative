@@ -22,6 +22,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtimes mostly wait on the mock's paced chunks). The example works around
   two catch-block sharp edges (`return`/`continue` inside `catch` compiles
   wrong or not at all), documented in its README
+- **conformance:** `lib-regex-engine`, `lib-string-long-slices` and
+  `semantics-dynamic-field-access`, with expected values checked against Node
+
+### Changed
+
+- **Regex engine:** every `TnRegex` now runs on one backtracking VM with JS
+  semantics (`src/regex_vm.ts`), replacing the closure-based backtracker and RE2
+  as the first choice. Programs compile lazily and once per pattern and flags. A
+  match allocates only its result, and first-byte sets, literal prefixes and
+  anchors reject most calls without running anything. RE2 stays as a fallback
+  for patterns it can run that exhaust the VM's step budget, so those keep their
+  linear-time guarantee. Regex literals used inline get the same engine; only
+  Node built-ins' arguments and `/(?<name>…)/.exec(s)` stay on plain RE2
+- **Dynamic values:** property reads and writes on objects held as any go through
+  plans cached per type and key instead of reflection; a read consumed on the
+  spot doesn't box its value; `obj.list.push(x)` appends in place instead of
+  converting the array on every push; object-type conversions are compiled per
+  pair of types; `Object.assign` between objects uses the same plans; `switch`
+  on a dynamic value over string literals is a Go string switch
+- **Strings:** long strings grown with `+=` on a dynamic value are amortized;
+  short ASCII strings need no code-point index
+- **Performance:** on 10 MB of input, examples/marked-cli went from 5.5x to 1.6x
+  slower than Node and examples/yaml-cli from 3.8x to 1.9x (the native binary
+  now finishes first up to about 1–2 MB per run), and marked's ReDoS inputs from
+  over 72 s to 4.7 s in total
+
+### Fixed
+
+- `.`, `^` and `$` follow JS's line terminators in every regex, `[]` and `[^]`
+  mean what they do in JS, captures reset on each loop iteration, and `\p` is a
+  property only with the `u` flag
+- `\k<name>` in a regex literal panicked in RE2
+- Slices of a long non-ASCII string rebuilt its whole index each time, making a
+  lexer over non-ASCII input quadratic
 
 ## [0.5.0] - 2026-11-01
 

@@ -82,55 +82,65 @@ and checks that the two JSON outputs are identical:
   Deployments, Services and ConfigMaps in one stream, from a fixed-seed
   generator, so every machine gets the same input).
 
-**Environment:** Linux 6.18 container, 4 vCPUs of an Intel Xeon @ 2.80GHz,
-Node v24.22.2, Go 1.26.0, TypeNative 0.4.2 (unreleased changes), default
-(non-`--release`) build. The binary is 7.3 MB.
+**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
+Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
+(non-`--release`) build. The binary is 7.6 MB. The machine had other work
+running while these were taken, which slows both runtimes, so read the ratios
+rather than the absolute times.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 214.80 ms | 249.92 ms | 248.16 ms | 305.68 ms |
-| TypeNative | 7.63 ms   | 9.16 ms   | 9.49 ms   | 12.83 ms  |
+| Node.js    | 366.01 ms | 400.18 ms | 398.72 ms | 435.91 ms |
+| TypeNative | 24.51 ms  | 32.75 ms  | 32.95 ms  | 51.16 ms  |
 
 (b) `yaml --json < manifests.yaml` (10.0 MB), 5 runs each:
 
-| Runtime    | min       | median    | mean      | max       | MB/s (median) |
-| ---------- | --------- | --------- | --------- | --------- | ------------- |
-| Node.js    | 3,916 ms  | 4,226 ms  | 4,137 ms  | 4,301 ms  | 2.37          |
-| TypeNative | 14,955 ms | 15,170 ms | 15,184 ms | 15,547 ms | 0.66          |
+| Runtime    | min      | median   | mean     | max      | MB/s (median) |
+| ---------- | -------- | -------- | -------- | -------- | ------------- |
+| Node.js    | 3,572 ms | 3,627 ms | 3,635 ms | 3,735 ms | 2.76          |
+| TypeNative | 7,032 ms | 7,056 ms | 7,112 ms | 7,326 ms | 1.42          |
 
-**Per call, TypeNative is 27x faster** (9 ms vs 250 ms, median). Node's
+**Per call, TypeNative is 12x faster** (33 ms vs 400 ms, median). Node's
 cost here is mostly startup. It loads and type-strips the 78 TypeScript
 files on every run before it reads a byte of input. That's what you feel
 when a tool calls the converter once per file.
 
-**On bulk throughput, TypeNative is 3.6x slower.** Once V8's JIT has warmed
-up on a long input, it runs this code faster than the compiled Go does. The
-library passes its values around as structural object types and unions
-(`Scalar | YAMLMap | YAMLSeq | Pair`, CST tokens), which TypeNative holds as
-`interface{}`. Property reads and calls on them go through reflection, and a
-value handed to a parameter of a narrower object type is copied field by
-field. Garbage collection takes about a fifth of the native run. Both costs
-grow linearly with input size, while Node's head start is fixed, so the
-native binary finishes first up to about 150–200 KB of YAML per process:
+**On bulk throughput, TypeNative is 1.9x slower.** Once V8's JIT has warmed
+up on a long input, it runs this code faster than the compiled Go does, in
+every phase rather than in one bad spot: lexing, parsing and composing each
+take about twice as long as under Node. The library passes its values around as
+structural object types and unions (`Scalar | YAMLMap | YAMLSeq | Pair`, CST
+tokens), which TypeNative holds as `interface{}`, so the cost is spread across
+property reads, conversions between object types and allocation, which alone
+takes about a fifth of the main thread. Garbage collection runs on other cores
+and hardly affects the wall clock. These costs grow linearly with input size,
+while Node's head start is fixed, so the native binary finishes first up to
+about 1–2 MB of YAML per process:
 
 | Input  | Node.js | TypeNative |
 | ------ | ------- | ---------- |
-| 16 KB  | 284 ms  | 38 ms      |
-| 64 KB  | 311 ms  | 107 ms     |
-| 128 KB | 345 ms  | 253 ms     |
-| 1 MB   | 862 ms  | 1,599 ms   |
+| 512 KB | 655 ms  | 413 ms     |
+| 1 MB   | 859 ms  | 756 ms     |
+| 2 MB   | 1,168 ms | 1,469 ms  |
 
 (Medians of 5 full process runs each, same generator.)
 
-Getting here fixed three performance bugs in TypeNative's runtime, all
-general:
+Getting here fixed performance bugs in TypeNative's runtime, all general:
 
 - Long strings' code-point indexes were evicted by the many short slices a
   lexer takes, so every sticky-regex match rebuilt the index of the whole
-  input. That made lexing quadratic: about 23 s for 1 MB before (measured on
-  a loaded machine), about 1.5 s after.
-- Struct field lookups by name are cached per type.
+  input. That made lexing quadratic.
+- Properties of objects held as any are read and written through plans cached
+  per type and key, with no lock, string hash or reflection on a hit. A read
+  that's consumed on the spot, such as a comparison, doesn't box the value.
+- `obj.list.push(x)` on an object held as any appends in place. It used to
+  convert the whole array on every push, which made building a list quadratic.
+- Conversions between object types are compiled once per pair of types.
+- `switch` on a value held as any compiles to a string switch when its cases
+  are string literals.
+- Regexes run on a VM that works on byte offsets, so a sticky match on a 10 MB
+  input costs no more than one on a short string.
 - `typeof f` types are func types, so the composer's callbacks are called
   directly instead of through reflection.

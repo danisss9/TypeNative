@@ -92,68 +92,71 @@ checks that the two HTML outputs are identical:
   emphasis, links and code spans, lists, tables, code fences and block quotes,
   from a fixed-seed generator, so every machine gets the same input).
 
-**Environment:** Linux 6.18 container, 4 vCPUs of an Intel Xeon @ 2.10GHz,
-Node v24.22.1, Go 1.26.0, TypeNative 0.4.2 (unreleased changes), default
-(non-`--release`) build. The binary is 6.3 MB.
+**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
+Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
+(non-`--release`) build. The binary is 6.4 MB. The machine had other work
+running while these were taken, which slows both runtimes, so read the ratios
+rather than the absolute times.
 
 (a) `marked < README.md` (3.5 KB), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 129.00 ms | 148.15 ms | 148.71 ms | 191.32 ms |
-| TypeNative | 18.04 ms  | 19.46 ms  | 19.71 ms  | 25.27 ms  |
+| Node.js    | 251.42 ms | 273.16 ms | 271.37 ms | 296.58 ms |
+| TypeNative | 40.42 ms  | 45.14 ms  | 46.14 ms  | 57.35 ms  |
 
 (b) `marked < generated.md` (10.0 MB, 114,893 lines), 5 runs each:
 
-| Runtime    | min       | median    | mean      | max       | MB/s (median) |
-| ---------- | --------- | --------- | --------- | --------- | ------------- |
-| Node.js    | 1,969 ms  | 2,053 ms  | 2,056 ms  | 2,164 ms  | 4.87          |
-| TypeNative | 10,378 ms | 10,573 ms | 10,685 ms | 11,006 ms | 0.95          |
+| Runtime    | min      | median   | mean     | max      | MB/s (median) |
+| ---------- | -------- | -------- | -------- | -------- | ------------- |
+| Node.js    | 2,608 ms | 2,642 ms | 2,669 ms | 2,792 ms | 3.79          |
+| TypeNative | 4,111 ms | 4,167 ms | 4,161 ms | 4,202 ms | 2.40          |
 
-**Per call, TypeNative is 7.6x faster** (19 ms vs 148 ms, median). Node's
+**Per call, TypeNative is 6.1x faster** (45 ms vs 273 ms, median). Node's
 cost here is mostly startup: it loads and type-strips the 13 TypeScript files
 and compiles marked's regexes on every run. That's what you feel when a docs
 build or a hook renders one file per process.
 
-**On bulk throughput, TypeNative is 5.2x slower.** On a long input V8's JIT
-and its regex engine (Irregexp compiles hot patterns to machine code) run
+**On bulk throughput, TypeNative is 1.6x slower.** On a long input V8's JIT
+and its regex engine (Irregexp compiles hot patterns to machine code) still run
 marked faster than the compiled Go does. In a profile of the native run on
-1 MB, lexing takes half the CPU and TypeNative's backtracking regex engine
-about a third of it: marked's patterns use lookarounds and backreferences, so
-most of them can't run on Go's RE2, and the backtracker interprets them node
-by node. Garbage collection takes about a third more on the other cores (each
-token is an object, each match a few strings). Both costs grow linearly with
-the input, while Node's head start is fixed, so the native binary finishes
-first up to about 150–200 KB of markdown per process:
+10 MB, about 30% of the main thread is TypeNative's regex VM, which interprets
+marked's patterns where Irregexp runs them as machine code, and allocation is
+about 15%: each token is an object and each match a few strings. Garbage
+collection runs on other cores and hardly affects the wall clock. Both costs
+grow linearly with the input, while Node's head start is fixed, so the native
+binary finishes first up to about 1–2 MB of markdown per process:
 
 | Input  | Node.js | TypeNative |
 | ------ | ------- | ---------- |
-| 16 KB  | 153 ms  | 37 ms      |
-| 64 KB  | 167 ms  | 96 ms      |
-| 128 KB | 182 ms  | 149 ms     |
-| 256 KB | 215 ms  | 287 ms     |
-| 1 MB   | 377 ms  | 1,051 ms   |
+| 512 KB | 442 ms  | 268 ms     |
+| 1 MB   | 560 ms  | 477 ms     |
+| 2 MB   | 740 ms  | 851 ms     |
 
 (Medians of 5 full process runs each, same generator.)
 
-The ReDoS inputs show the same split. The 28 of them take 3.4 s natively in
-total and 4.1 s under Node, but the worst one, 10,000 underscores
-(`quadratic_emstrong_delim`), takes 1.4 s natively against Node's 0.25 s. Each
-underscore restarts a pattern that scans the rest of the run, so the work is
-quadratic in both engines and the backtracker's constant factor shows.
+The ReDoS inputs now favor the native binary: all of them together take 4.7 s
+natively and 13 s under Node, though most of Node's time there is starting up
+once per input. The slowest native case, `quadratic_inline_masking`, takes
+0.7 s against Node's 0.9 s.
 
 Getting here fixed performance bugs in TypeNative's runtime and compiler, all
 general:
 
-- The backtracking engine converted the whole input to runes on every match
-  attempt, making a lexer that matches at each position quadratic. It now
-  works on byte offsets.
-- A greedy repeat of one character class no longer allocates, and ASCII is
-  tested against a table, which took the worst ReDoS input from 6.3 s to 1.4 s.
-- A regex whose match must start with certain bytes skips ahead to them, and
-  an anchored one fails at once, instead of RE2 scanning the rest of a long
-  input on every call.
+- Every regex now runs on one engine, a backtracking VM with JS semantics, in
+  place of Go's RE2 for simple patterns and a closure-based matcher for the
+  rest. A match allocates only its result. First-byte sets, literal prefixes
+  and anchors reject most calls without running anything, which matters here
+  because 83% of marked's 1.5 million regex calls per MB miss. RE2 remains as a
+  fallback: a pattern it can run that exhausts the VM's step budget switches to
+  it, so those patterns keep their linear-time guarantee.
+- Regex literals are compiled once, however many times they're evaluated.
+- `a += b` on a long string held as any is amortized: the string is extended
+  in place when it ends where its buffer's written part ends. It used to copy
+  on every append, which made the worst ReDoS input take over 10 s.
 - Strings built with `+=` in a loop are `strings.Builder`s, so rendering a
   long document is linear.
+- Short ASCII strings need no code-point index, and slices of a long non-ASCII
+  string share its index instead of rebuilding it.
 - Type inference is memoized per query. marked's
   `edit(re).replace(…).replace(…)…` chains took exponential time to compile.

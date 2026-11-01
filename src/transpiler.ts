@@ -1,4 +1,5 @@
 import { createNodeRegistry, NodeCall, NodeRegistry, SourcePosition } from './node/registry.js';
+import { REGEX_ENGINE_HELPER } from './regex_vm.js';
 import { registerPath } from './node/path.js';
 import { registerFs } from './node/fs.js';
 import { registerUrl } from './node/url.js';
@@ -2506,10 +2507,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const pattern = text.substring(1, lastSlash);
     const flags = text.substring(lastSlash + 1);
     const goPattern = translateJsRegexPattern(pattern);
-    // /g needs lastIndex state; backreferences and lookarounds need the
-    // backtracking engine — both live in the TnRegex wrapper, as does a regex
-    // kept as a value (any RegExp value is one)
-    if (needsStatefulRegex(pattern, flags) || !isInlineRegexUse(node)) {
+    // Every regex has JS semantics, in the TnRegex wrapper; only what needs a
+    // real RE2 regex is one (see staysPlainRegex)
+    if (needsStatefulRegex(pattern, flags) || !staysPlainRegex(node)) {
       useHelper('fancyRegex');
       return `TnRegexCompile("${goPattern}", "${flags}", ${toGoStringLiteral(pattern)})`;
     }
@@ -2637,7 +2637,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     if (hasDynamicProperties(node.expression) && node.name.text === 'length' && !isCallee(node)) {
       useHelper('dynamic');
-      return `TnLength(${visit(node.expression)})`;
+      return `TnLength(${peekRead(visit(node.expression))})`;
     }
     // x.constructor of any value: its class (when it is a class instance)
     if (hasDynamicProperties(node.expression) && node.name.text === 'constructor' && !isCallee(node) && !isAssignmentTarget(node)) {
@@ -3174,6 +3174,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     ) {
       useHelper('dynamic');
       useHelper('error');
+      if ((node.arguments ?? []).length === 1 && !isSpreadElement(node.arguments[0]) && inferExpressionType(node.arguments[0]) === 'string') {
+        return `TnCallValueString(${visit(node.expression)}, ${visit(node.arguments[0])})`;
+      }
       return `TnCallValue(${[visit(node.expression), ...(node.arguments ?? []).map((a: AstNode) => visit(a))].join(', ')})`;
     }
     const regexReplace = visitRegexReplace(node);
@@ -3589,7 +3592,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     ) {
       useHelper('numTruthy');
       const operand = (side: AstNode, goType: string | undefined): string =>
-        goType === '*float64' ? `TnNumPtr(${visit(side)})` : goType === 'interface{}' ? `TnNumber(${visit(side)})` : visit(side);
+        goType === '*float64' ? `TnNumPtr(${visit(side)})` : goType === 'interface{}' ? `TnNumber(${peekRead(visit(side))})` : visit(side);
       if (isDynamicGoType(bigLeft) || isDynamicGoType(bigRight)) useHelper('dynamic');
       const l = operand(node.left, bigLeft);
       const r = operand(node.right, bigRight);
@@ -3676,7 +3679,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         const loose = node.operatorToken.kind === 'EqualsEqualsToken' || node.operatorToken.kind === 'ExclamationEqualsToken';
         // (a T | undefined operand compares as its value)
         const operand = (side: AstNode) => (NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(side) ?? '') ? toGoValueOfType(side, 'interface{}') : visit(side));
-        const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${operand(node.left)}, ${operand(node.right)})`;
+        const same = `${loose ? 'TnLooseEqual' : 'TnSame'}(${peekRead(operand(node.left))}, ${peekRead(operand(node.right))})`;
         return op === '==' ? same : `!${same}`;
       }
       // x == null on an interface{} value or an optional chain (emitted as
@@ -4049,7 +4052,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     } else if (hasNilCase && discriminantType && !isNilableGoType(discriminantType)) {
       discriminant = `interface{}(${discriminant})`;
     }
-    return `switch ${discriminant} ${visit(node.caseBlock)}` + (options.inline ? '' : '\n\t');
+    // (a dynamic tag against string literals: Go's string switch, not an
+    // interface comparison per case; no literal is "", a non-string's tag)
+    if ((!discriminantType || discriminantType === 'interface{}') && !hasNilCase && switchHasOnlyStringCases(node)) {
+      useHelper('dynamic');
+      discriminant = `TnSwitchString(${peekRead(discriminant)})`;
+    }
+    return `switch ${peekRead(discriminant)} ${visit(node.caseBlock)}` + (options.inline ? '' : '\n\t');
   } else if (isCaseBlock(node)) {
     return `{\n\t\t${(node.clauses ?? []).map((c) => visit(c)).join('\n\t\t')}\n\t}`;
   } else if (isCaseClause(node) || isDefaultClause(node)) {
@@ -4739,12 +4748,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const nodeArgs = node.arguments ?? [];
       // g / y need lastIndex state, and a computed pattern may need the
       // backtracker: the JS-semantics regex (the pattern translated at run time)
-      if (!newRegExpIsPlain(node) || !isInlineRegexUse(node)) {
+      if (!newRegExpIsPlain(node) || !staysPlainRegex(node)) {
         useHelper('fancyRegex');
         const patternType = inferExpressionType(nodeArgs[0]) ?? '';
         // new RegExp(re) / new RegExp(re, flags): a copy of a regex's pattern
         const pattern = patternType === '*TnRegex' || patternType === '*regexp.Regexp'
-          ? `TnRegexWrap(${patternType === '*TnRegex' ? `(${visit(nodeArgs[0])}).re` : visit(nodeArgs[0])}).source`
+          ? patternType === '*TnRegex' ? `(${visit(nodeArgs[0])}).source` : `TnRegexWrap(${visit(nodeArgs[0])}).source`
           : toGoValueOfType(nodeArgs[0], 'string');
         const flags = nodeArgs.length >= 2 ? toGoValueOfType(nodeArgs[1], 'string') : patternType === '*TnRegex' ? `(${visit(nodeArgs[0])}).flags` : '""';
         return `func() *TnRegex { __p := ${pattern}; return TnRegexCompile(TnJSPatternToRE2(__p), ${flags}, __p) }()`;
@@ -5247,7 +5256,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     useHelper('dynamic');
     // T | undefined: box the dynamic value (nil when missing or of another type)
     if (goType.startsWith('*')) return `TnAsPtr[${goType.slice(1)}](${code})`;
-    return `TnAs[${goType}](${code})`;
+    return `TnAs[${goType}](${goType === 'string' || goType === 'float64' ? peekRead(code) : code})`;
   }
   // a promise of any value where a Promise<T> is expected: converted when it settles
   if (goType?.startsWith('chan ') && goType !== 'chan interface{}' && inferExpressionType(expr) === 'chan interface{}') {
@@ -5773,7 +5782,7 @@ function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
     if (isConcat) {
       // String(x) as JS renders it (Buffers decode, numbers in JS notation)
       useHelper('dynamic');
-      return `TnJSString(${visit(side)})`;
+      return `TnJSString(${peekRead(visit(side))})`;
     }
     useHelper('dynamic');
     // - * / % convert with ToNumber ('6' - 1, date - date); + keeps the number cast
@@ -8947,13 +8956,13 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
   if (isRegularExpressionLiteral(expr)) {
     const lastSlash = expr.text.lastIndexOf('/');
-    if (needsStatefulRegex(expr.text.substring(1, lastSlash), expr.text.substring(lastSlash + 1)) || !isInlineRegexUse(expr)) {
+    if (needsStatefulRegex(expr.text.substring(1, lastSlash), expr.text.substring(lastSlash + 1)) || !staysPlainRegex(expr)) {
       return '*TnRegex';
     }
     return '*regexp.Regexp';
   }
   if (isNewExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'RegExp') {
-    return newRegExpIsPlain(expr) && isInlineRegexUse(expr) ? '*regexp.Regexp' : '*TnRegex';
+    return newRegExpIsPlain(expr) && staysPlainRegex(expr) ? '*regexp.Regexp' : '*TnRegex';
   }
   if (expr.kind === 'TrueKeyword' || expr.kind === 'FalseKeyword')
     return 'bool';
@@ -10008,12 +10017,49 @@ function toGoCondition(expr: AstNode): string {
   return truthinessCheck(visit(expr, { inline: true }), inferExpressionType(expr));
 }
 
+// Whether every case of a switch is a distinct, non-empty string literal
+function switchHasOnlyStringCases(node: AstNode): boolean {
+  const seen = new Set<string>();
+  for (const clause of node.caseBlock?.clauses ?? []) {
+    if (!isCaseClause(clause)) continue;
+    const e = clause.expression;
+    if (!isStringLiteral(e) && !isNoSubstitutionTemplateLiteral(e)) return false;
+    if (e.text === '' || seen.has(e.text)) return false;
+    seen.add(e.text);
+  }
+  return seen.size > 0;
+}
+
+// A property read whose value is consumed on the spot (see TnGetPeek): code
+// when it is anything but one whole TnGetRef call
+function peekRead(code: string): string {
+  const head = 'TnGetRef(';
+  if (!code.startsWith(head)) return code;
+  let depth = 0;
+  let quote = '';
+  for (let i = head.length - 1; i < code.length; i++) {
+    const c = code.charAt(i);
+    if (quote !== '') {
+      if (c === '\\') i++;
+      else if (c === quote) quote = '';
+    } else if (c === '"' || c === '`') {
+      quote = c;
+    } else if (c === '(') {
+      depth++;
+    } else if (c === ')') {
+      depth--;
+      if (depth === 0) return i === code.length - 1 ? 'TnGetPeek(' + code.substring(head.length) : code;
+    }
+  }
+  return code;
+}
+
 function truthinessCheck(code: string, goType: string | undefined): string {
   if (goType === 'bool' || goType === ':') return code;
   // an unknown (or named Go) type: JS truthiness at run time
   if (!goType || goType === 'interface{}') {
     useHelper('dynamic');
-    return `TnTruthy(${code})`;
+    return `TnTruthy(${peekRead(code)})`;
   }
   if (NULLABLE_PRIMITIVE_TYPES.includes(goType) && !/^[\w.()*]+$/.test(code)) {
     return `func() bool { __t := ${code}; return ${truthinessCheck('__t', goType)} }()`;
@@ -13148,7 +13194,7 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
     if (dispatched && arrayPath) {
       useHelper('dynamic');
       const receiverCode = visit(node.expression.expression);
-      if (isDiscardedValue(node)) return `func() { if TnIsSlice(${receiverCode}) { ${arrayPath} } else { ${dispatched} } }()`;
+      if (isDiscardedValue(node)) return `func() { if TnIsSlice(${peekRead(receiverCode)}) { ${arrayPath} } else { ${dispatched} } }()`;
       return `func() interface{} { if TnIsSlice(${receiverCode}) { return ${arrayPath} }; return ${dispatched} }()`;
     }
   }
@@ -13162,6 +13208,10 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
     call.expression.parent = call;
     local.parent = call.expression;
     const resultType = inferExpressionType(call) ?? '';
+    // (one element onto a field: in place, nothing is converted or copied)
+    if (method === 'push' && (node.arguments ?? []).length === 1 && !isSpreadElement(node.arguments[0]) && isDiscardedValue(node) && isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression) && !hasQuestionDot(receiver) && !hasQuestionDot(node.expression)) {
+      return `TnPushField(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${toGoValueOfType(node.arguments[0], 'interface{}')})`;
+    }
     const writeBack = isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression)
       ? `TnSetArrayInPlace(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${elements})`
       : `${visit(receiver)} = ${elements}`;
@@ -13317,12 +13367,9 @@ function newRegExpIsPlain(node: AstNode): boolean {
   return !needsStatefulRegex(pattern.text, flags.text);
 }
 
-// A regex used where it's written, never kept as a value: the receiver of
-// its own method (/x/.test(s)) or a string method's pattern (s.replace(/x/, …)).
-// Only those may be a plain RE2 *regexp.Regexp; any other is a *TnRegex
-const INLINE_REGEX_STRING_METHODS = new Set(['replace', 'replaceAll', 'match', 'matchAll', 'split', 'search']);
-
-function isInlineRegexUse(node: AstNode): boolean {
+// The regexes that stay RE2: a Node built-in's argument (assert.match(s, /re/)
+// takes one), and /(?<name>…)/.exec(s), whose result has .groups (a TnMatch)
+function staysPlainRegex(node: AstNode): boolean {
   let child = node;
   let parent = node.parent;
   while (parent && isParenthesizedExpression(parent)) {
@@ -13330,13 +13377,8 @@ function isInlineRegexUse(node: AstNode): boolean {
     parent = parent.parent;
   }
   if (!parent) return false;
-  if (isPropertyAccessExpression(parent) && parent.expression === child) return isCallExpression(parent.parent) && parent.parent.expression === parent;
-  if (isCallExpression(parent) && (parent.arguments ?? [])[0] === child && isPropertyAccessExpression(parent.expression) && INLINE_REGEX_STRING_METHODS.has(parent.expression.name.text)) {
-    return inferExpressionType(parent.expression.expression) === 'string';
-  }
-  // (an argument of a Node built-in: assert.match(s, /re/) takes an RE2 regex)
-  if (isCallExpression(parent) && (parent.arguments ?? []).includes(child) && resolveNodeKey(parent.expression)) return true;
-  return false;
+  if (isCallExpression(parent) && (parent.arguments ?? []).includes(child) && !!resolveNodeKey(parent.expression)) return true;
+  return isRegularExpressionLiteral(node) && node.text.includes('(?<') && isPropertyAccessExpression(parent) && parent.expression === child && parent.name.text === 'exec' && isCallExpression(parent.parent);
 }
 
 function newRegExpIsStateful(node: AstNode): boolean {
@@ -13512,8 +13554,9 @@ function needsStatefulRegex(pattern: string, flags: string): boolean {
   // /g and /y keep lastIndex state; /u keeps its flag for .flags
   if (flags.includes('g') || flags.includes('y') || flags.includes('u')) return true;
   const stripped = pattern.replace(/\(\?<[A-Za-z_][A-Za-z0-9_]*>/g, '');
-  // (?= (?! and any remaining (?< (lookbehind) need the backtracker
-  return /\\[1-9]|\(\?[=!<]/.test(stripped);
+  // (?= (?! and any remaining (?< (lookbehind) need the backtracker, as do
+  // backreferences, by number or by name
+  return /\\[1-9]|\\k<|\(\?[=!<]/.test(stripped);
 }
 
 const REGEX_FLAG_PROPERTIES: Record<string, string> = {
@@ -16144,7 +16187,7 @@ const helperRequires: Record<string, string[]> = {
   structuredClone: [],
   globalThis: ['dynamic'],
   namedGroups: ['orderedMap', 'regexMatch'],
-  fancyRegex: ['orderedMap', 'regexMatch'],
+  fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
   dynamic: ['error', 'strIndex', 'toFixed'],
   regexMatch: ['strIndex'],
   classes: ['dynamic', 'error', 'orderedMap'],
@@ -16876,7 +16919,7 @@ const helperPackages: Record<string, string[]> = {
   weakRefs: ['weak', 'runtime', 'sync'],
   builtins: ['math', 'strconv', 'strings', 'math/big'],
   date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
-  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync'],
+  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic'],
   classes: ['reflect'],
   arraySubclass: ['reflect'],
   numTruthy: ['math'],
@@ -16891,10 +16934,11 @@ const helperPackages: Record<string, string[]> = {
   error: ['runtime', 'strings', 'fmt'],
   bigint: ['math/big', 'math'],
   symbol: [],
-  fancyRegex: ['regexp', 'regexp/syntax', 'strings', 'strconv', 'fmt', 'sort', 'unicode/utf8', 'unicode'],
+  fancyRegex: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
+  regexEngine: ['strings', 'fmt', 'strconv', 'sync', 'sync/atomic', 'unicode', 'unicode/utf8'],
   namedGroups: ['regexp', 'unicode/utf8'],
-  regexMatch: ['regexp', 'strings', 'strconv', 'math', 'unicode/utf8'],
-  strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings'],
+  regexMatch: ['regexp', 'math', 'unsafe', 'unicode/utf8'],
+  strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings', 'sort'],
   jsReplacement: ['strings'],
   moduleUrl: ['os'],
   asyncWait: [],
@@ -17483,11 +17527,9 @@ func TnIsArray(v interface{}) bool {
 // arrays []interface{}, numbers float64
 // A nullable primitive (*T) as the JS value it holds: its T, or undefined
 func tnPlainValue(v interface{}) interface{} {
-	// (an array field's reference, *[]T: nil is undefined)
-	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() && rv.Type().Elem().Kind() == reflect.Slice {
-		return nil
-	}
 	switch p := v.(type) {
+	case nil, string, float64, bool:
+		return v
 	case *string:
 		if p == nil {
 			return nil
@@ -17504,6 +17546,10 @@ func tnPlainValue(v interface{}) interface{} {
 		}
 		return *p
 	}
+	// (an array field's reference, *[]T: nil is undefined)
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() && rv.Type().Elem().Kind() == reflect.Slice {
+		return nil
+	}
 	return v
 }
 
@@ -17511,6 +17557,43 @@ func tnPlainValue(v interface{}) interface{} {
 // reference to it — JS arrays are shared, so a push or splice through the
 // value read changes the field
 func TnGetRef(obj interface{}, key string) interface{} {
+	if obj != nil {
+		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.own {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				return p.read(base)
+			}
+		}
+	}
+	return tnGetRefSlow(obj, key)
+}
+
+// TnGetRef for a value its consumer reads on the spot (a comparison, a test,
+// a conversion): a string or number stays in its field instead of being
+// boxed, so the result must not outlive the expression
+func TnGetPeek(obj interface{}, key string) interface{} {
+	if obj != nil {
+		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.own {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				var v interface{}
+				e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+				switch p.kind {
+				case tnFieldString, tnFieldFloat:
+					e[0], e[1] = p.field, unsafe.Add(base, p.offset)
+					return v
+				case tnFieldStringPtr, tnFieldFloatPtr:
+					if q := *(*unsafe.Pointer)(unsafe.Add(base, p.offset)); q != nil {
+						e[0], e[1] = p.elem, q
+					}
+					return v
+				}
+				return p.read(base)
+			}
+		}
+	}
+	return tnGetRefSlow(obj, key)
+}
+
+func tnGetRefSlow(obj interface{}, key string) interface{} {
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
 		if f := tnFieldOf(rv.Elem(), key); f.IsValid() && f.CanAddr() {
@@ -17537,6 +17620,328 @@ func tnHasOwnGet(obj interface{}) bool {
 		return true
 	}
 	return false
+}
+
+// A field read and written without reflection: the plan of one object type
+// and key, found through a table whose hits take no lock and hash no string.
+// (the kinds with a reference read or an unusual layout stay on tnFieldSlow)
+const (
+	tnFieldSlow = iota
+	tnFieldAny
+	tnFieldString
+	tnFieldFloat
+	tnFieldBool
+	tnFieldWord // a pointer, map, func or channel
+	tnFieldStringPtr
+	tnFieldFloatPtr
+	tnFieldBoolPtr
+	tnFieldSlice    // reads as a reference to the field
+	tnFieldSliceRef // *[]T: nil reads as undefined
+)
+
+type tnFieldPlan struct {
+	typ     unsafe.Pointer // the object's type (a pointer to a struct)
+	key     string
+	kind    uint8
+	own     bool           // it answers property reads itself (see tnHasOwnGet)
+	setter  bool           // writes go through Set_key, or a Map's Set
+	missing bool           // no such field (a getter, or nothing)
+	offset  uintptr
+	field   unsafe.Pointer // the field's type
+	ref     unsafe.Pointer // a pointer to the field's type
+	elem    unsafe.Pointer // what a pointer field points to
+	item    uint8          // an array field's elements (a kind above; tnFieldSlow: reflection)
+	itemT   unsafe.Pointer // their type
+}
+
+var tnFieldPlans [1 << 12]atomic.Pointer[tnFieldPlan]
+var tnFieldPlanIndex = map[tnFieldKey]*tnFieldPlan{}
+
+func tnPlanOf(obj interface{}, key string) *tnFieldPlan {
+	t := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[0]
+	h := uintptr(t) >> 4
+	if n := len(key); n > 0 {
+		h ^= uintptr(n) ^ uintptr(key[0])<<4 ^ uintptr(key[n-1])<<9
+	}
+	h = (h * 0x9E3779B1) >> 12 & (1<<12 - 1)
+	if p := tnFieldPlans[h].Load(); p != nil && p.typ == t && p.key == key {
+		return p
+	}
+	return tnPlanMiss(obj, key, t, h)
+}
+
+func tnPlanMiss(obj interface{}, key string, t unsafe.Pointer, h uintptr) *tnFieldPlan {
+	ck := tnFieldKey{t, key}
+	tnFieldIndexesMu.RLock()
+	p := tnFieldPlanIndex[ck]
+	tnFieldIndexesMu.RUnlock()
+	if p == nil {
+		p = tnMakeFieldPlan(obj, key, t)
+		tnFieldIndexesMu.Lock()
+		tnFieldPlanIndex[ck] = p
+		tnFieldIndexesMu.Unlock()
+	}
+	tnFieldPlans[h].Store(p)
+	return p
+}
+
+func tnMakeFieldPlan(obj interface{}, key string, t unsafe.Pointer) *tnFieldPlan {
+	p := &tnFieldPlan{typ: t, key: key, own: tnHasOwnGet(obj)}
+	rt := reflect.TypeOf(obj)
+	if rt.Kind() != reflect.Pointer || rt.Elem().Kind() != reflect.Struct {
+		return p
+	}
+	if _, ok := rt.MethodByName("Set_" + key); ok || strings.HasPrefix(rt.String(), "*main.TnMap[") {
+		p.setter = true
+	}
+	st := rt.Elem()
+	var field reflect.StructField
+	found := false
+	for _, name := range []string{key, key + "_"} {
+		if f, ok := st.FieldByName(name); ok {
+			field, found = f, true
+			break
+		}
+	}
+	if !found {
+		p.missing = true
+		return p
+	}
+	// (embedded parents are values; through a pointer, reflection follows it)
+	at := st
+	for _, i := range field.Index {
+		if at.Kind() != reflect.Struct {
+			return p
+		}
+		f := at.Field(i)
+		p.offset += f.Offset
+		at = f.Type
+	}
+	ft := field.Type
+	p.field = (*[2]unsafe.Pointer)(unsafe.Pointer(&ft))[1]
+	pt := reflect.PointerTo(ft)
+	p.ref = (*[2]unsafe.Pointer)(unsafe.Pointer(&pt))[1]
+	switch ft.Kind() {
+	case reflect.Interface:
+		if ft.NumMethod() == 0 {
+			p.kind = tnFieldAny
+		}
+	case reflect.String:
+		p.kind = tnFieldString
+	case reflect.Float64:
+		p.kind = tnFieldFloat
+	case reflect.Bool:
+		p.kind = tnFieldBool
+	case reflect.Map, reflect.Func, reflect.Chan:
+		p.kind = tnFieldWord
+	case reflect.Slice:
+		if ft.Elem().Kind() != reflect.Uint8 {
+			p.kind = tnFieldSlice
+		}
+	case reflect.Pointer:
+		et := ft.Elem()
+		p.elem = (*[2]unsafe.Pointer)(unsafe.Pointer(&et))[1]
+		switch et.Kind() {
+		case reflect.String:
+			p.kind = tnFieldStringPtr
+		case reflect.Float64:
+			p.kind = tnFieldFloatPtr
+		case reflect.Bool:
+			p.kind = tnFieldBoolPtr
+		case reflect.Slice:
+			p.kind = tnFieldSliceRef
+		default:
+			p.kind = tnFieldWord
+		}
+	}
+	// (only exactly these types: a named string type is not a plain string)
+	if p.kind >= tnFieldString && p.kind <= tnFieldBool && ft.PkgPath() != "" {
+		p.kind = tnFieldSlow
+	}
+	if p.kind == tnFieldSlice || p.kind == tnFieldSliceRef {
+		st := ft
+		if p.kind == tnFieldSliceRef {
+			st = ft.Elem()
+		}
+		it := st.Elem()
+		p.itemT = (*[2]unsafe.Pointer)(unsafe.Pointer(&it))[1]
+		switch it.Kind() {
+		case reflect.Interface:
+			if it.NumMethod() == 0 {
+				p.item = tnFieldAny
+			}
+		case reflect.Pointer, reflect.Map, reflect.Func, reflect.Chan:
+			p.item = tnFieldWord
+		case reflect.String:
+			if it.PkgPath() == "" {
+				p.item = tnFieldString
+			}
+		case reflect.Float64:
+			if it.PkgPath() == "" {
+				p.item = tnFieldFloat
+			}
+		}
+	}
+	return p
+}
+
+// Appends value to the array q points to, when it needs no conversion
+func (p *tnFieldPlan) push(q unsafe.Pointer, value interface{}) bool {
+	switch p.item {
+	case tnFieldAny:
+		a := (*[]interface{})(q)
+		*a = append(*a, value)
+		return true
+	case tnFieldWord:
+		if e := (*[2]unsafe.Pointer)(unsafe.Pointer(&value)); e[0] == p.itemT {
+			a := (*[]unsafe.Pointer)(q)
+			*a = append(*a, e[1])
+			return true
+		}
+	case tnFieldString:
+		if s, ok := value.(string); ok {
+			a := (*[]string)(q)
+			*a = append(*a, s)
+			return true
+		}
+	case tnFieldFloat:
+		if n, ok := value.(float64); ok {
+			a := (*[]float64)(q)
+			*a = append(*a, n)
+			return true
+		}
+	}
+	return false
+}
+
+// obj.key.push(value) on a dynamic object: in place, as JS arrays are shared
+func TnPushField(obj interface{}, key string, value interface{}) {
+	if obj != nil {
+		if p := tnPlanOf(obj, key); !p.setter {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				f := unsafe.Add(base, p.offset)
+				switch p.kind {
+				case tnFieldSliceRef:
+					if q := *(*unsafe.Pointer)(f); q != nil && p.push(q, value) {
+						return
+					}
+				case tnFieldSlice:
+					if p.push(f, value) {
+						return
+					}
+				case tnFieldAny:
+					if a, ok := (*(*interface{})(f)).(*[]interface{}); ok && a != nil {
+						*a = append(*a, value)
+						return
+					}
+				}
+			}
+		}
+	}
+	elements := append(TnAs[[]interface{}](TnGetRef(obj, key)), value)
+	TnSetArrayInPlace(obj, key, elements)
+}
+
+// The JS value of the field in the object at base (an array by reference)
+func (p *tnFieldPlan) read(base unsafe.Pointer) interface{} {
+	f := unsafe.Add(base, p.offset)
+	var v interface{}
+	switch p.kind {
+	case tnFieldAny:
+		return tnPlainValue(*(*interface{})(f))
+	case tnFieldString:
+		return *(*string)(f)
+	case tnFieldFloat:
+		return *(*float64)(f)
+	case tnFieldBool:
+		return *(*bool)(f)
+	case tnFieldWord:
+		e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+		e[0], e[1] = p.field, *(*unsafe.Pointer)(f)
+	case tnFieldStringPtr:
+		if q := *(**string)(f); q != nil {
+			return *q
+		}
+	case tnFieldFloatPtr:
+		if q := *(**float64)(f); q != nil {
+			return *q
+		}
+	case tnFieldBoolPtr:
+		if q := *(**bool)(f); q != nil {
+			return *q
+		}
+	case tnFieldSlice:
+		if *(*unsafe.Pointer)(f) != nil {
+			e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+			e[0], e[1] = p.ref, f
+		}
+	case tnFieldSliceRef:
+		if q := *(*unsafe.Pointer)(f); q != nil {
+			e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+			e[0], e[1] = p.field, q
+		}
+	}
+	return v
+}
+
+// Stores value in the field, when it already is of the field's type
+func (p *tnFieldPlan) write(base unsafe.Pointer, value interface{}) bool {
+	f := unsafe.Add(base, p.offset)
+	switch p.kind {
+	case tnFieldAny:
+		*(*interface{})(f) = value
+		return true
+	case tnFieldString:
+		if s, ok := value.(string); ok {
+			*(*string)(f) = s
+			return true
+		}
+	case tnFieldFloat:
+		if n, ok := value.(float64); ok {
+			*(*float64)(f) = n
+			return true
+		}
+	case tnFieldBool:
+		if b, ok := value.(bool); ok {
+			*(*bool)(f) = b
+			return true
+		}
+	case tnFieldSlice:
+		if e := (*[2]unsafe.Pointer)(unsafe.Pointer(&value)); e[0] == p.field {
+			*(*[]byte)(f) = *(*[]byte)(e[1])
+			return true
+		}
+	case tnFieldWord:
+		if e := (*[2]unsafe.Pointer)(unsafe.Pointer(&value)); e[0] == p.field {
+			*(*unsafe.Pointer)(f) = e[1]
+			return true
+		}
+	case tnFieldSliceRef:
+		e := (*[2]unsafe.Pointer)(unsafe.Pointer(&value))
+		if e[0] == p.field {
+			*(*unsafe.Pointer)(f) = e[1]
+			return true
+		}
+		// (an array for a reference to one: a new reference)
+		if e[0] == p.elem {
+			header := *(*[]byte)(e[1])
+			*(**[]byte)(f) = &header
+			return true
+		}
+	}
+	return false
+}
+
+// Whether the field is set (an unset one is not a property yet)
+func (p *tnFieldPlan) set(base unsafe.Pointer) bool {
+	f := unsafe.Add(base, p.offset)
+	switch p.kind {
+	case tnFieldAny:
+		return *(*interface{})(f) != nil
+	case tnFieldString, tnFieldFloat, tnFieldBool:
+		return true
+	}
+	return *(*unsafe.Pointer)(f) != nil
 }
 
 type tnFieldKey struct {
@@ -17591,6 +17996,12 @@ func TnGetValue(obj interface{}, key string) interface{} {
 	return v
 }
 
+// A switch's dynamic tag as a string ("" for anything else: see switchHasOnlyStringCases)
+func TnSwitchString(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
 func TnGet(obj interface{}, key string) interface{} {
 	switch o := obj.(type) {
 	case map[string]interface{}:
@@ -17624,6 +18035,13 @@ func TnGet(obj interface{}, key string) interface{} {
 			return o.Get_stack()
 		}
 		return o.prop(key)
+	}
+	if obj != nil {
+		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && p.kind != tnFieldSlice {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				return p.read(base)
+			}
+		}
 	}
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
@@ -17768,6 +18186,28 @@ func tnCallCollection(obj interface{}, isSet bool, name string, args []interface
 // Calls a function value held as any, converting the arguments to its
 // parameter types; its result (or nil)
 func TnCallValue(fn interface{}, args ...interface{}) interface{} {
+	// (the shapes callbacks take most often, without reflection)
+	switch f := fn.(type) {
+	case func():
+		f()
+		return nil
+	case func() interface{}:
+		return f()
+	case func(string):
+		if len(args) > 0 {
+			if s, ok := args[0].(string); ok {
+				f(s)
+				return nil
+			}
+		}
+	case func(interface{}):
+		f(TnArg(args, 0))
+		return nil
+	case func(interface{}) interface{}:
+		return f(TnArg(args, 0))
+	case func(interface{}, interface{}) interface{}:
+		return f(TnArg(args, 0), TnArg(args, 1))
+	}
 	fv := reflect.ValueOf(fn)
 	if fv.Kind() != reflect.Func {
 		panic(TnNodeError("TypeError", "", "value is not a function"))
@@ -17795,6 +18235,19 @@ func TnCallValue(fn interface{}, args ...interface{}) interface{} {
 	return out[0].Interface()
 }
 
+// TnCallValue with a string argument, boxed only if the function needs it
+func TnCallValueString(fn interface{}, s string) interface{} {
+	switch f := fn.(type) {
+	case func():
+		f()
+		return nil
+	case func(string):
+		f(s)
+		return nil
+	}
+	return TnCallValue(fn, s)
+}
+
 // new Error(message, { cause })
 func TnErrorWithOptions(e *TnError, options interface{}) *TnError {
 	if options == nil {
@@ -17820,6 +18273,18 @@ func TnErrorWithOptions(e *TnError, options interface{}) *TnError {
 // array the field references (*[]T) when it holds one, so the array's other
 // holders see the change, as they share it in JS
 func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
+	if obj != nil {
+		if p := tnPlanOf(obj, key); p.kind == tnFieldSliceRef && !p.setter {
+			base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]
+			e := (*[2]unsafe.Pointer)(unsafe.Pointer(&value))
+			if base != nil && e[0] == p.elem {
+				if q := *(*unsafe.Pointer)(unsafe.Add(base, p.offset)); q != nil {
+					*(*[]byte)(q) = *(*[]byte)(e[1])
+					return
+				}
+			}
+		}
+	}
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
 		if f := tnFieldOf(rv.Elem(), key); f.IsValid() && f.Kind() == reflect.Pointer && !f.IsNil() && f.Type().Elem().Kind() == reflect.Slice {
@@ -17835,6 +18300,13 @@ func TnSet(obj interface{}, key string, value interface{}) {
 	if o, ok := obj.(map[string]interface{}); ok {
 		o[key] = value
 		return
+	}
+	if obj != nil {
+		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.setter {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil && p.write(base, value) {
+				return
+			}
+		}
 	}
 	if tnSetMember(obj, key, value) {
 		return
@@ -17926,6 +18398,18 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 
 func TnIndex(obj interface{}, key interface{}) interface{} {
 	switch o := obj.(type) {
+	case *[]float64:
+		if i, ok := key.(float64); ok && o != nil && i >= 0 && int(i) < len(*o) && i == float64(int(i)) {
+			return (*o)[int(i)]
+		}
+	case []float64:
+		if i, ok := key.(float64); ok && i >= 0 && int(i) < len(o) && i == float64(int(i)) {
+			return o[int(i)]
+		}
+	case *[]interface{}:
+		if i, ok := key.(float64); ok && o != nil && i >= 0 && int(i) < len(*o) && i == float64(int(i)) {
+			return (*o)[int(i)]
+		}
 	case map[string]interface{}:
 		if k, ok := key.(string); ok {
 			return o[k]
@@ -17978,8 +18462,25 @@ func TnIndex(obj interface{}, key interface{}) interface{} {
 
 // JS ===: objects and arrays compare by identity, other values by value
 func TnSame(a interface{}, b interface{}) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
+	switch x := a.(type) {
+	case nil:
+		return b == nil
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case float64:
+		y, ok := b.(float64)
+		return ok && x == y
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	}
+	if b == nil {
+		return false
+	}
+	// (different types are never the same value)
+	if (*[2]unsafe.Pointer)(unsafe.Pointer(&a))[0] != (*[2]unsafe.Pointer)(unsafe.Pointer(&b))[0] {
+		return false
 	}
 	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
 	switch va.Kind() {
@@ -18006,7 +18507,40 @@ func TnDynamicAdd(a interface{}, b interface{}) interface{} {
 	if numeric(a) && numeric(b) {
 		return TnNumber(a) + TnNumber(b)
 	}
-	return TnJSString(a) + TnJSString(b)
+	return tnConcat(TnJSString(a), TnJSString(b))
+}
+
+// Long strings built by repeated a += b (JS ropes make that cheap): a is
+// extended in place when it ends where its buffer's written part ends. That
+// leaves every string already taken from the buffer as it was.
+type tnConcatTail struct {
+	buf  []byte
+	used atomic.Int64
+}
+
+// (a few at once: a parser may grow several strings in turn)
+var tnConcatTails [4]atomic.Pointer[tnConcatTail]
+var tnConcatNext atomic.Uint32
+
+func tnConcat(a string, b string) string {
+	if len(a) < 1024 {
+		return a + b
+	}
+	n := len(a) + len(b)
+	p := unsafe.StringData(a)
+	for i := range tnConcatTails {
+		t := tnConcatTails[i].Load()
+		if t != nil && unsafe.SliceData(t.buf) == p && n <= cap(t.buf) && t.used.CompareAndSwap(int64(len(a)), int64(n)) {
+			copy(t.buf[len(a):n], b)
+			return unsafe.String(p, n)
+		}
+	}
+	t := &tnConcatTail{buf: make([]byte, 2*n)}
+	copy(t.buf, a)
+	copy(t.buf[len(a):], b)
+	t.used.Store(int64(n))
+	tnConcatTails[tnConcatNext.Add(1)%uint32(len(tnConcatTails))].Store(t)
+	return unsafe.String(unsafe.SliceData(t.buf), n)
 }
 
 // a == b (JS loose equality): null == undefined; a number, string or boolean
@@ -18072,6 +18606,28 @@ func TnArrayRef[T any](v interface{}) *[]T {
 	if v == nil {
 		return nil
 	}
+	// (the usual case: the elements already are Ts)
+	var items []interface{}
+	switch a := v.(type) {
+	case []interface{}:
+		items = a
+	case *[]interface{}:
+		if a != nil {
+			items = *a
+		}
+	}
+	if items != nil {
+		s := make([]T, len(items))
+		ok := true
+		for i, item := range items {
+			if s[i], ok = item.(T); !ok {
+				break
+			}
+		}
+		if ok {
+			return &s
+		}
+	}
 	s := TnAs[[]T](v)
 	return &s
 }
@@ -18107,6 +18663,10 @@ func TnLength(v interface{}) float64 {
 		return float64(tnStrCount(t))
 	case []interface{}:
 		return float64(len(t))
+	case *[]interface{}:
+		if t != nil {
+			return float64(len(*t))
+		}
 	case interface{ TnItems() *[]interface{} }:
 		return float64(len(*t.TnItems()))
 	}
@@ -18499,6 +19059,13 @@ func TnHas(obj interface{}, key interface{}) bool {
 		}
 	}
 	// Struct objects: the in operator checks for a field
+	if k, ok := key.(string); ok && obj != nil {
+		if p := tnPlanOf(obj, k); p.kind != tnFieldSlow {
+			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				return p.set(base)
+			}
+		}
+	}
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
@@ -18642,6 +19209,14 @@ func TnIndexOf(v interface{}, x interface{}) float64 {
 	return -1
 }
 
+// One-character strings boxed once
+var tnCharBoxes = func() (t [128]interface{}) {
+	for c := range t {
+		t[c] = string(rune(c))
+	}
+	return
+}()
+
 func TnSlice(v interface{}, bounds ...float64) interface{} {
 	length := 0
 	switch t := v.(type) {
@@ -18670,7 +19245,11 @@ func TnSlice(v interface{}, bounds ...float64) interface{} {
 		start = end
 	}
 	if s, ok := v.(string); ok {
-		return s[tnStrByte(s, start):tnStrByte(s, end)]
+		r := s[tnStrByte(s, start):tnStrByte(s, end)]
+		if len(r) == 1 && r[0] < 128 {
+			return tnCharBoxes[r[0]]
+		}
+		return r
 	}
 	return v.([]interface{})[start:end]
 }
@@ -18768,7 +19347,145 @@ func tnStructCopyPlan(from, to reflect.Type) [][2]int {
 // for a regex: see regexObject)
 var tnTypeConverters = map[reflect.Type]func(interface{}) (interface{}, bool){}
 
+// A conversion between two object types (TS types are structural), compiled
+// once per pair of pointer types: the fields they share, copied without
+// reflection when both sides have the same type
+type tnCopyField struct {
+	from, to uintptr
+	kind     uint8  // tnFieldAny … as in tnFieldPlan; tnFieldSlow: reflection
+	si, di   int
+}
+
+type tnConvPlan struct {
+	from, to unsafe.Pointer
+	ok       bool // the pair is convertible this way
+	src, dst reflect.Type
+	fields   []tnCopyField
+}
+
+var tnConvPlans [1 << 10]atomic.Pointer[tnConvPlan]
+var tnConvPlanIndex = map[[2]unsafe.Pointer]*tnConvPlan{}
+var tnConvPlanMu sync.RWMutex
+
+func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsafe.Pointer) *tnConvPlan {
+	p := &tnConvPlan{from: from, to: to}
+	rt := reflect.TypeOf(v)
+	if rt == t || rt.Kind() != reflect.Pointer || t.Kind() != reflect.Pointer || rt.Elem().Kind() != reflect.Struct || t.Elem().Kind() != reflect.Struct || t.Elem().NumField() == 0 {
+		return p
+	}
+	if _, custom := tnTypeConverters[t]; custom || rt.AssignableTo(t) {
+		return p
+	}
+	if _, custom := tnTypeConverters[t.Elem()]; custom {
+		return p
+	}
+	if _, isNull := v.(interface{ TnIsNullValue() }); isNull {
+		return p
+	}
+	if _, isEntries := v.(interface{ Entries() [][]interface{} }); isEntries {
+		return p
+	}
+	if _, isMap := reflect.New(t.Elem()).Interface().(interface {
+		TnFill([][]interface{}, func(interface{}, reflect.Type) (reflect.Value, bool)) bool
+	}); isMap {
+		return p
+	}
+	instance := reflect.TypeOf((*interface{ TnClassInstance() })(nil)).Elem()
+	if rt.Implements(instance) && t.Implements(instance) {
+		return p
+	}
+	p.src, p.dst = rt.Elem(), t.Elem()
+	for _, pair := range tnStructCopyPlan(p.src, p.dst) {
+		sf, df := p.src.Field(pair[0]), p.dst.Field(pair[1])
+		field := tnCopyField{from: sf.Offset, to: df.Offset, si: pair[0], di: pair[1]}
+		if sf.Type == df.Type {
+			switch sf.Type.Kind() {
+			case reflect.Interface:
+				if sf.Type.NumMethod() == 0 {
+					field.kind = tnFieldAny
+				}
+			case reflect.String:
+				field.kind = tnFieldString
+			case reflect.Float64:
+				field.kind = tnFieldFloat
+			case reflect.Bool:
+				field.kind = tnFieldBool
+			case reflect.Pointer, reflect.Map, reflect.Func, reflect.Chan:
+				field.kind = tnFieldWord
+			case reflect.Slice:
+				field.kind = tnFieldSlice
+			}
+		}
+		p.fields = append(p.fields, field)
+	}
+	p.ok = true
+	return p
+}
+
+// v (a non-nil pointer to a struct) as a new value of the plan's target type
+func (p *tnConvPlan) convert(v interface{}) reflect.Value {
+	out := reflect.New(p.dst)
+	src, dst := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1], out.UnsafePointer()
+	for i := range p.fields {
+		f := &p.fields[i]
+		a, b := unsafe.Add(src, f.from), unsafe.Add(dst, f.to)
+		switch f.kind {
+		case tnFieldAny:
+			*(*interface{})(b) = *(*interface{})(a)
+		case tnFieldString:
+			*(*string)(b) = *(*string)(a)
+		case tnFieldFloat:
+			*(*float64)(b) = *(*float64)(a)
+		case tnFieldBool:
+			*(*bool)(b) = *(*bool)(a)
+		case tnFieldWord:
+			*(*unsafe.Pointer)(b) = *(*unsafe.Pointer)(a)
+		case tnFieldSlice:
+			*(*[]byte)(b) = *(*[]byte)(a)
+		default:
+			// (different types: converted, as the fields of TnConvertDynamic)
+			sf := reflect.NewAt(p.src, src).Elem().Field(f.si)
+			sf = reflect.NewAt(sf.Type(), unsafe.Pointer(sf.UnsafeAddr())).Elem()
+			switch sf.Kind() {
+			case reflect.Pointer, reflect.Interface, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan:
+				if sf.IsNil() {
+					continue
+				}
+			}
+			df := out.Elem().Field(f.di)
+			df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
+			if sf.Type().AssignableTo(df.Type()) {
+				df.Set(sf)
+			} else if converted, ok := TnConvertDynamic(sf.Interface(), df.Type()); ok {
+				df.Set(converted)
+			}
+		}
+	}
+	return out
+}
+
 func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
+	if v != nil {
+		from, to := (*[2]unsafe.Pointer)(unsafe.Pointer(&v)), (*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1]
+		h := ((uintptr(from[0])>>4 ^ uintptr(to)>>7) * 0x9E3779B1) >> 12 & (1<<10 - 1)
+		p := tnConvPlans[h].Load()
+		if p == nil || p.from != from[0] || p.to != to {
+			key := [2]unsafe.Pointer{from[0], to}
+			tnConvPlanMu.RLock()
+			p = tnConvPlanIndex[key]
+			tnConvPlanMu.RUnlock()
+			if p == nil {
+				p = tnMakeConvPlan(v, t, from[0], to)
+				tnConvPlanMu.Lock()
+				tnConvPlanIndex[key] = p
+				tnConvPlanMu.Unlock()
+			}
+			tnConvPlans[h].Store(p)
+		}
+		if p.ok && from[1] != nil {
+			return p.convert(v), true
+		}
+	}
 	if _, isNull := v.(interface{ TnIsNullValue() }); isNull && t.Kind() != reflect.Interface {
 		v = nil
 	}
@@ -19010,7 +19727,13 @@ func TnIsUndefined(v interface{}) bool {
 }
 
 func TnIsNil(v interface{}) bool {
-	if v == nil || v == TnNull {
+	switch v.(type) {
+	case nil:
+		return true
+	case string, float64, bool:
+		return false
+	}
+	if v == TnNull {
 		return true
 	}
 	rv := reflect.ValueOf(v)
@@ -19301,10 +20024,18 @@ type tnStrIdx struct {
 	p     *byte
 	n     int
 	ascii bool
-	offs  []int  // offs[i]: byte offset of code point i; offs[count] == n
-	runes []rune // the code points (built on demand, for the regex engine)
+	offs  []int // offs[i]-base: byte offset of code point i; offs[count]-base == n
+	base  int   // (a slice of a long string shares that string's offs)
 }
 
+// Slices of an ASCII string: nothing to remember
+var tnStrIdxASCII = &tnStrIdx{ascii: true}
+
+// Shorter strings are tested for ASCII each time: it costs less than an index
+const tnStrShort = 512
+
+// (the string indexed last: a scan over one string finds it first)
+var tnStrIdxLast atomic.Pointer[tnStrIdx]
 var tnStrIdxCache [8]atomic.Pointer[tnStrIdx]
 var tnStrIdxNext atomic.Uint32
 
@@ -19314,7 +20045,15 @@ var tnStrIdxBig [4]atomic.Pointer[tnStrIdx]
 var tnStrIdxBigNext atomic.Uint32
 
 func tnStrIsASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
+	i := 0
+	for ; i+8 <= len(s); i += 8 {
+		b := s[i : i+8]
+		// (the compiler merges these into one load)
+		if (uint64(b[0])|uint64(b[1])<<8|uint64(b[2])<<16|uint64(b[3])<<24|uint64(b[4])<<32|uint64(b[5])<<40|uint64(b[6])<<48|uint64(b[7])<<56)&0x8080808080808080 != 0 {
+			return false
+		}
+	}
+	for ; i < len(s); i++ {
 		if s[i] >= 0x80 {
 			return false
 		}
@@ -19324,26 +20063,31 @@ func tnStrIsASCII(s string) bool {
 
 func tnStrIndexOf(s string) *tnStrIdx {
 	p := unsafe.StringData(s)
+	if c := tnStrIdxLast.Load(); c != nil && c.p == p && c.n == len(s) {
+		return c
+	}
 	cache := tnStrIdxCache[:]
 	if len(s) >= 4096 {
 		cache = tnStrIdxBig[:]
 	}
-	inside := false
 	for i := range cache {
 		c := cache[i].Load()
 		if c == nil {
 			continue
 		}
 		if c.p == p && c.n == len(s) {
+			tnStrIdxLast.Store(c)
 			return c
 		}
 		// (a slice of a cached long string — the rest of a parser's input —
-		// is indexed without evicting it: an ASCII string's slices are ASCII)
-		if len(s) >= 4096 && uintptr(unsafe.Pointer(p)) >= uintptr(unsafe.Pointer(c.p)) && uintptr(unsafe.Pointer(p))+uintptr(len(s)) <= uintptr(unsafe.Pointer(c.p))+uintptr(c.n) {
+		// is indexed from it, without evicting it)
+		if len(s) >= 4096 && c.n > 0 && uintptr(unsafe.Pointer(p)) >= uintptr(unsafe.Pointer(c.p)) && uintptr(unsafe.Pointer(p))+uintptr(len(s)) <= uintptr(unsafe.Pointer(c.p))+uintptr(c.n) {
 			if c.ascii {
-				return &tnStrIdx{p: p, n: len(s), ascii: true}
+				return tnStrIdxASCII
 			}
-			inside = true
+			if sub := c.slice(p, len(s)); sub != nil {
+				return sub
+			}
 		}
 	}
 	c := &tnStrIdx{p: p, n: len(s), ascii: tnStrIsASCII(s)}
@@ -19356,9 +20100,7 @@ func tnStrIndexOf(s string) *tnStrIdx {
 		}
 		c.offs = append(c.offs, len(s))
 	}
-	if inside {
-		return c
-	}
+	tnStrIdxLast.Store(c)
 	if len(s) >= 4096 {
 		tnStrIdxBig[tnStrIdxBigNext.Add(1)%uint32(len(tnStrIdxBig))].Store(c)
 	} else if len(s) >= 32 {
@@ -19367,9 +20109,21 @@ func tnStrIndexOf(s string) *tnStrIdx {
 	return c
 }
 
+// The index of the slice of c's string at p, n bytes long: a view of c's
+// offsets (nil when it cuts a code point)
+func (c *tnStrIdx) slice(p *byte, n int) *tnStrIdx {
+	start := c.base + int(uintptr(unsafe.Pointer(p))-uintptr(unsafe.Pointer(c.p)))
+	lo := sort.SearchInts(c.offs, start)
+	hi := sort.SearchInts(c.offs, start+n)
+	if lo == len(c.offs) || hi == len(c.offs) || c.offs[lo] != start || c.offs[hi] != start+n {
+		return nil
+	}
+	return &tnStrIdx{p: p, n: n, offs: c.offs[lo : hi+1], base: start}
+}
+
 // The number of code points
 func tnStrCount(s string) int {
-	if len(s) < 32 && tnStrIsASCII(s) {
+	if len(s) < tnStrShort && tnStrIsASCII(s) {
 		return len(s)
 	}
 	c := tnStrIndexOf(s)
@@ -19384,7 +20138,7 @@ func tnStrByte(s string, i int) int {
 	if i <= 0 {
 		return 0
 	}
-	if len(s) < 32 && tnStrIsASCII(s) {
+	if len(s) < tnStrShort && tnStrIsASCII(s) {
 		return min(i, len(s))
 	}
 	c := tnStrIndexOf(s)
@@ -19394,7 +20148,7 @@ func tnStrByte(s string, i int) int {
 	if i >= len(c.offs) {
 		return len(s)
 	}
-	return c.offs[i]
+	return c.offs[i] - c.base
 }
 
 // The code point index of byte offset b
@@ -19402,13 +20156,14 @@ func tnStrRune(s string, b int) int {
 	if b <= 0 {
 		return 0
 	}
-	if len(s) < 32 && tnStrIsASCII(s) {
+	if len(s) < tnStrShort && tnStrIsASCII(s) {
 		return b
 	}
 	c := tnStrIndexOf(s)
 	if c.ascii {
 		return b
 	}
+	b += c.base
 	lo, hi := 0, len(c.offs)-1
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -19419,27 +20174,6 @@ func tnStrRune(s string, b int) int {
 		}
 	}
 	return lo
-}
-
-// The code points of s and their byte offsets (shared: read-only)
-func tnStrRunes(s string) ([]rune, []int) {
-	c := tnStrIndexOf(s)
-	if c.runes == nil {
-		runes := make([]rune, 0, len(s))
-		for b := 0; b < len(s); {
-			r, size := utf8.DecodeRuneInString(s[b:])
-			runes = append(runes, r)
-			b += size
-		}
-		c.runes = runes
-		if c.ascii {
-			c.offs = make([]int, len(s)+1)
-			for i := range c.offs {
-				c.offs[i] = i
-			}
-		}
-	}
-	return c.runes, c.offs
 }
 
 // A JS index argument as an int (NaN is 0, ±Infinity clamps)
@@ -19458,9 +20192,31 @@ func tnStrPos(f float64) int {
 
 func TnStrLength(s string) float64 { return float64(tnStrCount(s)) }
 
+// Whether code points are bytes in s (an operation asks once, not per offset)
+func tnStrASCII(s string) bool {
+	if len(s) < tnStrShort {
+		return tnStrIsASCII(s)
+	}
+	return tnStrIndexOf(s).ascii
+}
+
+// Whether code point n of s is byte n: everything up to it is ASCII
+func tnStrDirect(s string, n int) bool {
+	if n >= len(s) {
+		return false
+	}
+	if len(s) < tnStrShort {
+		return tnStrIsASCII(s[:n+1])
+	}
+	return tnStrIndexOf(s).ascii
+}
+
 // s[i] / s.charAt(i): "" out of range
 func TnCharAt(s string, i float64) string {
 	n := tnStrPos(i)
+	if i >= 0 && tnStrDirect(s, n) {
+		return s[n : n+1]
+	}
 	if i < 0 || n >= tnStrCount(s) {
 		return ""
 	}
@@ -19475,6 +20231,9 @@ func TnCharAt(s string, i float64) string {
 // s.charCodeAt(i): NaN out of range
 func TnCharCodeAt(s string, i float64) float64 {
 	n := tnStrPos(i)
+	if i >= 0 && tnStrDirect(s, n) {
+		return float64(s[n])
+	}
 	if i < 0 || n >= tnStrCount(s) {
 		return math.NaN()
 	}
@@ -19500,7 +20259,11 @@ func TnStrAt(s string, i float64) string {
 
 // s.slice(start, end?)
 func TnStrSlice(s string, start float64, end float64, hasEnd bool) string {
-	count := tnStrCount(s)
+	ascii := tnStrASCII(s)
+	count := len(s)
+	if !ascii {
+		count = tnStrCount(s)
+	}
 	a, b := tnStrPos(start), count
 	if hasEnd {
 		b = tnStrPos(end)
@@ -19515,18 +20278,28 @@ func TnStrSlice(s string, start float64, end float64, hasEnd bool) string {
 	if a >= b {
 		return ""
 	}
+	if ascii {
+		return s[a:b]
+	}
 	return s[tnStrByte(s, a):tnStrByte(s, b)]
 }
 
 // s.substring(start, end?): clamped, swapped when reversed
 func TnSubstring(s string, start float64, end float64, hasEnd bool) string {
-	count := tnStrCount(s)
+	ascii := tnStrASCII(s)
+	count := len(s)
+	if !ascii {
+		count = tnStrCount(s)
+	}
 	a, b := min(max(tnStrPos(start), 0), count), count
 	if hasEnd {
 		b = min(max(tnStrPos(end), 0), count)
 	}
 	if a > b {
 		a, b = b, a
+	}
+	if ascii {
+		return s[a:b]
 	}
 	return s[tnStrByte(s, a):tnStrByte(s, b)]
 }
@@ -19551,6 +20324,14 @@ func TnSubstr(s string, start float64, length float64, hasLength bool) string {
 
 // s.indexOf(search, from?)
 func TnStrIndexOf(s string, search string, from float64) float64 {
+	if tnStrASCII(s) {
+		b := min(max(0, tnStrPos(from)), len(s))
+		i := strings.Index(s[b:], search)
+		if i < 0 {
+			return -1
+		}
+		return float64(b + i)
+	}
 	b := tnStrByte(s, max(0, tnStrPos(from)))
 	i := strings.Index(s[b:], search)
 	if i < 0 {
@@ -20703,38 +21484,34 @@ func TnToFixed(x float64, digits float64) string {
 	}
 	return s[:loc[0]] + string(re.ExpandString(nil, repl, s, loc)) + s[loc[1]:]
 }`,
-  regexMatch: `// JS match arrays are []string; the match's .index rides in a hidden slot
-// past len, which reslicing up to cap reaches (an append overwrites it)
-const tnMatchIndexTag = "\\x00index:"
+  regexMatch: `// JS match arrays are []string. Past their length (reslicing up to cap) they
+// hide a mark and the input up to the match, whose code points are its .index
+// (an append overwrites both). A group that did not take part is tnUnmatched:
+// "" to everything but TnMatchGroup, where it is undefined
+var tnMatchMark = "\\x00index:"
+var tnUnmatchedByte [1]byte
+var tnUnmatched = unsafe.String(&tnUnmatchedByte[0], 1)[:0]
 
-// The groups of the match at loc, with room for the .index slot
+// Sets a match array's hidden slots: the match starts at byte lo of s
+func tnMatchTag(groups []string, s string, lo int) {
+	n := len(groups)
+	hidden := groups[:n+2]
+	hidden[n], hidden[n+1] = tnMatchMark, s[:lo]
+}
+
+// The groups of the match at loc, with their hidden slots
 func tnMatchGroups(s string, loc []int) []string {
 	n := len(loc) / 2
-	groups := make([]string, n, n+1)
+	groups := make([]string, n, n+2)
 	for i := 0; i < n; i++ {
 		if loc[2*i] >= 0 {
 			groups[i] = s[loc[2*i]:loc[2*i+1]]
+		} else {
+			groups[i] = tnUnmatched
 		}
 	}
-	tnMarkUnmatched(groups, loc)
+	tnMatchTag(groups, s, loc[0])
 	return groups
-}
-
-// A match array's hidden tag (past its length): "\\x00index:<index>|<groups
-// that did not participate>" — those are undefined in JS, "" here
-func tnMarkUnmatched(groups []string, loc []int) {
-	if cap(groups) <= len(groups) {
-		return
-	}
-	var miss []string
-	for i := 0; i < len(groups) && 2*i < len(loc); i++ {
-		if loc[2*i] < 0 {
-			miss = append(miss, strconv.Itoa(i))
-		}
-	}
-	if len(miss) > 0 {
-		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + "-1|" + strings.Join(miss, ",")
-	}
 }
 
 // m[i] of a match array as string | undefined (an unmatched group, or past the end)
@@ -20757,52 +21534,18 @@ func TnMatchGroup(m []string, i float64) *string {
 	if i < 0 || n >= len(m) {
 		return nil
 	}
-	if cap(m) > len(m) {
-		if tag := m[:len(m)+1][len(m)]; strings.HasPrefix(tag, tnMatchIndexTag) {
-			if bar := strings.IndexByte(tag, '|'); bar >= 0 {
-				for _, g := range strings.Split(tag[bar+1:], ",") {
-					if g == strconv.Itoa(n) {
-						return nil
-					}
-				}
-			}
-		}
-	}
 	v := m[n]
-	return &v
-}
-
-// The groups of the match at loc, tagged with its character index
-func tnMatchArray(s string, loc []int, index int) []string {
-	groups := tnMatchGroups(s, loc)
-	tnSetMatchIndex(groups, index)
-	return groups
-}
-
-func tnSetMatchIndex(groups []string, index int) {
-	if cap(groups) > len(groups) {
-		// (keeping the unmatched groups the tag records)
-		unmatched := ""
-		if tag := groups[:len(groups)+1][len(groups)]; strings.HasPrefix(tag, tnMatchIndexTag) {
-			if bar := strings.IndexByte(tag, '|'); bar >= 0 {
-				unmatched = tag[bar:]
-			}
-		}
-		groups[:len(groups)+1][len(groups)] = tnMatchIndexTag + strconv.Itoa(index) + unmatched
+	if v == "" && unsafe.StringData(v) == &tnUnmatchedByte[0] {
+		return nil
 	}
+	return &v
 }
 
 // m.index; NaN when m is not a match array
 func TnMatchIndex(m []string) float64 {
-	if cap(m) > len(m) {
-		if tag := m[:len(m)+1][len(m)]; strings.HasPrefix(tag, tnMatchIndexTag) {
-			index := tag[len(tnMatchIndexTag):]
-			if bar := strings.IndexByte(index, '|'); bar >= 0 {
-				index = index[:bar]
-			}
-			if n, err := strconv.Atoi(index); err == nil && n >= 0 {
-				return float64(n)
-			}
+	if n := len(m); cap(m) >= n+2 {
+		if hidden := m[:n+2]; unsafe.StringData(hidden[n]) == unsafe.StringData(tnMatchMark) {
+			return float64(tnStrCount(hidden[n+1]))
 		}
 	}
 	return math.NaN()
@@ -20821,73 +21564,69 @@ func TnRegexpExec(re *regexp.Regexp, s string) []string {
 	if loc == nil {
 		return nil
 	}
-	return tnMatchArray(s, loc, tnStrRune(s, loc[0]))
+	return tnMatchGroups(s, loc)
 }
 
 func TnRegexpMatchAll(re *regexp.Regexp, s string) [][]string {
 	var out [][]string
-	at, index := 0, 0
 	for _, loc := range re.FindAllStringSubmatchIndex(s, -1) {
-		index += utf8.RuneCountInString(s[at:loc[0]])
-		at = loc[0]
-		out = append(out, tnMatchArray(s, loc, index))
+		out = append(out, tnMatchGroups(s, loc))
 	}
 	return out
 }
 
 func TnRegexpSplit(re *regexp.Regexp, s string, limit int) []string {
-	return tnRegexSplit(s, limit, func(start int) []int {
+	return tnRegexSplit(s, limit, func(start int) ([]string, int, int) {
 		loc := re.FindStringSubmatchIndex(s[start:])
+		if loc == nil {
+			return nil, -1, -1
+		}
 		for i := range loc {
 			if loc[i] >= 0 {
 				loc[i] += start
 			}
 		}
-		return loc
+		return tnMatchGroups(s, loc), loc[0], loc[1]
 	})
 }
 
 // JS split: the pieces between matches plus each match's captures, at most
 // limit items (negative: no limit); an empty match at the start of a piece
 // or at the end of the string does not split. find returns the leftmost
-// match at or after a byte offset.
-func tnRegexSplit(s string, limit int, find func(start int) []int) []string {
+// match at or after a byte offset (its start is -1 without one).
+func tnRegexSplit(s string, limit int, find func(start int) ([]string, int, int)) []string {
 	parts := []string{}
 	if limit == 0 {
 		return parts
 	}
 	if s == "" {
-		if find(0) == nil {
+		if _, lo, _ := find(0); lo < 0 {
 			parts = append(parts, s)
 		}
 		return parts
 	}
 	last := 0
 	for at := 0; at < len(s); {
-		loc := find(at)
-		if loc == nil || loc[0] >= len(s) {
+		groups, lo, hi := find(at)
+		if lo < 0 || lo >= len(s) {
 			break
 		}
-		if loc[1] == last {
-			_, size := utf8.DecodeRuneInString(s[loc[0]:])
-			at = loc[0] + size
+		if hi == last {
+			_, size := utf8.DecodeRuneInString(s[lo:])
+			at = lo + size
 			continue
 		}
-		parts = append(parts, s[last:loc[0]])
+		parts = append(parts, s[last:lo])
 		if len(parts) == limit {
 			return parts
 		}
-		for i := 1; i < len(loc)/2; i++ {
-			group := ""
-			if loc[2*i] >= 0 {
-				group = s[loc[2*i]:loc[2*i+1]]
-			}
+		for _, group := range groups[1:] {
 			parts = append(parts, group)
 			if len(parts) == limit {
 				return parts
 			}
 		}
-		last = loc[1]
+		last = hi
 		at = last
 	}
 	return append(parts, s[last:])
@@ -20922,16 +21661,15 @@ type TnRegex struct {
 	// an object cast to RegExp ({ exec: () => null } as unknown as RegExp):
 	// its exec (see regexObject)
 	customExec func(string) []string
-	// RE2 matches s[start:], where ^, \\b and \\B can't see the text before
-	// start: a pattern using them runs on the backtracker past offset 0
 	pattern    string
-	contextual bool
-	btAfter    *tnBt
-	// the bytes an RE2 match can start with (nil: any)
-	first *tnFirstBytes
+	// the VM's program, looked up on first use (vm: not yet)
+	vm   bool
+	prog *tnRxProg
+	// RE2, compiled when needed: a plain regex wrapped, a pattern the VM's
+	// parser can't read, or one that ran out of the VM's budget (useRE2)
 	re        *regexp.Regexp
 	anchored  *regexp.Regexp
-	bt        *tnBt
+	useRE2    bool
 	lastIndex float64
 	global    bool
 	sticky    bool
@@ -20940,32 +21678,39 @@ type TnRegex struct {
 }
 
 func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
-	r := &TnRegex{global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags, pattern: pattern, contextual: tnPatternUsesContext(pattern)}
-	prefix := ""
-	for _, f := range "ims" {
-		if strings.ContainsRune(flags, f) {
-			prefix += string(f)
+	return &TnRegex{vm: true, global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags, pattern: pattern}
+}
+
+func (r *TnRegex) program() *tnRxProg {
+	if r.vm {
+		r.vm = false
+		r.prog = tnRxProgramOf(r.source, r.flags)
+	}
+	return r.prog
+}
+
+func (r *TnRegex) re2() *regexp.Regexp {
+	if r.re == nil {
+		prefix := ""
+		for _, f := range "ims" {
+			if strings.ContainsRune(r.flags, f) {
+				prefix += string(f)
+			}
 		}
-	}
-	if prefix != "" {
-		prefix = "(?" + prefix + ")"
-	}
-	if re, err := regexp.Compile(prefix + pattern); err == nil {
+		if prefix != "" {
+			prefix = "(?" + prefix + ")"
+		}
+		re, err := regexp.Compile(prefix + r.pattern)
+		if err != nil {
+			return nil
+		}
 		r.re = re
-		r.first = tnComputeFirstBytes(prefix+pattern, syntax.Perl)
 		// /y matches only at lastIndex: anchored, so a miss costs no scan
 		if r.sticky {
-			r.anchored = regexp.MustCompile(prefix + "\\\\A(?:" + pattern + ")")
-		}
-	} else {
-		r.bt = tnBtCompile(pattern)
-		if r.bt != nil {
-			r.bt.icase = strings.Contains(flags, "i")
-			r.bt.multiline = strings.Contains(flags, "m")
-			r.bt.dotAll = strings.Contains(flags, "s")
+			r.anchored = regexp.MustCompile(prefix + "\\\\A(?:" + r.pattern + ")")
 		}
 	}
-	return r
+	return r.re
 }
 
 // A JS pattern built at run time in RE2's syntax (what the transpiler does to
@@ -21084,109 +21829,6 @@ func tnPatternUsesContext(p string) bool {
 	return false
 }
 
-// The bytes a match can start with ([256]bool: a non-ASCII rune marks
-// 0x80-0xFF), when the pattern can't match the empty string: a regex whose
-// match must start at the input's start fails at once on any other byte
-type tnFirstBytes struct {
-	set      [256]bool
-	anchored bool
-}
-
-func tnComputeFirstBytes(pattern string, flags syntax.Flags) *tnFirstBytes {
-	re, err := syntax.Parse(pattern, flags)
-	if err != nil {
-		return nil
-	}
-	re = re.Simplify()
-	f := &tnFirstBytes{}
-	anchored, nullable := tnFirstOf(re, &f.set, false)
-	if nullable {
-		return nil
-	}
-	f.anchored = anchored
-	return f
-}
-
-// Adds the bytes re can start with to set; reports whether re begins with
-// \\A (^ without m) and whether it can match the empty string
-func tnFirstOf(re *syntax.Regexp, set *[256]bool, anchored bool) (bool, bool) {
-	addRune := func(r rune) {
-		if r < 0x80 {
-			set[r] = true
-		} else {
-			for b := 0x80; b < 0x100; b++ {
-				set[b] = true
-			}
-		}
-	}
-	switch re.Op {
-	case syntax.OpLiteral:
-		if len(re.Rune) == 0 {
-			return anchored, true
-		}
-		r := re.Rune[0]
-		addRune(r)
-		if re.Flags&syntax.FoldCase != 0 {
-			for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-				addRune(f)
-			}
-		}
-		return anchored, false
-	case syntax.OpCharClass:
-		for i := 0; i+1 < len(re.Rune); i += 2 {
-			lo, hi := re.Rune[i], re.Rune[i+1]
-			if lo >= 0x80 || hi >= 0x80 {
-				addRune(0x80)
-			}
-			for r := lo; r <= hi && r < 0x80; r++ {
-				set[r] = true
-			}
-		}
-		return anchored, false
-	case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
-		for b := range set {
-			set[b] = true
-		}
-		return anchored, false
-	case syntax.OpBeginText:
-		return true, true
-	case syntax.OpEmptyMatch, syntax.OpBeginLine, syntax.OpEndLine, syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-		return anchored, true
-	case syntax.OpCapture:
-		return tnFirstOf(re.Sub[0], set, anchored)
-	case syntax.OpStar, syntax.OpQuest:
-		tnFirstOf(re.Sub[0], set, anchored)
-		return anchored, true
-	case syntax.OpPlus:
-		return tnFirstOf(re.Sub[0], set, anchored)
-	case syntax.OpRepeat:
-		a, nullable := tnFirstOf(re.Sub[0], set, anchored)
-		return a, nullable || re.Min == 0
-	case syntax.OpConcat:
-		for _, sub := range re.Sub {
-			a, nullable := tnFirstOf(sub, set, anchored)
-			anchored = a
-			if !nullable {
-				return anchored, false
-			}
-		}
-		return anchored, true
-	case syntax.OpAlternate:
-		all := true
-		nullable := false
-		for _, sub := range re.Sub {
-			a, n := tnFirstOf(sub, set, false)
-			all = all && a
-			nullable = nullable || n
-		}
-		return anchored || all, nullable
-	}
-	for b := range set {
-		set[b] = true
-	}
-	return anchored, true
-}
-
 // A plain RE2 regex as a TnRegex
 func TnRegexWrap(re *regexp.Regexp) *TnRegex {
 	return &TnRegex{re: re, source: TnRegexpSource(re), flags: TnRegexpFlags(re)}
@@ -21207,16 +21849,12 @@ func TnRegexpFlags(re *regexp.Regexp) string {
 }
 
 func (r *TnRegex) Test(s string) bool {
-	groups, _ := r.find(s)
-	return groups != nil
+	_, lo, _ := r.find(s, false)
+	return lo >= 0
 }
 
 func (r *TnRegex) Find(s string) []string {
-	groups, loc := r.find(s)
-	// find tags /g and /y matches with their index as it moves lastIndex
-	if groups != nil && !r.global && !r.sticky {
-		tnSetMatchIndex(groups, tnStrRune(s, loc[0]))
-	}
+	groups, _, _ := r.find(s, true)
 	return groups
 }
 
@@ -21225,27 +21863,20 @@ func (r *TnRegex) Find(s string) []string {
 func (r *TnRegex) FindSub(s string) []string {
 	if r.global {
 		var all []string
-		r.scan(s, func(groups []string, loc []int) bool {
-			all = append(all, groups[0])
+		r.scan(s, false, func(_ []string, lo int, hi int) bool {
+			all = append(all, s[lo:hi])
 			return true
 		})
 		r.lastIndex = 0
 		return all
 	}
-	groups, loc := r.matchAt(&tnRegexInput{s: s}, 0, false)
-	if groups != nil {
-		tnSetMatchIndex(groups, tnStrRune(s, loc[0]))
-	}
+	groups, _, _ := r.matchAt(s, 0, false, true)
 	return groups
 }
 
 func (r *TnRegex) FindAllSub(s string) [][]string {
 	var out [][]string
-	at, index := 0, 0
-	r.scan(s, func(groups []string, loc []int) bool {
-		index += utf8.RuneCountInString(s[at:loc[0]])
-		at = loc[0]
-		tnSetMatchIndex(groups, index)
+	r.scan(s, true, func(groups []string, _ int, _ int) bool {
 		out = append(out, groups)
 		return true
 	})
@@ -21253,18 +21884,16 @@ func (r *TnRegex) FindAllSub(s string) [][]string {
 }
 
 func (r *TnRegex) FindIndexSub(s string) []int {
-	_, loc := r.matchAt(&tnRegexInput{s: s}, 0, false)
-	if loc == nil {
+	_, lo, hi := r.matchAt(s, 0, false, false)
+	if lo < 0 {
 		return nil
 	}
-	return loc[:2]
+	return []int{lo, hi}
 }
 
 func (r *TnRegex) SplitStr(s string, limit int) []string {
-	in := &tnRegexInput{s: s}
-	return tnRegexSplit(s, limit, func(start int) []int {
-		_, loc := r.matchAt(in, start, false)
-		return loc
+	return tnRegexSplit(s, limit, func(start int) ([]string, int, int) {
+		return r.matchAt(s, start, false, true)
 	})
 }
 
@@ -21279,12 +21908,20 @@ func TnRegexWrapReplaceFirst(r *TnRegex, s string, repl string) string {
 func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string, int) string, all bool) string {
 	var out strings.Builder
 	last := 0
-	r.scan(s, func(groups []string, loc []int) bool {
-		out.WriteString(s[last:loc[0]])
-		out.WriteString(fn(groups, tnStrRune(s, loc[0])))
-		last = loc[1]
+	ascii := tnStrASCII(s)
+	r.scan(s, true, func(groups []string, lo int, hi int) bool {
+		out.WriteString(s[last:lo])
+		if ascii {
+			out.WriteString(fn(groups, lo))
+		} else {
+			out.WriteString(fn(groups, tnStrRune(s, lo)))
+		}
+		last = hi
 		return all
 	})
+	if out.Len() == 0 {
+		return s[last:]
+	}
 	out.WriteString(s[last:])
 	return out.String()
 }
@@ -21292,12 +21929,20 @@ func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string, int) string, al
 func (r *TnRegex) replace(s string, repl string, all bool) string {
 	var out strings.Builder
 	last := 0
-	r.scan(s, func(groups []string, loc []int) bool {
-		out.WriteString(s[last:loc[0]])
-		out.WriteString(tnExpandGroups(repl, groups, r.groupNames(repl)))
-		last = loc[1]
+	plain := strings.IndexByte(repl, '$') < 0
+	r.scan(s, !plain, func(groups []string, lo int, hi int) bool {
+		out.WriteString(s[last:lo])
+		if plain {
+			out.WriteString(repl)
+		} else {
+			out.WriteString(tnExpandGroups(repl, groups, r.groupNames(repl)))
+		}
+		last = hi
 		return all
 	})
+	if out.Len() == 0 {
+		return s[last:]
+	}
 	out.WriteString(s[last:])
 	return out.String()
 }
@@ -21368,33 +22013,17 @@ func tnExpandGroups(repl string, groups []string, names map[string]int) string {
 	return out.String()
 }
 
-// A subject string; the rune view the backtracking engine needs is built
-// once per string, not once per match
-type tnRegexInput struct {
-	s    string
-	runs []rune
-	offs []int
-}
-
-func (in *tnRegexInput) runes() ([]rune, []int) {
-	if in.offs == nil {
-		// (shared with the string's index: not rebuilt per match)
-		in.runs, in.offs = tnStrRunes(in.s)
-	}
-	return in.runs, in.offs
-}
-
 // scan: every match left to right, like a /g loop from lastIndex 0 (an empty
-// match steps one rune forward), until yield returns false
-func (r *TnRegex) scan(s string, yield func(groups []string, loc []int) bool) {
-	in := &tnRegexInput{s: s}
+// match steps one rune forward), until yield returns false; its groups only
+// when want says so
+func (r *TnRegex) scan(s string, want bool, yield func(groups []string, lo int, hi int) bool) {
 	for at := 0; at <= len(s); {
-		groups, loc := r.matchAt(in, at, r.sticky)
-		if groups == nil || !yield(groups, loc) {
+		groups, lo, hi := r.matchAt(s, at, r.sticky, want)
+		if lo < 0 || !yield(groups, lo, hi) {
 			return
 		}
-		at = loc[1]
-		if loc[1] == loc[0] {
+		at = hi
+		if hi == lo {
 			if at == len(s) {
 				return
 			}
@@ -21405,1109 +22034,101 @@ func (r *TnRegex) scan(s string, yield func(groups []string, loc []int) bool) {
 }
 
 // matchAt: leftmost match at or after byte offset start (only at start when
-// sticky); loc holds byte offsets
-func (r *TnRegex) matchAt(in *tnRegexInput, start int, sticky bool) ([]string, []int) {
-	bt := r.bt
-	if bt == nil && start > 0 && r.contextual && r.pattern != "" {
-		if r.btAfter == nil {
-			r.btAfter = tnBtCompile(r.pattern)
-			if r.btAfter != nil {
-				r.btAfter.icase = strings.Contains(r.flags, "i")
-				r.btAfter.multiline = strings.Contains(r.flags, "m")
-				r.btAfter.dotAll = strings.Contains(r.flags, "s")
-			}
+// sticky): its groups when want says so, and its byte offsets (lo is -1
+// without a match)
+func (r *TnRegex) matchAt(s string, start int, sticky bool, want bool) ([]string, int, int) {
+	if p := r.program(); p != nil && (!r.useRE2 || (start > 0 && p.contextual)) {
+		if p.miss(s, start, sticky) {
+			return nil, -1, -1
 		}
-		bt = r.btAfter
+		m := tnRxAcquire(p, s, start)
+		lo := p.search(m, start, sticky)
+		if !m.over {
+			hi := m.end
+			var groups []string
+			if want && lo >= 0 {
+				groups = m.groups(p.ncaps/2, lo, hi)
+			}
+			tnRxRelease(m)
+			return groups, lo, hi
+		}
+		tnRxRelease(m)
+		// out of budget: RE2 is linear, and matches this regex from now on
+		if r.re2() == nil {
+			p.limit = 0
+			return r.matchAt(s, start, sticky, want)
+		}
+		r.useRE2 = true
 	}
-	if bt == nil {
-		re := r.re
-		if sticky && r.anchored != nil {
-			re = r.anchored
-		}
-		// (a match must start with one of these bytes: fail fast, skip ahead)
-		if f := r.first; f != nil {
-			if start >= len(in.s) {
-				return nil, nil
-			}
-			if f.anchored || sticky {
-				if !f.set[in.s[start]] {
-					return nil, nil
-				}
-			} else if !r.contextual {
-				// (only where the text before the match doesn't matter: RE2 sees s[start:])
-				for start < len(in.s) && !f.set[in.s[start]] {
-					start++
-				}
-				if start == len(in.s) {
-					return nil, nil
-				}
-			}
-		}
-		loc := re.FindStringSubmatchIndex(in.s[start:])
-		if loc == nil || (sticky && loc[0] != 0) {
-			return nil, nil
-		}
-		for i := range loc {
-			if loc[i] >= 0 {
-				loc[i] += start
-			}
-		}
-		return tnMatchGroups(in.s, loc), loc
+	re := r.re2()
+	if sticky && r.anchored != nil {
+		re = r.anchored
 	}
-	s := in.s
-	caps := make([]int, (bt.ngroups+1)*2)
-	m := &tnBtMatchState{s: s, caps: caps, bt: bt}
-	for pos := start; pos <= len(s); {
-		// (a pattern starting with ^ only matches at the input's start)
-		if bt.anchored && !bt.multiline && pos > 0 {
-			break
-		}
-		for i := range caps {
-			caps[i] = -1
-		}
-		end := -1
-		if m.match(bt.root, pos, func(e int) bool { end = e; return true }) {
-			caps[0], caps[1] = pos, end
-			// room for the hidden .index slot (tnSetMatchIndex)
-			groups := make([]string, bt.ngroups+1, bt.ngroups+2)
-			loc := make([]int, (bt.ngroups+1)*2)
-			for i := 0; i <= bt.ngroups; i++ {
-				si, ei := caps[2*i], caps[2*i+1]
-				if si >= 0 && ei >= si {
-					groups[i] = s[si:ei]
-					loc[2*i], loc[2*i+1] = si, ei
-				} else {
-					loc[2*i], loc[2*i+1] = -1, -1
-				}
-			}
-			tnMarkUnmatched(groups, loc)
-			return groups, loc
-		}
-		if sticky || pos == len(s) {
-			break
-		}
-		if s[pos] < utf8.RuneSelf {
-			pos++
-		} else {
-			_, w := utf8.DecodeRuneInString(s[pos:])
-			pos += w
+	loc := re.FindStringSubmatchIndex(s[start:])
+	if loc == nil || (sticky && loc[0] != 0) {
+		return nil, -1, -1
+	}
+	for i := range loc {
+		if loc[i] >= 0 {
+			loc[i] += start
 		}
 	}
-	return nil, nil
+	if !want {
+		return nil, loc[0], loc[1]
+	}
+	return tnMatchGroups(s, loc), loc[0], loc[1]
 }
 
 // find: leftmost match at or after lastIndex (which /g advances in runes)
-func (r *TnRegex) find(s string) ([]string, []int) {
+func (r *TnRegex) find(s string, want bool) ([]string, int, int) {
 	if r.customExec != nil {
 		if m := r.customExec(s); m != nil {
-			return m, []int{0, 0}
+			return m, 0, 0
 		}
-		return nil, nil
+		return nil, -1, -1
 	}
-	in := &tnRegexInput{s: s}
 	if !r.global && !r.sticky {
-		return r.matchAt(in, 0, false)
+		return r.matchAt(s, 0, false, want)
 	}
 	// (lastIndex is a code point index: its byte offset from the string's index)
-	if r.lastIndex < 0 || int(r.lastIndex) > tnStrCount(s) {
-		r.lastIndex = 0
-		return nil, nil
+	ascii := tnStrASCII(s)
+	count := len(s)
+	if !ascii {
+		count = tnStrCount(s)
 	}
-	start := tnStrByte(s, int(r.lastIndex))
-	groups, loc := r.matchAt(in, start, r.sticky)
-	if groups == nil {
+	if r.lastIndex < 0 || int(r.lastIndex) > count {
 		r.lastIndex = 0
-		return nil, nil
+		return nil, -1, -1
 	}
-	index := tnStrRune(s, loc[0])
-	tnSetMatchIndex(groups, index)
-	next := float64(tnStrRune(s, loc[1]))
-	if loc[1] == loc[0] {
+	start := int(r.lastIndex)
+	if !ascii {
+		start = tnStrByte(s, start)
+	}
+	groups, lo, hi := r.matchAt(s, start, r.sticky, want)
+	if lo < 0 {
+		r.lastIndex = 0
+		return nil, -1, -1
+	}
+	next := float64(hi)
+	if !ascii {
+		next = float64(tnStrRune(s, hi))
+	}
+	if hi == lo {
 		next++
 	}
 	r.lastIndex = next
-	return groups, loc
-}
-
-func tnByteOffsets(runs []rune) []int {
-	offs := make([]int, len(runs)+1)
-	bo := 0
-	for i, r := range runs {
-		offs[i] = bo
-		bo += len(string(r))
-	}
-	offs[len(runs)] = bo
-	return offs
-}
-
-// ---- Backtracking regex engine for patterns RE2 rejects ----
-
-type tnBtNode struct {
-	op       string
-	ch       rune
-	cls      func(rune) bool
-	ascii    *[utf8.RuneSelf]bool // (a class's ASCII members)
-	single   uint8 // 1 char, 2 any, 3 class (see tnBtMarkSingles); 0 others
-	negCls   bool
-	seq      []*tnBtNode
-	branches [][]*tnBtNode
-	child    *tnBtNode
-	min, max int
-	greedy   bool
-	anchor   byte
-	group    int
-	behind   bool
-	negative bool
-}
-
-type tnBt struct {
-	root      *tnBtNode
-	ngroups   int
-	icase     bool
-	multiline bool
-	dotAll    bool
-	// it begins with ^: only the input's start can match (without m)
-	anchored bool
-}
-
-type tnBtParser struct {
-	src   []rune
-	pos   int
-	ngrp  int
-	names map[string]int
-}
-
-func tnBtCompile(pattern string) *tnBt {
-	p := &tnBtParser{src: []rune(pattern)}
-	root, err := p.parseAlt()
-	if err != nil || p.pos < len(p.src) {
-		return nil
-	}
-	tnBtMarkSingles(root)
-	return &tnBt{root: root, ngroups: p.ngrp, anchored: tnBtStartAnchored(root)}
-}
-
-// The single-rune nodes' kinds as numbers (the matcher's hot paths test them)
-func tnBtMarkSingles(n *tnBtNode) {
-	if n == nil {
-		return
-	}
-	switch n.op {
-	case "char":
-		n.single = 1
-	case "any":
-		n.single = 2
-	case "class":
-		n.single = 3
-	}
-	for _, c := range n.seq {
-		tnBtMarkSingles(c)
-	}
-	for _, b := range n.branches {
-		for _, c := range b {
-			tnBtMarkSingles(c)
-		}
-	}
-	tnBtMarkSingles(n.child)
-}
-
-func (p *tnBtParser) peek() (rune, bool) {
-	if p.pos < len(p.src) {
-		return p.src[p.pos], true
-	}
-	return 0, false
-}
-
-func (p *tnBtParser) parseAlt() (*tnBtNode, error) {
-	var branches [][]*tnBtNode
-	for {
-		seq, err := p.parseSeq()
-		if err != nil {
-			return nil, err
-		}
-		branches = append(branches, seq)
-		if ch, ok := p.peek(); ok && ch == '|' {
-			p.pos++
-			continue
-		}
-		break
-	}
-	if len(branches) == 1 {
-		return &tnBtNode{op: "cat", seq: branches[0]}, nil
-	}
-	return &tnBtNode{op: "alt", branches: branches}, nil
-}
-
-func (p *tnBtParser) parseSeq() ([]*tnBtNode, error) {
-	var seq []*tnBtNode
-	for {
-		ch, ok := p.peek()
-		if !ok || ch == '|' || ch == ')' {
-			break
-		}
-		atom, err := p.parseAtom()
-		if err != nil {
-			return nil, err
-		}
-		if atom == nil {
-			continue
-		}
-		node, err := p.parseQuantifier(atom)
-		if err != nil {
-			return nil, err
-		}
-		seq = append(seq, node)
-	}
-	return seq, nil
-}
-
-func (p *tnBtParser) parseQuantifier(atom *tnBtNode) (*tnBtNode, error) {
-	ch, ok := p.peek()
-	if !ok {
-		return atom, nil
-	}
-	lo, hi := 0, 0
-	switch ch {
-	case '*':
-		lo, hi = 0, -1
-	case '+':
-		lo, hi = 1, -1
-	case '?':
-		lo, hi = 0, 1
-	case '{':
-		save := p.pos
-		p.pos++
-		parsedLo, parsedHi, ok2 := p.parseBraces()
-		if !ok2 {
-			p.pos = save
-			return atom, nil
-		}
-		lo, hi = parsedLo, parsedHi
-	default:
-		return atom, nil
-	}
-	p.pos++
-	greedy := true
-	if c, ok2 := p.peek(); ok2 && c == '?' {
-		greedy = false
-		p.pos++
-	}
-	return &tnBtNode{op: "rep", child: atom, min: lo, max: hi, greedy: greedy}, nil
-}
-
-// {m}, {m,}, {m,n} — returns ok=false when the brace is a literal
-func (p *tnBtParser) parseBraces() (int, int, bool) {
-	lo := 0
-	digits := 0
-	for {
-		c, ok := p.peek()
-		if !ok || c < '0' || c > '9' {
-			break
-		}
-		lo = lo*10 + int(c-'0')
-		digits++
-		p.pos++
-	}
-	if digits == 0 {
-		return 0, 0, false
-	}
-	hi := lo
-	if c, ok := p.peek(); ok && c == ',' {
-		p.pos++
-		hi = -1
-		hv := 0
-		hd := 0
-		for {
-			c2, ok2 := p.peek()
-			if !ok2 || c2 < '0' || c2 > '9' {
-				break
-			}
-			hv = hv*10 + int(c2-'0')
-			hd++
-			p.pos++
-		}
-		if hd > 0 {
-			hi = hv
-		}
-	}
-	if c, ok := p.peek(); !ok || c != '}' {
-		return 0, 0, false
-	}
-	return lo, hi, true
-}
-
-// JS's whitespace escape: ASCII whitespace, Unicode space separators, line terminators and the BOM
-func tnJSSpace(r rune) bool {
-	switch r {
-	case ' ', '\\t', '\\n', '\\r', '\\f', '\\v', 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff:
-		return true
-	}
-	return r >= 0x2000 && r <= 0x200a
-}
-
-func tnCharClass(escape rune) func(rune) bool {
-	switch escape {
-	case 'd':
-		return func(r rune) bool { return r >= '0' && r <= '9' }
-	case 'D':
-		return func(r rune) bool { return !(r >= '0' && r <= '9') }
-	case 'w':
-		return func(r rune) bool {
-			return r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
-		}
-	case 'W':
-		return func(r rune) bool {
-			return !(r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'))
-		}
-	case 's':
-		return tnJSSpace
-	case 'S':
-		return func(r rune) bool { return !tnJSSpace(r) }
-	}
-	return nil
-}
-
-func (p *tnBtParser) parseAtom() (*tnBtNode, error) {
-	ch, ok := p.peek()
-	if !ok {
-		return nil, fmt.Errorf("unexpected end")
-	}
-	p.pos++
-	switch ch {
-	case '(':
-		kind := "group"
-		negative := false
-		behind := false
-		if c, ok2 := p.peek(); ok2 && c == '?' {
-			p.pos++
-			c2, _ := p.peek()
-			switch c2 {
-			case ':':
-				p.pos++
-				kind = "noncap"
-			case '=':
-				p.pos++
-				kind = "look"
-			case '!':
-				p.pos++
-				kind = "look"
-				negative = true
-			case '<':
-				p.pos++
-				c3, ok3 := p.peek()
-				if !ok3 {
-					return nil, fmt.Errorf("bad (?<")
-				}
-				if c3 == '=' || c3 == '!' {
-					p.pos++
-					kind = "look"
-					behind = true
-					negative = c3 == '!'
-				} else {
-					name := p.groupName()
-					if name == "" {
-						return nil, fmt.Errorf("unterminated group name")
-					}
-					if p.names == nil {
-						p.names = map[string]int{}
-					}
-					p.names[name] = p.ngrp + 1
-				}
-			case 'P':
-				p.pos++
-				if c3, ok3 := p.peek(); ok3 && c3 == '<' {
-					p.pos++
-					name := p.groupName()
-					if name == "" {
-						return nil, fmt.Errorf("unterminated group name")
-					}
-					if p.names == nil {
-						p.names = map[string]int{}
-					}
-					p.names[name] = p.ngrp + 1
-				} else {
-					return nil, fmt.Errorf("bad (?P")
-				}
-			default:
-				return nil, fmt.Errorf("unsupported group")
-			}
-		}
-		// (a group's number is its opening parenthesis's position, as in JS)
-		group := 0
-		if kind == "group" {
-			p.ngrp++
-			group = p.ngrp
-		}
-		body, err := p.parseAlt()
-		if err != nil {
-			return nil, err
-		}
-		if c, ok2 := p.peek(); !ok2 || c != ')' {
-			return nil, fmt.Errorf("missing )")
-		}
-		p.pos++
-		switch kind {
-		case "noncap":
-			return body, nil
-		case "look":
-			return &tnBtNode{op: "look", child: body, behind: behind, negative: negative, max: tnBtMaxRunes(body)}, nil
-		default:
-			return &tnBtNode{op: "group", group: group, child: body}, nil
-		}
-	case '[':
-		return p.parseClass()
-	case '.':
-		return &tnBtNode{op: "any"}, nil
-	case '^':
-		return &tnBtNode{op: "anchor", anchor: '^'}, nil
-	case '$':
-		return &tnBtNode{op: "anchor", anchor: '$'}, nil
-	case '\\\\':
-		return p.parseEscape()
-	default:
-		return &tnBtNode{op: "char", ch: ch}, nil
-	}
-}
-
-// The name of a (?<name> group, after the '<', through the '>'
-func (p *tnBtParser) groupName() string {
-	start := p.pos
-	for p.pos < len(p.src) && p.src[p.pos] != '>' {
-		p.pos++
-	}
-	if p.pos >= len(p.src) {
-		return ""
-	}
-	name := string(p.src[start:p.pos])
-	p.pos++
-	return name
-}
-
-// The hex digits from the cursor (n of them, or {…} when n is 0): their value
-func (p *tnBtParser) hexValue(n int) (rune, bool) {
-	end := p.pos + n
-	if n == 0 {
-		if p.pos >= len(p.src) || p.src[p.pos] != '{' {
-			return 0, false
-		}
-		close := p.pos + 1
-		for close < len(p.src) && p.src[close] != '}' {
-			close++
-		}
-		if close >= len(p.src) {
-			return 0, false
-		}
-		v, err := strconv.ParseUint(string(p.src[p.pos+1:close]), 16, 32)
-		if err != nil {
-			return 0, false
-		}
-		p.pos = close + 1
-		return rune(v), true
-	}
-	if end > len(p.src) {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(string(p.src[p.pos:end]), 16, 32)
-	if err != nil {
-		return 0, false
-	}
-	p.pos = end
-	return rune(v), true
-}
-
-// The character or class an escape (after its backslash) stands for, as JS
-// reads it: d w s (JS whitespace), p{…} / P{…}, xHH, x{…}, uHHHH, u{…}, cX, 0,
-// n t r f v (and b, a backspace in a class)
-func (p *tnBtParser) escapeValue(inClass bool) (rune, func(rune) bool, bool) {
-	c, ok := p.peek()
-	if !ok {
-		return 0, nil, false
-	}
-	p.pos++
-	switch c {
-	case 'n':
-		return '\\n', nil, true
-	case 't':
-		return '\\t', nil, true
-	case 'r':
-		return '\\r', nil, true
-	case 'f':
-		return '\\f', nil, true
-	case 'v':
-		return '\\v', nil, true
-	case '0':
-		return 0, nil, true
-	case 'b':
-		if inClass {
-			return '\\b', nil, true
-		}
-	case 'x':
-		if v, ok := p.hexValue(2); ok {
-			return v, nil, true
-		}
-		if v, ok := p.hexValue(0); ok {
-			return v, nil, true
-		}
-		return 'x', nil, true
-	case 'u':
-		if v, ok := p.hexValue(4); ok {
-			return v, nil, true
-		}
-		if v, ok := p.hexValue(0); ok {
-			return v, nil, true
-		}
-		return 'u', nil, true
-	case 'c':
-		if n, ok := p.peek(); ok && ((n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z')) {
-			p.pos++
-			return n % 32, nil, true
-		}
-		return '\\\\', nil, true
-	case 'p', 'P':
-		if n, ok := p.peek(); ok && n == '{' {
-			close := p.pos + 1
-			for close < len(p.src) && p.src[close] != '}' {
-				close++
-			}
-			if close < len(p.src) {
-				if table := tnUnicodeProperty(string(p.src[p.pos+1 : close])); table != nil {
-					p.pos = close + 1
-					if c == 'P' {
-						return 0, func(r rune) bool { return !unicode.Is(table, r) }, true
-					}
-					return 0, func(r rune) bool { return unicode.Is(table, r) }, true
-				}
-			}
-		}
-	}
-	if cls := tnCharClass(c); cls != nil {
-		return 0, cls, true
-	}
-	return c, nil, true
-}
-
-// A p{…} property's table: a general category (L, Lu, P, Letter…), a
-// script (Greek, Script=Greek) or a binary property
-func tnUnicodeProperty(name string) *unicode.RangeTable {
-	if eq := strings.IndexByte(name, '='); eq >= 0 {
-		name = name[eq+1:]
-	}
-	long := map[string]string{
-		"Letter": "L", "Lowercase_Letter": "Ll", "Uppercase_Letter": "Lu", "Titlecase_Letter": "Lt", "Modifier_Letter": "Lm", "Other_Letter": "Lo",
-		"Mark": "M", "Number": "N", "Decimal_Number": "Nd", "Letter_Number": "Nl", "Other_Number": "No",
-		"Punctuation": "P", "Connector_Punctuation": "Pc", "Dash_Punctuation": "Pd", "Open_Punctuation": "Ps", "Close_Punctuation": "Pe",
-		"Initial_Punctuation": "Pi", "Final_Punctuation": "Pf", "Other_Punctuation": "Po",
-		"Symbol": "S", "Math_Symbol": "Sm", "Currency_Symbol": "Sc", "Modifier_Symbol": "Sk", "Other_Symbol": "So",
-		"Separator": "Z", "Space_Separator": "Zs", "Line_Separator": "Zl", "Paragraph_Separator": "Zp",
-		"Other": "C", "Control": "Cc", "Format": "Cf", "Private_Use": "Co", "Surrogate": "Cs",
-	}
-	if short, ok := long[name]; ok {
-		name = short
-	}
-	if t, ok := unicode.Categories[name]; ok {
-		return t
-	}
-	if t, ok := unicode.Scripts[name]; ok {
-		return t
-	}
-	if t, ok := unicode.Properties[name]; ok {
-		return t
-	}
-	return nil
-}
-
-func (p *tnBtParser) parseEscape() (*tnBtNode, error) {
-	c, ok := p.peek()
-	if !ok {
-		return nil, fmt.Errorf("trailing backslash")
-	}
-	switch c {
-	case 'b':
-		p.pos++
-		return &tnBtNode{op: "anchor", anchor: 'b'}, nil
-	case 'B':
-		p.pos++
-		return &tnBtNode{op: "anchor", anchor: 'B'}, nil
-	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		p.pos++
-		return &tnBtNode{op: "backref", group: int(c - '0')}, nil
-	case 'k':
-		// k<name>: the named group's text
-		if n, ok := p.peekAt(1); ok && n == '<' {
-			p.pos += 2
-			name := p.groupName()
-			if index, found := p.names[name]; found {
-				return &tnBtNode{op: "backref", group: index}, nil
-			}
-			return nil, fmt.Errorf("unknown group name")
-		}
-	}
-	ch, cls, ok := p.escapeValue(false)
-	if !ok {
-		return nil, fmt.Errorf("trailing backslash")
-	}
-	if cls != nil {
-		return &tnBtNode{op: "class", cls: cls}, nil
-	}
-	return &tnBtNode{op: "char", ch: ch}, nil
-}
-
-func (p *tnBtParser) parseClass() (*tnBtNode, error) {
-	negate := false
-	if c, ok := p.peek(); ok && c == '^' {
-		negate = true
-		p.pos++
-	}
-	var items []func(rune) bool
-	first := true
-	for {
-		c, ok := p.peek()
-		if !ok {
-			return nil, fmt.Errorf("unterminated class")
-		}
-		if c == ']' && !first {
-			p.pos++
-			break
-		}
-		first = false
-		p.pos++
-		var lo rune
-		if c == '\\\\' {
-			ch, cls, ok2 := p.escapeValue(true)
-			if !ok2 {
-				return nil, fmt.Errorf("trailing backslash in class")
-			}
-			if cls != nil {
-				items = append(items, cls)
-				continue
-			}
-			lo = ch
-		} else {
-			lo = c
-		}
-		// range?
-		if c3, ok3 := p.peek(); ok3 && c3 == '-' {
-			if c4, ok4 := p.peekAt(1); ok4 && c4 != ']' {
-				p.pos++ // consume '-'
-				hiChar, _ := p.peek()
-				p.pos++
-				hi := hiChar
-				if hiChar == '\\\\' {
-					hc, _, ok5 := p.escapeValue(true)
-					if !ok5 {
-						return nil, fmt.Errorf("trailing backslash in class")
-					}
-					hi = hc
-				}
-				l, h := lo, hi
-				items = append(items, func(r rune) bool { return r >= l && r <= h })
-				continue
-			}
-		}
-		l := lo
-		items = append(items, func(r rune) bool { return r == l })
-	}
-	matchers := items
-	// (ASCII from a table)
-	var ascii [utf8.RuneSelf]bool
-	for c := rune(0); c < utf8.RuneSelf; c++ {
-		for _, m := range matchers {
-			if m(c) {
-				ascii[c] = true
-				break
-			}
-		}
-	}
-	return &tnBtNode{op: "class", ascii: &ascii, cls: func(r rune) bool {
-		if r >= 0 && r < utf8.RuneSelf {
-			return ascii[r]
-		}
-		for _, m := range matchers {
-			if m(r) {
-				return true
-			}
-		}
-		return false
-	}, negCls: negate}, nil
-}
-
-func (p *tnBtParser) peekAt(offset int) (rune, bool) {
-	if p.pos+offset < len(p.src) {
-		return p.src[p.pos+offset], true
-	}
-	return 0, false
-}
-
-type tnBtMatchState struct {
-	s    string
-	caps []int
-	bt   *tnBt
-}
-
-// The rune at byte offset pos and its width (0 at the end)
-func (m *tnBtMatchState) at(pos int) (rune, int) {
-	if pos >= len(m.s) {
-		return 0, 0
-	}
-	if c := m.s[pos]; c < utf8.RuneSelf {
-		return rune(c), 1
-	}
-	return utf8.DecodeRuneInString(m.s[pos:])
-}
-
-// The rune before byte offset pos and its width (0 at the start)
-func (m *tnBtMatchState) before(pos int) (rune, int) {
-	if pos <= 0 {
-		return 0, 0
-	}
-	if c := m.s[pos-1]; c < utf8.RuneSelf {
-		return rune(c), 1
-	}
-	return utf8.DecodeLastRuneInString(m.s[:pos])
-}
-
-// Line terminators for . and multiline ^ $ (as JS defines them)
-func tnBtLineEnd(r rune) bool {
-	return r == '\\n' || r == '\\r' || r == 0x2028 || r == 0x2029
-}
-
-func tnBtWord(r rune) bool {
-	return r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
-}
-
-func tnBtIsSingle(n *tnBtNode) bool {
-	return n.single != 0
-}
-
-// The width of the one rune a char / any / class node matches at pos, or -1
-func (m *tnBtMatchState) single(node *tnBtNode, pos int) int {
-	r, size := m.at(pos)
-	if size == 0 {
-		return -1
-	}
-	switch node.single {
-	case 1:
-		if r == node.ch || m.bt.icase && unicode.ToLower(r) == unicode.ToLower(node.ch) {
-			return size
-		}
-	case 2:
-		if m.bt.dotAll || !tnBtLineEnd(r) {
-			return size
-		}
-	case 3:
-		in := node.cls(r)
-		if !in && m.bt.icase {
-			in = node.cls(unicode.ToLower(r)) || node.cls(unicode.ToUpper(r))
-		}
-		if in != node.negCls {
-			return size
-		}
-	}
-	return -1
-}
-
-func (m *tnBtMatchState) seq(nodes []*tnBtNode, pos int, k func(int) bool) bool {
-	// (single runes in a row are matched in place, without a continuation each)
-	for len(nodes) > 0 && tnBtIsSingle(nodes[0]) {
-		w := m.single(nodes[0], pos)
-		if w < 0 {
-			return false
-		}
-		pos += w
-		nodes = nodes[1:]
-	}
-	if len(nodes) == 0 {
-		return k(pos)
-	}
-	if len(nodes) == 1 {
-		return m.match(nodes[0], pos, k)
-	}
-	rest := nodes[1:]
-	return m.match(nodes[0], pos, func(p2 int) bool {
-		return m.seq(rest, p2, k)
-	})
-}
-
-func (m *tnBtMatchState) match(node *tnBtNode, pos int, k func(int) bool) bool {
-	if node.single != 0 {
-		if w := m.single(node, pos); w >= 0 {
-			return k(pos + w)
-		}
-		return false
-	}
-	switch node.op {
-	case "anchor":
-		switch node.anchor {
-		case '^':
-			if pos == 0 {
-				return k(pos)
-			}
-			if m.bt.multiline {
-				if r, _ := m.before(pos); tnBtLineEnd(r) {
-					return k(pos)
-				}
-			}
-		case '$':
-			if pos == len(m.s) {
-				return k(pos)
-			}
-			if m.bt.multiline {
-				if r, _ := m.at(pos); tnBtLineEnd(r) {
-					return k(pos)
-				}
-			}
-		case 'b', 'B':
-			rb, sb := m.before(pos)
-			ra, sa := m.at(pos)
-			boundary := (sb > 0 && tnBtWord(rb)) != (sa > 0 && tnBtWord(ra))
-			if boundary == (node.anchor == 'b') {
-				return k(pos)
-			}
-		}
-		return false
-	case "cat":
-		return m.seq(node.seq, pos, k)
-	case "alt":
-		for _, br := range node.branches {
-			if m.seq(br, pos, k) {
-				return true
-			}
-		}
-		return false
-	case "group":
-		si, ei := node.group*2, node.group*2+1
-		savedS, savedE := m.caps[si], m.caps[ei]
-		matched := m.match(node.child, pos, func(end int) bool {
-			ps, pe := m.caps[si], m.caps[ei]
-			m.caps[si], m.caps[ei] = pos, end
-			if k(end) {
-				return true
-			}
-			m.caps[si], m.caps[ei] = ps, pe
-			return false
-		})
-		if !matched {
-			m.caps[si], m.caps[ei] = savedS, savedE
-		}
-		return matched
-	case "backref":
-		s, e := m.caps[node.group*2], m.caps[node.group*2+1]
-		if s < 0 || e < 0 {
-			return k(pos)
-		}
-		if m.bt.icase {
-			p := pos
-			for _, r := range m.s[s:e] {
-				r2, w := m.at(p)
-				if w == 0 || unicode.ToLower(r) != unicode.ToLower(r2) {
-					return false
-				}
-				p += w
-			}
-			return k(p)
-		}
-		n := e - s
-		if pos+n > len(m.s) || m.s[pos:pos+n] != m.s[s:e] {
-			return false
-		}
-		return k(pos + n)
-	case "look":
-		// a positive lookaround keeps its captures (as in JS); a negative one,
-		// or one the rest of the pattern backtracks out of, does not
-		saved := append([]int(nil), m.caps...)
-		matched := false
-		if !node.behind {
-			matched = m.match(node.child, pos, func(int) bool { return true })
-		} else {
-			// (a start from pos back, as far as the lookbehind's longest match)
-			start := pos
-			for steps := 0; ; steps++ {
-				if m.match(node.child, start, func(end int) bool { return end == pos }) {
-					matched = true
-					break
-				}
-				if start == 0 || (node.max >= 0 && steps >= node.max) {
-					break
-				}
-				_, w := m.before(start)
-				start -= w
-			}
-		}
-		if !matched || node.negative {
-			copy(m.caps, saved)
-		}
-		if matched != node.negative && k(pos) {
-			return true
-		}
-		copy(m.caps, saved)
-		return false
-	case "rep":
-		if tnBtIsSingle(node.child) {
-			return m.repSingle(node, pos, k)
-		}
-		return m.rep(node, pos, 0, k)
-	}
-	return false
-}
-
-// A repeat of one rune (a*, [^\\n]+?, .{2,5}): the runes are matched in a
-// loop, the rest of the pattern tried from the longest run back (greedy) or
-// from the shortest on (lazy)
-func (m *tnBtMatchState) repSingle(node *tnBtNode, pos int, k func(int) bool) bool {
-	if !node.greedy {
-		count := 0
-		for {
-			if count >= node.min && k(pos) {
-				return true
-			}
-			if node.max >= 0 && count >= node.max {
-				return false
-			}
-			w := m.single(node.child, pos)
-			if w < 0 {
-				return false
-			}
-			pos += w
-			count++
-		}
-	}
-	// (each step matches one rune: giving one back steps back over the rune
-	// before, with nothing to remember on the way)
-	count := 0
-	child := node.child
-	table := child.ascii
-	if m.bt.icase {
-		table = nil
-	}
-	for node.max < 0 || count < node.max {
-		// (an ASCII byte against a class: its table)
-		if table != nil && pos < len(m.s) && m.s[pos] < utf8.RuneSelf {
-			if table[m.s[pos]] == child.negCls {
-				break
-			}
-			pos++
-			count++
-			continue
-		}
-		w := m.single(child, pos)
-		if w < 0 {
-			break
-		}
-		pos += w
-		count++
-	}
-	for ; count >= node.min; count-- {
-		if k(pos) {
-			return true
-		}
-		if count == 0 {
-			break
-		}
-		if c := m.s[pos-1]; c < utf8.RuneSelf {
-			pos--
-		} else {
-			_, w := utf8.DecodeLastRuneInString(m.s[:pos])
-			pos -= w
-		}
-	}
-	return false
-}
-
-func (m *tnBtMatchState) rep(node *tnBtNode, pos, count int, k func(int) bool) bool {
-	if count < node.min {
-		return m.match(node.child, pos, func(p2 int) bool {
-			return m.rep(node, p2, count+1, k)
-		})
-	}
-	tryMore := func() bool {
-		if node.max >= 0 && count >= node.max {
-			return false
-		}
-		return m.match(node.child, pos, func(p2 int) bool {
-			if p2 == pos {
-				return false
-			}
-			return m.rep(node, p2, count+1, k)
-		})
-	}
-	if node.greedy {
-		if tryMore() {
-			return true
-		}
-		return k(pos)
-	}
-	if k(pos) {
-		return true
-	}
-	return tryMore()
-}
-
-// The most runes a node can match (-1: no bound), for lookbehinds
-func tnBtMaxRunes(n *tnBtNode) int {
-	switch n.op {
-	case "char", "any", "class":
-		return 1
-	case "anchor", "look":
-		return 0
-	case "cat":
-		total := 0
-		for _, c := range n.seq {
-			w := tnBtMaxRunes(c)
-			if w < 0 {
-				return -1
-			}
-			total += w
-		}
-		return total
-	case "alt":
-		most := 0
-		for _, br := range n.branches {
-			w := tnBtMaxRunes(&tnBtNode{op: "cat", seq: br})
-			if w < 0 {
-				return -1
-			}
-			if w > most {
-				most = w
-			}
-		}
-		return most
-	case "group":
-		return tnBtMaxRunes(n.child)
-	case "rep":
-		w := tnBtMaxRunes(n.child)
-		if w < 0 || n.max < 0 {
-			return -1
-		}
-		return w * n.max
-	}
-	return -1
-}
-
-// Whether a pattern only matches at the input's start (it begins with ^)
-func tnBtStartAnchored(n *tnBtNode) bool {
-	switch n.op {
-	case "anchor":
-		return n.anchor == '^'
-	case "cat":
-		return len(n.seq) > 0 && tnBtStartAnchored(n.seq[0])
-	case "group":
-		return tnBtStartAnchored(n.child)
-	case "alt":
-		for _, br := range n.branches {
-			if len(br) == 0 || !tnBtStartAnchored(br[0]) {
-				return false
-			}
-		}
-		return len(n.branches) > 0
-	}
-	return false
+	return groups, lo, hi
 }`,
+  regexEngine: REGEX_ENGINE_HELPER,
   objectAssignTo: `// Object.assign(target, ...sources) on a typed target (a struct or a Map):
 // each source's properties are set on the target's fields / entries, and the
 // target is the result. Unset (nil) fields of a struct source count as absent;
 // a dynamic object's undefined properties are copied.
 func TnAssignTo[T any](target T, sources ...interface{}) T {
 	for _, src := range sources {
+		if tnAssignFields(any(target), src) {
+			continue
+		}
 		tnAssignProps(reflect.ValueOf(target), src)
 	}
 	return target
@@ -22628,6 +22249,103 @@ func tnFieldByKey(v reflect.Value, key string) (reflect.Value, bool) {
 		return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem(), true
 	}
 	return reflect.Value{}, false
+}
+
+// The own properties of an object type, for copying them through field plans
+type tnPropPlan struct {
+	keys []string
+	// (fields behind an embedded pointer, or Entries, take the general path)
+	ok bool
+}
+
+var tnPropPlans sync.Map
+
+func tnPropPlanOf(t reflect.Type) *tnPropPlan {
+	if v, ok := tnPropPlans.Load(t); ok {
+		return v.(*tnPropPlan)
+	}
+	plan := &tnPropPlan{}
+	if t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct {
+		if _, entries := t.MethodByName("Entries"); !entries {
+			plan.ok = true
+			var walk func(st reflect.Type)
+			walk = func(st reflect.Type) {
+				for i := 0; i < st.NumField(); i++ {
+					f := st.Field(i)
+					if f.Anonymous {
+						if f.Type.Kind() == reflect.Struct {
+							walk(f.Type)
+						} else if f.Type.Kind() == reflect.Pointer {
+							plan.ok = false
+						}
+						continue
+					}
+					if !strings.HasPrefix(f.Name, "__") {
+						plan.keys = append(plan.keys, strings.TrimSuffix(f.Name, "_"))
+					}
+				}
+			}
+			walk(t.Elem())
+		}
+	}
+	tnPropPlans.Store(t, plan)
+	return plan
+}
+
+// Object.assign(target, src) between two objects whose fields need no
+// conversion; the properties it can't copy this way go through tnAssignProps
+func tnAssignFields(target interface{}, src interface{}) bool {
+	if target == nil || src == nil {
+		return false
+	}
+	tt, st := reflect.TypeOf(target), reflect.TypeOf(src)
+	plan := tnPropPlanOf(st)
+	if !plan.ok || tt.Kind() != reflect.Pointer || tt.Elem().Kind() != reflect.Struct {
+		return false
+	}
+	if _, isMap := tt.MethodByName("Set"); isMap {
+		return false
+	}
+	tb, sb := (*[2]unsafe.Pointer)(unsafe.Pointer(&target))[1], (*[2]unsafe.Pointer)(unsafe.Pointer(&src))[1]
+	if tb == nil || sb == nil {
+		return tb != nil
+	}
+	for i, key := range plan.keys {
+		from, to := tnPlanOf(src, key), tnPlanOf(target, key)
+		if from.kind == tnFieldSlow || from.kind == tnFieldSlice || to.missing || to.kind == tnFieldSlow {
+			if i == 0 {
+				return false
+			}
+			tnAssignProp(reflect.ValueOf(target), src, key)
+			continue
+		}
+		if !from.set(sb) {
+			continue
+		}
+		if !to.write(tb, from.read(sb)) {
+			tnAssignProp(reflect.ValueOf(target), src, key)
+		}
+	}
+	return true
+}
+
+// One property of an object, as tnAssignProps copies it
+func tnAssignProp(target reflect.Value, src interface{}, key string) {
+	v := TnGet(src, key)
+	if p := tnPlanOf(src, key); p.kind == tnFieldSlice {
+		if q := unsafe.Add((*[2]unsafe.Pointer)(unsafe.Pointer(&src))[1], p.offset); *(*unsafe.Pointer)(q) == nil {
+			return
+		}
+	} else if v == nil {
+		return
+	}
+	field, ok := tnFieldByKey(target.Elem(), key)
+	if !ok {
+		return
+	}
+	if converted, cok := TnConvertDynamic(v, field.Type()); cok {
+		field.Set(converted)
+	}
 }
 
 func tnAssignProps(target reflect.Value, src interface{}) {
