@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["../../types/typenative.d.ts", "../../types/typenative-go.d.ts", "../../types/typenative-npm.d.ts"]
+  },
+  "include": ["**/*.ts", "dom-type-stubs.d.ts"]
+}

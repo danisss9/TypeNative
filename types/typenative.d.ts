@@ -24,8 +24,11 @@ interface CallableFunction extends Function {
 }
 interface NewableFunction extends Function {}
 
-/** The global `Function` as a value: an opaque constructor (`x instanceof Function` checks for a function); calling it compiles code, which a native binary cannot */
-interface FunctionConstructor extends Function {}
+/** The global `Function` as a value: an opaque constructor (`x instanceof Function` checks for a function). `new Function(...)` compiles to a binary that throws if the program ever calls the result: a native binary cannot evaluate dynamic code */
+interface FunctionConstructor extends Function {
+  new (...args: string[]): Function;
+  (...args: string[]): Function;
+}
 declare var Function: FunctionConstructor;
 
 interface IArguments {
@@ -257,23 +260,23 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Performs the callback for each element.
    */
-  forEach(callback: (value: T, index?: number, array?: T[]) => void): void;
+  forEach(callback: (value: T, index: number, array: T[]) => void): void;
   /**
    * Calls the callback function on each element of the array, accumulating a result.
    */
   reduce<U>(
-    callback: (accumulator: U, value: T, index?: number, array?: T[]) => U,
+    callback: (accumulator: U, value: T, index: number, array: T[]) => U,
     initialValue: U
   ): U;
-  reduce(callback: (accumulator: T, value: T, index?: number, array?: T[]) => T): T;
+  reduce(callback: (accumulator: T, value: T, index: number, array: T[]) => T): T;
   /**
    * Calls the callback function on each element of the array in reverse order, accumulating a result.
    */
   reduceRight<U>(
-    callback: (accumulator: U, value: T, index?: number, array?: T[]) => U,
+    callback: (accumulator: U, value: T, index: number, array: T[]) => U,
     initialValue: U
   ): U;
-  reduceRight(callback: (accumulator: T, value: T, index?: number, array?: T[]) => T): T;
+  reduceRight(callback: (accumulator: T, value: T, index: number, array: T[]) => T): T;
   /**
    * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
    */
@@ -329,8 +332,8 @@ interface Array<T> extends IterableIterator<T> {
   /**
    * Returns a new array formed by applying callback to each element and then flattening.
    */
-  flat(): T[];
-  flatMap<U>(callback: (value: T, index?: number, array?: T[]) => U[]): U[];
+  flat(depth?: number): T[];
+  flatMap<U>(callback: (value: T, index: number, array: T[]) => U[]): U[];
   /**
    * Returns a copy of a section of an array with the fill value applied.
    */
@@ -359,9 +362,14 @@ interface Array<T> extends IterableIterator<T> {
   [n: number]: T;
 }
 
+/** The read-only view of a Set: the same values, no mutating members used */
+type ReadonlySet<T> = Set<T>;
+
 interface ArrayConstructor {
   new <T>(length: number): T[];
   new <T>(...items: T[]): T[];
+  <T>(length: number): T[];
+  <T>(...items: T[]): T[];
   isArray(arg: any): arg is any[];
   from<T>(arrayLike: ArrayLike<T> | Iterable<T>): T[];
   from<T, U>(arrayLike: ArrayLike<T> | Iterable<T>, mapFn: (value: T, index: number) => U): U[];
@@ -395,11 +403,11 @@ interface String {
   isWellFormed(): boolean;
   toWellFormed(): string;
   /** Determines whether a string contains the specified substring. */
-  includes(searchString: string): boolean;
+  includes(searchString: string, position?: number): boolean;
   /** Determines whether a string begins with the specified characters. */
-  startsWith(searchString: string): boolean;
+  startsWith(searchString: string, position?: number): boolean;
   /** Determines whether a string ends with the specified characters. */
-  endsWith(searchString: string): boolean;
+  endsWith(searchString: string, endPosition?: number): boolean;
   /** Splits a string into substrings using the specified separator. */
   split(separator: string | RegExp, limit?: number): string[];
   /** Removes whitespace from both ends of a string. */
