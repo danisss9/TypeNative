@@ -3521,6 +3521,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (knownType && knownType !== 'nil' && knownType !== ':') {
         ensureGoTypePackages(knownType);
         const name = getSafeName(node.name.text);
+        // (a const of a literal: set at package initialization, so static
+        // class fields — package variables too — see it)
+        const literal = unwrapParentheses(node.initializer);
+        const isLiteral = isStringLiteral(literal) || isNoSubstitutionTemplateLiteral(literal) || isNumericLiteral(literal) || literal.kind === 'TrueKeyword' || literal.kind === 'FalseKeyword';
+        if (isLiteral && node.parent?.declarationKind === 'const' && ['string', 'float64', 'bool'].includes(knownType)) {
+          return `var ${name} ${knownType} ${initializer}`;
+        }
         moduleInitAssignments.push(`${name} ${initializer}`);
         return `var ${name} ${goLocalType(knownType)}`;
       }
@@ -4443,7 +4450,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
       if (node.asteriskToken) {
         // yield* other(): forward every value of the delegated generator
+        // (each in step with this generator's consumer)
+        if (!asyncChannelIsAsync) {
+          useHelper('generatorStep');
+          return `func() { __yg := TnGenLockstep(${visit(node.expression)}); for __yfirst := true; ; __yfirst = false { if !__yfirst { TnGenAck(__yg) }; __yv, __yok := <-__yg; if !__yok { TnGenDone(__yg); return }; ${asyncChannelVar} <- __yv; TnGenStep(${asyncChannelVar}) } }()`;
+        }
         return `for __yv := range ${visit(node.expression)} {\n\t\t\t${asyncChannelVar} <- __yv\n\t\t}`;
+      }
+      // (a generator resumes only once its consumer has run: see TnGenStep)
+      if (!asyncChannelIsAsync) {
+        useHelper('generatorStep');
+        return `${asyncChannelVar} <- ${visit(node.expression ?? 'nil')}; TnGenStep(${asyncChannelVar})`;
       }
       return `${asyncChannelVar} <- ${visit(node.expression ?? 'nil')}`;
     }
@@ -4594,12 +4611,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // Go requires a block body; `} else` must stay on the same line, so the
     // terminating ';' is only added when no else branch follows
     const thenTerm = node.elseStatement ? '' : ';';
+    // (the condition first: its names have their types before the branches run)
+    const conditionCode = toGoCondition(node.expression);
     const thenCode = withNarrowing(getNarrowedNames(node.expression, true), () =>
       isBlock(node.thenStatement)
         ? visit(node.thenStatement, { inline: !!node.elseStatement })
         : `{\n${withLineMarker(node.thenStatement, visit(node.thenStatement))}\n}${thenTerm}`
     );
-    const condition = `if ${toGoCondition(node.expression)} ${thenCode}`;
+    const condition = `if ${conditionCode} ${thenCode}`;
     if (node.elseStatement) {
       // else-if chains stay chained; other single statements get a block
       const elseCode = withNarrowing(getNarrowedNames(node.expression, false), () =>
@@ -5257,6 +5276,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             continue;
           }
           if (!isMethodDeclaration(member)) continue;
+          // (an inherited generator method: the embedded parent's, promoted;
+          // dispatched on any values too)
+          if (member.body && member.asteriskToken && isIdentifier(member.name) && !ownMethodNames.has(member.name.text) &&
+            !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword')) {
+            ownMethodNames.add(member.name.text);
+            emittedMethodNames.add(member.name.text);
+            copiedMethods.push(emitGeneratorMethod(name, typeParamNames, member, goFieldName(member.name.text)));
+            continue;
+          }
           if (!member.body || member.asteriskToken) continue; // abstract / generator
           if (member.modifiers?.some((m: AstNode) => m.kind === 'StaticKeyword')) continue;
           if (member.modifiers?.some((m: AstNode) => m.kind === 'AbstractKeyword')) continue;
@@ -5319,21 +5347,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         } else if (member.name && member.name.text) {
           genName = memberKey(member.name);
         }
-        if (genName) {
-          const yieldType = getGeneratorYieldType(member);
-          const prevChannel = asyncChannelVar;
-          const prevFn = asyncFunctionNode;
-          const prevIsAsync = asyncChannelIsAsync;
-          asyncChannelVar = '__ch';
-          asyncFunctionNode = member;
-          asyncChannelIsAsync = false;
-          const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
-          const genBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
-          asyncChannelVar = prevChannel;
-          asyncFunctionNode = prevFn;
-          asyncChannelIsAsync = prevIsAsync;
-          result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
-        }
+        if (genName) result += emitGeneratorMethod(name, typeParamNames, member, genName);
         continue;
       }
       if (isMethodDeclaration(member)) {
@@ -7294,6 +7308,26 @@ function widenToInterfaceParams(className: string, member: AstNode, signature: s
   return { signature, prefix };
 }
 
+// A generator method: a Go method returning the channel its body sends on
+// (registered for dispatch on any values; copied into subclasses as other
+// methods are, so `this` is the subclass there)
+function emitGeneratorMethod(className: string, typeParamNames: string, member: AstNode, genName: string): string {
+  const yieldType = getGeneratorYieldType(member);
+  const prevChannel = asyncChannelVar;
+  const prevFn = asyncFunctionNode;
+  const prevIsAsync = asyncChannelIsAsync;
+  asyncChannelVar = '__ch';
+  asyncFunctionNode = member;
+  asyncChannelIsAsync = false;
+  const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
+  const genBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
+  asyncChannelVar = prevChannel;
+  asyncFunctionNode = prevFn;
+  asyncChannelIsAsync = prevIsAsync;
+  if (genName !== 'Symbol_iterator') recordMethodSignature(className, memberKey(member.name) ?? genName, genName, methodParameterInfo.signature, `chan ${yieldType}`);
+  return `${lineMarker(member)}func (self *${className}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
+}
+
 // The trailing parameters an override lacks of the method it overrides
 // (`visit(node)` overriding `visit(ast, context?)`), as `__extraN T` slots
 function overriddenExtraParamDecls(className: string, member: AstNode): string[] {
@@ -7366,7 +7400,9 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   // (a string method's name that some object literal's function has too: a
   // string receiver runs the string method)
   // (with primitive arguments only: a string method's own argument types)
-  const primitiveArgs = (node.arguments ?? []).every((a: AstNode) => ['string', 'float64', 'bool'].includes(inferExpressionType(a) ?? '') || isRegularExpressionLiteral(unwrapParentheses(a)));
+  // (a regex literal argument too, for the string methods taking one plainly)
+  const regexArgOk = ['match', 'matchAll', 'search', 'split'].includes(method);
+  const primitiveArgs = (node.arguments ?? []).every((a: AstNode) => ['string', 'float64', 'bool'].includes(inferExpressionType(a) ?? '') || (regexArgOk && isRegularExpressionLiteral(unwrapParentheses(a))));
   if (STRING_ONLY_METHODS.has(method) && (objectLiteralMethodNames.has(method) || stringOrClassMethod) && !hasSpread && primitiveArgs) {
     const recvVar = getTempName('recv');
     const strName = getTempName('str');
@@ -7417,9 +7453,16 @@ function emitToJSONWrappers(): string {
   const out: string[] = [];
   for (const [className, methods] of classMethodSignatures) {
     const toString = methods.get('toString');
-    if (toString && toString.result === 'string') {
+    if (toString && (toString.result === 'string' || toString.result === '*string' || toString.result === 'interface{}')) {
       const paramTypes = toString.params ? goFuncParamTypes(`func(${toString.params})`) : [];
-      out.push(`func (self *${getSafeName(className)}) TnToString() string {\n\tvar __args []interface{}\n\t_ = __args\n\treturn self.${toString.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})\n}`);
+      const call = `self.${toString.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
+      // (a toString() that may return null / any value: its string form)
+      const body = toString.result === 'string'
+        ? `return ${call}`
+        : toString.result === '*string'
+          ? `if __r := ${call}; __r != nil {\n\t\treturn *__r\n\t}\n\treturn "null"`
+          : `return TnJSString(${call})`;
+      out.push(`func (self *${getSafeName(className)}) TnToString() string {\n\tvar __args []interface{}\n\t_ = __args\n\t${body}\n}`);
     }
     const sig = methods.get('toJSON');
     if (!sig) continue;
@@ -9330,8 +9373,9 @@ function getArrayLiteralElementType(node: AstNode): string {
       if (spreadType?.startsWith('[]')) spreadElement = spreadType.slice(2);
       else if (isTypedArrayGoType(spreadType)) spreadElement = 'float64';
       else if (spreadType === 'string') spreadElement = 'string';
-      // (a generator's channel: what it yields)
+      // (a generator's channel: what it yields; an iterable class instance's)
       else if (spreadType?.startsWith('chan ')) spreadElement = spreadType.slice(5);
+      else if (spreadType?.startsWith('*') && classIteratorMethods.has(spreadType.slice(1).replace(/\[.*\]$/, ''))) spreadElement = classIteratorMethods.get(spreadType.slice(1).replace(/\[.*\]$/, ''));
       else if (spreadType?.startsWith('*TnMap[') && extractMapValueType(spreadType) === 'struct{}') spreadElement = extractMapKeyType(spreadType);
       else if (spreadType?.startsWith('*TnMap[')) return '[]interface{}';
       else if (!spreadType || spreadType === 'interface{}') return 'interface{}';
@@ -9537,6 +9581,11 @@ function visitSpreadSource(expr: AstNode): string {
     return `func() []string { __parts := []string{}; for _, __r := range ${visit(expr)} { __parts = append(__parts, string(__r)) }; return __parts }()`;
   }
   if (isTypedArrayGoType(sourceType)) return `${visit(expr)}.tnFloats()`;
+  // [...iterable] of a class with a *[Symbol.iterator]() method: what it yields
+  const iterableClass = sourceType?.startsWith('*') ? classIteratorMethods.get(sourceType.slice(1).replace(/\[.*\]$/, '')) : undefined;
+  if (iterableClass) {
+    return `func() []${iterableClass} { __out := []${iterableClass}{}; for __v := range ${visit(expr)}.Symbol_iterator() { __out = append(__out, __v) }; return __out }()`;
+  }
   // [...generator()]: every value it yields
   if (sourceType?.startsWith('chan ')) {
     const element = sourceType.slice(5);
@@ -12038,6 +12087,8 @@ function getNullishResultType(expr: AstNode): string | undefined {
   // (primitives of two types — a number ?? '' — is either)
   const primitives = ['string', 'float64', 'bool'];
   if (leftValueType && primitives.includes(leftValueType) && primitives.includes(rightType) && leftValueType !== rightType) return 'interface{}';
+  // (an object ?? a primitive: either)
+  if (leftValueType && leftValueType.startsWith('*') && primitives.includes(rightType)) return 'interface{}';
   // (an operand of unknown type may hold any value: only a primitive
   // fallback types the result)
   if (!leftValueType) return ['string', 'float64', 'bool'].includes(rightType) ? rightType : 'interface{}';
@@ -12437,6 +12488,26 @@ function buildArrayCallbackInfo(
   paramTypes: string[] = [elementType, 'float64', `[]${elementType}`]
 ): ArrayCallbackInfo {
   if (isArrowFunction(callback) || isFunctionExpression(callback)) {
+    // (the callback's parameters are its own: the names' outer types come back after)
+    const paramNames: string[] = [];
+    for (const p of callback.parameters ?? []) bindingNames(p.name, paramNames);
+    const restoreTypes = saveVariableTypes(paramNames);
+    try {
+      return buildLiteralCallbackInfo(callback, elementType, forcedReturnType, paramTypes);
+    } finally {
+      restoreTypes();
+    }
+  }
+  return buildValueCallbackInfo(callback, elementType, forcedReturnType, paramTypes);
+}
+
+function buildLiteralCallbackInfo(
+  callback: AstNode,
+  elementType: string,
+  forcedReturnType: string | undefined,
+  paramTypes: string[]
+): ArrayCallbackInfo {
+  {
     const paramCount = (callback.parameters ?? []).length;
     // ([k, v]) => … / ({ a }) => …: a temporary parameter unpacked first
     const unpack: string[] = [];
@@ -12478,6 +12549,14 @@ function buildArrayCallbackInfo(
     };
   }
 
+}
+
+function buildValueCallbackInfo(
+  callback: AstNode,
+  elementType: string,
+  forcedReturnType: string | undefined,
+  paramTypes: string[]
+): ArrayCallbackInfo {
   // a predicate (some / filter / find …) whose result isn't a boolean: its truthiness
   const callbackType = functionValueGoType(callback) ?? '';
   const callbackResult = callbackType.startsWith('func(') ? goFuncReturnType(callbackType) : undefined;
@@ -13272,6 +13351,16 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (name === 'FinalizationRegistry' && !classNames.has(name)) return '*TnFinalizationRegistry';
     if (name === 'PromiseWithResolvers' && typeNode.typeArguments?.length === 1) {
       return promiseWithResolversGoType(getType(typeNode.typeArguments[0]));
+    }
+    // Pick<T, 'a' | 'b'> / Omit<T, 'c'> of an object type: a struct of those
+    // fields only (spreading one must not set T's other fields)
+    if ((name === 'Pick' || name === 'Omit') && typeNode.typeArguments?.length === 2 && !declaredTypeAliases.has(name)) {
+      const baseType = getType(typeNode.typeArguments[0]);
+      const keys = getMappedTypeKeys(typeNode.typeArguments[1]);
+      if (keys && (baseType.startsWith('*struct{') || (baseType.startsWith('*') && isObjectTypeName(baseType.slice(1))))) {
+        const fields = [...objectTypeFieldMap(typeNode.typeArguments[0])].filter(([k]) => keys.includes(goFieldName(k)) === (name === 'Pick'));
+        if (fields.length > 0) return `*struct{ ${fields.map(([k, t]) => `${goFieldName(k)} ${t}`).join('; ')} }`;
+      }
     }
     // Partial / Required / Readonly / Pick / Omit / NonNullable<T, ...> → T's Go type
     if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
@@ -14380,7 +14469,8 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   // push / unshift return the new length when their value is used
   push: (obj, args) => {
     // (an array a call returns — a getter's — is no Go variable: appended to a copy)
-    if (!isAddressable(obj) && !/^\(\*.+\)$/.test(obj) && !isIndexedAddressable(obj)) {
+    // (a field through a call's pointer result — getter().items — is addressable)
+    if (obj.endsWith(')') && !isAddressable(obj) && !/^\(\*.+\)$/.test(obj)) {
       return `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args)}; return float64(len(__s)) }()`;
     }
     return currentCallNode && !isDiscardedValue(currentCallNode)
@@ -19033,6 +19123,7 @@ const helperPackages: Record<string, string[]> = {
   date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
   dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic'],
   classes: ['reflect'],
+  generatorStep: ['sync'],
   arraySubclass: ['reflect'],
   numTruthy: ['math'],
   iterable: ['reflect'],
@@ -19078,6 +19169,38 @@ const helperPackages: Record<string, string[]> = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers: Record<string, string> = {
+  generatorStep: `// A generator consumed by for…of runs in step with the loop: after each
+// yield it waits until the loop body has run for that value (JS resumes a
+// generator only on next()), so the body sees the state the generator saw
+var tnGenAcks sync.Map
+
+// Marks a generator's channel as consumed in step (before its first receive)
+func TnGenLockstep[T any](ch chan T) chan T {
+	tnGenAcks.Store(ch, make(chan struct{}, 1))
+	return ch
+}
+
+// The loop body ran for the last value received: the generator may go on
+func TnGenAck[T any](ch chan T) {
+	if ack, ok := tnGenAcks.Load(ch); ok {
+		select {
+		case ack.(chan struct{}) <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// The generator ended (the loop saw its channel close)
+func TnGenDone[T any](ch chan T) {
+	tnGenAcks.Delete(ch)
+}
+
+// After a yield: wait for the consumer's go-ahead when it runs in step
+func TnGenStep[T any](ch chan T) {
+	if ack, ok := tnGenAcks.Load(ch); ok {
+		<-ack.(chan struct{})
+	}
+}`,
   iterators: `// Iterator helpers over generators (channels): lazy, one goroutine per stage
 type TnIterResult[T any] struct {
 	value T
@@ -22180,6 +22303,10 @@ func TnToArray(v interface{}) []interface{} {
 			out[i] = rv.Index(i).Interface()
 		}
 		return out
+	}
+	// (an instance of a class with a *[Symbol.iterator]() method: what it yields)
+	if m := rv.MethodByName("Symbol_iterator"); m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() == 1 {
+		return TnToArray(m.Call(nil)[0].Interface())
 	}
 	// (a generator: its values until it returns)
 	if rv.Kind() == reflect.Chan {
@@ -27384,6 +27511,18 @@ function goIterElems(goType: string): string[] {
   return out;
 }
 
+// for (const x of generator): each value received only after the loop body
+// ran for the previous one, and the generator resumed only then (as JS
+// resumes a generator on next()): TnGenLockstep / TnGenAck / TnGenStep
+function lockstepRange(name: string, chanExpr: string, body: AstNode): string {
+  useHelper('generatorStep');
+  const g = getTempName('gen');
+  const first = getTempName('first');
+  const ok = getTempName('ok');
+  const prefix = `if !${first} { TnGenAck(${g}) }\n\t\t${first} = false\n\t\t${name}, ${ok} := <-${g}\n\t\tif !${ok} {\n\t\t\tTnGenDone(${g})\n\t\t\tbreak\n\t\t}\n\t\t_ = ${name}\n\t\t`;
+  return `${g} := TnGenLockstep(${chanExpr})\n\t\t${first} := true\n\t\tfor ${visitLoopBody(body, prefix)}`;
+}
+
 function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | undefined): string {
   if (iterType === 'interface{}') iterType = '[]interface{}';
   // Go iter.Seq[V] / Seq2[K, V]: range the func directly.
@@ -27431,7 +27570,7 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
         : undefined;
       if (declaration && isIdentifier(declaration.name)) {
         registerLocalVariable(declaration.name.text, yieldType);
-        return `for ${visit(declaration.name)} := range ${iterExpr}.Symbol_iterator()${visitLoopBody(node.statement)}`;
+        return lockstepRange(visit(declaration.name), `${iterExpr}.Symbol_iterator()`, node.statement);
       }
       return `for _ = range ${iterExpr}.Symbol_iterator()${visitLoopBody(node.statement)}`;
     }
@@ -27466,7 +27605,7 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     }
     if (declaration && isIdentifier(declaration.name)) {
       registerLocalVariable(declaration.name.text, elemType);
-      return `for ${visit(declaration.name)} := range ${iterExpr}${visitLoopBody(node.statement)}`;
+      return lockstepRange(visit(declaration.name), iterExpr, node.statement);
     }
     // for await (const [a, b] of channel) → a := item[0]; b := item[1]
     if (declaration && isArrayBindingPattern(declaration.name)) {
