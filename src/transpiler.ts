@@ -2249,6 +2249,7 @@ function typeNodeToText(node) {
         NumberKeyword: 'number',
         StringKeyword: 'string',
         BooleanKeyword: 'boolean',
+        BigIntKeyword: 'bigint',
         AnyKeyword: 'any',
         UnknownKeyword: 'any',
         VoidKeyword: 'void',
@@ -3472,11 +3473,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const name = getSafeName(node.name.text);
       return `${name} := ${toGoValueOfType(node.initializer, refType)}\n\t\t_ = ${name}`;
     }
-    // const v = m.get(k) of a Map holding primitives, tested for undefined
-    // later: a *V (nil when the key is missing; a zero value is a value)
+    // const v = m.get(k) / rec[k] of a Map / record holding primitives, tested
+    // for undefined later: a *V (nil when the key is missing; a zero value is a value)
     if (isIdentifier(node.name) && !node.type && node.initializer && !isTopLevelDecl) {
       const lookup = getMapLookup(unwrapParentheses(node.initializer));
-      const valueType = lookup && isCallExpression(unwrapParentheses(node.initializer)) ? extractMapValueType(inferExpressionType(lookup.mapNode)!) : undefined;
+      // (or rec[k] of a record held as a TnMap)
+      const valueType = lookup ? extractMapValueType(inferExpressionType(lookup.mapNode)!) : undefined;
       if (lookup && valueType && ['string', 'float64', 'bool'].includes(valueType) && comparedToNullish(node.name.text, node)) {
         setVarGoType(node.name.text, `*${valueType}`);
         variableTypes.delete(node.name.text);
@@ -4128,10 +4130,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // x instanceof C: the runtime type is C's pointer type, or a subclass's
       const rightClass: string = node.right.text;
       const targets = [rightClass, ...subclassNames(rightClass)].map((c) => `*${getSafeName(c)}`);
+      // (a nil pointer of the class's type is undefined: no instance)
       if (targets.length === 1) {
-        return `func() bool { _, ok := interface{}(${visit(node.left)}).(${targets[0]}); return ok }()`;
+        return `func() bool { __v, ok := interface{}(${visit(node.left)}).(${targets[0]}); return ok && __v != nil }()`;
       }
-      return `func() bool { switch interface{}(${visit(node.left)}).(type) { case ${targets.join(', ')}: return true }; return false }()`;
+      return `func() bool { switch __v := interface{}(${visit(node.left)}).(type) { ${targets.map((t) => `case ${t}: return __v != nil`).join('; ')} }; return false }()`;
     }
     // Symbol.iterator in x: whether x is iterable
     if (
@@ -4214,6 +4217,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         if (dynamicSide === bl) bl = `TnToBigInt(${bl})`;
         else br = `TnToBigInt(${br})`;
       }
+      // 'text ' + big: the bigint's decimal digits
+      if (op === '+' && (bigLeft === 'string' || bigRight === 'string')) {
+        return bigLeft === 'string' ? `${bl} + ${br}.String()` : `${bl}.String() + ${br}`;
+      }
+      // big += x and the like: a new value stored back
+      const compound: Record<string, string> = { '+=': 'Add', '-=': 'Sub', '*=': 'Mul', '/=': 'Quo', '%=': 'Rem' };
+      if (compound[op] && bigLeft === '*tnbig.Int') {
+        return `${bl} = new(tnbig.Int).${compound[op]}(${bl}, ${br})`;
+      }
+      if (op === '**=' && bigLeft === '*tnbig.Int') return `${bl} = new(tnbig.Int).Exp(${bl}, ${br}, nil)`;
       if (op === '==') return `${bl}.Cmp(${br}) == 0`;
       if (op === '!=') return `${bl}.Cmp(${br}) != 0`;
       if (op === '<') return `${bl}.Cmp(${br}) < 0`;
@@ -11399,6 +11412,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     // an assignment's value is the target's
     if (ASSIGNMENT_OPERATORS.has(kind)) return inferExpressionType(expr.left);
     if (kind === 'CommaToken') return inferExpressionType(expr.right);
+    // ('text ' + big is a string)
+    if (kind === 'PlusToken' && (inferExpressionType(expr.left) === 'string' || inferExpressionType(expr.right) === 'string')) return 'string';
     // BigInt operands stay bigint
     if (
       [
@@ -13738,6 +13753,9 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       return 'float64';
     case 'boolean':
       return 'bool';
+    case 'bigint':
+      useHelper('bigint');
+      return '*tnbig.Int';
     case 'any':
       return 'interface{}';
     case 'void':
@@ -15583,7 +15601,13 @@ function visitRegexReplace(node: AstNode): string | undefined {
     const params = replacement.parameters ?? [];
     const groupArgs = params
       .map((p: AstNode, index: number) => {
-        if (p.dotDotDotToken) return '';
+        // (...rest: the remaining arguments, match and groups, offset, string)
+        if (p.dotDotDotToken) {
+          useHelper('regexMatch');
+          const restType = getParameterGoType(p).slice(3);
+          if (restType === 'string') return `TnReplacerStrings(__m, __at, __s)[${index}:]...`;
+          return restType === 'interface{}' ? `TnReplacerArgs(__m, __at, __s)[${index}:]...` : `TnSliceAs[${restType}](TnReplacerArgs(__m, __at, __s)[${index}:])...`;
+        }
         const numeric = p.type ? getType(p.type) === 'float64' : false;
         if (groups !== undefined ? index === groups + 1 : index > 0 && numeric) return 'float64(__at)';
         if (groups !== undefined && index === groups + 2) return '__s';
@@ -18791,6 +18815,7 @@ const helperRequires: Record<string, string[]> = {
   fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
   dynamic: ['error', 'strIndex', 'toFixed'],
   regexMatch: ['strIndex'],
+  stringSearch: ['strIndex'],
   classes: ['dynamic', 'error', 'orderedMap'],
   arraySubclass: ['dynamic', 'classes'],
   moduleUrl: ['pathToFileURL'],
@@ -19539,7 +19564,7 @@ const helperPackages: Record<string, string[]> = {
   fancyRegex: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
   regexEngine: ['strings', 'fmt', 'strconv', 'sync', 'sync/atomic', 'unicode', 'unicode/utf8'],
   namedGroups: ['regexp', 'unicode/utf8'],
-  regexMatch: ['regexp', 'math', 'unsafe', 'unicode/utf8'],
+  regexMatch: ['regexp', 'math', 'strconv', 'unsafe', 'unicode/utf8'],
   strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings', 'sort'],
   jsReplacement: ['strings'],
   moduleUrl: ['os'],
@@ -20840,6 +20865,13 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 		case "valueOf":
 			return n
 		}
+	}
+	// (as V8 words it: the receiver itself is undefined / null)
+	if obj == TnNull {
+		panic(TnNodeError("TypeError", "", fmt.Sprintf("Cannot read properties of null (reading '%s')", name)))
+	}
+	if TnIsNil(obj) {
+		panic(TnNodeError("TypeError", "", fmt.Sprintf("Cannot read properties of undefined (reading '%s')", name)))
 	}
 	fn := TnGet(obj, name)
 	if fn == nil {
@@ -24375,6 +24407,12 @@ func tnMatchGroups(s string, loc []int) []string {
 // m[i] of a match array as string | undefined (an unmatched group, or past the end)
 // A replacer function's arguments: (match, ...groups, offset, string), an
 // unmatched group undefined
+// (the same, for a string[] rest parameter: the offset as a string)
+func TnReplacerStrings(m []string, at int, s string) []string {
+	out := append([]string{}, m...)
+	return append(out, strconv.Itoa(at), s)
+}
+
 func TnReplacerArgs(m []string, at int, s string) []interface{} {
 	out := make([]interface{}, 0, len(m)+2)
 	for i := range m {
@@ -26849,15 +26887,13 @@ func TnDecorateClass(result interface{}) {
 	}
 }`,
   stringSearch: `// startsWith/endsWith/includes(search, position): the position clamped, as in JS
+// (a JS position: UTF-16 units, as a byte offset into the Go string)
 func tnClampIndex(s string, i float64) int {
 	n := int(i)
 	if n < 0 {
 		return 0
 	}
-	if n > len(s) {
-		return len(s)
-	}
-	return n
+	return tnStrByte(s, n)
 }`,
   flatArray: `// flat(depth): nested arrays flattened depth levels deep; Infinity flattens fully
 func TnArrayFlat(items []interface{}, depth float64) []interface{} {

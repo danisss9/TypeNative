@@ -1,5 +1,5 @@
-// const v = m.get(k) of a Map holding numbers / strings, tested against
-// undefined: a missing key is undefined, a stored 0 / '' is a value
+// const v = m.get(k) / rec[k] of a Map / record holding numbers / strings,
+// tested against undefined: a missing key is undefined, a stored 0 / '' is a value
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
 }
@@ -37,4 +37,16 @@ const names = new Map<string, string>([['a', ''], ['b', 'bee']]);
 assert(label(names, 'a') === '[]', 'empty string is a value');
 assert(label(names, 'b') === '[bee]', 'string value');
 assert(label(names, 'c') === 'missing', 'missing string');
+
+function i18nAttrs(attrs: string[], metas: string[]): string[] {
+  const attrsMeta: { [key: string]: string } = {};
+  for (const m of metas) attrsMeta[m.split('=')[0]] = m.split('=')[1] ?? '';
+  const out: string[] = [];
+  for (const name of attrs) {
+    const meta = attrsMeta[name];
+    if (meta !== undefined) out.push(`${name}:${meta}`);
+  }
+  return out;
+}
+assert(i18nAttrs(['id', 'title', 'alt'], ['title=m|d', 'alt']).join(',') === 'title:m|d,alt:', i18nAttrs(['id', 'title', 'alt'], ['title=m|d', 'alt']).join(','));
 console.log('ok');
