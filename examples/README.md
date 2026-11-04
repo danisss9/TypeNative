@@ -16,6 +16,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **12x faster per call** (33 vs 400 ms); 1.9x slower on 10 MB† |
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **6.1x faster per call** (45 vs 273 ms); 1.6x slower on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.2x faster per answer** (716 vs 875 ms streamed)          |
+| [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **8.7x faster per template** (117 vs 1,019 ms); 1.2x slower at 64 KB§ |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.4.0 (hello-world, fibonacci, json-server), 0.4.2 (desktop-notes) and 0.4.1
@@ -30,6 +31,12 @@ Node byte for byte on the yaml-test-suite (1,608 cases).
 ‡ Same setup as †. The native binary is faster up to about 1–2 MB of markdown
 per run. marked-cli's [parity.mjs](marked-cli/parity.mjs) checks every output
 against Node byte for byte on marked's spec suites (2,859 cases).
+
+§ Same setup as †. The native binary is faster up to about 50 KB of template
+per run; most component templates are a few KB. angular-templates'
+[parity.mjs](angular-templates/parity.mjs) checks every output against Node
+byte for byte on the templates of Angular's compiler compliance suite (612
+templates).
 
 ## Running an example
 
@@ -74,6 +81,7 @@ cd examples/desktop-notes  && npm install && node bench.mjs
 cd examples/yaml-cli       && node bench.mjs   # and node parity.mjs
 cd examples/marked-cli     && node bench.mjs   # and node parity.mjs
 cd examples/openai-chat    && node bench.mjs   # against a local mock API, no key needed
+cd examples/angular-templates && node bench.mjs   # and node parity.mjs
 ```
 
 TypeNative's clearest wins are process startup and memory. Startup is about

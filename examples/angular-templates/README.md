@@ -69,3 +69,66 @@ descriptions and custom ids, legacy message ids, line-ending normalization),
 pipes, two-way bindings, listeners, directive matching, `ng-content`
 projection, styling bindings and templates with errors (which
 must report the same messages).
+
+## Benchmark: Node.js vs TypeNative
+
+Reproduce with `node bench.mjs [runs=30] [sizeRuns=5] [kilobytes=8,16,32,64]`.
+The script compiles `main.ts`, then times **complete process runs** (spawn to
+exit) of `ng-compile` under both runtimes, alternating Node and native runs,
+and checks that the two outputs are identical:
+
+- **(a) per-call latency:** the built-in demo template (control flow,
+  bindings, pipes, listeners, `@let`, `ng-content`), about one component's
+  worth. This is what a build tool or editor pays per template when it starts
+  a compiler process per file.
+- **(b) scaling:** generated templates from 8 to 64 KB. Each is a dashboard of
+  cards using `@if`/`@for`/`@switch`, `@defer`, `@let`, property, class, style
+  and attribute bindings, listeners, two-way bindings, pipes, i18n attributes
+  and ICUs, `ng-template` references and `ng-content`, from a fixed-seed
+  generator, so every machine gets the same input. Each card is its own
+  embedded view (`@if (panels.x) { … }`), the way sections of a real template
+  are.
+
+**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
+Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
+(non-`--release`) build. The binary is 14.0 MB. The machine was idle.
+
+(a) `ng-compile` (built-in demo template), 30 runs each:
+
+| Runtime    | min       | median      | mean        | max         |
+| ---------- | --------- | ----------- | ----------- | ----------- |
+| Node.js    | 958.95 ms | 1,018.90 ms | 1,024.98 ms | 1,290.09 ms |
+| TypeNative | 113.47 ms | 117.49 ms   | 119.18 ms   | 158.34 ms   |
+
+(b) `ng-compile generated.component.html`, 5 runs per size (medians):
+
+| Template           | Node.js  | TypeNative | TypeNative vs Node |
+| ------------------ | -------- | ---------- | ------------------ |
+| 9 KB, 186 lines    | 1,080 ms | 305 ms     | 3.5x faster        |
+| 16 KB, 362 lines   | 1,105 ms | 469 ms     | 2.4x faster        |
+| 32 KB, 706 lines   | 1,233 ms | 873 ms     | 1.4x faster        |
+| 65 KB, 1,388 lines | 1,373 ms | 1,668 ms   | 1.2x slower        |
+
+**Per call, TypeNative is 8.7x faster** (117 ms vs 1,019 ms, median). Almost
+all of both times is fixed: a one-line template takes about as long. Node
+spends its second loading the compiler's 233 TypeScript files and transforming
+them (`--experimental-transform-types`) before it compiles anything. The
+native binary's 0.1 s is mostly the compiler's own module setup, such as the
+DOM schema and entity tables.
+
+**On large templates the native binary loses its lead at about 50 KB.** Past
+startup, compiling costs about 24 ms per KB natively against about 4–5 ms per
+KB under V8's JIT, so the gap closes as templates grow. Real component
+templates are mostly a few KB, well inside the native binary's lead. In a
+profile of the 64 KB run, about a third of the samples are goroutine handoffs:
+TypeNative runs each generator as a goroutine that passes every value to its
+consumer over a channel, in lockstep, and the compiler iterates its operation
+lists (`OpList`) through generators in each of its 74 phases. Property access
+through reflection on dynamically typed values and garbage collection are the
+next largest costs.
+
+A template whose sections all share the root view is another matter: Angular
+copies every `@let` and `#ref` of a view into each of its child views, so with
+hundreds of them at the top level the compile becomes quadratic in both
+runtimes. In this generator without the per-card `@if`, 64 KB took 2.7 s under
+Node and 7.3 s natively.
