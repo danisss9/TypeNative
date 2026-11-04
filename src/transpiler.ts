@@ -671,7 +671,7 @@ function emitClassDescriptors(): string {
     }
     const parentRef = parent && emittedClasses.has(parent) ? `TnClass_${getSafeName(parent)}` : 'nil';
     out.push(
-      `var TnClass_${goName} = tnRegisterClass(&TnClass{Name: ${toGoStringLiteral(name)}, Type: reflect.TypeOf((*${goName})(nil)), Parent: ${parentRef}, New: ${ctor}, statics: map[string]func() interface{}{${statics.join(', ')}}})`
+      `var TnClass_${goName} = tnRegisterClass(&TnClass{Name: ${toGoStringLiteral(originalTopNames.get(name) ?? name)}, Type: reflect.TypeOf((*${goName})(nil)), Parent: ${parentRef}, New: ${ctor}, statics: map[string]func() interface{}{${statics.join(', ')}}})`
     );
   }
   return out.join('\n');
@@ -2186,6 +2186,8 @@ function calledFunctionDeclaration(name: string, at: AstNode): AstNode | undefin
 
 function linkParents(node: AstNode, parent: AstNode | undefined): void {
   node.parent = parent;
+  // f!(…) / o.m!(…): the assertion has no run-time effect — the plain call
+  while (node.kind === 'CallExpression' && node.expression?.kind === 'NonNullExpression') node.expression = node.expression.expression;
   if (node.kind === 'FunctionDeclaration' && parent && parent.kind !== 'SourceFile' && parent.kind !== 'ModuleBlock' && node.name?.text) {
     nestedFunctionNames.add(node.name.text);
   }
@@ -2366,6 +2368,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   coverageFiles.length = 0;
   linkedModules.clear();
   linkedTopNames.clear();
+  originalTopNames.clear();
   destructureTempSeed = 0;
   moduleInitOrder.length = 0;
   moduleInitAssignments = null;
@@ -2811,7 +2814,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         if (slotType.startsWith('func(') && goFuncParamTypes(slotType).some((t) => t.startsWith('...'))) {
           useHelper('dynamic');
           useHelper('error');
-          return `func(__args ...interface{}) interface{} { return TnNew(${classValue(node.text)}, __args...) }`;
+          return `TnCtorOf(${classValue(node.text)}, func(__args ...interface{}) interface{} { return TnNew(${classValue(node.text)}, __args...) })`;
         }
         return `TnCtorOf(${classValue(node.text)}, New${getSafeName(node.text)})`;
       }
@@ -5791,7 +5794,7 @@ function adaptFunctionValue(code: string, from: string, to: string): string {
     const toResult2 = goFuncReturnType(to) || 'interface{}';
     // (a class identifier constructs through TnNew)
     if (/^TnClass_[A-Za-z_][A-Za-z0-9_]*$/.test(code.trim())) {
-      return `func(__args ...interface{}) interface{} { return TnNew(${code.trim()}, __args...) }`;
+      return `TnCtorOf(${code.trim()}, func(__args ...interface{}) interface{} { return TnNew(${code.trim()}, __args...) })`;
     }
     const names2 = fromFixed.map((_t: string, i: number) => `__a${i}`);
     const conv2 = fromFixed.map((t: string, i: number) => convertBetweenGoTypes(`TnArg(__args, ${i})`, 'interface{}', t));
@@ -5857,7 +5860,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     const otherStructs = isObjectPointer(elem0) && isObjectPointer(raw0.slice(2)) && elem0 !== raw0.slice(2);
     const same = raw0 === goType.slice(1) || (raw0.startsWith('[]') && elem0.startsWith('*') && raw0.slice(2).startsWith('*') && !otherStructs);
     if (same) {
-      if (isIdentifier(u0)) return referenceArrays.has(u0.text) || (inferExpressionType(u0) ?? '').startsWith('*[]') ? getSafeName(u0.text) : `&${getSafeName(u0.text)}`;
+      if (isIdentifier(u0)) return referenceArrays.has(u0.text) || isReferenceArrayRead(u0) || (inferExpressionType(u0) ?? '').startsWith('*[]') ? getSafeName(u0.text) : `&${getSafeName(u0.text)}`;
       if (isReferenceFieldAccess(u0) && !hasQuestionDot(u0) && isPropertyAccessExpression(u0)) {
         // a typed class's field: its address (a dynamic object's goes through
         // the usual reference read)
@@ -6954,6 +6957,12 @@ function jsStringOf(code: string, goType: string | undefined): string {
   // Node classes with a toString() (MIMEType, X509Certificate, …)
   const nodeKey = goType ? nodeRegistry.classByGoType[goType] : undefined;
   if (nodeKey && 'toString' in nodeRegistry.classes[nodeKey].methods) return `${code}.toString()`;
+  // (a class instance or an object: its toString(), else "[object Object]")
+  if (goType?.startsWith('*') && (classNames.has(goType.slice(1)) || isStructGoType(goType.slice(1)))) {
+    useHelper('dynamic');
+    useHelper('error');
+    return `TnJSString(${code})`;
+  }
   importedPackages.add('fmt');
   return `fmt.Sprintf("%v", ${code})`;
 }
@@ -10748,6 +10757,16 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
   // (an optional interface method read as a value: see TnMethodOf_m)
   if (isPropertyAccessExpression(expr) && !isCallee(expr) && isOptionalInterfaceMethodAccess(expr)) return 'interface{}';
+  // (m?.has(k) / m?.get(k) on a Map that may be absent: the result, or undefined)
+  if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && hasQuestionDot(expr.expression) && (inferExpressionType(expr.expression.expression) ?? '').startsWith('*TnMap[')) {
+    const plainAccess: AstNode = { ...expr.expression, questionDotToken: undefined };
+    const plainCall: AstNode = { ...expr, questionDotToken: undefined, expression: plainAccess, parent: expr.parent };
+    plainAccess.parent = plainCall;
+    const plainType = inferExpressionType(plainCall);
+    return plainType ? makeNullableType(plainType) : plainType;
+  }
+  // (m?.size: a number, or undefined)
+  if (isPropertyAccessExpression(expr) && expr.name.text === 'size' && hasQuestionDot(expr) && (inferExpressionType(expr.expression) ?? '').startsWith('*TnMap[')) return '*float64';
   // (a member the receiver's class lacks: read by name, see the emitter)
   if (isPropertyAccessExpression(expr) && !isCallee(expr) && expr.expression.kind !== 'ThisKeyword') {
     const receiverType = inferExpressionType(expr.expression) ?? '';
@@ -11909,13 +11928,20 @@ function getObjectTypeFields(typeNode: AstNode): string[] {
 // Object.assign(target, …) result type, when it has one: a typed target's
 // own type (it is mutated and returned); for a literal target, the type the
 // context expects, else that of a sole typed source ({} copies it)
+// Object.create(null): a fresh empty object, like {}
+function isObjectCreateNull(node: AstNode): boolean {
+  return isCallExpression(node) && isPropertyAccessExpression(node.expression) && isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'Object' && node.expression.name.text === 'create' &&
+    (node.arguments ?? []).length === 1 && unwrapParentheses(node.arguments[0]).kind === 'NullKeyword';
+}
+
 function objectAssignTargetType(call: AstNode): string | undefined {
   const args = call.arguments ?? [];
   if (args.length === 0 || args.some((a: AstNode) => isSpreadElement(a))) return undefined;
   const target = unwrapParentheses(args[0]);
   const assignable = (t: string | undefined): t is string =>
     !!t && (t.startsWith('*TnMap[') || (t.startsWith('*') && (isStructGoType(t.slice(1)) || classNames.has(t.slice(1)))));
-  if (!isObjectLiteralExpression(target)) {
+  if (!isObjectLiteralExpression(target) && !isObjectCreateNull(target)) {
     const t = inferExpressionType(target);
     return assignable(t) ? t : 'interface{}';
   }
@@ -12141,6 +12167,10 @@ function isNilableGoType(goType: string): boolean {
 function visitOptionalPropertyAccess(node: AstNode): string {
   const baseExpr = visit(node.expression);
   const baseType = inferExpressionType(node.expression);
+  // m?.size of a Map / Set that may be absent: its size, or undefined
+  if (baseType?.startsWith('*TnMap[') && node.name.text === 'size' && hasQuestionDot(node)) {
+    return `func() *float64 { if __m := ${baseExpr}; __m != nil { __n := float64(__m.Len()); return &__n }; return nil }()`;
+  }
   if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
     // Record/Map members are key lookups even through optional chains
     const objectType = resolveExpressionType(node.expression);
@@ -12304,6 +12334,19 @@ function visitOptionalCall(node: AstNode): string {
     }
     // (a typed result: its zero value — not undefined — when a is nullish)
     return `func() ${resultType} { ${guard} := ${baseExpr}; if TnIsNil(${guard}) { var __zero ${resultType}; return __zero }; return ${callCode} }()`;
+  }
+  // m?.set(k, v) on a Map / Set that may be absent: run only when it is set
+  // (the receiver read again for the call: a variable or a field)
+  if (baseType?.startsWith('*TnMap[') && hasQuestionDot(node.expression) && /^[\w.()*]+$/.test(baseExpr)) {
+    const plainAccess: AstNode = { ...node.expression, questionDotToken: undefined };
+    const plainCall: AstNode = { ...node, questionDotToken: undefined, expression: plainAccess };
+    plainAccess.parent = plainCall;
+    const callCode = visit(plainCall);
+    const resultType = inferExpressionType(plainCall) ?? '';
+    if (isDiscardedValue(node) || !resultType) return `func() { if ${baseExpr} != nil { ${callCode} } }()`;
+    const nullable = makeNullableType(resultType);
+    const value = nullable === resultType ? callCode : `func() ${nullable} { __v := ${callCode}; return &__v }()`;
+    return `func() ${nullable} { if ${baseExpr} == nil { return *new(${nullable}) }; return ${value} }()`;
   }
   if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
     const plainAccess: AstNode = { ...node.expression, questionDotToken: undefined };
@@ -13813,17 +13856,17 @@ const callHandlers: Record<string, CallHandler> = {
     const call = currentCallNode;
     const targetType = call ? objectAssignTargetType(call) : undefined;
     // (an existing object is updated in place and returned, whatever its type)
-    const existingTarget = !!call && (call.arguments ?? []).length > 0 && !isObjectLiteralExpression(unwrapParentheses(call.arguments[0])) && !(call.arguments ?? []).some((a: AstNode) => isSpreadElement(a));
+    const existingTarget = !!call && (call.arguments ?? []).length > 0 && !isObjectLiteralExpression(unwrapParentheses(call.arguments[0])) && !isObjectCreateNull(unwrapParentheses(call.arguments[0])) && !(call.arguments ?? []).some((a: AstNode) => isSpreadElement(a));
     if (call && (targetType || existingTarget)) {
       useHelper('objectAssignTo');
       const target = unwrapParentheses(call.arguments[0]);
       // a literal target: a fresh value of the type, its own properties first
-      const literal = isObjectLiteralExpression(target);
+      const literal = isObjectLiteralExpression(target) || isObjectCreateNull(target);
       const head = !literal ? args[0] : targetType === 'interface{}' ? `TnEmptyLike(${args[1]})` : newGoValueOf(targetType ?? '');
       // (a literal source's explicit undefined properties are copied too)
       const setsUndefined = (a: AstNode) => isObjectLiteralExpression(a) && (a.properties ?? []).some((p: AstNode) => isPropertyAssignment(p) && isIdentifier(p.initializer) && p.initializer.text === 'undefined');
       const rest = args.slice(1).map((code, i) => (setsUndefined(unwrapParentheses(call.arguments[i + 1])) ? dynamicObjectLiteral(unwrapParentheses(call.arguments[i + 1])) : code));
-      const sources = literal && (target.properties ?? []).length > 0 ? [dynamicObjectLiteral(target), ...rest] : rest;
+      const sources = isObjectLiteralExpression(target) && (target.properties ?? []).length > 0 ? [dynamicObjectLiteral(target), ...rest] : rest;
       return `TnAssignTo(${[head, ...sources].join(', ')})`;
     }
     useHelper('objectAssign');
@@ -15424,11 +15467,11 @@ function functionNameAndLength(target: string): { name: string; arity: number } 
   if (declared && !variableGoTypes.has(target)) {
     const params: AstNode[] = declared.parameters ?? [];
     const firstOptional = params.findIndex((p) => !!p.initializer || !!p.questionToken || !!p.dotDotDotToken);
-    return { name: target, arity: firstOptional < 0 ? params.length : firstOptional };
+    return { name: originalTopNames.get(target) ?? target, arity: firstOptional < 0 ? params.length : firstOptional };
   }
   if (classNames.has(target) && !variableGoTypes.has(target)) {
     if (staticMemberOwner(target, 'name') || staticMemberOwner(target, 'length')) return undefined;
-    return { name: target, arity: 0 };
+    return { name: originalTopNames.get(target) ?? target, arity: 0 };
   }
   const varType = variableGoTypes.get(target);
   if (varType?.startsWith('func(')) {
@@ -17278,12 +17321,34 @@ function normalizeCjsToEsm(code: string): string {
 // declare a name keeps it, later ones get name_2, name_3, … Importers'
 // references (named, default and namespace imports, re-exports) are renamed
 // to the names the exporting module ended up with.
+// The module a re-exported namespace names (through export * too)
+function linkedNamespaceExport(key: string, name: string, seen: Set<string>): string | undefined {
+  if (seen.has(key)) return undefined;
+  seen.add(key);
+  const mod = linkedModules.get(key);
+  if (!mod) return undefined;
+  const direct = mod.namespaceExports?.get(name);
+  if (direct) return direct;
+  if (mod.exports.has(name)) return undefined;
+  for (const star of mod.starExports) {
+    const found = linkedNamespaceExport(star, name, seen);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// A top-level name the linker renamed (Element_2) → the name declared (Element)
+const originalTopNames = new Map<string, string>();
+
 interface LinkedModule {
   ast: AstNode;
   // export name → package-unique name ('default' for the default export)
   exports: Map<string, string>;
   // keys of the modules `export * from` re-exports
   starExports: string[];
+  // export name → key of the module a re-exported namespace import names
+  // (`import * as ast from './ast'; export { ast }`)
+  namespaceExports?: Map<string, string>;
 }
 const linkedModules = new Map<string, LinkedModule>();
 const linkedTopNames = new Set<string>();
@@ -17368,6 +17433,8 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     for (let i = 2; linkedTopNames.has(goName); i++) goName = `${name}_${i}`;
     linkedTopNames.add(goName);
     renames.set(name, goName);
+    // (the name JS sees — a class's .name — is the declared one)
+    if (goName !== name) originalTopNames.set(goName, name);
   }
   for (const statement of statements) {
     const exported = statement.exported || hasModifier(statement, 'ExportKeyword');
@@ -17430,6 +17497,12 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     } else if (bindings?.kind === 'NamedImports') {
       for (const el of bindings.elements ?? []) {
         const remote = (el.propertyName ?? el.name).text;
+        // (a namespace the module re-exports: a namespace here too)
+        const reexportedNamespace = linkedNamespaceExport(targetKey, remote, new Set());
+        if (reexportedNamespace) {
+          namespaces.set(el.name.text, reexportedNamespace);
+          continue;
+        }
         const target = linkedExportName(targetKey, remote, new Set());
         if (target === undefined) continue;
         // f.prop on an imported function with expando properties
@@ -17455,6 +17528,10 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
       for (const el of statement.exportClause?.elements ?? []) {
         const local = (el.propertyName ?? el.name).text;
         mod.exports.set(el.name.text, renames.get(local) ?? local);
+        if (namespaces.has(local)) {
+          mod.namespaceExports ??= new Map();
+          mod.namespaceExports.set(el.name.text, namespaces.get(local)!);
+        }
       }
     } else if (statement.kind === 'ExportAssignment') {
       const expr = statement.expression;
@@ -20861,6 +20938,10 @@ func TnJSString(v interface{}) string {
 		}
 		return strings.Join(parts, ",")
 	}
+	// (an object, a class instance without toString(): as JS's default)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+		return "[object Object]"
+	}
 	return fmt.Sprintf("%v", v)
 }
 
@@ -21937,14 +22018,15 @@ func TnInstanceOf(v interface{}, cls interface{}) bool {
 // new C(…args), with C a class value
 func TnInstanceof(v interface{}, ctor interface{}) bool {
 	cls, _ := ctor.(*TnClass)
+	// (a constructor function standing for a class: that class)
+	if fv := reflect.ValueOf(ctor); cls == nil && fv.Kind() == reflect.Func && !fv.IsNil() {
+		cls = tnCtorClasses[fv.Pointer()]
+	}
 	if cls == nil || cls.Type == nil {
 		return false
 	}
-	rv := reflect.ValueOf(v)
-	if !rv.IsValid() || rv.Kind() != reflect.Ptr {
-		return false
-	}
-	return rv.Type() == cls.Type
+	// (an instance of a subclass is one too)
+	return TnInstanceOf(v, cls)
 }
 
 func TnNew(cls interface{}, args ...interface{}) interface{} {
