@@ -6164,8 +6164,13 @@ function toGoValueOfType(expr, goType) {
             const parts = [];
             for (const [goField, fieldType] of fields) {
                 if (goField === '__keys') {
-                    const keys = fields.filter(([f]) => f !== '__keys').map(([f]) => (f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
-                    parts.push(`__keys: &[]string{${keys.map((k) => toGoStringLiteral(k)).join(', ')}}`);
+                    const keys = [];
+                    for (const field of fields) {
+                        const f = field[0];
+                        if (f !== '__keys')
+                            keys.push(toGoStringLiteral(f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
+                    }
+                    parts.push(`__keys: &[]string{${keys.join(', ')}}`);
                     continue;
                 }
                 const tsField = goField.endsWith('_') && goFieldName(goField.slice(0, -1)) === goField ? goField.slice(0, -1) : goField.charAt(0).toLowerCase() + goField.slice(1);
@@ -6988,11 +6993,19 @@ function narrowedAfterIfElse(statement) {
     const elseNames = isIfStatement(statement.elseStatement) ? 'nested' : branchNames(statement.elseStatement, false);
     if (elseNames === 'nested')
         return [];
-    if (thenNames === 'exits')
-        return elseNames === 'exits' ? [] : [...elseNames];
-    if (elseNames === 'exits')
-        return [...thenNames];
-    return [...thenNames].filter((n) => elseNames.has(n));
+    // (as loops: the self-hosted compiler holds these unions as any)
+    const out = [];
+    if (thenNames === 'exits') {
+        if (elseNames !== 'exits')
+            for (const n of elseNames)
+                out.push(n);
+        return out;
+    }
+    for (const n of thenNames) {
+        if (elseNames === 'exits' || elseNames.has(n))
+            out.push(n);
+    }
+    return out;
 }
 // The nullable primitive variables (T | null held as *T) a statement assigns
 // a plain T value: `x = expr;` or `let x: T | null = expr;`
@@ -8934,10 +8947,12 @@ function registerStructAccessors(structType, node) {
     }
 }
 function isStructGetterField(structType, field) {
-    return structGetterFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+    const fields = structGetterFields.get(structType.replace(/^\*/, ''));
+    return fields !== undefined && fields.has(goFieldName(field));
 }
 function isStructMethodField(structType, field) {
-    return structMethodFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+    const fields = structMethodFields.get(structType.replace(/^\*/, ''));
+    return fields !== undefined && fields.has(goFieldName(field));
 }
 // The element type node of T[] / Array<T> / ReadonlyArray<T>
 function arrayElementTypeNode(typeNode) {
@@ -10712,10 +10727,23 @@ function inferArrowFunctionGoType(node) {
     if (hasTrailingDefaults)
         paramTypes.push('...interface{}');
     const params = paramTypes.join(', ');
-    // (the result with the function's own parameters and locals typed)
-    const retType = isPromiseReturningArrow(node)
-        ? `chan ${getPromiseChannelType(node)}`
-        : node.type ? inferFunctionBodyReturnType(node) : withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined;
+    // (the result with the function's own parameters and locals typed; a
+    // function whose result is being inferred already — one that returns a
+    // call of itself — adds nothing to it)
+    let retType;
+    if (isPromiseReturningArrow(node))
+        retType = `chan ${getPromiseChannelType(node)}`;
+    else if (node.type)
+        retType = inferFunctionBodyReturnType(node);
+    else if (!inferringFunctions.has(node)) {
+        inferringFunctions.add(node);
+        try {
+            retType = withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined;
+        }
+        finally {
+            inferringFunctions.delete(node);
+        }
+    }
     return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
 // fn.mock on a function value: the call record of a node:test mock (functions have no fields in Go)
@@ -16829,7 +16857,7 @@ function classHasMember(className, member) {
 // Whether the property is abstract where a class (or an ancestor) declares
 // it, with no concrete declaration on the way
 function isAbstractPropertyOf(className, property) {
-    for (let name = className, depth = 0; name && property && depth < 20; name = classParentNames.get(name), depth++) {
+    for (let name = className ?? '', depth = 0; name !== '' && property && depth < 20; name = classParentNames.get(name) ?? '', depth++) {
         const declaration = declaredClasses.get(name);
         const member = (declaration?.members ?? []).find((m) => (isPropertyDeclaration(m) || isGetAccessor(m)) && memberKey(m.name) === property);
         if (member)

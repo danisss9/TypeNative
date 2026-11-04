@@ -6067,8 +6067,12 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       const parts: string[] = [];
       for (const [goField, fieldType] of fields) {
         if (goField === '__keys') {
-          const keys = fields.filter(([f]) => f !== '__keys').map(([f]) => (f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
-          parts.push(`__keys: &[]string{${keys.map((k) => toGoStringLiteral(k)).join(', ')}}`);
+          const keys: string[] = [];
+          for (const field of fields) {
+            const f: string = field[0];
+            if (f !== '__keys') keys.push(toGoStringLiteral(f.endsWith('_') && goFieldName(f.slice(0, -1)) === f ? f.slice(0, -1) : f));
+          }
+          parts.push(`__keys: &[]string{${keys.join(', ')}}`);
           continue;
         }
         const tsField = goField.endsWith('_') && goFieldName(goField.slice(0, -1)) === goField ? goField.slice(0, -1) : goField.charAt(0).toLowerCase() + goField.slice(1);
@@ -6860,9 +6864,16 @@ function narrowedAfterIfElse(statement: AstNode): string[] {
   const thenNames = branchNames(statement.thenStatement, true);
   const elseNames = isIfStatement(statement.elseStatement) ? 'nested' : branchNames(statement.elseStatement, false);
   if (elseNames === 'nested') return [];
-  if (thenNames === 'exits') return elseNames === 'exits' ? [] : [...elseNames];
-  if (elseNames === 'exits') return [...thenNames];
-  return [...thenNames].filter((n) => elseNames.has(n));
+  // (as loops: the self-hosted compiler holds these unions as any)
+  const out: string[] = [];
+  if (thenNames === 'exits') {
+    if (elseNames !== 'exits') for (const n of elseNames as Set<string>) out.push(n);
+    return out;
+  }
+  for (const n of thenNames as Set<string>) {
+    if (elseNames === 'exits' || (elseNames as Set<string>).has(n)) out.push(n);
+  }
+  return out;
 }
 
 // The nullable primitive variables (T | null held as *T) a statement assigns
@@ -8740,11 +8751,13 @@ function registerStructAccessors(structType: string, node: AstNode): void {
 }
 
 function isStructGetterField(structType: string, field: string): boolean {
-  return structGetterFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+  const fields = structGetterFields.get(structType.replace(/^\*/, ''));
+  return fields !== undefined && fields.has(goFieldName(field));
 }
 
 function isStructMethodField(structType: string, field: string): boolean {
-  return structMethodFields.get(structType.replace(/^\*/, ''))?.has(goFieldName(field)) ?? false;
+  const fields = structMethodFields.get(structType.replace(/^\*/, ''));
+  return fields !== undefined && fields.has(goFieldName(field));
 }
 
 // The element type node of T[] / Array<T> / ReadonlyArray<T>
@@ -10407,10 +10420,20 @@ function inferArrowFunctionGoType(node: AstNode | AstNode): string {
   );
   if (hasTrailingDefaults) paramTypes.push('...interface{}');
   const params = paramTypes.join(', ');
-  // (the result with the function's own parameters and locals typed)
-  const retType = isPromiseReturningArrow(node)
-    ? `chan ${getPromiseChannelType(node)}`
-    : node.type ? inferFunctionBodyReturnType(node) : withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined;
+  // (the result with the function's own parameters and locals typed; a
+  // function whose result is being inferred already — one that returns a
+  // call of itself — adds nothing to it)
+  let retType: string | undefined;
+  if (isPromiseReturningArrow(node)) retType = `chan ${getPromiseChannelType(node)}`;
+  else if (node.type) retType = inferFunctionBodyReturnType(node);
+  else if (!inferringFunctions.has(node)) {
+    inferringFunctions.add(node);
+    try {
+      retType = withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined;
+    } finally {
+      inferringFunctions.delete(node);
+    }
+  }
   return `func(${params})${retType ? ` ${retType}` : ''}`;
 }
 
@@ -16342,7 +16365,7 @@ function classHasMember(className: string, member: string): boolean {
 // Whether the property is abstract where a class (or an ancestor) declares
 // it, with no concrete declaration on the way
 function isAbstractPropertyOf(className: string | undefined, property: string | undefined): boolean {
-  for (let name = className, depth = 0; name && property && depth < 20; name = classParentNames.get(name), depth++) {
+  for (let name: string = className ?? '', depth = 0; name !== '' && property && depth < 20; name = classParentNames.get(name) ?? '', depth++) {
     const declaration = declaredClasses.get(name);
     const member = (declaration?.members ?? []).find((m: AstNode) => (isPropertyDeclaration(m) || isGetAccessor(m)) && memberKey(m.name) === property);
     if (member) return isPropertyDeclaration(member) && (member.modifiers ?? []).some((m: AstNode) => m.kind === 'AbstractKeyword');
