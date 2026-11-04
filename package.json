@@ -33,12 +33,11 @@
   },
   "homepage": "https://github.com/danisss9/typenative#readme",
   "devDependencies": {
-    "@types/inquirer": "^9.0.10",
-    "@types/node": "^24.19.2",
-    "rimraf": "^6.1.3"
+    "@types/node": "^26.6.6",
+    "rimraf": "^6.1.4"
   },
   "dependencies": {
-    "inquirer": "^14.2.3",
+    "inquirer": "^14.2.5",
     "typescript": "^6.0.3"
   }
 }
