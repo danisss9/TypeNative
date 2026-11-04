@@ -91,25 +91,25 @@ and checks that the two outputs are identical:
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
 Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 14.0 MB. The machine was idle.
+(non-`--release`) build. The binary is 14.0 MB.
 
 (a) `ng-compile` (built-in demo template), 30 runs each:
 
 | Runtime    | min       | median      | mean        | max         |
 | ---------- | --------- | ----------- | ----------- | ----------- |
-| Node.js    | 958.95 ms | 1,018.90 ms | 1,024.98 ms | 1,290.09 ms |
-| TypeNative | 113.47 ms | 117.49 ms   | 119.18 ms   | 158.34 ms   |
+| Node.js    | 953.45 ms | 1,020.78 ms | 1,044.35 ms | 1,268.38 ms |
+| TypeNative | 108.83 ms | 117.35 ms   | 117.90 ms   | 133.38 ms   |
 
 (b) `ng-compile generated.component.html`, 5 runs per size (medians):
 
 | Template           | Node.js  | TypeNative | TypeNative vs Node |
 | ------------------ | -------- | ---------- | ------------------ |
-| 9 KB, 186 lines    | 1,080 ms | 305 ms     | 3.5x faster        |
-| 16 KB, 362 lines   | 1,105 ms | 469 ms     | 2.4x faster        |
-| 32 KB, 706 lines   | 1,233 ms | 873 ms     | 1.4x faster        |
-| 65 KB, 1,388 lines | 1,373 ms | 1,668 ms   | 1.2x slower        |
+| 9 KB, 186 lines    | 1,105 ms | 303 ms     | 3.7x faster        |
+| 16 KB, 362 lines   | 1,131 ms | 487 ms     | 2.3x faster        |
+| 32 KB, 706 lines   | 1,235 ms | 845 ms     | 1.5x faster        |
+| 65 KB, 1,388 lines | 1,354 ms | 1,620 ms   | 1.2x slower        |
 
-**Per call, TypeNative is 8.7x faster** (117 ms vs 1,019 ms, median). Almost
+**Per call, TypeNative is 8.7x faster** (117 ms vs 1,021 ms, median). Almost
 all of both times is fixed: a one-line template takes about as long. Node
 spends its second loading the compiler's 233 TypeScript files and transforming
 them (`--experimental-transform-types`) before it compiles anything. The

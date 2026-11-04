@@ -48,14 +48,14 @@ the same program under both runtimes. Since the program does no work, the
 numbers are almost entirely startup time.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.0, default (non-`--release`) build.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Runtime    | min        | median     | mean       | max        |
 |------------|------------|------------|------------|------------|
-| Node.js    | 97.07 ms   | 103.45 ms  | 104.51 ms  | 125.91 ms  |
-| TypeNative | 12.95 ms   | 14.72 ms   | 15.18 ms   | 25.11 ms   |
+| Node.js    | 91.67 ms   | 98.84 ms   | 101.51 ms  | 133.71 ms  |
+| TypeNative | 13.13 ms   | 14.52 ms   | 15.59 ms   | 26.55 ms   |
 
-**TypeNative starts 7.0x faster** (median). The compiled binary is a
+**TypeNative starts 6.8x faster** (median). The compiled binary is a
 self-contained 2.4 MB executable: there is no runtime to boot, no module
 system to initialize, and no JIT to warm up, so process-to-output latency is
 an order of magnitude lower. For CLI tools that are invoked frequently, this

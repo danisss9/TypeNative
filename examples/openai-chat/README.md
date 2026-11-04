@@ -112,18 +112,18 @@ client, which covers startup, the HTTP round trip, and parsing the stream as
 it arrives.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.1, default (non-`--release`) build.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Runtime    | min       | median    | mean      | max       |
 |------------|-----------|-----------|-----------|-----------|
-| Node.js    | 847.06 ms | 875.45 ms | 876.57 ms | 919.74 ms |
-| TypeNative | 713.35 ms | 716.48 ms | 717.33 ms | 735.39 ms |
+| Node.js    | 832.20 ms | 864.20 ms | 868.11 ms | 916.76 ms |
+| TypeNative | 668.19 ms | 716.66 ms | 712.19 ms | 740.19 ms |
 
 **TypeNative is 1.2x faster per answer** (median). The ratio looks small
 because both runtimes spend most of each run waiting for the mock's paced
 chunks — that part is identical by construction. The client-side share
-(startup, connect, first byte) is where they differ: about 160 ms of the
-median run, mostly Node's ~110 ms startup. For an interactive chat session
+(startup, connect, first byte) is where they differ: about 150 ms of the
+median run, mostly Node's ~100 ms startup. For an interactive chat session
 the numbers that matter are the first token and memory, and the binary starts
 about 7x faster and holds a fraction of Node's idle memory.
 

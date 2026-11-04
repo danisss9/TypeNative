@@ -84,24 +84,22 @@ the window can paint. It then lists the notes, opens 20 of them, saves one, and
 reads the app's own **resident memory** from `/api/info`.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.2, default (non-`--release`) build.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Spawn → first page | min       | median    | mean      | max       |
 |--------------------|-----------|-----------|-----------|-----------|
-| Node.js            | 212.53 ms | 246.86 ms | 241.53 ms | 273.47 ms |
-| TypeNative         | 42.59 ms  | 51.29 ms  | 119.99 ms | 719.02 ms |
+| Node.js            | 173.04 ms | 188.87 ms | 188.53 ms | 217.98 ms |
+| TypeNative         | 28.74 ms  | 31.76 ms  | 32.84 ms  | 46.74 ms  |
 
 | Resident memory | min      | median   | mean     | max      |
 |-----------------|----------|----------|----------|----------|
-| Node.js         | 71.4 MiB | 72.6 MiB | 72.6 MiB | 73.5 MiB |
-| TypeNative      | 11.1 MiB | 15.3 MiB | 13.4 MiB | 15.8 MiB |
+| Node.js         | 70.3 MiB | 71.5 MiB | 71.3 MiB | 71.9 MiB |
+| TypeNative      | 6.8 MiB  | 10.8 MiB | 10.1 MiB | 11.0 MiB |
 
-**TypeNative serves the first page 4.8x sooner and uses 4.7x less memory**
-(median). One TypeNative run took 719 ms, which is why its mean is so far above its
-median. The app is a single 12.4 MiB binary with the UI included, or 8.7 MiB with
-`--gui --release`. An Electron build of the same app would ship about 100 MiB of
-Chromium and Node. This app uses the webview the OS already has, and its backend
-idles at about 15 MiB.
+**TypeNative serves the first page 5.9x sooner and uses 6.6x less memory**
+(median). The app is a single 12.6 MiB binary with the UI included. An Electron
+build of the same app would ship about 100 MiB of Chromium and Node. This app uses
+the webview the OS already has, and its backend idles at about 11 MiB.
 
 These figures cover the headless server process only. They leave out the webview's
 own processes, which are about the same for both runtimes, and the extra window

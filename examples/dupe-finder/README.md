@@ -61,12 +61,12 @@ duplicates. It runs each runtime once to warm the OS file cache, then times
 byte-identical.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.1, default (non-`--release`) build.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Runtime    | min       | median    | mean      | max       |
 |------------|-----------|-----------|-----------|-----------|
-| Node.js    | 659.14 ms | 674.33 ms | 675.70 ms | 700.33 ms |
-| TypeNative | 398.94 ms | 412.47 ms | 411.52 ms | 423.42 ms |
+| Node.js    | 646.80 ms | 660.32 ms | 659.88 ms | 684.20 ms |
+| TypeNative | 397.47 ms | 407.00 ms | 407.20 ms | 418.77 ms |
 
 Both runtimes found the same 449 duplicate groups (1,494 files hashed,
 81.9 MiB wasted). **TypeNative finishes the scan 1.6x faster** (median). The

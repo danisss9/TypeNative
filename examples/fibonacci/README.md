@@ -62,23 +62,23 @@ reports two numbers per run: the program's own in-process compute time
 (parsed from its output) and the total wall time including process startup.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.0, default (non-`--release`) build.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 Compute time, `fib(35)` over 15 runs (measured in-program):
 
 | Runtime    | min       | median    | mean      | max       |
 |------------|-----------|-----------|-----------|-----------|
-| Node.js    | 93.53 ms  | 94.81 ms  | 96.43 ms  | 101.84 ms |
-| TypeNative | 42.61 ms  | 50.16 ms  | 49.57 ms  | 54.02 ms  |
+| Node.js    | 94.18 ms  | 96.96 ms  | 102.32 ms | 131.38 ms |
+| TypeNative | 47.59 ms  | 50.96 ms  | 51.35 ms  | 60.85 ms  |
 
 Total wall time per run, including startup (spawn to exit):
 
 | Runtime    | min       | median    | mean      | max       |
 |------------|-----------|-----------|-----------|-----------|
-| Node.js    | 197.57 ms | 203.96 ms | 209.96 ms | 227.60 ms |
-| TypeNative | 63.76 ms  | 65.49 ms  | 66.83 ms  | 78.75 ms  |
+| Node.js    | 202.18 ms | 222.81 ms | 226.27 ms | 282.14 ms |
+| TypeNative | 62.64 ms  | 68.90 ms  | 72.18 ms  | 93.87 ms  |
 
-**TypeNative computes 1.9x faster** and finishes the whole run **3.1x
+**TypeNative computes 1.9x faster** and finishes the whole run **3.2x
 faster**. The recursive calls, arithmetic, and number boxing all compile
 ahead of time to native machine code via Go, while V8 must tier up through
 its JIT before it reaches comparable speed — and never reaches it here, since

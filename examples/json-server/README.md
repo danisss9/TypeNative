@@ -104,24 +104,24 @@ plain `node:http` client tops out around 8–11k req/s on this machine, so
 with it both servers would simply tie at the client's limit.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
-TypeNative 0.4.0, default (non-`--release`) build, client and server on the
-same machine. Re-run variation is about ±10%; across runs TypeNative was
-1.2–1.3x Node on GET and 1.2–1.4x on POST.
+TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build, client
+and server on the same machine. Re-run variation is about ±10%; across runs
+TypeNative was 1.2x Node on GET and 1.1–1.2x on POST.
 
 | Runtime    | Endpoint    |  req/s | p50 (ms) | p99 (ms) |
 |------------|-------------|-------:|---------:|---------:|
-| Node.js    | GET /todos  |  13379 |     1.02 |     3.03 |
-| TypeNative | GET /todos  |  17794 |     0.66 |     1.87 |
-| Node.js    | POST /todos |  15405 |     0.94 |     2.17 |
-| TypeNative | POST /todos |  19581 |     0.60 |     2.32 |
+| Node.js    | GET /todos  |  13922 |     1.04 |     2.72 |
+| TypeNative | GET /todos  |  16933 |     0.73 |     1.86 |
+| Node.js    | POST /todos |  15044 |     0.96 |     2.23 |
+| TypeNative | POST /todos |  17043 |     0.69 |     2.46 |
 
-**TypeNative serves ~1.3x more requests per second**, with lower median
+**TypeNative serves ~1.2x more requests per second**, with lower median
 latency on both routes. JavaScript still runs one thing at a time, as in
 Node, but the compiled server spreads everything around it — socket reads
 and writes, HTTP parsing — across Go's `net/http` goroutines, and runs the
 handler right on the request's goroutine whenever the event loop is free.
 
 On top of that, the binary starts in ~15 ms instead of ~100 ms and is a
-single 9.7 MB executable with zero dependencies — `scp` it to a server and
+single 11.4 MB executable with zero dependencies — `scp` it to a server and
 run it, no Node install, no `node_modules` — and CPU-heavy work inside a
 handler runs ~2x faster (see the [fibonacci example](../fibonacci/README.md)).

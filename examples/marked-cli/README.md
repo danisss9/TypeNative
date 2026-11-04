@@ -94,30 +94,28 @@ checks that the two HTML outputs are identical:
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
 Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 6.4 MB. The machine had other work
-running while these were taken, which slows both runtimes, so read the ratios
-rather than the absolute times.
+(non-`--release`) build. The binary is 6.5 MB.
 
 (a) `marked < README.md` (3.5 KB), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 251.42 ms | 273.16 ms | 271.37 ms | 296.58 ms |
-| TypeNative | 40.42 ms  | 45.14 ms  | 46.14 ms  | 57.35 ms  |
+| Node.js    | 179.43 ms | 187.71 ms | 187.94 ms | 201.77 ms |
+| TypeNative | 24.41 ms  | 26.26 ms  | 26.87 ms  | 39.76 ms  |
 
 (b) `marked < generated.md` (10.0 MB, 114,893 lines), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 2,608 ms | 2,642 ms | 2,669 ms | 2,792 ms | 3.79          |
-| TypeNative | 4,111 ms | 4,167 ms | 4,161 ms | 4,202 ms | 2.40          |
+| Node.js    | 1,991 ms | 2,031 ms | 2,047 ms | 2,128 ms | 4.92          |
+| TypeNative | 3,364 ms | 3,442 ms | 3,428 ms | 3,478 ms | 2.91          |
 
-**Per call, TypeNative is 6.1x faster** (45 ms vs 273 ms, median). Node's
+**Per call, TypeNative is 7.1x faster** (26 ms vs 188 ms, median). Node's
 cost here is mostly startup: it loads and type-strips the 13 TypeScript files
 and compiles marked's regexes on every run. That's what you feel when a docs
 build or a hook renders one file per process.
 
-**On bulk throughput, TypeNative is 1.6x slower.** On a long input V8's JIT
+**On bulk throughput, TypeNative is 1.7x slower.** On a long input V8's JIT
 and its regex engine (Irregexp compiles hot patterns to machine code) still run
 marked faster than the compiled Go does. In a profile of the native run on
 10 MB, about 30% of the main thread is TypeNative's regex VM, which interprets
@@ -129,9 +127,9 @@ binary finishes first up to about 1–2 MB of markdown per process:
 
 | Input  | Node.js | TypeNative |
 | ------ | ------- | ---------- |
-| 512 KB | 442 ms  | 268 ms     |
-| 1 MB   | 560 ms  | 477 ms     |
-| 2 MB   | 740 ms  | 851 ms     |
+| 512 KB | 313 ms  | 201 ms     |
+| 1 MB   | 426 ms  | 370 ms     |
+| 2 MB   | 572 ms  | 710 ms     |
 
 (Medians of 5 full process runs each, same generator.)
 

@@ -84,30 +84,28 @@ and checks that the two JSON outputs are identical:
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
 Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 7.6 MB. The machine had other work
-running while these were taken, which slows both runtimes, so read the ratios
-rather than the absolute times.
+(non-`--release`) build. The binary is 7.6 MB.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 366.01 ms | 400.18 ms | 398.72 ms | 435.91 ms |
-| TypeNative | 24.51 ms  | 32.75 ms  | 32.95 ms  | 51.16 ms  |
+| Node.js    | 257.78 ms | 270.89 ms | 270.09 ms | 289.13 ms |
+| TypeNative | 15.29 ms  | 16.89 ms  | 17.84 ms  | 33.25 ms  |
 
 (b) `yaml --json < manifests.yaml` (10.0 MB), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 3,572 ms | 3,627 ms | 3,635 ms | 3,735 ms | 2.76          |
-| TypeNative | 7,032 ms | 7,056 ms | 7,112 ms | 7,326 ms | 1.42          |
+| Node.js    | 2,487 ms | 2,576 ms | 2,720 ms | 3,406 ms | 3.88          |
+| TypeNative | 6,051 ms | 6,065 ms | 6,214 ms | 6,517 ms | 1.65          |
 
-**Per call, TypeNative is 12x faster** (33 ms vs 400 ms, median). Node's
+**Per call, TypeNative is 16x faster** (17 ms vs 271 ms, median). Node's
 cost here is mostly startup. It loads and type-strips the 78 TypeScript
 files on every run before it reads a byte of input. That's what you feel
 when a tool calls the converter once per file.
 
-**On bulk throughput, TypeNative is 1.9x slower.** Once V8's JIT has warmed
+**On bulk throughput, TypeNative is 2.4x slower.** Once V8's JIT has warmed
 up on a long input, it runs this code faster than the compiled Go does, in
 every phase rather than in one bad spot: lexing, parsing and composing each
 take about twice as long as under Node. The library passes its values around as
@@ -117,13 +115,13 @@ property reads, conversions between object types and allocation, which alone
 takes about a fifth of the main thread. Garbage collection runs on other cores
 and hardly affects the wall clock. These costs grow linearly with input size,
 while Node's head start is fixed, so the native binary finishes first up to
-about 1–2 MB of YAML per process:
+about 1 MB of YAML per process:
 
 | Input  | Node.js | TypeNative |
 | ------ | ------- | ---------- |
-| 512 KB | 655 ms  | 413 ms     |
-| 1 MB   | 859 ms  | 756 ms     |
-| 2 MB   | 1,168 ms | 1,469 ms  |
+| 512 KB | 459 ms  | 334 ms     |
+| 1 MB   | 610 ms  | 632 ms     |
+| 2 MB   | 865 ms  | 1,235 ms   |
 
 (Medians of 5 full process runs each, same generator.)
 
