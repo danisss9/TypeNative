@@ -126,4 +126,10 @@ function compile(template: string, url: string): string {
 
 const path = process.argv[2];
 const template = path ? fs.readFileSync(path, 'utf-8') : DEMO_TEMPLATE;
-console.log(compile(template, path ?? 'demo.component.html'));
+try {
+  console.log(compile(template, path ?? 'demo.component.html'));
+} catch (e) {
+  // (an error the compiler throws, as a comment: the same under both runtimes)
+  console.log(`// compile error: ${(e as Error).message}`);
+  process.exitCode = 1;
+}
