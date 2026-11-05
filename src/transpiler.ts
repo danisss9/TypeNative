@@ -843,7 +843,7 @@ function parseAndLower(code: string): AstNode {
     if (isClassDeclaration(statement) && isIdentifier(statement.name)) topLevelClassNames.add(statement.name.text);
   }
   lowerDynamicExtends(sourceFile);
-  lowerUnderscoreFunctions(sourceFile);
+  lowerUnderscoreNames(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
   lowerSymbolKeys(sourceFile);
@@ -2187,27 +2187,34 @@ function lowerDynamicExtends(node: AstNode, inFunction = false): void {
   });
 }
 
-// function _() {} (zod names its constructor functions so): Go's blank
-// identifier can't name it, so it and the references in its scope become _ǂ
-function lowerUnderscoreFunctions(node: AstNode): void {
-  for (const child of childNodes(node)) lowerUnderscoreFunctions(child);
-  if (!Array.isArray(node.statements)) return;
-  if (!node.statements.some((st: AstNode) => isFunctionDeclaration(st) && isIdentifier(st.name) && st.name.text === '_')) return;
+// Bindings named _ (function _() {}, as zod names its constructor
+// functions; let _ = …; for (const _ of …); [_, a] = …): Go's blank
+// identifier can't hold them, so in a file declaring one, _ becomes _ǂ
+// (property names stay)
+function lowerUnderscoreNames(sourceFile: AstNode): void {
+  const declaresUnderscore = (n: AstNode): boolean => {
+    if (['FunctionDeclaration', 'VariableDeclaration', 'BindingElement', 'Parameter', 'ImportSpecifier', 'ClassDeclaration'].includes(n.kind) && isIdentifier(n.name) && n.name.text === '_') return true;
+    return childNodes(n).some(declaresUnderscore);
+  };
+  if (!declaresUnderscore(sourceFile)) return;
+  const PROPERTY_NAME_KINDS = new Set(['PropertyAccessExpression', 'PropertyAssignment', 'MethodDeclaration', 'PropertyDeclaration', 'PropertySignature', 'MethodSignature', 'GetAccessor', 'SetAccessor', 'EnumMember', 'JsxAttribute']);
   const rename = (n: AstNode, parentKey: string, parent: AstNode | undefined): void => {
+    // (a signature's parameters — no body — bind nothing)
+    if (parentKey === 'parameters' && parent && !parent.body) return;
     if (isIdentifier(n) && n.text === '_') {
-      // (a property name — o._ — is not the function)
-      if (!(parent && (isPropertyAccessExpression(parent) && parentKey === 'name'))) n.text = '_ǂ';
+      if (!(parent && parentKey === 'name' && PROPERTY_NAME_KINDS.has(parent.kind)) && !(parent?.kind === 'ImportSpecifier' && parentKey === 'propertyName') && parent?.kind !== 'ShorthandPropertyAssignment') n.text = '_ǂ';
       return;
     }
     for (const key of Object.keys(n)) {
-      if (key === 'parent') continue;
+      // (types hold no bindings: (_: T) => R stays as it is)
+      if (key === 'parent' || key === 'type' || key === 'typeArguments' || key === 'typeParameters') continue;
       const v = n[key];
       if (Array.isArray(v)) {
         for (const el of v) if (el && typeof el.kind === 'string') rename(el, key, n);
       } else if (v && typeof v.kind === 'string') rename(v, key, n);
     }
   };
-  for (const st of node.statements) rename(st, 'statements', node);
+  rename(sourceFile, '', undefined);
 }
 
 // The classes a file declares at its top level (lowerDynamicExtends)
@@ -3460,6 +3467,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // C.prototype: the class stands in for its prototype
     if (isIdentifier(node.expression) && classNames.has(node.expression.text) && node.name.text === 'prototype') {
       return classValue(node.expression.text);
+    }
+    // Object.prototype (Object.getPrototypeOf(o) !== Object.prototype): the
+    // Object class value, which plain objects have as theirs
+    if (isIdentifier(node.expression) && node.expression.text === 'Object' && node.name.text === 'prototype' && !classNames.has('Object') && !variableGoTypes.has('Object')) {
+      useHelper('classes');
+      return 'TnClass_Object';
     }
     // x.constructor: the class of a class instance
     if (node.name.text === 'constructor' && !isCallee(node) && !isAssignmentTarget(node)) {
@@ -8498,7 +8511,7 @@ function jsonCallbackAdapter(fnNode: AstNode | undefined, fnCode: string): strin
     // `func(k string, v any)`: drop parameter names
     const space = p.indexOf(' ');
     const first = space > 0 ? p.slice(0, space) : p;
-    return space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_]\w*$/.test(first)
+    return space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_ǂ][\wǂ]*$/.test(first)
       ? p.slice(space + 1)
       : p;
   });
@@ -8795,6 +8808,11 @@ function builtinInstanceOf(value: string, name: string): string {
   }
   // primitive wrapper objects (new String(…)) don't exist in TypeNative
   if (name === 'String' || name === 'Number' || name === 'Boolean') return `func() bool { _ = ${value}; return false }()`;
+  // a promise: a channel
+  if (name === 'Promise') {
+    importedPackages.add('reflect');
+    return `func() bool { v := interface{}(${value}); return v != nil && reflect.TypeOf(v).Kind() == reflect.Chan }()`;
+  }
   return '';
 }
 
@@ -11019,6 +11037,7 @@ function isLocallyBound(expr: AstNode): boolean {
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
   if (expr?.kind === 'TnExtendClass') return 'interface{}';
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Object' && expr.name.text === 'prototype' && !classNames.has('Object')) return 'interface{}';
   // C.prototype: the class value, which takes methods as a dynamic object
   if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && classNames.has(expr.expression.text) && expr.name.text === 'prototype') return 'interface{}';
   // A variable read inside its own initializer (an object whose methods
@@ -13676,29 +13695,75 @@ function getEnumBaseType(node: AstNode): 'string' | 'float64' | 'interface{}' {
   return hasString ? 'string' : 'float64';
 }
 
-function readNumericEnumInitializer(initializer: AstNode): number | undefined {
-  if (isNumericLiteral(initializer)) {
-    return Number(initializer.text);
+// A numeric enum member's constant value: a number, or an expression of
+// numbers and the enum's earlier members (`known`: by bare name or as
+// Enum.MEMBER) with the arithmetic and bitwise operators, as TS computes it
+function readNumericEnumInitializer(initializer: AstNode, known?: Map<string, number>, enumName?: string): number | undefined {
+  const node = unwrapParentheses(initializer);
+  if (isNumericLiteral(node)) {
+    // (0b0000_01: numeric separators)
+    return Number(node.text.replace(/_/g, ''));
   }
-
-  if (
-    isPrefixUnaryExpression(initializer) &&
-    initializer.operator === 'MinusToken' &&
-    isNumericLiteral(initializer.operand)
-  ) {
-    return -Number(initializer.operand.text);
+  if (known && isIdentifier(node) && known.has(node.text)) return known.get(node.text);
+  if (known && enumName && isPropertyAccessExpression(node) && isIdentifier(node.expression) && node.expression.text === enumName && known.has(node.name.text)) {
+    return known.get(node.name.text);
   }
-
+  if (isPrefixUnaryExpression(node)) {
+    const operand = readNumericEnumInitializer(node.operand, known, enumName);
+    if (operand === undefined) return undefined;
+    if (node.operator === 'MinusToken') return -operand;
+    if (node.operator === 'PlusToken') return operand;
+    if (node.operator === 'TildeToken') return ~operand;
+    return undefined;
+  }
+  if (known && isBinaryExpression(node)) {
+    const a = readNumericEnumInitializer(node.left, known, enumName);
+    const b = readNumericEnumInitializer(node.right, known, enumName);
+    if (a === undefined || b === undefined) return undefined;
+    switch (node.operatorToken.kind) {
+      case 'BarToken': return a | b;
+      case 'AmpersandToken': return a & b;
+      case 'CaretToken': return a ^ b;
+      case 'LessThanLessThanToken': return a << b;
+      case 'GreaterThanGreaterThanToken': return a >> b;
+      case 'GreaterThanGreaterThanGreaterThanToken': return a >>> b;
+      case 'PlusToken': return a + b;
+      case 'MinusToken': return a - b;
+      case 'AsteriskToken': return a * b;
+      case 'SlashToken': return a / b;
+      case 'PercentToken': return a % b;
+    }
+  }
   return undefined;
 }
 
+// Each member's constant value (auto-incremented after the last known one),
+// or undefined when it is computed at run time
+function enumMemberValues(node: AstNode): Map<AstNode, number | undefined> {
+  const out = new Map<AstNode, number | undefined>();
+  const known = new Map<string, number>();
+  const enumName: string = node.name?.text ?? '';
+  let next: number | undefined = 0;
+  for (const m of node.members ?? []) {
+    let value: number | undefined;
+    if (m.initializer) value = isStringLiteral(m.initializer) || isNoSubstitutionTemplateLiteral(m.initializer) ? undefined : readNumericEnumInitializer(m.initializer, known, enumName);
+    else value = next;
+    out.set(m, value);
+    const name = isIdentifier(m.name) || isStringLiteral(m.name) ? m.name.text : undefined;
+    if (value !== undefined && name !== undefined) known.set(name, value);
+    next = value !== undefined ? value + 1 : undefined;
+  }
+  return out;
+}
+
 function enumHasComputedMember(node: AstNode): boolean {
+  const values = enumMemberValues(node);
   return (node.members ?? []).some(
     (m: AstNode) =>
       m.initializer &&
       !isStringLiteral(m.initializer) &&
       !isNoSubstitutionTemplateLiteral(m.initializer) &&
-      readNumericEnumInitializer(m.initializer) === undefined
+      values.get(m) === undefined
   );
 }
 
@@ -13710,6 +13775,7 @@ function visitEnumDeclaration(node: AstNode, inPlace = false): string {
   let canAutoIncrement = true;
   let hasComputedMember = false;
   const members: string[] = [];
+  const constantValues = enumMemberValues(node);
 
   for (const member of (node.members ?? [])) {
     const memberName = getEnumMemberName(member.name);
@@ -13720,7 +13786,7 @@ function visitEnumDeclaration(node: AstNode, inPlace = false): string {
       if (baseType === 'interface{}' && (isStringLiteral(member.initializer) || isNoSubstitutionTemplateLiteral(member.initializer))) {
         valueExpr = visit(member.initializer);
       } else if (baseType !== 'string') {
-        const numericValue = readNumericEnumInitializer(member.initializer);
+        const numericValue = constantValues.get(member);
         if (numericValue !== undefined) {
           valueExpr = `${numericValue}`;
           nextNumericValue = numericValue + 1;
@@ -16372,7 +16438,8 @@ function goFuncParamTypes(funcType: string): string[] {
   return splitGoParameters(paramList).map((p) => {
     const space = p.indexOf(' ');
     const first = space > 0 ? p.slice(0, space) : p;
-    const isName = space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_]\w*$/.test(first);
+    // (ǂ stands for $ and _ in names: see goIdentifierChars)
+    const isName = space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_ǂ][\wǂ]*$/.test(first);
     return isName ? p.slice(space + 1) : p;
   });
 }
@@ -23212,6 +23279,15 @@ func TnClassOf(v interface{}) interface{} {
 	if c, ok := tnClassesByType[reflect.TypeOf(v)]; ok {
 		return c
 	}
+	// (a plain object's prototype is Object.prototype)
+	switch o := v.(type) {
+	case map[string]interface{}:
+		return TnClass_Object
+	case *TnMap[string, interface{}]:
+		if o.TnJSKind() == 0 {
+			return TnClass_Object
+		}
+	}
 	return nil
 }
 
@@ -28629,7 +28705,9 @@ function visitImportDeclaration(node: AstNode): string {
     // Renamed bindings refer to the original declaration (one Go package)
     const bindings = node.importClause?.namedBindings;
     if (bindings && isNamespaceImport(bindings)) defaultImportNamespaces.add(bindings.name.text);
-    if (bindings && isNamedImports(bindings)) {
+    // (a linked module's bindings were renamed at link time; the global alias
+    // would rename another file's own declaration of the local name)
+    if (bindings && isNamedImports(bindings) && !node.linkedKey) {
       for (const el of bindings.elements ?? []) {
         if (!el.propertyName) continue;
         importAliases.set(el.name.text, getSafeName(el.propertyName.text));
