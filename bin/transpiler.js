@@ -12535,7 +12535,9 @@ function inferExpressionTypeOf(expr) {
         // visited (an importer emitted first): its declared type
         if (varType === undefined && declaredVariables.has(expr.text)) {
             const declared = declaredVariables.get(expr.text);
-            if (declared.type && sourceFileIndexOf(declared) !== sourceFileIndexOf(expr))
+            // (in its own module too, read in a function emitted before it: zod's
+            // inst.uuid = … core._uuid(ZodUUID, …), ZodUUID declared further down)
+            if (declared.type && (sourceFileIndexOf(declared) !== sourceFileIndexOf(expr) || !isLocallyBound(expr) && !!getEnclosingFunction(expr)))
                 varType = getType(declared.type);
             // (const f = g of a declared function g, as f.prop = g lowers expandos)
             const init = declared.type ? undefined : declared.initializer;
@@ -19552,6 +19554,14 @@ function getCalleeSignature(call) {
         const staticMethod = staticMethodDeclaration(call.expression.expression.text, call.expression.name.text);
         if (staticMethod?.body)
             return staticMethod;
+    }
+    // util.f(…) through a namespace import: f's declaration
+    if (isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.name) && isIdentifier(call.expression.expression) &&
+        defaultImportNamespaces.has(call.expression.expression.text) && !variableGoTypes.has(call.expression.expression.text) &&
+        !declaredFunctions.has(call.expression.expression.text) && !classNames.has(call.expression.expression.text)) {
+        const declared = calledFunctionDeclaration(call.expression.name.text, call);
+        if (declared)
+            return declared;
     }
     // this.#m(…): a private method's declaration
     if (isPropertyAccessExpression(call.expression) && call.expression.name?.kind === 'PrivateIdentifier' && call.expression.expression.kind === 'ThisKeyword') {
