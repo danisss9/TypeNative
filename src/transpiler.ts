@@ -12041,6 +12041,14 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
       if (fn && !fn.asteriskToken && !(fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword') && sourceFileIndexOf(declared) !== sourceFileIndexOf(expr)) {
         varType = inferArrowFunctionGoType(fn);
       }
+      // (an unannotated one: its initializer's type — zod's z.object(…), any)
+      // (or one read, in a function, before its module's declaration of it)
+      if (varType === undefined && init && !fn && !declared.tnInferring && !isLocallyBound(expr)) {
+        declared.tnInferring = true;
+        const inferred = inferExpressionType(init);
+        declared.tnInferring = false;
+        if (inferred && inferred !== 'nil') varType = toFieldGoType(inferred);
+      }
     }
     const typeofNarrowed = (varType ?? 'interface{}') === 'interface{}' ? typeofNarrowedType(expr.text) : undefined;
     if (typeofNarrowed && isNarrowableReference(expr) && !isAssignmentTarget(expr)) return typeofNarrowed;
