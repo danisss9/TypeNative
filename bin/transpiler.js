@@ -759,6 +759,7 @@ function parseAndLower(code) {
     lowerDynamicExtends(sourceFile);
     lowerUnderscoreNames(sourceFile);
     lowerNestedVars(sourceFile);
+    lowerForwardReferencedLets(sourceFile);
     lowerClassExpressions(sourceFile);
     lowerWeakCollections(sourceFile);
     lowerSymbolKeys(sourceFile);
@@ -2488,6 +2489,66 @@ function lowerUnderscoreNames(sourceFile) {
     };
     rename(sourceFile, '', undefined);
 }
+// let x = … in a function body that a closure declared before it uses (jsesc's
+// increaseIndentation assigns indent, declared further down): legal in JS,
+// as the closure runs later; declared at the top of the body (typed by its
+// annotation, else its initializer's type), assigned where it was declared
+function lowerForwardReferencedLets(node) {
+    for (const child of childNodes(node))
+        lowerForwardReferencedLets(child);
+    if (!FUNCTION_LIKE_KINDS.has(node.kind) || !node.body || !isBlock(node.body))
+        return;
+    const statements = node.body.statements ?? [];
+    // (a read of the name, not a property's: options.indent, { indent: … })
+    const readsName = (n, name) => {
+        if (!n || typeof n !== 'object')
+            return false;
+        if (n.kind === 'Identifier')
+            return n.text === name;
+        for (const key of Object.keys(n)) {
+            if (key === 'parent')
+                continue;
+            if (key === 'name' && ['PropertyAccessExpression', 'PropertyAssignment', 'MethodDeclaration', 'PropertyDeclaration', 'GetAccessor', 'SetAccessor'].includes(n.kind))
+                continue;
+            const v = n[key];
+            if (Array.isArray(v) ? v.some((c) => c && typeof c.kind === 'string' && readsName(c, name)) : v && typeof v.kind === 'string' && readsName(v, name))
+                return true;
+        }
+        return false;
+    };
+    const referencedInClosure = (st, name) => containsNode(st, (n) => FUNCTION_LIKE_KINDS.has(n.kind) && readsName(n.body, name));
+    const hoisted = [];
+    const out = [];
+    statements.forEach((st, j) => {
+        const list = st.kind === 'VariableStatement' ? st.declarationList : undefined;
+        const kind = list?.declarationKind;
+        if (!list || (kind !== 'let' && kind !== 'const')) {
+            out.push(st);
+            return;
+        }
+        const moved = (list.declarations ?? []).filter((d) => isIdentifier(d.name) && statements.slice(0, j).some((earlier) => referencedInClosure(earlier, d.name.text)));
+        if (moved.length === 0) {
+            out.push(st);
+            return;
+        }
+        const at = { line: st.line, column: st.column };
+        for (const d of moved) {
+            // (typed by the initializer, inferred where the declaration was)
+            const type = d.type ?? (d.initializer ? { kind: 'TnTypeOf', expression: JSON.parse(JSON.stringify(d.initializer)), ...at } : undefined);
+            hoisted.push({ kind: 'VariableStatement', declarationList: { kind: 'VariableDeclarationList', declarationKind: 'let', declarations: [{ kind: 'VariableDeclaration', name: { ...d.name }, type, ...at }], ...at }, ...at });
+        }
+        const kept = (list.declarations ?? []).filter((d) => !moved.includes(d));
+        if (kept.length > 0)
+            out.push({ ...st, declarationList: { ...list, declarations: kept } });
+        for (const d of moved) {
+            if (!d.initializer)
+                continue;
+            out.push({ kind: 'ExpressionStatement', expression: { kind: 'BinaryExpression', left: { ...d.name }, operatorToken: { kind: 'EqualsToken' }, right: d.initializer, ...at }, ...at });
+        }
+    });
+    if (hoisted.length > 0)
+        node.body.statements = [...hoisted, ...out];
+}
 // var x = … inside a nested block of a function, read after the block (var
 // is function-scoped): declared at the top of the function (typed by its
 // annotation or literal initializer), assigned where it was declared
@@ -3880,6 +3941,11 @@ function visitNode(node, options = {}) {
                         break;
                 }
             }
+        }
+        // Array.isArray as a value (const isArray = Array.isArray)
+        if (isIdentifier(node.expression) && node.expression.text === 'Array' && node.name.text === 'isArray' && !isCallee(node) && !variableGoTypes.has('Array') && !classNames.has('Array')) {
+            useHelper('isArray');
+            return 'func(__v interface{}) bool { return TnIsArray(__v) }';
         }
         // Symbol.hasInstance as a value: the well-known symbol
         if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'hasInstance' && !variableGoTypes.has('Symbol')) {
@@ -8447,8 +8513,12 @@ function visitSpreadCallArguments(node) {
             useHelper('dynamic');
             const source = visit(arg.expression);
             const start = result.length;
-            for (let i = start; i < params.length; i++)
-                result.push(`TnAt(${source}, ${i - start})`);
+            // (each converted to its parameter's type)
+            for (let i = start; i < params.length; i++) {
+                const paramType = getParameterGoType(params[i]);
+                const generic = (fn?.typeParameters ?? []).some((tp) => tp.name?.text && new RegExp(`\\b${tp.name.text}\\b`).test(paramType));
+                result.push(generic || params[i].initializer || params[i].dotDotDotToken ? `TnAt(${source}, ${i - start})` : convertBetweenGoTypes(`TnAt(${source}, ${i - start})`, 'interface{}', paramType));
+            }
         }
     }
     return result;
@@ -12309,6 +12379,8 @@ function inferExpressionTypeOf(expr) {
     }
     if (isFunctionPropertyAccess(expr))
         return 'interface{}';
+    if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Array' && expr.name.text === 'isArray' && !isCallee(expr) && !variableGoTypes.has('Array') && !classNames.has('Array'))
+        return 'func(interface{}) bool';
     if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && expr.name.text === 'hasInstance' && !variableGoTypes.has('Symbol'))
         return '*TnSymbol';
     if (isPropertyAccessExpression(expr) && expr.name.text === 'prototype' && !(isIdentifier(expr.expression) && classNames.has(expr.expression.text)) && inferExpressionType(expr.expression)?.startsWith('func('))
@@ -15360,6 +15432,12 @@ function getType(typeNode, getArrayType = false) {
     // a type the transpiler inferred (see inferEvolvingLetType)
     if (typeNode.kind === 'TnGoType') {
         return getArrayType && typeNode.goType.startsWith('[]') ? typeNode.goType.slice(2) : typeNode.goType;
+    }
+    // (a hoisted declaration's: its initializer's type, see lowerForwardReferencedLets)
+    if (typeNode.kind === 'TnTypeOf') {
+        const inferred = inferExpressionType(typeNode.expression);
+        const goType = !inferred || inferred === 'nil' ? 'interface{}' : toFieldGoType(inferred);
+        return getArrayType && goType.startsWith('[]') ? goType.slice(2) : goType;
     }
     if (typeNode.kind === 'ParenthesizedType')
         return getType(typeNode.type, getArrayType);
@@ -19583,7 +19661,9 @@ function visitCallArguments(node) {
     // (a parameter typed by the callee's own type parameter is left to Go's
     // inference — unless another argument binds it: getOrInsertDefault(map,
     // key, new Set()) takes the map's value type for the Set)
-    const typeParamNames = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '');
+    // (erased ones are any values in Go: their arguments convert as such)
+    const erasedNames = FUNCTION_LIKE_KINDS.has(fn.kind) ? erasedFunctionTypeParameters(fn) : new Set();
+    const typeParamNames = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '').filter((n) => !erasedNames.has(n));
     const typeBindings = typeParamNames.length > 0 ? bindArgumentTypeParameters(params, args, typeParamNames) : new Map();
     // (a call naming type arguments Go couldn't infer: the arguments converted
     // to the instantiated parameter types)
