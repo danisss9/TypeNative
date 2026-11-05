@@ -9232,8 +9232,21 @@ function mergeObjectUnionMembers(members: AstNode[]): string {
 // An object literal's contextual type; of a union of object types (a
 // discriminated union), the member the literal is: the one its `type: '…'`
 // (any string-literal-typed key) selects, else the first with all its keys
+// Whether a type reference names a type parameter of a declaration around
+// it (getOrInsertDefault<U, V>(…, defaultValue: V)): no shape of its own
+function isTypeParameterReference(typeNode: AstNode | undefined): boolean {
+  if (!isTypeReferenceNode(typeNode) || !isIdentifier(typeNode.typeName) || (typeNode.typeArguments ?? []).length > 0) return false;
+  const name = typeNode.typeName.text;
+  for (let n = typeNode.parent; n; n = n.parent) {
+    if ((n.typeParameters ?? []).some((tp: AstNode) => tp.name?.text === name)) return true;
+  }
+  return false;
+}
+
 function objectLiteralContextualType(node: AstNode): AstNode | undefined {
-  const contextual = resolveTypeNode(getContextualTypeNode(node));
+  const declaredContext = getContextualTypeNode(node);
+  if (isTypeParameterReference(declaredContext)) return undefined;
+  const contextual = resolveTypeNode(declaredContext);
   if (!contextual || !isUnionTypeNode(contextual)) return contextual;
   // (a union of object type literals is one merged object type)
   if (objectLiteralUnionMembers((contextual.types ?? []).filter((t: AstNode) => t.kind !== 'NullKeyword' && t.kind !== 'UndefinedKeyword'))) return contextual;
@@ -12671,7 +12684,7 @@ function getMappedType(typeNode: AstNode): string {
   return 'interface{}';
 }
 
-const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit', 'NonNullable']);
+const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit', 'NonNullable', 'NoInfer']);
 
 // "name T" field declarations of an object type (type literal, alias or interface)
 // An object type's fields (name → Go type): an interface's with inherited
@@ -12860,6 +12873,8 @@ function getNullishResultType(expr: AstNode): string | undefined {
   // (an operand of unknown type may hold any value: only a primitive
   // fallback types the result)
   if (!leftValueType) return ['string', 'float64', 'bool'].includes(rightType) ? rightType : 'interface{}';
+  // (two different object types — loc ?? GeneratedSource, a symbol — is either)
+  if (leftValueType.startsWith('*') && rightType.startsWith('*') && leftValueType !== rightType) return 'interface{}';
   return leftValueType;
 }
 
@@ -14092,6 +14107,9 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (nonNullTypes.length === 1 && nonNullTypes.length < typeNode.types.length) {
       // This is a nullable type T | null or T | undefined
       const innerType = getType(nonNullTypes[0]);
+      // (a string enum's named type can't hold nil: Effect | null is any)
+      const inner = nonNullTypes[0];
+      if (isTypeReferenceNode(inner) && isIdentifier(inner.typeName) && enumNames.has(inner.typeName.text) && innerType === getSafeName(inner.typeName.text)) return 'interface{}';
       if (['float64', 'string', 'bool'].includes(innerType) || isStructGoType(innerType)) {
         return `*${innerType}`;
       }
@@ -16691,6 +16709,11 @@ const BUILTIN_TYPE_NAMES: Record<string, string> = {
   InstanceType: 'interface{}',
   ConstructorParameters: 'interface{}',
   Awaited: 'interface{}',
+  // (DOM / performance and lib types a program may name without building)
+  PerformanceMeasure: 'interface{}',
+  PerformanceMark: 'interface{}',
+  Proxy: 'interface{}',
+  WeakSet: 'interface{}',
   String: 'string',
   Number: 'float64',
   Boolean: 'bool',
@@ -17216,11 +17239,30 @@ function getTypeParameters(
     typeParameters = (typeParameters ?? []).filter((tp: AstNode) => !erased.has(tp.name?.text));
   }
   if (!typeParameters || typeParameters.length === 0) return '';
+  // (a type parameter keying a Map / Set of the signature — a Go map's key
+  // — must be comparable)
+  const keyed = new Set<string>();
+  if (owner) {
+    const scan = (n: AstNode): void => {
+      if (isTypeReferenceNode(n) && isIdentifier(n.typeName) && ['Map', 'ReadonlyMap', 'Set', 'ReadonlySet', 'WeakMap', 'WeakSet', 'Record'].includes(n.typeName.text)) {
+        const key = n.typeArguments?.[0];
+        if (isTypeReferenceNode(key) && isIdentifier(key.typeName)) keyed.add(key.typeName.text);
+      }
+      for (const child of childNodes(n)) scan(child);
+    };
+    for (const p of owner.parameters ?? []) if (p.type) scan(p.type);
+    if (owner.type) scan(owner.type);
+    for (const m of owner.members ?? []) {
+      if (m.type) scan(m.type);
+      for (const p of m.parameters ?? []) if (p.type) scan(p.type);
+    }
+  }
   const params = typeParameters.map((tp) => {
     const name = visit(tp.name);
     const constraint = tp.constraint ? getType(tp.constraint) : 'any';
     // Go constraints cannot require fields: object-type bounds become any
-    return `${name} ${constraint.startsWith('*') ? 'any' : constraint}`;
+    const bound = constraint.startsWith('*') ? 'any' : constraint;
+    return `${name} ${bound === 'any' && keyed.has(tp.name?.text) ? 'comparable' : bound}`;
   });
   return `[${params.join(', ')}]`;
 }
@@ -18495,6 +18537,8 @@ interface LinkedModule {
   ast: AstNode;
   // export name → package-unique name ('default' for the default export)
   exports: Map<string, string>;
+  // export name → the module and name a named re-export passes on
+  forwards: Map<string, { key: string; remote: string }>;
   // keys of the modules `export * from` re-exports
   starExports: string[];
   // export name → key of the module a re-exported namespace import names
@@ -18546,11 +18590,25 @@ function hasModifier(node: AstNode, kind: string): boolean {
 }
 
 // A module's package-unique name for an export, following `export * from`
+// Modules a module re-exports from, resolved but maybe not linked yet (a
+// cycle reaches the re-export first): linked on demand by linkedExportName
+const pendingModules = new Map<string, { content: string; dir: string | null; tsx: boolean; fileName: string }>();
+
 function linkedExportName(key: string, name: string, seen: Set<string>): string | undefined {
+  if (!linkedModules.has(key) && pendingModules.has(key)) {
+    const pending = pendingModules.get(key)!;
+    linkModule(key, pending.content, pending.dir, pending.tsx, pending.fileName);
+  }
   const mod = linkedModules.get(key);
   if (!mod || seen.has(key)) return undefined;
   seen.add(key);
   if (mod.exports.has(name)) return mod.exports.get(name);
+  // export { a as b } from './x', its imports still being linked: x's a
+  const forward = mod.forwards.get(name);
+  if (forward) {
+    const found = linkedExportName(forward.key, forward.remote, seen);
+    if (found !== undefined) return found;
+  }
   if (name === 'default') return undefined;
   for (const star of mod.starExports) {
     const found = linkedExportName(star, name, seen);
@@ -18573,7 +18631,7 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     code = normalizeCjsToEsm(code);
   }
   const ast = parseAndLower(code);
-  const mod: LinkedModule = { ast: ast, exports: new Map(), starExports: [] };
+  const mod: LinkedModule = { ast: ast, exports: new Map(), forwards: new Map(), starExports: [] };
   linkedModules.set(key, mod);
   const statements: AstNode[] = ast.statements ?? [];
 
@@ -18627,6 +18685,24 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     }
   }
 
+  // (export * from './x': known before the imports are linked, so a module
+  // importing this one back — a cycle — finds the names passing through)
+  for (const statement of statements) {
+    const isReexport = (statement.kind === 'ExportDeclaration' && !!statement.moduleSpecifier) || (statement.kind === 'ImportDeclaration' && statement.reexport);
+    const spec: string = statement.moduleSpecifier?.text ?? '';
+    if (!isReexport || !isStringLiteral(statement.moduleSpecifier) || !isLinkableSpecifier(spec) || !fileResolver) continue;
+    const resolved = fileResolver(spec, dir);
+    if (!resolved) continue;
+    const targetKey = resolved.path ?? `${resolved.dir}::${spec}`;
+    if (!linkedModules.has(targetKey)) pendingModules.set(targetKey, { content: resolved.content, dir: resolved.dir, tsx: !!resolved.tsx, fileName: resolved.path ?? spec });
+    const elements: AstNode[] = statement.kind === 'ExportDeclaration'
+      ? (statement.exportClause?.elements ?? [])
+      : (statement.importClause?.namedBindings?.kind === 'NamedImports' ? (statement.importClause.namedBindings.elements ?? []) : []);
+    const star = statement.kind === 'ExportDeclaration' ? !statement.exportClause : !statement.importClause;
+    if (star) mod.starExports.push(targetKey);
+    for (const el of elements) mod.forwards.set(el.name.text, { key: targetKey, remote: (el.propertyName ?? el.name).text });
+  }
+
   // 2. Imports: link the imported module, then bind the local names to its exports
   const namespaces = new Map<string, string>();
   // 'local.prop' → the package-unique name of an imported function's expando property
@@ -18645,7 +18721,7 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     if (isTypeReexport) {
       // export * from './x': every export of the target passes through
       if (!statement.exportClause) {
-        mod.starExports.push(targetKey);
+        if (!mod.starExports.includes(targetKey)) mod.starExports.push(targetKey);
         continue;
       }
       for (const el of statement.exportClause.elements ?? []) {
@@ -18656,7 +18732,7 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     }
     const clause = statement.importClause;
     if (!clause) {
-      if (statement.reexport) mod.starExports.push(targetKey);
+      if (statement.reexport && !mod.starExports.includes(targetKey)) mod.starExports.push(targetKey);
       continue;
     }
     if (clause.name) {
