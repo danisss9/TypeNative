@@ -310,6 +310,8 @@ CI (`.github/workflows/ci.yml`) runs `npm run build`, `npm run check:go-types` a
 
 When adding a feature: add a probe, link it from [conformance.md](conformance.md), and keep the ✅/❌ matrix honest gaps are documented, not hidden.
 
+`npm run perf` runs the [performance/](performance/) probes. Each is a micro-benchmark of one hot path (string `+=`, `Map` lookups, `switch` over a discriminated union, `any` property access, regex, …), timed under Node.js and as a TypeNative binary, with checksums that must match. Results and notes on the slow paths are in [performance/README.md](performance/README.md).
+
 ## Self-hosted native compiler
 
 TypeNative compiles itself. `src/main.ts` transpiles to Go and builds into a `typenative` binary that needs no Node.js at runtime and emits the same Go as the npm package:

@@ -8,6 +8,7 @@ Thanks for helping build TypeNative — a TypeScript-to-Go transpiler that ships
 
 - **Add a missing feature** — pick a ❌ row in [conformance.md](conformance.md) and make it ✅.
 - **Fix a bug** — failing probe, wrong Go output, bad error message.
+- **Make a hot path faster** — pick a slow row in [performance/README.md](performance/README.md). Quote `node scripts/performance.mjs <filter>` before and after in the PR, and add a probe if the path you sped up has none.
 - **Improve docs** — README, conformance matrix, code comments.
 - **Report issues** — open an issue with a minimal `.ts` repro, expected vs. actual output, and your `node --version` / `go version`.
 

@@ -19,6 +19,7 @@
     "conformance": "node scripts/conformance.mjs",
     "conformance:parallel": "node scripts/conformance-parallel.mjs",
     "bootstrap:check": "node scripts/bootstrap-check.mjs",
+    "perf": "node scripts/performance.mjs",
     "test": "npm run conformance",
     "release": "npm publish"
   },
