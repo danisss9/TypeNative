@@ -844,6 +844,7 @@ function parseAndLower(code: string): AstNode {
   }
   lowerDynamicExtends(sourceFile);
   lowerUnderscoreNames(sourceFile);
+  lowerNestedVars(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
   lowerSymbolKeys(sourceFile);
@@ -2215,6 +2216,73 @@ function lowerUnderscoreNames(sourceFile: AstNode): void {
     }
   };
   rename(sourceFile, '', undefined);
+}
+
+// var x = … inside a nested block of a function, read after the block (var
+// is function-scoped): declared at the top of the function (typed by its
+// annotation or literal initializer), assigned where it was declared
+function lowerNestedVars(node: AstNode): void {
+  for (const child of childNodes(node)) lowerNestedVars(child);
+  if (!FUNCTION_LIKE_KINDS.has(node.kind) || !node.body || !isBlock(node.body)) return;
+  const hoisted: AstNode[] = [];
+  const seen = new Set<string>();
+  const literalType = (init: AstNode | undefined): AstNode | undefined => {
+    const v = init ? unwrapParentheses(init) : undefined;
+    if (!v) return undefined;
+    if (v.kind === 'TrueKeyword' || v.kind === 'FalseKeyword') return { kind: 'BooleanKeyword' };
+    if (isNumericLiteral(v)) return { kind: 'NumberKeyword' };
+    if (isStringLiteral(v) || isNoSubstitutionTemplateLiteral(v)) return { kind: 'StringKeyword' };
+    return undefined;
+  };
+  const visitBlock = (block: AstNode, nested: boolean): void => {
+    if (!Array.isArray(block.statements)) return;
+    block.statements = block.statements.map((st: AstNode): AstNode => {
+      if (nested && st.kind === 'VariableStatement' && st.declarationList?.declarationKind === 'var') {
+        const decls: AstNode[] = st.declarationList.declarations ?? [];
+        const typed = decls.every((d: AstNode) => isIdentifier(d.name) && (d.type || literalType(d.initializer)));
+        if (typed && decls.length > 0) {
+          const assigns: AstNode[] = [];
+          for (const d of decls) {
+            if (!seen.has(d.name.text)) {
+              seen.add(d.name.text);
+              hoisted.push({
+                kind: 'VariableStatement',
+                declarationList: {
+                  kind: 'VariableDeclarationList',
+                  declarationKind: 'let',
+                  declarations: [{ kind: 'VariableDeclaration', name: { kind: 'Identifier', text: d.name.text }, type: d.type ?? literalType(d.initializer) }]
+                },
+                line: st.line,
+                column: st.column
+              });
+            }
+            if (d.initializer) {
+              assigns.push({
+                kind: 'ExpressionStatement',
+                expression: { kind: 'BinaryExpression', left: { kind: 'Identifier', text: d.name.text, line: d.line, column: d.column }, operatorToken: { kind: 'EqualsToken' }, right: d.initializer },
+                line: st.line,
+                column: st.column
+              });
+            }
+          }
+          return assigns.length === 1 ? assigns[0] : { kind: 'Block', statements: assigns, line: st.line, column: st.column };
+        }
+      }
+      // (blocks of if / else / try / loops / labels; not nested functions)
+      for (const child of childNodes(st)) {
+        if (FUNCTION_LIKE_KINDS.has(child.kind) || child.kind === 'ClassDeclaration' || child.kind === 'ClassExpression') continue;
+        walk(child);
+      }
+      return st;
+    });
+  };
+  const walk = (n: AstNode): void => {
+    if (FUNCTION_LIKE_KINDS.has(n.kind) || n.kind === 'ClassDeclaration' || n.kind === 'ClassExpression') return;
+    if (isBlock(n) || n.kind === 'CaseClause' || n.kind === 'DefaultClause') visitBlock(n, true);
+    else for (const child of childNodes(n)) walk(child);
+  };
+  visitBlock(node.body, false);
+  if (hoisted.length > 0) node.body.statements = [...hoisted, ...(node.body.statements ?? [])];
 }
 
 // The classes a file declares at its top level (lowerDynamicExtends)
@@ -3608,6 +3676,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           ? getObjectFieldGoType(initType, propName)
           : undefined;
         const defaultVal = el.initializer;
+        // const { length } = array / string: its length
+        if (!defaultVal && propName === 'length' && initType && (initType.startsWith('[]') || initType.startsWith('*[]') || initType === 'string')) {
+          const lengthOf = initType === 'string'
+            ? (useHelper('strIndex'), `float64(tnStrCount(${initExpr}))`)
+            : `float64(len(${initType.startsWith('*') ? `*${initExpr}` : initExpr}))`;
+          parts.push(`${localName} := ${lengthOf}`);
+          registerLocalVariable(bindingName(el, localName), 'float64');
+          continue;
+        }
         if (!defaultVal && classGetterMethods.has(`${structName}.${propName}`)) {
           parts.push(`${localName} := (${initExpr}).Get_${goFieldName(propName)}()`);
         } else if (!defaultVal && isStructGetterField(structName, propName)) {
@@ -10582,6 +10659,11 @@ function withFunctionScopeTypes(fn: AstNode, compute: () => string): string {
       const asserted = assertedObjectTypeNode(d.initializer);
       if (asserted) variableTypeNodes.set(d.name.text, asserted);
       else variableTypeNodes.delete(d.name.text);
+    } else if (!d.type && (!d.initializer || isNilLiteral(d.initializer)) && d.parent?.declarationKind !== 'const') {
+      // let x = null, assigned later: the type its assignments give it, as
+      // its declaration is emitted (inferEvolvingLetType)
+      const evolved = inferEvolvingLetType(d);
+      if (evolved && evolved !== 'interface{}') setVarGoType(d.name.text, evolved);
     }
   }
   const result = compute();
