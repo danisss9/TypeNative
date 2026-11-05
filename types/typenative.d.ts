@@ -644,6 +644,8 @@ interface ObjectConstructor {
   /** An instance's class (null for other values) */
   getPrototypeOf(obj: any): any;
   getOwnPropertyDescriptors<T>(obj: T): { [P in keyof T]: PropertyDescriptor } & { [key: string]: PropertyDescriptor };
+  getOwnPropertyDescriptor(obj: any, key: PropertyKey): PropertyDescriptor | undefined;
+  getOwnPropertySymbols(obj: any): symbol[];
   getOwnPropertyNames(obj: any): string[];
   freeze<T>(obj: T): T;
   seal<T>(obj: T): T;
@@ -1748,4 +1750,17 @@ declare namespace JSX {
   interface ElementChildrenAttribute {
     children: {};
   }
+}
+
+// Reflect: the Object operations as functions
+declare namespace Reflect {
+  function apply(target: Function, thisArgument: any, argumentsList: ArrayLike<any>): any;
+  function defineProperty(target: object, propertyKey: PropertyKey, attributes: PropertyDescriptor): boolean;
+  function deleteProperty(target: object, propertyKey: PropertyKey): boolean;
+  function get(target: object, propertyKey: PropertyKey, receiver?: any): any;
+  function getOwnPropertyDescriptor(target: object, propertyKey: PropertyKey): PropertyDescriptor | undefined;
+  function getPrototypeOf(target: object): object | null;
+  function has(target: object, propertyKey: PropertyKey): boolean;
+  function ownKeys(target: object): (string | symbol)[];
+  function set(target: object, propertyKey: PropertyKey, value: any, receiver?: any): boolean;
 }

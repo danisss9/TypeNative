@@ -2193,15 +2193,27 @@ function lowerDynamicExtends(node: AstNode, inFunction = false): void {
 // identifier can't hold them, so in a file declaring one, _ becomes _ǂ
 // (property names stay)
 function lowerUnderscoreNames(sourceFile: AstNode): void {
-  const declaresUnderscore = (n: AstNode): boolean => {
-    if (['FunctionDeclaration', 'VariableDeclaration', 'BindingElement', 'Parameter', 'ImportSpecifier', 'ClassDeclaration'].includes(n.kind) && isIdentifier(n.name) && n.name.text === '_') return true;
-    return childNodes(n).some(declaresUnderscore);
+  // (an array pattern's _ — [_, a] = xs — is Go's blank identifier as it is)
+  const inArrayPattern = (n: AstNode, parent: AstNode | undefined): boolean => n.kind === 'BindingElement' && parent?.kind === 'ArrayBindingPattern';
+  const declaresUnderscore = (n: AstNode, parent?: AstNode): boolean => {
+    if (['FunctionDeclaration', 'VariableDeclaration', 'BindingElement', 'Parameter', 'ImportSpecifier', 'ClassDeclaration'].includes(n.kind) && isIdentifier(n.name) && n.name.text === '_' && !inArrayPattern(n, parent)) return true;
+    return childNodes(n).some((c: AstNode) => declaresUnderscore(c, n));
   };
   if (!declaresUnderscore(sourceFile)) return;
   const PROPERTY_NAME_KINDS = new Set(['PropertyAccessExpression', 'PropertyAssignment', 'MethodDeclaration', 'PropertyDeclaration', 'PropertySignature', 'MethodSignature', 'GetAccessor', 'SetAccessor', 'EnumMember', 'JsxAttribute']);
   const rename = (n: AstNode, parentKey: string, parent: AstNode | undefined): void => {
     // (a signature's parameters — no body — bind nothing)
     if (parentKey === 'parameters' && parent && !parent.body) return;
+    if (n.kind === 'ArrayBindingPattern') {
+      for (const el of n.elements ?? []) {
+        if (el.kind === 'BindingElement' && isIdentifier(el.name) && el.name.text === '_') {
+          if (el.initializer) rename(el.initializer, 'initializer', el);
+          continue;
+        }
+        rename(el, 'elements', n);
+      }
+      return;
+    }
     if (isIdentifier(n) && n.text === '_') {
       if (!(parent && parentKey === 'name' && PROPERTY_NAME_KINDS.has(parent.kind)) && !(parent?.kind === 'ImportSpecifier' && parentKey === 'propertyName') && parent?.kind !== 'ShorthandPropertyAssignment') n.text = '_ǂ';
       return;
@@ -3538,7 +3550,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     // Object.prototype (Object.getPrototypeOf(o) !== Object.prototype): the
     // Object class value, which plain objects have as theirs
-    if (isIdentifier(node.expression) && node.expression.text === 'Object' && node.name.text === 'prototype' && !classNames.has('Object') && !variableGoTypes.has('Object')) {
+    if (isIdentifier(node.expression) && node.expression.text === 'Object' && node.name.text === 'prototype' && !classNames.has('Object') && !variableGoTypes.has('Object') &&
+      !(isPropertyAccessExpression(node.parent) && node.parent.expression === node)) {
       useHelper('classes');
       return 'TnClass_Object';
     }
@@ -4275,6 +4288,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (functionCall) return functionCall;
     const objectCall = visitObjectCall(node);
     if (objectCall) return objectCall;
+    const reflectCall = visitReflectCall(node);
+    if (reflectCall) return reflectCall;
     const caller = visit(node.expression);
     const safeCaller = getSafeName(caller);
     // (explicit type arguments for erased type parameters are dropped)
@@ -11132,7 +11147,8 @@ function isLocallyBound(expr: AstNode): boolean {
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
   if (expr?.kind === 'TnExtendClass') return 'interface{}';
-  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Object' && expr.name.text === 'prototype' && !classNames.has('Object')) return 'interface{}';
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Object' && expr.name.text === 'prototype' && !classNames.has('Object') &&
+    !(isPropertyAccessExpression(expr.parent) && expr.parent.expression === expr)) return 'interface{}';
   // C.prototype: the class value, which takes methods as a dynamic object
   if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && classNames.has(expr.expression.text) && expr.name.text === 'prototype') return 'interface{}';
   // A variable read inside its own initializer (an object whose methods
@@ -11380,6 +11396,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     }
     const objectCallType = inferObjectCallType(expr);
     if (objectCallType) return objectCallType;
+    const reflectName = reflectCallName(expr);
+    if (reflectName) return ['has', 'set', 'deleteProperty', 'defineProperty'].includes(reflectName) ? 'bool' : reflectName === 'ownKeys' ? '[]interface{}' : 'interface{}';
     if (isIdentifier(expr.expression) && expr.expression.text === 'structuredClone') {
       return inferExpressionType(expr.arguments?.[0]);
     }
@@ -12045,10 +12063,56 @@ function objectFieldNames(objectType: string): string[] {
 function inferObjectCallType(expr: AstNode): string | undefined {
   const name = getObjectCallName(expr);
   if (!name) return undefined;
+  if (name === 'getOwnPropertyDescriptor') return 'interface{}';
+  if (name === 'getOwnPropertySymbols') return '[]interface{}';
   if (OBJECT_INTEGRITY_LEVELS[name] || name === 'defineProperty') return inferExpressionType(expr.arguments?.[0]);
   if (OBJECT_INTEGRITY_CHECKS[name] || name === 'hasOwn') return 'bool';
   if (name === 'create') return 'interface{}';
   if (name === 'getOwnPropertyNames') return inferExpressionType({ ...expr, expression: { ...expr.expression, name: { kind: 'Identifier', text: 'keys' } } });
+  return undefined;
+}
+
+// Reflect.m(…) with Reflect the global, or undefined
+function reflectCallName(node: AstNode): string | undefined {
+  const callee = node.expression;
+  if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression) || callee.expression.text !== 'Reflect') return undefined;
+  if (variableGoTypes.has('Reflect') || classNames.has('Reflect')) return undefined;
+  const name: string = callee.name.text;
+  return ['ownKeys', 'apply', 'get', 'set', 'has', 'deleteProperty', 'getOwnPropertyDescriptor', 'defineProperty', 'getPrototypeOf'].includes(name) ? name : undefined;
+}
+
+// Reflect's methods, as the Object operations they stand for
+function visitReflectCall(node: AstNode): string | undefined {
+  const name = reflectCallName(node);
+  if (!name) return undefined;
+  useHelper('dynamic');
+  useHelper('error');
+  const args: AstNode[] = node.arguments ?? [];
+  const arg = (i: number, type = 'interface{}') => (args[i] ? toGoValueOfType(args[i], type) : 'nil');
+  switch (name) {
+    case 'ownKeys':
+      return `func() []interface{} { __k := []interface{}{}; for _, k := range TnKeys(${arg(0)}) { __k = append(__k, k) }; return __k }()`;
+    case 'apply':
+      useHelper('decorators');
+      return `TnWithThis(${arg(1)}, func() interface{} { return TnCallValue(${arg(0)}, TnAs[[]interface{}](${arg(2)})...) })`;
+    case 'get':
+      return `TnGet(${arg(0)}, TnJSString(${arg(1)}))`;
+    case 'set':
+      return `func() bool { TnSet(${arg(0)}, TnJSString(${arg(1)}), ${arg(2)}); return true }()`;
+    case 'has':
+      return `TnHas(${arg(0)}, ${arg(1)})`;
+    case 'deleteProperty':
+      return `TnDelete(${arg(0)}, ${arg(1)})`;
+    case 'getOwnPropertyDescriptor':
+      useHelper('classes');
+      return `TnOwnPropertyDescriptor(${arg(0)}, TnJSString(${arg(1)}))`;
+    case 'defineProperty':
+      useHelper('classes');
+      return `func() bool { TnDefineProperty(${arg(0)}, TnJSString(${arg(1)}), ${arg(2)}); return true }()`;
+    case 'getPrototypeOf':
+      useHelper('classes');
+      return `TnClassOf(${arg(0)})`;
+  }
   return undefined;
 }
 
@@ -12111,6 +12175,16 @@ function visitObjectCall(node: AstNode): string | undefined {
   }
   // Object.create / getPrototypeOf / getOwnPropertyDescriptors /
   // defineProperties: class values stand in for prototypes
+  // Object.getOwnPropertyDescriptor(o, k): k's descriptor (get / set for an
+  // accessor of a dynamic object), or undefined; getOwnPropertySymbols: none
+  // (symbol keys are property names here)
+  if (name === 'getOwnPropertyDescriptor') {
+    useHelper('classes');
+    useHelper('dynamic');
+    useHelper('error');
+    return `TnOwnPropertyDescriptor(${visit(args[0])}, ${args[1] ? toGoValueOfType(args[1], 'string') : '""'})`;
+  }
+  if (name === 'getOwnPropertySymbols') return `func() []interface{} { _ = ${visit(args[0])}; return []interface{}{} }()`;
   if (name === 'create' || name === 'getPrototypeOf' || name === 'getOwnPropertyDescriptors' || name === 'defineProperties') {
     useHelper('classes');
     useHelper('dynamic');
@@ -13961,7 +14035,9 @@ function visitEnumDeclaration(node: AstNode, inPlace = false): string {
       .join('\n')}\n)\n\nfunc ${enumName}__name(v float64) string { ${reverse}; return "" }${enumObjectDecl(node, enumName, members)}`;
   }
 
-  return `type ${enumName} ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
+  // (a string enum is an alias of string: its values mix freely with the
+  // strings of fields and generic instantiations typed by it)
+  return `type ${enumName} = ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
 }
 
 
@@ -17223,7 +17299,10 @@ function erasedFunctionTypeParameters(fn: AstNode): Set<string> {
     const inCallback = new RegExp(`\\b${name}\\b`).test(callbackTypes);
     // (<T extends { m(): R }> / <T extends Node>: Go constraints can't give T
     // members, so its values are read dynamically)
-    const structural = tp.constraint?.kind === 'TypeLiteral' || (isTypeReferenceNode(tp.constraint) && !isKeyofConstraint(tp.constraint));
+    // (<T extends (...args) => R>: a Go func constraint would need the exact
+    // signature, so T's values are functions called dynamically)
+    // (<T extends X[]>: a Go []X constraint takes only that exact slice type)
+    const structural = tp.constraint?.kind === 'TypeLiteral' || isFunctionTypeNode(tp.constraint) || isArrayTypeNode(tp.constraint) || tp.constraint?.kind === 'TupleType' || tp.constraint?.kind === 'TypeOperator' || (isTypeReferenceNode(tp.constraint) && !isKeyofConstraint(tp.constraint));
     if (name && (primitive || inCallback || structural || !new RegExp(`\\b${name}\\b`).test(paramTypes))) erased.add(name);
   }
   fn.tnErasedTypeParameters = erased;
@@ -17924,12 +18003,17 @@ function visitCallArguments(node: AstNode): string[] {
     return args.map((a) => visit(a));
   }
   const params: AstNode[] = fn.parameters ?? [];
-  // (a parameter typed by the callee's own type parameter is left to Go's inference)
+  // (a parameter typed by the callee's own type parameter is left to Go's
+  // inference — unless another argument binds it: getOrInsertDefault(map,
+  // key, new Set()) takes the map's value type for the Set)
   const typeParamNames: string[] = (fn.typeParameters ?? []).map((tp: AstNode) => tp.name?.text ?? '');
+  const typeBindings = typeParamNames.length > 0 ? bindArgumentTypeParameters(params, args, typeParamNames) : new Map<string, string>();
   const result = args.map((arg, index) => {
     const param = params[index];
     if (!param || param.dotDotDotToken) return visit(arg);
     const paramType = getParameterGoType(param);
+    const bound = isTypeReferenceNode(param.type) && isIdentifier(param.type.typeName) ? typeBindings.get(param.type.typeName.text) : undefined;
+    if (bound && !isSpreadElement(arg)) return toGoValueOfType(arg, bound);
     if (typeParamNames.some((n) => n && new RegExp(`\\b${n}\\b`).test(paramType))) return visit(arg);
     const converted = toGoValueOfType(arg, paramType);
     // (a converted copy the function changes: written back after the call)
@@ -17953,6 +18037,47 @@ function visitCallArguments(node: AstNode): string[] {
     for (const extra of interfaceExtraParamDecls(getEnclosingClassName(fn) ?? '', fn)) result.push(`*new(${extra.slice(extra.indexOf(' ') + 1)})`);
   }
   return result;
+}
+
+// The Go types a generic call's arguments bind its type parameters to:
+// T from an argument typed T, K and V from a Map<K, V> / Set<K> / T[]
+// argument's Go type (the first binding wins, as TypeScript infers it)
+function bindArgumentTypeParameters(params: AstNode[], args: AstNode[], names: string[]): Map<string, string> {
+  const bindings = new Map<string, string>();
+  const unify = (typeNode: AstNode | undefined, goType: string | undefined): void => {
+    if (!typeNode || !goType || goType === 'interface{}' || goType === 'nil') return;
+    if (typeNode.kind === 'ParenthesizedType') return unify(typeNode.type, goType);
+    if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
+      const name = typeNode.typeName.text;
+      if (names.includes(name) && (typeNode.typeArguments ?? []).length === 0) {
+        if (!bindings.has(name)) bindings.set(name, goType);
+        return;
+      }
+      const typeArgs: AstNode[] = typeNode.typeArguments ?? [];
+      if (['Map', 'ReadonlyMap'].includes(name) && typeArgs.length === 2 && goType.startsWith('*TnMap[')) {
+        unify(typeArgs[0], extractMapKeyType(goType));
+        unify(typeArgs[1], extractMapValueType(goType));
+      } else if (['Set', 'ReadonlySet'].includes(name) && typeArgs.length === 1 && goType.startsWith('*TnMap[')) {
+        unify(typeArgs[0], extractMapKeyType(goType));
+      } else if (['Array', 'ReadonlyArray'].includes(name) && typeArgs.length === 1) {
+        const element = goType.startsWith('*[]') ? goType.slice(3) : goType.startsWith('[]') ? goType.slice(2) : undefined;
+        unify(typeArgs[0], element);
+      }
+      return;
+    }
+    if (isArrayTypeNode(typeNode)) {
+      const element = goType.startsWith('*[]') ? goType.slice(3) : goType.startsWith('[]') ? goType.slice(2) : undefined;
+      unify(typeNode.elementType, element);
+    }
+  };
+  // (arguments whose own type is known first: a fresh new Set() binds nothing)
+  params.forEach((p: AstNode, i: number) => {
+    const arg = args[i];
+    if (!arg || p.dotDotDotToken || isSpreadElement(arg)) return;
+    if (isTypeReferenceNode(p.type) && isIdentifier(p.type.typeName) && names.includes(p.type.typeName.text)) return;
+    unify(p.type, inferExpressionType(arg));
+  });
+  return bindings;
 }
 
 function withContextualParameters(
@@ -23573,6 +23698,29 @@ func TnDefineProperty(obj interface{}, key string, descriptor interface{}) {
 	if TnHas(descriptor, "value") {
 		TnSet(obj, key, TnGet(descriptor, "value"))
 	}
+}
+
+func TnOwnPropertyDescriptor(obj interface{}, key string) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m.accessors != nil {
+		if a, ok := m.accessors[key]; ok {
+			d := map[string]interface{}{"enumerable": !m.hidden[key], "configurable": true}
+			if a.Get != nil {
+				d["get"] = a.Get
+			} else {
+				d["get"] = nil
+			}
+			if a.Set != nil {
+				d["set"] = a.Set
+			} else {
+				d["set"] = nil
+			}
+			return d
+		}
+	}
+	if !TnHas(obj, key) {
+		return nil
+	}
+	return map[string]interface{}{"value": TnGet(obj, key), "writable": true, "enumerable": true, "configurable": true}
 }
 
 // Object.getOwnPropertyDescriptors(x): { key: { value, writable,
