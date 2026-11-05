@@ -3473,6 +3473,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('classes');
       return `TnClass_${node.text}`;
     }
+    // TypeError / SyntaxError … as class values (Error: new (msg) => Error =
+    // TypeError, Babel's buildError): a class making that error
+    if (BUILTIN_ERROR_NAMES.has(node.text) && !variableGoTypes.has(node.text) && !classNames.has(node.text) && !isLocallyBound(node) && isClassValueReference(node)) {
+      useHelper('classes');
+      useHelper('error');
+      return `TnErrorClass(${toGoStringLiteral(node.text)})`;
+    }
     // Map / Set as class values (`new Type()` of a parameter)
     if ((node.text === 'Map' || node.text === 'Set') && !variableGoTypes.has(node.text) && !classNames.has(node.text) && isClassValueReference(node)) {
       useHelper('classes');
@@ -5306,7 +5313,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       return `${visit(node.left)} = TnDynamicAdd(${visit(node.left)}, ${visit(node.right)})`;
     }
     // s += n on a string: the value converts as JS renders it
-    if (op === '+=' && inferExpressionType(node.left) === 'string') {
+    // (a nullable string set before: let uid; … uid = `_x`; uid += i - 1)
+    if (op === '+=' && ['string', '*string'].includes(inferExpressionType(node.left) ?? '')) {
       const rightType = inferExpressionType(node.right);
       if (rightType !== 'string') return `${visit(node.left)} += ${jsStringOf(visit(node.right), rightType)}`;
     }
@@ -6421,6 +6429,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       importedPackages.add(goTarget.path);
       const goNew = visitGoNew(node, goTarget.path, goTarget.typeName);
       if (goNew !== undefined) return goNew;
+    }
+    // new X(…) with X a parameter or local holding a class (Error: new (msg)
+    // => Error = TypeError): constructed at run time
+    if (isIdentifier(node.expression) && (node.expression.text === 'Error' || BUILTIN_ERROR_NAMES.has(node.expression.text)) && isLocallyBound(node.expression)) {
+      useHelper('classes');
+      useHelper('dynamic');
+      const args = (node.arguments ?? []).map((a: AstNode) => toGoValueOfType(a, 'interface{}'));
+      return `TnAs[*TnError](TnNew(${[getSafeName(node.expression.text), ...args].join(', ')}))`;
     }
     const className = visit(node.expression);
     // new Function(params..., body): dynamic code evaluation has no native
@@ -11885,7 +11901,8 @@ function isFunctionPropertyAccess(node: AstNode): boolean {
   if (!isPropertyAccessExpression(node) || !isIdentifier(node.name) || hasQuestionDot(node) || FUNCTION_OWN_MEMBERS.has(node.name.text)) return false;
   const receiver = node.expression;
   if (isIdentifier(receiver) && (classNames.has(receiver.text) || enumNames.has(receiver.text))) return false;
-  return !!inferExpressionType(receiver)?.startsWith('func(');
+  // (a declared function too, imported through re-exports: traverseFast)
+  return !!inferExpressionType(receiver)?.startsWith('func(') || (isIdentifier(receiver) && declaredFunctions.has(receiver.text) && !variableGoTypes.has(receiver.text));
 }
 
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
@@ -24716,6 +24733,25 @@ func (c *TnClass) TnProp(key string) (interface{}, bool) {
 
 // Object and Error as class values (class C extends (cond ? Error : Object))
 var TnClass_Object = &TnClass{Name: "Object", New: func(args ...interface{}) interface{} { return TnNewMap[string, interface{}]() }}
+// TypeError, RangeError … as class values: one class each, making
+// errors of that name
+var tnErrorClasses = map[string]*TnClass{}
+
+func TnErrorClass(name string) *TnClass {
+	if c, ok := tnErrorClasses[name]; ok {
+		return c
+	}
+	c := &TnClass{Name: name, Parent: TnClass_Error, New: func(args ...interface{}) interface{} {
+		message := ""
+		if len(args) > 0 && args[0] != nil {
+			message = TnJSString(args[0])
+		}
+		return TnNodeError(name, "", message)
+	}}
+	tnErrorClasses[name] = c
+	return c
+}
+
 var TnClass_Error = tnRegisterClass(&TnClass{Name: "Error", Type: reflect.TypeOf((*TnError)(nil)), New: func(args ...interface{}) interface{} {
 	message := ""
 	if len(args) > 0 && args[0] != nil {
