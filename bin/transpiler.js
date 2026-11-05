@@ -2954,6 +2954,10 @@ export function transpileToNative(code, options) {
     coverageFiles.length = 0;
     linkedModules.clear();
     linkedTopNames.clear();
+    // (a module's own Buffer, URL or process takes another Go name: the bare
+    // one stays the Node global other modules mean)
+    for (const name of Object.keys(nodeRegistry.globals))
+        linkedTopNames.add(name);
     originalTopNames.clear();
     destructureTempSeed = 0;
     moduleInitOrder.length = 0;
@@ -4009,6 +4013,15 @@ function visitNode(node, options = {}) {
             classNames.has(leftGoType.slice(1)) && !classHasMember(leftGoType.slice(1), memberKey(node.name) ?? '')) {
             useHelper('dynamic');
             return `TnGetRef(${leftSide}, ${toGoStringLiteral(memberKey(node.name) ?? '')})`;
+        }
+        // x.f on an object type that has no f (Babel's generator reads
+        // node.optional under @ts-ignore): by name, an expando or undefined
+        if (!isCallee(node) && leftGoType?.startsWith('*') && interfacePropertyTypes.has(leftGoType.slice(1)) && !classNames.has(leftGoType.slice(1)) && isIdentifier(node.name)) {
+            const fieldNames = objectFieldNames(leftGoType);
+            if (fieldNames.length > 0 && !fieldNames.includes(node.name.text) && getStructFieldGoType(leftGoType.slice(1), node.name.text) === undefined && !isStructGetterField(leftGoType.slice(1), node.name.text)) {
+                useHelper('dynamic');
+                return `TnGetRef(${leftSide}, ${toGoStringLiteral(node.name.text)})`;
+            }
         }
         // this.x of an abstract property (declared by the class or an ancestor,
         // implemented by subclasses as a field or an accessor): read by name
@@ -5418,6 +5431,18 @@ function visitNode(node, options = {}) {
                 const elementType = delegatedType.startsWith('chan ') ? delegatedType.slice(5) : '';
                 useHelper('dynamic');
                 const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
+                // yield* xs of an array (or of any value: its elements, an array's
+                // or another iterable's)
+                if (!delegatedType.startsWith('chan ')) {
+                    const arrayElement = delegatedType.replace(/^\*\[\]/, '[]').startsWith('[]') ? delegatedType.replace(/^\*\[\]/, '[]').slice(2) : '';
+                    const source = arrayElement ? (delegatedType.startsWith('*[]') ? `(*${visit(node.expression)})` : visit(node.expression)) : `TnToArray(${visit(node.expression)})`;
+                    if (!arrayElement)
+                        useHelper('arraySubclass');
+                    const value = (arrayElement || 'interface{}') === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
+                    if (!asyncChannelIsAsync)
+                        useHelper('generatorStep');
+                    return `for _, __yv := range ${source} {\n\t\t\t${asyncChannelVar} <- ${value}${asyncChannelIsAsync ? '' : `; TnGenStep(${asyncChannelVar})`}\n\t\t}`;
+                }
                 if (!asyncChannelIsAsync) {
                     useHelper('generatorStep');
                     return `func() { __yg := TnGenLockstep(${visit(node.expression)}); for __yfirst := true; ; __yfirst = false { if !__yfirst { TnGenAck(__yg) }; __yv, __yok := <-__yg; if !__yok { TnGenDone(__yg); return }; ${asyncChannelVar} <- ${forwarded}; TnGenStep(${asyncChannelVar}) } }()`;
@@ -8166,6 +8191,10 @@ function isMapArrayGet(expr) {
 }
 function mapGoType(keyType, valueType) {
     useHelper('orderedMap');
+    // (a string | undefined key: the string or nil, compared as values — a
+    // *string would key by pointer)
+    if (NULLABLE_PRIMITIVE_TYPES.includes(keyType))
+        keyType = 'interface{}';
     return `*TnMap[${keyType}, ${valueType}]`;
 }
 // [K, V] of a *TnMap[K, V] type string
@@ -10389,6 +10418,8 @@ function propertyKeyString(name) {
 // An ordered map built from "key, value" entries (in source order)
 function orderedMapLiteral(keyType, valueType, entries) {
     useHelper('orderedMap');
+    if (NULLABLE_PRIMITIVE_TYPES.includes(keyType))
+        keyType = 'interface{}';
     const constructor = `TnNewMap[${keyType}, ${valueType}]()`;
     if (entries.length === 0)
         return constructor;
@@ -18065,7 +18096,14 @@ function visitFunctionCallApply(node) {
         const setup = [`__f := ${fn}`, ...bound].join('; ');
         return `func() func(${rest.join(', ')}) ${result} { ${setup}; return ${inner} }()`;
     }
-    return withThis(`${fn}(${args.map((a) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))).join(', ')})`, result);
+    // (f.call(this, a): the arguments converted to f's parameters, and the
+    // ones left out — undefined — zero values)
+    const spread = args.some((a) => isSpreadElement(a));
+    const callArgs = args.map((a, i) => (isSpreadElement(a) ? `${visit(a.expression)}...` : params[i] && !params[i].startsWith('...') && !spread ? toGoValueOfType(a, params[i]) : visit(a)));
+    if (!spread && !variadic)
+        for (let i = args.length; i < params.length; i++)
+            callArgs.push(`*new(${params[i]})`);
+    return withThis(`${fn}(${callArgs.join(', ')})`, result);
 }
 // Whether a decorator call returns a value (a replacement), or only has effects
 function decoratorReturnsValue(decorator) {
@@ -20058,6 +20096,8 @@ function visitNewMap(node) {
     const typeArguments = getCollectionTypeArguments(node);
     if (typeArguments.length === 2) {
         keyType = getType(typeArguments[0]);
+        if (NULLABLE_PRIMITIVE_TYPES.includes(keyType))
+            keyType = 'interface{}';
         valueType = getType(typeArguments[1]);
         // (arrays held by reference: see jsMapGoType)
         if (isPlainArrayGoType(valueType))
@@ -20093,7 +20133,12 @@ function visitNewMap(node) {
     return orderedMapLiteral(keyType, valueType, entries);
 }
 // The element type of `new Set(…)`: its type argument, else its source's
+// (string | undefined elements: compared as values, see mapGoType)
 function newSetElementType(node) {
+    const element = newSetElementTypeOf(node);
+    return NULLABLE_PRIMITIVE_TYPES.includes(element) ? 'interface{}' : element;
+}
+function newSetElementTypeOf(node) {
     const typeArguments = getCollectionTypeArguments(node);
     if (typeArguments.length === 1)
         return getType(typeArguments[0]);
@@ -20208,6 +20253,13 @@ function normalizeCjsToEsm(code) {
     code = code.replace(/['"]use strict['"];?\n?/g, '');
     // module.exports.X = function(...) { } or exports.X = function(...) { }
     code = code.replace(/(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g, 'export function $1(');
+    // module.exports = value (the default export), then module.exports.x =
+    // y (a named export, and a property of the default value too)
+    if (/^module\.exports\s*=/m.test(code)) {
+        code = code.replace(/^module\.exports\s*=\s*/m, 'const __cjsDefault = ');
+        code = code.replace(/^module\.exports\.(\w+)\s*=\s*([^\n;]+);?$/gm, (_m, name, value) => `${value.trim() === name ? `export { ${name} };` : `export const ${name} = ${value};`}\n(__cjsDefault as any).${name} = ${name};`);
+        code += '\nexport default __cjsDefault;\n';
+    }
     return code;
 }
 // ---- Module linking ----
