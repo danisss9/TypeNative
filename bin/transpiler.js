@@ -896,6 +896,29 @@ function goLineEndState(line, state) {
         return '`';
     return '*';
 }
+// tag`a${x}b` as the call it makes: tag(["a", "b"], x) (memoized per node)
+function taggedTemplateCall(node) {
+    if (node.tnTaggedCall)
+        return node.tnTaggedCall;
+    const template = node.template;
+    const at = { line: node.line, column: node.column };
+    const strings = { kind: 'ArrayLiteralExpression', elements: [], ...at };
+    const call = { kind: 'CallExpression', expression: node.tag, arguments: [strings], parent: node.parent, ...at };
+    const str = (text) => ({ kind: 'StringLiteral', text, parent: strings, ...at });
+    if (template.kind === 'NoSubstitutionTemplateLiteral') {
+        strings.elements.push(str(template.text));
+    }
+    else {
+        strings.elements.push(str(template.head.text));
+        for (const span of template.templateSpans ?? []) {
+            call.arguments.push(span.expression);
+            strings.elements.push(str(span.literal.text));
+        }
+    }
+    strings.parent = call;
+    node.tnTaggedCall = call;
+    return call;
+}
 // Records a transpile error at the node (or its nearest positioned ancestor)
 function reportError(node, message) {
     let positioned = node;
@@ -3367,6 +3390,11 @@ function visitNode(node, options = {}) {
         }
         return `(${pieces.join(' + ')})`;
     }
+    else if (node.kind === 'TaggedTemplateExpression' && isIdentifier(node.tag) && declaredFunctions.has(node.tag.text)) {
+        // tag`x${2}` of a declared function: the call tag(["x", ""], 2), its
+        // arguments converted (and optional parameters filled) as for any call
+        return visit(taggedTemplateCall(node));
+    }
     else if (node.kind === 'TaggedTemplateExpression') {
         // tag`x${2}` → tag(["x", ""], 2)
         const tag = visit(node.tag);
@@ -4146,6 +4174,15 @@ function visitNode(node, options = {}) {
         while (node.expression?.kind === 'NonNullExpression') {
             node.expression = node.expression.expression;
             node.expression.parent = node;
+        }
+        // f(…)(…) / tag`…`(…) whose callee is a dynamic value (an overloaded
+        // function's any result): called reflectively
+        if ((isCallExpression(node.expression) || node.expression.kind === 'TaggedTemplateExpression') && inferExpressionType(node.expression) === 'interface{}' &&
+            !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
+            useHelper('dynamic');
+            useHelper('error');
+            const args = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
+            return `TnCallValue(${visit(node.expression)}${args})`;
         }
         if (isUndeclaredClassMember(node.expression) && !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
             useHelper('dynamic');
@@ -10060,7 +10097,9 @@ function thisGoType(node) {
         if (isClassDeclaration(current)) {
             if (!current.name || !isIdentifier(current.name))
                 return undefined;
-            if (methodCopyClass && methodCopyClass !== current.name.text && !isPolymorphicClass(methodCopyClass))
+            // (not into an abstract class: it has no Go methods of its own)
+            if (methodCopyClass && methodCopyClass !== current.name.text && !isPolymorphicClass(methodCopyClass) &&
+                !hasModifier(declaredClasses.get(methodCopyClass) ?? {}, 'AbstractKeyword'))
                 return `*${methodCopyClass}`;
             return `*${current.name.text}`;
         }
@@ -11621,6 +11660,8 @@ function inferExpressionTypeOf(expr) {
         return 'TnJsxNode';
     if (expr.kind === 'TaggedTemplateExpression' && isStringRawTag(expr.tag))
         return 'string';
+    if (expr.kind === 'TaggedTemplateExpression' && isIdentifier(expr.tag) && declaredFunctions.has(expr.tag.text))
+        return inferExpressionType(taggedTemplateCall(expr));
     // sql`…` with a Node class method as the tag (node:sqlite's tag store)
     if (expr.kind === 'TaggedTemplateExpression' && isPropertyAccessExpression(expr.tag)) {
         const recvType = inferExpressionType(expr.tag.expression);
@@ -12044,6 +12085,8 @@ function inferExpressionTypeOf(expr) {
     }
     // (a call of one: see the emitter)
     if (isCallExpression(expr) && isUndeclaredClassMember(expr.expression))
+        return 'interface{}';
+    if (isCallExpression(expr) && (isCallExpression(expr.expression) || expr.expression.kind === 'TaggedTemplateExpression') && inferExpressionType(expr.expression) === 'interface{}')
         return 'interface{}';
     if (isPropertyAccessExpression(expr)) {
         const narrowingKey = getNarrowingKey(expr);
