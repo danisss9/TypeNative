@@ -6,7 +6,8 @@
   // (Boolean, Awaited, Partial, ...) plus duplicate-identifier errors.
   // VS Code picks this config up for files under types/.
   "compilerOptions": {
-    "target": "es2020",
+    "target": "es2025",
+    "useDefineForClassFields": false,
     "lib": [],
     "types": [],
     "strict": true,

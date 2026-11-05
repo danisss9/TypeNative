@@ -43,6 +43,8 @@ interface Number {
   toExponential(fractionDigits?: number): string;
 }
 
+type PropertyKey = string | number | symbol;
+
 interface Object {
   constructor: Function;
   toString(): string;

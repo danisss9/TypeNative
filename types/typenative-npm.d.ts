@@ -77,6 +77,7 @@ declare module 'node:buffer' {
 
 declare module 'node:fs' {
   import { Readable, Writable } from 'node:stream';
+  import { EventEmitter } from 'node:events';
   namespace fs {
     type PathLike = string;
     type EncodingOption = BufferEncoding | { encoding?: BufferEncoding | null; flag?: string } | null;
@@ -247,7 +248,7 @@ declare module 'node:fs' {
       encoding?: BufferEncoding;
       signal?: AbortSignal;
     }
-    interface FSWatcher extends import('node:events').EventEmitter {
+    interface FSWatcher extends EventEmitter {
       close(): void;
       ref(): this;
       unref(): this;
@@ -258,7 +259,7 @@ declare module 'node:fs' {
       once(event: 'error', listener: (error: Error) => void): this;
       once(event: 'close', listener: () => void): this;
     }
-    interface StatWatcher extends import('node:events').EventEmitter {
+    interface StatWatcher extends EventEmitter {
       ref(): this;
       unref(): this;
     }

@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Node 26 and ES2025:** TypeNative now requires Node.js 26 or newer
+  (`engines`), and CI runs on Node 26. Scaffolded projects (`--new`) and the
+  default type-check (no `tsconfig.json`) target `es2025` instead of `es2020`,
+  so target-gated syntax such as the regex `v` flag, regex modifiers and
+  duplicate named groups type-checks. `useDefineForClassFields: false` is set
+  alongside it to keep TypeScript's classic field order (parameter properties
+  before field initializers), which is what TypeNative compiles. Existing
+  projects that keep `target: es2020` are unaffected.
 - **Regex engine:** every `TnRegex` now runs on one backtracking VM with JS
   semantics (`src/regex_vm.ts`), replacing the closure-based backtracker and RE2
   as the first choice. Programs compile lazily and once per pattern and flags. A

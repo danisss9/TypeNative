@@ -43,7 +43,7 @@ Numbers are medians from the [examples/](examples/) benchmarks (Windows 11, Ryze
 
 ## Requirements
 
-- [Node.js v24](https://nodejs.org/en) or newer.
+- [Node.js v26](https://nodejs.org/en) or newer.
 - [Go 1.26](https://go.dev/doc/install) or newer
 
 ## Install
@@ -116,7 +116,8 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 ```json
 {
   "compilerOptions": {
-    "target": "es2020",
+    "target": "es2025",
+    "useDefineForClassFields": false,
     "lib": [],
     "types": ["typenative", "typenative/go", "typenative/npm"],
     "strict": true
@@ -125,6 +126,8 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 ```
 
 `lib: []` disables the standard TypeScript libraries, so `typenative`'s own declarations are the entire type surface, the compiler only accepts what actually transpiles.
+
+`useDefineForClassFields: false` keeps TypeScript's classic class-field order, which is the order TypeNative compiles: `super()`, then parameter properties, then field initializers, then the constructor body. Without it, any target from ES2022 on switches to native class-field semantics, and a field initializer that reads a parameter property (`doubled = this.k * 2` with `constructor(public k: number)`) becomes a type error.
 
 ## CLI reference
 
@@ -306,7 +309,7 @@ main.ts --(type-check)--(parse)--> normalized JSON AST --(transpileToNative)--> 
 
 `npm test` is `npm run conformance`: every `conformance/*.ts` probe is type-checked, transpiled, built with `go`, executed, and must exit `0` (`npm run conformance:parallel` runs them concurrently). Results print per category (`syntax` / `semantics` / `lib`) plus a total pass rate; any failure exits non-zero and lists the first diagnostic line (`*.go:line`, `panic:`, `Unsupported syntax`, `Error`).
 
-CI (`.github/workflows/ci.yml`) runs `npm run build`, `npm run check:go-types` and the conformance suite on Ubuntu, Windows and macOS with Node 24 and Go 1.26, and a Linux job that builds the self-hosted compiler, checks the bootstrap fixpoint (`npm run bootstrap:check`) and runs the suite through it. Releases are cut from `TypeNative_*` tags via trusted publishing, from a fresh `npm run build`.
+CI (`.github/workflows/ci.yml`) runs `npm run build`, `npm run check:go-types` and the conformance suite on Ubuntu, Windows and macOS with Node 26 and Go 1.26, and a Linux job that builds the self-hosted compiler, checks the bootstrap fixpoint (`npm run bootstrap:check`) and runs the suite through it. Releases are cut from `TypeNative_*` tags via trusted publishing, from a fresh `npm run build`.
 
 When adding a feature: add a probe, link it from [conformance.md](conformance.md), and keep the ✅/❌ matrix honest gaps are documented, not hidden.
 

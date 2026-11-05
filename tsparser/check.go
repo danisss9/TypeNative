@@ -86,7 +86,8 @@ func runCheck(entry string, typesDir string) {
 		}
 	} else {
 		options = &core.CompilerOptions{
-			Target:                       core.ScriptTargetES2020,
+			Target:                       core.ScriptTargetES2025,
+			UseDefineForClassFields:      core.TSFalse,
 			Module:                       core.ModuleKindESNext,
 			ModuleResolution:             core.ModuleResolutionKindBundler,
 			Lib:                          []string{},

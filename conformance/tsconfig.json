@@ -1,7 +1,8 @@
 {
     "include": ["*.ts", "*.tsx"],
     "compilerOptions": {
-      "target": "es2020",
+      "target": "es2025",
+      "useDefineForClassFields": false,
       // import attributes (JSON modules) and import x = require() both type-check
       "module": "preserve",
       "resolveJsonModule": true,

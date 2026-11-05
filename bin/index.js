@@ -666,7 +666,8 @@ function getTsConfig() {
     const tsConfig = {
         include: ['**/*.ts'],
         compilerOptions: {
-            target: 'es2020',
+            target: 'es2025',
+            useDefineForClassFields: false,
             lib: [],
             types: ['typenative', 'typenative/go', 'typenative/npm'],
             rootDir: '.',

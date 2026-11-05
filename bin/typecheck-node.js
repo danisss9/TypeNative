@@ -38,7 +38,8 @@ export function typeCheckNode(entry, typesDir) {
     }
     else {
         options = {
-            target: ts.ScriptTarget.ES2020,
+            target: ts.ScriptTarget.ES2025,
+            useDefineForClassFields: false,
             module: ts.ModuleKind.ESNext,
             moduleResolution: ts.ModuleResolutionKind.Bundler,
             lib: [],

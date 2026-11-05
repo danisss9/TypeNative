@@ -5359,7 +5359,7 @@ function visitNode(node, options = {}) {
         const superHandledInCtor = superCalledInCtor || conditionalSuper;
         if (ctor) {
             const ctorParameterInfo = getFunctionParametersInfo(ctor.parameters ?? []);
-            // As in TS (ES2020 class fields): super(), then parameter properties,
+            // As in TS (useDefineForClassFields: false): super(), then parameter properties,
             // then field initializers, then the rest of the body
             const parameterAssignments = getParameterProperties(node)
                 .map((p) => {
