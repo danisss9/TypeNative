@@ -445,8 +445,6 @@ const dangerousNames = new Set([
   'main',
   // (a package-level name Go reserves for init functions)
   'init',
-  // (Go's blank identifier: a JS function or variable named _)
-  '_',
   // Go reserved keywords
   'break', 'case', 'chan', 'const', 'continue',
   'default', 'defer', 'else', 'fallthrough', 'for',
@@ -845,6 +843,7 @@ function parseAndLower(code: string): AstNode {
     if (isClassDeclaration(statement) && isIdentifier(statement.name)) topLevelClassNames.add(statement.name.text);
   }
   lowerDynamicExtends(sourceFile);
+  lowerUnderscoreFunctions(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
   lowerSymbolKeys(sourceFile);
@@ -1143,6 +1142,41 @@ function mergeDeclarations(node: AstNode): void {
 function lowerModuleForms(node: AstNode): void {
   for (const child of childNodes(node)) lowerModuleForms(child);
   if (!Array.isArray(node.statements)) return;
+  // const { a, b: c } = ns, with ns a namespace import: import { a, b as c }
+  // from ns's module (the names are the module's top-level bindings)
+  if (node.kind === 'SourceFile') {
+    const namespaces = new Map<string, AstNode>();
+    for (const st of node.statements) {
+      const bindings = st.kind === 'ImportDeclaration' && !st.importClause?.isTypeOnly ? st.importClause?.namedBindings : undefined;
+      if (bindings?.kind === 'NamespaceImport' && isIdentifier(bindings.name)) namespaces.set(bindings.name.text, st.moduleSpecifier);
+    }
+    if (namespaces.size > 0) {
+      node.statements = node.statements.map((st: AstNode): AstNode => {
+        if (st.kind !== 'VariableStatement' || hasModifier(st, 'ExportKeyword')) return st;
+        const decls: AstNode[] = st.declarationList?.declarations ?? [];
+        if (decls.length !== 1 || st.declarationList.declarationKind !== 'const') return st;
+        const [d] = decls;
+        const pattern = d.name;
+        if (!isObjectBindingPattern(pattern) || !isIdentifier(d.initializer) || !namespaces.has(d.initializer.text)) return st;
+        const elements: AstNode[] = pattern.elements ?? [];
+        const simple = elements.every((el: AstNode) => !el.dotDotDotToken && !el.initializer && isIdentifier(el.name) && (!el.propertyName || isIdentifier(el.propertyName)));
+        if (!simple || elements.length === 0) return st;
+        return {
+          kind: 'ImportDeclaration',
+          moduleSpecifier: namespaces.get(d.initializer.text),
+          importClause: {
+            kind: 'ImportClause',
+            namedBindings: {
+              kind: 'NamedImports',
+              elements: elements.map((el: AstNode) => ({ kind: 'ImportSpecifier', propertyName: el.propertyName, name: el.name }))
+            }
+          },
+          line: st.line,
+          column: st.column
+        };
+      });
+    }
+  }
   node.statements = node.statements.map((statement: AstNode): AstNode => {
     const namespaceImport = (name: AstNode, specifier: AstNode): AstNode => ({
       kind: 'ImportDeclaration',
@@ -2153,6 +2187,29 @@ function lowerDynamicExtends(node: AstNode, inFunction = false): void {
   });
 }
 
+// function _() {} (zod names its constructor functions so): Go's blank
+// identifier can't name it, so it and the references in its scope become _ǂ
+function lowerUnderscoreFunctions(node: AstNode): void {
+  for (const child of childNodes(node)) lowerUnderscoreFunctions(child);
+  if (!Array.isArray(node.statements)) return;
+  if (!node.statements.some((st: AstNode) => isFunctionDeclaration(st) && isIdentifier(st.name) && st.name.text === '_')) return;
+  const rename = (n: AstNode, parentKey: string, parent: AstNode | undefined): void => {
+    if (isIdentifier(n) && n.text === '_') {
+      // (a property name — o._ — is not the function)
+      if (!(parent && (isPropertyAccessExpression(parent) && parentKey === 'name'))) n.text = '_ǂ';
+      return;
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'parent') continue;
+      const v = n[key];
+      if (Array.isArray(v)) {
+        for (const el of v) if (el && typeof el.kind === 'string') rename(el, key, n);
+      } else if (v && typeof v.kind === 'string') rename(v, key, n);
+    }
+  };
+  for (const st of node.statements) rename(st, 'statements', node);
+}
+
 // The classes a file declares at its top level (lowerDynamicExtends)
 const topLevelClassNames = new Set<string>();
 
@@ -2206,7 +2263,9 @@ function lowerSymbolKeys(sourceFile: AstNode): void {
 // A Symbol constant that is also read as a value (`B !== undefined`,
 // `fn.BREAK = B`), or that a file typed as `symbol` can see, is a real symbol:
 // it leaves `names` and keeps its declaration
-function retainSymbolsUsedAsValues(sourceFile: AstNode, names: Set<string>): void {
+// (shared: exported constants, seen from every file — imports and typeof
+// of them are no value uses there)
+function retainSymbolsUsedAsValues(sourceFile: AstNode, names: Set<string>, shared = false): void {
   const keyUses = new Set<AstNode>();
   const symbolTyped = { found: false };
   const markKeyUses = (node: AstNode): void => {
@@ -2214,9 +2273,18 @@ function retainSymbolsUsedAsValues(sourceFile: AstNode, names: Set<string>): voi
     if (node.kind === 'SymbolKeyword') symbolTyped.found = true;
     if (node.name?.kind === 'ComputedPropertyName' && isIdentifier(node.name.expression)) keyUses.add(node.name.expression);
     if (node.kind === 'ElementAccessExpression' && !hasQuestionDot(node) && isIdentifier(node.argumentExpression)) keyUses.add(node.argumentExpression);
+    if (shared && (node.kind === 'ImportSpecifier' || node.kind === 'ExportSpecifier')) {
+      if (node.name) keyUses.add(node.name);
+      if (node.propertyName) keyUses.add(node.propertyName);
+    }
+    if (shared && node.kind === 'TypeQuery' && isIdentifier(node.exprName)) keyUses.add(node.exprName);
+    // (type positions: an interface named like the symbol, extended or referenced)
+    if (shared && node.kind === 'TypeReference' && isIdentifier(node.typeName)) keyUses.add(node.typeName);
+    if (shared && node.kind === 'ExpressionWithTypeArguments' && isIdentifier(node.expression)) keyUses.add(node.expression);
+    if (shared && (node.kind === 'InterfaceDeclaration' || node.kind === 'TypeAliasDeclaration') && isIdentifier(node.name)) keyUses.add(node.name);
   };
   markKeyUses(sourceFile);
-  if (symbolTyped.found) {
+  if (symbolTyped.found && !shared) {
     names.clear();
     return;
   }
@@ -2269,6 +2337,8 @@ function lowerSharedSymbolKeys(asts: AstNode[]): void {
       }
     }
   }
+  // (one read as a value somewhere — x === GeneratedSource — is a real symbol)
+  for (const ast of asts) if (Array.isArray(ast.statements)) retainSymbolsUsedAsValues(ast, names, true);
   if (names.size === 0) return;
   for (const ast of asts) rewriteSymbolKeyUses(ast, names);
   // the declarations go away entirely (a value of the same name would
@@ -2406,7 +2476,9 @@ function linkParents(node: AstNode, parent: AstNode | undefined): void {
 
 // Renders a type node's source text syntactically (no typechecker needed).
 function isAnyTypeNode(n: AstNode): boolean {
-  return n?.kind === 'AnyKeyword' || n?.kind === 'UnknownKeyword';
+  return n?.kind === 'AnyKeyword' || n?.kind === 'UnknownKeyword' ||
+    // (a type sharing its name with a value: see valueShadowedTypeNames)
+    (n?.kind === 'TypeReference' && n.typeName?.kind === 'Identifier' && valueShadowedTypeNames.has(n.typeName.text));
 }
 
 function typeNodeToText(node) {
@@ -5304,6 +5376,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
 
     const methods: string[] = [];
     const properties: string[] = [];
+    const seenMethods = new Set<string>();
     for (const member of (node.members ?? [])) {
       // (an optional method is no part of the Go interface: implementations
       // may lack it, or declare it with another signature; calls dispatch on
@@ -5311,6 +5384,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (isMethodSignature(member) && member.questionToken && !interfaceHasProperties(node)) continue;
       if (isMethodSignature(member)) {
         const methodName = visit(member.name);
+        // (an overloaded method: its first signature)
+        if (seenMethods.has(methodName)) continue;
+        seenMethods.add(methodName);
         // (the parameter types implementations declare: optional ones are
         // nullable pointers, as class methods emit them)
         const params = (member.parameters ?? [])
@@ -12392,9 +12468,13 @@ function emitInterfaceAdapter(node: AstNode): string {
   const typeParamNames = '';
   const fields: string[] = [];
   const methods: string[] = [];
+  // (an overloaded method: its first signature, as signatureOf reads it)
+  const seen = new Set<string>();
   for (const member of node.members ?? []) {
     if (!isMethodSignature(member)) continue;
     const methodName = visit(member.name);
+    if (seen.has(methodName)) continue;
+    seen.add(methodName);
     const params = (member.parameters ?? []).map((p: AstNode) => `${visit(p.name)} ${p.type ? getParameterGoType({ ...p, parent: member }) : 'interface{}'}`);
     const args = (member.parameters ?? []).map((p: AstNode) => visit(p.name));
     const returnType = member.type ? getType(member.type) : '';
@@ -12478,12 +12558,28 @@ function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
   if (typeNode.kind === 'TypeLiteral') members = typeNode.members ?? [];
   else if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
+    // Pick<T, 'a'> / Omit<T, 'b'>: T's fields, those keys kept or dropped;
+    // Partial<T> / Readonly<T> / Required<T>: T's fields
+    // (a program's own Omit / Pick alias — zod declares one — means the same)
+    if ((name === 'Pick' || name === 'Omit') && (typeNode.typeArguments ?? []).length === 2 && !declaredInterfaces.has(name)) {
+      const keys = getMappedTypeKeys(typeNode.typeArguments[1]);
+      const base = objectTypeFieldMap(typeNode.typeArguments[0]);
+      if (!keys) return base;
+      for (const [field, fieldType] of base) if (keys.includes(goFieldName(field)) === (name === 'Pick')) out.set(field, fieldType);
+      return out;
+    }
+    if (UTILITY_TYPES.has(name) && (typeNode.typeArguments ?? []).length > 0 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
+      return objectTypeFieldMap(typeNode.typeArguments[0]);
+    }
     const iface = declaredInterfaces.get(name);
     if (iface) {
       collectInterfaceProperties(iface, out);
       return out;
     }
     const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
+    // (an object type known by its fields only: one of another file)
+    const known = !alias ? interfacePropertyTypes.get(name) : undefined;
+    if (known) return new Map(known);
     if (alias?.kind === 'TypeLiteral') members = alias.members ?? [];
     else if (alias?.kind === 'UnionType') {
       // a union of object types (type Token = A | B | …): every member's fields
@@ -13856,6 +13952,7 @@ function getType(typeNode: AstNode, getArrayType = false): string {
   }
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
+    if (valueShadowedTypeNames.has(name)) return 'interface{}';
     if (enumNames.has(name)) {
       // Numeric enums lowered to float64 constants have no named type
       if (enumBaseTypes.get(name) === 'float64') return 'float64';
@@ -17920,8 +18017,11 @@ function getGeneratorYieldType(fn: AstNode): string {
       if (n.asteriskToken && yielded !== undefined) {
         yielded = yielded.startsWith('chan ') ? yielded.slice(5) : yielded.startsWith('[]') ? yielded.slice(2) : undefined;
       }
-      if (yielded !== undefined && yielded !== 'interface{}' && yielded !== 'nil') found = yielded;
-      return found !== undefined;
+      // (a delegation whose type isn't known — a recursive yield* — leaves
+      // the other yields to say)
+      if (n.asteriskToken && (yielded === undefined || yielded === 'interface{}')) return false;
+      found = yielded;
+      return true;
     }
     return false;
   });
@@ -18198,6 +18298,8 @@ interface LinkedModule {
 }
 const linkedModules = new Map<string, LinkedModule>();
 const linkedTopNames = new Set<string>();
+// Types that share their (Go) name with a value: any values (see linkModule)
+const valueShadowedTypeNames = new Set<string>();
 
 // Specifiers the file resolver loads as TS modules (not node:, go:, JSON)
 function isLinkableSpecifier(spec: string): boolean {
@@ -18282,7 +18384,26 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     // (the name JS sees — a class's .name — is the declared one)
     if (goName !== name) originalTopNames.set(goName, name);
   }
+  // A type sharing its name with a value of the module (interface X {} and
+  // const X = …, as zod declares its schema classes): Go has one namespace,
+  // so the value keeps the name and the type is any value
+  const valueNames = new Set<string>();
   for (const statement of statements) {
+    if (statement.kind === 'VariableStatement') {
+      const names: string[] = [];
+      // (a Symbol() trait marker is no value there: lowerSharedSymbolKeys
+      // turns it into the interface's property key)
+      for (const d of statement.declarationList?.declarations ?? []) if (!isSymbolCallExpression(d.initializer)) bindingNames(d.name, names);
+      for (const n of names) valueNames.add(n);
+    } else if (statement.kind === 'FunctionDeclaration' && isIdentifier(statement.name)) valueNames.add(statement.name.text);
+  }
+  const isShadowedType = (st: AstNode) =>
+    (st.kind === 'InterfaceDeclaration' || st.kind === 'TypeAliasDeclaration') && isIdentifier(st.name) && valueNames.has(st.name.text);
+  if (statements.some(isShadowedType)) {
+    for (const st of statements) if (isShadowedType(st)) valueShadowedTypeNames.add(renames.get(st.name.text) ?? st.name.text);
+    ast.statements = statements.filter((st: AstNode) => !isShadowedType(st));
+  }
+  for (const statement of ast.statements ?? []) {
     const exported = statement.exported || hasModifier(statement, 'ExportKeyword');
     if (!exported) continue;
     const names: string[] = [];
@@ -28821,13 +28942,19 @@ function getForOfVarNames(initializer: AstNode): string[] {
     return ['_'];
   }
   const decl = initializer.declarations[0];
+  // (the bindings are new locals: an array-reference variable of the same
+  // name elsewhere — read as (*name) — is not them)
+  const fresh = (name: AstNode): string => {
+    if (isIdentifier(name)) referenceArrays.delete(name.text);
+    return visit(name);
+  };
   if (isArrayBindingPattern(decl.name)) {
     return (decl.name.elements ?? []).map((el) => {
       if (isOmittedExpression(el)) return '_';
-      return visit((el as AstNode).name);
+      return fresh((el as AstNode).name);
     });
   }
-  return [visit(decl.name)];
+  return [fresh(decl.name)];
 }
 
 // Set while emitting a try/catch whose blocks return from the enclosing function

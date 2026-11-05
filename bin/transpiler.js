@@ -330,8 +330,6 @@ const dangerousNames = new Set([
     'main',
     // (a package-level name Go reserves for init functions)
     'init',
-    // (Go's blank identifier: a JS function or variable named _)
-    '_',
     // Go reserved keywords
     'break', 'case', 'chan', 'const', 'continue',
     'default', 'defer', 'else', 'fallthrough', 'for',
@@ -757,6 +755,7 @@ function parseAndLower(code) {
             topLevelClassNames.add(statement.name.text);
     }
     lowerDynamicExtends(sourceFile);
+    lowerUnderscoreFunctions(sourceFile);
     lowerClassExpressions(sourceFile);
     lowerWeakCollections(sourceFile);
     lowerSymbolKeys(sourceFile);
@@ -1082,6 +1081,46 @@ function lowerModuleForms(node) {
         lowerModuleForms(child);
     if (!Array.isArray(node.statements))
         return;
+    // const { a, b: c } = ns, with ns a namespace import: import { a, b as c }
+    // from ns's module (the names are the module's top-level bindings)
+    if (node.kind === 'SourceFile') {
+        const namespaces = new Map();
+        for (const st of node.statements) {
+            const bindings = st.kind === 'ImportDeclaration' && !st.importClause?.isTypeOnly ? st.importClause?.namedBindings : undefined;
+            if (bindings?.kind === 'NamespaceImport' && isIdentifier(bindings.name))
+                namespaces.set(bindings.name.text, st.moduleSpecifier);
+        }
+        if (namespaces.size > 0) {
+            node.statements = node.statements.map((st) => {
+                if (st.kind !== 'VariableStatement' || hasModifier(st, 'ExportKeyword'))
+                    return st;
+                const decls = st.declarationList?.declarations ?? [];
+                if (decls.length !== 1 || st.declarationList.declarationKind !== 'const')
+                    return st;
+                const [d] = decls;
+                const pattern = d.name;
+                if (!isObjectBindingPattern(pattern) || !isIdentifier(d.initializer) || !namespaces.has(d.initializer.text))
+                    return st;
+                const elements = pattern.elements ?? [];
+                const simple = elements.every((el) => !el.dotDotDotToken && !el.initializer && isIdentifier(el.name) && (!el.propertyName || isIdentifier(el.propertyName)));
+                if (!simple || elements.length === 0)
+                    return st;
+                return {
+                    kind: 'ImportDeclaration',
+                    moduleSpecifier: namespaces.get(d.initializer.text),
+                    importClause: {
+                        kind: 'ImportClause',
+                        namedBindings: {
+                            kind: 'NamedImports',
+                            elements: elements.map((el) => ({ kind: 'ImportSpecifier', propertyName: el.propertyName, name: el.name }))
+                        }
+                    },
+                    line: st.line,
+                    column: st.column
+                };
+            });
+        }
+    }
     node.statements = node.statements.map((statement) => {
         const namespaceImport = (name, specifier) => ({
             kind: 'ImportDeclaration',
@@ -2158,6 +2197,38 @@ function lowerDynamicExtends(node, inFunction = false) {
         };
     });
 }
+// function _() {} (zod names its constructor functions so): Go's blank
+// identifier can't name it, so it and the references in its scope become _ǂ
+function lowerUnderscoreFunctions(node) {
+    for (const child of childNodes(node))
+        lowerUnderscoreFunctions(child);
+    if (!Array.isArray(node.statements))
+        return;
+    if (!node.statements.some((st) => isFunctionDeclaration(st) && isIdentifier(st.name) && st.name.text === '_'))
+        return;
+    const rename = (n, parentKey, parent) => {
+        if (isIdentifier(n) && n.text === '_') {
+            // (a property name — o._ — is not the function)
+            if (!(parent && (isPropertyAccessExpression(parent) && parentKey === 'name')))
+                n.text = '_ǂ';
+            return;
+        }
+        for (const key of Object.keys(n)) {
+            if (key === 'parent')
+                continue;
+            const v = n[key];
+            if (Array.isArray(v)) {
+                for (const el of v)
+                    if (el && typeof el.kind === 'string')
+                        rename(el, key, n);
+            }
+            else if (v && typeof v.kind === 'string')
+                rename(v, key, n);
+        }
+    };
+    for (const st of node.statements)
+        rename(st, 'statements', node);
+}
 // The classes a file declares at its top level (lowerDynamicExtends)
 const topLevelClassNames = new Set();
 function lowerClassExpressions(node) {
@@ -2214,7 +2285,9 @@ function lowerSymbolKeys(sourceFile) {
 // A Symbol constant that is also read as a value (`B !== undefined`,
 // `fn.BREAK = B`), or that a file typed as `symbol` can see, is a real symbol:
 // it leaves `names` and keeps its declaration
-function retainSymbolsUsedAsValues(sourceFile, names) {
+// (shared: exported constants, seen from every file — imports and typeof
+// of them are no value uses there)
+function retainSymbolsUsedAsValues(sourceFile, names, shared = false) {
     const keyUses = new Set();
     const symbolTyped = { found: false };
     const markKeyUses = (node) => {
@@ -2226,9 +2299,24 @@ function retainSymbolsUsedAsValues(sourceFile, names) {
             keyUses.add(node.name.expression);
         if (node.kind === 'ElementAccessExpression' && !hasQuestionDot(node) && isIdentifier(node.argumentExpression))
             keyUses.add(node.argumentExpression);
+        if (shared && (node.kind === 'ImportSpecifier' || node.kind === 'ExportSpecifier')) {
+            if (node.name)
+                keyUses.add(node.name);
+            if (node.propertyName)
+                keyUses.add(node.propertyName);
+        }
+        if (shared && node.kind === 'TypeQuery' && isIdentifier(node.exprName))
+            keyUses.add(node.exprName);
+        // (type positions: an interface named like the symbol, extended or referenced)
+        if (shared && node.kind === 'TypeReference' && isIdentifier(node.typeName))
+            keyUses.add(node.typeName);
+        if (shared && node.kind === 'ExpressionWithTypeArguments' && isIdentifier(node.expression))
+            keyUses.add(node.expression);
+        if (shared && (node.kind === 'InterfaceDeclaration' || node.kind === 'TypeAliasDeclaration') && isIdentifier(node.name))
+            keyUses.add(node.name);
     };
     markKeyUses(sourceFile);
-    if (symbolTyped.found) {
+    if (symbolTyped.found && !shared) {
         names.clear();
         return;
     }
@@ -2286,6 +2374,10 @@ function lowerSharedSymbolKeys(asts) {
             }
         }
     }
+    // (one read as a value somewhere — x === GeneratedSource — is a real symbol)
+    for (const ast of asts)
+        if (Array.isArray(ast.statements))
+            retainSymbolsUsedAsValues(ast, names, true);
     if (names.size === 0)
         return;
     for (const ast of asts)
@@ -2412,7 +2504,9 @@ function linkParents(node, parent) {
 }
 // Renders a type node's source text syntactically (no typechecker needed).
 function isAnyTypeNode(n) {
-    return n?.kind === 'AnyKeyword' || n?.kind === 'UnknownKeyword';
+    return n?.kind === 'AnyKeyword' || n?.kind === 'UnknownKeyword' ||
+        // (a type sharing its name with a value: see valueShadowedTypeNames)
+        (n?.kind === 'TypeReference' && n.typeName?.kind === 'Identifier' && valueShadowedTypeNames.has(n.typeName.text));
 }
 function typeNodeToText(node) {
     if (!node)
@@ -5393,6 +5487,7 @@ function visitNode(node, options = {}) {
         }
         const methods = [];
         const properties = [];
+        const seenMethods = new Set();
         for (const member of (node.members ?? [])) {
             // (an optional method is no part of the Go interface: implementations
             // may lack it, or declare it with another signature; calls dispatch on
@@ -5401,6 +5496,10 @@ function visitNode(node, options = {}) {
                 continue;
             if (isMethodSignature(member)) {
                 const methodName = visit(member.name);
+                // (an overloaded method: its first signature)
+                if (seenMethods.has(methodName))
+                    continue;
+                seenMethods.add(methodName);
                 // (the parameter types implementations declare: optional ones are
                 // nullable pointers, as class methods emit them)
                 const params = (member.parameters ?? [])
@@ -12850,10 +12949,15 @@ function emitInterfaceAdapter(node) {
     const typeParamNames = '';
     const fields = [];
     const methods = [];
+    // (an overloaded method: its first signature, as signatureOf reads it)
+    const seen = new Set();
     for (const member of node.members ?? []) {
         if (!isMethodSignature(member))
             continue;
         const methodName = visit(member.name);
+        if (seen.has(methodName))
+            continue;
+        seen.add(methodName);
         const params = (member.parameters ?? []).map((p) => `${visit(p.name)} ${p.type ? getParameterGoType({ ...p, parent: member }) : 'interface{}'}`);
         const args = (member.parameters ?? []).map((p) => visit(p.name));
         const returnType = member.type ? getType(member.type) : '';
@@ -12937,12 +13041,32 @@ function objectTypeFieldMap(typeNode) {
         members = typeNode.members ?? [];
     else if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
+        // Pick<T, 'a'> / Omit<T, 'b'>: T's fields, those keys kept or dropped;
+        // Partial<T> / Readonly<T> / Required<T>: T's fields
+        // (a program's own Omit / Pick alias — zod declares one — means the same)
+        if ((name === 'Pick' || name === 'Omit') && (typeNode.typeArguments ?? []).length === 2 && !declaredInterfaces.has(name)) {
+            const keys = getMappedTypeKeys(typeNode.typeArguments[1]);
+            const base = objectTypeFieldMap(typeNode.typeArguments[0]);
+            if (!keys)
+                return base;
+            for (const [field, fieldType] of base)
+                if (keys.includes(goFieldName(field)) === (name === 'Pick'))
+                    out.set(field, fieldType);
+            return out;
+        }
+        if (UTILITY_TYPES.has(name) && (typeNode.typeArguments ?? []).length > 0 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
+            return objectTypeFieldMap(typeNode.typeArguments[0]);
+        }
         const iface = declaredInterfaces.get(name);
         if (iface) {
             collectInterfaceProperties(iface, out);
             return out;
         }
         const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
+        // (an object type known by its fields only: one of another file)
+        const known = !alias ? interfacePropertyTypes.get(name) : undefined;
+        if (known)
+            return new Map(known);
         if (alias?.kind === 'TypeLiteral')
             members = alias.members ?? [];
         else if (alias?.kind === 'UnionType') {
@@ -14277,6 +14401,8 @@ function getType(typeNode, getArrayType = false) {
     }
     if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
+        if (valueShadowedTypeNames.has(name))
+            return 'interface{}';
         if (enumNames.has(name)) {
             // Numeric enums lowered to float64 constants have no named type
             if (enumBaseTypes.get(name) === 'float64')
@@ -18472,9 +18598,12 @@ function getGeneratorYieldType(fn) {
             if (n.asteriskToken && yielded !== undefined) {
                 yielded = yielded.startsWith('chan ') ? yielded.slice(5) : yielded.startsWith('[]') ? yielded.slice(2) : undefined;
             }
-            if (yielded !== undefined && yielded !== 'interface{}' && yielded !== 'nil')
-                found = yielded;
-            return found !== undefined;
+            // (a delegation whose type isn't known — a recursive yield* — leaves
+            // the other yields to say)
+            if (n.asteriskToken && (yielded === undefined || yielded === 'interface{}'))
+                return false;
+            found = yielded;
+            return true;
         }
         return false;
     });
@@ -18736,6 +18865,8 @@ function linkedNamespaceExport(key, name, seen) {
 const originalTopNames = new Map();
 const linkedModules = new Map();
 const linkedTopNames = new Set();
+// Types that share their (Go) name with a value: any values (see linkModule)
+const valueShadowedTypeNames = new Set();
 // Specifiers the file resolver loads as TS modules (not node:, go:, JSON)
 function isLinkableSpecifier(spec) {
     if (/\.json$/i.test(spec) || spec.startsWith('go:') || spec.startsWith('node:'))
@@ -18825,7 +18956,32 @@ function linkModule(key, code, dir, tsx, fileName) {
         if (goName !== name)
             originalTopNames.set(goName, name);
     }
+    // A type sharing its name with a value of the module (interface X {} and
+    // const X = …, as zod declares its schema classes): Go has one namespace,
+    // so the value keeps the name and the type is any value
+    const valueNames = new Set();
     for (const statement of statements) {
+        if (statement.kind === 'VariableStatement') {
+            const names = [];
+            // (a Symbol() trait marker is no value there: lowerSharedSymbolKeys
+            // turns it into the interface's property key)
+            for (const d of statement.declarationList?.declarations ?? [])
+                if (!isSymbolCallExpression(d.initializer))
+                    bindingNames(d.name, names);
+            for (const n of names)
+                valueNames.add(n);
+        }
+        else if (statement.kind === 'FunctionDeclaration' && isIdentifier(statement.name))
+            valueNames.add(statement.name.text);
+    }
+    const isShadowedType = (st) => (st.kind === 'InterfaceDeclaration' || st.kind === 'TypeAliasDeclaration') && isIdentifier(st.name) && valueNames.has(st.name.text);
+    if (statements.some(isShadowedType)) {
+        for (const st of statements)
+            if (isShadowedType(st))
+                valueShadowedTypeNames.add(renames.get(st.name.text) ?? st.name.text);
+        ast.statements = statements.filter((st) => !isShadowedType(st));
+    }
+    for (const statement of ast.statements ?? []) {
         const exported = statement.exported || hasModifier(statement, 'ExportKeyword');
         if (!exported)
             continue;
@@ -29457,14 +29613,21 @@ function getForOfVarNames(initializer) {
         return ['_'];
     }
     const decl = initializer.declarations[0];
+    // (the bindings are new locals: an array-reference variable of the same
+    // name elsewhere — read as (*name) — is not them)
+    const fresh = (name) => {
+        if (isIdentifier(name))
+            referenceArrays.delete(name.text);
+        return visit(name);
+    };
     if (isArrayBindingPattern(decl.name)) {
         return (decl.name.elements ?? []).map((el) => {
             if (isOmittedExpression(el))
                 return '_';
-            return visit(el.name);
+            return fresh(el.name);
         });
     }
-    return [visit(decl.name)];
+    return [fresh(decl.name)];
 }
 // Set while emitting a try/catch whose blocks return from the enclosing function
 let tryReturn;

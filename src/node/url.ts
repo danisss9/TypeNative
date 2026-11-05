@@ -115,7 +115,7 @@ func tnParseHost(host string, special bool) (string, bool) {
 		host = decoded
 	}
 	host = strings.ToLower(host)
-	if !tnIsASCII(host) {
+	if !tnPunyIsASCII(host) {
 		host = TnPunycodeToASCII(host)
 	}
 	if strings.ContainsAny(host, " #%/:<>?@[\\\\]^|") {
