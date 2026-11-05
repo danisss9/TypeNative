@@ -3564,7 +3564,7 @@ function visitNode(node, options = {}) {
         }
         // x.f on a class instance whose class has no member f (read in a branch
         // TypeScript narrowed to another class, which never runs for it): by name
-        if (!isCallee(node) && !isAssignmentTarget(node) && leftGoType?.startsWith('*') && node.expression.kind !== 'ThisKeyword' &&
+        if (!isCallee(node) && !isAssignmentTarget(node) && leftGoType?.startsWith('*') && (node.expression.kind !== 'ThisKeyword' || !!plainFunctionOfThis(node.expression)) &&
             classNames.has(leftGoType.slice(1)) && !classHasMember(leftGoType.slice(1), memberKey(node.name) ?? '')) {
             useHelper('dynamic');
             return `TnGetRef(${leftSide}, ${toGoStringLiteral(memberKey(node.name) ?? '')})`;
@@ -4024,6 +4024,12 @@ function visitNode(node, options = {}) {
         while (node.expression?.kind === 'NonNullExpression') {
             node.expression = node.expression.expression;
             node.expression.parent = node;
+        }
+        if (isUndeclaredClassMember(node.expression) && !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
+            useHelper('dynamic');
+            useHelper('error');
+            const args = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
+            return `TnCallMember(${visit(node.expression.expression)}, ${toGoStringLiteral(memberKey(node.expression.name) ?? '')}${args})`;
         }
         // seq.at(i) / super.push(x) on an Array subclass: an Array method (one
         // the class doesn't declare itself) works on the elements
@@ -4929,21 +4935,28 @@ function visitNode(node, options = {}) {
     else if (node.kind === 'YieldExpression') {
         // Inside a generator: yield sends the value over the generator's channel
         if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
+            // (the value converted to what the generator's channel carries)
+            const yieldType = asyncFunctionNode ? getGeneratorYieldType(asyncFunctionNode) : 'interface{}';
             if (node.asteriskToken) {
                 // yield* other(): forward every value of the delegated generator
                 // (each in step with this generator's consumer)
+                const delegatedType = inferExpressionType(node.expression) ?? '';
+                const elementType = delegatedType.startsWith('chan ') ? delegatedType.slice(5) : '';
+                useHelper('dynamic');
+                const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
                 if (!asyncChannelIsAsync) {
                     useHelper('generatorStep');
-                    return `func() { __yg := TnGenLockstep(${visit(node.expression)}); for __yfirst := true; ; __yfirst = false { if !__yfirst { TnGenAck(__yg) }; __yv, __yok := <-__yg; if !__yok { TnGenDone(__yg); return }; ${asyncChannelVar} <- __yv; TnGenStep(${asyncChannelVar}) } }()`;
+                    return `func() { __yg := TnGenLockstep(${visit(node.expression)}); for __yfirst := true; ; __yfirst = false { if !__yfirst { TnGenAck(__yg) }; __yv, __yok := <-__yg; if !__yok { TnGenDone(__yg); return }; ${asyncChannelVar} <- ${forwarded}; TnGenStep(${asyncChannelVar}) } }()`;
                 }
-                return `for __yv := range ${visit(node.expression)} {\n\t\t\t${asyncChannelVar} <- __yv\n\t\t}`;
+                return `for __yv := range ${visit(node.expression)} {\n\t\t\t${asyncChannelVar} <- ${forwarded}\n\t\t}`;
             }
+            const yielded = node.expression ? toGoValueOfType(node.expression, yieldType) : 'nil';
             // (a generator resumes only once its consumer has run: see TnGenStep)
             if (!asyncChannelIsAsync) {
                 useHelper('generatorStep');
-                return `${asyncChannelVar} <- ${visit(node.expression ?? 'nil')}; TnGenStep(${asyncChannelVar})`;
+                return `${asyncChannelVar} <- ${yielded}; TnGenStep(${asyncChannelVar})`;
             }
-            return `${asyncChannelVar} <- ${visit(node.expression ?? 'nil')}`;
+            return `${asyncChannelVar} <- ${yielded}`;
         }
         return '';
     }
@@ -5846,7 +5859,11 @@ function visitNode(node, options = {}) {
                     const widenedCopy = widenToInterfaceParams(name, member, methodParameterInfo.signature, methodParameterInfo.prefixBlockContent);
                     methodParameterInfo = { signature: [widenedCopy.signature, ...inheritedExtras].filter(Boolean).join(', '), prefixBlockContent: widenedCopy.prefix };
                     recordMethodSignature(name, methodName, goMethodName, methodParameterInfo.signature, inheritedReturnType ?? '');
+                    // (this, in the copy, is the subclass: this.m(…) calls its overrides)
+                    const prevCopyClass = methodCopyClass;
+                    methodCopyClass = name;
                     const copiedBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
+                    methodCopyClass = prevCopyClass;
                     const copiedSlotKey = mockSlotKey('method', methodName);
                     const copiedMockable = mockedMemberNames.has(copiedSlotKey)
                         ? emitMockableMethod(`${name}${typeParamNames}`, goMethodName, copiedSlotKey, methodParameterInfo.signature, returnType, copiedBody, mockSlots)
@@ -9742,15 +9759,14 @@ function visitAnonymousStructLiteral(node) {
                 if (!fields.has(entry[0]))
                     fields.set(entry[0], entry[1]);
             }
-            if (!sawSpread) {
-                sawSpread = true;
-                steps.push(`__obj := *(${visit(p.expression)})`);
-            }
-            else {
-                steps.push(srcFields
-                    .map((entry) => `__obj.${entry[0]} = (${visit(p.expression)}).${entry[0]}`)
-                    .join(';\n\t\t'));
-            }
+            // (the object has every field — the spreads' and its own — so each
+            // spread copies its source's fields in: a spread of null copies none)
+            sawSpread = true;
+            const src = getTempName('src');
+            const copies = srcFields.map((entry) => `__obj.${entry[0]} = ${src}.${entry[0]}`).join('; ');
+            steps.push(srcType?.startsWith('*')
+                ? `if ${src} := ${visit(p.expression)}; ${src} != nil { ${copies} }`
+                : `${src} := ${visit(p.expression)}; _ = ${src}; ${copies}`);
             continue;
         }
         if ((isMethodDeclaration(p) || isGetAccessor(p) || isSetAccessor(p)) && isIdentifier(p.name)) {
@@ -9794,6 +9810,8 @@ function visitAnonymousStructLiteral(node) {
     const self = sawSpread ? '__obj' : getTempName('obj');
     const lines = [];
     if (sawSpread) {
+        // (the properties before the first spread, set first)
+        lines.push(values.length > 0 ? `__obj := ${structType}${compositeBody(values)}` : `var __obj ${structType}`);
         for (const step of steps)
             lines.push(step);
         lines.push('return &__obj');
@@ -9889,12 +9907,16 @@ function getEnclosingClassName(node) {
 // The Go type of `this` inside a class body (methods, constructor, field
 // initializers, arrow functions within them): *ClassName / *Box[T]; undefined
 // inside function expressions and object literals, where `this` is something else
+// The class an inherited method is being copied into (see the class emitter)
+let methodCopyClass;
 function thisGoType(node) {
     let current = node.parent;
     while (current) {
         if (isClassDeclaration(current)) {
             if (!current.name || !isIdentifier(current.name))
                 return undefined;
+            if (methodCopyClass && methodCopyClass !== current.name.text && !isPolymorphicClass(methodCopyClass))
+                return `*${methodCopyClass}`;
             return `*${current.name.text}`;
         }
         // (an object literal's own methods bind this; its property values don't)
@@ -11857,11 +11879,14 @@ function inferExpressionTypeOf(expr) {
     if (isPropertyAccessExpression(expr) && expr.name.text === 'size' && hasQuestionDot(expr) && (inferExpressionType(expr.expression) ?? '').startsWith('*TnMap['))
         return '*float64';
     // (a member the receiver's class lacks: read by name, see the emitter)
-    if (isPropertyAccessExpression(expr) && !isCallee(expr) && expr.expression.kind !== 'ThisKeyword') {
+    if (isPropertyAccessExpression(expr) && !isCallee(expr) && (expr.expression.kind !== 'ThisKeyword' || !!plainFunctionOfThis(expr.expression))) {
         const receiverType = inferExpressionType(expr.expression) ?? '';
         if (receiverType.startsWith('*') && classNames.has(receiverType.slice(1)) && !classHasMember(receiverType.slice(1), memberKey(expr.name) ?? ''))
             return 'interface{}';
     }
+    // (a call of one: see the emitter)
+    if (isCallExpression(expr) && isUndeclaredClassMember(expr.expression))
+        return 'interface{}';
     if (isPropertyAccessExpression(expr)) {
         const narrowingKey = getNarrowingKey(expr);
         if (narrowingKey && narrowedVariables.has(narrowingKey) && !isAssignmentTarget(expr)) {
@@ -14236,6 +14261,24 @@ function enumObjectDecl(node, enumName, members) {
 var ${enumName}__object = map[string]interface{}{${entries}}`;
 }
 let inPlaceEnum = false;
+// The class C of an interface declared `extends InstanceType<typeof C>`
+// (Babel's NodePath: the class's instances with the methods mixed into its
+// prototype), or undefined
+function instanceTypeClassOf(interfaceName) {
+    const iface = declaredInterfaces.get(interfaceName);
+    if (!iface)
+        return undefined;
+    for (const clause of iface.heritageClauses ?? []) {
+        if (clause.token !== 'ExtendsKeyword')
+            continue;
+        for (const type of clause.types ?? []) {
+            const query = isIdentifier(type.expression) && type.expression.text === 'InstanceType' ? type.typeArguments?.[0] : undefined;
+            if (query?.kind === 'TypeQuery' && isIdentifier(query.exprName) && classNames.has(query.exprName.text))
+                return query.exprName.text;
+        }
+    }
+    return undefined;
+}
 // The type aliases getType is expanding (name<type arguments>)
 const aliasesExpanding = new Set();
 function getType(typeNode, getArrayType = false) {
@@ -14403,6 +14446,10 @@ function getType(typeNode, getArrayType = false) {
         const name = typeNode.typeName.text;
         if (valueShadowedTypeNames.has(name))
             return 'interface{}';
+        // interface P extends InstanceType<typeof C>, …mixins: C's instances
+        const instanceClass = instanceTypeClassOf(name);
+        if (instanceClass)
+            return isPolymorphicClass(instanceClass) ? 'interface{}' : `*${instanceClass}`;
         if (enumNames.has(name)) {
             // Numeric enums lowered to float64 constants have no named type
             if (enumBaseTypes.get(name) === 'float64')
@@ -14671,8 +14718,9 @@ function resolveExpressionType(expr) {
         if (narrowedCategory)
             return narrowedCategory;
         const known = variableTypes.get(expr.text) ?? goTypeCategory(variableGoTypes.get(expr.text));
-        // Named imports of Node values (import { METHODS } from 'node:http')
-        if (known === undefined && nodeLocalNames.has(expr.text))
+        // Named imports of Node values (import { METHODS } from 'node:http'),
+        // and of another module's top-level variables: their inferred type's
+        if (known === undefined)
             return goTypeCategory(inferExpressionType(expr));
         return known;
     }
@@ -17270,6 +17318,20 @@ function collectClassImplementedInterfaces() {
     }
 }
 // Whether a class (or an ancestor) declares a member of the name
+// recv.m(…) / recv.x with recv a class instance whose class (nor an
+// ancestor) declares m: a method added to the prototype at run time, or a
+// member of a class TypeScript narrowed it to — called / read by name
+// (this counts in plain functions, whose this may be any instance)
+function isUndeclaredClassMember(access) {
+    if (!isPropertyAccessExpression(access) || hasQuestionDot(access) || access.name?.kind === 'PrivateIdentifier')
+        return false;
+    if (access.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(access.expression))
+        return false;
+    if (access.expression.kind === 'SuperKeyword')
+        return false;
+    const receiverType = inferExpressionType(access.expression) ?? '';
+    return receiverType.startsWith('*') && classNames.has(receiverType.slice(1)) && !classHasMember(receiverType.slice(1), memberKey(access.name) ?? '');
+}
 function classHasMember(className, member) {
     if (!member)
         return true;
@@ -17277,7 +17339,8 @@ function classHasMember(className, member) {
         const declaration = declaredClasses.get(name);
         if (!declaration)
             return true;
-        if ((declaration.members ?? []).some((m) => m.name && memberKey(m.name) === member))
+        // (a static member of the name is no instance member)
+        if ((declaration.members ?? []).some((m) => m.name && memberKey(m.name) === member && !hasModifier(m, 'StaticKeyword')))
             return true;
         if (getParameterProperties(declaration).some((p) => p.name?.text === member))
             return true;
@@ -19249,6 +19312,11 @@ function renameModuleBindings(node, renames, namespaces, expandoReads, inObjectP
     let scopeRenames = renames;
     let scopeNamespaces = namespaces;
     let scopeExpandos = expandoReads;
+    // (a function or class declaration's name is the enclosing scope's: renamed
+    // even when a parameter of the same name shadows it inside)
+    if ((node.kind === 'FunctionDeclaration' || node.kind === 'ClassDeclaration') && isIdentifier(node.name) && renames.has(node.name.text)) {
+        node.name.text = renames.get(node.name.text);
+    }
     if (node.kind !== 'SourceFile') {
         // a local named as an import's target (`variable` beside o.variable(…)
         // or an import renamed to it): the local is renamed, so both stay reachable
