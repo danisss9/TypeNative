@@ -2605,7 +2605,7 @@ function linkParents(node, parent) {
 function isAnyTypeNode(n) {
     return n?.kind === 'AnyKeyword' || n?.kind === 'UnknownKeyword' ||
         // (a type sharing its name with a value: see valueShadowedTypeNames)
-        (n?.kind === 'TypeReference' && n.typeName?.kind === 'Identifier' && valueShadowedTypeNames.has(n.typeName.text));
+        (n?.kind === 'TypeReference' && n.typeName?.kind === 'Identifier' && (valueShadowedTypeNames.has(n.typeName.text) || openObjectTypeNames.has(n.typeName.text)));
 }
 function typeNodeToText(node) {
     if (!node)
@@ -2814,6 +2814,7 @@ export function transpileToNative(code, options) {
         }
     }
     collectClassImplementedInterfaces();
+    collectOpenObjectTypes();
     collectArrayCastClasses();
     // and so are their enums (a module emitted first may read another's: imports can cycle)
     for (const mod of linkedModules.values()) {
@@ -3427,6 +3428,12 @@ function visitNode(node, options = {}) {
     }
     else if (isBlock(node)) {
         return `{\n\t\t${coverageEnter(node)}${options.prefixBlockContent ?? ''}${visitBlockStatements(node.statements ?? [])}${options.extraBlockContent ?? ''}${fallbackReturn(node)}}${options.inline ? '' : '\n\t'}`;
+    }
+    else if (node.kind === 'TnNamespaceObject') {
+        // (see renameModuleBindings: a namespace import used as a value)
+        useHelper('dynamicSpread');
+        const entries = namespaceValueEntries(node.moduleKey).map(([name, value]) => `__ns.Set(${toGoStringLiteral(name)}, ${value})`);
+        return `func() *TnMap[string, interface{}] { __ns := TnNewMap[string, interface{}](); ${entries.join('; ')}; return __ns }()`;
     }
     else if (node.kind === 'TnExtendClass') {
         // (see lowerDynamicExtends)
@@ -11529,7 +11536,7 @@ function isLocallyBound(expr) {
 function inferExpressionTypeOf(expr) {
     if (expr?.kind === 'TnArrayItems')
         return '[]interface{}';
-    if (expr?.kind === 'TnExtendClass')
+    if (expr?.kind === 'TnExtendClass' || expr?.kind === 'TnNamespaceObject')
         return 'interface{}';
     if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Object' && expr.name.text === 'prototype' && !classNames.has('Object') &&
         !(isPropertyAccessExpression(expr.parent) && expr.parent.expression === expr))
@@ -14723,7 +14730,7 @@ function getType(typeNode, getArrayType = false) {
     }
     if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
-        if (valueShadowedTypeNames.has(name))
+        if (valueShadowedTypeNames.has(name) || openObjectTypeNames.has(name))
             return 'interface{}';
         // interface P extends InstanceType<typeof C>, …mixins: C's instances
         const instanceClass = instanceTypeClassOf(name);
@@ -14789,8 +14796,9 @@ function getType(typeNode, getArrayType = false) {
         if (name === 'RegExpExecArray' || name === 'RegExpMatchArray') {
             return '[]string';
         }
-        // Uint8Array / Buffer / ArrayBuffer annotations are Go []byte.
-        if (name === 'Uint8Array' || name === 'Buffer' || name === 'ArrayBuffer') {
+        // Uint8Array / Buffer / ArrayBuffer annotations are Go []byte (not a
+        // program's own class of the name: @babel/generator's Buffer)
+        if ((name === 'Uint8Array' || name === 'Buffer' || name === 'ArrayBuffer') && !classNames.has(name)) {
             return '[]byte';
         }
         if (name === 'TemplateStringsArray')
@@ -14858,6 +14866,11 @@ function getType(typeNode, getArrayType = false) {
         // through its methods, so no pointer)
         if (declaredInterfaces.has(name)) {
             return name;
+        }
+        // a type the program declares nowhere it can see (one a .d.ts / .d.cts
+        // beside a CommonJS file declares): any
+        if (!isTypeParameterInScope(name, typeNode) && !declaredTypeAliases.has(name) && !typeAliases.has(name) && !classNames.has(name) && !enumNames.has(name) && !interfacePropertyTypes.has(name) && !/^[A-Z]$/.test(name) && !name.startsWith('Tn')) {
+            return 'interface{}';
         }
         const typeArgs = getTypeArguments(typeNode.typeArguments);
         return `${name}${typeArgs}`;
@@ -19298,6 +19311,34 @@ const linkedModules = new Map();
 const linkedTopNames = new Set();
 // Types that share their (Go) name with a value: any values (see linkModule)
 const valueShadowedTypeNames = new Set();
+// Object types with a string index signature beside their named members
+// ({ [k: string]: unknown; type?: string }, zod's JSONSchema), and the
+// interfaces extending them: open objects, held as dynamic values
+const openObjectTypeNames = new Set();
+function collectOpenObjectTypes() {
+    const hasIndex = (members) => (members ?? []).some((m) => m.kind === 'IndexSignature' && (m.parameters?.[0]?.type?.kind === 'StringKeyword')) &&
+        (members ?? []).some((m) => m.kind !== 'IndexSignature');
+    for (const [name, iface] of declaredInterfaces)
+        if (hasIndex(iface.members))
+            openObjectTypeNames.add(name);
+    for (const [name, alias] of declaredTypeAliases)
+        if (alias?.kind === 'TypeLiteral' && hasIndex(alias.members))
+            openObjectTypeNames.add(name);
+    for (let changed = true; changed;) {
+        changed = false;
+        for (const [name, iface] of declaredInterfaces) {
+            if (openObjectTypeNames.has(name))
+                continue;
+            const extendsOpen = (iface.heritageClauses ?? []).some((c) => c.token === 'ExtendsKeyword' &&
+                (c.types ?? []).some((t) => isIdentifier(t.expression) &&
+                    (openObjectTypeNames.has(t.expression.text) || declaredTypeAliases.get(t.expression.text)?.kind === 'AnyKeyword')));
+            if (extendsOpen) {
+                openObjectTypeNames.add(name);
+                changed = true;
+            }
+        }
+    }
+}
 // Specifiers the file resolver loads as TS modules (not node:, go:, JSON)
 function isLinkableSpecifier(spec) {
     if (/\.json$/i.test(spec) || spec.startsWith('go:') || spec.startsWith('node:'))
@@ -19447,6 +19488,21 @@ function linkModule(key, code, dir, tsx, fileName) {
         }
         if (hasModifier(statement, 'DefaultKeyword') && names.length === 1) {
             mod.exports.set('default', renames.get(names[0]) ?? names[0]);
+        }
+    }
+    // (export { own as b } / export default own, of the module's own
+    // declarations: known before the imports are linked, for a cycle back here)
+    const ownNames = new Set(moduleOwnNames(statements));
+    for (const statement of statements) {
+        if (statement.kind === 'ExportDeclaration' && !statement.moduleSpecifier) {
+            for (const el of statement.exportClause?.elements ?? []) {
+                const local = (el.propertyName ?? el.name).text;
+                if (ownNames.has(local))
+                    mod.exports.set(el.name.text, renames.get(local) ?? local);
+            }
+        }
+        else if (statement.kind === 'ExportAssignment' && isIdentifier(statement.expression) && ownNames.has(statement.expression.text)) {
+            mod.exports.set('default', renames.get(statement.expression.text) ?? statement.expression.text);
         }
     }
     // (export * from './x': known before the imports are linked, so a module
@@ -19649,6 +19705,56 @@ function collectVarNames(node, out) {
     }
 }
 // An identifier node at another node's source position
+// The value exports of a linked module (and of the modules it re-exports)
+// as [export name, Go value]: functions, variables and class values
+function namespaceValueEntries(key, seen = new Set()) {
+    const mod = linkedModules.get(key);
+    if (!mod || seen.has(key))
+        return [];
+    seen.add(key);
+    const out = new Map();
+    const valueGoNames = new Set();
+    const classGoNames = new Set();
+    for (const st of mod.ast.statements ?? []) {
+        if (st.kind === 'VariableStatement') {
+            const names = [];
+            for (const d of st.declarationList?.declarations ?? [])
+                bindingNames(d.name, names);
+            for (const n of names)
+                valueGoNames.add(n);
+        }
+        else if (st.kind === 'FunctionDeclaration' && isIdentifier(st.name))
+            valueGoNames.add(st.name.text);
+        else if (st.kind === 'ClassDeclaration' && isIdentifier(st.name))
+            classGoNames.add(st.name.text);
+    }
+    for (const [name, goName] of mod.exports) {
+        if (name === 'default')
+            continue;
+        if (classGoNames.has(goName) || classNames.has(goName))
+            out.set(name, classValue(goName));
+        else if (valueGoNames.has(goName) || declaredFunctions.has(goName)) {
+            // (a generic Go function is no value until instantiated)
+            const fn = declaredFunctions.get(goName);
+            if (fn && getTypeParameters(fn.typeParameters, fn) !== '')
+                continue;
+            out.set(name, goName);
+        }
+    }
+    for (const [name, forward] of mod.forwards) {
+        if (out.has(name))
+            continue;
+        const entry = namespaceValueEntries(forward.key, new Set(seen)).find(([n]) => n === forward.remote);
+        if (entry)
+            out.set(name, entry[1]);
+    }
+    for (const star of mod.starExports) {
+        for (const [name, value] of namespaceValueEntries(star, seen))
+            if (!out.has(name))
+                out.set(name, value);
+    }
+    return [...out];
+}
 function identifierAt(text, at) {
     return { kind: 'Identifier', text: text, line: at.line, column: at.column, endLine: at.endLine, endColumn: at.endColumn };
 }
@@ -19782,6 +19888,18 @@ function renameModuleBindings(node, renames, namespaces, expandoReads, inObjectP
             const expandoTarget = expandoKey && scopeExpandos.has(expandoKey) ? scopeExpandos.get(expandoKey) : undefined;
             if (expandoTarget !== undefined) {
                 const replacement = identifierAt(expandoTarget, child);
+                if (isList)
+                    value[i] = replacement;
+                else
+                    node[key] = replacement;
+                continue;
+            }
+            // a namespace import used as a value (traverse.visitors = visitors,
+            // virtualTypes[type]): the module's namespace object
+            if (isIdentifier(child) && scopeNamespaces.has(child.text) && !scopeRenames.has(child.text) &&
+                !(node.kind === 'ImportSpecifier' || node.kind === 'NamespaceImport' || node.kind === 'ImportClause' || node.kind === 'ExportSpecifier') &&
+                !(node.kind === 'TypeQuery' || node.kind === 'TypeReference' || node.kind === 'QualifiedName' || node.kind === 'ExpressionWithTypeArguments')) {
+                const replacement = { kind: 'TnNamespaceObject', moduleKey: scopeNamespaces.get(child.text), line: child.line, column: child.column };
                 if (isList)
                     value[i] = replacement;
                 else
