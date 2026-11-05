@@ -6252,7 +6252,7 @@ function visitNode(node, options = {}) {
                 // constructors ran, see TnMixinClass)
                 const baseField = goFieldName(parentClass);
                 result += emitConstructor(name, typeParams, typeParamNames, '', `{\n\t\tpanic(TnNodeError("TypeError", "", "${name} is a mixin: its class is made at run time"))\n\t}`);
-                result += `func TnMixinWrap_${name}(__parent interface{}) interface{} {\n\t\t__base := __parent.(interface{ TnMixinBase() interface{} }).TnMixinBase().(*${parentClass})\n\t\tself := &${name}{${baseField}: __base, __super: __parent.(${mixinOf}__VT)}\n\t\t__base.__vt = self\n\t\treturn self\n\t}\n\n`;
+                result += `func TnMixinWrap_${name}(__parent interface{}) interface{} {\n\t\t__base := __parent.(interface{ TnMixinBase() interface{} }).TnMixinBase().(*${parentClass})\n\t\tself := &${name}{${baseField}: __base, __super: tnAsVT_${mixinOf}(__parent)}\n\t\t__base.__vt = tnAsVT_${mixinOf}(self)\n\t\treturn self\n\t}\n\n`;
                 result += `func TnMixinFields_${name}(__obj interface{}) {\n\t\tself := __obj.(*${name})\n\t\t_ = self\n\t\t${fieldInitializers(node)}\n\t}\n\n`;
                 result += `func (self *${name}) TnMixinBase() interface{} { return self.${baseField} }\n\n`;
                 useHelper('error');
@@ -6458,6 +6458,9 @@ function visitNode(node, options = {}) {
                     // (the declared return for dispatch/inference: the conformed one
                     // is only the emitted signature, which Go matches exactly)
                     recordMethodSignature(name, memberKey(member.name) ?? methodName, methodName, fullSignature, methodReturnGoType(member) ?? '');
+                    // (and the emitted one, for the Go interfaces naming the method: a
+                    // mixin base's __VT)
+                    emittedMethodResults.set(`${name}.${memberKey(member.name) ?? methodName}`, returnType.trim());
                     const body = visit(member.body, { prefixBlockContent: prefix });
                     const slotKey = mockSlotKey('method', memberKey(member.name) ?? methodName);
                     const mockable = mockedMemberNames.has(slotKey)
@@ -6930,6 +6933,13 @@ function toGoValueOfType(expr, goType) {
     // write expression: null into a boolean field — can only be its zero value)
     if ((goType === 'bool' || goType === 'string' || goType === 'float64') && isNilLiteral(unwrapParentheses(expr)))
         return `*new(${goType})`;
+    // (a call that never returns — CompilerError.throwTodo(…) — as a value:
+    // it runs, and the slot's type is satisfied)
+    if (goType && goType !== ':' && goType !== '' && isCallExpression(unwrapParentheses(expr))) {
+        const signature = getCalleeSignature(unwrapParentheses(expr));
+        if (signature?.type?.kind === 'NeverKeyword')
+            return `func() ${goType} { ${visit(expr)}; panic("unreachable") }()`;
+    }
     // x! into a slot of x's own nullable type: x itself (the assertion is
     // not checked at runtime: a null stays null)
     if (goType && NULLABLE_PRIMITIVE_TYPES.includes(goType)) {
@@ -8787,6 +8797,55 @@ function emitMixinBaseConstructors(base) {
     return out + emitConstructor(base, '', '', baseSignature, `{\n\t\tself := &${base}{}\n\t\tself.__vt = self\n\t\tself.tnInit_${getSafeName(base)}(${(baseSignature ? forwardOf(baseSignature) : []).join(', ')})\n\t\treturn self\n\t}`);
 }
 const mixinBaseCtorSignatures = new Map();
+// Class.method → the Go result its method is emitted with (an array
+// reference *[]T, an implemented interface's type), where it differs
+const emittedMethodResults = new Map();
+// The body of a method of signature `to` calling `target` of signature
+// `from` (a mixin's override typed otherwise than its base's): the
+// arguments, defaults (…interface{}) included, mapped and converted, and the
+// result converted back
+function adaptedMethodCall(target, from, to) {
+    useHelper('dynamic');
+    const split = (params) => splitGoParameters(params).filter((p) => p.trim()).map((p) => {
+        const t = p.trim();
+        const space = t.indexOf(' ');
+        return { name: t.slice(0, space), type: t.slice(space + 1).trim() };
+    });
+    const toParams = split(to.params);
+    const fromParams = split(from.params);
+    const toRest = toParams.length > 0 && toParams[toParams.length - 1].type.startsWith('...') ? toParams.pop() : undefined;
+    const fromRest = fromParams.length > 0 && fromParams[fromParams.length - 1].type.startsWith('...') ? fromParams.pop() : undefined;
+    const sameShape = !toRest && !fromRest && toParams.length === fromParams.length;
+    let prefix = '';
+    const args = [];
+    if (sameShape) {
+        fromParams.forEach((p, i) => args.push(convertBetweenGoTypes(toParams[i].name, toParams[i].type, p.type)));
+    }
+    else {
+        // (every argument as a list, read by position)
+        const fixed = `[]interface{}{${toParams.map((p) => p.name).join(', ')}}`;
+        const all = toRest ? `append(${fixed}, ${toRest.type === '...interface{}' ? toRest.name : `TnToArray(${toRest.name})`}...)` : fixed;
+        if (toRest && toRest.type !== '...interface{}')
+            useHelper('arraySubclass');
+        prefix = `__all := ${all}; _ = __all; `;
+        fromParams.forEach((p, i) => {
+            if (i < toParams.length && toParams[i].type === p.type)
+                args.push(toParams[i].name);
+            else
+                args.push(convertBetweenGoTypes(`TnArg(__all, ${i})`, 'interface{}', p.type));
+        });
+        if (fromRest) {
+            const element = fromRest.type.slice(3);
+            args.push(element === 'interface{}' ? `TnRestArgs(__all, ${fromParams.length})...` : `TnRestArgsAs[${element}](__all, ${fromParams.length})...`);
+        }
+    }
+    const call = `${target}(${args.join(', ')})`;
+    if (!to.result)
+        return `${prefix}${call}`;
+    if (!from.result)
+        return `${prefix}${call}; return *new(${to.result})`;
+    return `${prefix}return ${convertBetweenGoTypes(call, from.result, to.result)}`;
+}
 function isMixinBaseAncestor(name) {
     for (const base of mixinVirtualMethods.keys()) {
         for (let c = classParentNames.get(base); c; c = classParentNames.get(c))
@@ -8801,10 +8860,16 @@ function emitMixinSupport() {
         const mixins = [...mixinBaseOf].filter(([, b]) => b === base).map(([m]) => m);
         const baseSigs = classMethodSignatures.get(base) ?? new Map();
         const sigs = new Map();
+        // (with the result each method is emitted with)
+        const emitted = (cls, n, sig) => {
+            const r = emittedMethodResults.get(`${cls}.${n}`);
+            return r !== undefined && r !== sig.result ? { ...sig, result: r } : sig;
+        };
         for (const n of [...names].sort()) {
-            const sig = baseSigs.get(n) ?? mixins.map((m) => classMethodSignatures.get(m)?.get(n)).find((x) => !!x);
-            if (sig)
-                sigs.set(n, sig);
+            const owner = baseSigs.has(n) ? base : mixins.find((m) => classMethodSignatures.get(m)?.has(n));
+            const sig = owner ? (owner === base ? baseSigs : classMethodSignatures.get(owner)).get(n) : undefined;
+            if (sig && owner)
+                sigs.set(n, emitted(owner, n, sig));
         }
         const result = (sg) => (sg.result ? ` ${sg.result}` : '');
         const forward = (sg) => splitGoParameters(sg.params).map((p) => {
@@ -8830,6 +8895,25 @@ function emitMixinSupport() {
                 out.push(`func (self *${m}) ${sg.goName}(${sg.params})${result(sg)} { ${sg.result ? 'return ' : ''}self.__super.${sg.goName}(${forward(sg)}) }`);
             }
         }
+        // Each mixin as the base's __vt (and as the next one's __super): an
+        // adapter giving its methods the __VT signatures (an override may type
+        // its parameters or result otherwise: arguments and result converted)
+        const funcType = (sg) => `func(${goFuncParamTypes(`func(${sg.params})`).join(', ')})${result(sg)}`;
+        const normalized = (t) => t.replace(/\s+/g, '');
+        for (const m of mixins) {
+            const own = classMethodSignatures.get(m) ?? new Map();
+            out.push(`type ${m}__VTA struct{ o *${m} }`);
+            for (const [n, sg] of sigs) {
+                const ownSig = own.get(n);
+                const mine = ownSig ? emitted(m, n, ownSig) : undefined;
+                let body = `${sg.result ? 'return ' : ''}a.o.${sg.goName}(${forward(sg)})`;
+                if (mine && normalized(funcType(mine)) !== normalized(funcType(sg)))
+                    body = adaptedMethodCall(`a.o.${mine.goName}`, mine, sg);
+                out.push(`func (a *${m}__VTA) ${sg.goName}(${sg.params})${result(sg)} { ${body} }`);
+            }
+        }
+        // (an object made over the base, as the __VT its methods dispatch through)
+        out.push(`func tnAsVT_${base}(o interface{}) ${base}__VT {\n\tswitch v := o.(type) {\n${mixins.map((m) => `\tcase *${m}:\n\t\treturn &${m}__VTA{v}`).join('\n')}\n\t}\n\treturn o.(${base}__VT)\n}`);
     }
     return out.length > 0 ? `\n\n${out.join('\n\n')}` : '';
 }
@@ -11396,12 +11480,35 @@ function prescanVariableDeclarations(block) {
         }
     }
 }
+// A function literal's contextual Go type mentioning the type parameters of
+// the generic function it is passed to (getOrInsertWith(m, k, () => [])):
+// those bound by the call's other arguments; undefined when one stays open
+function boundCallTypeParameters(fn, goType) {
+    const call = fn.parent;
+    const callee = isCallExpression(call) && isIdentifier(call.expression) ? calledFunctionDeclaration(call.expression.text, call) : undefined;
+    const names = (callee?.typeParameters ?? []).map((tp) => tp.name?.text ?? '').filter((n) => n && new RegExp(`\\b${n}\\b`).test(goType));
+    if (!callee || names.length === 0 || (call.typeArguments ?? []).length > 0)
+        return goType;
+    if (fn.tnBindingCallTypes)
+        return undefined;
+    fn.tnBindingCallTypes = true;
+    const bindings = bindArgumentTypeParameters(callee.parameters ?? [], (call.arguments ?? []).filter((a) => a !== fn), names);
+    fn.tnBindingCallTypes = false;
+    if (!names.every((n) => bindings.has(n)))
+        return undefined;
+    return names.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), bindings.get(n)), goType);
+}
 function inferFunctionBodyReturnType(node) {
     if (node.type)
         return getType(node.type);
     const contextualFn = getContextualFunctionType(node);
-    if (contextualFn?.type)
-        return getType(contextualFn.type);
+    if (contextualFn?.type) {
+        const contextualResult = boundCallTypeParameters(node, getType(contextualFn.type));
+        // (() => V of a generic callee, V bound by none of its arguments: the
+        // body's own type)
+        if (contextualResult !== undefined)
+            return contextualResult;
+    }
     if (isArrowFunction(node) && !isBlock(node.body)) {
         const bodyType = inferExpressionType(node.body);
         // `() => undefined`: nil is not a Go type
@@ -16651,6 +16758,12 @@ const arrayMethodHandlers = {
         // (an array a call returns — a getter's — is no Go variable: appended to a copy)
         // (a field through a call's pointer result — getter().items — is addressable)
         if (obj.endsWith(')') && !isAddressable(obj) && !/^\(\*.+\)$/.test(obj)) {
+            // (a call returning an array reference — a Map of arrays' value through
+            // getOrInsertWith — appends to the array it refers to)
+            const receiver = currentCallNode && isPropertyAccessExpression(currentCallNode.expression) ? currentCallNode.expression.expression : undefined;
+            if (receiver && inferRawExpressionType(receiver)?.startsWith('*[]')) {
+                return `func() float64 { __p := ${obj}; *__p = ${appendArguments('*__p', args)}; return float64(len(*__p)) }()`;
+            }
             return `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args)}; return float64(len(__s)) }()`;
         }
         return currentCallNode && !isDiscardedValue(currentCallNode)
@@ -17235,7 +17348,9 @@ function visitDynamicMethodCall(node) {
         const call = { ...node, expression: { ...node.expression, expression: local } };
         call.expression.parent = call;
         local.parent = call.expression;
-        const resultType = inferExpressionType(call) ?? '';
+        // (the result of the method on any elements, when not inferred)
+        const elementResults = { push: 'float64', unshift: 'float64', pop: 'interface{}', shift: 'interface{}', splice: '[]interface{}' };
+        const resultType = inferExpressionType(call) || (elementResults[method] ?? '');
         // (one element onto a field: in place, nothing is converted or copied)
         if (method === 'push' && (node.arguments ?? []).length === 1 && !isSpreadElement(node.arguments[0]) && isDiscardedValue(node) && isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression) && !hasQuestionDot(receiver) && !hasQuestionDot(node.expression)) {
             return `TnPushField(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${toGoValueOfType(node.arguments[0], 'interface{}')})`;
