@@ -768,6 +768,10 @@ interface ErrorOptions {
 interface ErrorConstructor {
   new (message?: string, options?: ErrorOptions): Error;
   (message?: string, options?: ErrorOptions): Error;
+  // (V8's: accepted, without effect — there are no V8 stack frames)
+  captureStackTrace(targetObject: object, constructorOpt?: Function): void;
+  stackTraceLimit: number;
+  prepareStackTrace?: (err: Error, stackTraces: any[]) => any;
 }
 
 declare var Error: ErrorConstructor;
