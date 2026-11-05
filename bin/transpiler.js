@@ -4742,7 +4742,13 @@ function visitNode(node, options = {}) {
         const classMethodCallee = isPropertyAccessExpression(node.expression) && (isIdentifier(node.expression.expression) && classNames.has(node.expression.expression.text) && !variableGoTypes.has(node.expression.expression.text) ||
             !!classNameOfGoType(inferExpressionType(node.expression.expression) ?? ''));
         const keptTypeArgs = classMethodCallee ? [] : (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
-        const typeArgs = getTypeArguments(keptTypeArgs);
+        let typeArgs = getTypeArguments(keptTypeArgs);
+        // (f(fn, visitor, undefined): type arguments Go can't infer from a nil)
+        if (!typeArgs && calleeDeclaration && !classMethodCallee && (node.typeArguments ?? []).length === 0) {
+            const inst = uninferableInstantiation(calleeDeclaration, node);
+            if (inst)
+                typeArgs = `[${inst.args.join(', ')}]`;
+        }
         // Handle spread arguments: fn(...arr) → fn(arr...)
         const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
         const args = hasSpreadArg ? visitSpreadCallArguments(node) : visitCallArguments(node);
@@ -18530,6 +18536,8 @@ function genericInstantiation(node) {
     const fn = calledFunctionDeclaration(node.expression.text, node);
     const typeParameters = fn?.typeParameters ?? [];
     const typeArguments = node.typeArguments ?? [];
+    if (fn && typeParameters.length > 0 && typeArguments.length === 0)
+        return uninferableInstantiation(fn, node);
     if (!fn || typeParameters.length === 0 || typeParameters.length !== typeArguments.length)
         return undefined;
     const erased = erasedFunctionTypeParameters(fn);
@@ -18542,6 +18550,30 @@ function genericInstantiation(node) {
         args.push(getType(typeArguments[i]));
     });
     return params.length > 0 ? { params, args } : undefined;
+}
+// f(fn, visitor, undefined) of f<TState>(…, state: TState): Go can't infer a
+// type parameter only nil arguments are passed for, so the call names them
+// all (each bound by the other arguments, else any)
+function uninferableInstantiation(fn, call) {
+    const erased = erasedFunctionTypeParameters(fn);
+    const names = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '').filter((n) => n && !erased.has(n));
+    if (names.length === 0)
+        return undefined;
+    const params = fn.parameters ?? [];
+    const args = call.arguments ?? [];
+    if (args.some((a) => isSpreadElement(a)))
+        return undefined;
+    const mentions = (p, n) => !!p.type && new RegExp(`\\b${n}\\b`).test(getType(p.type));
+    // (an argument held as any binds nothing Go can see either)
+    const inferable = (n) => params.some((p, i) => mentions(p, n) && !!args[i] && !isNilLiteral(unwrapParentheses(args[i])) && !(isIdentifier(args[i]) && args[i].text === 'undefined') &&
+        !['interface{}', ''].includes(inferExpressionType(args[i]) ?? ''));
+    if (names.every(inferable))
+        return undefined;
+    // (only when the nil argument is what leaves it open)
+    if (!names.some((n) => params.some((p, i) => mentions(p, n) && !!args[i])))
+        return undefined;
+    const bindings = bindArgumentTypeParameters(params, args, names);
+    return { params: names, args: names.map((n) => bindings.get(n) ?? 'interface{}') };
 }
 // Names of top-level generic functions some code reads as a value (passes, stores) rather than calls
 let functionsUsedAsValuesCache;
@@ -18643,6 +18675,26 @@ function getTypeParameters(typeParameters, owner) {
                 scan(p.type);
         if (owner.type)
             scan(owner.type);
+        // (and new Set(xs) / new Map<T, V>() in the body, xs a T[] parameter)
+        if (owner.body) {
+            const elementName = (t) => {
+                const r = t && isUnionTypeNode(t) ? (t.types ?? []).find((m) => m.kind !== 'NullKeyword' && m.kind !== 'UndefinedKeyword' && !(isLiteralTypeNode(m) && m.literal?.kind === 'NullKeyword')) : t;
+                const element = r && isArrayTypeNode(r) ? r.elementType : r && r.kind === 'TypeOperator' && isArrayTypeNode(r.type) ? r.type.elementType : undefined;
+                return element && isTypeReferenceNode(element) && isIdentifier(element.typeName) ? element.typeName.text : undefined;
+            };
+            containsNode(owner.body, (n) => {
+                if (!isNewExpression(n) || !isIdentifier(n.expression) || !['Set', 'Map'].includes(n.expression.text))
+                    return false;
+                for (const ta of n.typeArguments ?? [])
+                    scan(ta);
+                const arg = (n.arguments ?? [])[0];
+                const param = arg && isIdentifier(arg) ? (owner.parameters ?? []).find((p) => isIdentifier(p.name) && p.name.text === arg.text) : undefined;
+                const key = n.expression.text === 'Set' ? elementName(param?.type) : undefined;
+                if (key)
+                    keyed.add(key);
+                return false;
+            });
+        }
         for (const m of owner.members ?? []) {
             if (m.type)
                 scan(m.type);
@@ -19380,6 +19432,24 @@ function visitCallArguments(node) {
     // key, new Set()) takes the map's value type for the Set)
     const typeParamNames = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '');
     const typeBindings = typeParamNames.length > 0 ? bindArgumentTypeParameters(params, args, typeParamNames) : new Map();
+    // (a call naming type arguments Go couldn't infer: the arguments converted
+    // to the instantiated parameter types)
+    const instantiated = typeParamNames.length > 0 && (node.typeArguments ?? []).length === 0 && !isMethodDeclaration(fn) && !isFunctionTypeNode(fn) ? uninferableInstantiation(fn, node) : undefined;
+    if (instantiated) {
+        const instantiate = (t) => instantiated.params.reduce((acc, p, i) => acc.replace(new RegExp(`\\b${p}\\b`, 'g'), instantiated.args[i]), t);
+        const converted = args.map((arg, index) => {
+            const param = params[index];
+            if (!param || param.dotDotDotToken || isSpreadElement(arg))
+                return visit(arg);
+            return toGoValueOfType(arg, instantiate(getParameterGoType(param)));
+        });
+        for (let i = args.length; i < params.length; i++) {
+            if (params[i].initializer || params[i].dotDotDotToken)
+                break;
+            converted.push(`*new(${instantiate(getParameterGoType(params[i]))})`);
+        }
+        return converted;
+    }
     const restParam = params.length > 0 && params[params.length - 1].dotDotDotToken ? params[params.length - 1] : undefined;
     const result = args.map((arg, index) => {
         const param = params[index];
@@ -19406,7 +19476,13 @@ function visitCallArguments(node) {
         const bound = isTypeReferenceNode(param.type) && isIdentifier(param.type.typeName) ? typeBindings.get(param.type.typeName.text) : undefined;
         if (bound && !isSpreadElement(arg))
             return toGoValueOfType(arg, bound);
-        if (typeParamNames.some((n) => n && new RegExp(`\\b${n}\\b`).test(paramType)))
+        const mentioned = typeParamNames.filter((n) => n && new RegExp(`\\b${n}\\b`).test(paramType));
+        // (an any value for xs: T[], T bound by another argument: converted to
+        // the bound type, as Go can't take it unconverted)
+        if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && inferExpressionType(arg) === 'interface{}') {
+            return toGoValueOfType(arg, mentioned.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), typeBindings.get(n)), paramType));
+        }
+        if (mentioned.length > 0)
             return visit(arg);
         const converted = toGoValueOfType(arg, paramType);
         // (a converted copy the function changes: written back after the call)
@@ -19443,6 +19519,13 @@ function bindArgumentTypeParameters(params, args, names) {
             return;
         if (typeNode.kind === 'ParenthesizedType')
             return unify(typeNode.type, goType);
+        // (T[] | null: its one non-null member)
+        if (isUnionTypeNode(typeNode)) {
+            const members = (typeNode.types ?? []).filter((m) => m.kind !== 'NullKeyword' && m.kind !== 'UndefinedKeyword' && !(isLiteralTypeNode(m) && m.literal?.kind === 'NullKeyword'));
+            if (members.length === 1)
+                unify(members[0], goType);
+            return;
+        }
         if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
             const name = typeNode.typeName.text;
             if (names.includes(name) && (typeNode.typeArguments ?? []).length === 0) {
@@ -21121,7 +21204,10 @@ function goFileImportLines(fileCode) {
     const declaresName = (name) => new RegExp(`^(/\\*line [^*]*\\*/)?(var|func|const|type) ${name}\\b`, 'm').test(code);
     const referenced = (pkg) => {
         const name = goPathAliases[pkg] ?? pkg.split('/').pop();
-        return new RegExp(`(^|[^.\\w])${name}\\.`).test(code) && !declaresName(name);
+        // (or another file does: the package has one namespace)
+        return new RegExp(`(^|[^.\\w])${name}\\.`).test(code) && !declaresName(name) &&
+            // (one getSafeName keeps as is: a package's name is renamed apart)
+            !(linkedTopNames.has(name) && !dangerousNames.has(name) && !(goPackageIdentifiers.has(name) && !goPackageLocalNames.has(name)));
     };
     // (a standard package the code no longer references — its use was in a
     // branch emitted another way — is left out, as Go requires)
