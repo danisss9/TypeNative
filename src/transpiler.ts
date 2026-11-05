@@ -445,6 +445,8 @@ const dangerousNames = new Set([
   'main',
   // (a package-level name Go reserves for init functions)
   'init',
+  // (Go's blank identifier: a JS function or variable named _)
+  '_',
   // Go reserved keywords
   'break', 'case', 'chan', 'const', 'continue',
   'default', 'defer', 'else', 'fallthrough', 'for',
@@ -502,6 +504,12 @@ function isHeritageType(node: AstNode): boolean {
 // field, an array, an argument of its own function or class, a variable):
 // there JS null stays distinct from undefined. Values handed to the runtime
 // (callback results, Node / Go arguments) stay nil.
+// The outermost parenthesized expression around node (node itself if none)
+function unwrapParenthesesUp(node: AstNode): AstNode {
+  while (node.parent && isParenthesizedExpression(node.parent)) node = node.parent;
+  return node;
+}
+
 function storesJsNull(expr: AstNode): boolean {
   let node = expr;
   while (node.parent && isParenthesizedExpression(node.parent)) node = node.parent;
@@ -822,6 +830,7 @@ function parseAndLower(code: string): AstNode {
   lowerModuleForms(sourceFile);
   lowerDisposeSymbols(sourceFile);
   lowerNamespaces(sourceFile);
+  lowerDestructuringForHeaders(sourceFile);
   lowerNestedDestructuring(sourceFile);
   lowerPrototypeCalls(sourceFile);
   lowerArraySpreadCalls(sourceFile);
@@ -832,6 +841,10 @@ function parseAndLower(code: string): AstNode {
   lowerErrorNameFields(sourceFile);
   lowerDollarNames(sourceFile);
   lowerEnumIifes(sourceFile);
+  for (const statement of sourceFile.statements ?? []) {
+    if (isClassDeclaration(statement) && isIdentifier(statement.name)) topLevelClassNames.add(statement.name.text);
+  }
+  lowerDynamicExtends(sourceFile);
   lowerClassExpressions(sourceFile);
   lowerWeakCollections(sourceFile);
   lowerSymbolKeys(sourceFile);
@@ -983,6 +996,9 @@ function reportError(node: AstNode, message: string): void {
 // `this: T` parameters only type `this`; they are not real parameters
 function stripThisParameters(node: AstNode): void {
   if (Array.isArray(node.parameters)) {
+    const thisParam = node.parameters.find((p: AstNode) => isIdentifier(p.name) && p.name.text === 'this');
+    // (a plain function's `this: T` types its this: see plainFunctionThisType)
+    if (thisParam?.type) node.tnThisType = thisParam.type;
     node.parameters = node.parameters.filter((p: AstNode) => !(isIdentifier(p.name) && p.name.text === 'this'));
   }
   for (const child of childNodes(node)) stripThisParameters(child);
@@ -1148,6 +1164,10 @@ function lowerModuleForms(node: AstNode): void {
     }
     if (statement.kind === 'ImportEqualsDeclaration' && statement.moduleReference?.kind === 'ExternalModuleReference') {
       return namespaceImport(statement.name, statement.moduleReference.expression);
+    }
+    // export default function () {} / class {}: named, for the module linker
+    if ((statement.kind === 'FunctionDeclaration' || statement.kind === 'ClassDeclaration') && !statement.name && hasModifier(statement, 'DefaultKeyword')) {
+      statement.name = { kind: 'Identifier', text: 'defaultExport', line: statement.line, column: statement.column, parent: statement };
     }
     const declarations: AstNode[] = statement.kind === 'VariableStatement' ? (statement.declarationList?.declarations ?? []) : [];
     const init = declarations.length === 1 ? declarations[0].initializer : undefined;
@@ -1512,6 +1532,8 @@ function lowerNestedDestructuring(node: AstNode): void {
   if (Array.isArray(node.statements)) {
     node.statements = node.statements.map((statement: AstNode): AstNode => {
       if (!isExpressionStatement(statement)) return statement;
+      const objectAssignment = lowerObjectDestructuringAssignment(statement);
+      if (objectAssignment) return objectAssignment;
       const expr = statement.expression;
       if (
         !isBinaryExpression(expr) ||
@@ -1589,6 +1611,102 @@ function lowerNestedDestructuring(node: AstNode): void {
       node.body = { kind: 'Block', statements: [...prologue, ...statements], line: node.body.line, column: node.body.column };
     }
   }
+}
+
+// ({ a, b: c, d = 1 } = expr); with no declaration: a temp holds the source,
+// then each target assigns its property (a default when it is undefined)
+function lowerObjectDestructuringAssignment(statement: AstNode): AstNode | undefined {
+  const expr = unwrapParentheses(statement.expression);
+  if (!isBinaryExpression(expr) || expr.operatorToken.kind !== 'EqualsToken' || !expr.right) return undefined;
+  const pattern = unwrapParentheses(expr.left);
+  if (!isObjectLiteralExpression(pattern)) return undefined;
+  const props: AstNode[] = pattern.properties ?? [];
+  const simpleTarget = (t: AstNode | undefined) => !!t && (isIdentifier(t) || isPropertyAccessExpression(t) || isElementAccessExpression(t));
+  const ok = props.every((p: AstNode) =>
+    (isShorthandPropertyAssignment(p) && isIdentifier(p.name)) ||
+    (isPropertyAssignment(p) && (isIdentifier(p.name) || isStringLiteral(p.name)) &&
+      (simpleTarget(p.initializer) || (isBinaryExpression(p.initializer) && p.initializer.operatorToken.kind === 'EqualsToken' && simpleTarget(p.initializer.left)))));
+  if (!ok) return undefined;
+  const temp = destructureTemp(pattern);
+  const decl: AstNode = {
+    kind: 'VariableStatement',
+    declarationList: {
+      kind: 'VariableDeclarationList',
+      declarationKind: 'const',
+      declarations: [{ kind: 'VariableDeclaration', name: temp, initializer: { ...expr.right, parent: statement }, parent: statement }],
+      parent: statement
+    },
+    line: statement.line,
+    column: statement.column,
+    parent: statement
+  };
+  const assigns = props.map((p: AstNode): AstNode => {
+    let target: AstNode = isShorthandPropertyAssignment(p) ? p.name : p.initializer;
+    let fallback: AstNode | undefined = isShorthandPropertyAssignment(p) ? p.objectAssignmentInitializer : undefined;
+    if (isPropertyAssignment(p) && isBinaryExpression(p.initializer)) {
+      target = p.initializer.left;
+      fallback = p.initializer.right;
+    }
+    const read: AstNode = {
+      kind: 'PropertyAccessExpression',
+      expression: { ...temp, parent: expr },
+      name: { kind: 'Identifier', text: p.name.text },
+      parent: expr
+    };
+    const value: AstNode = fallback
+      ? {
+          kind: 'ConditionalExpression',
+          condition: { kind: 'BinaryExpression', left: read, operatorToken: { kind: 'EqualsEqualsEqualsToken' }, right: { kind: 'Identifier', text: 'undefined' }, parent: expr },
+          whenTrue: fallback,
+          whenFalse: { ...read },
+          parent: expr
+        }
+      : read;
+    return {
+      kind: 'ExpressionStatement',
+      expression: { kind: 'BinaryExpression', left: { ...target, parent: expr }, operatorToken: { kind: 'EqualsToken' }, right: value, parent: expr },
+      line: statement.line,
+      column: statement.column,
+      parent: statement
+    };
+  });
+  return { kind: 'Block', statements: [decl, ...assigns], line: statement.line, column: statement.column, parent: statement.parent };
+}
+
+// for (let { a, b } = x; cond; { a, b } = y) body — a destructuring
+// initializer or update (which Go's for header can't hold): the initializer
+// runs before the loop, in a block of its own, and the update at the end of
+// the body (when no continue skips it)
+function lowerDestructuringForHeaders(node: AstNode): void {
+  for (const child of childNodes(node)) lowerDestructuringForHeaders(child);
+  if (!Array.isArray(node.statements)) return;
+  node.statements = node.statements.map((statement: AstNode): AstNode => {
+    if (statement.kind !== 'ForStatement') return statement;
+    const init = statement.initializer;
+    const patternInit = !!init && isVariableDeclarationList(init) && (init.declarations ?? []).some((d: AstNode) => isBindingPatternNode(d.name));
+    const update = statement.incrementor ? unwrapParentheses(statement.incrementor) : undefined;
+    const patternUpdate = !!update && isBinaryExpression(update) && update.operatorToken.kind === 'EqualsToken' &&
+      (isObjectLiteralExpression(unwrapParentheses(update.left)) || isArrayLiteralExpression(unwrapParentheses(update.left)));
+    if (!patternInit && !patternUpdate) return statement;
+    const continues = containsNode(statement.statement, (n: AstNode) => n.kind === 'ContinueStatement');
+    if (continues && statement.incrementor) return statement;
+    const at = { line: statement.line, column: statement.column };
+    const pre: AstNode[] = [];
+    if (init) {
+      pre.push(isVariableDeclarationList(init)
+        ? { kind: 'VariableStatement', declarationList: init, ...at }
+        : { kind: 'ExpressionStatement', expression: init, ...at });
+    }
+    const body: AstNode[] = isBlock(statement.statement) ? (statement.statement.statements ?? []) : [statement.statement];
+    const tail: AstNode[] = statement.incrementor ? [{ kind: 'ExpressionStatement', expression: statement.incrementor, ...at }] : [];
+    const loop: AstNode = {
+      kind: 'ForStatement',
+      condition: statement.condition,
+      statement: { kind: 'Block', statements: [...body, ...tail], line: statement.statement.line, column: statement.statement.column },
+      ...at
+    };
+    return { kind: 'Block', statements: [...pre, loop], ...at, parent: statement.parent };
+  });
 }
 
 // Built-ins that construct when called without `new`: RegExp(…), Error(…)
@@ -2009,6 +2127,34 @@ function lowerArraySpreadCalls(node: AstNode): void {
     delete node.arguments;
   }
 }
+
+// class C extends P {} (no members) inside a function, with P a value known
+// only at run time (not a class name): const C = <the class extending P>
+function lowerDynamicExtends(node: AstNode, inFunction = false): void {
+  const nested = inFunction || FUNCTION_LIKE_KINDS.has(node.kind);
+  for (const child of childNodes(node)) lowerDynamicExtends(child, nested);
+  if (!nested || !Array.isArray(node.statements)) return;
+  node.statements = node.statements.map((statement: AstNode): AstNode => {
+    if (!isClassDeclaration(statement) || !isIdentifier(statement.name) || (statement.members ?? []).length > 0) return statement;
+    const clause = (statement.heritageClauses ?? []).find((c: AstNode) => c.token === 'ExtendsKeyword');
+    const base = clause?.types?.[0]?.expression;
+    if (!base || !isIdentifier(base) || topLevelClassNames.has(base.text)) return statement;
+    const at = { line: statement.line, column: statement.column };
+    const value: AstNode = { kind: 'TnExtendClass', expression: base, ...at };
+    const declaration: AstNode = { kind: 'VariableDeclaration', name: statement.name, initializer: value, ...at };
+    base.parent = value;
+    value.parent = declaration;
+    return {
+      kind: 'VariableStatement',
+      declarationList: { kind: 'VariableDeclarationList', declarationKind: 'const', declarations: [declaration], ...at },
+      ...at,
+      parent: statement.parent
+    };
+  });
+}
+
+// The classes a file declares at its top level (lowerDynamicExtends)
+const topLevelClassNames = new Set<string>();
 
 function lowerClassExpressions(node: AstNode): void {
   for (const child of childNodes(node)) lowerClassExpressions(child);
@@ -2882,6 +3028,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const goAlias = importAliases.get(node.text);
     if (goAlias) return goAlias;
+    // Object / Error as class values (`params.Parent ?? Object`)
+    if ((node.text === 'Object' || node.text === 'Error') && !variableGoTypes.has(node.text) && !classNames.has(node.text) && isClassValueReference(node)) {
+      useHelper('classes');
+      return `TnClass_${node.text}`;
+    }
     // Map / Set as class values (`new Type()` of a parameter)
     if ((node.text === 'Map' || node.text === 'Set') && !variableGoTypes.has(node.text) && !classNames.has(node.text) && isClassValueReference(node)) {
       useHelper('classes');
@@ -3054,6 +3205,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     return `{\n\t\t${coverageEnter(node)}${options.prefixBlockContent ?? ''}${visitBlockStatements(
       node.statements ?? []
     )}${options.extraBlockContent ?? ''}${fallbackReturn(node)}}${options.inline ? '' : '\n\t'}`;
+  } else if (node.kind === 'TnExtendClass') {
+    // (see lowerDynamicExtends)
+    useHelper('classes');
+    return `TnExtendClass(${toGoValueOfType(node.expression, 'interface{}')})`;
   } else if (node.kind === 'TnArrayItems') {
     useHelper('arraySubclass');
     return `(*${visit(node.expression)}.TnItems())`;
@@ -3879,6 +4034,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
         const receive = takesValue ? `__v := <-__tnP` : `<-__tnP`;
         const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
+        // (used as a value — proms.push(p.then(cb)) —: the promise of the
+        // callback's result, a channel that receives it once the callback ran)
+        if (!isExpressionStatement(unwrapParenthesesUp(node).parent)) {
+          const returns = !!cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && !!inferFunctionBodyReturnType(cb);
+          const settle = returns ? `__out <- ${invoke}` : `${invoke}; __out <- nil`;
+          return `func() chan interface{} {\n\t\t__out := make(chan interface{}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${settle} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})\n\t\treturn __out\n\t}()`;
+        }
         // The promise expression is a go-statement argument: it runs now, with
         // the baton (exec() registering its listeners off the loop would race it)
         return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${invoke} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})`;
@@ -4957,6 +5119,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       node,
       getFunctionParametersInfo(node.parameters ?? [])
     );
+    if (!isPropertyAssignment(node.parent)) {
+      const prologue = thisPrologue(node);
+      if (prologue) parameterInfo.prefixBlockContent = prologue + (parameterInfo.prefixBlockContent ?? '');
+    }
 
     if (node.body && isBlock(node.body)) {
       prescanVariableDeclarations(node.body);
@@ -5058,7 +5224,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (thisOverrideName && getEnclosingFunction(node) === thisOverrideFn) return thisOverrideName;
     if (isThisOfPlainFunction(node)) {
       useHelper('decorators');
-      return 'TnThis';
+      return plainFunctionOfThis(node)?.tnThisPrologue ? '__this' : 'TnThis';
     }
     return 'self';
   } else if (node.kind === 'PrivateIdentifier') {
@@ -9405,7 +9571,10 @@ function thisGoType(node: AstNode): string | undefined {
       return `*${current.name.text}`;
     }
     // (an object literal's own methods bind this; its property values don't)
-    if (isFunctionExpression(current) || isFunctionDeclaration(current)) return undefined;
+    // (a plain function's this: its annotation's type, or any value)
+    if (isFunctionExpression(current) || isFunctionDeclaration(current)) {
+      return isPropertyAssignment(current.parent) ? undefined : plainFunctionThisType(current);
+    }
     if ((isMethodDeclaration(current) || isGetAccessor(current) || isSetAccessor(current)) && isObjectLiteralExpression(current.parent)) return undefined;
     current = current.parent;
   }
@@ -10752,6 +10921,9 @@ function isLocallyBound(expr: AstNode): boolean {
 
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
+  if (expr?.kind === 'TnExtendClass') return 'interface{}';
+  // C.prototype: the class value, which takes methods as a dynamic object
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && classNames.has(expr.expression.text) && expr.name.text === 'prototype') return 'interface{}';
   // A variable read inside its own initializer (an object whose methods
   // return it: { replace: () => obj }): any, as a Go type can't contain itself
   if (isIdentifier(expr) && isInOwnInitializer(expr)) return 'interface{}';
@@ -15974,6 +16146,33 @@ function getDecorators(node: AstNode): AstNode[] {
 }
 
 // `this` inside a function / function expression (not a class member, not an arrow's)
+// The plain function whose `this` a this expression is (arrows see their
+// enclosing function's), or undefined (a method's, a class's, top level)
+function plainFunctionOfThis(node: AstNode): AstNode | undefined {
+  for (let n = node.parent; n; n = n.parent) {
+    if (isArrowFunction(n)) continue;
+    if (isFunctionExpression(n) || isFunctionDeclaration(n)) return isPropertyAssignment(n.parent) ? undefined : n;
+    if (isMethodDeclaration(n) || isConstructorDeclaration(n) || isPropertyDeclaration(n) || isGetAccessor(n) || isSetAccessor(n) || isClassDeclaration(n)) return undefined;
+  }
+  return undefined;
+}
+
+// A plain function's this: its `this: T` annotation's Go type, else any
+function plainFunctionThisType(fn: AstNode): string {
+  const declared = fn.tnThisType ? getType(fn.tnThisType) : '';
+  return declared && declared !== ':' && declared.startsWith('*') ? declared : 'interface{}';
+}
+
+// A plain function using its own this reads it once, on entry, into __this
+// (the value its caller set, TnThis): arrows in it keep seeing that one
+function thisPrologue(fn: AstNode): string {
+  if (!fn.body || !containsNode(fn.body, (n: AstNode) => n.kind === 'ThisKeyword' && plainFunctionOfThis(n) === fn)) return '';
+  useHelper('decorators');
+  fn.tnThisPrologue = true;
+  const thisType = plainFunctionThisType(fn);
+  return thisType === 'interface{}' ? '__this := TnThis; _ = __this\n\t\t' : `__this, _ := TnThis.(${thisType}); _ = __this\n\t\t`;
+}
+
 function isThisOfPlainFunction(node: AstNode): boolean {
   for (let n = node.parent; n; n = n.parent) {
     if (isArrowFunction(n)) continue;
@@ -16045,16 +16244,26 @@ function visitFunctionCallApply(node: AstNode): string | undefined {
   const method = node.expression.name.text;
   if (method !== 'call' && method !== 'apply' && method !== 'bind') return undefined;
   const fnType = functionValueGoType(node.expression.expression);
-  // (a function held as any: called reflectively, thisArg dropped)
+  // f.call(thisArg, …) / f.apply(thisArg, …): this is thisArg while f runs
+  // (as TnThis, which plain functions read on entry)
+  const thisArg: AstNode | undefined = method !== 'bind' ? (node.arguments ?? [])[0] : undefined;
+  const bindsThis = !!thisArg && thisArg.kind !== 'NullKeyword' && !(isIdentifier(thisArg) && thisArg.text === 'undefined') && thisArg.kind !== 'VoidExpression';
+  const withThis = (call: string, resultType: string): string => {
+    if (!bindsThis) return call;
+    useHelper('decorators');
+    const receiver = toGoValueOfType(thisArg!, 'interface{}');
+    return resultType ? `TnWithThis(${receiver}, func() ${resultType} { return ${call} })` : `TnWithThis(${receiver}, func() struct{} { ${call}; return struct{}{} })`;
+  };
+  // (a function held as any: called reflectively)
   if (!fnType && method !== 'bind' && isDynamicValue(node.expression.expression) && !(node.arguments ?? []).some((a: AstNode) => isSpreadElement(a))) {
     useHelper('dynamic');
     useHelper('error');
     const fnValue = visit(node.expression.expression);
     const rest: AstNode[] = (node.arguments ?? []).slice(1);
     if (method === 'apply') {
-      return rest[0] ? `TnCallValue(${fnValue}, TnAs[[]interface{}](interface{}(${visit(rest[0])}))...)` : `TnCallValue(${fnValue})`;
+      return withThis(rest[0] ? `TnCallValue(${fnValue}, TnAs[[]interface{}](interface{}(${visit(rest[0])}))...)` : `TnCallValue(${fnValue})`, 'interface{}');
     }
-    return `TnCallValue(${[fnValue, ...rest.map((a: AstNode) => visit(a))].join(', ')})`;
+    return withThis(`TnCallValue(${[fnValue, ...rest.map((a: AstNode) => visit(a))].join(', ')})`, 'interface{}');
   }
   if (!fnType) return undefined;
   const fn = visit(node.expression.expression);
@@ -16063,12 +16272,12 @@ function visitFunctionCallApply(node: AstNode): string | undefined {
   const result = goFuncReturnType(fnType) ?? '';
   const variadic = params.length > 0 && params[params.length - 1].startsWith('...');
   if (method === 'apply') {
-    if (!args[0]) return `${fn}()`;
-    if (variadic) return `${fn}(${visit(args[0])}...)`;
+    if (!args[0]) return withThis(`${fn}()`, result);
+    if (variadic) return withThis(`${fn}(${visit(args[0])}...)`, result);
     // a non-variadic Go func takes the array's elements one by one (missing ones are zero)
     useHelper('dynamic');
     const picks = params.map((p, i) => `TnAs[${p}](TnAt(__a, ${i}))`).join(', ');
-    return `func() ${result} { __a := ${toGoValueOfType(args[0], '[]interface{}')}; ${result ? 'return ' : ''}${fn}(${picks}) }()`;
+    return withThis(`func() ${result} { __a := ${toGoValueOfType(args[0], '[]interface{}')}; ${result ? 'return ' : ''}${fn}(${picks}) }()`, result);
   }
   if (method === 'bind') {
     const bound = args.map((a, i) => `__b${i} := ${toGoValueOfType(a, params[i] ?? 'interface{}')}`);
@@ -16079,7 +16288,7 @@ function visitFunctionCallApply(node: AstNode): string | undefined {
     const setup = [`__f := ${fn}`, ...bound].join('; ');
     return `func() func(${rest.join(', ')}) ${result} { ${setup}; return ${inner} }()`;
   }
-  return `${fn}(${args.map((a) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))).join(', ')})`;
+  return withThis(`${fn}(${args.map((a) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a))).join(', ')})`, result);
 }
 
 // Whether a decorator call returns a value (a replacement), or only has effects
@@ -16768,7 +16977,8 @@ function getParameterGoType(param: AstNode): string {
   }
   if (param.type) {
     let explicitType = getType(param.type);
-    if (explicitType === ':') return 'interface{}';
+    // (a void / never parameter only ever holds undefined)
+    if (explicitType === ':' || explicitType === '') return 'interface{}';
     // Array parameters are references (mutations are visible to the caller) —
     // except unbound type parameters (Go generics) and template-tag arrays
     if (explicitType.startsWith('[]') && explicitType !== '[]byte' && !param.dotDotDotToken) {
@@ -18939,7 +19149,7 @@ const helperRequires: Record<string, string[]> = {
   dynamic: ['error', 'strIndex', 'toFixed'],
   regexMatch: ['strIndex'],
   stringSearch: ['strIndex'],
-  classes: ['dynamic', 'error', 'orderedMap'],
+  classes: ['dynamic', 'error', 'orderedMap', 'decorators'],
   arraySubclass: ['dynamic', 'classes'],
   moduleUrl: ['pathToFileURL'],
   timerWait: ['eventLoop'],
@@ -20869,12 +21079,22 @@ func TnGet(obj interface{}, key string) interface{} {
 		if v, ok := tnExpandoGet(obj, key); ok {
 			return v
 		}
+		// a method added to its class's prototype (C.prototype.m = fn)
+		if tnProtoMethodOf != nil {
+			if m, ok := tnProtoMethodOf(obj, key); ok {
+				return m
+			}
+		}
 	}
 	if key == "length" {
 		return TnLength(obj)
 	}
 	return nil
 }
+
+// Finds a method added to the prototype of obj's class (set by the classes
+// helper, when classes are used)
+var tnProtoMethodOf func(obj interface{}, key string) (interface{}, bool)
 
 // Properties set on an object whose type has no such field (JS adds them to
 // the object): kept beside it, by the object's address
@@ -21175,6 +21395,11 @@ func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
 func TnSet(obj interface{}, key string, value interface{}) {
 	if o, ok := obj.(map[string]interface{}); ok {
 		o[key] = value
+		return
+	}
+	// C.prototype.m = fn (a class value stands in for its prototype)
+	if p, ok := obj.(interface{ TnProtoSet(string, interface{}) }); ok {
+		p.TnProtoSet(key, value)
 		return
 	}
 	if obj != nil {
@@ -22705,9 +22930,46 @@ type TnClass struct {
 	Parent  *TnClass
 	New     func(args ...interface{}) interface{}
 	statics map[string]func() interface{}
+	// methods added to the prototype at run time (C.prototype.m = fn,
+	// Object.assign(C.prototype, { m })), in the order they were added
+	proto     map[string]interface{}
+	protoKeys []string
 }
 
 var tnClassesByType = map[reflect.Type]*TnClass{}
+
+// C.prototype.m = fn: instances of C (and of its subclasses) get method m,
+// called with this (TnThis) the instance
+func (c *TnClass) TnProtoSet(key string, fn interface{}) {
+	if c.proto == nil {
+		c.proto = map[string]interface{}{}
+	}
+	if _, ok := c.proto[key]; !ok {
+		c.protoKeys = append(c.protoKeys, key)
+	}
+	c.proto[key] = fn
+}
+
+// for (k in C.prototype): the methods added to it
+func (c *TnClass) Keys() []string {
+	return append([]string{}, c.protoKeys...)
+}
+
+func init() {
+	tnProtoMethodOf = func(obj interface{}, key string) (interface{}, bool) {
+		for k := tnClassesByType[reflect.TypeOf(obj)]; k != nil; k = k.Parent {
+			if fn, ok := k.proto[key]; ok {
+				return func(args ...interface{}) interface{} {
+					prev := TnThis
+					TnThis = obj
+					defer func() { TnThis = prev }()
+					return TnCallValue(fn, args...)
+				}, true
+			}
+		}
+		return nil, false
+	}
+}
 
 func tnRegisterClass(c *TnClass) *TnClass {
 	tnClassesByType[c.Type] = c
@@ -22727,8 +22989,33 @@ func (c *TnClass) TnProp(key string) (interface{}, bool) {
 		if f, ok := k.statics[key]; ok {
 			return f(), true
 		}
+		if f, ok := k.proto[key]; ok {
+			return f, true
+		}
 	}
 	return nil, false
+}
+
+// Object and Error as class values (class C extends (cond ? Error : Object))
+var TnClass_Object = &TnClass{Name: "Object", New: func(args ...interface{}) interface{} { return TnNewMap[string, interface{}]() }}
+var TnClass_Error = tnRegisterClass(&TnClass{Name: "Error", Type: reflect.TypeOf((*TnError)(nil)), New: func(args ...interface{}) interface{} {
+	message := ""
+	if len(args) > 0 && args[0] != nil {
+		message = TnJSString(args[0])
+	}
+	return TnNewError(message)
+}})
+
+// class C extends P {} with P a value known only at run time (a class value,
+// a constructor function): its instances are P's
+func TnExtendClass(parent interface{}) *TnClass {
+	c := &TnClass{}
+	if p, ok := parent.(*TnClass); ok {
+		c.Name = p.Name
+		c.Parent = p
+	}
+	c.New = func(args ...interface{}) interface{} { return TnNew(parent, args...) }
+	return c
 }
 
 // Map and Set as class values
@@ -22757,6 +23044,10 @@ func TnCtorOf[F any](cls *TnClass, fn F) F {
 }
 
 func TnInstanceOf(v interface{}, cls interface{}) bool {
+	if cls == TnClass_Error {
+		_, isError := v.(interface{ TnBaseError() *TnError })
+		return isError
+	}
 	c, ok := cls.(*TnClass)
 	if fv := reflect.ValueOf(cls); !ok && fv.Kind() == reflect.Func && !fv.IsNil() {
 		c, ok = tnCtorClasses[fv.Pointer()]
@@ -22793,7 +23084,17 @@ func TnNew(cls interface{}, args ...interface{}) interface{} {
 		if k, known := tnCtorClasses[fv.Pointer()]; known && k.New != nil {
 			return k.New(args...)
 		}
-		return TnCallValue(cls, args...)
+		// a plain function: called with this a fresh object, which the new
+		// expression is (unless the function returns an object of its own)
+		obj := TnNewMap[string, interface{}]()
+		prev := TnThis
+		TnThis = obj
+		result := TnCallValue(cls, args...)
+		TnThis = prev
+		if TnIsObject(result) {
+			return result
+		}
+		return obj
 	}
 	if !ok || c.New == nil {
 		panic(TnNodeError("TypeError", "", "value is not a constructor"))
@@ -25293,6 +25594,13 @@ func (r *TnRegex) find(s string, want bool) ([]string, int, int) {
 // a dynamic object's undefined properties are copied.
 func TnAssignTo[T any](target T, sources ...interface{}) T {
 	for _, src := range sources {
+		// Object.assign(C.prototype, methods): methods of C's instances
+		if p, ok := any(target).(interface{ TnProtoSet(string, interface{}) }); ok {
+			for _, prop := range tnOwnProps(src) {
+				p.TnProtoSet(prop.key, prop.value)
+			}
+			continue
+		}
 		if tnAssignFields(any(target), src) {
 			continue
 		}
@@ -27131,6 +27439,14 @@ func tnJsxString(v interface{}) string {
 }`,
   decorators: `// this inside plain functions: the receiver of the decorated method being called
 var TnThis interface{}
+
+// f.call(thisArg, …): f runs with this (TnThis) set to thisArg
+func TnWithThis[R any](this interface{}, f func() R) R {
+	prev := TnThis
+	TnThis = this
+	defer func() { TnThis = prev }()
+	return f()
+}
 
 // The context a decorator receives (kind is "method" or "class")
 type TnDecoratorContext struct {
