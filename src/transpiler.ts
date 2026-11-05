@@ -826,6 +826,7 @@ function parseAndLower(code: string): AstNode {
   lowerIndexSignatures(sourceFile);
   lowerAmbientDeclarations(sourceFile);
   lowerModuleForms(sourceFile);
+  lowerMixinFactories(sourceFile);
   lowerDisposeSymbols(sourceFile);
   lowerNamespaces(sourceFile);
   lowerDestructuringForHeaders(sourceFile);
@@ -1162,9 +1163,81 @@ function mergeDeclarations(node: AstNode): void {
 //   export * from './m'               → import './m'
 //   import x = require('./m')         → import * as x from './m'
 //   const x = await import('./m')     → import * as x from './m'
+// const mixin = (superClass: typeof Base) => class M extends superClass {…}
+// (Babel's parser plugins): M becomes a top-level class of its own, declared
+// to extend Base (its methods see Base's members), emitted as a mixin — an
+// object over a Base instance whose methods dispatch through it (see the
+// class emitter) — and the factory, given the class to extend at run time,
+// makes the class of those objects (TnMixinFactory)
+function lowerMixinFactories(sourceFile: AstNode): void {
+  if (!Array.isArray(sourceFile.statements)) return;
+  const out: AstNode[] = [];
+  const bases: string[] = [];
+  for (const st of sourceFile.statements) {
+    const decl = st.kind === 'VariableStatement' && (st.declarationList?.declarations ?? []).length === 1 ? st.declarationList.declarations[0] : undefined;
+    const fn = decl?.initializer;
+    const param = (isArrowFunction(fn) || isFunctionExpression(fn)) && (fn.parameters ?? []).length === 1 ? fn.parameters[0] : undefined;
+    let cls: AstNode | undefined;
+    if (param && isIdentifier(param.name)) {
+      if (fn.body?.kind === 'ClassExpression') cls = fn.body;
+      else if (isBlock(fn.body) && (fn.body.statements ?? []).length === 1 && fn.body.statements[0].kind === 'ReturnStatement' && fn.body.statements[0].expression?.kind === 'ClassExpression') cls = fn.body.statements[0].expression;
+    }
+    const clause = cls ? (cls.heritageClauses ?? []).find((c: AstNode) => c.token === 'ExtendsKeyword') : undefined;
+    const extendsParam = clause && isIdentifier(clause.types?.[0]?.expression) && clause.types[0].expression.text === param.name.text;
+    // the base: typeof Base, or ClassWithMixin<typeof Base, …>
+    let baseQuery = param?.type;
+    if (isTypeReferenceNode(baseQuery) && (baseQuery.typeArguments ?? []).length > 0) baseQuery = baseQuery.typeArguments[0];
+    const base = baseQuery?.kind === 'TypeQuery' && isIdentifier(baseQuery.exprName) ? baseQuery.exprName.text : undefined;
+    if (!cls || !extendsParam || !base) {
+      out.push(st);
+      continue;
+    }
+    const at = { line: cls.line, column: cls.column };
+    const className = isIdentifier(cls.name) ? cls.name.text : `${decl.name.text}Mixin`;
+    const declaration: AstNode = {
+      ...cls,
+      kind: 'ClassDeclaration',
+      name: { kind: 'Identifier', text: className, ...at },
+      heritageClauses: [{ ...clause, types: [{ ...clause.types[0], expression: { kind: 'Identifier', text: base, ...at } }] }],
+      tnMixin: true,
+      modifiers: (cls.modifiers ?? []).filter((m: AstNode) => m.kind !== 'ExportKeyword' && m.kind !== 'DefaultKeyword')
+    };
+    decl.initializer = { kind: 'TnMixinFactory', expression: { kind: 'Identifier', text: className, ...at }, ...at };
+    bases.push(base);
+    out.push(declaration, st);
+  }
+  sourceFile.statements = out;
+  // (the base, imported for its type, is extended as a value now)
+  for (const st of sourceFile.statements) {
+    if (st.kind !== 'ImportDeclaration' || !st.importClause) continue;
+    if (st.importClause.name && bases.includes(st.importClause.name.text)) st.importClause.isTypeOnly = false;
+    for (const el of st.importClause.namedBindings?.elements ?? []) {
+      if (bases.includes(el.name.text)) {
+        el.isTypeOnly = false;
+        st.importClause.isTypeOnly = false;
+      }
+    }
+  }
+}
+
 function lowerModuleForms(node: AstNode): void {
   for (const child of childNodes(node)) lowerModuleForms(child);
   if (!Array.isArray(node.statements)) return;
+  // export default <expression> (an arrow, an object literal, a call):
+  // const defaultExport = <expression>; export default defaultExport
+  if (node.kind === 'SourceFile') {
+    node.statements = node.statements.flatMap((st: AstNode): AstNode[] => {
+      if (st.kind !== 'ExportAssignment' || st.isExportEquals || !st.expression || isIdentifier(st.expression)) return [st];
+      const at = { line: st.line, column: st.column };
+      const name: AstNode = { kind: 'Identifier', text: 'defaultExport', ...at };
+      const declaration: AstNode = {
+        kind: 'VariableStatement',
+        declarationList: { kind: 'VariableDeclarationList', declarationKind: 'const', declarations: [{ kind: 'VariableDeclaration', name, initializer: st.expression, ...at }], ...at },
+        ...at
+      };
+      return [declaration, { ...st, expression: { kind: 'Identifier', text: 'defaultExport', ...at } }];
+    });
+  }
   // const { a, b: c } = ns, with ns a namespace import: import { a, b as c }
   // from ns's module (the names are the module's top-level bindings)
   if (node.kind === 'SourceFile') {
@@ -2834,6 +2907,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   }
   collectClassImplementedInterfaces();
   collectOpenObjectTypes();
+  collectMixins();
   collectArrayCastClasses();
   // and so are their enums (a module emitted first may read another's: imports can cycle)
   for (const mod of linkedModules.values()) {
@@ -2902,7 +2976,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   const coverageCode = coverageFiles.length > 0 ? `\n\n${coverageTables()}` : '';
   // (generated before the helpers: they may use more of them)
   const dispatchCode = dynamicMethodCalls.size > 0 ? `\n\n${emitDynamicDispatchers()}` : '';
-  const classCode = (classValuesUsed ? `\n\n${emitClassDescriptors()}` : '') + `\n\n${emitToJSONWrappers()}`;
+  const classCode = (classValuesUsed ? `\n\n${emitClassDescriptors()}` : '') + `\n\n${emitToJSONWrappers()}` + emitMixinSupport();
   const helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
   const mainImports = [...importedPackages].filter((pkg) => {
     if (!hasGoPackage(pkg)) return true;
@@ -3396,6 +3470,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     useHelper('dynamicSpread');
     const entries = namespaceValueEntries(node.moduleKey).map(([name, value]) => `__ns.Set(${toGoStringLiteral(name)}, ${value})`);
     return `func() *TnMap[string, interface{}] { __ns := TnNewMap[string, interface{}](); ${entries.join('; ')}; return __ns }()`;
+  } else if (node.kind === 'TnMixinFactory') {
+    // (see lowerMixinFactories) the factory: the class extending its argument
+    useHelper('classes');
+    const mixinName: string = node.expression.text;
+    return `func(superClass interface{}) interface{} { return TnMixinClass(${toGoStringLiteral(originalTopNames.get(mixinName) ?? mixinName)}, superClass, TnMixinNew_${mixinName}) }`;
   } else if (node.kind === 'TnExtendClass') {
     // (see lowerDynamicExtends)
     useHelper('classes');
@@ -3549,6 +3628,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (node.expression.kind === 'SuperKeyword') {
       const ownerClass = getEnclosingClassName(node);
       const parentName = ownerClass ? classParentNames.get(ownerClass) : undefined;
+      // (in a mixin: the class it extends at run time, __super)
+      if (ownerClass && mixinBaseOf.has(ownerClass) && isCallee(node)) return `self.__super.${visit(node.name)}`;
       if (parentName) {
         // super.x on an accessor reads the parent's getter
         if (!isCallee(node) && !isAssignmentTarget(node) && classGetterMethods.has(`${parentName}.${node.name.text}`)) {
@@ -3561,6 +3642,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `self.${goFieldName(parentName)}.${visit(node.name)}`;
       }
       return visit(node.name);
+    }
+    // a method of a mixin system called on its base or a mixin (this.m(),
+    // parser.m()): through the base's __vt, the outermost mixin over it
+    if (isCallee(node) && isIdentifier(node.name) && !hasQuestionDot(node)) {
+      const viaThis = node.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(node.expression);
+      const receiverClass = viaThis ? (methodCopyClass ?? getEnclosingClassName(node)) : classNameOfGoType(inferExpressionType(node.expression) ?? '');
+      const base = mixinSystemBase(receiverClass);
+      if (base && mixinVirtualMethods.get(base)!.has(node.name.text)) {
+        return viaThis ? `self.__vt.${visit(node.name)}` : `(${visit(node.expression)}).__vt.${visit(node.name)}`;
+      }
     }
     if (isIdentifier(node.expression) && enumNames.has(node.expression.text)) {
       return `${getSafeName(node.expression.text)}_${getEnumMemberName(node.name)}`;
@@ -3878,7 +3969,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // may be reassigned another type); `any` elsewhere is interface{}
     const anyInitType = isAnyTypeNode(node.type) && node.initializer ? inferExpressionType(node.initializer) : undefined;
     const isInferredAny =
-      isAnyTypeNode(node.type) && !!node.initializer && !['string', 'float64', 'bool'].includes(anyInitType ?? '');
+      isAnyTypeNode(node.type) && !!node.initializer && !!anyInitType && anyInitType !== 'interface{}' && !['string', 'float64', 'bool', '*TnClass'].includes(anyInitType);
     let type: string = isInferredAny ? ':' : getType(node.type!);
     // Array aliasing: b = a keeps pointing at the same backing array
     if (
@@ -5457,6 +5548,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('decorators');
       return plainFunctionOfThis(node)?.tnThisPrologue ? '__this' : 'TnThis';
     }
+    // (a mixin's this, as a value, is the base object it works on)
+    const thisClass = getEnclosingClassName(node);
+    if (thisClass && mixinBaseOf.has(thisClass) && !(isPropertyAccessExpression(node.parent) && node.parent.expression === node)) {
+      return `self.${goFieldName(mixinBaseOf.get(thisClass)!)}`;
+    }
     return 'self';
   } else if (node.kind === 'PrivateIdentifier') {
     // #field → a mangled struct field, distinct from a public `field`
@@ -5615,9 +5711,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const isAbstractClass = (node.modifiers ?? []).some((m: AstNode) => m.kind === 'AbstractKeyword');
 
     const fields: string[] = [];
-    if (parentClass) {
+    // a mixin works on a base object it points at, and calls super through
+    // the object it extends at run time; a base points at its outermost mixin
+    const mixinOf = mixinBaseOf.get(name);
+    const isMixinBase = mixinVirtualMethods.has(name);
+    if (mixinOf) {
+      fields.push(`\t*${parentClass}`, `\t__super ${mixinOf}__VT`);
+    } else if (parentClass) {
       fields.push(`\t${extendsError ? 'TnError' : parentClass}`);
     }
+    if (isMixinBase) fields.push(`\t__vt ${name}__VT`);
     if (extendsArray) fields.push('\tTnArray');
     for (const member of (node.members ?? [])) {
       // static properties are package-level Class_name variables, not fields
@@ -5647,6 +5750,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // (the marker keeps an instance from being converted to another
     // object type, which would copy it: see TnConvertDynamic)
     let result = `type ${name}${typeParams} struct {\n${fields.join('\n')}\n}\n\nfunc (*${name}${typeParamNames}) TnClassInstance() {}\n\n`;
+    if (isMixinBase) result += `func (self *${name}) TnMixinBase() interface{} { return self }\n\n`;
 
     // JS methods may take fewer parameters than the interface they implement:
     // the missing ones become trailing `_ interface{}` slots so the Go
@@ -5769,7 +5873,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, [])}\n\t\t`
           : '';
       const leadingInit = superHandledInCtor ? '' : `${parentInit}${instanceInit}`;
-      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${coverageEnter(ctor.body)}${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${leadingInit}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
+      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${isMixinBase ? 'self.__vt = self\n\t\t' : ''}${coverageEnter(ctor.body)}${nodeSelfLink(parentClass)}${ctorParameterInfo.prefixBlockContent}${leadingInit}${bodyStatements}${nodeSelfLink(parentClass, node)}return self;\n\t}`;
       result += emitConstructor(name, typeParams, typeParamNames, ctorParameterInfo.signature, ctorBody);
     } else if (extendsError) {
       // class X extends Error {} — the constructor takes the message
@@ -5785,8 +5889,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const parentInit =
         parentClass && !extendsError ? `self.${goFieldName(parentClass)} = *${parentConstructorCall(parentClass, forwarded)}\n\t\t` : '';
       const arrayInit = extendsArray ? 'self.TnArray.items = TnArrayInit(__elements)\n\t\t' : '';
-      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${parentInit}${arrayInit}${fieldInitializers(node)}${nodeSelfLink(parentClass, node)}return self\n\t}`;
-      result += emitConstructor(name, typeParams, typeParamNames, signature, ctorBody);
+      const ctorBody = `{\n\t\tself := &${name}${typeParamNames}{}\n\t\t${isMixinBase ? 'self.__vt = self\n\t\t' : ''}${parentInit}${arrayInit}${fieldInitializers(node)}${nodeSelfLink(parentClass, node)}return self\n\t}`;
+      if (mixinOf) {
+        // (a mixin's objects are made over the object its class extends at
+        // run time: TnMixinNew_M, see TnMixinClass)
+        const baseField = goFieldName(parentClass!);
+        result += emitConstructor(name, typeParams, typeParamNames, '', `{\n\t\tpanic(TnNodeError("TypeError", "", "${name} is a mixin: its class is made at run time"))\n\t}`);
+        result += `func TnMixinNew_${name}(__parent interface{}) interface{} {\n\t\t__base := __parent.(interface{ TnMixinBase() interface{} }).TnMixinBase().(*${parentClass})\n\t\tself := &${name}{${baseField}: __base, __super: __parent.(${mixinOf}__VT)}\n\t\t__base.__vt = self\n\t\t${fieldInitializers(node)}return self\n\t}\n\n`;
+        result += `func (self *${name}) TnMixinBase() interface{} { return self.${baseField} }\n\n`;
+        useHelper('error');
+      } else result += emitConstructor(name, typeParams, typeParamNames, signature, ctorBody);
     }
 
     // Inherited concrete methods are copied onto the subclass: Go embedding
@@ -5812,7 +5924,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       ownAccessorKeys.add(`get:${param.name.text}`);
       ownAccessorKeys.add(`set:${param.name.text}`);
     }
-    if (parentClass && !extendsError) {
+    if (parentClass && !extendsError && !mixinOf) {
       // Walk the parent chain (iteratively — no local recursive closures)
       const pending: string[] = [parentClass];
       const seenClasses = new Set<string>();
@@ -8087,6 +8199,53 @@ function interfaceExtraParamDeclsOnly(className: string, member: AstNode): strin
   return [];
 }
 
+// Per mixin base: the __VT interface its __vt holds (every virtual method,
+// with the base's Go signature, else a mixin's), a stub on the base for a
+// method only mixins define, and on each mixin a method passing to __super
+// each virtual method it doesn't define itself
+// A virtual method's __VT signature: the base's, else a mixin's
+function mixinVirtualSignature(base: string, name: string): MethodSignature | undefined {
+  const own = classMethodSignatures.get(base)?.get(name);
+  if (own) return own;
+  for (const [m, b] of mixinBaseOf) {
+    if (b !== base) continue;
+    const sig = classMethodSignatures.get(m)?.get(name);
+    if (sig) return sig;
+  }
+  return undefined;
+}
+
+function emitMixinSupport(): string {
+  const out: string[] = [];
+  for (const [base, names] of mixinVirtualMethods) {
+    const mixins = [...mixinBaseOf].filter(([, b]) => b === base).map(([m]) => m);
+    const baseSigs = classMethodSignatures.get(base) ?? new Map<string, MethodSignature>();
+    const sigs = new Map<string, MethodSignature>();
+    for (const n of [...names].sort()) {
+      const sig = baseSigs.get(n) ?? mixins.map((m) => classMethodSignatures.get(m)?.get(n)).find((x) => !!x);
+      if (sig) sigs.set(n, sig);
+    }
+    const result = (sg: MethodSignature) => (sg.result ? ` ${sg.result}` : '');
+    const forward = (sg: MethodSignature) => splitGoParameters(sg.params).map((p) => {
+      const space = p.indexOf(' ');
+      return p.slice(space + 1).startsWith('...') ? `${p.slice(0, space)}...` : p.slice(0, space);
+    }).join(', ');
+    out.push(`type ${base}__VT interface {\n${[...sigs.values()].map((sg) => `\t${sg.goName}(${sg.params})${result(sg)}`).join('\n')}\n}`);
+    for (const [n, sg] of sigs) {
+      if (baseSigs.has(n)) continue;
+      out.push(`func (self *${base}) ${sg.goName}(${sg.params})${result(sg)} { panic(TnNodeError("TypeError", "", "this.${n} is not a function")) }`);
+    }
+    for (const m of mixins) {
+      const own = classMethodSignatures.get(m) ?? new Map<string, MethodSignature>();
+      for (const [n, sg] of sigs) {
+        if (own.has(n)) continue;
+        out.push(`func (self *${m}) ${sg.goName}(${sg.params})${result(sg)} { ${sg.result ? 'return ' : ''}self.__super.${sg.goName}(${forward(sg)}) }`);
+      }
+    }
+  }
+  return out.length > 0 ? `\n\n${out.join('\n\n')}` : '';
+}
+
 function recordMethodSignature(className: string, jsName: string, goName: string, params: string, result: string): void {
   const methods = classMethodSignatures.get(className) ?? new Map<string, MethodSignature>();
   methods.set(jsName, { goName: goName, params: params, result: result.trim() });
@@ -8203,6 +8362,15 @@ function emitDynamicDispatchers(): string {
       const callArgs = paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ');
       const call = `o.${sig.goName}(${callArgs})`;
       cases.push(`\tcase *${getSafeName(className)}:\n\t\t${sig.result ? `return ${call}` : `${call}\n\t\treturn nil`}`);
+    }
+    // (a mixin forwarding the method to __super: its __VT signature)
+    for (const [mixin, base] of mixinBaseOf) {
+      if (classMethodSignatures.get(mixin)?.has(method) || !mixinVirtualMethods.get(base)?.has(method)) continue;
+      const sig = mixinVirtualSignature(base, method);
+      if (!sig) continue;
+      const paramTypes = sig.params ? goFuncParamTypes(`func(${sig.params})`) : [];
+      const call = `o.${sig.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
+      cases.push(`\tcase *${getSafeName(mixin)}:\n\t\t${sig.result ? `return ${call}` : `${call}\n\t\treturn nil`}`);
     }
     // (an object literal of a method interface with the method optional: its function, when set)
     for (const entry of adapterOptionalMethods.get(method) ?? []) {
@@ -11190,6 +11358,7 @@ function isLocallyBound(expr: AstNode): boolean {
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
   if (expr?.kind === 'TnExtendClass' || expr?.kind === 'TnNamespaceObject') return 'interface{}';
+  if (expr?.kind === 'TnMixinFactory') return 'func(interface{}) interface{}';
   if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Object' && expr.name.text === 'prototype' && !classNames.has('Object') &&
     !(isPropertyAccessExpression(expr.parent) && expr.parent.expression === expr)) return 'interface{}';
   // C.prototype: the class value, which takes methods as a dynamic object
@@ -18725,6 +18894,47 @@ const linkedModules = new Map<string, LinkedModule>();
 const linkedTopNames = new Set<string>();
 // Types that share their (Go) name with a value: any values (see linkModule)
 const valueShadowedTypeNames = new Set<string>();
+// Mixin classes (lowerMixinFactories) → the base class they extend, and per
+// base the names of the instance methods that dispatch through its __vt (the
+// base hierarchy's and every mixin's): a call this.m() reaches the outermost
+// mixin's m
+const mixinBaseOf = new Map<string, string>();
+const mixinVirtualMethods = new Map<string, Set<string>>();
+
+function instanceMethodNames(cls: AstNode): string[] {
+  return (cls.members ?? [])
+    .filter((m: AstNode) => isMethodDeclaration(m) && m.name && m.name.kind !== 'PrivateIdentifier' && m.name.kind !== 'ComputedPropertyName' && !hasModifier(m, 'StaticKeyword') && !m.asteriskToken)
+    .map((m: AstNode) => memberKey(m.name) ?? '')
+    .filter((n: string) => !!n);
+}
+
+function collectMixins(): void {
+  for (const [name, declaration] of declaredClasses) {
+    if (!declaration.tnMixin) continue;
+    const base = classParentNames.get(name);
+    if (!base) continue;
+    mixinBaseOf.set(name, base);
+    let methods = mixinVirtualMethods.get(base);
+    if (!methods) {
+      methods = new Set<string>();
+      for (let c: string | undefined = base; c; c = classParentNames.get(c)) {
+        const cls = declaredClasses.get(c);
+        if (cls) for (const m of instanceMethodNames(cls)) methods.add(m);
+      }
+      mixinVirtualMethods.set(base, methods);
+    }
+    for (const m of instanceMethodNames(declaration)) methods.add(m);
+  }
+}
+
+// The base class of the mixin system a class belongs to (the base itself,
+// or a mixin of it), or undefined
+function mixinSystemBase(className: string | undefined): string | undefined {
+  if (!className) return undefined;
+  if (mixinVirtualMethods.has(className)) return className;
+  return mixinBaseOf.get(className);
+}
+
 // Object types with a string index signature beside their named members
 // ({ [k: string]: unknown; type?: string }, zod's JSONSchema), and the
 // interfaces extending them: open objects, held as dynamic values
@@ -23684,6 +23894,17 @@ func TnExtendClass(parent interface{}) *TnClass {
 		c.Parent = p
 	}
 	c.New = func(args ...interface{}) interface{} { return TnNew(parent, args...) }
+	return c
+}
+
+// mixin(cls) of a mixin factory (superClass => class M extends superClass):
+// a class whose objects are made over an object of cls (see TnMixinNew_M)
+func TnMixinClass(name string, parent interface{}, make func(interface{}) interface{}) *TnClass {
+	c := &TnClass{Name: name}
+	if p, ok := parent.(*TnClass); ok {
+		c.Parent = p
+	}
+	c.New = func(args ...interface{}) interface{} { return make(TnNew(parent, args...)) }
 	return c
 }
 
