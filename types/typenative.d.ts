@@ -174,6 +174,7 @@ interface RegExp {
   readonly multiline: boolean;
   readonly dotAll: boolean;
   readonly unicode: boolean;
+  readonly unicodeSets: boolean;
   readonly sticky: boolean;
   test(string: string): boolean;
   exec(string: string): RegExpExecArray | null;

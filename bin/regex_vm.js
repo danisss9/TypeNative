@@ -656,11 +656,10 @@ func tnRxProgramOf(source string, flags string) *tnRxProg {
 }
 
 func tnRxCompile(source string, flags string) *tnRxProg {
-	// (the v flag's class syntax is left to RE2, which rejects what it can't read)
-	if strings.Contains(flags, "v") {
-		return nil
-	}
-	bt := tnBtCompile(source, strings.Contains(flags, "u"))
+	// (v: unicode mode with class set syntax; RE2 can't read it, so a v pattern
+	// the parser rejects gets no program)
+	sets := strings.Contains(flags, "v")
+	bt := tnBtCompile(source, sets || strings.Contains(flags, "u"), sets, strings.Contains(flags, "i"))
 	if bt == nil {
 		return nil
 	}
@@ -1176,10 +1175,14 @@ type tnBtParser struct {
 	ngrp    int
 	names   map[string]int
 	unicode bool
+	// v flag: classes are set expressions (nesting, &&, --, \\q{…}), and with
+	// icase each operand is case-closed before the set operations, as in JS
+	sets  bool
+	icase bool
 }
 
-func tnBtCompile(pattern string, unicode bool) *tnBt {
-	p := &tnBtParser{src: []rune(pattern), unicode: unicode}
+func tnBtCompile(pattern string, unicode bool, sets bool, icase bool) *tnBt {
+	p := &tnBtParser{src: []rune(pattern), unicode: unicode, sets: sets, icase: icase}
 	root, err := p.parseAlt()
 	if err != nil || p.pos < len(p.src) {
 		return nil
@@ -1628,7 +1631,287 @@ func (p *tnBtParser) parseEscape() (*tnBtNode, error) {
 	return &tnBtNode{op: "char", ch: ch}, nil
 }
 
+// A v-flag class's contents: the code points it matches, plus its strings of
+// zero or two-plus code points (from \\q{…})
+type tnBtClassSet struct {
+	has  func(rune) bool
+	strs map[string]bool
+}
+
+// A v-flag class (after its [) as a node: a class, or when it has strings an
+// alternation trying them longest first, then the code points, then the
+// empty string, as JS does
+func (p *tnBtParser) parseClassSetNode() (*tnBtNode, error) {
+	set, negate, err := p.parseClassSet()
+	if err != nil {
+		return nil, err
+	}
+	cls := &tnBtNode{op: "class", cls: set.has, negCls: negate}
+	if len(set.strs) == 0 {
+		return cls, nil
+	}
+	var strs []string
+	empty := false
+	for s := range set.strs {
+		if s == "" {
+			empty = true
+			continue
+		}
+		strs = append(strs, s)
+	}
+	// longest first; equal lengths in code point order, so programs are stable
+	for i := 1; i < len(strs); i++ {
+		for j := i; j > 0; j-- {
+			a, b := utf8.RuneCountInString(strs[j-1]), utf8.RuneCountInString(strs[j])
+			if a > b || (a == b && strs[j-1] < strs[j]) {
+				break
+			}
+			strs[j-1], strs[j] = strs[j], strs[j-1]
+		}
+	}
+	var branches [][]*tnBtNode
+	for _, s := range strs {
+		var seq []*tnBtNode
+		for _, r := range s {
+			seq = append(seq, &tnBtNode{op: "char", ch: r})
+		}
+		branches = append(branches, seq)
+	}
+	branches = append(branches, []*tnBtNode{cls})
+	if empty {
+		branches = append(branches, nil)
+	}
+	return &tnBtNode{op: "alt", branches: branches}, nil
+}
+
+// A v-flag class's set expression, after the [ through the ]: a union
+// (operands side by side, with a-z ranges), an intersection (A&&B&&…) or a
+// subtraction (A--B--…); mixing them needs a nested class, as in JS
+func (p *tnBtParser) parseClassSet() (*tnBtClassSet, bool, error) {
+	negate := false
+	if c, ok := p.peek(); ok && c == '^' {
+		negate = true
+		p.pos++
+	}
+	var operands []*tnBtClassSet
+	var op rune // 0: union, '&': intersection, '-': subtraction
+	for {
+		c, ok := p.peek()
+		if !ok {
+			return nil, false, fmt.Errorf("unterminated class")
+		}
+		if c == ']' {
+			p.pos++
+			break
+		}
+		if n, _ := p.peekAt(1); (c == '&' || c == '-') && n == c {
+			if len(operands) == 0 || (op == 0 && len(operands) > 1) || (op != 0 && op != c) {
+				return nil, false, fmt.Errorf("class set operators mixed")
+			}
+			op = c
+			p.pos += 2
+			operand, _, _, err := p.classSetOperand()
+			if err != nil {
+				return nil, false, err
+			}
+			operands = append(operands, operand)
+			continue
+		}
+		if op != 0 {
+			return nil, false, fmt.Errorf("class set operand without an operator")
+		}
+		operand, lo, single, err := p.classSetOperand()
+		if err != nil {
+			return nil, false, err
+		}
+		// a range: one character, a single -, another character
+		if n, _ := p.peekAt(1); single && n != '-' {
+			if c, ok := p.peek(); ok && c == '-' {
+				p.pos++
+				_, hi, single2, err := p.classSetOperand()
+				if err != nil {
+					return nil, false, err
+				}
+				if !single2 || hi < lo {
+					return nil, false, fmt.Errorf("bad class range")
+				}
+				operand = &tnBtClassSet{has: p.caseClosed(func(r rune) bool { return r >= lo && r <= hi })}
+			}
+		}
+		operands = append(operands, operand)
+	}
+	set := &tnBtClassSet{has: func(rune) bool { return false }}
+	if len(operands) > 0 {
+		set = operands[0]
+	}
+	if len(operands) > 1 {
+		has := make([]func(rune) bool, len(operands))
+		for i, o := range operands {
+			has[i] = o.has
+		}
+		strs := map[string]bool{}
+		switch op {
+		case 0:
+			set = &tnBtClassSet{has: func(r rune) bool {
+				for _, h := range has {
+					if h(r) {
+						return true
+					}
+				}
+				return false
+			}}
+			for _, o := range operands {
+				for s := range o.strs {
+					strs[s] = true
+				}
+			}
+		case '&':
+			set = &tnBtClassSet{has: func(r rune) bool {
+				for _, h := range has {
+					if !h(r) {
+						return false
+					}
+				}
+				return true
+			}}
+			for s := range operands[0].strs {
+				all := true
+				for _, o := range operands[1:] {
+					all = all && o.strs[s]
+				}
+				if all {
+					strs[s] = true
+				}
+			}
+		default:
+			first, rest := has[0], has[1:]
+			set = &tnBtClassSet{has: func(r rune) bool {
+				if !first(r) {
+					return false
+				}
+				for _, h := range rest {
+					if h(r) {
+						return false
+					}
+				}
+				return true
+			}}
+			for s := range operands[0].strs {
+				kept := true
+				for _, o := range operands[1:] {
+					kept = kept && !o.strs[s]
+				}
+				if kept {
+					strs[s] = true
+				}
+			}
+		}
+		set.strs = strs
+	}
+	if negate && len(set.strs) > 0 {
+		return nil, false, fmt.Errorf("negated class with strings")
+	}
+	return set, negate, nil
+}
+
+// One operand of a v-flag class: a nested class, a \\q{…} string list, an
+// escape or a character (single: a character, which can start or end a range)
+func (p *tnBtParser) classSetOperand() (*tnBtClassSet, rune, bool, error) {
+	c, ok := p.peek()
+	if !ok {
+		return nil, 0, false, fmt.Errorf("unterminated class")
+	}
+	p.pos++
+	switch c {
+	case '[':
+		set, negate, err := p.parseClassSet()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if negate {
+			has := set.has
+			set = &tnBtClassSet{has: func(r rune) bool { return !has(r) }}
+		}
+		return set, 0, false, nil
+	case ']':
+		return nil, 0, false, fmt.Errorf("missing class operand")
+	case '\\\\':
+		if n, _ := p.peek(); n == 'q' {
+			if b, _ := p.peekAt(1); b == '{' {
+				p.pos += 2
+				return p.classStrings()
+			}
+		}
+		ch, cls, ok := p.escapeValue(true)
+		if !ok {
+			return nil, 0, false, fmt.Errorf("trailing backslash in class")
+		}
+		if cls != nil {
+			return &tnBtClassSet{has: p.caseClosed(cls)}, 0, false, nil
+		}
+		c = ch
+	}
+	ch := c
+	return &tnBtClassSet{has: p.caseClosed(func(r rune) bool { return r == ch })}, ch, true, nil
+}
+
+// \\q{a|bc|…} (after the {, through the }): one-code-point strings join the
+// code points, the rest are the class's strings
+func (p *tnBtParser) classStrings() (*tnBtClassSet, rune, bool, error) {
+	var singles []rune
+	strs := map[string]bool{}
+	var cur []rune
+	for {
+		c, ok := p.peek()
+		if !ok {
+			return nil, 0, false, fmt.Errorf("unterminated \\\\q{")
+		}
+		p.pos++
+		if c == '|' || c == '}' {
+			if len(cur) == 1 {
+				singles = append(singles, cur[0])
+			} else {
+				strs[string(cur)] = true
+			}
+			cur = nil
+			if c == '}' {
+				break
+			}
+			continue
+		}
+		if c == '\\\\' {
+			ch, cls, ok := p.escapeValue(true)
+			if !ok || cls != nil {
+				return nil, 0, false, fmt.Errorf("bad escape in \\\\q{")
+			}
+			c = ch
+		}
+		cur = append(cur, c)
+	}
+	in := func(r rune) bool {
+		for _, s := range singles {
+			if r == s {
+				return true
+			}
+		}
+		return false
+	}
+	return &tnBtClassSet{has: p.caseClosed(in), strs: strs}, 0, false, nil
+}
+
+// With the i flag, a v-flag operand matches every case of what it holds, so
+// [\\p{L}--[a-z]] leaves out A-Z too
+func (p *tnBtParser) caseClosed(in func(rune) bool) func(rune) bool {
+	if !p.icase {
+		return in
+	}
+	return func(r rune) bool { return in(r) || in(unicode.ToLower(r)) || in(unicode.ToUpper(r)) }
+}
+
 func (p *tnBtParser) parseClass() (*tnBtNode, error) {
+	if p.sets {
+		return p.parseClassSetNode()
+	}
 	negate := false
 	if c, ok := p.peek(); ok && c == '^' {
 		negate = true

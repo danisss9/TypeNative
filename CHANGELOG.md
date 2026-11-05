@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
+  class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
+  (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
+  are tried longest first. With `i`, each operand is case-folded before the set
+  operation, as in JS. `v` implies unicode mode, and `re.unicodeSets` reports
+  the flag. Until now these patterns went to RE2, which misread the class and
+  matched the wrong text. Properties of strings (`\p{RGI_Emoji}`) aren't
+  supported.
 - **examples/openai-chat:** a chat client for any OpenAI-compatible
   `/v1/chat/completions` API. Answers stream into the terminal token by token:
   `fetch` with a streaming response body (`response.body.getReader()`),

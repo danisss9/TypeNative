@@ -16219,7 +16219,7 @@ function needsStatefulRegex(pattern, flags) {
     return /\\[1-9]|\\k<|\(\?[=!<]/.test(stripped);
 }
 const REGEX_FLAG_PROPERTIES = {
-    global: 'g', ignoreCase: 'i', multiline: 'm', dotAll: 's', unicode: 'u', sticky: 'y'
+    global: 'g', ignoreCase: 'i', multiline: 'm', dotAll: 's', unicode: 'u', unicodeSets: 'v', sticky: 'y'
 };
 function inferRegexPropertyType(expr) {
     if (!isPropertyAccessExpression(expr))
@@ -25294,6 +25294,8 @@ func (r *TnRegex) TnProp(key string) (interface{}, bool) {
 		return strings.Contains(r.flags, "s"), true
 	case "unicode":
 		return strings.Contains(r.flags, "u"), true
+	case "unicodeSets":
+		return strings.Contains(r.flags, "v"), true
 	case "test":
 		return func(s string) bool { return r.Test(s) }, true
 	case "exec":
