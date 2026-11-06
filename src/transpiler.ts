@@ -4330,7 +4330,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // is that reference (a.push(x) changes the array in the map)
     const isTopLevelDecl = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
     // (as is a call's *[]T result: a generic V bound to a Map's array values)
-    const callResultReference = isIdentifier(node.name) && !node.type && !!node.initializer && isCallExpression(unwrapParentheses(node.initializer)) &&
+    // (or an object's array field read by a computed key: old[phase])
+    const callResultReference = isIdentifier(node.name) && !node.type && !!node.initializer && (isCallExpression(unwrapParentheses(node.initializer)) || isElementAccessExpression(unwrapParentheses(node.initializer))) &&
       (inferExpressionType(node.initializer) ?? '').startsWith('*[]');
     if (isIdentifier(node.name) && !node.type && node.initializer && !isTopLevelDecl && (isMapArrayGet(node.initializer) || callResultReference)) {
       const initType = inferExpressionType(node.initializer) ?? '';
@@ -7353,7 +7354,9 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   const annotatedLiteral =
     isLiteral &&
     !!goType && ((unwrappedExpr.parameters ?? []).every((p: AstNode) => !!p.type && !p.dotDotDotToken) &&
-    (unwrappedExpr.parameters ?? []).length === goFuncParamTypes(goType).length ||
+    ((unwrappedExpr.parameters ?? []).length === goFuncParamTypes(goType).length ||
+      // (fewer annotated parameters, no slot type to follow: newFn = function (path: NodePath) {…})
+      ((unwrappedExpr.parameters ?? []).length < goFuncParamTypes(goType).length && !getContextualFunctionType(unwrappedExpr))) ||
     // (function(...args) where fixed parameters are expected: adapted)
     (unwrappedExpr.parameters ?? []).some((p: AstNode) => !!p.dotDotDotToken) && !goFuncParamTypes(goType).some((t: string) => t.startsWith('...')) ||
     // (function (node: t.MemberExpression, key, val) where the slot's node
@@ -9756,7 +9759,10 @@ function visitObjectMemberAccess(node: AstNode, goType: string): string {
     if (getters.includes(key.text) && !isAssignmentTarget(node)) return `${object}.Get_${goFieldName(key.text)}()`;
     return `${object}.${goFieldName(key.text)}`;
   }
-  if (isAssignmentTarget(node)) return '';
+  // (the target of a plain assignment is written elsewhere; a ||= / ??=
+  // target is read here first)
+  const assignment = isAssignmentTarget(node) ? node.parent : undefined;
+  if (assignment && !(isBinaryExpression(assignment) && ['BarBarEqualsToken', 'QuestionQuestionEqualsToken', 'AmpersandAmpersandEqualsToken'].includes(assignment.operatorToken.kind))) return '';
   const resultType = objectMemberCommonType(goType);
   const cases = [
     ...objectFieldNames(goType).map((f) => `case ${toGoStringLiteral(f)}: return o.${goFieldName(f)}`),
@@ -16320,6 +16326,9 @@ const callHandlers: Record<string, CallHandler> = {
   'console.warn': (_caller, args) => consoleOut('Stderr', args),
   'Array.isArray': (_caller, args) => {
     useHelper('isArray');
+    // (an array reference variable — possibly unset —: whether it is set)
+    const arg = currentCallArgNodes[0] ? unwrapParentheses(currentCallArgNodes[0]) : undefined;
+    if (arg && isIdentifier(arg) && referenceArrays.has(arg.text) && (variableGoTypes.get(arg.text) ?? '').startsWith('*[]')) return `(${getSafeName(arg.text)} != nil)`;
     return `TnIsArray(${args[0]})`;
   },
   'String': (_caller, args) => jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
