@@ -4458,12 +4458,16 @@ function visitNode(node, options = {}) {
         // const a = m.get(k)! of a Map holding arrays by reference: the variable
         // is that reference (a.push(x) changes the array in the map)
         const isTopLevelDecl = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
-        if (isIdentifier(node.name) && !node.type && node.initializer && !isTopLevelDecl && isMapArrayGet(node.initializer)) {
-            const refType = `*${inferExpressionType(node.initializer)}`;
+        // (as is a call's *[]T result: a generic V bound to a Map's array values)
+        const callResultReference = isIdentifier(node.name) && !node.type && !!node.initializer && isCallExpression(unwrapParentheses(node.initializer)) &&
+            (inferExpressionType(node.initializer) ?? '').startsWith('*[]');
+        if (isIdentifier(node.name) && !node.type && node.initializer && !isTopLevelDecl && (isMapArrayGet(node.initializer) || callResultReference)) {
+            const initType = inferExpressionType(node.initializer) ?? '';
+            const refType = initType.startsWith('*[]') ? initType : `*${initType}`;
             setVarGoType(node.name.text, refType.slice(1));
             variableTypes.delete(node.name.text);
             const name = getSafeName(node.name.text);
-            return `${name} := ${toGoValueOfType(node.initializer, refType)}\n\t\t_ = ${name}`;
+            return `${name} := ${initType === refType ? visit(node.initializer) : toGoValueOfType(node.initializer, refType)}\n\t\t_ = ${name}`;
         }
         // const v = m.get(k) / rec[k] of a Map / record holding primitives, tested
         // for undefined later: a *V (nil when the key is missing; a zero value is a value)
@@ -5003,6 +5007,10 @@ function visitNode(node, options = {}) {
             !!(variableGoTypes.get(node.expression.text) ?? topLevelGoTypes.get(node.expression.text))?.startsWith('func(');
         const keptTypeArgs = classMethodCallee || functionValueCallee ? [] : (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
         let typeArgs = getTypeArguments(keptTypeArgs);
+        // (getOrInsertWith<K, Array<T>>(map, k, () => []): Go infers the type
+        // arguments from the arguments — the map holds *[]T, not the []T named)
+        if (typeArgs && calleeDeclaration && explicitTypeArgumentsBoxed(calleeDeclaration, node))
+            typeArgs = '';
         // (f(fn, visitor, undefined): type arguments Go can't infer from a nil)
         if (!typeArgs && calleeDeclaration && !classMethodCallee && (node.typeArguments ?? []).length === 0) {
             const inst = uninferableInstantiation(calleeDeclaration, node);
@@ -7307,6 +7315,12 @@ function toGoValueOfType(expr, goType) {
         const signature = getCalleeSignature(unwrapParentheses(expr));
         if (signature?.type?.kind === 'NeverKeyword')
             return `func() ${goType} { ${visit(expr)}; panic("unreachable") }()`;
+    }
+    // (a call's *[]T result — a generic V bound to a Map's array values —
+    // into a []T slot: the array)
+    if (goType && goType.startsWith('[]') && goType !== '[]byte' && isCallExpression(unwrapParentheses(expr)) && !isMapArrayGetCall(unwrapParentheses(expr)) && inferExpressionType(expr) === `*${goType}`) {
+        useHelper('dynamic');
+        return `TnDerefSlice(${visit(expr)})`;
     }
     // x! into a slot of x's own nullable type: x itself (the assertion is
     // not checked at runtime: a null stays null)
@@ -11389,6 +11403,11 @@ function getContextualTypeNode(node) {
             // (an argument for a rest parameter `...xs: T[]`: a T)
             if (rest && index >= params.length - 1)
                 return arrayElementTypeNode(resolveTypeNode(rest.type));
+            // (f<K, V[]>(…, () => []): the parameter's type with the call's type arguments)
+            if ((parent.typeArguments ?? []).length > 0 && (fn.typeParameters ?? []).length === parent.typeArguments.length && params[index]?.type &&
+                isFunctionDeclaration(fn) && erasedFunctionTypeParameters(fn).size === 0) {
+                return instantiatedParameterType(params[index].type, fn.typeParameters, parent);
+            }
             return params[index]?.type;
         }
         // a function value of a known Go type (Class.method held in a variable):
@@ -11423,6 +11442,40 @@ function getContextualTypeNode(node) {
         }
     }
     return undefined;
+}
+// A parameter's type node with the type parameters replaced by a call's
+// explicit type arguments (one copy per call and parameter)
+const instantiatedParameterTypes = new WeakMap();
+function instantiatedParameterType(typeNode, typeParameters, call) {
+    let perCall = instantiatedParameterTypes.get(call);
+    if (!perCall)
+        instantiatedParameterTypes.set(call, (perCall = new Map()));
+    const cached = perCall.get(typeNode);
+    if (cached)
+        return cached;
+    const bound = new Map();
+    typeParameters.forEach((tp, i) => {
+        if (tp.name?.text)
+            bound.set(tp.name.text, call.typeArguments[i]);
+    });
+    const copy = (node, parent) => {
+        if (isTypeReferenceNode(node) && isIdentifier(node.typeName) && !node.typeArguments && bound.has(node.typeName.text))
+            return bound.get(node.typeName.text);
+        const out = { ...node, parent };
+        for (const key of Object.keys(node)) {
+            if (key === 'parent')
+                continue;
+            const value = node[key];
+            if (Array.isArray(value))
+                out[key] = value.map((v) => (v && typeof v.kind === 'string' ? copy(v, out) : v));
+            else if (value && typeof value === 'object' && typeof value.kind === 'string')
+                out[key] = copy(value, out);
+        }
+        return out;
+    };
+    const result = copy(typeNode, typeNode.parent);
+    perCall.set(typeNode, result);
+    return result;
 }
 // A type parameter of an enclosing function or class (T inside function f<T>)
 function isTypeParameterInScope(name, node) {
@@ -19177,6 +19230,22 @@ function erasedResultBinding(call) {
         return undefined;
     return argType;
 }
+// Whether a call's explicit type arguments name an array where the
+// arguments bind the type parameter to its reference (*[]T: a Map's array
+// values): Go then infers them, every type parameter being bound
+function explicitTypeArgumentsBoxed(fn, call) {
+    const explicit = call.typeArguments ?? [];
+    const names = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '');
+    if (explicit.length === 0 || explicit.length !== names.length || !FUNCTION_LIKE_KINDS.has(fn.kind))
+        return false;
+    const erased = erasedFunctionTypeParameters(fn);
+    if (names.some((n) => !n || erased.has(n)))
+        return false;
+    const bound = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], names);
+    if (!names.every((n) => bound.has(n)))
+        return false;
+    return names.some((n, i) => bound.get(n) === `*${getType(explicit[i])}` && isPlainArrayGoType(getType(explicit[i])));
+}
 // A generic function's result type at a call: its type parameters bound to
 // the explicit type arguments, else to the types of arguments passed for
 // parameters of that bare type (f<T>(value: T) called with a string)
@@ -19190,6 +19259,9 @@ function bindCallTypeParameters(fn, call, result) {
         if (!name || !new RegExp(`\\b${name}\\b`).test(result))
             return;
         let bound = explicit[i] ? getType(explicit[i]) : undefined;
+        // (an array type argument Go infers as its reference: see explicitTypeArgumentsBoxed)
+        if (bound && explicitTypeArgumentsBoxed(fn, call))
+            bound = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], [name]).get(name) ?? bound;
         const isName = (t) => !!t && isTypeReferenceNode(t) && isIdentifier(t.typeName) && t.typeName.text === name;
         if (!bound) {
             const index = (fn.parameters ?? []).findIndex((p) => isName(p.type) && !p.dotDotDotToken);
@@ -19197,6 +19269,13 @@ function bindCallTypeParameters(fn, call, result) {
             const argType = arg ? inferExpressionType(arg) : undefined;
             if (argType && argType !== 'nil')
                 bound = argType;
+            // (an untyped new Map() / [] for defaultValue: V, a Map<K, V> argument
+            // binding V: that binding, as the argument converts to it)
+            if (bound && ['*TnMap[interface{}, interface{}]', '*TnMap[interface{}, struct{}]', '[]interface{}', '*[]interface{}'].includes(bound)) {
+                const structural = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], [name]).get(name);
+                if (structural && structural !== bound)
+                    bound = structural;
+            }
         }
         // (xs: T[] / Array<T> given an array: its element type)
         if (!bound) {
@@ -19213,6 +19292,12 @@ function bindCallTypeParameters(fn, call, result) {
             const argType = (arg ? inferExpressionType(arg) ?? '' : '').replace(/^\*\[\]/, '[]');
             if (argType.startsWith('[]') && argType !== '[]interface{}')
                 bound = argType.slice(2);
+        }
+        // (a Map<K, T> argument binds T as Go infers it: its *[]X values)
+        if (!bound) {
+            const structural = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], [name]).get(name);
+            if (structural?.startsWith('*[]'))
+                bound = structural;
         }
         // (compute: () => T given a callback: the callback's result type)
         if (!bound) {
@@ -20200,6 +20285,16 @@ function visitCallArguments(node) {
         // (or an array its function changes in place: passed as the reference)
         if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && (inferExpressionType(arg) === 'interface{}' || paramType.startsWith('*[]'))) {
             return toGoValueOfType(arg, mentioned.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), typeBindings.get(n)), paramType));
+        }
+        // (a callback for makeDefault: () => V, V bound by another argument —
+        // a Map's *[]T values —: the callback with that signature)
+        if (mentioned.length > 0 && !isSpreadElement(arg) && paramType.startsWith('func(') && mentioned.every((n) => typeBindings.has(n))) {
+            const boundType = mentioned.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), typeBindings.get(n)), paramType);
+            const argType = inferExpressionType(arg) ?? '';
+            const literal = isArrowFunction(unwrapParentheses(arg)) || isFunctionExpression(unwrapParentheses(arg));
+            if ((literal && (node.typeArguments ?? []).length > 0) || (!literal && argType.startsWith('func(') && argType !== boundType && boundType.includes('*[]'))) {
+                return toGoValueOfType(arg, boundType);
+            }
         }
         if (mentioned.length > 0)
             return visit(arg);
