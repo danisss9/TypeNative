@@ -2756,6 +2756,17 @@ function lowerWeakCollections(node) {
     const name = node.kind === 'NewExpression' ? node.expression : node.kind === 'TypeReference' ? node.typeName : undefined;
     if (isIdentifier(name) && (name.text === 'WeakMap' || name.text === 'WeakSet'))
         name.text = name.text.slice(4);
+    // (new (WeakSet ?? Set)(): Set, either way)
+    if (node.kind === 'NewExpression') {
+        let callee = node.expression;
+        while (callee?.kind === 'ParenthesizedExpression')
+            callee = callee.expression;
+        const op = callee?.kind === 'BinaryExpression' ? callee.operatorToken?.kind : undefined;
+        if ((op === 'QuestionQuestionToken' || op === 'BarBarToken') && isIdentifier(callee.left) && isIdentifier(callee.right) &&
+            ['WeakMap', 'WeakSet'].includes(callee.left.text) && callee.right.text === callee.left.text.slice(4)) {
+            node.expression = callee.right;
+        }
+    }
 }
 // const K = Symbol('…') used as a property key — [K]: v in a literal, [K] = v
 // on a class, o[K] to read or write. A symbol's identity is only observable
@@ -4368,10 +4379,15 @@ function visitNode(node, options = {}) {
         }
         // Array destructuring: const [a, b] = arr
         if (isArrayBindingPattern(node.name) && node.initializer) {
-            const initGoType = inferExpressionType(node.initializer);
-            const initExpr = isDynamicValue(node.initializer)
+            let initGoType = inferExpressionType(node.initializer);
+            let initExpr = isDynamicValue(node.initializer)
                 ? toGoValueOfType(node.initializer, '[]interface{}')
                 : visit(node.initializer);
+            // (const [first] = set: its values in order)
+            if (initGoType?.startsWith('*TnMap[') && extractMapValueType(initGoType) === 'struct{}') {
+                initExpr = `${initExpr}.Keys()`;
+                initGoType = `[]${extractMapKeyType(initGoType)}`;
+            }
             const tmpVar = getTempName('arr');
             // (a dynamic value is read as an any-slice: its elements are any values)
             const elemType = isDynamicValue(node.initializer) ? 'interface{}' : initGoType?.startsWith('[]') ? initGoType.slice(2) : undefined;
@@ -5811,6 +5827,19 @@ function visitNode(node, options = {}) {
             useHelper('arraySubclass');
         let iterExpr = dynamicIterable ? `TnToArray(${visit(iterNode, { inline: true })})` : visit(iterNode, { inline: true });
         let iterType = inferExpressionType(iterNode);
+        // (a parameter or variable declared Iterable<T> — any iterable, held as
+        // any —: elements of T)
+        if (dynamicIterable && isIdentifier(iterNode)) {
+            const declared = resolveTypeNode(declaredTypeNodeOf(iterNode) ?? getExpressionTypeNode(iterNode));
+            if (isTypeReferenceNode(declared) && isIdentifier(declared.typeName) && ['Iterable', 'IterableIterator', 'Iterator', 'Generator'].includes(declared.typeName.text) && (declared.typeArguments ?? []).length >= 1 && !declaredInterfaces.has(declared.typeName.text)) {
+                const elementType = getType(declared.typeArguments[0]);
+                if (elementType && elementType !== 'interface{}' && elementType !== ':') {
+                    useHelper('dynamic');
+                    iterExpr = `TnSliceAs[${elementType}](${iterExpr})`;
+                    iterType = `[]${elementType}`;
+                }
+            }
+        }
         // Node class instances iterate through their iterator method (URLSearchParams → entries())
         const nodeIterator = iterType ? nodeRegistry.iterators[iterType] : undefined;
         if (iterType && nodeIterator) {
@@ -9537,7 +9566,14 @@ function sortArray(obj, args) {
     const comparatorType = currentCallArgTypes[0] ?? '';
     const paramTypes = comparatorType.startsWith('func(') ? goFuncParamTypes(comparatorType) : [];
     const element = (v, i) => (paramTypes[i] && !paramTypes[i].startsWith('...') ? convertBetweenGoTypes(v, arrayType.slice(2), paramTypes[i]) : v);
+    // (a comparator returning any — a dynamic localeCompare — compares its number)
+    const comparatorGoType = comparatorType.startsWith('func(') ? comparatorType : currentCallArgNodes[0] ? inferExpressionType(currentCallArgNodes[0]) ?? '' : '';
+    const comparatorResult = comparatorGoType.startsWith('func(') ? goFuncReturnType(comparatorGoType) : 'float64';
     let less = `(${args[0]})(${element('__s[i]', 0)}, ${element('__s[j]', 1)}) < 0`;
+    if (args[0] && comparatorResult !== 'float64') {
+        useHelper('dynamic');
+        less = `TnNumber((${args[0]})(${element('__s[i]', 0)}, ${element('__s[j]', 1)})) < 0`;
+    }
     if (!args[0]) {
         // the default order compares the elements as strings
         useHelper('dynamic');
@@ -11014,6 +11050,10 @@ function resolveTypeNode(typeNode, depth = 0) {
         // Readonly<T> / Required<T> / Omit<T, …> & co. have T's members
         if (UTILITY_TYPES.has(typeNode.typeName.text) && (typeNode.typeArguments ?? []).length > 0 && !declaredTypeAliases.has(typeNode.typeName.text)) {
             return resolveTypeNode(typeNode.typeArguments[0], depth + 1);
+        }
+        // Exclude<T, U> / Extract<T, U>: T's members without / with those U names
+        if (['Exclude', 'Extract'].includes(typeNode.typeName.text) && (typeNode.typeArguments ?? []).length === 2 && !declaredTypeAliases.has(typeNode.typeName.text)) {
+            return filteredUnionType(typeNode, depth);
         }
         const alias = declaredTypeAliases.get(typeNode.typeName.text);
         if (alias && alias.kind !== 'TypeLiteral')
@@ -14409,6 +14449,40 @@ function isObjectTypeName(name) {
     return interfacePropertyTypes.has(name);
 }
 // The keys a mapped type iterates: string literals of a union, or keyof an object type
+// Exclude<T, U> / Extract<T, U> as a type node: of a union T, the members
+// (by their text, or a string literal's value) U does or doesn't name; an
+// object type member of U (Extract<Effect, { kind: 'Apply' }>) keeps T's
+// object types — a discriminated union is one merged struct
+function filteredUnionType(typeNode, depth) {
+    if (typeNode.tnFiltered)
+        return typeNode.tnFiltered;
+    const extract = typeNode.typeName.text === 'Extract';
+    const [tArg, uArg] = typeNode.typeArguments;
+    const members = (t) => {
+        const r = resolveTypeNode(t, depth + 1) ?? t;
+        if (isUnionTypeNode(r))
+            return (r.types ?? []).flatMap((m) => members(m));
+        // keyof T: T's keys as string literals
+        if (r.kind === 'TypeOperator' && r.operator === 'KeyOfKeyword') {
+            const fieldNames = [...objectTypeFieldMap(r.type).keys()];
+            if (fieldNames.length > 0)
+                return fieldNames.map((name) => ({ kind: 'LiteralType', literal: { kind: 'StringLiteral', text: name } }));
+        }
+        return [r];
+    };
+    const keyOf = (m) => (isLiteralTypeNode(m) && isStringLiteral(m.literal) ? `"${m.literal.text}"` : typeNodeToText(m));
+    const uMembers = members(uArg);
+    const uKeys = new Set(uMembers.map(keyOf));
+    const uObjects = uMembers.some((m) => m.kind === 'TypeLiteral');
+    const tMembers = members(tArg);
+    const kept = tMembers.filter((m) => {
+        const named = uKeys.has(keyOf(m)) || (uObjects && (m.kind === 'TypeLiteral' || isTypeReferenceNode(m)));
+        return extract ? named : !named;
+    });
+    const result = kept.length === 1 ? kept[0] : kept.length === 0 ? { kind: 'NeverKeyword' } : { kind: 'UnionType', types: kept, parent: typeNode.parent };
+    typeNode.tnFiltered = result;
+    return result;
+}
 function getMappedTypeKeys(constraint) {
     const keys = resolveTypeNode(constraint);
     if (!keys)
@@ -16052,6 +16126,10 @@ function getType(typeNode, getArrayType = false) {
         if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
             return getType(typeNode.typeArguments[0], getArrayType);
         }
+        if ((name === 'Exclude' || name === 'Extract') && (typeNode.typeArguments ?? []).length === 2 && !declaredTypeAliases.has(name)) {
+            const filtered = filteredUnionType(typeNode, 0);
+            return filtered.kind === 'NeverKeyword' ? 'interface{}' : getType(filtered, getArrayType);
+        }
         if (isErasedTypeParameter(typeNode, name))
             return primitiveTypeParameterConstraint(typeNode, name) ?? 'interface{}';
         // Built-in types with no Go counterpart of their own
@@ -16977,7 +17055,26 @@ const stringMethodHandlers = {
             return `func() string { __e := ${end}; return TnStrSlice(${obj}, ${args[0] ?? '0'}, TnDeref(__e), __e != nil) }()`;
         return `TnStrSlice(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
     },
-    concat: (obj, args) => `${obj} + ${args.join(' + ')}`,
+    // (each argument String()ed: s.concat(value as string) of a number too)
+    concat: (obj, args) => {
+        const argNodes = currentCallArgNodes;
+        const parts = args.map((arg, i) => {
+            let argNode = argNodes[i];
+            if (!argNode || isSpreadElement(argNode))
+                return arg;
+            while (isAsExpression(argNode) || argNode.kind === 'ParenthesizedExpression' || argNode.kind === 'NonNullExpression')
+                argNode = argNode.expression;
+            const argType = inferExpressionType(argNode);
+            if (argType === 'string')
+                return arg;
+            if (argType && NULLABLE_PRIMITIVE_TYPES.includes(argType)) {
+                useHelper('dynamic');
+                return `TnFormat(${visit(argNode)})`;
+            }
+            return jsStringOf(visit(argNode), argType);
+        });
+        return [obj, ...parts].join(' + ');
+    },
     // normalize('NFC' | 'NFD' | 'NFKC' | 'NFKD')
     normalize: (obj, args) => {
         importedPackages.add('golang.org/x/text/unicode/norm');
@@ -17742,7 +17839,7 @@ const ARRAY_ONLY_METHODS = new Set([
 const STRING_ONLY_METHODS = new Set([
     'startsWith', 'endsWith', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase', 'split',
     'replace', 'replaceAll', 'charAt', 'charCodeAt', 'padStart', 'padEnd', 'repeat', 'match', 'matchAll', 'search',
-    'substring', 'lastIndexOf'
+    'substring', 'lastIndexOf', 'localeCompare', 'codePointAt', 'normalize', 'toLocaleUpperCase', 'toLocaleLowerCase'
 ]);
 // x.method(...) where x is any: re-visit with the receiver cast to the type the
 // method belongs to; methods of both strings and arrays dispatch at runtime
@@ -20620,7 +20717,7 @@ function visitNewMap(node) {
     const entries = args.length > 0 && isArrayLiteralExpression(args[0])
         ? args[0].elements
             .filter((el) => isArrayLiteralExpression(el) && (el.elements ?? []).length >= 2)
-            .map((pair) => `${visit(pair.elements[0])}, ${valueType.startsWith('*[]') || (valueType !== 'interface{}' && isObjectLiteralExpression(unwrapParentheses(pair.elements[1]))) ? toGoValueOfType(pair.elements[1], valueType) : visit(pair.elements[1])}`)
+            .map((pair) => `${visit(pair.elements[0])}, ${valueType.startsWith('*[]') || (valueType !== 'interface{}' && (isObjectLiteralExpression(unwrapParentheses(pair.elements[1])) || isNewExpression(unwrapParentheses(pair.elements[1])) || isArrayLiteralExpression(unwrapParentheses(pair.elements[1])))) ? toGoValueOfType(pair.elements[1], valueType) : visit(pair.elements[1])}`)
         : [];
     return orderedMapLiteral(keyType, valueType, entries);
 }
@@ -20706,7 +20803,7 @@ function visitNewSet(node) {
         return `func() *TnMap[${elementType}, struct{}] { ${src} := ${visit(args[0])}; __s := TnNewMap[${elementType}, struct{}](); for _, ${item} := range ${items} { __s.Set(${item_}, struct{}{}) }; return __s }()`;
     }
     const values = args.length > 0 && isArrayLiteralExpression(args[0])
-        ? (args[0].elements ?? []).map((el) => `${elementType === 'interface{}' ? toGoValueOfType(el, elementType) : visit(el)}, struct{}{}`)
+        ? (args[0].elements ?? []).map((el) => `${elementType === 'interface{}' || isObjectLiteralExpression(unwrapParentheses(el)) ? toGoValueOfType(el, elementType) : visit(el)}, struct{}{}`)
         : [];
     return orderedMapLiteral(elementType, 'struct{}', values);
 }
