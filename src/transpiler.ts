@@ -18152,6 +18152,8 @@ function bindCallTypeParameters(fn: AstNode, call: AstNode, result: string): str
       const result: string = arg ? (goFuncReturnType(functionValueGoType(arg)) ?? '') : '';
       if (result !== '' && result !== 'interface{}' && !new RegExp(`\\b${name}\\b`).test(result)) bound = result;
     }
+    // (else what the arguments' types bind it to: T of T[][] given a [][]X)
+    if (!bound) bound = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], [name]).get(name);
     if (bound) result = result.replace(new RegExp(`\\b${name}\\b`, 'g'), bound);
   });
   return result;
@@ -19046,7 +19048,8 @@ function visitCallArguments(node: AstNode): string[] {
     const mentioned = typeParamNames.filter((n) => n && new RegExp(`\\b${n}\\b`).test(paramType));
     // (an any value for xs: T[], T bound by another argument: converted to
     // the bound type, as Go can't take it unconverted)
-    if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && inferExpressionType(arg) === 'interface{}') {
+    // (or an array its function changes in place: passed as the reference)
+    if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && (inferExpressionType(arg) === 'interface{}' || paramType.startsWith('*[]'))) {
       return toGoValueOfType(arg, mentioned.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), typeBindings.get(n)!), paramType));
     }
     if (mentioned.length > 0) return visit(arg);
@@ -19079,8 +19082,19 @@ function visitCallArguments(node: AstNode): string[] {
 // argument's Go type (the first binding wins, as TypeScript infers it)
 function bindArgumentTypeParameters(params: AstNode[], args: AstNode[], names: string[]): Map<string, string> {
   const bindings = new Map<string, string>();
+  // (inside an array or collection, an any element is a binding: T of T[][]
+  // given [][]interface{} is interface{})
+  let depth = 0;
   const unify = (typeNode: AstNode | undefined, goType: string | undefined): void => {
-    if (!typeNode || !goType || goType === 'interface{}' || goType === 'nil') return;
+    if (!typeNode || !goType || goType === 'nil' || (goType === 'interface{}' && depth === 0)) return;
+    depth++;
+    try {
+      unifyAt(typeNode, goType);
+    } finally {
+      depth--;
+    }
+  };
+  const unifyAt = (typeNode: AstNode, goType: string): void => {
     if (typeNode.kind === 'ParenthesizedType') return unify(typeNode.type, goType);
     // (T[] | null: its one non-null member)
     if (isUnionTypeNode(typeNode)) {

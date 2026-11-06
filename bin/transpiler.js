@@ -18856,6 +18856,9 @@ function bindCallTypeParameters(fn, call, result) {
             if (result !== '' && result !== 'interface{}' && !new RegExp(`\\b${name}\\b`).test(result))
                 bound = result;
         }
+        // (else what the arguments' types bind it to: T of T[][] given a [][]X)
+        if (!bound)
+            bound = bindArgumentTypeParameters(fn.parameters ?? [], call.arguments ?? [], [name]).get(name);
         if (bound)
             result = result.replace(new RegExp(`\\b${name}\\b`, 'g'), bound);
     });
@@ -19828,7 +19831,8 @@ function visitCallArguments(node) {
         const mentioned = typeParamNames.filter((n) => n && new RegExp(`\\b${n}\\b`).test(paramType));
         // (an any value for xs: T[], T bound by another argument: converted to
         // the bound type, as Go can't take it unconverted)
-        if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && inferExpressionType(arg) === 'interface{}') {
+        // (or an array its function changes in place: passed as the reference)
+        if (mentioned.length > 0 && !isSpreadElement(arg) && mentioned.every((n) => typeBindings.has(n)) && (inferExpressionType(arg) === 'interface{}' || paramType.startsWith('*[]'))) {
             return toGoValueOfType(arg, mentioned.reduce((t, n) => t.replace(new RegExp(`\\b${n}\\b`, 'g'), typeBindings.get(n)), paramType));
         }
         if (mentioned.length > 0)
@@ -19863,9 +19867,21 @@ function visitCallArguments(node) {
 // argument's Go type (the first binding wins, as TypeScript infers it)
 function bindArgumentTypeParameters(params, args, names) {
     const bindings = new Map();
+    // (inside an array or collection, an any element is a binding: T of T[][]
+    // given [][]interface{} is interface{})
+    let depth = 0;
     const unify = (typeNode, goType) => {
-        if (!typeNode || !goType || goType === 'interface{}' || goType === 'nil')
+        if (!typeNode || !goType || goType === 'nil' || (goType === 'interface{}' && depth === 0))
             return;
+        depth++;
+        try {
+            unifyAt(typeNode, goType);
+        }
+        finally {
+            depth--;
+        }
+    };
+    const unifyAt = (typeNode, goType) => {
         if (typeNode.kind === 'ParenthesizedType')
             return unify(typeNode.type, goType);
         // (T[] | null: its one non-null member)
