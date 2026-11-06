@@ -142,7 +142,7 @@ func TnPunycodeDecode(input string) string {
 	return string(out)
 }
 
-func tnIsASCII(s string) bool {
+func tnPunyIsASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 {
 			return false
@@ -163,7 +163,7 @@ func tnMapDomainLabels(domain string, fn func(string) string) string {
 
 func TnPunycodeToASCII(domain string) string {
 	return tnMapDomainLabels(domain, func(label string) string {
-		if tnIsASCII(label) {
+		if tnPunyIsASCII(label) {
 			return label
 		}
 		return "xn--" + TnPunycodeEncode(label)

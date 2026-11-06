@@ -1,5 +1,7 @@
 {
     "include": ["**/*.ts"],
+    // (the React Compiler example's vendored declarations belong to it alone)
+    "exclude": ["react-compiler/vendor", "*/.cache"],
     "compilerOptions": {
       "target": "es2025",
       "useDefineForClassFields": false,

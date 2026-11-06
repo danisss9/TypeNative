@@ -415,6 +415,19 @@ export function registerProcess(r) {
         return 'TnProcessArgv()';
     });
     value('execArgv', '[]string', () => '[]string{}');
+    // process itself as a value (let p = process || {}, picocolors'): an
+    // object of its common members, read dynamically
+    r.values['process'] = (_c) => {
+        use();
+        r.helper('osPlatform');
+        r.helper('dynamic');
+        r.pkg('os');
+        return 'func() *TnMap[string, interface{}] { __p := TnNewMap[string, interface{}](); __argv := []interface{}{}; for _, __a := range TnProcessArgv() { __argv = append(__argv, __a) }; __p.Set("argv", __argv); ' +
+            '__env := TnNewMap[string, interface{}](); __src := TnEnvMap(); for _, __k := range __src.Keys() { __env.Set(__k, __src.Get(__k)) }; __p.Set("env", __env); __p.Set("platform", TnOsPlatform()); ' +
+            '__out := TnNewMap[string, interface{}](); if TnIsTTY(os.Stdout) { __out.Set("isTTY", true) }; __p.Set("stdout", __out); ' +
+            '__p.Set("emitWarning", func(__w interface{}, __rest ...interface{}) { __t, _ := TnArg(__rest, 0).(string); TnProcessEmitWarning(__w, __t) }); return __p }()';
+    };
+    r.valueTypes['process'] = '*TnMap[string, interface{}]';
     value('argv0', 'string', () => {
         r.pkg('os');
         return 'os.Args[0]';
