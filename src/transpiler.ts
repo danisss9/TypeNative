@@ -13962,6 +13962,11 @@ function isLogicalValueExpression(expr: AstNode): boolean {
   return !!leftType && leftType !== 'bool' && !!rightType && rightType !== 'bool';
 }
 
+function isEmptyObjectOrArrayLiteral(n: AstNode): boolean {
+  const u = unwrapParentheses(n);
+  return (isObjectLiteralExpression(u) && (u.properties ?? []).length === 0) || (isArrayLiteralExpression(u) && (u.elements ?? []).length === 0);
+}
+
 function getLogicalValueType(expr: AstNode): string {
   const leftType = logicalOperandType(expr.left) ?? 'interface{}';
   const rightType = logicalOperandType(expr.right);
@@ -13971,6 +13976,8 @@ function getLogicalValueType(expr: AstNode): string {
   }
   if (rightType === 'nil') return makeNullableType(leftType);
   if (leftType.startsWith('*') && rightType === leftType.slice(1)) return rightType;
+  // (opts || {} / xs || []: the left side's object or array type)
+  if (isEmptyObjectOrArrayLiteral(expr.right) && (leftType.startsWith('*') || leftType.startsWith('[]')) && !NULLABLE_PRIMITIVE_TYPES.includes(leftType)) return leftType;
   // operands of unrelated types (`hour || 0` with a string hour): any
   if (rightType && rightType !== leftType && rightType !== `*${leftType}` && rightType.replace(/^\*\[\]/, '[]') !== leftType.replace(/^\*\[\]/, '[]')) {
     return 'interface{}';
@@ -14441,6 +14448,8 @@ function getNullishResultType(expr: AstNode): string | undefined {
   if (rightType === leftValueType) return rightType;
   if (leftValueType && rightType === `*${leftValueType}`) return rightType;
   if (leftValueType === 'interface{}') return 'interface{}';
+  // (opts ?? {}: the left side's object type)
+  if (leftValueType && isEmptyObjectOrArrayLiteral(expr.right) && (leftValueType.startsWith('*') || leftValueType.startsWith('[]'))) return leftValueType;
   // (primitives of two types — a number ?? '' — is either)
   const primitives = ['string', 'float64', 'bool'];
   if (leftValueType && primitives.includes(leftValueType) && primitives.includes(rightType) && leftValueType !== rightType) return 'interface{}';
@@ -16315,7 +16324,7 @@ const callHandlers: Record<string, CallHandler> = {
     return `TnObjectIs(${args[0]}, ${args[1]})`;
   },
   'Array.of': (_caller, args) => `${arrayOfGoType(currentCallArgTypes)}{${args.join(', ')}}`,
-  'String.fromCodePoint': (_caller, args) => `string([]rune{${args.map((a) => `rune(int(${a}))`).join(', ')}})`,
+  'String.fromCodePoint': (_caller, args) => `string([]rune{${args.map((a, i) => `rune(int(${numericArgument(a, i)}))`).join(', ')}})`,
   'Symbol.for': (_caller, args) => {
     useHelper('symbol');
     return `TnSymbolFor(${args[0]})`;
@@ -16586,7 +16595,7 @@ const callHandlers: Record<string, CallHandler> = {
     return `TnIsArray(${args[0]})`;
   },
   'String': (_caller, args) => jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
-  'String.fromCharCode': (_caller, args) => `string(rune(int(${args[0] ?? '0'})))`,
+  'String.fromCharCode': (_caller, args) => `string(rune(int(${args[0] ? numericArgument(args[0], 0) : '0'})))`,
   // Symbol(description) — unique values for record keys
   Symbol: (_caller, args) => {
     useHelper('symbol');
@@ -16626,6 +16635,14 @@ const callHandlers: Record<string, CallHandler> = {
   'Object': (_caller, args) => `interface{}(${args[0] ?? 'map[string]interface{}{}'})`,
   'Boolean': (_caller, args) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
 };
+
+// A call's argument as a number (an any or nullable value: its JS number)
+function numericArgument(arg: string, index: number): string {
+  const argType = currentCallArgTypes[index];
+  if (argType === 'float64') return arg;
+  useHelper('dynamic');
+  return NULLABLE_PRIMITIVE_TYPES.includes(argType ?? '') ? `TnNumber(TnPtrValue(${arg}))` : `TnNumber(${arg})`;
+}
 
 // The argument of Number.isInteger & co. as a value to test (a number | undefined
 // is its number, or nil)
@@ -17139,6 +17156,8 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   // concat(a, [b, c], d): arrays are flattened one level, other values appended
   concat: (obj, args) => {
     const parts = args.map((arg, i) => {
+      // (typed elements into an any array — [].concat(Object.keys(o)) —: one by one)
+      if (currentCallArgTypes[i]?.startsWith('[]') && receiverElementType() === 'interface{}' && currentCallArgTypes[i] !== '[]interface{}') return `for _, __v := range ${arg} { __r = append(__r, __v) }`;
       if (currentCallArgTypes[i]?.startsWith('[]')) return `__r = append(__r, ${arg}...)`;
       // a dynamic value: flattened when it is an array at run time
       if (currentCallArgTypes[i] === 'interface{}' && receiverElementType() === 'interface{}') {
@@ -18236,6 +18255,20 @@ const typeQueryInProgress = new Set<AstNode>();
 function functionValueGoType(expr: AstNode): string {
   const inferred = inferExpressionType(expr);
   if (inferred?.startsWith('func(')) return inferred;
+  // (set.add / map.get … as a value: the function the emitter wraps it in)
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.name) && !hasQuestionDot(expr) && ['add', 'has', 'delete', 'get', 'set'].includes(expr.name.text)) {
+    const collectionType = inferExpressionType(expr.expression) ?? '';
+    if (collectionType.startsWith('*TnMap[')) {
+      const keyType = extractMapKeyType(collectionType);
+      const valueType = extractMapValueType(collectionType);
+      switch (expr.name.text) {
+        case 'add': if (valueType === 'struct{}') return `func(${keyType}) ${collectionType}`; break;
+        case 'has': case 'delete': return `func(${keyType}) bool`;
+        case 'get': if (valueType !== 'struct{}') return `func(${keyType}) ${valueType}`; break;
+        case 'set': if (valueType !== 'struct{}') return `func(${keyType}, ${valueType}) ${collectionType}`; break;
+      }
+    }
+  }
   if (isIdentifier(expr) && !variableGoTypes.has(expr.text)) {
     const declared = declaredFunctions.get(expr.text);
     if (declared && !declared.asteriskToken && !(declared.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) {
@@ -20639,6 +20672,24 @@ function normalizeCjsToEsm(code: string): string {
     /(?:module\.exports|exports)\.(\w+)\s*=\s*function\s*\w*\s*\(/g,
     'export function $1('
   );
+  // exports.x = value / exports.default = value (no module.exports = …):
+  // named exports, and the exports object as the default import — as Node
+  // gives an ES module importing CommonJS (js-tokens' default.exec, matchToToken)
+  if (!/^module\.exports\s*=/m.test(code) && /^exports\.\w+\s*=/m.test(code)) {
+    code = code.replace(/^Object\.defineProperty\(exports,\s*["']__esModule["'],\s*\{\s*value:\s*true\s*\}\);?/m, '');
+    const names: string[] = [];
+    code = code.replace(/^export function (\w+)\(/gm, (m: string, name: string) => {
+      names.push(name);
+      return m;
+    });
+    code = code.replace(/^exports\.(\w+)\s*=\s*/gm, (_m: string, name: string) => {
+      names.push(name);
+      return name === 'default' ? 'const __cjsDefaultValue = ' : `export const ${name} = `;
+    });
+    const entries = [...new Set(names)].map((n) => (n === 'default' ? 'default: __cjsDefaultValue' : n));
+    code += `\nconst __cjsExports: any = { ${entries.join(', ')} };\nexport default __cjsExports;\n`;
+    return code;
+  }
   // module.exports = value (the default export), then module.exports.x =
   // y (a named export, and a property of the default value too)
   if (/^module\.exports\s*=/m.test(code)) {
