@@ -5122,6 +5122,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (dynamicArithmetic) return dynamicArithmetic;
     }
     if (op === '==' || op === '!=') {
+      // two function values: the same function (closure) or not
+      const leftFn = inferExpressionType(node.left) ?? '';
+      const rightFn = inferExpressionType(node.right) ?? '';
+      if (leftFn.startsWith('func(') && rightFn.startsWith('func(') && !isNilLiteral(node.left) && !isNilLiteral(node.right)) {
+        useHelper('dynamic');
+        return `${op === '!=' ? '!' : ''}TnSameFunc(${visit(node.left)}, ${visit(node.right)})`;
+      }
       // any values: JS equality (objects by identity) without Go's uncomparable-type panic
       if (
         (isDynamicValue(node.left) || isDynamicValue(node.right)) &&
@@ -11986,7 +11993,9 @@ function isLocallyBound(expr: AstNode): boolean {
 const FUNCTION_OWN_MEMBERS = new Set(['call', 'apply', 'bind', 'name', 'length', 'toString', 'prototype', 'constructor', 'mock']);
 
 function isFunctionPropertyAccess(node: AstNode): boolean {
-  if (!isPropertyAccessExpression(node) || !isIdentifier(node.name) || hasQuestionDot(node) || FUNCTION_OWN_MEMBERS.has(node.name.text)) return false;
+  if (!isPropertyAccessExpression(node) || !isIdentifier(node.name) || hasQuestionDot(node)) return false;
+  // (fn.toString = () => …: an own property set on the function, kept)
+  if (FUNCTION_OWN_MEMBERS.has(node.name.text) && !(node.name.text === 'toString' && isAssignmentTarget(node))) return false;
   const receiver = node.expression;
   if (isIdentifier(receiver) && (classNames.has(receiver.text) || enumNames.has(receiver.text))) return false;
   // (a declared function too, imported through re-exports: traverseFast)
@@ -15160,6 +15169,15 @@ function getType(typeNode: AstNode, getArrayType = false): string {
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
     if (valueShadowedTypeNames.has(name) || openObjectTypeNames.has(name)) return 'interface{}';
+    // (a callable interface — (formatter, ...args): void plus enabled,
+    // namespace — is its function; the properties are the function's own)
+    const callableInterface = declaredInterfaces.get(name);
+    const callSignature = callableInterface && !(callableInterface.heritageClauses ?? []).length
+      ? (callableInterface.members ?? []).find((m: AstNode) => m.kind === 'CallSignature')
+      : undefined;
+    if (callSignature && !(callableInterface!.members ?? []).some((m: AstNode) => m.kind === 'ConstructSignature' || m.kind === 'MethodSignature')) {
+      return getType({ kind: 'FunctionType', parameters: callSignature.parameters, type: callSignature.type, parent: callSignature });
+    }
     // interface P extends InstanceType<typeof C>, …mixins: C's instances
     const instanceClass = instanceTypeClassOf(name);
     if (instanceClass) return isPolymorphicClass(instanceClass) ? 'interface{}' : `*${instanceClass}`;
@@ -22982,6 +23000,13 @@ func tnFuncHasInstance(v interface{}, fn interface{}) (bool, bool) {
 		return false, false
 	}
 	return TnTruthy(TnCallValue(h, v)), true
+}
+
+// a === b of two function values: the same closure
+func TnSameFunc(a, b interface{}) bool {
+	ia, okA := tnFuncIdentity(a)
+	ib, okB := tnFuncIdentity(b)
+	return okA == okB && ia == ib
 }
 
 // fn.prototype: the function's prototype object (made on first use)
