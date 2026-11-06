@@ -6072,7 +6072,11 @@ function visitNode(node, options = {}) {
         const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
         // (the function's result type as its signature declares it: computed
         // without the narrowing in effect here)
-        const returnGoType = enclosingFn && !isAsync ? withoutNarrowing(() => inferFunctionBodyReturnType(enclosingFn)) : undefined;
+        // (a method conformed to an implemented interface's return: that type)
+        const conformedReturn = enclosingFn && !isAsync && isMethodDeclaration(enclosingFn) ? interfaceConformedReturnType(enclosingFn) : undefined;
+        const returnGoType = conformedReturn && conformedReturn !== 'interface{}'
+            ? conformedReturn
+            : enclosingFn && !isAsync ? withoutNarrowing(() => inferFunctionBodyReturnType(enclosingFn)) : undefined;
         // `return value` in a function typed to return nothing (a callback whose
         // type says void): the value is evaluated, nothing is returned
         if (node.expression && returnGoType === '' && enclosingFn && !enclosingFn.asteriskToken && goCallbackResultType(enclosingFn) === undefined && !(tryReturn && enclosingFn === tryReturn.fn)) {
@@ -7338,6 +7342,12 @@ function toGoValueOfType(expr, goType) {
         const signature = getCalleeSignature(unwrapParentheses(expr));
         if (signature?.type?.kind === 'NeverKeyword')
             return `func() ${goType} { ${visit(expr)}; panic("unreachable") }()`;
+    }
+    // (an any value into a method interface's slot — a Stack<T> union of
+    // classes returned as the StackInterface it conforms to —: asserted)
+    if (goType && /^[A-Za-z_]\w*$/.test(goType) && declaredInterfaces.has(goType) && !interfaceHasProperties(declaredInterfaces.get(goType)) && !isNilLiteral(unwrapParentheses(expr)) && inferExpressionType(expr) === 'interface{}') {
+        useHelper('dynamic');
+        return `TnAs[${goType}](${visit(expr)})`;
     }
     // (a call's *[]T result — a generic V bound to a Map's array values —
     // into a []T slot: the array)
@@ -10960,7 +10970,15 @@ function visitObjectLiteralAsStruct(node, pointerType) {
 }
 // Go func type of an object-literal method or getter
 function methodFuncType(member) {
-    const params = (member.parameters ?? []).map((p) => getParameterGoType(p)).join(', ');
+    // (as getFunctionParametersInfo emits it: trailing defaulted parameters
+    // are a variadic ...interface{})
+    const parameters = member.parameters ?? [];
+    const firstDefaultIndex = parameters.findIndex((p) => !!p.initializer);
+    const trailingDefaults = firstDefaultIndex > -1 && !takesEveryParameter(parameters);
+    const paramTypes = (trailingDefaults ? parameters.slice(0, firstDefaultIndex) : parameters).map((p) => getParameterGoType(p));
+    if (trailingDefaults)
+        paramTypes.push('...interface{}');
+    const params = paramTypes.join(', ');
     const ret = member.type
         ? getType(member.type)
         : inferFunctionBodyReturnType(member) ?? '';
@@ -14821,6 +14839,11 @@ function getNullishResultType(expr) {
     // (two different object types — loc ?? GeneratedSource, a symbol — is either)
     if (leftValueType.startsWith('*') && rightType.startsWith('*') && leftValueType !== rightType)
         return 'interface{}';
+    // (a Set ?? an array: either)
+    const isMapType = (t) => t.startsWith('*TnMap[');
+    const isSliceType = (t) => t.replace(/^\*/, '').startsWith('[]');
+    if ((isMapType(leftValueType) && isSliceType(rightType)) || (isSliceType(leftValueType) && isMapType(rightType)))
+        return 'interface{}';
     return leftValueType;
 }
 // Inside a ?? chain an operand keeps its own type; otherwise the context decides
@@ -17961,6 +17984,20 @@ function visitDynamicMethodCall(node) {
         return undefined;
     }
     const method = node.expression.name.text;
+    // xs.forEach((v, k) => …) of an any value that may be a Map or Set (a
+    // discriminated union's members field: Map in one member, an array in
+    // another): its entries (value, key), else the elements (value, index)
+    if (method === 'forEach' && (node.arguments ?? []).length === 1) {
+        const callback = node.arguments[0];
+        const fn = unwrapParentheses(callback);
+        if ((isArrowFunction(fn) || isFunctionExpression(fn)) && (fn.parameters ?? []).length === 2) {
+            useHelper('dynamic');
+            useHelper('arraySubclass');
+            const info = buildArrayCallbackInfo(callback, 'interface{}', '', ['interface{}', 'interface{}']);
+            const recv = getTempName('recv');
+            return `func() { ${recv} := interface{}(${visit(node.expression.expression)}); if __m, __ok := ${recv}.(interface{ Entries() [][]interface{} }); __ok && !TnIsSlice(${recv}) { __set := false; if __k, __isKind := ${recv}.(interface{ TnJSKind() uint8 }); __isKind { __set = __k.TnJSKind() == 2 }; for _, __e := range __m.Entries() { if __set { (${info.fnExpr})(__e[0], __e[0]) } else { (${info.fnExpr})(__e[1], __e[0]) } } } else { for __i, __v := range TnToArray(${recv}) { (${info.fnExpr})(__v, float64(__i)) } } }()`;
+        }
+    }
     // a mutating array method on an any value: on its elements, written back
     // (a class declaring the method — an Array subclass's own push — dispatches;
     // when the value may be either, it is decided at run time)
@@ -20908,12 +20945,57 @@ function logicalFallbackCollectionType(node) {
     while (at.parent && isParenthesizedExpression(at.parent))
         at = at.parent;
     const parent = at.parent;
+    // (const next = new Map(); stack.push(next): the collection type the
+    // value is pushed into or set as)
+    if (parent?.kind === 'VariableDeclaration' && parent.initializer === at && isIdentifier(parent.name) && !parent.type)
+        return usageCollectionType(parent);
     if (!parent || !isBinaryExpression(parent) || parent.right !== at)
         return undefined;
     if (!['BarBarToken', 'QuestionQuestionToken'].includes(parent.operatorToken.kind))
         return undefined;
     const left = inferExpressionType(parent.left) ?? '';
     return left.startsWith('*TnMap[') ? left : undefined;
+}
+// The typed collection a variable initialized by an untyped new Map() / new
+// Set() is pushed into (xs.push(v)) or set as a value of (m.set(k, v)) in the
+// statements after it: that element's type
+const usageCollectionTypes = new WeakMap();
+function usageCollectionType(declaration) {
+    if (usageCollectionTypes.has(declaration))
+        return usageCollectionTypes.get(declaration) ?? undefined;
+    usageCollectionTypes.set(declaration, null);
+    const name = declaration.name.text;
+    const statement = declaration.parent?.parent;
+    const block = statement?.parent;
+    const statements = block?.statements ?? [];
+    const index = statements.indexOf(statement);
+    let found;
+    const isName = (n) => !!n && isIdentifier(unwrapParentheses(n)) && unwrapParentheses(n).text === name;
+    for (const st of index >= 0 ? statements.slice(index + 1) : []) {
+        const scan = (n) => {
+            if (found || !n || FUNCTION_LIKE_KINDS.has(n.kind))
+                return;
+            if (isCallExpression(n) && isPropertyAccessExpression(n.expression) && isIdentifier(n.expression.name)) {
+                const method = n.expression.name.text;
+                const args = n.arguments ?? [];
+                const receiverType = (inferExpressionType(n.expression.expression) ?? '').replace(/^\*/, '');
+                let candidate = '';
+                if ((method === 'push' || method === 'unshift') && args.length === 1 && isName(args[0]) && receiverType.startsWith('[]'))
+                    candidate = receiverType.slice(2);
+                if (method === 'set' && args.length === 2 && isName(args[1]) && receiverType.startsWith('TnMap['))
+                    candidate = extractMapValueType(`*${receiverType}`);
+                if (candidate.startsWith('*TnMap[') && !candidate.includes('interface{}'))
+                    found = candidate;
+            }
+            for (const child of childNodes(n))
+                scan(child);
+        };
+        scan(st);
+        if (found)
+            break;
+    }
+    usageCollectionTypes.set(declaration, found ?? null);
+    return found;
 }
 function visitNewSet(node) {
     const elementType = newSetElementType(node);
