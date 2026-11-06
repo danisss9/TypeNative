@@ -3430,6 +3430,9 @@ function interfaceHasProperties(iface: AstNode, seen = new Set<string>()): boole
   return false;
 }
 
+// (A & B in an interface's heritage: the type literal of their members)
+const mergedIntersectionLiterals = new WeakMap<AstNode, AstNode>();
+
 // The object type an interface extends: a declared interface or object type
 // alias, also through Omit<T, K> / Pick<T, K> / Partial<T> / Required<T> /
 // Readonly<T> (keys: the keys Omit drops or Pick keeps)
@@ -3442,11 +3445,13 @@ function heritageObjectType(type: AstNode): { base: AstNode; keys: string[] | un
     if (n && n.kind === 'TypeLiteral') return n;
     // (A & B of object types: their members together)
     if (n && n.kind === 'IntersectionType') {
-      if (n.tnMergedLiteral) return n.tnMergedLiteral;
+      const cached = mergedIntersectionLiterals.get(n);
+      if (cached) return cached;
       const parts = (n.types ?? []).map((t: AstNode) => named(t));
       if (parts.length === 0 || parts.some((p: AstNode | undefined) => !p || (p.heritageClauses ?? []).length > 0)) return undefined;
-      n.tnMergedLiteral = { kind: 'TypeLiteral', members: parts.flatMap((p: AstNode) => p.members ?? []), parent: n };
-      return n.tnMergedLiteral;
+      const merged: AstNode = { kind: 'TypeLiteral', members: parts.flatMap((p: AstNode) => p.members ?? []), parent: n };
+      mergedIntersectionLiterals.set(n, merged);
+      return merged;
     }
     if (!n || !isTypeReferenceNode(n) || !isIdentifier(n.typeName)) return undefined;
     const iface = declaredInterfaces.has(n.typeName.text) ? declaredInterfaces.get(n.typeName.text) : undefined;
@@ -13823,8 +13828,11 @@ function isObjectTypeName(name: string): boolean {
 // (by their text, or a string literal's value) U does or doesn't name; an
 // object type member of U (Extract<Effect, { kind: 'Apply' }>) keeps T's
 // object types — a discriminated union is one merged struct
+const filteredUnionTypes = new WeakMap<AstNode, AstNode>();
+
 function filteredUnionType(typeNode: AstNode, depth: number): AstNode {
-  if (typeNode.tnFiltered) return typeNode.tnFiltered;
+  const cached = filteredUnionTypes.get(typeNode);
+  if (cached) return cached;
   const extract = typeNode.typeName.text === 'Extract';
   const [tArg, uArg] = typeNode.typeArguments;
   const members = (t: AstNode): AstNode[] => {
@@ -13847,11 +13855,15 @@ function filteredUnionType(typeNode: AstNode, depth: number): AstNode {
     return extract ? named : !named;
   });
   const result: AstNode = kept.length === 1 ? kept[0] : kept.length === 0 ? { kind: 'NeverKeyword' } : { kind: 'UnionType', types: kept, parent: typeNode.parent };
-  typeNode.tnFiltered = result;
+  filteredUnionTypes.set(typeNode, result);
   return result;
 }
 
 function getMappedTypeKeys(constraint: AstNode | undefined): string[] | undefined {
+  // (not keys computed by Exclude / Extract — zod's Omit<T, K> alias,
+  // Pick<T, Exclude<keyof T, K>>, keeps T: TypeScript's own Omit is T's
+  // fields where its keys are listed)
+  if (isTypeReferenceNode(constraint) && isIdentifier(constraint.typeName) && ['Exclude', 'Extract'].includes(constraint.typeName.text)) return undefined;
   const keys = resolveTypeNode(constraint);
   if (!keys) return undefined;
   if (keys.kind === 'TypeOperator' && keys.operator === 'KeyOfKeyword') {
