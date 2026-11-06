@@ -2564,7 +2564,9 @@ function lowerForwardReferencedLets(node: AstNode): void {
     }
     return false;
   };
-  const referencedInClosure = (st: AstNode, name: string): boolean => containsNode(st, (n: AstNode) => FUNCTION_LIKE_KINDS.has(n.kind) && readsName(n.body, name));
+  // (the earlier statement may be the closure itself: function g() { … seen … })
+  const closureReads = (n: AstNode, name: string): boolean => FUNCTION_LIKE_KINDS.has(n.kind) && readsName(n.body, name);
+  const referencedInClosure = (st: AstNode, name: string): boolean => closureReads(st, name) || containsNode(st, (n: AstNode) => closureReads(n, name));
   const hoisted: AstNode[] = [];
   const out: AstNode[] = [];
   statements.forEach((st: AstNode, j: number) => {
@@ -4886,6 +4888,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             if (isDynamicValue(a.expression)) {
               useHelper('dynamic');
               args[i] = `TnAs[[]${elementType}](${visit(a.expression)})...`;
+            } else if ((inferExpressionType(a.expression) ?? '').replace(/^\*/, '') === '[]interface{}') {
+              // (an any[] spread into typed elements: each asserted)
+              useHelper('dynamic');
+              useHelper('arraySubclass');
+              args[i] = `TnSliceAs[${elementType}](${visit(a.expression)})...`;
             }
           } else if (isDynamicValue(a)) args[i] = toGoValueOfType(a, elementType);
         });
@@ -5636,63 +5643,78 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       `_ = ${varName}\n\t\t`
     )}`;
   } else if (isForOfStatement(node)) {
-    // Unwrap Object.entries(x) → treat x as the iterable
-    let iterNode: AstNode = node.expression;
-    if (
-      isCallExpression(iterNode) &&
-      isPropertyAccessExpression(iterNode.expression) &&
-      isIdentifier(iterNode.expression.expression) &&
-      iterNode.expression.expression.text === 'Object' &&
-      iterNode.expression.name.text === 'entries' &&
-      iterNode.arguments.length > 0 &&
-      isOrderedMapArg(iterNode.arguments[0])
-    ) {
-      iterNode = iterNode.arguments[0] as AstNode;
-    }
-    // for (const x of seq) over an Array subclass: its elements
-    if (iterNode.kind !== 'TnArrayItems' && arraySubclassOf(iterNode)) {
-      iterNode = arrayItemsNode(iterNode);
-      node.expression = iterNode;
-    }
-    // (a dynamic iterable — array, Map, Set, string — as its elements)
-    const dynamicIterable = isDynamicValue(iterNode);
-    if (dynamicIterable) useHelper('arraySubclass');
-    let iterExpr = dynamicIterable ? `TnToArray(${visit(iterNode, { inline: true })})` : visit(iterNode, { inline: true });
-    let iterType = inferExpressionType(iterNode);
-    // (a parameter or variable declared Iterable<T> — any iterable, held as
-    // any —: elements of T)
-    if (dynamicIterable && isIdentifier(iterNode)) {
-      const declared = resolveTypeNode(declaredTypeNodeOf(iterNode) ?? getExpressionTypeNode(iterNode));
-      if (isTypeReferenceNode(declared) && isIdentifier(declared.typeName) && ['Iterable', 'IterableIterator', 'Iterator', 'Generator'].includes(declared.typeName.text) && (declared.typeArguments ?? []).length >= 1 && !declaredInterfaces.has(declared.typeName.text)) {
-        const elementType = getType(declared.typeArguments[0]);
-        if (elementType && elementType !== 'interface{}' && elementType !== ':') {
-          useHelper('dynamic');
-          iterExpr = `TnSliceAs[${elementType}](${iterExpr})`;
-          iterType = `[]${elementType}`;
+    // (the loop's bindings are its own: an outer variable of the same name
+    // keeps its type after the loop)
+    return withLoopBindingsRestored(node.initializer, () => {
+      // Unwrap Object.entries(x) → treat x as the iterable
+      let iterNode: AstNode = node.expression;
+      if (
+        isCallExpression(iterNode) &&
+        isPropertyAccessExpression(iterNode.expression) &&
+        isIdentifier(iterNode.expression.expression) &&
+        iterNode.expression.expression.text === 'Object' &&
+        iterNode.expression.name.text === 'entries' &&
+        iterNode.arguments.length > 0 &&
+        isOrderedMapArg(iterNode.arguments[0])
+      ) {
+        iterNode = iterNode.arguments[0] as AstNode;
+      }
+      // for (const x of seq) over an Array subclass: its elements
+      if (iterNode.kind !== 'TnArrayItems' && arraySubclassOf(iterNode)) {
+        iterNode = arrayItemsNode(iterNode);
+        node.expression = iterNode;
+      }
+      // (a dynamic iterable — array, Map, Set, string — as its elements)
+      const dynamicIterable = isDynamicValue(iterNode);
+      if (dynamicIterable) useHelper('arraySubclass');
+      let iterExpr = dynamicIterable ? `TnToArray(${visit(iterNode, { inline: true })})` : visit(iterNode, { inline: true });
+      let iterType = inferExpressionType(iterNode);
+      // (a parameter or variable declared Iterable<T> — any iterable, held as
+      // any —: elements of T)
+      if (dynamicIterable && isIdentifier(iterNode)) {
+        const declared = resolveTypeNode(declaredTypeNodeOf(iterNode) ?? getExpressionTypeNode(iterNode));
+        if (isTypeReferenceNode(declared) && isIdentifier(declared.typeName) && ['Iterable', 'IterableIterator', 'Iterator', 'Generator'].includes(declared.typeName.text) && (declared.typeArguments ?? []).length >= 1 && !declaredInterfaces.has(declared.typeName.text)) {
+          const elementType = getType(declared.typeArguments[0]);
+          if (elementType && elementType !== 'interface{}' && elementType !== ':') {
+            useHelper('dynamic');
+            iterExpr = `TnSliceAs[${elementType}](${iterExpr})`;
+            iterType = `[]${elementType}`;
+          }
         }
       }
-    }
-    // Node class instances iterate through their iterator method (URLSearchParams → entries())
-    const nodeIterator = iterType ? nodeRegistry.iterators[iterType] : undefined;
-    if (iterType && nodeIterator) {
-      const cls = nodeRegistry.classes[nodeRegistry.classByGoType[iterType]];
-      iterExpr = `${iterExpr}.${nodeIterator}()`;
-      iterType = cls?.methods[nodeIterator] ?? iterType;
-    }
-    if (iterType && iterType.startsWith('*TnMap[')) {
-      const valueType = extractMapValueType(iterType);
-      const isSet = valueType === 'struct{}';
-      const varInfo = getForOfVarNames(node.initializer);
-      registerLocalVariable(varInfo[0], extractMapKeyType(iterType));
-      if (varInfo.length >= 2 && !isSet) registerLocalVariable(varInfo[1], valueType);
-      // (JS allows bindings the body never reads)
-      const uses = (names: string[]) => names.filter((n) => n !== '_').map((n) => `_ = ${n}\n\t\t`).join('');
-      if (varInfo.length >= 2 && !isSet) {
-        return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0], varInfo[1]]))}`;
+      // Node class instances iterate through their iterator method (URLSearchParams → entries())
+      const nodeIterator = iterType ? nodeRegistry.iterators[iterType] : undefined;
+      if (iterType && nodeIterator) {
+        const cls = nodeRegistry.classes[nodeRegistry.classByGoType[iterType]];
+        iterExpr = `${iterExpr}.${nodeIterator}()`;
+        iterType = cls?.methods[nodeIterator] ?? iterType;
       }
-      return `for ${varInfo[0]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0]]))}`;
-    }
-    return visitForOfSequence(node, iterExpr, iterType);
+      if (iterType && iterType.startsWith('*TnMap[')) {
+        const valueType = extractMapValueType(iterType);
+        const isSet = valueType === 'struct{}';
+        const varInfo = getForOfVarNames(node.initializer);
+        registerLocalVariable(varInfo[0], extractMapKeyType(iterType));
+        if (varInfo.length >= 2 && !isSet) registerLocalVariable(varInfo[1], valueType);
+        // (JS allows bindings the body never reads)
+        const uses = (names: string[]) => names.filter((n) => n !== '_').map((n) => `_ = ${n}\n\t\t`).join('');
+        if (varInfo.length >= 2 && !isSet) {
+          return `for ${varInfo[0]}, ${varInfo[1]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0], varInfo[1]]))}`;
+        }
+        // (for (const entry of map): each [key, value] pair, a tuple)
+        const single = isVariableDeclarationList(node.initializer) ? node.initializer.declarations?.[0] : undefined;
+        if (!isSet && single && isIdentifier(single.name) && varInfo[0] !== '_') {
+          const keyVar = getTempName('k');
+          const valueVar = getTempName('v');
+          const keyType = extractMapKeyType(iterType);
+          registerLocalVariable(varInfo[0], '[]interface{}');
+          const tuple: AstNode = { kind: 'TupleType', elements: [{ kind: 'TnGoType', goType: keyType }, { kind: 'TnGoType', goType: valueType }] };
+          variableTypeNodes.set(single.name.text, tuple);
+          return `for ${keyVar}, ${valueVar} := range ${iterExpr}.All()${visitLoopBody(node.statement, `${varInfo[0]} := []interface{}{${keyVar}, ${valueVar}}\n\t\t${uses([varInfo[0]])}`)}`;
+        }
+        return `for ${varInfo[0]} := range ${iterExpr}.All()${visitLoopBody(node.statement, uses([varInfo[0]]))}`;
+      }
+      return visitForOfSequence(node, iterExpr, iterType);
+    });
   } else if (isWhileStatement(node)) {
     // while ((x = next()) !== null) → for { x = next(); if !(x != nil) { break }; … }
     const hoisted = getHoistedConditionAssignment(node.expression);
@@ -7243,7 +7265,9 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     return `func() interface{} { __l := ${toGoValueOfType(orNull.left, 'interface{}')}; if ${test} { return __l }; return TnNull }()`;
   }
   // c ? null : x into an any slot: each branch as an any (null stays null)
-  if (goType === 'interface{}' && isConditionalExpression(orNull) && [orNull.whenTrue, orNull.whenFalse].some((b: AstNode) => unwrapParentheses(b).kind === 'NullKeyword') && storesJsNull(orNull.whenTrue)) {
+  // (also where its value would be a nullable primitive: c ? 'Component' : null)
+  if (goType === 'interface{}' && isConditionalExpression(orNull) && [orNull.whenTrue, orNull.whenFalse].some((b: AstNode) => unwrapParentheses(b).kind === 'NullKeyword') &&
+    (storesJsNull(orNull.whenTrue) || NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(orNull) ?? ''))) {
     useHelper('dynamic');
     const whenTrue = withNarrowing(getNarrowedNames(orNull.condition, true), () => toGoValueOfType(orNull.whenTrue, 'interface{}'));
     const whenFalse = withNarrowing(getNarrowedNames(orNull.condition, false), () => toGoValueOfType(orNull.whenFalse, 'interface{}'));
@@ -12211,8 +12235,24 @@ function isLocallyBound(expr: AstNode): boolean {
       if (n.body && isBlock(n.body) && (n.body.statements ?? []).some((st: AstNode) => isNestedFunctionDeclaration(st) && st.name.text === expr.text)) return true;
     }
     if (n.kind === 'CatchClause' && n.variableDeclaration && isIdentifier(n.variableDeclaration.name) && n.variableDeclaration.name.text === expr.text) return true;
+    // (a block's let / const, or a for loop's binding: block-scoped, at the
+    // top level too — for (const { types } of all) { … types … })
+    if (isBlock(n) && !FUNCTION_LIKE_KINDS.has(n.parent?.kind) && (n.statements ?? []).some((st: AstNode) =>
+      st.kind === 'VariableStatement' && st.declarationList?.declarationKind !== 'var' && declarationListBinds(st.declarationList, expr.text))) return true;
+    if ((isForOfStatement(n) || n.kind === 'ForStatement' || n.kind === 'ForInStatement') && isVariableDeclarationList(n.initializer) &&
+      n.initializer.declarationKind !== 'var' && declarationListBinds(n.initializer, expr.text)) return true;
   }
   return false;
+}
+
+// Whether a declaration list binds a name (destructuring patterns included)
+function declarationListBinds(list: AstNode, name: string): boolean {
+  const binds = (n: AstNode | undefined): boolean => {
+    if (!n) return false;
+    if (isIdentifier(n)) return n.text === name;
+    return (n.elements ?? []).some((el: AstNode) => !isOmittedExpression(el) && binds(el.name));
+  };
+  return (list.declarations ?? []).some((d: AstNode) => binds(d.name));
 }
 
 // fn.prop on a function value (validate.oneOfNodeTypes = types): not one
@@ -13012,8 +13052,10 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     const isEmptyLiteral = (n: AstNode) =>
       (isObjectLiteralExpression(unwrapParentheses(n)) && (unwrapParentheses(n).properties ?? []).length === 0) ||
       (isArrayLiteralExpression(unwrapParentheses(n)) && (unwrapParentheses(n).elements ?? []).length === 0);
-    if (whenTrueType && isEmptyLiteral(expr.whenFalse)) return whenTrueType;
-    if (whenFalseType && isEmptyLiteral(expr.whenTrue)) return whenFalseType;
+    // (not a primitive's: `c ? \`[${id}]\` : []` is either)
+    const primitive = (t: string | undefined) => t === 'string' || t === 'float64' || t === 'bool';
+    if (whenTrueType && isEmptyLiteral(expr.whenFalse) && !primitive(whenTrueType)) return whenTrueType;
+    if (whenFalseType && isEmptyLiteral(expr.whenTrue) && !primitive(whenFalseType)) return whenFalseType;
     // branches of different types (`f ? f(x) : 'none'`)
     if (whenTrueType && whenFalseType && whenTrueType.replace(/^\*\[\]/, '[]') !== whenFalseType.replace(/^\*\[\]/, '[]')) {
       return 'interface{}';
@@ -20094,7 +20136,7 @@ function visitNewSet(node: AstNode): string {
   }
   const values: string[] =
     args.length > 0 && isArrayLiteralExpression(args[0])
-      ? (args[0].elements ?? []).map((el: AstNode) => `${elementType === 'interface{}' || isObjectLiteralExpression(unwrapParentheses(el)) ? toGoValueOfType(el, elementType) : visit(el)}, struct{}{}`)
+      ? (args[0].elements ?? []).map((el: AstNode) => `${elementType === 'interface{}' || isObjectLiteralExpression(unwrapParentheses(el)) || isDynamicValue(el) ? toGoValueOfType(el, elementType) : visit(el)}, struct{}{}`)
       : [];
   return orderedMapLiteral(elementType, 'struct{}', values);
 }
@@ -30993,6 +31035,36 @@ function registerLocalVariable(name: string, goType: string | undefined): void {
   else referenceArrays.delete(name);
   if (goType) variableGoTypes.set(name, goType);
   else variableGoTypes.delete(name);
+}
+
+// Runs emit with a for…of's binding names' recorded types restored after it
+function withLoopBindingsRestored(initializer: AstNode, emit: () => string): string {
+  const names: string[] = [];
+  const collect = (n: AstNode | undefined): void => {
+    if (!n) return;
+    if (isIdentifier(n)) names.push(n.text);
+    else for (const el of n.elements ?? []) if (!isOmittedExpression(el)) collect(el.name);
+  };
+  if (isVariableDeclarationList(initializer)) for (const d of initializer.declarations ?? []) collect(d.name);
+  const saved = names.map((name) => ({
+    name,
+    goType: variableGoTypes.get(name),
+    type: variableTypes.get(name),
+    className: variableClassNames.get(name),
+    typeNode: variableTypeNodes.get(name),
+    reference: referenceArrays.has(name)
+  }));
+  try {
+    return emit();
+  } finally {
+    for (const v of saved) {
+      if (v.goType === undefined) variableGoTypes.delete(v.name); else variableGoTypes.set(v.name, v.goType);
+      if (v.type === undefined) variableTypes.delete(v.name); else variableTypes.set(v.name, v.type);
+      if (v.className === undefined) variableClassNames.delete(v.name); else variableClassNames.set(v.name, v.className);
+      if (v.typeNode === undefined) variableTypeNodes.delete(v.name); else variableTypeNodes.set(v.name, v.typeNode);
+      if (v.reference) referenceArrays.add(v.name); else referenceArrays.delete(v.name);
+    }
+  }
 }
 
 // for...of over arrays and strings (a string yields one-character strings)
