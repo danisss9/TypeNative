@@ -257,8 +257,10 @@ export function registerTimers(r: NodeRegistry): void {
     r.results[`perf_hooks.performance.${name}`] = result;
   };
   perf('now', 'float64', (_c: NodeCall) => 'TnPerfNow()');
-  perf('mark', '*TnPerformanceEntry', (c: NodeCall) => `TnPerfMark(${c.args.join(', ')})`);
-  perf('measure', '*TnPerformanceEntry', (c: NodeCall) => `TnPerfMeasure(${c.args.join(', ')})`);
+  // (the name of an any value: its string)
+  const named = (c: NodeCall) => [c.types[0] === 'string' ? c.args[0] : `TnJSString(${c.args[0]})`, ...c.args.slice(1)].join(', ');
+  perf('mark', '*TnPerformanceEntry', (c: NodeCall) => `TnPerfMark(${named(c)})`);
+  perf('measure', '*TnPerformanceEntry', (c: NodeCall) => `TnPerfMeasure(${named(c)})`);
   perf('getEntries', '[]*TnPerformanceEntry', (_c: NodeCall) => 'TnPerfEntries("", "")');
   perf('getEntriesByName', '[]*TnPerformanceEntry', (c: NodeCall) => `TnPerfEntries(${c.args[0]}, ${c.args[1] ?? '""'})`);
   perf('getEntriesByType', '[]*TnPerformanceEntry', (c: NodeCall) => `TnPerfEntries("", ${c.args[0]})`);
