@@ -3949,6 +3949,19 @@ function visitNode(node, options = {}) {
                 }
             }
         }
+        // this.x in a static method (arrows inside it too): the class's x
+        if (node.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(node.expression)) {
+            let fn = node.parent;
+            while (fn && (!FUNCTION_LIKE_KINDS.has(fn.kind) || isArrowFunction(fn)))
+                fn = fn.parent;
+            const owner = fn && (isMethodDeclaration(fn) || isGetAccessor(fn) || isSetAccessor(fn)) && hasModifier(fn, 'StaticKeyword') ? getEnclosingClassName(fn) : undefined;
+            if (owner) {
+                const classRef = { kind: 'Identifier', text: owner, parent: node, line: node.line, column: node.column };
+                const access = { ...node, expression: classRef };
+                classRef.parent = access;
+                return visit(access);
+            }
+        }
         // Array.isArray as a value (const isArray = Array.isArray)
         if (isIdentifier(node.expression) && node.expression.text === 'Array' && node.name.text === 'isArray' && !isCallee(node) && !variableGoTypes.has('Array') && !classNames.has('Array')) {
             useHelper('isArray');
@@ -15483,7 +15496,7 @@ function visitEnumDeclaration(node, inPlace = false) {
     }
     // (a string enum is an alias of string: its values mix freely with the
     // strings of fields and generic instantiations typed by it)
-    return `type ${enumName} = ${baseType}\n\nvar (\n${members.join('\n')}\n)`;
+    return `type ${enumName} = ${baseType}\n\nvar (\n${members.join('\n')}\n)${enumObjectDecl(node, enumName, members)}`;
 }
 // The enum name as a value (a bundled FESM exports object holds it): its
 // members as a dynamic map — direct member reads go through EnumName.Member
@@ -15499,12 +15512,14 @@ function enumObjectDecl(node, enumName, members) {
         const plain = value.startsWith(`${enumName}(`) && value.endsWith(')')
             ? value.slice(enumName.length + 1, -1)
             : value;
-        return `${toGoStringLiteral(name.slice(enumName.length + 1))}: ${plain}`;
+        return `.Set(${toGoStringLiteral(name.slice(enumName.length + 1))}, ${plain})`;
     })
-        .join(', ');
+        .join('');
+    // (in declaration order, as Object.keys(Enum) lists them)
+    useHelper('orderedMap');
     return `
 
-var ${enumName}__object = map[string]interface{}{${entries}}`;
+var ${enumName}__object = TnNewMap[string, interface{}]()${entries}`;
 }
 let inPlaceEnum = false;
 // The class C of an interface declared `extends InstanceType<typeof C>`
