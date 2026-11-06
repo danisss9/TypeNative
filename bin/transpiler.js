@@ -10875,7 +10875,9 @@ function objectLiteralContextualType(node) {
             return false;
         const tags = literalTypes(memberType);
         const value = literalValue(p);
-        if (isPropertyAssignment(p) && value === undefined && primitiveGo(inferExpressionType(p.initializer))) {
+        const init = isPropertyAssignment(p) ? unwrapParentheses(p.initializer) : undefined;
+        // (not of a nested literal: its type comes from this one's)
+        if (init && value === undefined && (isIdentifier(init) || isPropertyAccessExpression(init)) && primitiveGo(inferExpressionType(init))) {
             const memberGo = getType(memberType);
             if (memberGo !== 'interface{}' && !primitiveGo(memberGo))
                 return false;
