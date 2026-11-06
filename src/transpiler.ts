@@ -747,6 +747,9 @@ const diagnostics: TranspileDiagnostic[] = [];
 // While a module file's top-level statement is visited: its variables'
 // assignments (run by the module's init function, in order)
 let moduleInitAssignments: string[] | null = null;
+// Per class of the module file being emitted: its static field assignments
+// that run with the module's code (see emitModuleFile)
+let staticInitSinks: Map<AstNode, string[]> | null = null;
 // The modules' init functions, in JS evaluation order (imports first)
 const moduleInitOrder: string[] = [];
 // Tracks already-included files by a stable key to prevent duplicates/cycles
@@ -6441,6 +6444,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           member.type
             ? getOptionalNodeType(member.type, !!member.questionToken)
             : toFieldGoType(member.initializer ? inferExpressionType(member.initializer) : undefined);
+        // (one reading a module variable — static globals = [...lower] — is
+        // set when the module's code runs, after that variable: a Go
+        // initializer would run before it)
+        const readsModuleVariable = !!member.initializer && containsNode(member.initializer, (n: AstNode) =>
+          isIdentifier(n) && declaredVariables.has(n.text) && !isFieldNameIdentifier(n) && !isLocallyBound(n));
+        const staticSink = staticInitSinks?.get(node);
+        if (readsModuleVariable && staticSink && fieldType && fieldType !== ':') {
+          staticSink.push(`${name}_${fieldName} = ${toGoValueOfType(member.initializer, fieldType)}`);
+          result += `var ${name}_${fieldName} ${fieldType}\n\n`;
+          continue;
+        }
         const initializer = member.initializer ? ` = ${visit(member.initializer)}` : '';
         result += `var ${name}_${fieldName} ${fieldType}${initializer}\n\n`;
       }
@@ -20469,7 +20483,16 @@ function includeLocalImport(
   const prevEmittingModuleFile = emittingModuleFile;
   const prevInitAssignments = moduleInitAssignments;
   emittingModuleFile = true;
+  // (a class's static fields reading module variables: set where the class
+  // is, in the module's code, see the class emitter)
+  const prevStaticSinks = staticInitSinks;
+  staticInitSinks = new Map<AstNode, string[]>();
+  const staticSlots = new Map<AstNode, number>();
   for (const stmt of sf.statements) {
+    if (isClassDeclaration(stmt)) {
+      staticInitSinks.set(stmt, []);
+      staticSlots.set(stmt, statementLines.length);
+    }
     moduleInitAssignments = [];
     const result = visit(stmt, { addFunctionOutside: true });
     const assignments = moduleInitAssignments;
@@ -20494,6 +20517,11 @@ function includeLocalImport(
   const fileOutside = localizeGoPaths(
     outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n')
   );
+  for (const [cls, at] of [...staticSlots].sort((a, b) => b[1] - a[1])) {
+    const inits = staticInitSinks.get(cls) ?? [];
+    if (inits.length > 0) statementLines.splice(at, 0, ...inits.map((line) => withLineMarker(cls, localizeGoPaths(line))));
+  }
+  staticInitSinks = prevStaticSinks;
   // The module's code runs from main, after the modules it imports (JS
   // evaluation order), not in Go's file-ordered init()
   const initName = `tnModuleInit_${moduleInitOrder.length + 1}_${goFileName.replace(/\.go$/, '').replace(/[^A-Za-z0-9_]/g, '_')}`;
