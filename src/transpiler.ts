@@ -10396,7 +10396,8 @@ function isDynamicValue(expr: AstNode): boolean {
 
 // A value whose type is a type parameter (a: T in f<T>): its properties are read dynamically
 function isTypeParameterValue(expr: AstNode): boolean {
-  const type = inferExpressionType(expr);
+  // (state: State | null: a *State, read the same way)
+  const type = (inferExpressionType(expr) ?? '').replace(/^\*/, '');
   return !!type && isUnboundGoType(type) && isTypeParameterInScope(type, expr);
 }
 
@@ -12005,6 +12006,8 @@ function inferArrowFunctionGoType(node: AstNode | AstNode): string {
     (p) => getParameterGoType(p)
   );
   if (hasTrailingDefaults) paramTypes.push('...interface{}');
+  // (a function reading `arguments` takes extra ones: see withArgumentsObject)
+  else if (!parameters.some((p) => p.dotDotDotToken) && !isArrowFunction(node) && usesArgumentsObject(node)) paramTypes.push('...interface{}');
   const params = paramTypes.join(', ');
   // (the result with the function's own parameters and locals typed; a
   // function whose result is being inferred already — one that returns a
@@ -15009,7 +15012,8 @@ function instantiateAliasType(aliasType: AstNode, reference: AstNode): AstNode {
   const declaration = aliasType.parent;
   const params: AstNode[] = declaration?.kind === 'TypeAliasDeclaration' ? (declaration.typeParameters ?? []) : [];
   const args: AstNode[] = reference.typeArguments ?? [];
-  if (params.length === 0 || args.length === 0) return aliasType;
+  // (no type arguments: the parameters' defaults, VisitWrapper<S = any>)
+  if (params.length === 0 || (args.length === 0 && !params.some((p) => p.default))) return aliasType;
   const bound = new Map<string, AstNode>();
   params.forEach((p, i) => {
     const arg = args[i] ?? p.default;
@@ -18768,7 +18772,12 @@ function erasedFunctionTypeParameters(fn: AstNode): Set<string> {
   for (const p of fn.parameters ?? []) {
     const types: AstNode[] = p.type && isUnionTypeNode(p.type) ? p.type.types ?? [] : p.type ? [p.type] : [];
     for (const t of types) {
-      const resolved = t.kind === 'ParenthesizedType' ? t.type : t;
+      let resolved = t.kind === 'ParenthesizedType' ? t.type : t;
+      // (an alias of a function type — wrapper?: VisitWrapper<State> —: its signature)
+      if (isTypeReferenceNode(resolved) && isIdentifier(resolved.typeName) && declaredTypeAliases.has(resolved.typeName.text)) {
+        const target = resolveTypeNode(resolved);
+        if (isFunctionTypeNode(target)) resolved = target;
+      }
       if (!isFunctionTypeNode(resolved)) continue;
       for (const cp of resolved.parameters ?? []) if (cp.type) callbackParamTypes.push(getType(cp.type));
     }
@@ -23677,6 +23686,23 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 	}
 	if TnIsNil(obj) {
 		panic(TnNodeError("TypeError", "", fmt.Sprintf("Cannot read properties of undefined (reading '%s')", name)))
+	}
+	// a function value's call / apply (fn.apply(this, arguments) of a
+	// Function-typed value): the function with those arguments
+	if (name == "call" || name == "apply") && reflect.ValueOf(obj).Kind() == reflect.Func {
+		rest := []interface{}{}
+		if name == "call" && len(args) > 1 {
+			rest = args[1:]
+		} else if name == "apply" && len(args) > 1 && !TnIsNil(args[1]) {
+			if list, ok := args[1].([]interface{}); ok {
+				rest = list
+			} else if rv := reflect.Indirect(reflect.ValueOf(args[1])); rv.Kind() == reflect.Slice {
+				for i := 0; i < rv.Len(); i++ {
+					rest = append(rest, rv.Index(i).Interface())
+				}
+			}
+		}
+		return TnCallValue(obj, rest...)
 	}
 	fn := TnGet(obj, name)
 	if fn == nil {
