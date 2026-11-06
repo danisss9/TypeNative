@@ -4764,7 +4764,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // +s / -s on a string, a boolean or an any value: its JS number (Number(s))
     if (node.operator === 'PlusToken' || node.operator === 'MinusToken') {
       const operandType = inferExpressionType(node.operand) ?? '';
-      if (['string', 'bool', 'interface{}', '*string', '*bool'].includes(operandType)) {
+      // (-n of a number | undefined: its number, NaN when unset)
+      if (['string', 'bool', 'interface{}', '*string', '*bool', '*float64'].includes(operandType)) {
         useHelper('dynamic');
         const value = operandType.startsWith('*') ? `TnPtrValue(${visit(node.operand)})` : `interface{}(${visit(node.operand)})`;
         return `${node.operator === 'MinusToken' ? '-' : ''}TnNumber(${value})`;
@@ -5812,6 +5813,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         while (statement.kind === 'ParenthesizedExpression') statement = statement.expression;
         discardedExpressions.add(statement);
         return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}${visit(statement)}; }`;
+      }
+      // (a call that returns nothing, where a value is expected — () =>
+      // super.parseFunctionBody(…) for a () => T callback: it runs, the
+      // result is undefined)
+      if (isVoidCall(node.body as AstNode)) {
+        let statement: AstNode = node.body;
+        while (statement.kind === 'ParenthesizedExpression') statement = statement.expression;
+        discardedExpressions.add(statement);
+        return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}${visit(statement)}; return *new(${inferredRetType}) }`;
       }
       // (the result converts to the declared or contextual result type)
       return `func(${parameterInfo.signature})${returnType} { ${coverageEnter(node)}return ${toGoValueOfType(node.body as AstNode, inferredRetType)}; }`;
@@ -23202,6 +23212,14 @@ func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
 func TnSet(obj interface{}, key string, value interface{}) {
 	if o, ok := obj.(map[string]interface{}); ok {
 		o[key] = value
+		return
+	}
+	// (an error's own property: error.missingPlugins = …, read back by prop)
+	if e, ok := obj.(*TnError); ok && e != nil && key != "message" && key != "name" && key != "stack" {
+		if e.props == nil {
+			e.props = map[string]interface{}{}
+		}
+		e.props[key] = value
 		return
 	}
 	// C.prototype.m = fn (a class value stands in for its prototype)
