@@ -550,6 +550,7 @@ function classValue(name) {
 // constructor (arguments converted as for dynamic calls) and static members
 function emitClassDescriptors() {
     const out = [];
+    const constructors = [];
     for (const name of [...emittedClasses].sort()) {
         const declaration = declaredClasses.get(name);
         const goName = getSafeName(name);
@@ -581,8 +582,14 @@ function emitClassDescriptors() {
             statics.push(`"from": func() interface{} { return func(__src interface{}, __fn ...interface{}) interface{} { return TnArraySubclassFrom(tnClassesByType[reflect.TypeOf((*${goName})(nil))], __src, __fn...) } }`);
         }
         const parentRef = parent && emittedClasses.has(parent) ? `TnClass_${getSafeName(parent)}` : 'nil';
-        out.push(`var TnClass_${goName} = tnRegisterClass(&TnClass{Name: ${toGoStringLiteral(originalTopNames.get(name) ?? name)}, Type: reflect.TypeOf((*${goName})(nil)), Parent: ${parentRef}, New: ${ctor}, statics: map[string]func() interface{}{${statics.join(', ')}}})`);
+        // (the constructor is set in init(): a constructor using its own class as
+        // a value — this._zod = { constr: S } — would make an initialization cycle)
+        out.push(`var TnClass_${goName} = tnRegisterClass(&TnClass{Name: ${toGoStringLiteral(originalTopNames.get(name) ?? name)}, Type: reflect.TypeOf((*${goName})(nil)), Parent: ${parentRef}, statics: map[string]func() interface{}{${statics.join(', ')}}})`);
+        if (ctor !== 'nil')
+            constructors.push(`TnClass_${goName}.New = ${ctor}`);
     }
+    if (constructors.length > 0)
+        out.push(`func init() {\n\t${constructors.join('\n\t')}\n}`);
     return out.join('\n');
 }
 // A class name used as a value (not new C / C.x / instanceof C / extends C)
@@ -3991,6 +3998,10 @@ function visitNode(node, options = {}) {
         }
         return `${visit(node.expression)}[int(${numericIndex(node.argumentExpression)})]`;
     }
+    else if (isErrorCaptureStackTraceValue(node)) {
+        // (stack traces are the runtime's own: a function that does nothing)
+        return 'func(__args ...interface{}) {}';
+    }
     else if (isPropertyAccessExpression(node)) {
         // an optional interface method read as a value: the method, or undefined
         if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalInterfaceMethodAccess(node)) {
@@ -4957,6 +4968,10 @@ function visitNode(node, options = {}) {
             if (isTypedArrayGoType(inferExpressionType(sourceNode)) && (node.arguments ?? []).length === 1) {
                 return `${visit(sourceNode)}.tnFloats()`;
             }
+            // (a Uint8Array / Buffer: its bytes as numbers)
+            if (inferExpressionType(sourceNode) === '[]byte' && (node.arguments ?? []).length === 1) {
+                return `func() []float64 { __b := ${visit(sourceNode)}; __out := make([]float64, len(__b)); for __i, __v := range __b { __out[__i] = float64(__v) }; return __out }()`;
+            }
             const callbackNode = (node.arguments ?? [])[1];
             const sourceType = inferExpressionType(sourceNode) ?? '';
             const isArrayLikeStruct = sourceType.startsWith('*struct{') && /\blength /.test(sourceType);
@@ -5234,6 +5249,7 @@ function visitNode(node, options = {}) {
             const nodeClassKey = nodeClassKeyOfName(node.right.text);
             const nodeClass = nodeClassKey ? nodeRegistry.classes[nodeClassKey] : undefined;
             if (nodeClass) {
+                useNodeHelperDefining(nodeClass.goType);
                 return `func() bool { _, ok := interface{}(${visit(node.left)}).(${nodeClass.goType}); return ok }()`;
             }
         }
@@ -6942,6 +6958,18 @@ function visitNode(node, options = {}) {
         if (className === 'TnFunction') {
             useHelper('error');
             return `func(__args ...interface{}) interface{} { panic(TnNodeError("TypeError", "", "new Function() is not supported: a native binary cannot evaluate dynamic code")) }`;
+        }
+        // new Proxy(target, handler): not supported natively (see conformance.md);
+        // a program that never runs it still builds (zod's createTransparentProxy)
+        if (className === 'Proxy' && !classNames.has('Proxy')) {
+            useHelper('error');
+            return `func() interface{} { panic(TnNodeError("TypeError", "", "Proxy is not supported in native builds")) }()`;
+        }
+        // const F = Function; new F(""): an eval check (zod's allowsEval) — it
+        // throws, as in a runtime that disallows code generation from strings
+        if (isIdentifier(node.expression) && isFunctionConstructorAlias(node.expression)) {
+            useHelper('error');
+            return `func() interface{} { panic(TnNodeError("EvalError", "", "Code generation from strings disallowed for this context")) }()`;
         }
         if (className === 'Promise') {
             return visitNewPromise(node);
@@ -12824,7 +12852,31 @@ function isFunctionPropertyAccess(node) {
     // (a declared function too, imported through re-exports: traverseFast)
     return !!inferExpressionType(receiver)?.startsWith('func(') || (isIdentifier(receiver) && declaredFunctions.has(receiver.text) && !variableGoTypes.has(receiver.text));
 }
+// A const initialized to the Function constructor (const F = Function)
+function isFunctionConstructorAlias(id) {
+    if (classNames.has(id.text) || importAliases.has('Function'))
+        return false;
+    for (let n = id.parent; n; n = n.parent) {
+        for (const st of n.statements ?? []) {
+            if (st.kind !== 'VariableStatement')
+                continue;
+            for (const d of st.declarationList?.declarations ?? []) {
+                if (isIdentifier(d.name) && d.name.text === id.text && d.initializer && isIdentifier(unwrapParentheses(d.initializer)) && unwrapParentheses(d.initializer).text === 'Function')
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+// Error.captureStackTrace read as a value (zod's `"captureStackTrace" in
+// Error ? Error.captureStackTrace : …`), not called
+function isErrorCaptureStackTraceValue(node) {
+    return isPropertyAccessExpression(node) && isIdentifier(node.expression) && node.expression.text === 'Error' && isIdentifier(node.name) &&
+        node.name.text === 'captureStackTrace' && !classNames.has('Error') && !isCallee(node);
+}
 function inferExpressionTypeOf(expr) {
+    if (isErrorCaptureStackTraceValue(expr))
+        return 'func(...interface{})';
     if (expr?.kind === 'TnArrayItems')
         return '[]interface{}';
     // a class as a value (let cls = Parser): its class descriptor
@@ -13025,6 +13077,12 @@ function inferExpressionTypeOf(expr) {
         return recordSpreadType(expr) ?? getObjectLiteralGoType(expr);
     // new f(…) where f holds a constructor function: its result
     if (isNewExpression(expr) && !(isIdentifier(expr.expression) && classNames.has(expr.expression.text))) {
+        // (new inst._zod.constr(…) on a type parameter's value: read and
+        // constructed dynamically, an any instance)
+        for (let e = expr.expression; isPropertyAccessExpression(e); e = e.expression) {
+            if (hasDynamicProperties(e.expression))
+                return 'interface{}';
+        }
         const ctorType = expr.expression.kind === 'ThisKeyword' ? '' : (inferExpressionType(expr.expression) ?? '');
         if (ctorType.startsWith('func('))
             return goFuncReturnType(ctorType) ?? 'interface{}';
@@ -13283,6 +13341,9 @@ function inferExpressionTypeOf(expr) {
             const result = goFuncReturnType(functionValueGoType(callback) ?? '');
             return result && (sourceType.startsWith('[]') || sourceType.startsWith('*TnMap[') || sourceType === 'string') ? `[]${result}` : '[]interface{}';
         }
+        // (a Uint8Array's bytes: numbers)
+        if (sourceType === '[]byte')
+            return '[]float64';
         if (sourceType.startsWith('[]') && !arraySubclassOf(source))
             return sourceType;
         if (isTypedArrayGoType(sourceType))
@@ -13625,6 +13686,9 @@ function inferExpressionTypeOf(expr) {
                 const initial = expr.arguments?.[1] ? unwrapParentheses(expr.arguments[1]) : undefined;
                 if (initial && isObjectLiteralExpression(initial) && elementType.startsWith('*') && isStructGoType(elementType.slice(1)) && !classNames.has(elementType.slice(1)))
                     return elementType;
+                // (over any elements: any, as emitted)
+                if (initial && isObjectLiteralExpression(initial) && elementType === 'interface{}')
+                    return 'interface{}';
                 return (expr.arguments?.[1] ? inferExpressionType(expr.arguments[1]) : undefined) ?? elementType;
             }
             if (methodName === 'flat' && elementType.startsWith('[]'))
@@ -14034,8 +14098,15 @@ function visitObjectCall(node) {
             return `TnClassOf(${visit(args[0])})`;
         if (name === 'getOwnPropertyDescriptors')
             return `TnOwnPropertyDescriptors(${visit(args[0])})`;
-        if (name === 'defineProperties')
-            return `TnDefineProperties(${visit(args[0])}, ${visit(args[1])})`;
+        if (name === 'defineProperties') {
+            // (an object literal target is a dynamic object: properties are added
+            // to it; as a value, the call is the object)
+            const target = isObjectLiteralExpression(unwrapParentheses(args[0])) ? toGoValueOfType(args[0], 'interface{}') : visit(args[0]);
+            if (isDiscardedValue(node))
+                return `TnDefineProperties(${target}, ${visit(args[1])})`;
+            const targetType = isObjectLiteralExpression(unwrapParentheses(args[0])) ? 'interface{}' : inferExpressionType(args[0]) || 'interface{}';
+            return `func() ${targetType} { __o := ${target}; TnDefineProperties(__o, ${visit(args[1])}); return __o }()`;
+        }
         return `TnObjectCreate(${visit(args[0])}, ${args[1] ? visit(args[1]) : 'nil'})`;
     }
     if (name === 'defineProperty') {
@@ -15227,6 +15298,12 @@ function inferArrayCallbackReturnType(callback, elementType, fallbackType) {
         const inferred = withFunctionScopeTypes(callback, () => {
             if (paramName)
                 variableGoTypes.set(paramName, elementType);
+            // (([k, v]) => v over [key, value] pairs: each binding an element)
+            if (param && isArrayBindingPattern(param.name) && elementType.startsWith('[]')) {
+                for (const el of param.name.elements ?? [])
+                    if (!isOmittedExpression(el) && isIdentifier(el.name) && !el.dotDotDotToken)
+                        variableGoTypes.set(el.name.text, elementType.slice(2));
+            }
             return (isBlock(callback.body) ? inferFunctionBodyReturnType(callback) : inferExpressionType(callback.body)) ?? '';
         });
         return inferred || fallbackType;
@@ -16307,6 +16384,15 @@ function getType(typeNode, getArrayType = false) {
         if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
             return getType(typeNode.typeArguments[0], getArrayType);
         }
+        // InstanceType<typeof C>: C's instances (Uint8Array: a []byte)
+        if (name === 'InstanceType' && !declaredTypeAliases.has(name) && (typeNode.typeArguments ?? []).length === 1) {
+            const query = typeNode.typeArguments[0];
+            if (query?.kind === 'TypeQuery' && isIdentifier(query.exprName)) {
+                const instance = getType({ kind: 'TypeReference', typeName: query.exprName, parent: typeNode }, getArrayType);
+                if (instance && instance !== ':')
+                    return instance;
+            }
+        }
         if ((name === 'Exclude' || name === 'Extract') && (typeNode.typeArguments ?? []).length === 2 && !declaredTypeAliases.has(name)) {
             const filtered = filteredUnionType(typeNode, 0);
             return filtered.kind === 'NeverKeyword' ? 'interface{}' : getType(filtered, getArrayType);
@@ -16704,7 +16790,9 @@ const callHandlers = {
     },
     'Number.parseInt': (_caller, args) => {
         useHelper('dynamic');
-        return `TnParseInt(${args[0]}, ${args[1] ?? '10'})`;
+        // (the string of a non-string value, as JS converts it)
+        const str = currentCallArgTypes[0] === 'string' ? args[0] : jsStringOf(args[0], currentCallArgTypes[0]);
+        return `TnParseInt(${str}, ${args[1] ?? '10'})`;
     },
     'Number.parseFloat': (_caller, args) => {
         useHelper('dynamic');
@@ -16865,7 +16953,9 @@ const callHandlers = {
     },
     parseInt: (_caller, args) => {
         useHelper('dynamic');
-        return `TnParseInt(${args[0]}, ${args[1] ?? '10'})`;
+        // (the string of a non-string value, as JS converts it)
+        const str = currentCallArgTypes[0] === 'string' ? args[0] : jsStringOf(args[0], currentCallArgTypes[0]);
+        return `TnParseInt(${str}, ${args[1] ?? '10'})`;
     },
     parseFloat: (_caller, args) => {
         useHelper('dynamic');
@@ -17949,6 +18039,10 @@ function visitTypeOf(node) {
         return toGoStringLiteral('undefined');
     if (isIdentifier(operand) && ownEntry(GLOBAL_TYPEOF, operand.text) && !variableGoTypes.has(operand.text) && !classNames.has(operand.text)) {
         return toGoStringLiteral(GLOBAL_TYPEOF[operand.text]);
+    }
+    // (a Node global class — File, Blob, URL —: a constructor)
+    if (isIdentifier(operand) && !variableGoTypes.has(operand.text) && !classNames.has(operand.text) && !isLocallyBound(operand) && nodeRegistry.globals[operand.text] && nodeRegistry.classes[nodeRegistry.globals[operand.text]]) {
+        return toGoStringLiteral('function');
     }
     const goType = inferExpressionType(node.expression);
     const known = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined' };
@@ -20718,6 +20812,20 @@ function getFunctionParametersInfo(parameters) {
         signature: signatureParts.join(', '),
         prefixBlockContent: prefixBlockContent + destructuring
     };
+}
+// Includes the Node helper whose source declares a Go type (*TnBlob: the
+// web-streams helper), for code naming the type without calling into it
+function useNodeHelperDefining(goType) {
+    const name = goType.replace(/^\*/, '');
+    if (!/^\w+$/.test(name))
+        return;
+    const declaration = new RegExp(`^type ${name}\\b`, 'm');
+    for (const id of Object.keys(nodeRegistry.goHelpers)) {
+        if (declaration.test(nodeRegistry.goHelpers[id])) {
+            useHelper(id);
+            return;
+        }
+    }
 }
 // Go packages the generated code may import: a user identifier with one of
 // these names would shadow the package, so it is renamed (unless the name is
