@@ -7529,6 +7529,9 @@ function toGoValueOfType(expr, goType) {
         const signature = getCalleeSignature(unwrapParentheses(expr));
         if (signature?.type?.kind === 'NeverKeyword')
             return `func() ${goType} { ${visit(expr)}; panic("unreachable") }()`;
+        // (a call returning nothing — abort(), typed never — as a value: it runs, undefined)
+        if (emitsNoValue(expr))
+            return `func() ${goType} { ${visit(expr)}; return *new(${goType}) }()`;
     }
     // (an any value into a method interface's slot — a Stack<T> union of
     // classes returned as the StackInterface it conforms to —: asserted)
@@ -12582,7 +12585,8 @@ function fallbackReturn(block) {
         goType = goCallbackResultType(fn) ?? inferFunctionBodyReturnType(fn) ?? '';
     }
     else if (isGetAccessor(fn)) {
-        goType = fn.type ? getType(fn.type) : 'interface{}';
+        // (as emitAccessor declares it)
+        goType = fn.type ? getType(fn.type) : methodReturnGoType(fn) || 'interface{}';
     }
     if (!goType)
         return '';
@@ -14503,6 +14507,10 @@ function toGoCondition(expr) {
     // an array reference (*[]T): set unless nil (an array is always truthy)
     if (isIdentifier(expr) && referenceArrays.has(expr.text))
         return `${getSafeName(expr.text)} != nil`;
+    // (a call returning nothing — abort() of a tryParse callback —: it runs,
+    // and is undefined: false)
+    if (isCallExpression(unwrapParentheses(expr)) && emitsNoValue(expr))
+        return `func() bool { ${visit(expr, { inline: true })}; return false }()`;
     return truthinessCheck(visit(expr, { inline: true }), inferExpressionType(expr));
 }
 // Whether every case of a switch is a distinct, non-empty string literal
@@ -14614,6 +14622,9 @@ function isLogicalValueExpression(expr) {
         return !!rightType && rightType !== 'bool' && rightType !== ':';
     if (expr.operatorToken.kind !== 'BarBarToken')
         return false;
+    // (f() || abort(): f()'s value, else the call runs — undefined)
+    if (!!leftType && leftType !== 'bool' && emitsNoValue(expr.right))
+        return true;
     return !!leftType && leftType !== 'bool' && !!rightType && rightType !== 'bool';
 }
 function isEmptyObjectOrArrayLiteral(n) {
@@ -14627,7 +14638,7 @@ function getLogicalValueType(expr) {
     if (expr.operatorToken.kind === 'AmpersandAmpersandToken') {
         return leftType === rightType ? leftType : 'interface{}';
     }
-    if (rightType === 'nil')
+    if (rightType === 'nil' || emitsNoValue(expr.right))
         return makeNullableType(leftType);
     if (leftType.startsWith('*') && rightType === leftType.slice(1))
         return rightType;
@@ -20562,6 +20573,17 @@ function getCollectionArgumentTypes(node) {
 // parameters are passed as zero values (nil for pointers)
 // A call to a function that returns nothing (declared `void`, or a declared
 // function without a value-returning `return`)
+// A call whose Go form returns nothing: a void function, or a function
+// value of a result-less func type (abort: (node?) => never)
+function emitsNoValue(expr) {
+    const call = unwrapParentheses(expr);
+    if (!isCallExpression(call))
+        return false;
+    if (isVoidCall(call) || inferExpressionType(call) === '')
+        return true;
+    const calleeType = functionValueGoType(call.expression) ?? '';
+    return calleeType.startsWith('func(') && !goFuncReturnType(calleeType);
+}
 function isVoidCall(expr) {
     expr = unwrapParentheses(expr);
     if (!isCallExpression(expr))
@@ -21108,9 +21130,11 @@ function getFunctionParametersInfo(parameters) {
         const paramType = getParameterGoType(param);
         // Array-reference parameters need the default boxed to *[]T (an
         // optional parameter's default is undefined)
+        // (a default of another Go type — this.startNode() for a typed node —
+        // converted to the parameter's)
         const defaultValue = !param.initializer
             ? `*new(${paramType})`
-            : paramType.startsWith('*[]')
+            : paramType.startsWith('*[]') || (paramType !== 'interface{}' && inferExpressionType(param.initializer) === 'interface{}')
                 ? toGoValueOfType(param.initializer, paramType)
                 : visit(param.initializer);
         // a missing or undefined argument takes the default; others convert
