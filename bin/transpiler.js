@@ -753,6 +753,7 @@ function parseAndLower(code) {
     lowerDestructuringForHeaders(sourceFile);
     lowerNestedDestructuring(sourceFile);
     lowerBuiltinMemberAliases(sourceFile);
+    lowerShadowedAccessors(sourceFile);
     lowerTopLevelDestructuring(sourceFile);
     lowerPrototypeCalls(sourceFile);
     lowerArraySpreadCalls(sourceFile);
@@ -2046,6 +2047,55 @@ function lowerArrayIntersectionAliases(sourceFile) {
 // const { a, b: c = d } = expr / const [x, y] = expr at a module's top level:
 // const __tlN = expr, then one declaration per name (package variables the
 // module's functions read)
+// A class whose constructor defines own data properties on the instance
+// (Object.defineProperties(this, { references: { value: … } }), Babel 7
+// shadowing its Babel 8 getters that throw): those names are plain fields
+// (any values) — an own property shadows the prototype's accessor —, and
+// the accessors go
+function lowerShadowedAccessors(node) {
+    for (const child of childNodes(node))
+        lowerShadowedAccessors(child);
+    if (node.kind !== 'ClassDeclaration' && node.kind !== 'ClassExpression')
+        return;
+    const ctor = (node.members ?? []).find((m) => m.kind === 'Constructor' && m.body);
+    if (!ctor)
+        return;
+    const names = new Set();
+    const scan = (n) => {
+        if (!n || FUNCTION_LIKE_KINDS.has(n.kind))
+            return;
+        if (n.kind === 'CallExpression' && n.expression?.kind === 'PropertyAccessExpression' && isIdentifier(n.expression.expression) && n.expression.expression.text === 'Object') {
+            const method = n.expression.name?.text;
+            const [target, a1, a2] = n.arguments ?? [];
+            if (target?.kind === 'ThisKeyword' && method === 'defineProperties' && a1?.kind === 'ObjectLiteralExpression') {
+                for (const p of a1.properties ?? []) {
+                    const hasValue = p.kind === 'PropertyAssignment' && p.initializer?.kind === 'ObjectLiteralExpression' &&
+                        (p.initializer.properties ?? []).some((q) => isIdentifier(q.name) && q.name.text === 'value');
+                    if (hasValue && (isIdentifier(p.name) || isStringLiteral(p.name)))
+                        names.add(p.name.text);
+                }
+            }
+            if (target?.kind === 'ThisKeyword' && method === 'defineProperty' && a1 && isStringLiteral(a1) && a2?.kind === 'ObjectLiteralExpression' &&
+                (a2.properties ?? []).some((q) => isIdentifier(q.name) && q.name.text === 'value'))
+                names.add(a1.text);
+        }
+        for (const c of childNodes(n))
+            scan(c);
+    };
+    for (const st of ctor.body.statements ?? [])
+        scan(st);
+    const accessorNames = new Set((node.members ?? []).filter((m) => (m.kind === 'GetAccessor' || m.kind === 'SetAccessor') && isIdentifier(m.name) && !hasModifier(m, 'StaticKeyword')).map((m) => m.name.text));
+    const shadowed = [...names].filter((n) => accessorNames.has(n));
+    if (shadowed.length === 0)
+        return;
+    node.members = (node.members ?? []).filter((m) => !((m.kind === 'GetAccessor' || m.kind === 'SetAccessor') && isIdentifier(m.name) && shadowed.includes(m.name.text) && !hasModifier(m, 'StaticKeyword')));
+    const at = { line: node.line, column: node.column };
+    for (const name of shadowed) {
+        if ((node.members ?? []).some((m) => m.kind === 'PropertyDeclaration' && isIdentifier(m.name) && m.name.text === name))
+            continue;
+        node.members.unshift({ kind: 'PropertyDeclaration', name: { kind: 'Identifier', text: name, ...at }, type: { kind: 'AnyKeyword', ...at }, ...at });
+    }
+}
 // const { defineProperty } = Object / const { floor } = Math at the top
 // level: each use of the name is the member itself (Object.defineProperty),
 // as the built-in's functions have no Go value of their own
@@ -2755,6 +2805,33 @@ function lowerClassExpressions(node) {
         const initializer = declarations.length === 1 ? declarations[0].initializer : undefined;
         if (initializer?.kind !== 'ClassExpression' || !isIdentifier(declarations[0].name))
             return statement;
+        // (const NodePath_Final = class NodePath { … new NodePath(…) … }: the
+        // class's own name inside it is the declared one)
+        const ownName = isIdentifier(initializer.name) ? initializer.name.text : undefined;
+        const declaredName = declarations[0].name.text;
+        if (ownName && ownName !== declaredName) {
+            const rename = (n, parent, key) => {
+                if (isIdentifier(n)) {
+                    const isMemberName = parent && key === 'name' && ['PropertyAccessExpression', 'PropertyAssignment', 'MethodDeclaration', 'PropertyDeclaration', 'GetAccessor', 'SetAccessor', 'PropertySignature', 'MethodSignature'].includes(parent.kind);
+                    if (n.text === ownName && !isMemberName && key !== 'propertyName')
+                        n.text = declaredName;
+                    return;
+                }
+                for (const k of Object.keys(n)) {
+                    if (k === 'parent' || (n === initializer && k === 'name'))
+                        continue;
+                    const v = n[k];
+                    if (Array.isArray(v))
+                        for (const c of v) {
+                            if (c && typeof c.kind === 'string')
+                                rename(c, n, k);
+                        }
+                    else if (v && typeof v.kind === 'string')
+                        rename(v, n, k);
+                }
+            };
+            rename(initializer, undefined, '');
+        }
         return { ...initializer, kind: 'ClassDeclaration', name: declarations[0].name, modifiers: statement.modifiers };
     });
 }
@@ -6790,7 +6867,7 @@ function visitNode(node, options = {}) {
                     }
                     let methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
                     if (usesArgumentsObject(member))
-                        methodParameterInfo = withArgumentsObject(member, methodParameterInfo, false);
+                        methodParameterInfo = withArgumentsObject(member, methodParameterInfo, methodTakesExtraArguments(member));
                     // `return this` in an unannotated ancestor method returns the subclass here
                     // (the interface's return wins for the signature, as in the ancestor's own)
                     let inheritedReturnType = interfaceConformedReturnType(member) ?? methodReturnGoType(member);
@@ -6842,7 +6919,7 @@ function visitNode(node, options = {}) {
                 const methodName = visit(member.name);
                 let methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
                 if (usesArgumentsObject(member))
-                    methodParameterInfo = withArgumentsObject(member, methodParameterInfo, false);
+                    methodParameterInfo = withArgumentsObject(member, methodParameterInfo, methodTakesExtraArguments(member));
                 // the interface's return type wins for the SIGNATURE (Go converts a
                 // concrete result implicitly); inference keeps the declared one
                 const ownReturnType = interfaceConformedReturnType(member) ?? methodReturnGoType(member);
@@ -19318,8 +19395,12 @@ function collectClassImplementedInterfaces() {
 function isUndeclaredClassMember(access) {
     if (!isPropertyAccessExpression(access) || hasQuestionDot(access) || access.name?.kind === 'PrivateIdentifier')
         return false;
-    if (access.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(access.expression))
-        return false;
+    // (this.isScope() in a class whose prototype gets methods assigned —
+    // Object.assign(NodePath.prototype, validators) —: called by name)
+    if (access.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(access.expression)) {
+        const className = getEnclosingClassName(access);
+        return !!className && isCallee(access) && classNames.has(className) && !classHasMember(className, memberKey(access.name) ?? '') && !findClassMethod(className, memberKey(access.name) ?? '');
+    }
     if (access.expression.kind === 'SuperKeyword')
         return false;
     const receiverType = inferExpressionType(access.expression) ?? '';
@@ -20486,6 +20567,13 @@ function visitCallArguments(node) {
         const paramTypes = goFuncParamTypes(getType(fn));
         if (!paramTypes.some((t) => t.startsWith('...'))) {
             const converted = args.map((arg, index) => paramTypes[index] && !isSpreadElement(arg) ? toGoValueOfType(arg, paramTypes[index]) : visit(arg));
+            // (extra arguments, JS ignores: evaluated, not passed)
+            if (converted.length > paramTypes.length && !args.some((a) => isSpreadElement(a))) {
+                const dropped = converted.splice(paramTypes.length);
+                if (paramTypes.length > 0 && dropped.some((d) => !/^[\w.]+$/.test(d))) {
+                    converted[paramTypes.length - 1] = `func() ${paramTypes[paramTypes.length - 1]} { __v := ${converted[paramTypes.length - 1]}; ${dropped.map((d) => `_ = ${d}`).join('; ')}; return __v }()`;
+                }
+            }
             // omitted optional parameters are zero values (nil for pointers)
             const fnParams = fn.parameters ?? [];
             for (let i = args.length; i < fnParams.length && i < paramTypes.length; i++) {
@@ -20620,6 +20708,18 @@ function visitCallArguments(node) {
             break;
         result.push(`*new(${getParameterGoType(param)})`);
     }
+    // (extra arguments for a fixed signature — renamer.rename(arguments[2])
+    // under @ts-ignore —: JS ignores them, after evaluating them)
+    if (result.length > params.length && !restParam && !params.some((p) => p.initializer) && !args.some((a) => isSpreadElement(a)) &&
+        FUNCTION_LIKE_KINDS.has(fn.kind) && fn.body && !usesArgumentsObject(fn) && (isMethodDeclaration(fn) || isFunctionDeclaration(fn))) {
+        const dropped = result.splice(params.length);
+        if (dropped.some((d) => !/^[\w.]+$/.test(d))) {
+            // (kept for their side effects)
+            const evaluated = dropped.map((d) => `_ = ${d}`).join('; ');
+            if (params.length > 0)
+                result[params.length - 1] = `func() ${getParameterGoType(params[params.length - 1])} { __v := ${result[params.length - 1]}; ${evaluated}; return __v }()`;
+        }
+    }
     // (the method's Go signature pads what an implemented interface declares)
     if (isMethodDeclaration(fn) && result.length === params.length && !args.some((a) => isSpreadElement(a))) {
         for (const extra of interfaceExtraParamDecls(getEnclosingClassName(fn) ?? '', fn))
@@ -20706,6 +20806,27 @@ function withContextualParameters(fn, info) {
         .map((p) => `_ ${p.dotDotDotToken ? '...' : ''}${p.type ? (p.questionToken && !p.dotDotDotToken ? makeNullableType(getType(p.type)) : getType(p.type)) : 'interface{}'}`);
     const signature = [info.signature, ...extra].filter((part) => part).join(', ');
     return { ...info, signature };
+}
+// A method reading `arguments` whose signature nothing else fixes — no
+// interface it implements, no ancestor or subclass declaring it — takes
+// extra arguments too (Renamer#rename reads arguments[0], Babel 7)
+function methodTakesExtraArguments(member) {
+    if (!isMethodDeclaration(member) || hasModifier(member, 'StaticKeyword'))
+        return false;
+    const className = getEnclosingClassName(member);
+    const name = memberKey(member.name);
+    if (!className || !name || implementedInterfacesOf(className).length > 0)
+        return false;
+    const parent = classParentNames.get(className);
+    if (parent && findClassMethod(parent, name))
+        return false;
+    for (const [sub, base] of classParentNames) {
+        if (base !== className)
+            continue;
+        if ((declaredClasses.get(sub)?.members ?? []).some((m) => m.name && memberKey(m.name) === name))
+            return false;
+    }
+    return true;
 }
 // `arguments` in a function: a []interface{} of the arguments passed (a
 // method's signature stays as declared: no extra arguments)
@@ -21853,7 +21974,8 @@ function namespaceValueEntries(key, seen = new Set()) {
             const fn = declaredFunctions.get(goName);
             if (fn && getTypeParameters(fn.typeParameters, fn) !== '')
                 continue;
-            out.set(name, goName);
+            // (as the declaration is named in Go: clear → clear_…, beside the builtin)
+            out.set(name, getSafeName(goName));
         }
     }
     for (const [name, forward] of mod.forwards) {
