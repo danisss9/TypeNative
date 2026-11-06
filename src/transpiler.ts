@@ -4102,6 +4102,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       return `${leftSide}.${rightSide}`;
     }
+    // err.framesToPop: an Error's own property (an expando), read by name
+    if (!isCallee(node) && !isAssignmentTarget(node) && isUndeclaredErrorMember(node)) {
+      useHelper('dynamic');
+      return `TnGet(${leftSide}, ${toGoStringLiteral(node.name.text)})`;
+    }
     // x.f on a class instance whose class has no member f (read in a branch
     // TypeScript narrowed to another class, which never runs for it): by name
     if (!isCallee(node) && !isAssignmentTarget(node) && leftGoType?.startsWith('*') && (node.expression.kind !== 'ThisKeyword' || !!plainFunctionOfThis(node.expression)) &&
@@ -5432,6 +5437,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `TnSetIndex(${visit(base)}, ${visit(node.left.argumentExpression)}, ${visit(node.right)})`;
       }
     }
+    // (err.name = … / err.framesToPop = …: an Error's own properties)
+    if (op === '=' && isPropertyAccessExpression(node.left) && isIdentifier(node.left.name) && (isUndeclaredErrorMember(node.left) ||
+      (node.left.name.text === 'name' && inferExpressionType(node.left.expression) === '*TnError'))) {
+      useHelper('dynamic');
+      return `TnSet(${visit(node.left.expression)}, ${toGoStringLiteral(node.left.name.text)}, ${toGoValueOfType(node.right, 'interface{}')})`;
+    }
     if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
       useHelper('dynamic');
       return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'interface{}')})`;
@@ -5919,9 +5930,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // without the narrowing in effect here)
     // (a method conformed to an implemented interface's return: that type)
     const conformedReturn = enclosingFn && !isAsync && isMethodDeclaration(enclosingFn) ? interfaceConformedReturnType(enclosingFn) : undefined;
-    const returnGoType = conformedReturn && conformedReturn !== 'interface{}'
+    let returnGoType = conformedReturn && conformedReturn !== 'interface{}'
       ? conformedReturn
       : enclosingFn && !isAsync ? withoutNarrowing(() => inferFunctionBodyReturnType(enclosingFn)) : undefined;
+    // (an arrow held in a variable — jsesc, recursive —: the result of the
+    // signature it was declared with)
+    if (returnGoType === 'interface{}' && enclosingFn && !isAsync && !enclosingFn.type && (isArrowFunction(enclosingFn) || isFunctionExpression(enclosingFn)) &&
+      enclosingFn.parent?.kind === 'VariableDeclaration' && isIdentifier(enclosingFn.parent.name)) {
+      const declaredName = enclosingFn.parent.name.text;
+      const declared = goFuncReturnType(topLevelGoTypes.get(declaredName) ?? variableGoTypes.get(declaredName) ?? '');
+      if (declared && declared !== 'interface{}') returnGoType = declared;
+    }
     // `return value` in a function typed to return nothing (a callback whose
     // type says void): the value is evaluated, nothing is returned
     if (node.expression && returnGoType === '' && enclosingFn && !enclosingFn.asteriskToken && goCallbackResultType(enclosingFn) === undefined && !(tryReturn && enclosingFn === tryReturn.fn)) {
@@ -9494,6 +9513,16 @@ function visitIncrementOrDecrement(node: AstNode, isPrefix: boolean): string {
     const result = isPrefix ? `${arr}.Get(${index})` : old;
     return `func() float64 { ${arr}, ${index} := ${visit(node.operand.expression)}, ${visit(node.operand.argumentExpression)}; ${old} := ${arr}.Get(${index}); ${arr}.Set(${index}, ${old} ${sign} 1); return ${result} }()`;
   }
+  // (++o.n / o[k]++ on an any object: read, written back through TnSet)
+  const operand = unwrapParentheses(node.operand);
+  if ((isPropertyAccessExpression(operand) || isElementAccessExpression(operand)) && isDynamicValue(operand.expression)) {
+    useHelper('dynamic');
+    const sign = node.operator === 'PlusPlusToken' ? '+' : '-';
+    const key = isPropertyAccessExpression(operand) ? toGoStringLiteral(operand.name.text) : visit(operand.argumentExpression);
+    const read = isPropertyAccessExpression(operand) ? `TnGet(__o, ${key})` : `TnIndex(__o, __k)`;
+    const write = isPropertyAccessExpression(operand) ? `TnSet(__o, ${key}, __new)` : `TnSetIndex(__o, __k, __new)`;
+    return `func() float64 { __o := ${visit(operand.expression)}; __k := ${isPropertyAccessExpression(operand) ? '0' : key}; _ = __k; __old := TnNumber(${read}); __new := __old ${sign} 1; ${write}; return ${isPrefix ? '__new' : '__old'} }()`;
+  }
   const target = visit(node.operand, { inline: true });
   const op = node.operator === 'PlusPlusToken' ? '++' : '--';
   const parent = node.parent;
@@ -12863,6 +12892,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
   // (m?.size: a number, or undefined)
   if (isPropertyAccessExpression(expr) && expr.name.text === 'size' && hasQuestionDot(expr) && (inferExpressionType(expr.expression) ?? '').startsWith('*TnMap[')) return '*float64';
+  if (isPropertyAccessExpression(expr) && !isCallee(expr) && isUndeclaredErrorMember(expr)) return 'interface{}';
   // (a member the receiver's class lacks: read by name, see the emitter)
   if (isPropertyAccessExpression(expr) && !isCallee(expr) && (expr.expression.kind !== 'ThisKeyword' || !!plainFunctionOfThis(expr.expression))) {
     const receiverType = inferExpressionType(expr.expression) ?? '';
@@ -17774,7 +17804,11 @@ function visitRegexReplace(node: AstNode): string | undefined {
       })
       .filter((a: string) => a)
       .join(', ');
-    const fn = `func(__m []string, __at int) string { return (${callback})(${groupArgs}) }`;
+    // (a callback whose result isn't a string — an any value —: String()ed)
+    const callbackResult = goFuncReturnType(inferExpressionType(replacement) ?? '') ?? 'string';
+    const called = `(${callback})(${groupArgs})`;
+    if (callbackResult !== 'string') useHelper('dynamic');
+    const fn = `func(__m []string, __at int) string { return ${callbackResult === 'string' ? called : `TnJSString(${called})`} }`;
     const subject = groupArgs.includes('__s') ? `func() string { __s := ${target}; return ${reIsWrapper ? 'TnRegexReplaceFuncW' : 'TnRegexReplaceFunc'}(${re}, __s, ${fn}, ${isGlobal}) }()` : '';
     if (reIsWrapper) useHelper('fancyRegex');
     if (subject) return subject;
@@ -18552,6 +18586,15 @@ function isUndeclaredClassMember(access: AstNode): boolean {
   if (access.expression.kind === 'SuperKeyword') return false;
   const receiverType = inferExpressionType(access.expression) ?? '';
   return receiverType.startsWith('*') && classNames.has(receiverType.slice(1)) && !classHasMember(receiverType.slice(1), memberKey(access.name) ?? '');
+}
+
+// err.x on an Error value (*TnError) where x is none of its members: an own
+// property set on it (error.framesToPop = 1, error.missingPlugins)
+function isUndeclaredErrorMember(access: AstNode): boolean {
+  if (!isPropertyAccessExpression(access) || hasQuestionDot(access) || !isIdentifier(access.name)) return false;
+  if (inferExpressionType(access.expression) !== '*TnError') return false;
+  const name: string = access.name.text;
+  return !(classPropertyTypes.get('TnError')?.has(name) || classMethodReturnTypes.get('TnError')?.has(name) || ['message', 'name', 'stack', 'toString', 'cause'].includes(name));
 }
 
 function classHasMember(className: string, member: string): boolean {
@@ -24006,7 +24049,7 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		return
 	}
 	// (an error's own property: error.missingPlugins = …, read back by prop)
-	if e, ok := obj.(*TnError); ok && e != nil && key != "message" && key != "name" && key != "stack" {
+	if e, ok := obj.(*TnError); ok && e != nil && key != "message" && key != "stack" {
 		if e.props == nil {
 			e.props = map[string]interface{}{}
 		}
