@@ -5257,7 +5257,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const plain: AstNode = { kind: 'BinaryExpression', left: node.left, operatorToken: operator, right: node.right, parent: node.parent };
       const statement: AstNode = { kind: 'ExpressionStatement', expression: plain, parent: node.parent };
       plain.parent = statement;
-      return `if ${test} { ${visit(plain).trim()} }`;
+      // (the target is the plain assignment's while it is written: an array
+      // field's reference, not its array)
+      const savedParent = node.left.parent;
+      node.left.parent = plain;
+      const write = visit(plain).trim();
+      node.left.parent = savedParent;
+      return `if ${test} { ${write} }`;
     }
     let op = operatorTokenText(node.operatorToken);
     if (op === '===') op = '==';
@@ -7503,6 +7509,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       ((unwrappedExpr.parameters ?? []).length < goFuncParamTypes(goType).length && !getContextualFunctionType(unwrappedExpr))) ||
     // (function(...args) where fixed parameters are expected: adapted)
     (unwrappedExpr.parameters ?? []).some((p: AstNode) => !!p.dotDotDotToken) && !goFuncParamTypes(goType).some((t: string) => t.startsWith('...')) ||
+    // ((node = null) => … — emitted variadic for its default — where fixed parameters are expected)
+    (unwrappedExpr.parameters ?? []).some((p: AstNode) => !!p.initializer) && !takesEveryParameter(unwrappedExpr.parameters ?? []) && !goFuncParamTypes(goType).some((t: string) => t.startsWith('...')) ||
     // (function (node: t.MemberExpression, key, val) where the slot's node
     // is any value: adapted, the annotation narrowing the argument)
     (unwrappedExpr.parameters ?? []).some((p: AstNode, i: number) => !!p.type && !p.dotDotDotToken && !!goFuncParamTypes(goType ?? "")[i] && getParameterGoType(p) !== goFuncParamTypes(goType ?? "")[i]));
@@ -15109,14 +15117,20 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
     const callback = (node.arguments ?? [])[0];
     if (!callback) return undefined;
     const keyType = extractMapKeyType(ownerType);
-    const valueType = extractMapValueType(ownerType);
+    const heldType = extractMapValueType(ownerType);
+    // (arrays held by reference: the array, for a callback taking one — a
+    // function value typed (a: [E, P]) => void —; a literal takes the reference)
+    const callbackParams = goFuncParamTypes(functionValueGoType(callback) ?? '');
+    const valueType = heldType.startsWith('*[]') && callbackParams[0] === heldType.slice(1) && !(isArrowFunction(callback) || isFunctionExpression(callback)) ? heldType.slice(1) : heldType;
     const info = buildArrayCallbackInfo(callback, valueType, '', [
       valueType === 'struct{}' ? keyType : valueType,
       keyType
     ]);
     const key = getTempName('key');
     const value = getTempName('value');
-    const args = [valueType === 'struct{}' ? key : value, key].slice(0, info.paramCount).join(', ');
+    if (heldType !== valueType) useHelper('dynamic');
+    const valueArg = heldType !== valueType ? `TnDerefSlice(${value})` : value;
+    const args = [valueType === 'struct{}' ? key : valueArg, key].slice(0, info.paramCount).join(', ');
     return `func() { for ${key}, ${value} := range ${arrayExpr}.All() { _, _ = ${key}, ${value}; (${info.fnExpr})(${args}) } }()`;
   }
 
@@ -19807,6 +19821,12 @@ function getCalleeSignature(call: AstNode): AstNode | undefined {
       receiverClass = systemBase;
       method = findClassMethod(systemBase, call.expression.name.text);
       for (const [m, b] of mixinBaseOf) if (!method && b === systemBase) method = findClassMethod(m, call.expression.name.text);
+    }
+    // (this.m(…) in a method declaring this: Parser — m a subclass's —: Parser's m)
+    if (!method && call.expression.expression.kind === 'ThisKeyword') {
+      const enclosing = getEnclosingFunction(call);
+      const declaredThis = enclosing?.tnThisType && isTypeReferenceNode(enclosing.tnThisType) && isIdentifier(enclosing.tnThisType.typeName) ? enclosing.tnThisType.typeName.text : '';
+      if (declaredThis && classNames.has(declaredThis)) method = findClassMethod(declaredThis, call.expression.name.text);
     }
     // (an abstract method declares the parameters its implementations take)
     if (method?.body || (method && (method.modifiers ?? []).some((m: AstNode) => m.kind === 'AbstractKeyword'))) return method;
