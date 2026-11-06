@@ -9045,12 +9045,38 @@ function interfaceExtraParamDeclsOnly(className: string, member: AstNode): strin
 function mixinVirtualSignature(base: string, name: string): MethodSignature | undefined {
   const own = classMethodSignatures.get(base)?.get(name);
   if (own) return own;
+  let first: MethodSignature | undefined;
   for (const [m, b] of mixinBaseOf) {
     if (b !== base) continue;
     const sig = classMethodSignatures.get(m)?.get(name);
-    if (sig) return sig;
+    if (sig && !first) first = sig;
   }
-  return undefined;
+  return first ? widenedMixinSignature(base, name, first) : undefined;
+}
+
+// A method only mixins define, typed differently by each (typeCastToParameter
+// of a TsTypeCastExpression in one, a TypeCastExpression in another): the
+// parameters they disagree on are any values in the __VT signature
+function widenedMixinSignature(base: string, name: string, sig: MethodSignature): MethodSignature {
+  const params = splitGoParameters(sig.params);
+  const types = params.map((p) => p.trim().slice(p.trim().indexOf(' ') + 1));
+  let changed = false;
+  for (const [m, b] of mixinBaseOf) {
+    if (b !== base) continue;
+    const other = classMethodSignatures.get(m)?.get(name);
+    if (!other) continue;
+    const otherTypes = splitGoParameters(other.params).map((p) => p.trim().slice(p.trim().indexOf(' ') + 1));
+    if (otherTypes.length !== types.length) continue;
+    types.forEach((t, i) => {
+      if (t !== otherTypes[i] && !t.startsWith('...') && !otherTypes[i].startsWith('...') && t !== 'interface{}') {
+        types[i] = 'interface{}';
+        changed = true;
+      }
+    });
+  }
+  if (!changed) return sig;
+  const widened = params.map((p, i) => `${p.trim().slice(0, p.trim().indexOf(' '))} ${types[i]}`).join(', ');
+  return { ...sig, params: widened };
 }
 
 // A mixin base's constructor chain runs on the one base object, as in JS,
@@ -9179,7 +9205,7 @@ function emitMixinSupport(): string {
     for (const n of [...names].sort()) {
       const owner = baseSigs.has(n) ? base : mixins.find((m) => classMethodSignatures.get(m)?.has(n));
       const sig = owner ? (owner === base ? baseSigs : classMethodSignatures.get(owner)!).get(n) : undefined;
-      if (sig && owner) sigs.set(n, emitted(owner, n, sig));
+      if (sig && owner) sigs.set(n, owner === base ? emitted(owner, n, sig) : widenedMixinSignature(base, n, emitted(owner, n, sig)));
     }
     const result = (sg: MethodSignature) => (sg.result ? ` ${sg.result}` : '');
     const forward = (sg: MethodSignature) => splitGoParameters(sg.params).map((p) => {
@@ -19828,7 +19854,18 @@ function getCalleeSignature(call: AstNode): AstNode | undefined {
       const declaredThis = enclosing?.tnThisType && isTypeReferenceNode(enclosing.tnThisType) && isIdentifier(enclosing.tnThisType.typeName) ? enclosing.tnThisType.typeName.text : '';
       if (declaredThis && classNames.has(declaredThis)) method = findClassMethod(declaredThis, call.expression.name.text);
     }
-    // (an abstract method declares the parameters its implementations take)
+    // (an abstract method declares the parameters its implementations take —
+    // unless its implementation adds optional ones, which the Go method has)
+    if (method && !method.body && (method.modifiers ?? []).some((m: AstNode) => m.kind === 'AbstractKeyword') && receiverClass) {
+      const name = call.expression.name.text;
+      for (const [cls] of declaredClasses) {
+        let isDescendant = false;
+        for (let c: string | undefined = classParentNames.get(cls), depth = 0; c && depth < 20; c = classParentNames.get(c), depth++) if (c === receiverClass) isDescendant = true;
+        if (!isDescendant) continue;
+        const impl = findClassMethod(cls, name);
+        if (impl?.body && (impl.parameters ?? []).length > (method.parameters ?? []).length) return impl;
+      }
+    }
     if (method?.body || (method && (method.modifiers ?? []).some((m: AstNode) => m.kind === 'AbstractKeyword'))) return method;
     // a function-typed member of the receiver's declared type (or of the
     // interface / object type its Go type names)
