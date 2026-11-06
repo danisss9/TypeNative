@@ -6036,6 +6036,9 @@ function visitNode(node, options = {}) {
                 if (isPropertySignature(member) && isIdentifier(member.name)) {
                     properties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
                 }
+                // (a method: a func field, as an object literal's arrow fills it)
+                if (isMethodSignature(member) && isIdentifier(member.name))
+                    properties.set(member.name.text, methodSignatureFieldType(member));
             }
             if (properties.size > 0)
                 interfacePropertyTypes.set(visit(node.name), properties);
@@ -6046,12 +6049,17 @@ function visitNode(node, options = {}) {
             if (isPropertySignature(member) && isIdentifier(member.name)) {
                 localProperties.set(member.name.text, getObjectFieldNodeType(member.type, !!member.questionToken));
             }
+            if (isMethodSignature(member) && isIdentifier(member.name))
+                localProperties.set(member.name.text, methodSignatureFieldType(member));
         }
         if (localProperties.size > 0)
             interfacePropertyTypes.set(visit(node.name), localProperties);
         const fields = (node.type.members ?? [])
-            .filter((m) => isPropertySignature(m) && isIdentifier(m.name))
-            .map((m) => `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}${nullFieldTag(m)}`);
+            .filter((m) => (isPropertySignature(m) || isMethodSignature(m)) && isIdentifier(m.name))
+            .filter((m, i, all) => all.findIndex((o) => o.name.text === m.name.text) === i)
+            .map((m) => isMethodSignature(m)
+            ? `\t${goFieldName(m.name.text)} ${methodSignatureFieldType(m)}`
+            : `\t${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}${nullFieldTag(m)}`);
         const terminator = options.isOutside ? '' : ';\n\t';
         return `type ${visit(node.name)} struct {\n${fields.join('\n')}\n\t__keys *[]string\n}${terminator}`;
     }
