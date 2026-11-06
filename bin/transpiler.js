@@ -754,6 +754,7 @@ function parseAndLower(code) {
     lowerNestedDestructuring(sourceFile);
     lowerBuiltinMemberAliases(sourceFile);
     lowerShadowedAccessors(sourceFile);
+    lowerLiteralPropertyAdditions(sourceFile);
     lowerTopLevelDestructuring(sourceFile);
     lowerPrototypeCalls(sourceFile);
     lowerArraySpreadCalls(sourceFile);
@@ -2095,6 +2096,42 @@ function lowerShadowedAccessors(node) {
             continue;
         node.members.unshift({ kind: 'PropertyDeclaration', name: { kind: 'Identifier', text: name, ...at }, type: { kind: 'AnyKeyword', ...at }, ...at });
     }
+}
+// const o = { a } at the top level, then o.b = v (a statement of its own,
+// also at the top level, o not read in between): b is one of the literal's
+// properties (Babel's importAttributes.assertions), as the object's type
+// must have it
+function lowerLiteralPropertyAdditions(sourceFile) {
+    const statements = sourceFile.statements ?? [];
+    const removed = new Set();
+    const mentions = (n, name) => !!n && (isIdentifier(n) ? n.text === name : childNodes(n).some((c) => mentions(c, name)));
+    statements.forEach((st, i) => {
+        if (st.kind !== 'VariableStatement' || st.declarationList?.declarationKind !== 'const')
+            return;
+        const decls = st.declarationList.declarations ?? [];
+        if (decls.length !== 1 || !isIdentifier(decls[0].name) || decls[0].type || decls[0].initializer?.kind !== 'ObjectLiteralExpression')
+            return;
+        const name = decls[0].name.text;
+        const literal = decls[0].initializer;
+        const keys = new Set((literal.properties ?? []).filter((p) => p.name && (isIdentifier(p.name) || isStringLiteral(p.name))).map((p) => p.name.text));
+        for (let j = i + 1; j < statements.length; j++) {
+            const next = statements[j];
+            const assign = next.kind === 'ExpressionStatement' ? next.expression : undefined;
+            const isAddition = assign?.kind === 'BinaryExpression' && assign.operatorToken?.kind === 'EqualsToken' && assign.left?.kind === 'PropertyAccessExpression' &&
+                isIdentifier(assign.left.expression) && assign.left.expression.text === name && isIdentifier(assign.left.name) && !keys.has(assign.left.name.text) && !mentions(assign.right, name);
+            if (isAddition) {
+                literal.properties.push({ kind: 'PropertyAssignment', name: assign.left.name, initializer: assign.right, line: next.line, column: next.column });
+                keys.add(assign.left.name.text);
+                removed.add(next);
+                continue;
+            }
+            // (anything else reading the object ends the run)
+            if (mentions(next, name))
+                break;
+        }
+    });
+    if (removed.size > 0)
+        sourceFile.statements = statements.filter((st) => !removed.has(st));
 }
 // const { defineProperty } = Object / const { floor } = Math at the top
 // level: each use of the name is the member itself (Object.defineProperty),
@@ -10830,12 +10867,19 @@ function objectLiteralContextualType(node) {
             return (r.types ?? []).flatMap((m) => literalTypes(m));
         return [];
     };
+    // (a primitive value — a string for name — fits no object-typed member)
+    const primitiveGo = (t) => !!t && ['string', 'float64', 'bool', '*string', '*float64', '*bool'].includes(t);
     const fits = (member) => props.every((p) => {
         const memberType = getMemberTypeNode(member, p.name.text);
         if (!memberType || memberType.kind === 'NeverKeyword')
             return false;
         const tags = literalTypes(memberType);
         const value = literalValue(p);
+        if (isPropertyAssignment(p) && value === undefined && primitiveGo(inferExpressionType(p.initializer))) {
+            const memberGo = getType(memberType);
+            if (memberGo !== 'interface{}' && !primitiveGo(memberGo))
+                return false;
+        }
         return tags.length === 0 || value === undefined || tags.includes(value);
     });
     return objectMembers.find(fits) ?? contextual;
@@ -13103,8 +13147,24 @@ function inferExpressionTypeOf(expr) {
         return 'float64';
     if (expr.kind === 'VoidExpression')
         return 'nil';
-    if (expr.kind === 'SatisfiesExpression')
+    if (expr.kind === 'SatisfiesExpression') {
+        // (function (parent, key) {…} satisfies ValidatorImpl: emitted with the
+        // signature it is checked against, its three parameters)
+        const inner = unwrapParentheses(expr.expression);
+        if (isArrowFunction(inner) || isFunctionExpression(inner)) {
+            // (its own parameters, padded with any ones as the emitter pads them)
+            const contextual = getContextualFunctionType(inner);
+            const contextualCount = contextual ? (contextual.parameters ?? []).length : 0;
+            const own = inferExpressionType(expr.expression) ?? '';
+            const ownParams = own.startsWith('func(') ? goFuncParamTypes(own) : [];
+            if (own.startsWith('func(') && contextualCount > ownParams.length && !ownParams.some((t) => t.startsWith('...'))) {
+                const padded = [...ownParams, ...Array(contextualCount - ownParams.length).fill('interface{}')];
+                const result = goFuncReturnType(own);
+                return `func(${padded.join(', ')})${result ? ` ${result}` : ''}`;
+            }
+        }
         return inferExpressionType(expr.expression);
+    }
     if (expr.kind === 'BigIntLiteral')
         return '*tnbig.Int';
     if (expr.kind === 'TypeOfExpression')
@@ -14873,6 +14933,14 @@ const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit'
 function objectTypeFieldMap(typeNode) {
     const out = new Map();
     let members = [];
+    // (A & B & { c }: every part's fields — aliases of intersections too)
+    if (typeNode.kind === 'IntersectionType') {
+        for (const t of typeNode.types ?? [])
+            for (const [field, fieldType] of objectTypeFieldMap(t))
+                if (!out.has(field))
+                    out.set(field, fieldType);
+        return out;
+    }
     if (typeNode.kind === 'TypeLiteral')
         members = typeNode.members ?? [];
     else if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
