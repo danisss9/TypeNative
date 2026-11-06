@@ -4827,7 +4827,10 @@ function visitNode(node, options = {}) {
         // (a class's static or instance method: Go methods take no type parameters)
         const classMethodCallee = isPropertyAccessExpression(node.expression) && (isIdentifier(node.expression.expression) && classNames.has(node.expression.expression.text) && !variableGoTypes.has(node.expression.expression.text) ||
             !!classNameOfGoType(inferExpressionType(node.expression.expression) ?? ''));
-        const keptTypeArgs = classMethodCallee ? [] : (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
+        // (a function value — const last = <T>(…) => … — takes no type arguments)
+        const functionValueCallee = isIdentifier(node.expression) && !calleeDeclaration &&
+            !!(variableGoTypes.get(node.expression.text) ?? topLevelGoTypes.get(node.expression.text))?.startsWith('func(');
+        const keptTypeArgs = classMethodCallee || functionValueCallee ? [] : (node.typeArguments ?? []).filter((_t, i) => !erasedParams?.has(calleeDeclaration?.typeParameters?.[i]?.name?.text));
         let typeArgs = getTypeArguments(keptTypeArgs);
         // (f(fn, visitor, undefined): type arguments Go can't infer from a nil)
         if (!typeArgs && calleeDeclaration && !classMethodCallee && (node.typeArguments ?? []).length === 0) {
@@ -6591,7 +6594,9 @@ function visitNode(node, options = {}) {
             }
         }
         result += copiedMethods.join('\n');
-        result += emitSuperCopies(name, typeParamNames, node);
+        // (a mixin's super.m() goes through __super: no copies)
+        if (!mixinOf)
+            result += emitSuperCopies(name, typeParamNames, node);
         // Static property declarations → package-level vars named ClassName_propName
         for (const member of (node.members ?? [])) {
             if (isPropertyDeclaration(member) &&
@@ -6783,7 +6788,9 @@ function visitNode(node, options = {}) {
         if (thisOwner)
             return `New${getSafeName(thisOwner)}(${args.join(', ')})`;
         // new X(…) where X holds a class value (tag.nodeClass, this.constructor)
-        if (!classNames.has(className) && !isIdentifier(node.expression) || (isIdentifier(node.expression) && !classNames.has(node.expression.text) && isDynamicValue(node.expression))) {
+        // (or a variable holding one: let cls = Parser; … new cls(…))
+        const classVariable = isIdentifier(node.expression) && !classNames.has(node.expression.text) && inferExpressionType(node.expression) === '*TnClass';
+        if (!classNames.has(className) && !isIdentifier(node.expression) || (isIdentifier(node.expression) && !classNames.has(node.expression.text) && isDynamicValue(node.expression)) || classVariable) {
             useHelper('classes');
             useHelper('dynamic');
             useHelper('error');
@@ -7040,6 +7047,16 @@ function toGoValueOfType(expr, goType) {
     // write expression: null into a boolean field — can only be its zero value)
     if ((goType === 'bool' || goType === 'string' || goType === 'float64') && isNilLiteral(unwrapParentheses(expr)))
         return `*new(${goType})`;
+    // (a class value slot: any value holding a class — a mixin class made at
+    // run time — asserted)
+    if (goType === '*TnClass' && !isNilLiteral(unwrapParentheses(expr)) && !(isIdentifier(unwrapParentheses(expr)) && classNames.has(unwrapParentheses(expr).text))) {
+        const own = inferExpressionType(expr);
+        if (own !== '*TnClass') {
+            useHelper('classes');
+            useHelper('dynamic');
+            return `TnAs[*TnClass](interface{}(${visit(expr)}))`;
+        }
+    }
     // (a call that never returns — CompilerError.throwTodo(…) — as a value:
     // it runs, and the slot's type is satisfied)
     if (goType && goType !== ':' && goType !== '' && isCallExpression(unwrapParentheses(expr))) {
@@ -7164,6 +7181,13 @@ function toGoValueOfType(expr, goType) {
             useHelper('arraySubclass');
             return `TnSliceAs[interface{}](${visit(expr)})`;
         }
+        // (an array reference of any elements: a reference to the converted copy)
+        if (goType === '*[]interface{}' && own.startsWith('[]') && own !== '[]interface{}' && !own.startsWith('[]T') && !(inferRawExpressionType(expr) ?? '').startsWith('*') &&
+            !(isIdentifier(unwrapParentheses(expr)) && referenceArrays.has(unwrapParentheses(expr).text))) {
+            useHelper('dynamic');
+            useHelper('arraySubclass');
+            return `func() *[]interface{} { __s := TnSliceAs[interface{}](${visit(expr)}); return &__s }()`;
+        }
         if (goType !== '[]interface{}' && goType !== '*[]interface{}' && !goType.replace(/^\*?\[\]/, '').startsWith('[]')) {
             if (own.startsWith('[]') && own !== goType.replace(/^\*/, '') && !own.startsWith('[]T')) {
                 useHelper('dynamic');
@@ -7249,10 +7273,13 @@ function toGoValueOfType(expr, goType) {
         // (function (node: t.MemberExpression, key, val) where the slot's node
         // is any value: adapted, the annotation narrowing the argument)
         (unwrappedExpr.parameters ?? []).some((p, i) => !!p.type && !p.dotDotDotToken && !!goFuncParamTypes(goType ?? "")[i] && getParameterGoType(p) !== goFuncParamTypes(goType ?? "")[i]));
-    if (goType?.startsWith('func(') && !goType.includes('[') && (!isLiteral || annotatedLiteral)) {
+    // (a generic instantiation in the signature — Box[T] — is left to Go;
+    // slices, maps and ordered maps are adapted)
+    const genericIn = (t) => /\b(?!TnMap\b|map\b|chan\b)[A-Za-z_][\w]*\[(?!\])/.test(t);
+    if (goType?.startsWith('func(') && !genericIn(goType) && (!isLiteral || annotatedLiteral)) {
         // (|| not ??: natively an unknown type reads as '')
         const exprType = inferExpressionType(expr) || (isIdentifier(unwrappedExpr) && declaredFunctions.has(unwrappedExpr.text) ? functionValueGoType(unwrappedExpr) : undefined);
-        if (exprType?.startsWith('func(') && exprType.replace(/\s+/g, '') !== goType.replace(/\s+/g, '') && !exprType.includes('[')) {
+        if (exprType?.startsWith('func(') && exprType.replace(/\s+/g, '') !== goType.replace(/\s+/g, '') && !genericIn(exprType)) {
             return adaptFunctionValue(visit(expr), exprType, goType);
         }
         // (an any value holding a function — zod's ZodUUID class — where a
@@ -8224,6 +8251,14 @@ function visitNullableComparison(node, op) {
     const rightType = inferExpressionType(node.right);
     let pointerSide;
     let valueSide;
+    // (two nullable values: equal when both are unset, or both hold the same
+    // value — not when they are the same pointer)
+    if (leftType && NULLABLE_PRIMITIVE_TYPES.includes(leftType) && rightType === leftType && !isNilLiteral(node.left) && !isNilLiteral(node.right)) {
+        const a = getTempName('cmp');
+        const b = getTempName('cmp');
+        const equal = `(${a} == nil && ${b} == nil) || (${a} != nil && ${b} != nil && *${a} == *${b})`;
+        return `func() bool { ${a}, ${b} := ${visit(node.left)}, ${visit(node.right)}; return ${op === '==' ? equal : `!(${equal})`} }()`;
+    }
     if (leftType && NULLABLE_PRIMITIVE_TYPES.includes(leftType) && rightType === leftType.slice(1)) {
         pointerSide = node.left;
         valueSide = node.right;
@@ -11618,6 +11653,9 @@ function boundCallTypeParameters(fn, goType) {
 function inferFunctionBodyReturnType(node) {
     if (node.type)
         return getType(node.type);
+    // (an array method's callback literal: the result it is emitted with)
+    if (typeof node.tnCallbackReturnType === 'string')
+        return node.tnCallbackReturnType;
     const contextualFn = getContextualFunctionType(node);
     if (contextualFn?.type) {
         const contextualResult = boundCallTypeParameters(node, getType(contextualFn.type));
@@ -12376,6 +12414,9 @@ function isFunctionPropertyAccess(node) {
 function inferExpressionTypeOf(expr) {
     if (expr?.kind === 'TnArrayItems')
         return '[]interface{}';
+    // a class as a value (let cls = Parser): its class descriptor
+    if (isIdentifier(expr) && classNames.has(expr.text) && !variableGoTypes.has(expr.text) && expr.parent && isClassValueReference(expr) && !isLocallyBound(expr))
+        return '*TnClass';
     // a?.b?.m(…) on any values: an any value (undefined when the chain stops)
     if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && (hasQuestionDot(expr) || hasQuestionDot(expr.expression)) &&
         isDynamicValue(expr.expression.expression)) {
@@ -13163,6 +13204,11 @@ function inferExpressionTypeOf(expr) {
                 // (reduce<Acc>(…): the accumulator's declared type)
                 if ((expr.typeArguments ?? []).length === 1 && expr.arguments?.[1])
                     return getType(expr.typeArguments[0]);
+                // (an object literal start — types.reduce((a, b) => …, { kind: 'None' })
+                // — of the elements' object type: that type, the callback returns them)
+                const initial = expr.arguments?.[1] ? unwrapParentheses(expr.arguments[1]) : undefined;
+                if (initial && isObjectLiteralExpression(initial) && elementType.startsWith('*') && isStructGoType(elementType.slice(1)) && !classNames.has(elementType.slice(1)))
+                    return elementType;
                 return (expr.arguments?.[1] ? inferExpressionType(expr.arguments[1]) : undefined) ?? elementType;
             }
             if (methodName === 'flat' && elementType.startsWith('[]'))
@@ -14765,6 +14811,9 @@ function buildLiteralCallbackInfo(callback, elementType, forcedReturnType, param
             .slice(0, paramTypes.length)
             .map((p, index) => `${isIdentifier(p.name) && !asserted.has(index) ? getSafeName(p.name.text) : `__dp${index}`} ${paramTypes[index]}`);
         const prefix = unpack.join('');
+        // (its returns convert to the result it is emitted with)
+        if (isBlock(callback.body) && callbackReturnType)
+            callback.tnCallbackReturnType = callbackReturnType;
         let body = isBlock(callback.body)
             ? visit(callback.body, { inline: true })
             : forcedReturnType === 'bool'
@@ -15045,7 +15094,12 @@ function visitArrayHigherOrderCall(node) {
         if (!reduceCallback)
             return undefined;
         // (reduce<Acc>(…): the accumulator's declared type, the initial value converted to it)
-        const declaredAcc = (node.typeArguments ?? []).length === 1 && (node.arguments ?? [])[1] ? getType(node.typeArguments[0]) : undefined;
+        let declaredAcc = (node.typeArguments ?? []).length === 1 && (node.arguments ?? [])[1] ? getType(node.typeArguments[0]) : undefined;
+        // (an object literal start of the elements' object type: that type, see
+        // the reduce inference)
+        const initialNode = (node.arguments ?? [])[1] ? unwrapParentheses(node.arguments[1]) : undefined;
+        if (!declaredAcc && initialNode && isObjectLiteralExpression(initialNode) && elementType.startsWith('*') && isStructGoType(elementType.slice(1)) && !classNames.has(elementType.slice(1)))
+            declaredAcc = elementType;
         const initialValue = (node.arguments ?? [])[1]
             ? declaredAcc ? toGoValueOfType((node.arguments ?? [])[1], declaredAcc) : visit((node.arguments ?? [])[1])
             : undefined;
@@ -18703,7 +18757,8 @@ function isErasedTypeParameter(typeNode, name) {
             continue;
         if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunction'].includes(n.kind)) {
             // a nested function is a Go closure: closures take no type parameters
-            if (getEnclosingFunction(n))
+            // (nor does any function value: const last = <T>(arr: T[]) => …)
+            if (getEnclosingFunction(n) || n.kind !== 'FunctionDeclaration')
                 return true;
             return erasedFunctionTypeParameters(n).has(name);
         }
@@ -18862,6 +18917,12 @@ function functionsUsedAsValues() {
 function erasedFunctionTypeParameters(fn) {
     if (fn.tnErasedTypeParameters)
         return fn.tnErasedTypeParameters;
+    // (a function value — an arrow, a function expression — has no Go type
+    // parameters: all erased, see isErasedTypeParameter)
+    if (isArrowFunction(fn) || isFunctionExpression(fn)) {
+        fn.tnErasedTypeParameters = new Set((fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '').filter((n) => n));
+        return fn.tnErasedTypeParameters;
+    }
     // (while the parameter types are computed, none is erased)
     fn.tnErasedTypeParameters = new Set();
     const paramTypes = (fn.parameters ?? []).map((p) => (p.type ? getType(p.type) : '')).join(' ');
@@ -25011,6 +25072,12 @@ func TnAs[T any](v interface{}) T {
 	}
 	t, ok := v.(T)
 	if !ok && v != nil {
+		// (an object a mixin class made, as its base class)
+		if m, isMixin := v.(interface{ TnMixinBase() interface{} }); isMixin {
+			if base, bok := m.TnMixinBase().(T); bok {
+				return base
+			}
+		}
 		if custom, isErr := v.(interface{ TnBaseError() *TnError }); isErr {
 			if base, bok := interface{}(custom.TnBaseError()).(T); bok {
 				return base
