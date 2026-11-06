@@ -5151,7 +5151,8 @@ function visitNode(node, options = {}) {
         const calleeDeclaration = isIdentifier(node.expression) ? calledFunctionDeclaration(node.expression.text, node) : undefined;
         const erasedParams = calleeDeclaration ? erasedFunctionTypeParameters(calleeDeclaration) : undefined;
         // (a class's static or instance method: Go methods take no type parameters)
-        const classMethodCallee = isPropertyAccessExpression(node.expression) && (isIdentifier(node.expression.expression) && classNames.has(node.expression.expression.text) && !variableGoTypes.has(node.expression.expression.text) ||
+        const classMethodCallee = isPropertyAccessExpression(node.expression) && (node.expression.expression.kind === 'SuperKeyword' || node.expression.expression.kind === 'ThisKeyword' ||
+            isIdentifier(node.expression.expression) && classNames.has(node.expression.expression.text) && !variableGoTypes.has(node.expression.expression.text) ||
             !!classNameOfGoType(inferExpressionType(node.expression.expression) ?? ''));
         // (a function value — const last = <T>(…) => … — takes no type arguments)
         const functionValueCallee = isIdentifier(node.expression) && !calleeDeclaration &&
@@ -6398,7 +6399,7 @@ function visitNode(node, options = {}) {
         }).trimEnd()}`;
     }
     else if (node.kind === 'ThisKeyword') {
-        if (thisOverrideName && getEnclosingFunction(node) === thisOverrideFn)
+        if (thisOverrideName && getEnclosingFunction(node) === thisOverrideFn && !isDescriptorMethod(thisOverrideFn))
             return thisOverrideName;
         if (isThisOfPlainFunction(node)) {
             useHelper('decorators');
@@ -7392,7 +7393,8 @@ function visitNode(node, options = {}) {
             thisOverrideFn = p;
             const paramInfo = withContextualParameters(p, getFunctionParametersInfo(p.parameters ?? []));
             const result = fieldType.startsWith('func(') ? goFuncReturnType(fieldType) : inferFunctionBodyReturnType(p);
-            const body = visit(p.body, { prefixBlockContent: paramInfo.prefixBlockContent });
+            // (a property descriptor's get / set: this is the object, see isDescriptorMethod)
+            const body = visit(p.body, { prefixBlockContent: (isDescriptorMethod(p) ? thisPrologue(p) : '') + paramInfo.prefixBlockContent });
             thisOverrideName = prevName;
             thisOverrideFn = prevFn;
             methodSteps.push(`__obj.${goFieldName(p.name.text)} = func(${paramInfo.signature})${result ? ` ${result}` : ''} ${body.trimEnd()}`);
@@ -11215,7 +11217,7 @@ function dynamicObjectMethod(p) {
     const paramInfo = getFunctionParametersInfo(p.parameters ?? []);
     const fnType = methodFuncType(p);
     const retType = fnType.slice(fnType.indexOf(')') + 1);
-    const body = visit(p.body, { prefixBlockContent: paramInfo.prefixBlockContent });
+    const body = visit(p.body, { prefixBlockContent: (isDescriptorMethod(p) ? thisPrologue(p) : '') + paramInfo.prefixBlockContent });
     thisOverrideName = prevName;
     thisOverrideFn = prevFn;
     return `func(${paramInfo.signature})${retType} ${body.trimEnd()}`;
@@ -11266,7 +11268,7 @@ function visitAnonymousStructLiteral(node) {
             thisOverrideFn = p;
             const paramInfo = getFunctionParametersInfo(p.parameters ?? []);
             const retType = methodFuncType(p).slice(methodFuncType(p).indexOf(')') + 1);
-            const body = visit(p.body, { prefixBlockContent: paramInfo.prefixBlockContent });
+            const body = visit(p.body, { prefixBlockContent: (isDescriptorMethod(p) ? thisPrologue(p) : '') + paramInfo.prefixBlockContent });
             thisOverrideName = prevName;
             thisOverrideFn = prevFn;
             steps.push(`__obj.${field} = func(${paramInfo.signature})${retType} ${body.trimEnd()}`);
@@ -14980,6 +14982,23 @@ function objectTypeFieldMap(typeNode) {
         if (UTILITY_TYPES.has(name) && (typeNode.typeArguments ?? []).length > 0 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
             return objectTypeFieldMap(typeNode.typeArguments[0]);
         }
+        // Record<'a' | 'b', V>: a field per key (V, nullable — a key may be unset)
+        if (name === 'Record' && (typeNode.typeArguments ?? []).length === 2 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
+            // (unions of aliased unions flattened: TsModifier | N.Accessibility)
+            const flatten = (k, depth = 0) => {
+                const r = k ? resolveTypeNode(k) ?? k : undefined;
+                if (!r || depth > 10)
+                    return [];
+                return isUnionTypeNode(r) ? (r.types ?? []).flatMap((m) => flatten(m, depth + 1)) : [r];
+            };
+            const resolvedKeys = flatten(typeNode.typeArguments[0]);
+            if (resolvedKeys.length > 0 && resolvedKeys.every((k) => isLiteralTypeNode(k) && k.literal && isStringLiteral(k.literal))) {
+                const fieldType = getObjectFieldNodeType(typeNode.typeArguments[1], true);
+                for (const k of resolvedKeys)
+                    out.set(k.literal.text, fieldType);
+                return out;
+            }
+        }
         const iface = declaredInterfaces.get(name);
         if (iface) {
             collectInterfaceProperties(iface, out);
@@ -16375,6 +16394,11 @@ function getType(typeNode, getArrayType = false) {
         const fnMember = (typeNode.types ?? []).map(asFunction).find((t) => !!t);
         if (fnMember && (typeNode.types ?? []).every((t) => t.kind === 'TypeLiteral' || !!asFunction(t)))
             return getType(fnMember, getArrayType);
+        // (SyntaxError & { loc, … }: an error value, its extra properties own
+        // properties of the error — Babel's ParseError)
+        if ((typeNode.types ?? []).some((t) => isTypeReferenceNode(t) && isIdentifier(t.typeName) && (t.typeName.text === 'Error' || BUILTIN_ERROR_NAMES.has(t.typeName.text)) && !classNames.has(t.typeName.text))) {
+            return '*TnError';
+        }
         // Tag & { extra }, with Tag a class or an interface with methods: Tag's
         // own Go type (a struct can't stand in for it)
         const head = (typeNode.types ?? [])[0];
@@ -18963,10 +18987,25 @@ function plainFunctionOfThis(node) {
             continue;
         if (isFunctionExpression(n) || isFunctionDeclaration(n))
             return isPropertyAssignment(n.parent) ? undefined : n;
+        // (an object literal's method declaring its this — a property
+        // descriptor's get(this: ParseError) —: the receiver it is called on)
+        if (isDescriptorMethod(n))
+            return n;
         if (isMethodDeclaration(n) || isConstructorDeclaration(n) || isPropertyDeclaration(n) || isGetAccessor(n) || isSetAccessor(n) || isClassDeclaration(n))
             return undefined;
     }
     return undefined;
+}
+// get() / set(v) of a property descriptor (Object.defineProperty(o, k,
+// { get() { … this … } })): this is the object the property is on
+function isDescriptorMethod(n) {
+    if (!n || !(isMethodDeclaration(n) || isGetAccessor(n) || isSetAccessor(n)) || !isObjectLiteralExpression(n.parent) || !isIdentifier(n.name))
+        return false;
+    if (!['get', 'set'].includes(n.name.text))
+        return false;
+    const call = n.parent.parent;
+    return !!call && isCallExpression(call) && isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.expression) &&
+        call.expression.expression.text === 'Object' && call.expression.name.text === 'defineProperty' && (call.arguments ?? [])[2] === n.parent;
 }
 // A plain function's this: its `this: T` annotation's Go type, else any
 function plainFunctionThisType(fn) {
@@ -18989,6 +19028,8 @@ function isThisOfPlainFunction(node) {
             continue;
         if (isFunctionExpression(n) || isFunctionDeclaration(n))
             return !isPropertyAssignment(n.parent);
+        if (isDescriptorMethod(n))
+            return true;
         if (isMethodDeclaration(n) || isConstructorDeclaration(n) || isPropertyDeclaration(n) || isGetAccessor(n) || isSetAccessor(n) || isClassDeclaration(n))
             return false;
     }
