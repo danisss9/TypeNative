@@ -5619,7 +5619,7 @@ function visitNode(node, options = {}) {
         }
         if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
             useHelper('dynamic');
-            return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${visit(node.right)})`;
+            return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'interface{}')})`;
         }
         // record.key = v on a Record (an ordered map): a key write
         if (op === '=' && isPropertyAccessExpression(node.left) && !hasQuestionDot(node.left)) {
@@ -7095,7 +7095,10 @@ function visitNode(node, options = {}) {
         });
         // new F(…) where F holds a constructor function (construct signature)
         if (!classNames.has(className) && inferExpressionType(node.expression)?.startsWith('func(')) {
-            return `${className}(${args.join(', ')})`;
+            // (each argument converted to the signature's parameter type)
+            const ctorParams = goFuncParamTypes(inferExpressionType(node.expression));
+            const converted = (node.arguments ?? []).map((a, i) => ctorParams[i] && !ctorParams[i].startsWith('...') && !isSpreadElement(a) && !ctorParams.some((t) => t.startsWith('...')) ? toGoValueOfType(a, ctorParams[i]) : args[i]);
+            return `${className}(${converted.join(', ')})`;
         }
         // omitted parameters are zero values (nil for pointers): optional ones
         // as in TS, and missing ones as JS passes undefined (a JS file's calls
@@ -7377,7 +7380,7 @@ function toGoValueOfType(expr, goType) {
         return `*new(${goType})`;
     // (null into a plain boolean, string or number slot — Babel's builders
     // write expression: null into a boolean field — can only be its zero value)
-    if ((goType === 'bool' || goType === 'string' || goType === 'float64') && isNilLiteral(unwrapParentheses(expr)))
+    if ((goType === 'bool' || goType === 'string' || goType === 'float64' || goType === 'time.Time') && isNilLiteral(unwrapParentheses(expr)))
         return `*new(${goType})`;
     // (a class value slot: any value holding a class — a mixin class made at
     // run time — asserted)
@@ -7557,7 +7560,7 @@ function toGoValueOfType(expr, goType) {
     // c ? null : x into an any slot: each branch as an any (null stays null)
     // (also where its value would be a nullable primitive: c ? 'Component' : null)
     if (goType === 'interface{}' && isConditionalExpression(orNull) && [orNull.whenTrue, orNull.whenFalse].some((b) => unwrapParentheses(b).kind === 'NullKeyword') &&
-        (storesJsNull(orNull.whenTrue) || NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(orNull) ?? ''))) {
+        (storesJsNull(orNull.whenTrue) || NULLABLE_PRIMITIVE_TYPES.includes(inferExpressionType(orNull) ?? '') || !isNilableGoType(inferExpressionType(orNull) ?? 'interface{}'))) {
         useHelper('dynamic');
         const whenTrue = withNarrowing(getNarrowedNames(orNull.condition, true), () => toGoValueOfType(orNull.whenTrue, 'interface{}'));
         const whenFalse = withNarrowing(getNarrowedNames(orNull.condition, false), () => toGoValueOfType(orNull.whenFalse, 'interface{}'));
@@ -8861,8 +8864,14 @@ function visitDelete(node) {
         return `func() bool { os.Unsetenv(${key}); return true }()`;
     }
     const objectType = inferExpressionType(object);
-    if (objectType?.startsWith('*TnMap['))
-        return `${visit(object)}.Delete(${key})`;
+    if (objectType?.startsWith('*TnMap[')) {
+        // (a key of another type — an any value — converted to the map's)
+        const keyType = extractMapKeyType(objectType);
+        const typedKey = isElementAccessExpression(target) && keyType !== 'interface{}' && inferExpressionType(target.argumentExpression) !== keyType
+            ? keyType === 'string' ? jsStringOf(key, inferExpressionType(target.argumentExpression)) : toGoValueOfType(target.argumentExpression, keyType)
+            : key;
+        return `${visit(object)}.Delete(${typedKey})`;
+    }
     useHelper('dynamic');
     return `TnDelete(${visit(object)}, ${key})`;
 }
@@ -13088,7 +13097,10 @@ function inferExpressionTypeOf(expr) {
             return goFuncReturnType(ctorType) ?? 'interface{}';
     }
     // new (expr)(…) / new x(…) where x holds a class value: any instance
-    if (isNewExpression(expr) && (!isIdentifier(expr.expression) && expr.expression.kind !== 'ThisKeyword' && !isPropertyAccessExpression(expr.expression) || (isIdentifier(expr.expression) && variableGoTypes.get(expr.expression.text) === 'interface{}'))) {
+    // (a constant holding a constructor value — zod's $ZodCheck, beside an
+    // interface of that name —: constructed dynamically too)
+    if (isNewExpression(expr) && (!isIdentifier(expr.expression) && expr.expression.kind !== 'ThisKeyword' && !isPropertyAccessExpression(expr.expression) ||
+        (isIdentifier(expr.expression) && (variableGoTypes.get(expr.expression.text) === 'interface{}' || (!classNames.has(expr.expression.text) && isDynamicValue(expr.expression)))))) {
         return 'interface{}';
     }
     // new this(…) in a static method: an instance of the class declaring it
@@ -16786,6 +16798,10 @@ const callHandlers = {
     },
     'Number.isSafeInteger': (_caller, args) => {
         importedPackages.add('math');
+        // (no coercion: anything but a number is false)
+        if (currentCallArgTypes[0] !== 'float64') {
+            return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && __n == math.Trunc(__n) && math.Abs(__n) <= 9007199254740991 }()`;
+        }
         return `(${args[0]} == math.Trunc(${args[0]}) && math.Abs(${args[0]}) <= 9007199254740991)`;
     },
     'Number.parseInt': (_caller, args) => {
@@ -21619,6 +21635,11 @@ function linkModule(key, code, dir, tsx, fileName) {
         const bindings = clause.namedBindings;
         if (bindings?.kind === 'NamespaceImport') {
             namespaces.set(bindings.name.text, targetKey);
+            // (export * as util from './util': a namespace the module exports)
+            if (statement.reexport) {
+                mod.namespaceExports ??= new Map();
+                mod.namespaceExports.set(bindings.name.text, targetKey);
+            }
         }
         else if (bindings?.kind === 'NamedImports') {
             for (const el of bindings.elements ?? []) {
