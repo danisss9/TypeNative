@@ -1537,6 +1537,18 @@ function linkFlattenedNamespaceTypes(asts) {
             walk(ast);
 }
 function lowerNamespaces(sourceFile) {
+    // (a namespace of types only — namespace Scope { export type Binding = … }
+    // merged with a class — declares no value: dropped, so the name stays the
+    // class's)
+    const typeOnly = (st) => {
+        if (st.kind !== 'ModuleDeclaration' || !st.body)
+            return false;
+        const body = st.body.kind === 'ModuleDeclaration' ? st.body : st.body;
+        if (body.kind === 'ModuleDeclaration')
+            return typeOnly(body);
+        return (body.statements ?? []).every((m) => ['TypeAliasDeclaration', 'InterfaceDeclaration'].includes(m.kind));
+    };
+    sourceFile.statements = (sourceFile.statements ?? []).filter((st) => !typeOnly(st));
     const flat = flattenNamespaces(sourceFile.statements ?? []);
     sourceFile.statements = flat.statements;
     if (flat.namespaces.length > 0)
