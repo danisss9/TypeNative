@@ -4211,12 +4211,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     // x.f on an object type that has no f (Babel's generator reads
     // node.optional under @ts-ignore): by name, an expando or undefined
-    if (!isCallee(node) && leftGoType?.startsWith('*') && interfacePropertyTypes.has(leftGoType.slice(1)) && !classNames.has(leftGoType.slice(1)) && isIdentifier(node.name)) {
-      const fieldNames = objectFieldNames(leftGoType);
-      if (fieldNames.length > 0 && !fieldNames.includes(node.name.text) && getStructFieldGoType(leftGoType.slice(1), node.name.text) === undefined && !isStructGetterField(leftGoType.slice(1), node.name.text)) {
-        useHelper('dynamic');
-        return `TnGetRef(${leftSide}, ${toGoStringLiteral(node.name.text)})`;
-      }
+    if (!isCallee(node) && isUndeclaredObjectTypeMember(node, leftGoType)) {
+      useHelper('dynamic');
+      return `TnGetRef(${leftSide}, ${toGoStringLiteral(node.name.text)})`;
     }
     // this.x of an abstract property (declared by the class or an ancestor,
     // implemented by subclasses as a field or an accessor): read by name
@@ -13013,6 +13010,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   // (m?.size: a number, or undefined)
   if (isPropertyAccessExpression(expr) && expr.name.text === 'size' && hasQuestionDot(expr) && (inferExpressionType(expr.expression) ?? '').startsWith('*TnMap[')) return '*float64';
   if (isPropertyAccessExpression(expr) && !isCallee(expr) && isUndeclaredErrorMember(expr)) return 'interface{}';
+  if (isPropertyAccessExpression(expr) && !isCallee(expr) && !hasQuestionDot(expr) && isUndeclaredObjectTypeMember(expr, inferExpressionType(expr.expression))) return 'interface{}';
   // (a member the receiver's class lacks: read by name, see the emitter)
   if (isPropertyAccessExpression(expr) && !isCallee(expr) && (expr.expression.kind !== 'ThisKeyword' || !!plainFunctionOfThis(expr.expression))) {
     const receiverType = inferExpressionType(expr.expression) ?? '';
@@ -14786,9 +14784,12 @@ function visitOptionalCall(node: AstNode): string {
   if (parentKind === 'ExpressionStatement' || (parentKind === 'ArrowFunction' && node.parent.body === node)) {
     const guard = getTempName('optc');
     const call = makeNarrowedReceiverCall(node, guard, baseType);
-    const callType = withNarrowingType([guard], () => inferExpressionType(call));
+    // (an object pointer — printer.tokenMap?.find(…), a class instance — is
+    // used as it is; a nullable primitive or array reference is dereferenced)
+    const narrowed = /^\*[A-Za-z_]/.test(baseType) && !NULLABLE_PRIMITIVE_TYPES.includes(baseType) ? [] : [guard];
+    const callType = withNarrowingType(narrowed, () => inferExpressionType(call));
     if (parentKind === 'ExpressionStatement' || callType === '') {
-      const callCode = withNarrowing([guard], () => visit(call));
+      const callCode = withNarrowing(narrowed, () => visit(call));
       return `func() { ${guard} := ${baseExpr}; if ${guard} != nil { ${callCode} } }()`;
     }
   }
@@ -14797,7 +14798,10 @@ function visitOptionalCall(node: AstNode): string {
   const returnType = (ifaceFnType ? goFuncReturnType(ifaceFnType) : undefined) ?? classMethodReturnTypes.get(className)?.get(methodName) ?? 'interface{}';
   const nullableType = makeNullableType(returnType);
   const tmp = getTempName('optc');
-  const callExpr = `${tmp}.${methodName}(${args})`;
+  // (the arguments converted to the method's parameter types)
+  const typedCall = makeNarrowedReceiverCall(node, tmp, baseType);
+  const typedArgs = getCalleeSignature(typedCall) && !(node.arguments ?? []).some((a: AstNode) => isSpreadElement(a)) ? visitCallArguments(typedCall).join(', ') : args;
+  const callExpr = `${tmp}.${methodName}(${typedArgs})`;
 
   if (nullableType.startsWith('*') && nullableType.slice(1) === returnType) {
     const valueTemp = getTempName('optcv');
@@ -18749,6 +18753,14 @@ function isUndeclaredClassMember(access: AstNode): boolean {
   if (access.expression.kind === 'SuperKeyword') return false;
   const receiverType = inferExpressionType(access.expression) ?? '';
   return receiverType.startsWith('*') && classNames.has(receiverType.slice(1)) && !classHasMember(receiverType.slice(1), memberKey(access.name) ?? '');
+}
+
+// x.f on an object type (an interface's struct) that has no f — Babel's
+// generator reads node.handlers under @ts-expect-error —: read by name
+function isUndeclaredObjectTypeMember(node: AstNode, leftGoType: string | undefined): boolean {
+  if (!leftGoType?.startsWith('*') || !interfacePropertyTypes.has(leftGoType.slice(1)) || classNames.has(leftGoType.slice(1)) || !isIdentifier(node.name)) return false;
+  const fieldNames = objectFieldNames(leftGoType);
+  return fieldNames.length > 0 && !fieldNames.includes(node.name.text) && getStructFieldGoType(leftGoType.slice(1), node.name.text) === undefined && !isStructGetterField(leftGoType.slice(1), node.name.text);
 }
 
 // err.x on an Error value (*TnError) where x is none of its members: an own
