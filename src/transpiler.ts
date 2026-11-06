@@ -4353,6 +4353,23 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `${name} := func() *${valueType} { if __v, ok := ${lookup.map}.Lookup(${lookup.key}); ok { return &__v }; return nil }()\n\t\t_ = ${name}`;
       }
     }
+    // let ops = eachOperand(v) (a generator) later assigned an array (ops =
+    // [v.callee]): an array of the generator's values, both ways
+    if (isIdentifier(node.name) && !node.type && node.initializer && node.parent?.declarationKind === 'let' && !node.tnDrained) {
+      const initType = inferExpressionType(node.initializer) ?? '';
+      const callee = isCallExpression(unwrapParentheses(node.initializer)) && isIdentifier(unwrapParentheses(node.initializer).expression)
+        ? calledFunctionDeclaration(unwrapParentheses(node.initializer).expression.text, node) : undefined;
+      if (initType.startsWith('chan ') && callee?.asteriskToken && assignsArrayLiteral(node)) {
+        node.tnDrained = true;
+        const at = { line: node.initializer.line, column: node.initializer.column };
+        const spread: AstNode = { kind: 'SpreadElement', expression: node.initializer, ...at };
+        const array: AstNode = { kind: 'ArrayLiteralExpression', elements: [spread], parent: node, ...at };
+        spread.parent = array;
+        node.initializer.parent = spread;
+        node.initializer = array;
+        node.type = { kind: 'TnGoType', goType: `[]${initType.slice(5)}`, parent: node };
+      }
+    }
     // let x; / let x = undefined: typed by what the code assigns to it later
     if (isIdentifier(node.name) && !node.type && (!node.initializer || isNilLiteral(node.initializer))) {
       node.type = { kind: 'TnGoType', goType: inferEvolvingLetType(node), parent: node };
@@ -4888,6 +4905,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             if (isDynamicValue(a.expression)) {
               useHelper('dynamic');
               args[i] = `TnAs[[]${elementType}](${visit(a.expression)})...`;
+            } else if ((inferExpressionType(a.expression) ?? '').startsWith('*TnMap[') && extractMapValueType(inferExpressionType(a.expression)!) === 'struct{}') {
+              // (a Set spread: its values, asserted when typed otherwise)
+              const keyType = extractMapKeyType(inferExpressionType(a.expression)!);
+              useHelper('dynamic');
+              useHelper('arraySubclass');
+              args[i] = keyType === elementType ? `${visit(a.expression)}.Keys()...` : `TnSliceAs[${elementType}](TnToArray(${visit(a.expression)}))...`;
             } else if ((inferExpressionType(a.expression) ?? '').replace(/^\*/, '') === '[]interface{}') {
               // (an any[] spread into typed elements: each asserted)
               useHelper('dynamic');
@@ -11189,7 +11212,9 @@ function getArrayLiteralElementType(node: AstNode): string {
     }
     // mixed element types ([['a', 1]]) make an interface{} array
     // (a call through a function value: its signature's result)
-    const elementType = inferExpressionType(element) ?? (isCallExpression(element) ? goFuncReturnType(functionValueGoType(element.expression) ?? '') : undefined);
+    // (a declared function named as a value: its func type)
+    const elementType = inferExpressionType(element) ??
+      (isCallExpression(element) ? goFuncReturnType(functionValueGoType(element.expression) ?? '') : isIdentifier(element) && declaredFunctions.has(element.text) ? functionValueGoType(element) || 'interface{}' : undefined);
     if (elementType && elementType !== 'nil' && !isUnboundGoType(elementType)) {
       if (firstElementType && firstElementType !== elementType) return 'interface{}';
       if (!firstElementType) firstElementType = elementType;
@@ -13765,6 +13790,15 @@ function assignsStatefulRegex(declaration: AstNode): boolean {
   );
 }
 
+// Whether a variable's function assigns it an array literal (x = [a, b])
+function assignsArrayLiteral(declaration: AstNode): boolean {
+  const name: string = declaration.name.text;
+  let scope = declaration.parent;
+  while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
+  return !!scope && containsNode(scope.body ?? scope, (n: AstNode) =>
+    isBinaryExpression(n) && n.operatorToken.kind === 'EqualsToken' && isIdentifier(n.left) && n.left.text === name && isArrayLiteralExpression(unwrapParentheses(n.right)));
+}
+
 function inferEvolvingLetType(declaration: AstNode): string {
   const name: string = declaration.name.text;
   let scope = declaration.parent;
@@ -14923,6 +14957,9 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
     // the reduce inference)
     const initialNode = (node.arguments ?? [])[1] ? unwrapParentheses(node.arguments[1]) : undefined;
     if (!declaredAcc && initialNode && isObjectLiteralExpression(initialNode) && elementType.startsWith('*') && isStructGoType(elementType.slice(1)) && !classNames.has(elementType.slice(1))) declaredAcc = elementType;
+    // (an object literal start of any elements — a union of object types
+    // held as any —: an any accumulator)
+    if (!declaredAcc && initialNode && isObjectLiteralExpression(initialNode) && elementType === 'interface{}') declaredAcc = 'interface{}';
     // (reduce((acc: T | null, x) => …, null as T | null): the callback's
     // annotated accumulator)
     const accParam = (isArrowFunction(unwrapParentheses(reduceCallback)) || isFunctionExpression(unwrapParentheses(reduceCallback))) ? (unwrapParentheses(reduceCallback).parameters ?? [])[0] : undefined;
@@ -15748,8 +15785,8 @@ function getTypeCategory(typeNode: AstNode | undefined): string | undefined {
   }
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
-    if (name === 'Map') return 'Map';
-    if (name === 'Set') return 'Set';
+    if ((name === 'Map' || name === 'ReadonlyMap') && !classNames.has(name)) return 'Map';
+    if ((name === 'Set' || name === 'ReadonlySet') && !classNames.has(name)) return 'Set';
     if (classNames.has(name)) return 'class';
     if ((name === 'Array' || name === 'ReadonlyArray') && !classNames.has(name)) return 'array';
     // an alias: its target's category
@@ -20055,7 +20092,11 @@ function extractMapValueType(mapType: string): string {
 function getCollectionTypeArguments(node: AstNode): AstNode[] {
   if ((node.typeArguments ?? []).length > 0) return node.typeArguments;
   const contextual = resolveTypeNode(getContextualTypeNode(node));
-  return isTypeReferenceNode(contextual) ? (contextual.typeArguments ?? []) : [];
+  const args: AstNode[] = isTypeReferenceNode(contextual) ? (contextual.typeArguments ?? []) : [];
+  // (a generic callee's own type parameter — Set_equal<T>(a: ReadonlySet<T>) —
+  // is bound by this argument, not a type of its own)
+  if (args.some((a: AstNode) => isTypeParameterReference(a) && !isTypeParameterInScope(a.typeName.text, node))) return [];
+  return args;
 }
 
 function visitNewMap(node: AstNode): string {
