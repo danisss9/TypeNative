@@ -9458,18 +9458,26 @@ function interfaceExtraParamDeclsOnly(className, member) {
 // each virtual method it doesn't define itself
 // A virtual method's __VT signature: the base's, else a mixin's
 function mixinVirtualSignature(base, name) {
+    // (with the result each method is emitted with, as emitMixinSupport writes the __VT)
+    const emitted = (cls, sig) => {
+        const r = emittedMethodResults.get(`${cls}.${name}`);
+        return r !== undefined && r !== sig.result ? { ...sig, result: r } : sig;
+    };
     const own = classMethodSignatures.get(base)?.get(name);
     if (own)
-        return own;
+        return emitted(base, own);
     let first;
+    let owner = '';
     for (const [m, b] of mixinBaseOf) {
         if (b !== base)
             continue;
         const sig = classMethodSignatures.get(m)?.get(name);
-        if (sig && !first)
+        if (sig && !first) {
             first = sig;
+            owner = m;
+        }
     }
-    return first ? widenedMixinSignature(base, name, first) : undefined;
+    return first ? widenedMixinSignature(base, name, emitted(owner, first)) : undefined;
 }
 // A method only mixins define, typed differently by each (typeCastToParameter
 // of a TsTypeCastExpression in one, a TypeCastExpression in another): the
@@ -13215,6 +13223,11 @@ function inferExpressionTypeOf(expr) {
         const base = mixinSystemBase(owner);
         const viaVt = expr.expression.expression.kind === 'ThisKeyword' ? !plainFunctionOfThis(expr.expression.expression) : !!owner && mixinBaseOf.has(owner);
         if (base && viaVt && mixinVirtualMethods.get(base).has(expr.expression.name.text)) {
+            // (a method the base inherits with an annotated result: that result —
+            // the __VT signature written at the end has it)
+            const declared = findClassMethod(base, expr.expression.name.text);
+            if (declared?.type)
+                return getType(declared.type) || undefined;
             const sig = mixinVirtualSignature(base, expr.expression.name.text);
             if (sig)
                 return sig.result || undefined;
