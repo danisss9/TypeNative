@@ -4994,7 +4994,21 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     // Handle spread arguments: fn(...arr) → fn(arr...)
     const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
-    const args = hasSpreadArg ? visitSpreadCallArguments(node) : visitCallArguments(node);
+    let args = hasSpreadArg ? visitSpreadCallArguments(node) : visitCallArguments(node);
+    // (this.m(…) through a mixin system's __vt: the arguments as its __VT
+    // signature takes them — isConstructor?: boolean is a *bool there)
+    const vtSignature = !hasSpreadArg ? mixinVtCallSignature(node) : undefined;
+    if (vtSignature) {
+      const vtParams = goFuncParamTypes(`func(${vtSignature.params})`);
+      if (!vtParams.some((t) => t.startsWith('...')) && args.length <= vtParams.length) {
+        args = args.map((arg, i) => {
+          const argNode = (node.arguments ?? [])[i];
+          const argType = argNode ? inferExpressionType(argNode) : undefined;
+          return argNode && argType && argType !== vtParams[i] && vtParams[i] !== 'interface{}' ? toGoValueOfType(argNode, vtParams[i]) : arg;
+        });
+        for (let i = args.length; i < vtParams.length; i++) args.push(`*new(${vtParams[i]})`);
+      }
+    }
     // Resolve object type for type-aware method dispatch
     let objectType: string | undefined;
     if (isPropertyAccessExpression(node.expression)) {
@@ -9182,6 +9196,18 @@ function adaptedMethodCall(target: string, from: MethodSignature, to: MethodSign
   if (!to.result) return `${prefix}${call}`;
   if (!from.result) return `${prefix}${call}; return *new(${to.result})`;
   return `${prefix}return ${convertBetweenGoTypes(call, from.result, to.result)}`;
+}
+
+// The __VT signature a this.m(…) / obj.m(…) call of a mixin system goes through
+function mixinVtCallSignature(call: AstNode): MethodSignature | undefined {
+  const callee = call.expression;
+  if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.name) || hasQuestionDot(callee)) return undefined;
+  const viaThis = callee.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(callee.expression);
+  if (callee.expression.kind === 'SuperKeyword') return undefined;
+  const receiverClass = viaThis ? (methodCopyClass ?? getEnclosingClassName(call)) : classNameOfGoType(inferExpressionType(callee.expression) ?? '');
+  const base = mixinSystemBase(receiverClass);
+  if (!base || !mixinVirtualMethods.get(base)?.has(callee.name.text)) return undefined;
+  return mixinVirtualSignature(base, callee.name.text);
 }
 
 function isMixinBaseAncestor(name: string): boolean {
@@ -19518,6 +19544,8 @@ function arrayElementNeedsConversion(element: AstNode, elementType: string): boo
     const u = unwrapParentheses(element);
     return u.kind === 'NullKeyword' || (isIdentifier(u) && isReferenceArrayRead(u) && (variableGoTypes.get(u.text) ?? topLevelGoTypes.get(u.text) ?? '').startsWith('*[]'));
   }
+  // ([arrows, []]: an empty literal takes the elements' array type)
+  if (isEmptyObjectOrArrayLiteral(element) && (elementType.startsWith('[]') || elementType.startsWith('*'))) return true;
   const t = inferExpressionType(element);
   // (a T among T | undefined elements is boxed)
   if (NULLABLE_PRIMITIVE_TYPES.includes(elementType) && t === elementType.slice(1)) return true;
