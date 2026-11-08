@@ -2451,6 +2451,14 @@ function lowerDollarNames(sourceFile: AstNode): void {
   const rewrite = (node: AstNode, parent: AstNode | undefined): void => {
     for (const child of childNodes(node)) rewrite(child, node);
     if (!isIdentifier(node) || !renamed.has(node.text) || !parent || isNamedSlot(parent, node)) return;
+    // (export { explode$1 as explode } names the local binding: renamed; an
+    // export of it under its own name keeps that name as the exported one)
+    if (parent.kind === 'ExportSpecifier' && !parent.tnDollarLowered) {
+      parent.tnDollarLowered = true;
+      if (parent.propertyName === node) node.text = renamed.get(node.text)!;
+      else if (!parent.propertyName) parent.propertyName = { ...node, text: renamed.get(node.text)! };
+      return;
+    }
     // property keys and import/export/enum member names keep their source
     // text (they are runtime strings, not Go identifiers)
     if (
@@ -6157,6 +6165,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           : `func(${parameterInfo.signature})${returnType} ${visit(node.body!, { prefixBlockContent: parameterInfo.prefixBlockContent }).trimEnd()}`;
       return `${nestedName} ${node.tnForwardDeclared ? '=' : ':='} ${nestedLiteral}\n\t\t`;
     }
+    // a generator function expression (tokenize = function* (text) {…}):
+    // the channel function a generator declaration is
+    if (isFunctionExpression(node) && node.asteriskToken) return emitChannelFunction(node, false, 'func');
     // an async function expression kept as a value returns a promise
     if (isFunctionExpression(node) && isPromiseReturningArrow(node) && !node.asteriskToken) return emitAsyncArrow(node);
     if (!node.name) {
@@ -8163,6 +8174,8 @@ function visitBlockStatements(statements: AstNode[]): string {
   // declaration): those are defined where they stand
   const functions = statements.filter((st) => isNestedFunctionDeclaration(st));
   const hoisted = new Set<AstNode>();
+  // statement index → the functions defined right after it
+  const earlyDefinitions = new Map<number, AstNode[]>();
   if (functions.length > 0) {
     const blockVariables = new Set<string>();
     for (const st of statements) {
@@ -8178,7 +8191,28 @@ function visitBlockStatements(statements: AstNode[]): string {
     }
     for (const fn of functions) {
       const usesBlockVariables = containsNode(fn, (n) => n !== fn.name && isIdentifier(n) && blockVariables.has(n.text) && !isFieldNameIdentifier(n));
-      if (usesBlockVariables) continue;
+      if (usesBlockVariables) {
+        // (defined once the last block variable it reads is declared — a
+        // call above the function's own position, as JS hoists it, finds it set)
+        const used = new Set<string>();
+        containsNode(fn, (n) => {
+          if (n !== fn.name && isIdentifier(n) && blockVariables.has(n.text) && !isFieldNameIdentifier(n)) used.add(n.text);
+          return false;
+        });
+        let lastDeclaring = -1;
+        statements.forEach((st, i) => {
+          if (isVariableStatement(st) && blockScopeNames({ statements: [st] } as AstNode).some((name: string) => used.has(name))) lastDeclaring = i;
+          else if (st.kind === 'ClassDeclaration' && st.name && used.has(st.name.text)) lastDeclaring = i;
+        });
+        const ownIndex = statements.indexOf(fn);
+        if (lastDeclaring >= 0 && lastDeclaring < ownIndex) {
+          const after = earlyDefinitions.get(lastDeclaring) ?? [];
+          after.push(fn);
+          earlyDefinitions.set(lastDeclaring, after);
+          hoisted.add(fn);
+        }
+        continue;
+      }
       hoisted.add(fn);
       parts.push(withLineMarker(fn, visit(fn)));
     }
@@ -8199,6 +8233,7 @@ function visitBlockStatements(statements: AstNode[]): string {
       }
     }
     parts.push(withLineMarker(statement, visit(statement)) + coverageAfter(statement));
+    for (const fn of earlyDefinitions.get(index) ?? []) parts.push(withLineMarker(fn, visit(fn)));
     // x = 'value' / let x: T | null = 'value': x is a T from here on
     // (after if / else: when both branches leave x set)
     const assignedNames = isIfStatement(statement) && statement.elseStatement ? narrowedAfterIfElse(statement) : nonNullAssignedNames(statement);
@@ -12240,6 +12275,8 @@ function getEnclosingParameterType(expr: AstNode): string | undefined {
 }
 
 function inferArrowFunctionGoType(node: AstNode | AstNode): string {
+  // (a generator function expression: a function returning its channel)
+  if (isFunctionExpression(node) && node.asteriskToken) return nestedFunctionGoType(node);
   // Mirrors getFunctionParametersInfo: trailing defaulted parameters become
   // a variadic `...interface{}`
   const parameters: AstNode[] = node.parameters ?? [];
@@ -20567,6 +20604,12 @@ function emitChannelFunction(node: AstNode, isAsync: boolean, header?: string): 
 const generatorYieldsInferring = new Set<AstNode>();
 
 function getGeneratorYieldType(fn: AstNode): string {
+  // (a function expression's slot type — let tokenize: (text) => Generator<T> — names it too)
+  const contextualReturn = !fn.type && isFunctionExpression(fn) ? resolveTypeNode(getContextualFunctionType(fn)?.type) : undefined;
+  if (contextualReturn && isTypeReferenceNode(contextualReturn) && isIdentifier(contextualReturn.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator'].includes(contextualReturn.typeName.text) && (contextualReturn.typeArguments ?? []).length > 0) {
+    const annotated = getType(contextualReturn.typeArguments[0]);
+    if (annotated && annotated !== ':') return annotated;
+  }
   // (an annotation Generator<T> / Iterable<T> / Iterator<T> names it)
   if (fn.type && isTypeReferenceNode(fn.type) && isIdentifier(fn.type.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator'].includes(fn.type.typeName.text) && (fn.type.typeArguments ?? []).length > 0) {
     const annotated = getType(fn.type.typeArguments[0]);
