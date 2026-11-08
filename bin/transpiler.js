@@ -4843,6 +4843,11 @@ function visitNode(node, options = {}) {
         const emitType = type === ':' ? type : goLocalType(type);
         if (type !== ':')
             ensureGoTypePackages(type);
+        // (const js: any = lazy(() => … js …): declared first, then assigned)
+        if (type !== ':' && initializer && !isPackageScope && !isMainTopLevel && isIdentifier(node.name) && !options.inline &&
+            containsNode(node.initializer, (n) => isIdentifier(n) && n.text === node.name.text && !isFieldNameIdentifier(n))) {
+            return `var ${declName} ${emitType}\n\t\t_ = ${declName}\n\t\t${declName} ${initializer}`;
+        }
         // a local JS never reads is fine; Go rejects it unless it is used
         const loopHeader = node.parent?.parent;
         const inLoopHeader = !!loopHeader && (isForStatement(loopHeader) || isForOfStatement(loopHeader) || isForInStatement(loopHeader));
@@ -5200,7 +5205,7 @@ function visitNode(node, options = {}) {
             typeArgs = '';
         // (f(fn, visitor, undefined): type arguments Go can't infer from a nil)
         if (!typeArgs && calleeDeclaration && !classMethodCallee && (node.typeArguments ?? []).length === 0) {
-            const inst = uninferableInstantiation(calleeDeclaration, node);
+            const inst = uninferableInstantiation(calleeDeclaration, node) ?? conflictingInstantiation(calleeDeclaration, node);
             if (inst)
                 typeArgs = `[${inst.args.join(', ')}]`;
         }
@@ -6012,6 +6017,12 @@ function visitNode(node, options = {}) {
         const chained = !options.inline ? statementsOfChainedAssignment(node) : undefined;
         if (chained)
             return chained.map((st) => visit(st)).join('\t');
+        // (`def satisfies never;` — an exhaustiveness check —: a bare name read)
+        let bare = exprStmt;
+        while (['ParenthesizedExpression', 'SatisfiesExpression', 'AsExpression', 'NonNullExpression', 'TypeAssertionExpression'].includes(bare?.kind))
+            bare = bare.expression;
+        if (!options.inline && isIdentifier(bare) && bare !== exprStmt && (declaredVariables.has(bare.text) || variableGoTypes.has(bare.text)))
+            return `_ = ${visit(bare)};\n\t`;
         // f(op) as a statement, op converted to the parameter's object type (a
         // copy) and f changing its fields: the changes are copied back
         if (!options.inline && isCallExpression(exprStmt)) {
@@ -11494,6 +11505,14 @@ function resolveTypeNode(typeNode, depth = 0) {
         return typeNode;
     if (isAnyTypeNode(typeNode))
         return undefined;
+    // typeof f of a declared function (overloads too): its implementation's
+    // signature (const g: typeof f = (a, b) => … takes f's parameter types)
+    if (typeNode.kind === 'TypeQuery' && isIdentifier(typeNode.exprName) && !declaredVariables.has(typeNode.exprName.text) && !variableGoTypes.has(typeNode.exprName.text)) {
+        const fn = declaredFunctions.get(typeNode.exprName.text);
+        if (fn && isFunctionDeclaration(fn) && (fn.typeParameters ?? []).length === 0) {
+            return { kind: 'FunctionType', parameters: fn.parameters ?? [], type: fn.type, parent: fn };
+        }
+    }
     if (typeNode.kind === 'ParenthesizedType')
         return resolveTypeNode(typeNode.type, depth + 1);
     // readonly T[]: T[]
@@ -13624,6 +13643,15 @@ function inferExpressionTypeOf(expr) {
         const iife = unwrapParentheses(expr.expression);
         if ((isArrowFunction(iife) || isFunctionExpression(iife)) && !iife.asteriskToken && (iife.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
             return `chan ${getPromiseChannelType(iife)}`;
+        }
+        // (wrap(f)(…): the result of the function value the call returned)
+        if (isCallExpression(iife)) {
+            const fnType = inferExpressionType(iife) ?? '';
+            if (fnType.startsWith('func(')) {
+                const result = goFuncReturnType(fnType);
+                if (result)
+                    return result;
+            }
         }
         const objectCallType = inferObjectCallType(expr);
         if (objectCallType)
@@ -15764,6 +15792,9 @@ function inferArrayCallbackReturnType(callback, elementType, fallbackType) {
             }
             return (isBlock(callback.body) ? inferFunctionBodyReturnType(callback) : inferExpressionType(callback.body)) ?? '';
         });
+        // (() => null: an any value — nil is no element type)
+        if (inferred === 'nil')
+            return 'interface{}';
         return inferred || fallbackType;
     }
     if (isIdentifier(callback) && !variableGoTypes.has(callback.text)) {
@@ -16737,10 +16768,11 @@ function getType(typeNode, getArrayType = false) {
         const name = typeNode.typeName.text;
         if (valueShadowedTypeNames.has(name) || openObjectTypeNames.has(name))
             return 'interface{}';
-        // (an object type of several call signatures — Babel's TemplateBuilder,
-        // overloads plus an ast property —: a function value held as any)
+        // (an object type of several call signatures plus properties — Babel's
+        // TemplateBuilder, overloads plus an ast property —: a function value
+        // held as any; bare overloads stay a function type)
         const callableAlias = declaredTypeAliases.get(name);
-        if (callableAlias?.kind === 'TypeLiteral' && (callableAlias.members ?? []).filter((m) => m.kind === 'CallSignature').length > 1)
+        if (callableAlias?.kind === 'TypeLiteral' && (callableAlias.members ?? []).filter((m) => m.kind === 'CallSignature').length > 1 && (callableAlias.members ?? []).some((m) => m.kind !== 'CallSignature'))
             return 'interface{}';
         // (a callable interface — (formatter, ...args): void plus enabled,
         // namespace — is its function; the properties are the function's own)
@@ -20182,6 +20214,33 @@ function uninferableInstantiation(fn, call) {
     const bindings = bindArgumentTypeParameters(params, args, names);
     return { params: names, args: names.map((n) => bindings.get(n) ?? 'interface{}') };
 }
+// insert<T>(array: T[], index, value: T) given a []interface{} array and a
+// []float64 value: Go can't unify T, so it's instantiated as the
+// container's interface{} (the value converts implicitly)
+function conflictingInstantiation(fn, call) {
+    const erased = erasedFunctionTypeParameters(fn);
+    const names = (fn.typeParameters ?? []).map((tp) => tp.name?.text ?? '').filter((n) => n && !erased.has(n));
+    if (names.length === 0)
+        return undefined;
+    const params = fn.parameters ?? [];
+    const args = call.arguments ?? [];
+    if (args.some((a) => isSpreadElement(a)))
+        return undefined;
+    const bindings = bindArgumentTypeParameters(params, args, names);
+    let conflict = false;
+    params.forEach((p, i) => {
+        const arg = args[i];
+        if (!arg || p.dotDotDotToken || !isTypeReferenceNode(p.type) || !isIdentifier(p.type.typeName) || !names.includes(p.type.typeName.text))
+            return;
+        const bound = bindings.get(p.type.typeName.text);
+        const argType = inferExpressionType(arg);
+        if (bound === 'interface{}' && argType && !['interface{}', 'nil'].includes(argType))
+            conflict = true;
+    });
+    if (!conflict || names.some((n) => !bindings.has(n)))
+        return undefined;
+    return { params: names, args: names.map((n) => bindings.get(n)) };
+}
 // Names of top-level generic functions some code reads as a value (passes, stores) rather than calls
 let functionsUsedAsValuesCache;
 function functionsUsedAsValues() {
@@ -21602,6 +21661,8 @@ function emitChannelFunction(node, isAsync, header) {
     }
     const chanType = isAsync ? getPromiseChannelType(node) : getGeneratorYieldType(node);
     const channelVar = '__ch';
+    // (a plain function's this: read on entry, before the body's goroutine)
+    const prologue = !header?.startsWith('func (') && (isFunctionDeclaration(node) || isFunctionExpression(node)) && !isPropertyAssignment(node.parent) ? thisPrologue(node).replace(/\n\t\t$/, '\n\t') : '';
     if (isAsync)
         useHelper('promise');
     const rejectOnPanic = isAsync ? `\n\t\tdefer TnRejectOnPanic(${channelVar})` : '';
@@ -21618,9 +21679,9 @@ function emitChannelFunction(node, isAsync, header) {
     if (isAsync) {
         // The body runs synchronously until its first await, holding the JS baton
         useHelper('eventLoop');
-        return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`);
+        return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`);
     }
-    return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
+    return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`);
 }
 // The type a generator yields: from its first yield expression's operand
 // The generator functions whose yield type is being inferred
@@ -22405,7 +22466,26 @@ function linkModule(key, code, dir, tsx, fileName) {
             renames.delete(name);
     }
     if (renames.size > 0 || namespaces.size > 0 || expandoReads.size > 0) {
-        renameModuleBindings(ast, renames, namespaces, expandoReads);
+        // (a name the module declares only as a type — interface File — still
+        // reads the global as a value: input instanceof File)
+        const valueNames = new Set();
+        const typeNames = new Set();
+        for (const statement of statements) {
+            if (statement.kind === 'InterfaceDeclaration' || statement.kind === 'TypeAliasDeclaration') {
+                if (isIdentifier(statement.name))
+                    typeNames.add(statement.name.text);
+            }
+            else
+                for (const n of moduleOwnNames([statement]))
+                    valueNames.add(n);
+        }
+        typeOnlyRenamedNames = new Set([...typeNames].filter((n) => !valueNames.has(n) && renames.has(n)));
+        try {
+            renameModuleBindings(ast, renames, namespaces, expandoReads);
+        }
+        finally {
+            typeOnlyRenamedNames = new Set();
+        }
     }
     registerSourceFile(ast);
     currentFileDir = prevDir;
@@ -22590,6 +22670,13 @@ function renameLocalBindings(node, names, inObjectPattern) {
         }
     }
 }
+// Names a module declares only as types (interfaces, type aliases), renamed
+// where they name the type but not where they read a value
+let typeOnlyRenamedNames = new Set();
+const TYPE_NAME_PARENTS = new Set([
+    'TypeReference', 'InterfaceDeclaration', 'TypeAliasDeclaration', 'QualifiedName',
+    'ExpressionWithTypeArguments', 'ExportSpecifier', 'ImportSpecifier', 'ExportAssignment'
+]);
 function renameModuleBindings(node, renames, namespaces, expandoReads, inObjectPattern = false) {
     let scopeRenames = renames;
     let scopeNamespaces = namespaces;
@@ -22679,6 +22766,8 @@ function renameModuleBindings(node, renames, namespaces, expandoReads, inObjectP
             }
             if (isIdentifier(child)) {
                 if (!scopeRenames.has(child.text))
+                    continue;
+                if (typeOnlyRenamedNames.has(child.text) && !TYPE_NAME_PARENTS.has(node.kind))
                     continue;
                 const goName = scopeRenames.get(child.text);
                 if (node.kind === 'ShorthandPropertyAssignment') {
