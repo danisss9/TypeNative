@@ -1,0 +1,369 @@
+import type Printer from "../printer.ts";
+import { isLiteral, isMemberExpression, isPattern } from "../../../types/src/index.ts";
+// We inline this package
+// eslint-disable-next-line import/no-extraneous-dependencies
+import * as charCodes from "../../../../charcodes/src/index.ts";
+import type * as t from "../../../types/src/index.ts";
+import { TokenContext, hasPostfixPart } from "../node/index.ts";
+
+export function UnaryExpression(this: Printer, node: t.UnaryExpression) {
+  const { operator } = node;
+  const firstChar = operator.charCodeAt(0);
+  if (firstChar >= charCodes.lowercaseA && firstChar <= charCodes.lowercaseZ) {
+    this.word(operator);
+    this.space();
+  } else {
+    this.tokenChar(firstChar);
+  }
+
+  this.print(node.argument);
+}
+
+export function DoExpression(this: Printer, node: t.DoExpression) {
+  if (node.async) {
+    this.word("async", true);
+    this.space();
+  }
+  this.word("do");
+  this.space();
+  this.print(node.body);
+}
+
+export function ParenthesizedExpression(
+  this: Printer,
+  node: t.ParenthesizedExpression,
+) {
+  this.tokenChar(40);
+  const oldNoLineTerminatorAfterNode = this.enterDelimited();
+  this.print(node.expression, undefined, true);
+  this._noLineTerminatorAfterNode = oldNoLineTerminatorAfterNode;
+  this.rightParens(node);
+}
+
+export function UpdateExpression(this: Printer, node: t.UpdateExpression) {
+  if (node.prefix) {
+    this.token(node.operator, false, 0, true);
+    this.print(node.argument);
+  } else {
+    this.print(node.argument, true);
+    this.token(node.operator, false, 0, true);
+  }
+}
+
+export function ConditionalExpression(
+  this: Printer,
+  node: t.ConditionalExpression,
+) {
+  this.print(node.test);
+  this.space();
+  this.tokenChar(63);
+  this.space();
+  this.print(node.consequent);
+  this.space();
+  this.tokenChar(58);
+  this.space();
+  this.print(node.alternate);
+}
+
+function _printExpressionArguments(
+  this: Printer,
+  node: t.CallExpression | t.NewExpression | t.OptionalCallExpression,
+) {
+  this.tokenChar(40);
+  const oldNoLineTerminatorAfterNode = this.enterDelimited();
+  this.printList(
+    node.arguments,
+    this.shouldPrintTrailingComma(")"),
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+  this._noLineTerminatorAfterNode = oldNoLineTerminatorAfterNode;
+  this.rightParens(node);
+}
+
+export function NewExpression(
+  this: Printer,
+  node: t.NewExpression,
+  parent: t.Node,
+) {
+  const omitArguments =
+    ((this.format.minified &&
+    node.arguments.length === 0 &&
+    !node.typeArguments) && (!node.typeParameters && !node.optional));
+  const wrapInParens = omitArguments && hasPostfixPart(node, parent);
+  if (wrapInParens) this.tokenChar(40);
+  this.word("new");
+  this.space();
+  this.print(node.callee);
+  if (omitArguments) {
+    if (wrapInParens) this.tokenChar(41);
+    return;
+  }
+
+  this.print(node.typeArguments);
+  
+    // @ts-ignore(Babel 7 vs Babel 8) Removed in Babel 8
+    this.print(node.typeParameters); // Legacy TS AST
+    // @ts-ignore(Babel 7 vs Babel 8) Removed in Babel 8
+    if (node.optional) {
+      this.token("?.");
+    }
+  
+
+  if (
+    node.arguments.length === 0 &&
+    this.tokenMap &&
+    !this.tokenMap.endMatches(node, ")") &&
+    (!hasPostfixPart(node, parent) || node.extra?.parenthesized)
+  ) {
+    return;
+  }
+
+  _printExpressionArguments.call(this, node);
+}
+
+export function SequenceExpression(this: Printer, node: t.SequenceExpression) {
+  this.printList(node.expressions);
+}
+
+export function ThisExpression(this: Printer) {
+  this.word("this");
+}
+
+export function Super(this: Printer) {
+  this.word("super");
+}
+
+export function _shouldPrintDecoratorsBeforeExport(
+  this: Printer,
+  node: t.ExportDeclaration & { declaration: t.ClassDeclaration },
+) {
+  if (typeof this.format.decoratorsBeforeExport === "boolean") {
+    return this.format.decoratorsBeforeExport;
+  }
+  return (
+    typeof node.start === "number" && node.start === node.declaration.start
+  );
+}
+
+export function Decorator(this: Printer, node: t.Decorator) {
+  this.tokenChar(64);
+  const { expression } = node;
+  this.print(expression);
+  this.newline();
+}
+
+export function OptionalMemberExpression(
+  this: Printer,
+  node: t.OptionalMemberExpression,
+) {
+  let { computed } = node;
+  const { optional, property } = node;
+
+  this.print(node.object);
+
+  if (!computed && isMemberExpression(property)) {
+    throw new TypeError("Got a MemberExpression for MemberExpression property");
+  }
+
+  // @ts-expect-error todo(flow->ts) maybe instead of typeof check specific literal types?
+  if (isLiteral(property) && typeof property.value === "number") {
+    computed = true;
+  }
+  if (optional) {
+    this.token("?.");
+  }
+
+  if (computed) {
+    this.tokenChar(91);
+    this.print(property);
+    this.tokenChar(93);
+  } else {
+    if (!optional) {
+      this.tokenChar(46);
+    }
+    this.print(property);
+  }
+}
+
+export function OptionalCallExpression(
+  this: Printer,
+  node: t.OptionalCallExpression,
+) {
+  this.print(node.callee);
+
+  
+    // @ts-ignore(Babel 7 vs Babel 8) Removed in Babel 8
+    this.print(node.typeParameters); // legacy TS AST
+  
+
+  if (node.optional) {
+    this.token("?.");
+  }
+
+  this.print(node.typeArguments);
+
+  _printExpressionArguments.call(this, node);
+}
+
+export function CallExpression(this: Printer, node: t.CallExpression) {
+  this.print(node.callee);
+
+  this.print(node.typeArguments);
+  
+    // @ts-ignore(Babel 7 vs Babel 8) Removed in Babel 8
+    this.print(node.typeParameters); // legacy TS AST
+  
+
+  _printExpressionArguments.call(this, node);
+}
+
+export function Import(this: Printer) {
+  this.word("import");
+}
+
+export function AwaitExpression(this: Printer, node: t.AwaitExpression) {
+  this.word("await");
+  this.space();
+  this.print(node.argument);
+}
+
+export function YieldExpression(this: Printer, node: t.YieldExpression) {
+  if (node.delegate) {
+    this.word("yield", true);
+    this.tokenChar(42);
+    if (node.argument) {
+      this.space();
+      // line terminators are allowed after yield*
+      this.print(node.argument);
+    }
+  } else if (node.argument) {
+    this.word("yield", true);
+    this.space();
+    this.print(node.argument);
+  } else {
+    this.word("yield");
+  }
+}
+
+export function EmptyStatement(this: Printer) {
+  this.semicolon(true /* force */);
+}
+
+export function ExpressionStatement(
+  this: Printer,
+  node: t.ExpressionStatement,
+) {
+  this.tokenContext |= TokenContext.expressionStatement;
+  this.print(node.expression);
+  this.semicolon();
+}
+
+export function AssignmentPattern(this: Printer, node: t.AssignmentPattern) {
+  this.print(node.left);
+  if (node.left.type === "Identifier" || isPattern(node.left)) {
+    if (node.left.optional) this.tokenChar(63);
+    this.print(node.left.typeAnnotation);
+  }
+  this.space();
+  this.tokenChar(61);
+  this.space();
+  this.print(node.right);
+}
+
+export function AssignmentExpression(
+  this: Printer,
+  node: t.AssignmentExpression | t.LogicalExpression,
+) {
+  this.print(node.left);
+
+  this.space();
+  this.token(node.operator, false, 0, true);
+  this.space();
+
+  this.print(node.right);
+}
+
+export { AssignmentExpression as LogicalExpression };
+
+export function BinaryExpression(this: Printer, node: t.BinaryExpression) {
+  this.print(node.left);
+
+  this.space();
+  const { operator } = node;
+  if (operator.charCodeAt(0) === charCodes.lowercaseI) {
+    this.word(operator);
+  } else {
+    this.token(operator, false, 0, true);
+    this.setLastChar(operator.charCodeAt(operator.length - 1));
+  }
+  this.space();
+
+  this.print(node.right);
+}
+
+export function BindExpression(this: Printer, node: t.BindExpression) {
+  this.print(node.object);
+  this.token("::");
+  this.print(node.callee);
+}
+
+export function MemberExpression(this: Printer, node: t.MemberExpression) {
+  this.print(node.object);
+
+  if (!node.computed && isMemberExpression(node.property)) {
+    throw new TypeError("Got a MemberExpression for MemberExpression property");
+  }
+
+  let computed = node.computed;
+  // @ts-expect-error todo(flow->ts) maybe use specific literal types
+  if (isLiteral(node.property) && typeof node.property.value === "number") {
+    computed = true;
+  }
+
+  if (computed) {
+    const oldNoLineTerminatorAfterNode = this.enterDelimited();
+    this.tokenChar(91);
+    this.print(node.property, undefined, true);
+    this.tokenChar(93);
+    this._noLineTerminatorAfterNode = oldNoLineTerminatorAfterNode;
+  } else {
+    this.tokenChar(46);
+    this.print(node.property);
+  }
+}
+
+export function MetaProperty(this: Printer, node: t.MetaProperty) {
+  this.print(node.meta);
+  this.tokenChar(46);
+  this.print(node.property);
+}
+
+export function PrivateName(this: Printer, node: t.PrivateName) {
+  this.tokenChar(35);
+  this.print(node.id);
+}
+
+export function V8IntrinsicIdentifier(
+  this: Printer,
+  node: t.V8IntrinsicIdentifier,
+) {
+  this.tokenChar(37);
+  this.word(node.name);
+}
+
+export function ModuleExpression(this: Printer, node: t.ModuleExpression) {
+  this.word("module", true);
+  this.space();
+  this.tokenChar(123);
+  this.indent();
+  const { body } = node;
+  if (body.body.length || body.directives.length) {
+    this.newline();
+  }
+  this.print(body);
+  this.dedent();
+  this.rightBrace(node);
+}
