@@ -13128,6 +13128,9 @@ function isErrorCaptureStackTraceValue(node) {
 function inferExpressionTypeOf(expr) {
     if (isErrorCaptureStackTraceValue(expr))
         return 'func(...interface{})';
+    // (arguments[i]: any value, see the emitter)
+    if (isElementAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'arguments' && (variableGoTypes.get('arguments') ?? '[]interface{}') === '[]interface{}')
+        return 'interface{}';
     // (the global object, as emitted: TnGlobalThis)
     if (isIdentifier(expr) && ((expr.text === 'globalThis' && !variableGoTypes.has('globalThis')) || isNodeGlobalObject(expr)))
         return 'map[string]interface{}';
@@ -21193,8 +21196,8 @@ function usesArgumentsObject(fn) {
     if (isArrowFunction(fn) || !fn.body)
         return false;
     // (a parameter's default may read it too)
-    const inDefaults = (fn.parameters ?? []).some((p) => p.initializer && (isIdentifier(p.initializer) && p.initializer.text === 'arguments' ||
-        containsNode(p.initializer, (n) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n))));
+    // ({ noNewArrows = !arguments[0]?.specCompliant } = {}: a destructured element's too)
+    const inDefaults = (fn.parameters ?? []).some((p) => containsNode(p, (n) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n)));
     if (inDefaults)
         return true;
     return containsNode(fn.body, (n) => {

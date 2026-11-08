@@ -12593,6 +12593,8 @@ function isErrorCaptureStackTraceValue(node: AstNode): boolean {
 
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (isErrorCaptureStackTraceValue(expr)) return 'func(...interface{})';
+  // (arguments[i]: any value, see the emitter)
+  if (isElementAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'arguments' && (variableGoTypes.get('arguments') ?? '[]interface{}') === '[]interface{}') return 'interface{}';
   // (the global object, as emitted: TnGlobalThis)
   if (isIdentifier(expr) && ((expr.text === 'globalThis' && !variableGoTypes.has('globalThis')) || isNodeGlobalObject(expr))) return 'map[string]interface{}';
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
@@ -20271,8 +20273,9 @@ function withArgumentsObject(fn: AstNode, info: FunctionParametersInfo, allowExt
 function usesArgumentsObject(fn: AstNode): boolean {
   if (isArrowFunction(fn) || !fn.body) return false;
   // (a parameter's default may read it too)
-  const inDefaults = (fn.parameters ?? []).some((p: AstNode) => p.initializer && (isIdentifier(p.initializer) && p.initializer.text === 'arguments' ||
-    containsNode(p.initializer, (n: AstNode) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n))));
+  // ({ noNewArrows = !arguments[0]?.specCompliant } = {}: a destructured element's too)
+  const inDefaults = (fn.parameters ?? []).some((p: AstNode) =>
+    containsNode(p, (n: AstNode) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n)));
   if (inDefaults) return true;
   return containsNode(fn.body, (n) => {
     if (n !== fn.body && (isFunctionDeclaration(n) || isFunctionExpression(n) || isMethodDeclaration(n))) return false;
