@@ -1947,6 +1947,11 @@ function lowerPrototypeCall(node: AstNode): AstNode {
       params.pop();
       call.arguments.pop();
     }
+    // (toString / valueOf take none: Function.call.bind(Object.prototype.toString))
+    if (bound.name.text === 'toString' || bound.name.text === 'valueOf') {
+      params.splice(1);
+      call.arguments.splice(1);
+    }
     return { kind: 'ArrowFunction', parameters: params, body: lowerPrototypeCall(call), equalsGreaterThanToken: { kind: 'EqualsGreaterThanToken' }, ...at };
   }
   const how = node.expression.name.text;
@@ -8571,6 +8576,8 @@ function mapGoType(keyType: string, valueType: string): string {
   // (a string | undefined key: the string or nil, compared as values — a
   // *string would key by pointer)
   if (NULLABLE_PRIMITIVE_TYPES.includes(keyType)) keyType = 'interface{}';
+  // (an array key — Set<T[]> — is its reference: arrays are keyed by identity)
+  if (keyType.startsWith('[]') && keyType !== '[]byte') keyType = `*${keyType}`;
   return `*TnMap[${keyType}, ${valueType}]`;
 }
 
@@ -20726,6 +20733,7 @@ function visitNewMap(node: AstNode): string {
   if (typeArguments.length === 2) {
     keyType = getType(typeArguments[0]);
     if (NULLABLE_PRIMITIVE_TYPES.includes(keyType)) keyType = 'interface{}';
+    if (keyType.startsWith('[]') && keyType !== '[]byte') keyType = `*${keyType}`;
     valueType = getType(typeArguments[1]);
     // (arrays held by reference: see jsMapGoType)
     if (isPlainArrayGoType(valueType)) valueType = `*${valueType}`;
@@ -20765,6 +20773,8 @@ function visitNewMap(node: AstNode): string {
 // (string | undefined elements: compared as values, see mapGoType)
 function newSetElementType(node: AstNode): string {
   const element = newSetElementTypeOf(node);
+  // (arrays by their reference, see mapGoType)
+  if (element.startsWith('[]') && element !== '[]byte') return `*${element}`;
   return NULLABLE_PRIMITIVE_TYPES.includes(element) ? 'interface{}' : element;
 }
 
