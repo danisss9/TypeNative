@@ -3906,6 +3906,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (node.expression.kind !== 'TnArrayItems' && arraySubclassOf(node.expression) && !isStringLiteral(node.argumentExpression)) {
       node.expression = arrayItemsNode(node.expression);
     }
+    // (arguments[i] past the arguments passed: undefined)
+    if (isIdentifier(node.expression) && node.expression.text === 'arguments' && (variableGoTypes.get('arguments') ?? '[]interface{}') === '[]interface{}' && !isAssignmentTarget(node)) {
+      useHelper('dynamic');
+      return `TnAt(arguments, ${numericIndex(node.argumentExpression)})`;
+    }
     if (hasQuestionDot(node)) {
       return visitOptionalElementAccess(node);
     }
@@ -5074,7 +5079,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     if (node.operator === 'TildeToken') {
       useHelper('dynamic');
-      return `float64(^TnInt32(${visit(node.operand)}))`;
+      // (~x of an any value: of its number)
+      const operandType = inferExpressionType(node.operand);
+      const operand = operandType === 'float64' ? visit(node.operand) : NULLABLE_PRIMITIVE_TYPES.includes(operandType ?? '') ? `TnNumber(TnPtrValue(${visit(node.operand)}))` : `TnNumber(${visit(node.operand)})`;
+      return `float64(^TnInt32(${operand}))`;
     }
     // -10n / -x on bigints (*big.Int)
     if (node.operator === 'MinusToken' && node.operand.kind === 'BigIntLiteral') {
@@ -17265,10 +17273,13 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   },
   // Sorts in place and returns the array; without a comparator, compares as strings (like JS)
   sort: (obj, args) => sortArray(obj, args),
-  indexOf: (obj, args) =>
-    `func() float64 { __x := ${args[0]}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
-  includes: (obj, args) =>
-    `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
+  // (from a start position: indexOf(x, from), negative from the end)
+  indexOf: (obj, args) => args.length > 1
+    ? (useHelper('dynamic'), `func() float64 { __s := ${obj}; __x := ${args[0]}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`)
+    : `func() float64 { __x := ${args[0]}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
+  includes: (obj, args) => args.length > 1
+    ? (useHelper('dynamic'), `func() bool { __s := ${obj}; __x := ${args[0]}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return true } }; return false }()`)
+    : `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
   // concat(a, [b, c], d): arrays are flattened one level, other values appended
   concat: (obj, args) => {
     const parts = args.map((arg, i) => {
@@ -17847,7 +17858,12 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
   if (method === 'toString' && (node.arguments ?? []).length > 0) {
     return `TnCallMember(${visit(node.expression.expression)}, "toString", ${(node.arguments ?? []).map((a: AstNode) => visit(a)).join(', ')})`;
   }
-  const args = (node.arguments ?? []).map((a: AstNode) => visit(a));
+  // (the bounds / start position as numbers)
+  const args = (node.arguments ?? []).map((a: AstNode, i: number) => {
+    const numeric = method === 'slice' || ((method === 'indexOf' || method === 'includes') && i === 1);
+    const t = inferExpressionType(a);
+    return numeric && t !== 'float64' ? (NULLABLE_PRIMITIVE_TYPES.includes(t ?? '') ? `TnNumber(TnPtrValue(${visit(a)}))` : `TnNumber(${visit(a)})`) : visit(a);
+  });
   return `${helper}(${[visit(node.expression.expression), ...args].join(', ')})`;
 }
 
@@ -19531,8 +19547,10 @@ function coerceBuiltinMethodArguments(node: AstNode, objectType: string, args: s
   if (!kinds || !Object.hasOwn(objectType === 'string' ? STRING_METHOD_PARAMS : ARRAY_METHOD_PARAMS, node.expression.name.text)) return;
   for (let i = 0; i < args.length && i < kinds.length; i++) {
     // (a property of an any value is any value too)
-    const argNode = (node.arguments ?? [])[i];
-    const argType = argTypes[i] ?? (argNode && isPropertyAccessExpression(argNode) && isDynamicValue(argNode.expression) ? 'interface{}' : undefined);
+    let argNode = (node.arguments ?? [])[i];
+    while (argNode && (argNode.kind === 'NonNullExpression' || argNode.kind === 'ParenthesizedExpression')) argNode = argNode.expression;
+    // (node.start! of a node read dynamically: any)
+    const argType = (argTypes[i] && argTypes[i] !== '' ? argTypes[i] : undefined) ?? (argNode && isPropertyAccessExpression(argNode) && (hasDynamicProperties(argNode.expression) || inferExpressionType(argNode) === 'interface{}') ? 'interface{}' : undefined);
     if (kinds[i] === 's' && argType === 'interface{}') {
       useHelper('dynamic');
       args[i] = `TnJSString(${args[i]})`;
@@ -20224,6 +20242,17 @@ function withArgumentsObject(fn: AstNode, info: FunctionParametersInfo, allowExt
   const required = (rest ? params.slice(0, -1) : params).filter((p: AstNode) => !p.questionToken && !p.initializer).length;
   useHelper('dynamic');
   registerLocalVariable('arguments', '[]interface{}');
+  // (trailing defaulted parameters come in __defaultArgs: arguments is the
+  // required ones and those, made before the defaults — a default may read
+  // it: noNewArrows = !arguments[0]?.specCompliant)
+  if (!rest && /__defaultArgs \.\.\.interface\{\}/.test(info.signature)) {
+    const firstDefault = params.findIndex((p: AstNode) => !!p.initializer);
+    const requiredNames = params.slice(0, firstDefault).map((p: AstNode) => getParameterName(p, params));
+    return {
+      ...info,
+      prefixBlockContent: `arguments := TnArguments(${requiredNames.length}, []interface{}{${requiredNames.join(', ')}}, __defaultArgs...)\n\t\t_ = arguments\n\t\t${info.prefixBlockContent}`
+    };
+  }
   if (rest || info.signature.includes('...') || !allowExtra) {
     const restName = rest ? getParameterName(rest, params) : '';
     const extra = rest ? `func() []interface{} { __out := []interface{}{}; for _, __v := range ${restName} { __out = append(__out, __v) }; return __out }()...` : '';
@@ -20241,6 +20270,10 @@ function withArgumentsObject(fn: AstNode, info: FunctionParametersInfo, allowExt
 // A non-arrow function whose own body reads `arguments` (arrows see their parent's)
 function usesArgumentsObject(fn: AstNode): boolean {
   if (isArrowFunction(fn) || !fn.body) return false;
+  // (a parameter's default may read it too)
+  const inDefaults = (fn.parameters ?? []).some((p: AstNode) => p.initializer && (isIdentifier(p.initializer) && p.initializer.text === 'arguments' ||
+    containsNode(p.initializer, (n: AstNode) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n))));
+  if (inDefaults) return true;
   return containsNode(fn.body, (n) => {
     if (n !== fn.body && (isFunctionDeclaration(n) || isFunctionExpression(n) || isMethodDeclaration(n))) return false;
     return isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n);
@@ -25359,19 +25392,33 @@ func TnKeys(obj interface{}) []string {
 	return keys
 }
 
-func TnIncludes(v interface{}, x interface{}) bool {
-	return TnIndexOf(v, x) >= 0
+func TnIncludes(v interface{}, x interface{}, from ...float64) bool {
+	return TnIndexOf(v, x, from...) >= 0
 }
 
-func TnIndexOf(v interface{}, x interface{}) float64 {
+// x.indexOf(y, from?) of an any value (a string or an array)
+func TnIndexOf(v interface{}, x interface{}, from ...float64) float64 {
+	start := 0
+	if len(from) > 0 && from[0] > 0 {
+		start = int(from[0])
+	}
 	switch t := v.(type) {
 	case string:
 		if s, ok := x.(string); ok {
-			return float64(strings.Index(t, s))
+			if start == 0 {
+				return float64(strings.Index(t, s))
+			}
+			runes := []rune(t)
+			if start > len(runes) {
+				start = len(runes)
+			}
+			if i := strings.Index(string(runes[start:]), s); i >= 0 {
+				return float64(start + len([]rune(string(runes[start:])[:i])))
+			}
 		}
 	case []interface{}:
-		for i, item := range t {
-			if TnSame(item, x) {
+		for i := start; i < len(t); i++ {
+			if TnSame(t[i], x) {
 				return float64(i)
 			}
 		}
