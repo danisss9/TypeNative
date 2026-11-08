@@ -3854,6 +3854,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         parts.push(toGoStringLiteral(span.literal.text));
       }
     }
+    // (a tag held as any — template.expression.ast`…` —: called dynamically,
+    // its strings an array of any values)
+    if (isDynamicValue(node.tag)) {
+      useHelper('dynamic');
+      useHelper('error');
+      const dynamicArgs = (template.templateSpans ?? []).map((span: AstNode) => toGoValueOfType(span.expression, 'interface{}'));
+      return `TnCallValue(${tag}, []interface{}{${parts.join(', ')}}${dynamicArgs.length ? `, ${dynamicArgs.join(', ')}` : ''})`;
+    }
     return `${tag}([]string{${parts.join(', ')}}${args.length ? `, ${args.join(', ')}` : ''})`;
   } else if (isNumericLiteral(node)) {
     return `float64(${node.text})`;
@@ -12078,8 +12086,12 @@ function forcedCastSource(node: AstNode): AstNode | undefined {
 // for the same names are set aside, then restored)
 function withFunctionScopeTypes(fn: AstNode, compute: () => string): string {
   const declarations: AstNode[] = [];
+  // (const { names, code } = f(): each binding typed by its field)
+  const destructured: AstNode[] = [];
   const walk = (n: AstNode): void => {
     if (n.kind === 'VariableDeclaration' && isIdentifier(n.name)) declarations.push(n);
+    if (n.kind === 'VariableDeclaration' && isObjectBindingPattern(n.name) && n.initializer &&
+      (n.name.elements ?? []).every((el: AstNode) => !el.dotDotDotToken && isIdentifier(el.name) && (!el.propertyName || isIdentifier(el.propertyName)))) destructured.push(n);
     for (const child of childNodes(n)) if (!FUNCTION_LIKE_KINDS.has(child.kind) && child.kind !== 'ClassDeclaration') walk(child);
   };
   if (fn.body) walk(fn.body);
@@ -12088,6 +12100,7 @@ function withFunctionScopeTypes(fn: AstNode, compute: () => string): string {
   const names: string[] = [];
   for (const p of fn.parameters ?? []) if (isIdentifier(p.name)) names.push(p.name.text);
   for (const d of declarations) names.push(d.name.text);
+  for (const d of destructured) for (const el of d.name.elements ?? []) names.push(el.name.text);
   for (const f of nestedFunctions) names.push(f.name.text);
   const restore = saveVariableTypes(names);
   inferMemoPush();
@@ -12100,6 +12113,17 @@ function withFunctionScopeTypes(fn: AstNode, compute: () => string): string {
     }
   }
   for (const p of fn.parameters ?? []) registerParameterType(p);
+  for (const d of destructured) {
+    const sourceType = inferExpressionType(d.initializer) ?? '';
+    const structName = sourceType.startsWith('*') ? sourceType.slice(1) : '';
+    const anonymous = structName.startsWith('struct{') ? new Map(parseStructFields(structName)) : undefined;
+    for (const el of d.name.elements ?? []) {
+      const field: string = (el.propertyName ?? el.name).text;
+      const fieldType = anonymous ? anonymous.get(goFieldName(field)) : structName ? getStructFieldGoType(structName, field) : undefined;
+      if (fieldType && !el.initializer) setVarGoType(el.name.text, fieldType);
+      else variableGoTypes.delete(el.name.text);
+    }
+  }
   for (const d of declarations) {
     if (d.type) {
       setVarGoType(d.name.text, getType(d.type));
@@ -15993,6 +16017,10 @@ function getType(typeNode: AstNode, getArrayType = false): string {
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     const name = typeNode.typeName.text;
     if (valueShadowedTypeNames.has(name) || openObjectTypeNames.has(name)) return 'interface{}';
+    // (an object type of several call signatures — Babel's TemplateBuilder,
+    // overloads plus an ast property —: a function value held as any)
+    const callableAlias = declaredTypeAliases.get(name);
+    if (callableAlias?.kind === 'TypeLiteral' && (callableAlias.members ?? []).filter((m: AstNode) => m.kind === 'CallSignature').length > 1) return 'interface{}';
     // (a callable interface — (formatter, ...args): void plus enabled,
     // namespace — is its function; the properties are the function's own)
     const callableInterface = declaredInterfaces.get(name);
