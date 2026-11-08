@@ -5488,11 +5488,21 @@ function visitNode(node, options = {}) {
             node.operatorToken.kind === 'AmpersandAmpersandEqualsToken' ||
             node.operatorToken.kind === 'QuestionQuestionEqualsToken') {
             const kind = node.operatorToken.kind;
-            const test = kind === 'QuestionQuestionEqualsToken'
+            let test = kind === 'QuestionQuestionEqualsToken'
                 ? nullishTargetTest(node.left)
                 : kind === 'BarBarEqualsToken'
                     ? `!${wrapCondition(toGoCondition(node.left))}`
                     : toGoCondition(node.left);
+            // (xs[i] ||= [] / ??= past the end: unset — read only when in range)
+            const target = unwrapParentheses(node.left);
+            const arrayType = isElementAccessExpression(target) && !isStringLiteral(target.argumentExpression) ? (inferExpressionType(target.expression) ?? '') : '';
+            if (kind !== 'AmpersandAmpersandEqualsToken' && /^\*?\[\]/.test(arrayType) && arrayType !== '[]byte' && !isTypedArrayGoType(arrayType)) {
+                const arrayCode = arrayType.startsWith('*') ? `(*${visit(target.expression)})` : visit(target.expression);
+                const elementType = arrayType.replace(/^\*/, '').slice(2);
+                useHelper('dynamic');
+                const unset = kind === 'BarBarEqualsToken' ? `!(${truthinessCheck('__a[__i]', elementType)})` : 'TnIsNil(__a[__i])';
+                test = `func() bool { __a := ${arrayCode}; __i := int(${toGoValueOfType(target.argumentExpression, 'float64')}); return __i < 0 || __i >= len(__a) || ${unset} }()`;
+            }
             const operator = { kind: 'EqualsToken' };
             const plain = { kind: 'BinaryExpression', left: node.left, operatorToken: operator, right: node.right, parent: node.parent };
             const statement = { kind: 'ExpressionStatement', expression: plain, parent: node.parent };
@@ -10321,7 +10331,7 @@ function visitGrowingArrayWrite(target, value) {
         return '';
     }
     useHelper('arrayWrite');
-    return `TnSetAt[${elementType}](${pointer}, ${visit(target.argumentExpression)}, ${toGoValueOfType(value, elementType)})`;
+    return `TnSetAt[${elementType}](${pointer}, ${toGoValueOfType(target.argumentExpression, 'float64')}, ${toGoValueOfType(value, elementType)})`;
 }
 // A TS (key, value) callback (JSON replacer / reviver) as the Go
 // func(string, interface{}) interface{} the JSON helpers call; '' if not a function
@@ -17449,6 +17459,11 @@ const callHandlers = {
     },
     'JSON.parse': (_caller, args) => {
         useHelper('jsonStringify');
+        // (a value not typed string — a T narrowed by typeof — is its string)
+        if (args[0] && currentCallArgTypes[0] !== 'string') {
+            useHelper('dynamic');
+            args = [`TnJSString(interface{}(${args[0]}))`, ...args.slice(1)];
+        }
         if (args.length >= 2) {
             const reviver = jsonCallbackAdapter(currentCallArgNodes[1], args[1]);
             if (reviver)
@@ -18543,6 +18558,11 @@ function visitTypeOf(node) {
         return toGoStringLiteral('function');
     }
     const goType = inferExpressionType(node.expression);
+    // (a type parameter's value — map: T —: its run-time type)
+    if (goType && isUnboundGoType(goType.replace(/^\*/, '')) && isTypeParameterInScope(goType.replace(/^\*/, ''), node)) {
+        useHelper('typeOf');
+        return `TnTypeOf(interface{}(${visit(node.expression)}))`;
+    }
     const known = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined' };
     if (goType && known[goType])
         return toGoStringLiteral(known[goType]);
