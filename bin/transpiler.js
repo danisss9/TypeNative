@@ -6261,6 +6261,18 @@ function visitNode(node, options = {}) {
         return visitTryStatement(node, options);
     }
     else if (isReturnStatement(node)) {
+        // (return other in a constructor — TraceMap returning the map it was
+        // given —: that object is the new instance)
+        let ctorOfReturn = node.parent;
+        while (ctorOfReturn && !FUNCTION_LIKE_KINDS.has(ctorOfReturn.kind))
+            ctorOfReturn = ctorOfReturn.parent;
+        if (node.expression && ctorOfReturn && isConstructorDeclaration(ctorOfReturn) && node.expression.kind !== 'ThisKeyword') {
+            const owner = getEnclosingClassName(node);
+            if (owner) {
+                useHelper('dynamic');
+                return `return TnAs[*${getSafeName(owner)}](interface{}(${visit(node.expression)}))` + (options.inline ? '' : ';\n\t');
+            }
+        }
         // return f() where f returns nothing: call it, then return
         if (node.expression && isVoidCall(node.expression)) {
             const bare = { ...node, expression: undefined };
@@ -8424,7 +8436,7 @@ function visitAssignmentValue(node) {
     // (an array field holds a reference: its array)
     if (goType.startsWith('[]') && inferRawExpressionType(node.left) === `*${goType}`) {
         useHelper('dynamic');
-        return `func() ${goType} { ${write}; return TnDerefSlice(${visit(node.left)}) }()`;
+        return `func() ${goType} { ${write}; return TnDerefSlice(${visit(node.left, { rawArrayField: true })}) }()`;
     }
     return `func() ${goType} { ${write}; return ${visit(node.left)} }()`;
 }
@@ -18099,17 +18111,17 @@ const arrayMethodHandlers = {
     },
     lastIndexOf: (obj, args) => {
         const elementType = receiverElementType();
-        return `func() float64 { __x := ${args[0]}; for __i := len(${obj}) - 1; __i >= 0; __i-- { if ${elementEqualsFor(elementType, `${obj}[__i]`, '__x')} { return float64(__i) } }; return float64(-1) }()`;
+        return `func() float64 { __x := ${nullSearchValue(args[0])}; for __i := len(${obj}) - 1; __i >= 0; __i-- { if ${elementEqualsFor(elementType, `${obj}[__i]`, '__x')} { return float64(__i) } }; return float64(-1) }()`;
     },
     // Sorts in place and returns the array; without a comparator, compares as strings (like JS)
     sort: (obj, args) => sortArray(obj, args),
     // (from a start position: indexOf(x, from), negative from the end)
     indexOf: (obj, args) => args.length > 1
-        ? (useHelper('dynamic'), `func() float64 { __s := ${obj}; __x := ${args[0]}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`)
-        : `func() float64 { __x := ${args[0]}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
+        ? (useHelper('dynamic'), `func() float64 { __s := ${obj}; __x := ${nullSearchValue(args[0])}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`)
+        : `func() float64 { __x := ${nullSearchValue(args[0])}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
     includes: (obj, args) => args.length > 1
-        ? (useHelper('dynamic'), `func() bool { __s := ${obj}; __x := ${args[0]}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return true } }; return false }()`)
-        : `func() bool { __x := ${args[0]}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
+        ? (useHelper('dynamic'), `func() bool { __s := ${obj}; __x := ${nullSearchValue(args[0])}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return true } }; return false }()`)
+        : `func() bool { __x := ${nullSearchValue(args[0])}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
     // concat(a, [b, c], d): arrays are flattened one level, other values appended
     concat: (obj, args) => {
         const parts = args.map((arg, i) => {
@@ -18234,7 +18246,20 @@ function sliceIndex(obj, index) {
     return `TnSliceIndex(${index}, len(${obj}))`;
 }
 // Equality of two array elements of the current receiver's element type
+// The value indexOf / includes look for: null among nullable primitives is
+// an untyped nil (an element's TnPtrValue), among others the element type's nil
+function nullSearchValue(arg) {
+    if (arg !== 'nil')
+        return arg;
+    const elementType = receiverElementType();
+    return NULLABLE_PRIMITIVE_TYPES.includes(elementType) || elementType === 'interface{}' ? 'interface{}(nil)' : `*new(${elementType})`;
+}
 function elementEqualsFor(elementType, a, b) {
+    // ((string | null)[]: an element's value, or null)
+    if (NULLABLE_PRIMITIVE_TYPES.includes(elementType)) {
+        useHelper('dynamic');
+        return `TnSame(TnPtrValue(${a}), interface{}(${b}))`;
+    }
     if (elementType === 'interface{}' || elementType.startsWith('*TnMap[') || elementType.startsWith('[]')) {
         useHelper('dynamic');
         return `TnSame(${a}, ${b})`;
