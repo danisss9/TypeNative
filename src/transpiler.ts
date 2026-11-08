@@ -2206,6 +2206,10 @@ function lowerTopLevelDestructuring(sourceFile: AstNode): void {
   const imported = new Set<string>();
   for (const st of sourceFile.statements ?? []) {
     const clause = st.kind === 'ImportDeclaration' ? st.importClause : undefined;
+    // (a TypeScript module's export — const { isCompatTag } = react from
+    // @babel/types — is a value like any other: lowered)
+    const spec: string = st.kind === 'ImportDeclaration' && isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : '';
+    if (spec && isLinkableSpecifier(spec)) continue;
     if (clause?.name) imported.add(clause.name.text);
     const bindings = clause?.namedBindings;
     if (bindings?.kind === 'NamespaceImport') imported.add(bindings.name.text);
@@ -3648,7 +3652,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // `Function` as a value (`const Type = Function`): a sentinel; `instanceof Function` is handled above
     useHelper('functionValue');
     return 'TnFunction';
-  } else if (isIdentifier(node) && node.text === 'globalThis') {
+  } else if (isIdentifier(node) && (node.text === 'globalThis' || (node.text === 'global' && isNodeGlobalObject(node)))) {
+    // (Node's global is globalThis)
     useHelper('globalThis');
     return 'TnGlobalThis';
   } else if (isIdentifier(node)) {
@@ -3915,7 +3920,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `${enumGoName}__name(${toGoValueOfType(key, 'float64')})`;
       }
     }
-    if (isDynamicValue(node.expression)) {
+    // (or the global object read by a computed name: global[name])
+    if (isDynamicValue(node.expression) || (!isAssignmentTarget(node) && inferExpressionType(node.expression) === 'map[string]interface{}' && !isStringLiteral(node.argumentExpression))) {
       useHelper('dynamic');
       return `TnIndex(${visit(node.expression)}, ${dynamicKeyOperand(node.argumentExpression)})`;
     }
@@ -11457,7 +11463,7 @@ function getArrayLiteralElementType(node: AstNode): string {
     }
   }
   // [null, 1]: null has no place in a []float64
-  if (firstElementType && ['float64', 'string', 'bool'].includes(firstElementType) && (node.elements ?? []).some((e: AstNode) => isNilLiteral(e))) return 'interface{}';
+  if (firstElementType && ['float64', 'string', 'bool'].includes(firstElementType) && (node.elements ?? []).some((e: AstNode) => isNilLiteral(unwrapParentheses(e)))) return 'interface{}';
   return firstElementType ?? 'interface{}';
 }
 
@@ -12550,6 +12556,12 @@ function isFunctionPropertyAccess(node: AstNode): boolean {
   return !!inferExpressionType(receiver)?.startsWith('func(') || (isIdentifier(receiver) && declaredFunctions.has(receiver.text) && !variableGoTypes.has(receiver.text));
 }
 
+// `global` read where nothing declares it: Node's global object
+function isNodeGlobalObject(node: AstNode): boolean {
+  return isIdentifier(node) && node.text === 'global' && !isFieldNameIdentifier(node) && !variableGoTypes.has('global') && !topLevelGoTypes.has('global') &&
+    !declaredFunctions.has('global') && !classNames.has('global') && !isLocallyBound(node) && !importAliases.has('global');
+}
+
 // A const initialized to the Function constructor (const F = Function)
 function isFunctionConstructorAlias(id: AstNode): boolean {
   if (classNames.has(id.text) || importAliases.has('Function')) return false;
@@ -12573,6 +12585,8 @@ function isErrorCaptureStackTraceValue(node: AstNode): boolean {
 
 function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (isErrorCaptureStackTraceValue(expr)) return 'func(...interface{})';
+  // (the global object, as emitted: TnGlobalThis)
+  if (isIdentifier(expr) && ((expr.text === 'globalThis' && !variableGoTypes.has('globalThis')) || isNodeGlobalObject(expr))) return 'map[string]interface{}';
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
   // a class as a value (let cls = Parser): its class descriptor
   if (isIdentifier(expr) && classNames.has(expr.text) && !variableGoTypes.has(expr.text) && expr.parent && isClassValueReference(expr) && !isLocallyBound(expr)) return '*TnClass';
