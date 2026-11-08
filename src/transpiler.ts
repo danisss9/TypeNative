@@ -3788,6 +3788,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         useHelper('dynamic');
         return `TnNarrow[${typeofNarrowed}](${getSafeName(node.text)})`;
       }
+      // (an array may be held as the shared *[]T of an array variable)
+      if (typeofNarrowed.startsWith('[]')) {
+        useHelper('dynamic');
+        return `TnAs[${typeofNarrowed}](${getSafeName(node.text)})`;
+      }
       return `interface{}(${getSafeName(node.text)}).(${typeofNarrowed})`;
     }
     return getSafeName(node.text);
@@ -4929,8 +4934,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // callback's result, a channel that receives it once the callback ran)
         if (!isExpressionStatement(unwrapParenthesesUp(node).parent)) {
           const returns = !!cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && !!inferFunctionBodyReturnType(cb);
-          const settle = returns ? `__out <- ${invoke}` : `${invoke}; __out <- nil`;
-          return `func() chan interface{} {\n\t\t__out := make(chan interface{}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${settle} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})\n\t\treturn __out\n\t}()`;
+          const outType = thenResultType(node)?.slice(5) ?? 'interface{}';
+          const settle = returns ? `__out <- ${invoke}` : `${invoke}; __out <- *new(${outType})`;
+          return `func() chan ${outType} {\n\t\t__out := make(chan ${outType}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${settle} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})\n\t\treturn __out\n\t}()`;
         }
         // The promise expression is a go-statement argument: it runs now, with
         // the baton (exec() registering its listeners off the loop would race it)
@@ -6093,11 +6099,21 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // `return otherPromise()` settles with the awaited value; the explicit
         // type argument converts into an unannotated function's interface{}
         const chanType = getPromiseChannelType(asyncFunctionNode!);
-        const returnedType = inferExpressionType(node.expression);
-        const returned =
+        let returnedType = inferExpressionType(node.expression);
+        // (return otherPromise() as any: still a promise to settle with)
+        let bare = node.expression;
+        while (['ParenthesizedExpression', 'AsExpression', 'SatisfiesExpression', 'NonNullExpression', 'TypeAssertionExpression'].includes(bare?.kind)) bare = bare.expression;
+        if (bare !== node.expression && inferExpressionType(bare)?.startsWith('chan ')) returnedType = inferExpressionType(bare);
+        let returned =
           returnedType?.startsWith('chan ') && chanType !== returnedType
             ? `TnAwait(${visit(node.expression)})`
-            : visit(node.expression);
+            : chanType !== 'interface{}' && returnedType && returnedType !== chanType
+              ? toGoValueOfType(unwrapParentheses(node.expression), chanType)
+              : visit(node.expression);
+        if (returnedType?.startsWith('chan ') && chanType !== returnedType && returnedType.slice(5) !== chanType && chanType !== 'interface{}') {
+          useHelper('dynamic');
+          returned = `TnAs[${chanType}](interface{}(${returned}))`;
+        }
         return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); return` + (options.inline ? '' : ';\n\t');
       }
       return `${asyncChannelVar} <- ${visit(node.expression)}; return` + (options.inline ? '' : ';\n\t');
@@ -7369,6 +7385,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       return `TnAs[*TnClass](interface{}(${visit(expr)}))`;
     }
   }
+  // (`{} as never` — a value the types say is never read —: the slot's zero
+  // value, the expression still evaluated)
+  if (goType && goType !== ':' && goType !== 'interface{}' && expr?.kind === 'AsExpression' && expr.type?.kind === 'NeverKeyword') {
+    const inner = unwrapParentheses(expr.expression);
+    if (isObjectLiteralExpression(inner) && (inner.properties ?? []).length === 0 || isIdentifier(inner) || isNilLiteral(inner) || isNumericLiteral(inner) || isStringLiteral(inner)) return `*new(${goType})`;
+    return `func() ${goType} { _ = ${visit(expr.expression)}; return *new(${goType}) }()`;
+  }
   // (a call that never returns — CompilerError.throwTodo(…) — as a value:
   // it runs, and the slot's type is satisfied)
   if (goType && goType !== ':' && goType !== '' && isCallExpression(unwrapParentheses(expr))) {
@@ -7424,7 +7447,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     const otherStructs = isObjectPointer(elem0) && isObjectPointer(raw0.slice(2)) && elem0 !== raw0.slice(2);
     const same = raw0 === goType.slice(1) || (raw0.startsWith('[]') && elem0.startsWith('*') && raw0.slice(2).startsWith('*') && !otherStructs);
     if (same) {
-      if (isIdentifier(u0)) return referenceArrays.has(u0.text) || isReferenceArrayRead(u0) || (inferExpressionType(u0) ?? '').startsWith('*[]') ? getSafeName(u0.text) : `&${getSafeName(u0.text)}`;
+      // (a narrowed any variable — Array.isArray(tpl) — holds no slice to point at)
+      if (isIdentifier(u0) && /^\*?\[\]/.test(withoutNarrowing(() => inferExpressionType(u0)) ?? '')) return referenceArrays.has(u0.text) || isReferenceArrayRead(u0) || (inferExpressionType(u0) ?? '').startsWith('*[]') ? getSafeName(u0.text) : `&${getSafeName(u0.text)}`;
       if (isReferenceFieldAccess(u0) && !hasQuestionDot(u0) && isPropertyAccessExpression(u0)) {
         // a typed class's field: its address (a dynamic object's goes through
         // the usual reference read)
@@ -7694,10 +7718,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       // values (node:sqlite's all()): convert, then box
       const castSource = isAsExpression(expr) ? expr.expression : expr;
       const dynamicElements = goType !== '*[]interface{}' && inferExpressionType(castSource) === '[]interface{}';
-      if (isDynamicValue(castSource) || dynamicElements) {
+      // (an any variable narrowed by Array.isArray: the array it holds,
+      // which may be a shared reference)
+      const narrowedAny = isIdentifier(unwrapParentheses(castSource)) && withoutNarrowing(() => inferExpressionType(castSource)) === 'interface{}';
+      if (isDynamicValue(castSource) || dynamicElements || narrowedAny) {
         useHelper('dynamic');
         // (a reference to an array of this type is shared, not copied)
-        return `TnArrayRef[${goType.slice(3)}](${visit(castSource)})`;
+        return `TnArrayRef[${goType.slice(3)}](${narrowedAny ? getSafeName(unwrapParentheses(castSource).text) : visit(castSource)})`;
       }
       // a call of an array reference function: the reference itself
       const refCall = unwrapParentheses(expr);
@@ -7719,7 +7746,10 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       // pushes and splices change the field (the array is shared, as in JS)
       // (as an argument only: a variable keeps the array, not the field slot)
       const passed = (isCallExpression(expr.parent) || isNewExpression(expr.parent)) && ((expr.parent.arguments ?? []).includes(expr));
-      if (passed && (isPropertyAccessExpression(unwrapParentheses(expr)) || isIdentifier(unwrapParentheses(expr))) && !hasQuestionDot(unwrapParentheses(expr)) && inferExpressionType(expr) === goType.slice(1)) {
+      // (not a narrowed any value — Array.isArray(tpl) of a string | string[] —:
+      // that one is converted below)
+      if (passed && (isPropertyAccessExpression(unwrapParentheses(expr)) || isIdentifier(unwrapParentheses(expr))) && !hasQuestionDot(unwrapParentheses(expr)) && inferExpressionType(expr) === goType.slice(1) &&
+        withoutNarrowing(() => inferExpressionType(expr)) === goType.slice(1)) {
         const field = visit(expr);
         if (/^[\w.()*]+$/.test(field) && !field.endsWith(')')) return `&${field}`;
       }
@@ -10775,6 +10805,8 @@ function getAsExpressionType(node: AstNode): string {
   if (subclass && isArraySubclass(subclass)) return target;
   // (an object passed off as a RegExp: converted when stored as one)
   if (target === '*TnRegex' && !['*TnRegex', '*regexp.Regexp'].includes(inferExpressionType(node.expression) ?? '')) useHelper('regexObject');
+  // (payload.value % (def.value as bigint): the any value as a bigint)
+  if (target === '*tnbig.Int') return target;
   if (isDynamicValue(node.expression) && (isStructGoType(target) || target.startsWith('*'))) {
     return 'interface{}';
   }
@@ -11356,6 +11388,17 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
       // (else the left operand's anonymous object or array type)
       const outer = getContextualTypeNode(parent);
       if (outer) return outer;
+      // (uri ?? ((id) => id): the left operand's declared function type)
+      if (isArrowFunction(unwrapParentheses(node)) || isFunctionExpression(unwrapParentheses(node))) {
+        let declared = resolveTypeNode(getExpressionTypeNode(parent.left));
+        while (declared?.kind === 'ParenthesizedType') declared = resolveTypeNode(declared.type);
+        if (declared && isUnionTypeNode(declared)) {
+          const members = (declared.types ?? []).filter((m: AstNode) => m.kind !== 'UndefinedKeyword' && m.kind !== 'NullKeyword' && !(isLiteralTypeNode(m) && m.literal?.kind === 'NullKeyword'));
+          declared = members.length === 1 ? resolveTypeNode(members[0]) : undefined;
+          while (declared?.kind === 'ParenthesizedType') declared = resolveTypeNode(declared.type);
+        }
+        if (declared && isFunctionTypeNode(declared)) return declared;
+      }
       const leftType = inferExpressionType(parent.left);
       return leftType && (leftType.startsWith('*struct{') || /^\*?\[\]/.test(leftType)) ? { kind: 'TnGoType', goType: leftType, parent: node } : undefined;
     }
@@ -13337,6 +13380,13 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     }
     const fnValueType = variableGoTypes.get(expr.expression.text);
     if (fnValueType?.startsWith('func(')) return goFuncReturnType(fnValueType);
+    // (a module's const holding a function — spa: SafeParseAsync = mk(…) —:
+    // the result of the Go type it is declared with)
+    const topValueType = !fn && !fnValueType ? topLevelGoTypes.get(expr.expression.text) : undefined;
+    if (topValueType?.startsWith('func(')) {
+      const result = goFuncReturnType(topValueType);
+      if (result) return result;
+    }
   }
 
   if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression)) {
@@ -13947,13 +13997,34 @@ function getRejectedPromiseType(node: AstNode): string {
   return getPromiseChannelType(node);
 }
 
+// p.then(cb) used as a value: the promise of cb's result (a promise or
+// nothing returned: any)
+function thenResultType(expr: AstNode): string | undefined {
+  if (!isPropertyAccessExpression(expr.expression) || expr.expression.name.text !== 'then' || hasQuestionDot(expr.expression)) return undefined;
+  const recvType = inferExpressionType(expr.expression.expression);
+  if (!recvType?.startsWith('chan ')) return undefined;
+  const cb = (expr.arguments ?? [])[0];
+  if (!cb || !(isArrowFunction(cb) || isFunctionExpression(cb))) return 'chan interface{}';
+  const result = inferArrayCallbackReturnType(cb, recvType.slice(5) || 'interface{}', '');
+  return !result || result === 'nil' || result.startsWith('chan ') || !inferFunctionBodyReturnType(cb) ? 'chan interface{}' : `chan ${result}`;
+}
+
 function inferPromiseCallType(expr: AstNode): string | undefined {
+  const thenType = thenResultType(expr);
+  if (thenType) return thenType;
   if (isPromiseStaticCall(expr, new Set(['reject']))) return `chan ${getRejectedPromiseType(expr)}`;
   if (isPromiseStaticCall(expr, PROMISE_COMBINATORS)) {
     const elem = promiseAllElementType(expr) ?? 'interface{}';
     return expr.expression.name.text === 'allSettled' ? `chan []*TnSettled[${elem}]` : `chan ${elem}`;
   }
   if (isPromiseMethodCall(expr)) return inferExpressionType(expr.expression.expression);
+  // (Promise.resolve(v): a settled channel of v's type — see the handler)
+  if (isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) && expr.expression.expression.text === 'Promise' &&
+    expr.expression.name.text === 'resolve' && !variableGoTypes.has('Promise') && !classNames.has('Promise')) {
+    const arg = (expr.arguments ?? [])[0];
+    const t = arg ? inferExpressionType(arg) : undefined;
+    return `chan ${t && t !== 'nil' ? t : 'interface{}'}`;
+  }
   return undefined;
 }
 
@@ -14764,6 +14835,14 @@ function visitNullishCoalescingExpression(node: AstNode): string {
       const value = resultType === 'interface{}' ? tmp : `TnAs[${resultType}](${tmp})`;
       steps.push(`if ${tmp} := interface{}(${visit(operand)}); !TnIsNil(${tmp}) { return ${value} }`);
     } else {
+      // (uri ?? ((id) => id) with no declared type to give the literal: its
+      // function adapted to the left side's)
+      const literal = unwrapParentheses(operand);
+      const literalType = (isArrowFunction(literal) || isFunctionExpression(literal)) && resultType.startsWith('func(') && !getContextualFunctionType(literal) ? inferExpressionType(literal) ?? '' : '';
+      if (literalType.startsWith('func(') && literalType !== resultType) {
+        steps.push(`return ${adaptFunctionValue(visit(literal), literalType, resultType)}`);
+        break;
+      }
       steps.push(`return ${toGoValueOfType(operand, resultType)}`);
       break;
     }
@@ -15545,7 +15624,9 @@ function getAliasType(name: string, seen = new Set<string>()): AstNode | undefin
   if (!aliasType) return undefined;
 
   if (seen.has(name)) return undefined;
-  if (isTypeReferenceNode(aliasType) && isIdentifier(aliasType.typeName)) {
+  // (type A = B: B's type; not type Flatten<T> = Identity<{…}>, whose
+  // arguments B's body is instantiated with)
+  if (isTypeReferenceNode(aliasType) && isIdentifier(aliasType.typeName) && (aliasType.typeArguments ?? []).length === 0) {
     const nestedName = aliasType.typeName.text;
     if (typeAliases.has(nestedName) || declaredTypeAliases.has(nestedName)) {
       seen.add(name);
@@ -16195,6 +16276,11 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       return filtered.kind === 'NeverKeyword' ? 'interface{}' : getType(filtered, getArrayType);
     }
     if (isErasedTypeParameter(typeNode, name)) return primitiveTypeParameterConstraint(typeNode, name) ?? 'interface{}';
+    // (a type parameter named like a declared type — extendedTrace<Arg,
+    // Result> beside an interface Result —: the parameter)
+    if ((typeNode.typeArguments ?? []).length === 0 && (classNames.has(name) || declaredInterfaces.has(name) || isObjectTypeName(name)) && isTypeParameterInScope(name, typeNode)) {
+      return getSafeName(name);
+    }
     // Built-in types with no Go counterpart of their own
     // (hasOwn first: a native Record<string, string> gives '' for a missing key)
     const builtinType = Object.hasOwn(BUILTIN_TYPE_NAMES, name) ? BUILTIN_TYPE_NAMES[name] : undefined;
@@ -16670,7 +16756,7 @@ const callHandlers: Record<string, CallHandler> = {
     return `func() chan ${t} { ch := make(chan ${t}, 1); func() { defer TnRejectExecutor(ch); ${settle} }(); return ch }()`;
   },
   'Promise.resolve': (_caller, args) => {
-    const valueType = currentCallArgTypes[0] ?? 'interface{}';
+    const valueType = currentCallArgTypes[0] && currentCallArgTypes[0] !== 'nil' ? currentCallArgTypes[0] : 'interface{}';
     return `func() chan ${valueType} { __ch := make(chan ${valueType}, 1); __ch <- ${args[0] ?? 'nil'}; return __ch }()`;
   },
   structuredClone: (_caller, args) => {
@@ -17864,7 +17950,7 @@ function visitTypeOf(node: AstNode): string {
     useHelper('typeOf');
     return `TnTypeOf(interface{}(${visit(node.expression)}))`;
   }
-  const known: Record<string, string> = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined' };
+  const known: Record<string, string> = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined', '*tnbig.Int': 'bigint', '*TnSymbol': 'symbol' };
   if (goType && known[goType]) return toGoStringLiteral(known[goType]);
   // (a function or object value held in a variable or field may be unset)
   const mayBeUnset = !isArrowFunction(operand) && !isFunctionExpression(operand) && !isObjectLiteralExpression(operand) && !isNewExpression(operand) &&
@@ -22334,6 +22420,7 @@ const helperRequires: Record<string, string[]> = {
   objectAssignTo: ['dynamic', 'orderedMap'],
   promiseAll: ['orderedMap', 'asyncWait', 'promise'],
   promise: ['error', 'eventLoop', 'asyncWait'],
+  dynamicPromise: ['dynamic', 'promise'],
   functionValue: [],
   goMust: ['error'],
   goMaps: ['orderedMap'],
@@ -22388,6 +22475,8 @@ function useHelper(id: string): void {
     importedPackages.add(pkg);
     helperProvidedPackages.add(pkg);
   }
+  // (dynamic values and promises both used: promises held as any get their methods)
+  if ((id === 'dynamic' || id === 'promise') && usedHelpers.has('dynamic') && usedHelpers.has('promise')) useHelper('dynamicPromise');
 }
 
 // Node.js standard library (src/node/*): functions, values and classes the
@@ -23113,6 +23202,7 @@ const helperPackages: Record<string, string[]> = {
   uri: ['strings', 'fmt', 'net/url'],
   promiseAll: ['reflect'],
   promise: ['sync', 'reflect'],
+  dynamicPromise: ['reflect'],
   functionValue: [],
   goMust: [],
   goNums: [],
@@ -24465,6 +24555,9 @@ func TnRestArgsAs[T any](args []interface{}, i int) []T {
 
 // obj.name(…args) on a dynamic value whose class has no such method: a
 // function-valued property (an object literal's method, a record's function)
+// then / catch / finally on a promise held as any (set when promises are used)
+var tnDynamicPromiseMethod func(p reflect.Value, name string, args []interface{}) (interface{}, bool)
+
 func TnCallMember(obj interface{}, name string, args ...interface{}) interface{} {
 	// a Map / Set's methods (Get, Set, Has … on the ordered map)
 	if kind, ok := obj.(interface{ TnJSKind() uint8 }); ok {
@@ -24496,6 +24589,12 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 	}
 	if TnIsNil(obj) {
 		panic(TnNodeError("TypeError", "", fmt.Sprintf("Cannot read properties of undefined (reading '%s')", name)))
+	}
+	// a promise held as any: then / catch / finally (see dynamicPromise)
+	if tnDynamicPromiseMethod != nil && reflect.ValueOf(obj).Kind() == reflect.Chan {
+		if v, handled := tnDynamicPromiseMethod(reflect.ValueOf(obj), name, args); handled {
+			return v
+		}
 	}
 	// a function value's call / apply (fn.apply(this, arguments) of a
 	// Function-typed value): the function with those arguments
@@ -27232,6 +27331,16 @@ func TnDeref[T any](p *T) T {
 	}
 	// (an unset function or object field is undefined)
 	rv := reflect.ValueOf(v)
+	// (a bigint, a symbol: told by their Go types)
+	switch rv.Type().String() {
+	case "*big.Int":
+		if rv.IsNil() {
+			return "undefined"
+		}
+		return "bigint"
+	case "*main.TnSymbol":
+		return "symbol"
+	}
 	switch rv.Kind() {
 	case reflect.Func:
 		if rv.IsNil() {
@@ -30935,6 +31044,88 @@ func TnArrayFlat(items []interface{}, depth float64) []interface{} {
 	}
 	flat(items, int(depth))
 	return out
+}`,
+  dynamicPromise: `// p.then(f, g) / p.catch(g) / p.finally(f) on a promise held as any
+func init() { tnDynamicPromiseMethod = tnPromiseMethodDynamic }
+
+func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (interface{}, bool) {
+	if name != "then" && name != "catch" && name != "finally" {
+		return nil, false
+	}
+	arg := func(i int) interface{} {
+		if i < len(args) && !TnIsNil(args[i]) {
+			return args[i]
+		}
+		return nil
+	}
+	onFulfilled, onRejected := arg(0), arg(1)
+	if name == "catch" {
+		onFulfilled, onRejected = nil, arg(0)
+	}
+	out := make(chan interface{}, 1)
+	ctx := TnAsyncSnapshot()
+	__tnWaitGroup.Add(1)
+	go func() {
+		defer __tnWaitGroup.Done()
+		received, ok := p.Recv()
+		var v interface{}
+		if received.IsValid() {
+			v = received.Interface()
+		}
+		var reason interface{}
+		rejected := false
+		if !ok {
+			reason, rejected = tnRejections.Load(p.Interface())
+		}
+		if name == "finally" {
+			if onFulfilled != nil {
+				TnLoopCall(func() { TnAsyncRun(ctx, func() { TnCallValue(onFulfilled) }) })
+			}
+		} else if handler := map[bool]interface{}{false: onFulfilled, true: onRejected}[rejected]; handler != nil {
+			input := v
+			if rejected {
+				input = reason
+			}
+			var result, thrown interface{}
+			threw := false
+			TnLoopCall(func() {
+				TnAsyncRun(ctx, func() {
+					defer func() {
+						if r := recover(); r != nil {
+							thrown, threw = r, true
+						}
+					}()
+					result = TnCallValue(handler, input)
+				})
+			})
+			if threw {
+				TnReject(out, thrown)
+				return
+			}
+			// (a handler returning a promise: settled with it)
+			if rv := reflect.ValueOf(result); rv.Kind() == reflect.Chan {
+				inner, innerOk := rv.Recv()
+				if !innerOk {
+					if r, innerRejected := tnRejections.Load(rv.Interface()); innerRejected {
+						TnReject(out, r)
+						return
+					}
+				}
+				result = nil
+				if inner.IsValid() {
+					result = inner.Interface()
+				}
+			}
+			v, rejected = result, false
+		}
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		TnAsyncSend(out, v)
+		TnAsyncClose(out)
+	}()
+	return out, true
 }`,
   functionValue: `// The global Function used as a value: an opaque sentinel
 type tnFunctionConstructor struct{}
