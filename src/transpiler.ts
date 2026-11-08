@@ -8779,8 +8779,15 @@ function visitDelete(node: AstNode): string {
 function visitSpreadCallArguments(node: AstNode): string[] {
   const fn = isIdentifier(node.expression) ? calledFunctionDeclaration(node.expression.text, node) : undefined;
   const params: AstNode[] = fn?.parameters ?? [];
-  // (fn(...args) on a function value of fixed parameters: args[i] for each)
-  const calleeType = !fn ? functionValueGoType(node.expression) : '';
+  // (fn(...args) on a function value of fixed parameters: args[i] for each;
+  // super.m(...args) / obj.m(...args) of a method without a rest parameter too)
+  let calleeType = !fn ? functionValueGoType(node.expression) : '';
+  if (!fn && !calleeType.startsWith('func(') && isPropertyAccessExpression(node.expression)) {
+    const method = getCalleeSignature(node);
+    if (method && FUNCTION_LIKE_KINDS.has(method.kind) && !(method.parameters ?? []).some((p: AstNode) => p.dotDotDotToken || p.initializer)) {
+      calleeType = `func(${(method.parameters ?? []).map((p: AstNode) => getParameterGoType(p)).join(', ')})`;
+    }
+  }
   const valueParams = calleeType.startsWith('func(') ? goFuncParamTypes(calleeType) : [];
   if (!fn && calleeType.startsWith('func(') && !valueParams.some((t) => t.startsWith('...'))) {
     useHelper('dynamic');
@@ -12639,6 +12646,10 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   if (isErrorCaptureStackTraceValue(expr)) return 'func(...interface{})';
   // (arguments[i]: any value, see the emitter)
   if (isElementAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'arguments' && (variableGoTypes.get('arguments') ?? '[]interface{}') === '[]interface{}') return 'interface{}';
+  // (String / Number / Boolean as functions, as emitted)
+  if (isIdentifier(expr) && ['String', 'Number', 'Boolean'].includes(expr.text) && !variableGoTypes.has(expr.text) && !classNames.has(expr.text) && expr.parent && isClassValueReference(expr)) {
+    return expr.text === 'String' ? 'func(interface{}) string' : expr.text === 'Number' ? 'func(interface{}) float64' : 'func(interface{}) bool';
+  }
   // (the global object, as emitted: TnGlobalThis)
   if (isIdentifier(expr) && ((expr.text === 'globalThis' && !variableGoTypes.has('globalThis')) || isNodeGlobalObject(expr))) return 'map[string]interface{}';
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
@@ -14097,6 +14108,8 @@ function isLogicalValueExpression(expr: AstNode): boolean {
   if (expr.operatorToken.kind !== 'BarBarToken') return false;
   // (f() || abort(): f()'s value, else the call runs — undefined)
   if (!!leftType && leftType !== 'bool' && emitsNoValue(expr.right)) return true;
+  // (type === 'P' || super.isValidLVal(…) returning any: true, or that value)
+  if (leftType === 'bool' && rightType === 'interface{}') return true;
   return !!leftType && leftType !== 'bool' && !!rightType && rightType !== 'bool';
 }
 
@@ -20451,7 +20464,7 @@ function getFunctionParametersInfo(
       // converted to the parameter's)
       const defaultValue = !param.initializer
         ? `*new(${paramType})`
-        : paramType.startsWith('*[]') || (paramType !== 'interface{}' && inferExpressionType(param.initializer) === 'interface{}')
+        : paramType.startsWith('*[]') || (paramType !== 'interface{}' && (inferExpressionType(param.initializer) === 'interface{}' || inferExpressionType(param.initializer) !== paramType && isObjectLiteralExpression(unwrapParentheses(param.initializer))))
           ? toGoValueOfType(param.initializer!, paramType)
           : visit(param.initializer!);
 
