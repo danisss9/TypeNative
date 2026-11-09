@@ -73,17 +73,16 @@ object).
 At runtime the binary initializes every module the way Node evaluates them —
 zod's whole schema graph constructs, `parseEnvironmentConfig` validates
 identically — and the compiler's whole pipeline runs: the Babel parser parses
-the program (import specifiers, unions, intersection types and renamed
-cross-module declarations included), traverse dispatches visitors, the
+the program (JSX included — the tokenizer's element context stack, the
+TypeScript plugin's JSX/arrow disambiguation try-parses and the alias tables
+@babel/types' validators read all work), traverse dispatches visitors, the
 compiler transforms functions, and the generator prints the output, with the
 logger's `// CompileSuccess` / `// CompileSkip` / `// CompileError` lines
-matching Node's byte for byte, including memo slot and block counts.
-Components and hooks without JSX in the source compile to their memoized form
-identically (`node parity.mjs parse-error` matches; a plain function
-reproduces Node's output and its CompileSuccess line exactly). The remaining
-gap is JSX: the TypeScript plugin's JSX/arrow disambiguation try-parse fails
-natively (`Unexpected token` at the tag), so sources containing JSX do not
-compile yet — most fixtures in [parity.mjs](parity.mjs) report the diff.
+matching Node's byte for byte, including memo slot and block counts. The
+remaining gap is in @babel/traverse's Scope: its `crawl` collects no bindings
+natively (`getBindingIdentifiers` returns nothing, so every function param is
+unknown), and BuildHIR then rejects functions with `Could not find binding
+for param` — [parity.mjs](parity.mjs) reports the diff.
 
 ## Parity with Node.js
 
@@ -93,8 +92,8 @@ the compiler over each fixture (components and hooks through
 test pragmas, `"use no memo"`, and the error paths) with both runtimes.
 stdout, stderr and the exit code must match byte for byte — including the
 memo slot and block counts in the `// CompileSuccess` lines. Failures are
-written to `.cache/failures/`. It reports the current gap (non-JSX paths
-match; every fixture containing JSX still fails to parse natively):
+written to `.cache/failures/`. It reports the current gap (the scope-bindings
+gap above fails every fixture that defines a function):
 
 ```sh
 node parity.mjs
@@ -104,5 +103,5 @@ node parity.mjs
 
 [bench.mjs](bench.mjs) is ready (per-call latency on the demo, scaling on
 generated component files from 8 to 64 KB, alternating Node and native runs
-with output equality enforced) and will report numbers once the JSX parsing
+with output equality enforced) and will report numbers once the scope-bindings
 gap above is closed.

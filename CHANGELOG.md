@@ -12,12 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler`
   + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
-  drove a series of transpiler and runtime fixes (below); the whole pipeline
-  now runs natively — components without JSX compile with the same
-  `// CompileSuccess` counts as Node and the error paths match — while sources
-  containing JSX still fail to parse (the TS plugin's JSX/arrow try-parse),
-  tracked in the example's README; `parity.mjs` reports the gap and
-  `bench.mjs` is ready but not yet reporting
+  drove a series of transpiler and runtime fixes (below); JSX sources now
+  parse natively (the tokenizer's element context stack, the TypeScript
+  plugin's JSX/arrow try-parses, @babel/types' validators) and the compiler
+  runs to its own diagnostics — @babel/traverse's Scope collects no bindings
+  natively yet (`getBindingIdentifiers` returns nothing), which BuildHIR
+  reports as `Could not find binding for param`; tracked in the example's
+  README; `parity.mjs` reports the gap and `bench.mjs` is ready but not yet
+  reporting
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
@@ -149,6 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   null`) reads as nil when absent instead of dereferencing nil
 - Optional chain calls guard the receiver, and a function's result type drives
   `return f(…)` conversions again after the write-back change
+- **A destructured binding of an object's array field** binds the array
+  itself, as in JS: push/pop/splice through it mutate the field's array
+  (`const { context } = this.state` then `context.push(…)` in Babel's JSX
+  tokenizer); it used to bind a copy and drop every mutation, flattening the
+  tokenizer's element context stack
 - **conformance:parallel:** example builds get the 10-minute budget the
   sequential runner already gave them (the vendored-package examples
   transpile tens of thousands of lines and go build the result — the React
