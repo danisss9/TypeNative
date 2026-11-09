@@ -3935,6 +3935,8 @@ function visitNode(node, options = {}) {
             return `${getSafeName(node.text)}.String()`;
         // Array references: reads go through the shared slice-header pointer
         // (`arr === null` tests the reference itself)
+        if (process.env.TN_DEBUG_REF && node.text.includes('context'))
+            console.error(`[ref] ${node.text}: in-refarrays=${referenceArrays.has(node.text)} refread=${isReferenceArrayRead(node)} parent=${node.parent?.kind}`);
         if (isReferenceArrayRead(node)) {
             const parent = node.parent;
             const comparedToNil = parent && isBinaryExpression(parent) &&
@@ -4596,6 +4598,19 @@ function visitNode(node, options = {}) {
                     // (a nullable field a guard narrowed — `if (o.f === null) return;` — binds its value)
                     const sourceKey = getNarrowingKey(node.initializer);
                     const narrowedField = !!sourceKey && !!fieldType && NULLABLE_PRIMITIVE_TYPES.includes(fieldType) && narrowedVariables.has(`${sourceKey}.${propName}`);
+                    // (an array field: the binding is the array itself, as in JS — push
+                    // through it mutates the field's array — so a pointer-based source
+                    // binds the field's address)
+                    const bindFieldAddress = !!fieldType && /^\*?\[\]/.test(fieldType) && fieldType !== '[]byte' && initType.startsWith('*') && !isDynamicValue(node.initializer);
+                    if (bindFieldAddress) {
+                        parts.push(fieldType.startsWith('*[]')
+                            ? `${localName} := (${initExpr}).${goFieldName(propName)}`
+                            : `${localName} := &(${initExpr}).${goFieldName(propName)}`);
+                        // (the *[]T form: it registers the binding as an array reference,
+                        // so reads and pushes go through the shared header)
+                        registerLocalVariable(bindingName(el, localName), fieldType.startsWith('*') ? fieldType : `*${fieldType}`);
+                        continue;
+                    }
                     parts.push(narrowedField
                         ? `${localName} := *(${initExpr}).${goFieldName(propName)}`
                         : `${localName} := (${initExpr}).${goFieldName(propName)}`);
@@ -4767,6 +4782,8 @@ function visitNode(node, options = {}) {
             const inferredType = node.initializer && (!node.type || isInferredAny)
                 ? inferExpressionType(node.initializer)
                 : undefined;
+            if (process.env.TN_DEBUG_DECL && node.name.text.includes('context'))
+                console.error(`[decl] ${node.name.text}: inferred=${inferredType} type0=${node.type ? getType(node.type) : '(none)'} init-kind=${node.initializer?.kind} raw=${inferRawExpressionType(node.initializer)}`);
             variableTypes.delete(node.name.text);
             variableClassNames.delete(node.name.text);
             narrowedVariables.delete(node.name.text);
@@ -4830,8 +4847,14 @@ function visitNode(node, options = {}) {
             else {
                 setVarGoType(node.name.text, undefined);
             }
-            if (referenceArrays.has(node.name.text) && type.startsWith('[]')) {
-                type = variableGoTypes.get(node.name.text);
+            if (referenceArrays.has(node.name.text)) {
+                // (an unannotated binding of an object's array field — const { context }
+                // = this.state —: the registered reference type drives the initializer,
+                // so the binding holds the array itself and push through it mutates the
+                // field, as in JS)
+                const registered = variableGoTypes.get(node.name.text);
+                if (registered)
+                    type = registered;
             }
             // const v = undefined / void 0: Go cannot infer a type from nil
             if (type === ':' && inferredType === 'nil') {
