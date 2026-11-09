@@ -12,10 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler`
   + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
-  drove a series of transpiler and runtime fixes (below); its runtime compile
-  of the demo component is one parser gap away — see the example's README —
-  so its `parity.mjs` (byte-for-byte against Node over components, hooks,
-  pragmas and error paths) and `bench.mjs` are ready but not yet reporting
+  drove a series of transpiler and runtime fixes (below); the whole pipeline
+  now runs natively — components without JSX compile with the same
+  `// CompileSuccess` counts as Node and the error paths match — while sources
+  containing JSX still fail to parse (the TS plugin's JSX/arrow try-parse),
+  tracked in the example's README; `parity.mjs` reports the gap and
+  `bench.mjs` is ready but not yet reporting
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
@@ -107,6 +109,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the new object
 - **`Object.assign`/spread into a fresh object** skips a struct's internal
   `__`-prefixed fields
+- **A property assigned a value its field's Go type can't hold** now replaces
+  the property, as in JS: the field reads as undefined and the value is kept
+  beside the object (`Object.defineProperty`-style visitors — Babel's traverse
+  `explode` replaces a visitor function with `{ enter: fn }`) instead of
+  leaving the stale value readable and dropping the assignment. Reads fall
+  through a nil reference field to what was set beside the object, and
+  `Object.defineProperty` with a getter/setter now defines a real accessor on
+  class instances too (Babel's ParseError computes its `message` in a getter
+  that self-assigns); it used to silently support them only on dynamic objects
+- **A call's argument converted to a copy the callee changes** is written back
+  at every statement position (plain calls, `x = f(op)`, `const x = f(op)`,
+  `return f(op)`), including arguments written `node as SomeType` and calls
+  through a mixin's virtual table, when the callee mutates the parameter's
+  fields — directly or by passing it on to a function that does. The fields it
+  changes are copied back to the original object, and ones the original's type
+  has no slot for are kept beside it (Babel's parser passes its nodes between
+  `parseExport`/`maybeParseExportDeclaration` and reads the fields back on the
+  original); the copy's changes used to be lost, emptying the parse result
+- **`arr.push(x)` on an array read out of a container** (`aliases[k].push(x)`,
+  a Map's array value) stores the appended array back into the container, as
+  push mutates it in JS; it used to append to a copy and drop it, which left
+  @babel/types' alias tables empty and its node validators rejecting every node
+- **A class instance passed where an interface type is expected** converts
+  with the properties it carries beyond its class filling the interface's
+  fields (Babel's parser keeps `imported`/`local` of an import specifier on a
+  bare Node); the conversion used to build a zero-filled struct
+- **`f?.call(thisArg, …)` on a function value** calls nothing when f is unset
+  (an optional callback parameter's Go func type is nil); it used to deref nil.
+  A `do { … = this.parseSubscript(…, state) } while (!state.stop)` also no
+  longer loops forever: the state object the callee writes through the
+  converted parameter is written back
+- **An intersection type alias** (`ParseResult<File> = File & { … }`) compiles
+  to a struct with every member's fields, and an interface renamed for a
+  cross-module name collision still resolves its fields (and shadows a Node
+  global's type) through the original name — the parser's `File` used to
+  convert to a 3-field struct and Node's `File` global type leaked into Babel's
+- **A nullable array parameter with a default** (`tokens: Token[] | null =
+  null`) reads as nil when absent instead of dereferencing nil
+- Optional chain calls guard the receiver, and a function's result type drives
+  `return f(…)` conversions again after the write-back change
+- **conformance:parallel:** example builds get the 10-minute budget the
+  sequential runner already gave them (the vendored-package examples
+  transpile tens of thousands of lines and go build the result — the React
+  Compiler example used to be killed at 90 s and reported as a bare `exit 1`),
+  and the largest example runs alone before the pack
 - `.`, `^` and `$` follow JS's line terminators in every regex, `[]` and `[^]`
   mean what they do in JS, captures reset on each loop iteration, and `\p` is a
   property only with the `u` flag

@@ -83,7 +83,10 @@ function runOne({ name, args: jobArgs }) {
     let out = '';
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (out += d));
-    const t = setTimeout(() => killTree(p), 90000);
+    // An example's build is its own program's: the vendored-package ones
+    // transpile tens of thousands of lines and go build the result (the same
+    // budget the sequential runner gives them); probes get 90s
+    const t = setTimeout(() => killTree(p), name.startsWith('example-') ? 600000 : 90000);
     p.on('close', (code) => {
       clearTimeout(t);
       // Anything the probe left running in its group goes too
@@ -122,6 +125,16 @@ if (warm) {
   jobs.unshift(warm);
   idx = 1;
   await runOne(warm);
+}
+// The largest example (the React Compiler: ~450 transpiled modules) also runs
+// alone before the pack, so its build gets full cores instead of contending
+// with N-1 other jobs
+const heavy = jobs.find((j) => j.name === 'example-react-compiler');
+if (heavy) {
+  jobs.splice(jobs.indexOf(heavy), 1);
+  jobs.splice(idx, 0, heavy);
+  await runOne(heavy);
+  idx++;
 }
 await Promise.all(Array.from({ length: N }, worker));
 console.log('');

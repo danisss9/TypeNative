@@ -17,7 +17,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **7.1x faster per call** (26 vs 188 ms); 1.7x slower on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.2x faster per answer** (717 vs 864 ms streamed)          |
 | [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **8.7x faster per template** (117 vs 1,021 ms); 1.2x slower at 64 KB§ |
-| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form | in progress — builds natively, one parser gap left¶ |
+| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form | in progress — the full pipeline (parse → compile → generate) runs natively; JSX sources still fail to parse natively¶ |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.5.0 (unreleased changes), all examples. See each example's README for full
@@ -39,11 +39,14 @@ templates).
 
 ¶ The largest codebase TypeNative compiles. The binary builds and
 initializes all ~470 vendored modules in Node's evaluation order (see the
-TypeNative CHANGELOG for what that took); its runtime compile of the demo
-component is one parser gap away, tracked in
-[the example's README](react-compiler/README.md#status-what-works-natively).
-[parity.mjs](react-compiler/parity.mjs) and [bench.mjs](react-compiler/bench.mjs)
-are ready and will report the numbers.
+TypeNative CHANGELOG for what that took); the compiler's whole pipeline runs
+natively — components without JSX compile to their memoized form with the
+same `// CompileSuccess` slot and block counts as Node, and error paths print
+the same messages. JSX sources still fail to parse natively (`Unexpected
+token` at the tag), tracked in
+[the example's README](react-compiler/README.md#status-what-works-natively);
+[parity.mjs](react-compiler/parity.mjs) reports the current gap and
+[bench.mjs](react-compiler/bench.mjs) is ready.
 
 ## Running an example
 
