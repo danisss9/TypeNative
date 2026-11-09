@@ -65,7 +65,9 @@ for (const job of jobs) {
   const result = spawnSync(command, [...args, ...jobArgs], {
     cwd: root,
     encoding: 'utf-8',
-    timeout: 60000
+    // (an example's build is its own program's: the vendored-package ones
+    // transpile tens of thousands of lines and go build the result)
+    timeout: job.build ? 600000 : 60000
   });
   if (outDir) rmSync(outDir, { recursive: true, force: true });
   const passed = result.status === 0;

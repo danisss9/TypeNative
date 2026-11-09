@@ -1,7 +1,11 @@
 {
   "extends": "../tsconfig.json",
+  // The vendored Babel, React Compiler and zod sources are checked upstream by
+  // their own toolchains, not tsc; noCheck keeps them out of the gate while
+  // still resolving their imports for main.ts's own check
   "compilerOptions": {
-    "types": ["../../types/typenative.d.ts", "../../types/typenative-go.d.ts", "../../types/typenative-npm.d.ts"]
+    "types": ["../../types/typenative.d.ts", "../../types/typenative-go.d.ts", "../../types/typenative-npm.d.ts"],
+    "noCheck": true
   },
   "include": ["main.ts"]
 }

@@ -292,7 +292,10 @@ each, live in [examples/](examples/). The flagships are
 unmodified source, matching Node's output on all 1,608 yaml-test-suite cases,
 and [marked-cli](examples/marked-cli/): the `marked` markdown parser's CLI,
 also from unmodified source, matching Node on all 2,859 cases of marked's spec
-suites (CommonMark, GFM, its own tests and ReDoS inputs).
+suites (CommonMark, GFM, its own tests and ReDoS inputs). The newest,
+[react-compiler](examples/react-compiler/), compiles the React Compiler
+itself (`babel-plugin-react-compiler` on Babel 7.29 and zod 4 — the largest
+codebase yet) and is one runtime gap away from its benchmarks.
 
 ## How it works
 

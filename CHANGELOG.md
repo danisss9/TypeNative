@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler`
+  + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
+  React components and hooks to their auto-memoized form, natively. The build
+  drove a series of transpiler and runtime fixes (below); its runtime compile
+  of the demo component is one parser gap away — see the example's README —
+  so its `parity.mjs` (byte-for-byte against Node over components, hooks,
+  pragmas and error paths) and `bench.mjs` are ready but not yet reporting
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
@@ -66,6 +73,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Module initialization order:** a program's module-level code now runs in
+  the import graph's evaluation order, as JS evaluates it — each module after
+  the modules it imports, with an import cycle's back edge not waiting (the
+  way Node starts evaluating a cycle mid-way through a module). It used to be
+  the emission order, which a cycle (the React Compiler's entrypoint barrels,
+  zod's) evaluates differently, leaving re-exported values uninitialized.
+  Imports whose bindings the code never uses as values — which tsc's emit
+  elides — no longer order inits either
+- **`new F(…)` on a constructor-function value** now has JS `new` semantics:
+  the function runs with `this` a fresh object, which it may return or fill
+  (zod's `$constructor` factories read `this`); it used to be a plain call,
+  so a function reading `this` saw nothing
+- **`fn.bind(…)` on a function value held as any** returns a bound function
+  (with the bound `this` and prepended arguments) instead of failing with
+  "bind is not a function"
+- **`Object.assign(fn, props)`** copies the properties onto the function
+  value, where `fn.prop` reads them, instead of dropping them
+- **`C.prototype[k] = fn` with a computed key** adds the method to the
+  class's prototype (its instances call it with `this` the instance) instead
+  of failing
+- **A dynamic array method whose name a class or object literal declares
+  too** (`values.map(…)` beside a `Result.map`) runs the array method on
+  arrays and dispatches to the class on class instances, decided at run time
+- **`x ??= v` on a nullable array variable** tests the reference itself
+  instead of dereferencing it, which panicked when it was unset
+- **An empty object literal (`{}`) is no longer a zero-size Go value** — Go
+  gives every zero-size value the same address, which made every `{}` in a
+  program one shared object (each zod schema's internals landed in one place,
+  every schema reading the last-written definition)
+- **Properties set on dynamic objects** are keyed by the object itself, so a
+  garbage-collected object's address being reused cannot hand its properties
+  to the new object
+- **`Object.assign`/spread into a fresh object** skips a struct's internal
+  `__`-prefixed fields
 - `.`, `^` and `$` follow JS's line terminators in every regex, `[]` and `[^]`
   mean what they do in JS, captures reset on each loop iteration, and `\p` is a
   property only with the `u` flag

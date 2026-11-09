@@ -757,6 +757,12 @@ let moduleInitAssignments: string[] | null = null;
 let staticInitSinks: Map<AstNode, string[]> | null = null;
 // The modules' init functions, in JS evaluation order (imports first)
 const moduleInitOrder: string[] = [];
+// Each module's init function by its file path, and its runtime imports'
+// paths: main() runs the inits in their import graph's evaluation order (a
+// post-order walk of these edges), not in emission order, which an import
+// cycle makes diverge from what JS evaluates
+const moduleInitNames = new Map<string, string>();
+const moduleInitDeps = new Map<string, Set<string>>();
 // Tracks already-included files by a stable key to prevent duplicates/cycles
 const includedLocalImports = new Set<string>();
 // Collects Go source files generated from local TS imports (filename → content)
@@ -3216,6 +3222,8 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   originalTopNames.clear();
   destructureTempSeed = 0;
   moduleInitOrder.length = 0;
+  moduleInitNames.clear();
+  moduleInitDeps.clear();
   moduleInitAssignments = null;
   objectLiteralMethodNames.clear();
   stringAccumulators.clear();
@@ -3231,6 +3239,16 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   collectUndefinedPrimitiveFields([...[...linkedModules.values()].map((m) => m.ast), sourceFile]);
   collectMockTargets(sourceFile);
   instrumentCoverage(sourceFile, code);
+  // The entry's runtime imports, in order: the DFS below runs the modules'
+  // inits from them (the entry's own code runs last, after every module)
+  {
+    const mainDeps = new Set<string>();
+    moduleInitDeps.set('::main', mainDeps);
+    for (const stmt of sourceFile.statements ?? []) {
+      if (stmt.kind !== 'ImportDeclaration' || !stmt.linkedKey || stmt.isTypeOnly) continue;
+      if (stmt.importRuntime !== false) mainDeps.add(String(stmt.linkedKey));
+    }
+  }
   importedPackages.clear();
   goSideEffectImports.clear();
   outsideNodes = [];
@@ -3396,7 +3414,29 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
       : goImportLine(pkg);
   // process.on('uncaughtException'): a throw in the top-level code is handed to it too
   // With second entry points, TN_ENTRY runs one of them instead of the program
-  const moduleInits = moduleInitOrder.map((name) => `${name}()\n\t`).join('');
+  // The inits run in the import graph's evaluation order, as in JS: a
+  // post-order walk of the entry's imports, where a module's init runs after
+  // its imports' and an import cycle's back edge (a module already being
+  // evaluated) does not wait. A re-export barrel has no init of its own: its
+  // deps are its importers' too.
+  const orderedInits: string[] = [];
+  {
+    const state = new Map<string, 'visiting' | 'done'>();
+    const visitModule = (id: string): void => {
+      if (state.get(id) !== undefined) return;
+      state.set(id, 'visiting');
+      for (const dep of moduleInitDeps.get(id) ?? []) visitModule(dep);
+      state.set(id, 'done');
+      const init = moduleInitNames.get(id);
+      if (init !== undefined) orderedInits.push(init);
+    };
+    visitModule('::main');
+    // (a module no import reaches — none today — keeps its emission order)
+    for (const name of moduleInitOrder) {
+      if (!orderedInits.includes(name)) orderedInits.push(name);
+    }
+  }
+  const moduleInits = orderedInits.map((name) => `${name}()\n\t`).join('');
   const mainBody = `${coverageLoaded(sourceFile)}${mainCode.trim()}`;
   const programCode = usedHelpers.has('entryPoints')
     ? `if __entry := tnEntryPoints[tnCurrentEntry]; __entry != nil {\n\t__entry()\n\t} else {\n\t${mainBody}\n\t}`
@@ -7085,13 +7125,22 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       return visit(a);
     });
-    // new F(…) where F holds a constructor function (construct signature)
+    // new F(…) where F holds a constructor function (construct signature):
+    // called with this a fresh object (which a function reading this, as
+    // zod's $constructor, needs), unless it returns an object of its own
     if (!classNames.has(className) && inferExpressionType(node.expression)?.startsWith('func(')) {
       // (each argument converted to the signature's parameter type)
-      const ctorParams = goFuncParamTypes(inferExpressionType(node.expression)!);
+      const ctorType = inferExpressionType(node.expression)!;
+      const ctorParams = goFuncParamTypes(ctorType);
       const converted = (node.arguments ?? []).map((a: AstNode, i: number) =>
         ctorParams[i] && !ctorParams[i].startsWith('...') && !isSpreadElement(a) && !ctorParams.some((t: string) => t.startsWith('...')) ? toGoValueOfType(a, ctorParams[i]) : args[i]);
-      return `${className}(${converted.join(', ')})`;
+      useHelper('classes');
+      useHelper('dynamic');
+      useHelper('error');
+      // (the constructed value is the signature's return type)
+      const resultType = goFuncReturnType(ctorType);
+      const constructed = `TnNew(${[className, ...converted].join(', ')})`;
+      return !resultType || resultType === 'interface{}' ? constructed : `TnAs[${resultType}](${constructed})`;
     }
     // omitted parameters are zero values (nil for pointers): optional ones
     // as in TS, and missing ones as JS passes undefined (a JS file's calls
@@ -8164,6 +8213,9 @@ function nullishTargetTest(target: AstNode): string {
       return isNilableGoType(extractMapValueType(mapType)) ? `(${missing} || ${map}.Get(${key}) == nil)` : missing;
     }
   }
+  // (an array reference is the *[]T itself: nil when unset — the default read
+  // would dereference it)
+  if (isIdentifier(target) && isReferenceArrayRead(target)) return `${getSafeName(target.text)} == nil`;
   return `${visit(target)} == nil`;
 }
 
@@ -10750,7 +10802,9 @@ function getObjectLiteralGoType(node: AstNode): string {
     const value = isPropertyAssignment(p) ? p.initializer : p.name;
     fields.set(goFieldName(p.name.text), objectFieldGoType(toFieldGoType(inferExpressionType(value))));
   }
-  const structType = `struct{ ${structFieldsBody(fields)} }`;
+  // (an empty object type is never zero-size: every Go value of a zero-size
+  // type shares one address, which would make every `{}` the same object)
+  const structType = fields.size === 0 ? 'struct{ __keys *[]string }' : `struct{ ${structFieldsBody(fields)} }`;
   registerStructAccessors(structType, node);
   return `*${structType}`;
 }
@@ -11100,7 +11154,16 @@ function visitAnonymousStructLiteral(node: AstNode): string {
       values.push(`${field}: ${fieldType.startsWith('*[]') ? toGoValueOfType(valueNode, fieldType) : visit(valueNode)}`);
     }
   }
-  const structType = `struct{ ${structFieldsBody(fields)} }`;
+  const contextualStruct = (inferExpectedTypeFromContext(node) ?? '').replace(/^\*/, '');
+  const structType = fields.size === 0
+    ? // (an empty object still needs an identity of its own: Go gives every
+      // zero-size value the same address, which would share one object
+      // between every `{}` in the program — the contextual struct type, when
+      // there is one, is non-zero-size for the same reason)
+      contextualStruct.startsWith('struct{') && contextualStruct.includes('__keys')
+        ? contextualStruct
+        : 'struct{ __keys *[]string }'
+    : `struct{ ${structFieldsBody(fields)} }`;
   registerStructAccessors(structType, node);
   if (steps.length === 0) {
     return `&${structType}${compositeBody(values)}`;
@@ -18096,6 +18159,32 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
     if (!resultType || isDiscardedValue(node)) return `func() { ${stop}${read}; ${op}; ${writeBack} }()`;
     return `func() ${resultType} { ${stop}${read}; __r := ${op}; ${writeBack}; return __r }()`;
   }
+  // a non-mutating array method on an any value whose name an object literal's
+  // function has too (so the call dispatches, as TnCall_m): on its elements,
+  // unless the value dispatches (decided at run time)
+  if (ARRAY_ONLY_METHODS.has(method) && objectLiteralMethodNames.has(method) && !dynamicArrayOrDispatch.has(node)) {
+    dynamicArrayOrDispatch.add(node);
+    const dispatched = visitDynamicDispatch(node);
+    const arrayPath = (() => {
+      const receiver = node.expression.expression;
+      const elements = getTempName('arr');
+      const local: AstNode = { kind: 'Identifier', text: elements, parent: node.expression };
+      registerLocalVariable(elements, '[]interface{}');
+      const call: AstNode = { ...node, expression: { ...node.expression, expression: local } };
+      call.expression.parent = call;
+      local.parent = call.expression;
+      const resultType = inferExpressionType(call) || 'interface{}';
+      const op = visit(call);
+      return `func() ${resultType} { ${elements} := TnAs[[]interface{}](${visit(receiver)}); return ${op} }()`;
+    })();
+    dynamicArrayOrDispatch.delete(node);
+    if (dispatched && arrayPath) {
+      useHelper('dynamic');
+      const receiverCode = visit(node.expression.expression);
+      if (isDiscardedValue(node)) return `func() { if TnIsSlice(${receiverCode}) { ${arrayPath} } else { ${dispatched} } }()`;
+      return `func() interface{} { if TnIsSlice(${receiverCode}) { return ${arrayPath} }; return ${dispatched} }()`;
+    }
+  }
   const castCall = castDynamicReceiverCall(node);
   if (castCall) return visit(castCall);
   const dynamicHelpers: Record<string, string> = {
@@ -21379,9 +21468,75 @@ function linkedExportName(key: string, name: string, seen: Set<string>): string 
   return undefined;
 }
 
+// Subtrees that hold a type, whose identifiers are erased at run time (as
+// tsc's emit does): references inside them order no module init
+const TYPE_ONLY_KINDS = new Set([
+  'TypeLiteral', 'TypeReference', 'ParenthesizedType', 'TypeQuery', 'TypeOperator',
+  'IntersectionType', 'ArrayType', 'TypePredicate', 'TupleType', 'MappedType',
+  'LiteralType', 'UnionType', 'ThisType', 'InferType', 'IndexedAccessType',
+  'TemplateLiteralType', 'FunctionType', 'ConstructorType', 'ConditionalType'
+]);
+
+// Declaration kinds whose `type` field is an annotation (erased)
+const ANNOTATED_KINDS = new Set([
+  'Parameter', 'PropertySignature', 'PropertyDeclaration', 'VariableDeclaration',
+  'FunctionDeclaration', 'MethodDeclaration', 'GetAccessor', 'SetAccessor', 'IndexSignature'
+]);
+
+// The local names the module's code references in value positions: what tsc
+// keeps an import for (a binding only used in type positions is elided)
+function moduleValueReferences(sf: AstNode): Set<string> {
+  const refs = new Set<string>();
+  const walk = (node: AstNode | AstNode[] | undefined): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    if (typeof node.kind !== 'string') return;
+    if (TYPE_ONLY_KINDS.has(node.kind)) return;
+    if (node.kind === 'ImportDeclaration') return;
+    if (node.kind === 'HeritageClause' && node.token === 'ImplementsKeyword') return;
+    if (isIdentifier(node)) {
+      refs.add(node.text);
+      return;
+    }
+    // (the value side of x as T / <T>x survives; the type does not)
+    if (node.kind === 'AsExpression' || node.kind === 'TypeAssertionExpression') {
+      walk(node.expression);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'parent' || NON_REFERENCE_KEYS.has(key)) continue;
+      if (key === 'type' && ANNOTATED_KINDS.has(node.kind)) continue;
+      if (key === 'typeArguments') continue;
+      walk(node[key]);
+    }
+  };
+  walk(sf.statements);
+  return refs;
+}
+
+// Whether an import statement brings in anything at run time: a re-export, a
+// side-effect import, a default or namespace binding used as a value, or a
+// named binding referenced in a value position (as tsc's emit keeps those)
+function importHasRuntimeBinding(stmt: AstNode, valueRefs: Set<string>): boolean {
+  if (stmt.reexport) {
+    const elements = stmt.importClause?.namedBindings?.elements ?? [];
+    return elements.length === 0 || elements.some((el: AstNode) => !el.isTypeOnly);
+  }
+  const clause = stmt.importClause;
+  if (!clause || (!clause.name && !clause.namedBindings)) return true;
+  if (clause.name) return valueRefs.has(clause.name.text);
+  const bindings = clause.namedBindings;
+  if (bindings?.kind !== 'NamedImports') return valueRefs.has(bindings?.name?.text ?? '');
+  const elements = bindings.elements ?? [];
+  if (elements.length === 0) return true;
+  return elements.some((el: AstNode) => !el.isTypeOnly && valueRefs.has(el.name.text));
+}
+
 // Parses and links a module (and the modules it imports); returns its AST
-function linkModule(key: string, code: string, dir: string | null, tsx: boolean, fileName: string): AstNode {
-  const existing = linkedModules.get(key);
+function linkModule(key: string, code: string, dir: string | null, tsx: boolean, fileName: string): AstNode {  const existing = linkedModules.get(key);
   if (existing) return existing.ast;
   const prevDir = currentFileDir;
   const prevTsx = currentFileIsTsx;
@@ -21459,6 +21614,15 @@ function linkModule(key: string, code: string, dir: string | null, tsx: boolean,
     } else if (statement.kind === 'ExportAssignment' && isIdentifier(statement.expression) && ownNames.has(statement.expression.text)) {
       mod.exports.set('default', renames.get(statement.expression.text) ?? statement.expression.text);
     }
+  }
+  // Whether each import brings in anything at run time, decided on the module
+  // as parsed: the binding renames below erase the references that keep an
+  // import alive (a namespace object's member reads become direct calls), and
+  // tsc's emit keeps an import whose bindings the code uses as values
+  const preValueRefs = moduleValueReferences(ast);
+  for (const statement of statements) {
+    if (statement.kind !== 'ImportDeclaration') continue;
+    statement.importRuntime = importHasRuntimeBinding(statement, preValueRefs);
   }
   // (export * from './x': known before the imports are linked, so a module
   // importing this one back — a cycle — finds the names passing through)
@@ -21963,6 +22127,16 @@ function includeLocalImport(
   const sf = linkedAst ?? parseSource(code);
   collectMockTargets(sf);
   instrumentCoverage(sf, code);
+  // The module's runtime imports (its init runs after theirs, as in JS): the
+  // facts were decided at link time, on the module as parsed (see linkModule)
+  const moduleDeps = new Set<string>();
+  moduleInitDeps.set(fileName, moduleDeps);
+  const valueRefs = moduleValueReferences(sf);
+  for (const stmt of sf.statements) {
+    if (stmt.kind !== 'ImportDeclaration' || !stmt.linkedKey || stmt.isTypeOnly) continue;
+    const runtime = stmt.importRuntime ?? importHasRuntimeBinding(stmt, valueRefs);
+    if (runtime) moduleDeps.add(String(stmt.linkedKey));
+  }
   // (`func(` without a name is an IIFE statement, not a declaration)
   const isDeclarationLine = (line: string) => /^(var|const|type|import)\b|^func\s|^\/\/go:embed /.test(line.trim());
   const declarationLines: string[] = [];
@@ -22012,7 +22186,10 @@ function includeLocalImport(
   // The module's code runs from main, after the modules it imports (JS
   // evaluation order), not in Go's file-ordered init()
   const initName = `tnModuleInit_${moduleInitOrder.length + 1}_${goFileName.replace(/\.go$/, '').replace(/[^A-Za-z0-9_]/g, '_')}`;
-  if (statementLines.length > 0) moduleInitOrder.push(initName);
+  if (statementLines.length > 0) {
+    moduleInitOrder.push(initName);
+    moduleInitNames.set(fileName, initName);
+  }
   const fileInline = [
     ...declarationLines,
     ...(statementLines.length > 0 ? [`func ${initName}() {\n\t${statementLines.join('\n\t')}\n}`] : [])
@@ -22431,14 +22608,15 @@ const helperRequires: Record<string, string[]> = {
   builtins: ['error', 'dynamic', 'bigint'],
   date: ['error', 'dynamic'],
   goBlocking: ['error', 'eventLoop'],
-  decorators: [],
+  decorators: ['functionThis'],
+  functionThis: [],
   jsx: [],
   objectIntegrity: [],
   structuredClone: [],
   globalThis: ['dynamic'],
   namedGroups: ['orderedMap', 'regexMatch'],
   fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
-  dynamic: ['error', 'strIndex', 'toFixed'],
+  dynamic: ['error', 'strIndex', 'toFixed', 'functionThis'],
   regexMatch: ['strIndex'],
   stringSearch: ['strIndex'],
   classes: ['dynamic', 'error', 'orderedMap', 'decorators'],
@@ -24397,7 +24575,9 @@ func TnGet(obj interface{}, key string) interface{} {
 var tnProtoMethodOf func(obj interface{}, key string) (interface{}, bool)
 
 // Properties set on an object whose type has no such field (JS adds them to
-// the object): kept beside it, by the object's address
+// the object): kept beside it, keyed by the object itself (which also keeps
+// it alive: a recycled address must not inherit a collected object's
+// properties)
 var tnExpandos sync.Map
 
 // A function value's identity: its closure (each function expression made
@@ -24428,7 +24608,9 @@ func tnExpandoSet(obj interface{}, key string, value interface{}) bool {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
 		return false
 	}
-	props, _ := tnExpandos.LoadOrStore(rv.Pointer(), &sync.Map{})
+	// (keyed by the object itself: a recycled address of a collected object
+	// must not hand its expandos to the new object at the same address)
+	props, _ := tnExpandos.LoadOrStore(obj, &sync.Map{})
 	props.(*sync.Map).Store(key, value)
 	return true
 }
@@ -24445,7 +24627,7 @@ func tnExpandoGet(obj interface{}, key string) (interface{}, bool) {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, false
 	}
-	props, ok := tnExpandos.Load(rv.Pointer())
+	props, ok := tnExpandos.Load(obj)
 	if !ok {
 		return nil, false
 	}
@@ -24612,6 +24794,22 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 			}
 		}
 		return TnCallValue(obj, rest...)
+	}
+	// a function value's bind: a function calling it with this and the
+	// arguments given at bind time prepended
+	if name == "bind" && reflect.ValueOf(obj).Kind() == reflect.Func {
+		var thisArg interface{}
+		rest := []interface{}{}
+		if len(args) > 0 {
+			thisArg = args[0]
+			rest = append(rest, args[1:]...)
+		}
+		return func(callArgs ...interface{}) interface{} {
+			prev := TnThis
+			TnThis = thisArg
+			defer func() { TnThis = prev }()
+			return TnCallValue(obj, append(rest, callArgs...)...)
+		}
 	}
 	fn := TnGet(obj, name)
 	if fn == nil {
@@ -24896,8 +25094,15 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 			return
 		}
 	}
-	if k, ok := key.(string); ok && tnSetMember(obj, k, value) {
-		return
+	// obj[key] = v with a computed key: the paths TnSet takes for obj.k = v
+	if k, ok := key.(string); ok {
+		if p, ok := obj.(interface{ TnProtoSet(string, interface{}) }); ok {
+			p.TnProtoSet(k, value)
+			return
+		}
+		if tnSetMember(obj, k, value) || tnExpandoSet(obj, k, value) {
+			return
+		}
 	}
 	panic(fmt.Sprintf("TnSetIndex: cannot set property %v", key))
 }
@@ -29139,6 +29344,13 @@ func TnAssignTo[T any](target T, sources ...interface{}) T {
 			}
 			continue
 		}
+		// Object.assign(fn, props): properties of the function value
+		if reflect.ValueOf(any(target)).Kind() == reflect.Func {
+			for _, prop := range tnOwnProps(src) {
+				tnExpandoSet(any(target), prop.key, prop.value)
+			}
+			continue
+		}
 		if tnAssignFields(any(target), src) {
 			continue
 		}
@@ -29153,7 +29365,12 @@ func TnEmptyLike(v interface{}) interface{} {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct && rv.Elem().Type().Name() != "" {
 		if _, ok := v.(interface{ Entries() [][]interface{} }); !ok {
-			return reflect.New(rv.Elem().Type()).Interface()
+			// (a zero-size struct: every value of it is the same address, and
+			// a fresh empty object needs one of its own)
+			if rv.Elem().Type().Size() > 0 {
+				return reflect.New(rv.Elem().Type()).Interface()
+			}
+			return TnNewMap[string, interface{}]()
 		}
 	}
 	return TnNewMap[string, interface{}]()
@@ -29433,7 +29650,8 @@ func tnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
 	if rv.Kind() == reflect.Struct {
 		rt := rv.Type()
 		for i := 0; i < rt.NumField(); i++ {
-			if rv.Field(i).Kind() == reflect.Func {
+			name := rt.Field(i).Name
+			if rv.Field(i).Kind() == reflect.Func || (len(name) > 1 && name[0] == '_' && name[1] == '_') {
 				continue
 			}
 			if !rv.Field(i).CanInterface() {
@@ -30981,7 +31199,7 @@ func tnJsxString(v interface{}) string {
 	}
 	return fmt.Sprint(v)
 }`,
-  decorators: `// this inside plain functions: the receiver of the decorated method being called
+  functionThis: `// this inside plain functions: the receiver of the method, call or bind
 var TnThis interface{}
 
 // f.call(thisArg, …): f runs with this (TnThis) set to thisArg
@@ -30990,9 +31208,8 @@ func TnWithThis[R any](this interface{}, f func() R) R {
 	TnThis = this
 	defer func() { TnThis = prev }()
 	return f()
-}
-
-// The context a decorator receives (kind is "method" or "class")
+}`,
+  decorators: `// The context a decorator receives (kind is "method" or "class")
 type TnDecoratorContext struct {
 	kind    string
 	name    string
