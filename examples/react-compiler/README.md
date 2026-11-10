@@ -80,9 +80,15 @@ compiler transforms functions, and the generator prints the output, with the
 logger's `// CompileSuccess` / `// CompileSkip` / `// CompileError` lines
 matching Node's byte for byte, including memo slot and block counts. The
 remaining gap is in @babel/traverse's Scope: its `crawl` collects no bindings
-natively (`getBindingIdentifiers` returns nothing, so every function param is
-unknown), and BuildHIR then rejects functions with `Could not find binding
-for param` — [parity.mjs](parity.mjs) reports the diff.
+natively. `registerBinding` reads `path.getOuterBindingIdentifiers(true)`,
+whose values Babel builds as `(ids[name] = ids[name] || []); _ids.push(id)` —
+an array stored into a dynamic object and then mutated through a local
+binding. The push appends into a copy of the slice header (the entry in the
+dynamic object keeps its zero length), so no binding is ever registered and
+BuildHIR rejects functions with `Could not find binding for param` —
+[parity.mjs](parity.mjs) reports the diff. The general fix is dynamic-array
+aliasing: pushes through an any binding need to store through to the object
+the array lives in (the same JS semantics `o.list.push(x)` already has).
 
 ## Parity with Node.js
 

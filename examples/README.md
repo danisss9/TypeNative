@@ -43,8 +43,10 @@ TypeNative CHANGELOG for what that took); the whole pipeline runs natively —
 JSX sources parse (the tokenizer's element context stack, the TypeScript
 plugin's try-parses, @babel/types' validators) and the compiler runs to its
 own diagnostics. @babel/traverse's Scope collects no bindings natively yet
-(`getBindingIdentifiers` returns nothing), which BuildHIR reports as
-`Could not find binding for param`; tracked in
+(an array stored into a dynamic object and mutated through a local binding —
+Babel's `(ids[name] = ids[name] || []).push` — appends to a copy, so no
+binding registers), which BuildHIR reports as `Could not find binding for
+param`; tracked in
 [the example's README](react-compiler/README.md#status-what-works-natively);
 [parity.mjs](react-compiler/parity.mjs) reports the current gap and
 [bench.mjs](react-compiler/bench.mjs) is ready.
