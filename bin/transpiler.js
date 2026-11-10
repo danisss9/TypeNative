@@ -25274,6 +25274,13 @@ func tnPlainValue(v interface{}) interface{} {
 // reference to it — JS arrays are shared, so a push or splice through the
 // value read changes the field
 func TnGetRef(obj interface{}, key string) interface{} {
+	// (a view copy reads stale fields once the origin was written directly;
+	// resolve to the origin so reads and writes agree — JS object identity)
+	if obj != nil && tnAnyViews.Load() {
+		if origin, ok := tnViewOrigin(obj); ok {
+			obj = origin
+		}
+	}
 	// (an accessor shadows the property: reads go through it, see TnGet)
 	if obj != nil && tnAnyAccessors.Load() {
 		return tnGetRefSlow(obj, key)
@@ -25777,6 +25784,11 @@ func TnSwitchString(v interface{}) string {
 }
 
 func TnGet(obj interface{}, key string) interface{} {
+	if obj != nil && key != "length" && key != "size" {
+		if origin, ok := tnViewOrigin(obj); ok {
+			obj = origin
+		}
+	}
 	switch o := obj.(type) {
 	case map[string]interface{}:
 		return o[key]
@@ -26400,6 +26412,11 @@ func tnBoxArray(v interface{}) interface{} {
 }
 
 func TnSet(obj interface{}, key string, value interface{}) {
+	// (a view copy — a merged-union narrowing of a wider object — forwards
+	// field writes to its origin: JS object identity)
+	if origin, ok := tnViewOrigin(obj); ok {
+		obj = origin
+	}
 	if o, ok := obj.(map[string]interface{}); ok {
 		// (an array stored as a reference: see tnBoxArray)
 		o[key] = tnBoxArray(value)
@@ -27572,6 +27589,71 @@ type tnConvPlan struct {
 	src, dst reflect.Type
 	fields   []tnCopyField
 	expandos []tnExpandoField
+	view     bool // the target is a prefix view of the source: reinterpret, not copy
+}
+
+
+// Whether the target struct's fields are an exact prefix of the source's
+// (same names, types, order): the target can alias the source's memory,
+// as JS object identity requires for discriminated-union narrowing
+var tnPrefixPlans sync.Map
+
+// Narrowing copies of wider objects (a merged-union struct viewed as one of
+// its members): effect/field writes through the copy propagate to the
+// original, as JS object identity requires (Babel: place.effect writes
+// through Place | SpreadPattern narrowing)
+var tnViews sync.Map
+var tnAnyViews atomic.Bool
+
+// Resolves a view copy to its origin object (following chains)
+func tnViewOrigin(obj interface{}) (interface{}, bool) {
+	if !tnAnyViews.Load() {
+		return nil, false
+	}
+	if t := reflect.TypeOf(obj); t != nil {
+		switch t.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Map, reflect.Slice, reflect.UnsafePointer:
+			return nil, false
+		}
+	}
+	cur := obj
+	depth := 0
+	for depth < 8 {
+		next, ok := tnViews.Load(cur)
+		if !ok || next == nil {
+			return nil, false
+		}
+		cur = next
+		depth++
+	}
+	return cur, true
+}
+
+func tnRegisterView(copy interface{}, orig interface{}) {
+	tnViews.Store(copy, orig)
+	tnAnyViews.Store(true)
+	rv := reflect.ValueOf(copy)
+	if rv.Kind() == reflect.Ptr {
+		runtime.SetFinalizer(rv.Interface(), func(x interface{}) { tnViews.Delete(x) })
+	}
+}
+
+func tnPrefixCompatible(from, to reflect.Type) bool {
+	key := tnTypePair{from, to}
+	if v, ok := tnPrefixPlans.Load(key); ok {
+		return v.(bool)
+	}
+	compatible := from.NumField() <= to.NumField()
+	if compatible {
+		for i := 0; i < from.NumField(); i++ {
+			if from.Field(i).Name != to.Field(i).Name || from.Field(i).Type != to.Field(i).Type {
+				compatible = false
+				break
+			}
+		}
+	}
+	tnPrefixPlans.Store(key, compatible)
+	return compatible
 }
 
 var tnConvPlans [1 << 10]atomic.Pointer[tnConvPlan]
@@ -27606,6 +27688,15 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 		return p
 	}
 	p.src, p.dst = rt.Elem(), t.Elem()
+	// a discriminated-union member view: the target's fields are an exact
+	// prefix of the source's — reinterpret the source as the target (JS
+	// object identity: effect writes through the narrowed view reach the
+	// original), instead of copying
+	if tnPrefixCompatible(p.src, p.dst) && !rt.Implements(instance) {
+		p.view = true
+		p.ok = true
+		return p
+	}
 	for _, pair := range tnStructCopyPlan(p.src, p.dst) {
 		sf, df := p.src.Field(pair[0]), p.dst.Field(pair[1])
 		field := tnCopyField{from: sf.Offset, to: df.Offset, si: pair[0], di: pair[1]}
@@ -27644,6 +27735,9 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 
 // v (a non-nil pointer to a struct) as a new value of the plan's target type
 func (p *tnConvPlan) convert(v interface{}) reflect.Value {
+	if p.view {
+		return reflect.NewAt(p.dst, unsafe.Pointer(reflect.ValueOf(v).Elem().UnsafeAddr()))
+	}
 	out := reflect.New(p.dst)
 	src, dst := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1], out.UnsafePointer()
 	for i := range p.fields {
@@ -27680,6 +27774,12 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 				df.Set(converted)
 			}
 		}
+	}
+	// (a narrowing copy — the source has every target field plus extras — is
+	// registered so field writes through it reach the source: JS object
+	// identity across merged-union member views)
+	if p.src.NumField() > p.dst.NumField() {
+		tnRegisterView(out.Interface(), reflect.NewAt(p.src, src).Interface())
 	}
 	// the properties the object carries beyond its struct (tnExpandos): a
 	// target field of the same name reads them
@@ -27886,6 +27986,12 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		_, isInstance := v.(interface{ TnClassInstance() })
 		toClass := reflect.PointerTo(t).Implements(reflect.TypeOf((*interface{ TnClassInstance() })(nil)).Elem())
 		if src := reflect.Indirect(rv); !ok && !isEntries && !(isInstance && toClass) && src.Kind() == reflect.Struct && t.NumField() > 0 {
+			// a discriminated-union member view: the target's fields are an exact
+			// prefix of the source's — alias the source's memory (JS object
+			// identity), don't copy
+			if src.CanAddr() && tnPrefixCompatible(src.Type(), t) {
+				return reflect.NewAt(t, unsafe.Pointer(src.UnsafeAddr())), true
+			}
 			if !src.CanAddr() {
 				copied := reflect.New(src.Type()).Elem()
 				copied.Set(src)
@@ -27932,6 +28038,12 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 					}
 				}
 			}
+		// (a narrowing copy registers so field writes through it reach the source:
+		// JS object identity across merged-union member views)
+		if rv.Kind() == reflect.Ptr && src.NumField() > t.NumField() {
+			tnRegisterView(out.Addr().Interface(), src.Addr().Interface())
+		}
+
 			return out, true
 		}
 		if props, isRecord := v.(interface{ Entries() [][]interface{} }); !ok && isRecord {
