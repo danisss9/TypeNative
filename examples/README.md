@@ -42,8 +42,9 @@ initializes all ~470 vendored modules in Node's evaluation order (see the
 TypeNative CHANGELOG for what that took); the whole pipeline runs natively —
 JSX parses, Scope collects bindings, the HIR builds, and codegen emits
 memoized output whose CompileSuccess lines match Node's. Simple functions
-compile byte-identically; the remaining fixtures hit runtime panics in the
-compiler's own passes, tracked in
+compile byte-identically; the remaining fixtures fail inside the compiler's
+own passes (effects-inference ordering, nil dereferences in instruction
+rewriting), tracked in
 [the example's README](react-compiler/README.md#status-what-works-natively);
 [parity.mjs](react-compiler/parity.mjs) reports the current gap and
 [bench.mjs](react-compiler/bench.mjs) is ready.

@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler`
-  + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
+- **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler` + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
   drove a series of transpiler and runtime fixes (below); the pipeline now
   runs end to end — JSX parses, Scope collects bindings, the HIR builds, and
   codegen emits memoized output whose CompileSuccess lines match Node's, with
-  simple functions byte-identical — while most fixtures still hit runtime
-  panics in the compiler's own passes, tracked in the example's README;
-  `parity.mjs` reports the gap and `bench.mjs` is ready but not yet reporting
+  simple functions byte-identical — while most fixtures still fail inside the
+  compiler's own passes (effects-inference ordering, nil dereferences in the
+  rewrite passes), tracked in the example's README; `parity.mjs` reports
+  the gap and `bench.mjs` is ready but not yet reporting
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which

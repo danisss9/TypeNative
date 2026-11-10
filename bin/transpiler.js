@@ -25789,7 +25789,7 @@ func TnGet(obj interface{}, key string) interface{} {
 			return float64(tnStrCount(o))
 		}
 	case interface{ TnProp(string) (interface{}, bool) }:
-		if v, ok := o.TnProp(key); ok || key != "length" {
+		if v, ok := o.TnProp(key); ok || (key != "length" && key != "size") {
 			return v
 		}
 	case *TnError:
@@ -25871,7 +25871,7 @@ func TnGet(obj interface{}, key string) interface{} {
 			return v
 		}
 	}
-	if key == "length" {
+	if key == "length" || key == "size" {
 		return TnLength(obj)
 	}
 	return nil
@@ -26248,11 +26248,10 @@ func tnCallCollection(obj interface{}, isSet bool, name string, args []interface
 		call("Set", arg(0), arg(1))
 		return obj, true
 	case "add":
-		if isSet {
-			m := rv.MethodByName("Set")
-			m.Call([]reflect.Value{tnConvertTo(arg(0), m.Type().In(0)), reflect.Zero(m.Type().In(1))})
-			return obj, true
-		}
+		// (a converted Set may have lost its jsKind: any TnMap takes add)
+		m := rv.MethodByName("Set")
+		m.Call([]reflect.Value{tnConvertTo(arg(0), m.Type().In(0)), reflect.Zero(m.Type().In(1))})
+		return obj, true
 	case "keys":
 		return call("Keys"), true
 	case "values":
@@ -26822,6 +26821,10 @@ func TnAt[T any](s []T, i float64) T {
 
 func TnLength(v interface{}) float64 {
 	switch t := v.(type) {
+	case interface{ Len() int }:
+		if t != nil {
+			return float64(t.Len())
+		}
 	case string:
 		return float64(tnStrCount(t))
 	case []interface{}:

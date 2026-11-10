@@ -73,14 +73,16 @@ object).
 At runtime the binary initializes every module the way Node evaluates them —
 zod's whole schema graph constructs, `parseEnvironmentConfig` validates
 identically — and the compiler's whole pipeline runs: the Babel parser parses
-the program (JSX included), traverse dispatches visitors, the compiler's
-lowering builds the HIR (params, destructuring patterns, literals, and
-Scope's binding tables all populate), and the codegen emits memoized output —
-t1's compiled function is byte-identical to Node's, CompileSuccess line
-included. The remaining failures are runtime panics and invariant errors
-scattered across the compiler's own passes (`Expected function expression
-entry block to have zero predecessors`, nil dereferences in instruction
-rewriting) — [parity.mjs](parity.mjs) reports the diff.
+the program (JSX included), traverse dispatches visitors, Scope collects
+bindings, the lowering builds the HIR (params, destructuring patterns,
+literals all populate), the SSA/memoization passes run, and the codegen
+emits memoized output whose CompileSuccess lines match Node's — t1's
+compiled function is byte-identical, line for line. The remaining fixtures
+fail inside the compiler's own passes: an effects-inference ordering error
+(`Expected effects to be inferred prior to
+ValidateLocalsNotReassignedAfterRender`), nil dereferences in the
+instruction-rewrite passes, and a lost optional-method call —
+[parity.mjs](parity.mjs) reports each diff.
 
 ## Parity with Node.js
 
