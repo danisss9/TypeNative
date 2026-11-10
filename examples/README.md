@@ -17,7 +17,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **7.1x faster per call** (26 vs 188 ms); 1.7x slower on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.2x faster per answer** (717 vs 864 ms streamed)          |
 | [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **8.7x faster per template** (117 vs 1,021 ms); 1.2x slower at 64 KB§ |
-| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form | in progress — JSX now parses natively; the compiler's scope bindings are the next gap¶ |
+| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form | in progress — the full pipeline runs; simple functions compile byte-identically, runtime panics remain in the compiler's passes¶ |
 
 \* Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0, TypeNative
 0.5.0 (unreleased changes), all examples. See each example's README for full
@@ -40,13 +40,10 @@ templates).
 ¶ The largest codebase TypeNative compiles. The binary builds and
 initializes all ~470 vendored modules in Node's evaluation order (see the
 TypeNative CHANGELOG for what that took); the whole pipeline runs natively —
-JSX sources parse (the tokenizer's element context stack, the TypeScript
-plugin's try-parses, @babel/types' validators) and the compiler runs to its
-own diagnostics. @babel/traverse's Scope collects no bindings natively yet
-(an array stored into a dynamic object and mutated through a local binding —
-Babel's `(ids[name] = ids[name] || []).push` — appends to a copy, so no
-binding registers), which BuildHIR reports as `Could not find binding for
-param`; tracked in
+JSX parses, Scope collects bindings, the HIR builds, and codegen emits
+memoized output whose CompileSuccess lines match Node's. Simple functions
+compile byte-identically; the remaining fixtures hit runtime panics in the
+compiler's own passes, tracked in
 [the example's README](react-compiler/README.md#status-what-works-natively);
 [parity.mjs](react-compiler/parity.mjs) reports the current gap and
 [bench.mjs](react-compiler/bench.mjs) is ready.

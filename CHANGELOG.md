@@ -12,14 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler`
   + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
-  drove a series of transpiler and runtime fixes (below); JSX sources now
-  parse natively (the tokenizer's element context stack, the TypeScript
-  plugin's JSX/arrow try-parses, @babel/types' validators) and the compiler
-  runs to its own diagnostics — @babel/traverse's Scope collects no bindings
-  natively yet (`getBindingIdentifiers` returns nothing), which BuildHIR
-  reports as `Could not find binding for param`; tracked in the example's
-  README; `parity.mjs` reports the gap and `bench.mjs` is ready but not yet
-  reporting
+  drove a series of transpiler and runtime fixes (below); the pipeline now
+  runs end to end — JSX parses, Scope collects bindings, the HIR builds, and
+  codegen emits memoized output whose CompileSuccess lines match Node's, with
+  simple functions byte-identical — while most fixtures still hit runtime
+  panics in the compiler's own passes, tracked in the example's README;
+  `parity.mjs` reports the gap and `bench.mjs` is ready but not yet reporting
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
@@ -156,6 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`const { context } = this.state` then `context.push(…)` in Babel's JSX
   tokenizer); it used to bind a copy and drop every mutation, flattening the
   tokenizer's element context stack
+- **An array stored into a dynamic object is kept as a reference**, as JS
+  arrays are shared: a push through any binding of the value reaches the
+  object's entry (`(ids[name] = ids[name] || []).push(…)` building Babel
+  traverse's Scope binding tables); the push used to append to a copy and
+  never register a binding, which rejected every node in Scope's validators.
+  `push`/`pop`/`shift`/`unshift` work on such references held as any
+- **`x.push(…)` on an expando-stored array** (a bare parser Node's `body`)
+  appends to the array the object holds; it used to append to a copy and drop
+  it, which emptied every statement list the compiler's lowering walked
+- **A mixin virtual method call returns its implementations' result** even
+  when an abstract declaration types it `: void` (Babel:
+  `return this.parseObjPropValue(prop, …)` over an
+  `abstract parseObjPropValue(…): void`); the returned node used to be
+  dropped, which made the compiler lower every function body to nothing
 - **conformance:parallel:** example builds get the 10-minute budget the
   sequential runner already gave them (the vendored-package examples
   transpile tens of thousands of lines and go build the result — the React

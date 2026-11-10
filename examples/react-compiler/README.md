@@ -73,22 +73,14 @@ object).
 At runtime the binary initializes every module the way Node evaluates them —
 zod's whole schema graph constructs, `parseEnvironmentConfig` validates
 identically — and the compiler's whole pipeline runs: the Babel parser parses
-the program (JSX included — the tokenizer's element context stack, the
-TypeScript plugin's JSX/arrow disambiguation try-parses and the alias tables
-@babel/types' validators read all work), traverse dispatches visitors, the
-compiler transforms functions, and the generator prints the output, with the
-logger's `// CompileSuccess` / `// CompileSkip` / `// CompileError` lines
-matching Node's byte for byte, including memo slot and block counts. The
-remaining gap is in @babel/traverse's Scope: its `crawl` collects no bindings
-natively. `registerBinding` reads `path.getOuterBindingIdentifiers(true)`,
-whose values Babel builds as `(ids[name] = ids[name] || []); _ids.push(id)` —
-an array stored into a dynamic object and then mutated through a local
-binding. The push appends into a copy of the slice header (the entry in the
-dynamic object keeps its zero length), so no binding is ever registered and
-BuildHIR rejects functions with `Could not find binding for param` —
-[parity.mjs](parity.mjs) reports the diff. The general fix is dynamic-array
-aliasing: pushes through an any binding need to store through to the object
-the array lives in (the same JS semantics `o.list.push(x)` already has).
+the program (JSX included), traverse dispatches visitors, the compiler's
+lowering builds the HIR (params, destructuring patterns, literals, and
+Scope's binding tables all populate), and the codegen emits memoized output —
+t1's compiled function is byte-identical to Node's, CompileSuccess line
+included. The remaining failures are runtime panics and invariant errors
+scattered across the compiler's own passes (`Expected function expression
+entry block to have zero predecessors`, nil dereferences in instruction
+rewriting) — [parity.mjs](parity.mjs) reports the diff.
 
 ## Parity with Node.js
 

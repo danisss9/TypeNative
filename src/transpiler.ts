@@ -5126,7 +5126,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           const converted = toGoValueOfType(argNode, vtParams[i]);
     // (a converted copy a mixin method's body changes: written back
     // after the call, as a statement call's converted arguments are)
-    if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && identifierOfCastArgument(argNode) && vtParams[i].startsWith('*') && isObjectTypeName(vtParams[i].slice(1))) {
+    if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && identifierOfCastArgument(argNode) && vtParams[i].startsWith('*') && (isObjectTypeName(vtParams[i].slice(1)) || vtParams[i].slice(1).startsWith('struct{'))) {
       const tmp = getTempName('wb');
       callWriteBacks.items.push({ tmp, converted, target: visit(argNode) });
       return tmp;
@@ -20365,6 +20365,11 @@ function getCollectionArgumentTypes(node: AstNode): string[] | undefined {
 function emitsNoValue(expr: AstNode): boolean {
   const call = unwrapParentheses(expr);
   if (!isCallExpression(call)) return false;
+  // a mixin virtual method returns whatever its implementations return (see
+  // isVoidCall): its widened signature's result is the truth, not the
+  // abstract declaration's `void`
+  const vtSig = mixinVtCallSignature(call);
+  if (vtSig) return !vtSig.result;
   if (isVoidCall(call) || inferExpressionType(call) === '') return true;
   const calleeType = functionValueGoType(call.expression) ?? '';
   return calleeType.startsWith('func(') && !goFuncReturnType(calleeType);
@@ -20373,6 +20378,12 @@ function emitsNoValue(expr: AstNode): boolean {
 function isVoidCall(expr: AstNode): boolean {
   expr = unwrapParentheses(expr);
   if (!isCallExpression(expr)) return false;
+  // a mixin virtual method returns whatever its implementations return — an
+  // abstract `: void` declaration doesn't make the call resultless (Babel:
+  // return this.parseObjPropValue(prop, …) over an abstract
+  // parseObjPropValue(…): void)
+  const vtVoidSig = mixinVtCallSignature(expr);
+  if (vtVoidSig) return !vtVoidSig.result;
   // process.exit() / process.abort() return nothing (they never return)
   if (isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) && expr.expression.expression.text === 'process' &&
     !variableGoTypes.has('process') && ['exit', 'abort'].includes(expr.expression.name.text)) return true;
@@ -20511,16 +20522,15 @@ function mutatesParameterFields(fn: AstNode, name: string, passedOn = new WeakSe
   if (local) return true;
   if (passedOn.has(fn)) return false;
   passedOn.add(fn);
+  // (a parameter handed to another call — a method especially, whose body is
+  // not always resolvable — is treated as mutating: writing an unchanged
+  // copy's fields back is transparent, losing the changes is not — Babel's
+  // parser fills property nodes through parseObjPropValue(prop) →
+  // parsePropertyName(prop))
   for (const call of calls) {
-    const callee = getCalleeSignature(call);
-    if (!callee || !callee.body || !isBlock(callee.body)) continue;
-    const params: AstNode[] = callee.parameters ?? [];
     const args: AstNode[] = call.arguments ?? [];
-    for (let i = 0; i < args.length; i++) {
-      if (!isIdentifier(args[i]) || args[i].text !== name) continue;
-      const param = params[i];
-      if (!param || param.dotDotDotToken || !isIdentifier(param.name)) continue;
-      if (mutatesParameterFields(callee, param.name.text, passedOn)) return true;
+    for (const arg of args) {
+      if (isIdentifier(arg) && arg.text === name) return true;
     }
   }
   return false;
@@ -20651,7 +20661,7 @@ function visitCallArguments(node: AstNode): string[] {
     if (mentioned.length > 0) return visit(arg);
     const converted = toGoValueOfType(arg, paramType);
     // (a converted copy the function changes: written back after the call)
-    if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && identifierOfCastArgument(arg) && paramType.startsWith('*') && isObjectTypeName(paramType.slice(1)) && isIdentifier(param.name) && fn.body && mutatesParameterFields(fn, param.name.text)) {
+    if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && identifierOfCastArgument(arg) && paramType.startsWith('*') && (isObjectTypeName(paramType.slice(1)) || paramType.slice(1).startsWith('struct{')) && isIdentifier(param.name) && fn.body && mutatesParameterFields(fn, param.name.text)) {
       const tmp = getTempName('wb');
       callWriteBacks.items.push({ tmp, converted, target: visit(arg) });
       return tmp;
@@ -24457,8 +24467,7 @@ func tnMakeFieldPlan(obj interface{}, key string, t unsafe.Pointer) *tnFieldPlan
 }
 
 // Appends value to the array q points to, when it needs no conversion
-func (p *tnFieldPlan) push(q unsafe.Pointer, value interface{}) bool {
-	switch p.item {
+func (p *tnFieldPlan) push(q unsafe.Pointer, value interface{}) bool {	switch p.item {
 	case tnFieldAny:
 		a := (*[]interface{})(q)
 		*a = append(*a, value)
@@ -24539,7 +24548,10 @@ func TnPushField(obj interface{}, key string, value interface{}) {
 		}
 	}
 	elements := append(TnAs[[]interface{}](TnGetRef(obj, key)), value)
-	TnSetArrayInPlace(obj, key, elements)
+	// (an expando-stored array — node.body.push(stmt) on a bare parser Node —
+	// has no field to store through: TnSet's paths cover it, as they do maps
+	// and typed fields)
+	TnSet(obj, key, elements)
 }
 
 // The JS value of the field in the object at base (an array by reference)
@@ -25087,6 +25099,32 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 		}
 		return TnCallValue(obj, rest...)
 	}
+	// an array reference (*[]interface{}) held as any — a dynamic object's
+	// array entry: its mutating methods run through the shared header
+	if ref, ok := obj.(*[]interface{}); ok {
+		switch name {
+		case "push":
+			*ref = append(*ref, args...)
+			return float64(len(*ref))
+		case "pop":
+			if len(*ref) == 0 {
+				return nil
+			}
+			last := (*ref)[len(*ref)-1]
+			*ref = (*ref)[:len(*ref)-1]
+			return last
+		case "shift":
+			if len(*ref) == 0 {
+				return nil
+			}
+			first := (*ref)[0]
+			*ref = (*ref)[1:]
+			return first
+		case "unshift":
+			*ref = append(args, *ref...)
+			return float64(len(*ref))
+		}
+	}
 	// a function value's bind: a function calling it with this and the
 	// arguments given at bind time prepended
 	if name == "bind" && reflect.ValueOf(obj).Kind() == reflect.Func {
@@ -25279,9 +25317,31 @@ func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
 	TnSet(obj, key, value)
 }
 
+// An array stored into a dynamic object is kept as a reference
+// (*[]interface{}): JS arrays are shared, so a push through any binding of
+// the value mutates the object's entry (Babel builds maps with
+// (ids[name] = ids[name] || []); ids[name].push(…))
+func tnBoxArray(v interface{}) interface{} {
+	switch a := v.(type) {
+	case []interface{}:
+		return &a
+	case []byte:
+		return v
+	}
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice {
+		out := make([]interface{}, rv.Len())
+		for i := range out {
+			out[i] = rv.Index(i).Interface()
+		}
+		return &out
+	}
+	return v
+}
+
 func TnSet(obj interface{}, key string, value interface{}) {
 	if o, ok := obj.(map[string]interface{}); ok {
-		o[key] = value
+		// (an array stored as a reference: see tnBoxArray)
+		o[key] = tnBoxArray(value)
 		return
 	}
 	// (an error's own property: error.missingPlugins = …, read back by prop)
@@ -25308,6 +25368,11 @@ func TnSet(obj interface{}, key string, value interface{}) {
 	if obj != nil {
 		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.setter {
 			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
+				// (an array into an any-typed field is stored as a reference:
+				// pushes through bindings of the value mutate the field)
+				if p.kind == tnFieldAny {
+					value = tnBoxArray(value)
+				}
 				if p.write(base, value) {
 					return
 				}
@@ -25320,7 +25385,8 @@ func TnSet(obj interface{}, key string, value interface{}) {
 			}
 		}
 	}
-	if tnSetMember(obj, key, value) || tnExpandoSet(obj, key, value) {
+	// (an expando-stored array is a reference too: see tnBoxArray)
+	if tnSetMember(obj, key, value) || tnExpandoSet(obj, key, tnBoxArray(value)) {
 		return
 	}
 	panic(fmt.Sprintf("TnSet: cannot set property %s of %T", key, obj))
@@ -25376,7 +25442,9 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 	switch o := obj.(type) {
 	case map[string]interface{}:
 		if k, ok := key.(string); ok {
-			o[k] = value
+			// (an array is stored as a reference: JS arrays are shared, so a
+			// push through a binding of the value reaches the object's entry)
+			o[k] = tnBoxArray(value)
 			return
 		}
 	case []interface{}:
