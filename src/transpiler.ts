@@ -26573,7 +26573,7 @@ func TnArrayRef[T any](v interface{}) *[]T {
 			fallback := TnAs[[]T](v)
 			return &fallback
 		}
-		entry.Elem().Set(reflect.ValueOf(s))
+			entry.Elem().Set(reflect.ValueOf(s))
 		return entry.Interface().(*[]T)
 	}
 	// (the usual case: the elements already are Ts)
@@ -27870,7 +27870,7 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 			if !innerOk {
 				return reflect.Value{}, false
 			}
-			entry.Elem().Set(inner)
+				entry.Elem().Set(inner)
 			return entry, true
 		}
 		inner, ok := TnConvertDynamic(v, t.Elem())
@@ -27878,7 +27878,7 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 			return reflect.Value{}, false
 		}
 		p := reflect.New(t.Elem())
-		p.Elem().Set(inner)
+			p.Elem().Set(inner)
 		return p, true
 	case reflect.Struct:
 		m, ok := v.(map[string]interface{})
@@ -31597,9 +31597,22 @@ func TnIsErrorOf(v interface{}, name string) bool {
 // (nil dereference, failed assertion …) is a TypeError
 func TnCaught(r interface{}) interface{} {
 	if e, ok := r.(runtime.Error); ok {
-		return TnNodeError("TypeError", "", e.Error())
+		return tnCaughtError(e.Error(), 2)
+	}
+	// (a reflect panic: never a JS throw — wrapping it keeps the value a
+	// TypeError and carries the Go stack, which says where it came from)
+	if s, ok := r.(string); ok && strings.HasPrefix(s, "reflect") {
+		return tnCaughtError(s, 2)
 	}
 	return r
+}
+
+func tnCaughtError(msg string, skip int) *TnError {
+	err := TnNodeError("TypeError", "", msg)
+	var pcs [32]uintptr
+	n := runtime.Callers(skip, pcs[:])
+	err.pcs = append(err.pcs, pcs[:n]...)
+	return err
 }
 
 func TnNodeError(name string, code string, message string) *TnError {
