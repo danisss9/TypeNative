@@ -27655,7 +27655,12 @@ func TnNarrow[T any](v interface{}) T {
 	return v.(T)
 }
 
-// A dynamic array as a *[]T: the reference it is, else a converted copy
+// A dynamic array as a *[]T: the reference it is, else a converted copy —
+// one dynamic array converts to one *[]T view per element type (JS array
+// identity across element-type conversions: the pushes a typed binding of
+// an object's array makes are what a later conversion of the same array
+// reads back — Babel's parser pushes directives through the binding, and
+// finishNode's node conversion reads them back)
 func TnArrayRef[T any](v interface{}) *[]T {
 	if p, ok := v.(*[]T); ok {
 		return p
@@ -27663,15 +27668,29 @@ func TnArrayRef[T any](v interface{}) *[]T {
 	if v == nil {
 		return nil
 	}
+	if a, ok := v.(*[]interface{}); ok && a != nil && reflect.TypeOf((*[]T)(nil)).Elem().Elem().Kind() != reflect.Interface {
+		entry, found := tnConvIdentityOf(unsafe.Pointer(a), reflect.TypeOf((*[]T)(nil)).Elem(), unsafe.Sizeof(*a))
+		if found {
+			return entry.Interface().(*[]T)
+		}
+		s := make([]T, len(*a))
+		converted := true
+		for i, item := range *a {
+			if s[i], converted = item.(T); !converted {
+				break
+			}
+		}
+		if !converted {
+			fallback := TnAs[[]T](v)
+			return &fallback
+		}
+		entry.Elem().Set(reflect.ValueOf(s))
+		return entry.Interface().(*[]T)
+	}
 	// (the usual case: the elements already are Ts)
 	var items []interface{}
-	switch a := v.(type) {
-	case []interface{}:
+	if a, ok := v.([]interface{}); ok {
 		items = a
-	case *[]interface{}:
-		if a != nil {
-			items = *a
-		}
 	}
 	if items != nil {
 		s := make([]T, len(items))
@@ -28948,6 +28967,22 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 				}
 				return target, true
 			}
+		}
+		// (a boxed dynamic array into a pointer to a typed slice: the one
+		// *[]T view the array has — see TnArrayRef. A fill of a node
+		// conversion reads the pushes its typed bindings made)
+		if a, isBoxed := v.(*[]interface{}); isBoxed && a != nil && t.Elem().Kind() == reflect.Slice &&
+			t.Elem().Elem().Kind() != reflect.Interface {
+			entry, found := tnConvIdentityOf(unsafe.Pointer(a), t.Elem(), unsafe.Sizeof(*a))
+			if found {
+				return entry, true
+			}
+			inner, innerOk := TnConvertDynamic(*a, t.Elem())
+			if !innerOk {
+				return reflect.Value{}, false
+			}
+			entry.Elem().Set(inner)
+			return entry, true
 		}
 		inner, ok := TnConvertDynamic(v, t.Elem())
 		if !ok {
