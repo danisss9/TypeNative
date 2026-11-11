@@ -100,16 +100,12 @@ node parity.mjs
 
 The remaining failures, by root cause:
 
-- **Directive collection** (mode-annotation, skip-use-no-memo). The vendored
-  parser classifies `"use memo"` statements correctly and pushes into its
-  `Directive[]` (traced: `TN_LOOP pushed, len: 1`), but the pushes land on the
-  parser's working node — `startNode`'s undone node type (`*main.Node_2`) —
-  while `fn.body` holds a `*main.BlockStatement` whose `directives` field reads
-  as a fresh empty array. The conversion between the two types loses the array
-  (a layout reinterpretation or header copy). Probes:
-  `.cache/probe-directives*.ts` (import main.ts's full vendor graph — a
-  parser-only entry resolves types differently). `TN_DEBUG_ERRORS=1` prints
-  thrown values and stacks.
+- **Directive collection** (mode-all, closures-and-destructuring partially
+  remain) — FIXED: the parser's directives now reach the compiler (one
+  dynamic array converts to one typed view; see the CHANGELOG). mode-annotation
+  memoizes its Component and fails later on a pre-existing `reflect.Set`
+  panic (`**[]interface{}` not assignable to `*[]interface{}`), visible with
+  `TN_DEBUG_ERRORS=1`.
 - **Reactive-scope classification** (demo-infer, jsx-outlining, error-mutate-prop,
   error-conditional-hook). `Driver.visitBreak` raises `Expected reactive scope
   to implicitly break to fallthrough` (BuildReactiveFunction.ts:1202) where
