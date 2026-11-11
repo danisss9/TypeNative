@@ -4546,6 +4546,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         initGoType = `[]${extractMapKeyType(initGoType)}`;
       }
       const tmpVar = getTempName('arr');
+      // (a record's array value is the reference it holds: destructure its elements)
+      if (initGoType?.startsWith('*[]')) {
+        useHelper('dynamic');
+        initExpr = `TnDerefSlice(${initExpr})`;
+        initGoType = initGoType.slice(1);
+      }
       // (a dynamic value is read as an any-slice: its elements are any values)
       const elemType = isDynamicValue(node.initializer) ? 'interface{}' : initGoType?.startsWith('[]') ? initGoType.slice(2) : undefined;
       // Multi-value Go calls: each element asserts back to its own type
@@ -6093,6 +6099,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (dynamicIterable) useHelper('arraySubclass');
       let iterExpr = dynamicIterable ? `TnToArray(${visit(iterNode, { inline: true })})` : visit(iterNode, { inline: true });
       let iterType = inferExpressionType(iterNode);
+      // (a record's array value is the reference it holds: iterate its elements)
+      if (iterType && iterType.startsWith('*[]')) {
+        useHelper('dynamic');
+        iterExpr = `TnDerefSlice(${iterExpr})`;
+        iterType = iterType.slice(1);
+      }
       // (a parameter or variable declared Iterable<T> — any iterable, held as
       // any —: elements of T)
       if (dynamicIterable && isIdentifier(iterNode)) {
@@ -7934,6 +7946,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (isIdentifier(field) && inferExpressionType(field) === goType) {
         return getSafeName(field.text);
       }
+      // (an expression that already yields the reference — an assignment's
+      // value read back out of a Map of array references: the reference itself)
+      if (inferExpressionType(expr) === goType) {
+        return visit(expr);
+      }
       // (an argument of pointer-element type: its address, shared as in JS)
       if (
         (isCallExpression(expr.parent) || isNewExpression(expr.parent)) &&
@@ -8950,6 +8967,10 @@ function mapGoType(keyType: string, valueType: string): string {
   if (NULLABLE_PRIMITIVE_TYPES.includes(keyType)) keyType = 'interface{}';
   // (an array key — Set<T[]> — is its reference: arrays are keyed by identity)
   if (keyType.startsWith('[]') && keyType !== '[]byte') keyType = `*${keyType}`;
+  // (an array value is its reference too: a push through a binding of a
+  // record's array mutates the record's entry — Record<string, T[]> as in JS,
+  // where Babel accumulates (ids[name] = ids[name] || []).push(id))
+  if (isPlainArrayGoType(valueType)) valueType = `*${valueType}`;
   return `*TnMap[${keyType}, ${valueType}]`;
 }
 
@@ -11333,7 +11354,9 @@ function visitRecordSpreadLiteral(node: AstNode): string | undefined {
 
 function visitMapLiteral(node: AstNode, recordType: AstNode): string {
   const keyType = getType(recordType.typeArguments[0]);
-  const valueType = getType(recordType.typeArguments[1]);
+  let valueType = getType(recordType.typeArguments[1]);
+  // (an array value is its reference — see mapGoType)
+  if (isPlainArrayGoType(valueType)) valueType = `*${valueType}`;
   // { ...source, k: v }: each source's entries copied in order (an object
   // source's set fields, converted to the value type)
   if ((node.properties ?? []).some((p: AstNode) => p.kind === 'SpreadAssignment')) {
@@ -15931,8 +15954,15 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
   // a class's own map() / filter() / … method
   const receiverClass = classNameOfGoType(inferExpressionType(arrayExprNode) ?? '');
   if (!typedReceiver && receiverClass && findClassMethod(receiverClass, methodName)) return undefined;
-  const arrayExpr = typedReceiver ? typedReceiver : visit(arrayExprNode);
-  const ownerType = typedReceiver ? '[]float64' : inferExpressionType(arrayExprNode);
+  const arrayExpr0 = typedReceiver ? typedReceiver : visit(arrayExprNode);
+  let ownerType = typedReceiver ? '[]float64' : inferExpressionType(arrayExprNode);
+  // (a record's array value is the reference it holds: iterate its elements)
+  let arrayExpr = arrayExpr0;
+  if (!typedReceiver && ownerType?.startsWith('*[]')) {
+    useHelper('dynamic');
+    arrayExpr = `TnDerefSlice(${arrayExpr0})`;
+    ownerType = ownerType.slice(1);
+  }
   const elementType = isArrayLikeGoType(ownerType)
     ? getArrayElementTypeFromGoType(ownerType!)
     : 'interface{}';
@@ -25335,6 +25365,14 @@ func TnGet(obj interface{}, key string) interface{} {
 			return v
 		}
 	}
+	// (an array is an object too: a property set beside it — Babel's
+	// mergePair writes enter/exit onto the arrays its spreads produce)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice &&
+		rv.Elem().Type().Elem().Kind() != reflect.Uint8 {
+		if v, ok := tnExpandoGet(obj, key); ok {
+			return v
+		}
+	}
 	if key == "length" || key == "size" {
 		return TnLength(obj)
 	}
@@ -25437,7 +25475,18 @@ func tnExpandoSet(obj interface{}, key string, value interface{}) bool {
 		return true
 	}
 	rv := reflect.ValueOf(obj)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return false
+	}
+	switch rv.Elem().Kind() {
+	case reflect.Struct:
+	case reflect.Slice:
+		// (an array is an object: a property set beside it, keyed by its
+		// reference — but a []byte backs string-ish data, not a JS array)
+		if rv.Elem().Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+	default:
 		return false
 	}
 	// (keyed by the object itself: a recycled address of a collected object
@@ -26853,6 +26902,9 @@ func TnDelete(obj interface{}, key interface{}) bool {
 			if f.IsValid() && f.CanAddr() {
 				reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.Zero(f.Type()))
 			}
+		} else if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+			// (an array is an object: the delete removes a property set beside it)
+			tnExpandoDelete(obj, k)
 		}
 		return true
 	}
