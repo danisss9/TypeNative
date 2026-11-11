@@ -88,20 +88,41 @@ instruction-rewrite passes, and a lost optional-method call —
 
 [node parity.mjs](parity.mjs) compiles `main.ts` to a native binary and runs
 the compiler over each fixture (components and hooks through
-`useState`/`useMemo`/`useRef`/`useEffect` and custom hooks, the compiler's
-test pragmas, `"use no memo"`, and the error paths) with both runtimes.
-stdout, stderr and the exit code must match byte for byte — including the
-memo slot and block counts in the `// CompileSuccess` lines. Failures are
-written to `.cache/failures/`. It reports the current gap (the scope-bindings
-gap above fails every fixture that defines a function):
+`useState`/`useMemo`/`useRef`/`useEffect` and custom hooks, the compiler's test
+pragmas, `"use no memo"`, and the error paths) with both runtimes.
+stdout, stderr and the exit code must match byte for byte — including the memo
+slot and block counts in the `// CompileSuccess` lines. Failures are written
+to `.cache/failures/`. Current gap, 3/15:
 
 ```sh
 node parity.mjs
 ```
 
+The remaining failures, by root cause:
+
+- **Directive collection** (mode-annotation, skip-use-no-memo). The vendored
+  parser classifies `"use memo"` statements correctly (they leave `body`), but
+  the `Directive[]` its `parseBlockBody` pushes onto does not reach the body
+  node the compiler reads: the write lands in a struct type whose `directives`
+  field differs from the one `fn.body` ends up holding (the body node is
+  re-viewed/copied between `parseBlockBody` and the assignment). Probes:
+  `.cache/probe-directives*.ts` (import main.ts's full vendor graph — a
+  parser-only entry resolves types differently). `TN_DEBUG_ERRORS=1` prints
+  thrown values and stacks.
+- **Reactive-scope classification** (demo-infer, jsx-outlining, error-mutate-prop,
+  error-conditional-hook). `Driver.visitBreak` raises `Expected reactive scope
+  to implicitly break to fallthrough` (BuildReactiveFunction.ts:1202) where
+  Node compiles — the same local/context classification family as fixtures
+  12/14's `consistently local or context references` invariant.
+- **Nested-scope bindings** (mode-all, closures-and-destructuring): BuildHIR's
+  `Todo: Support destructuring of context variables` on every
+  `const [x, setX] = useState(...)`.
+- **Runtime gaps**: `Array.prototype.at` on dynamic values (validate-manual-memo),
+  member-expression scope lookups (hooks-and-refs).
+
 ## Benchmark
 
 [bench.mjs](bench.mjs) is ready (per-call latency on the demo, scaling on
 generated component files from 8 to 64 KB, alternating Node and native runs
-with output equality enforced) and will report numbers once the scope-bindings
-gap above is closed.
+with output equality enforced) and will report numbers once the parity gaps
+above are closed.
