@@ -147,5 +147,12 @@ try {
   // under both runtimes)
   const message = e instanceof CompilerError ? e.withPrintedMessage(source, { eslint: false }).message : (e as Error).message;
   console.log(`// compile error: ${message}`);
+  // TN_DEBUG_ERRORS=1 surfaces the thrown value and its stack (a pass
+  // failure whose message is empty prints as `undefined` otherwise)
+  if (process.env.TN_DEBUG_ERRORS) {
+    console.log(`// debug: typeof=${typeof e} string=${String(e)}`);
+    const stack = (e as Error)?.stack;
+    if (stack) console.log(stack);
+  }
   process.exitCode = 1;
 }

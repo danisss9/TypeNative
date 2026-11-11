@@ -25995,6 +25995,7 @@ type tnFieldPlan struct {
 	elem    unsafe.Pointer // what a pointer field points to
 	item    uint8          // an array field's elements (a kind above; tnFieldSlow: reflection)
 	itemT   unsafe.Pointer // their type
+	fieldT  reflect.Type   // the field's Go type (dynamic value conversions)
 }
 
 var tnFieldPlans [1 << 12]atomic.Pointer[tnFieldPlan]
@@ -26061,6 +26062,7 @@ func tnMakeFieldPlan(obj interface{}, key string, t unsafe.Pointer) *tnFieldPlan
 		at = f.Type
 	}
 	ft := field.Type
+	p.fieldT = ft
 	p.field = (*[2]unsafe.Pointer)(unsafe.Pointer(&ft))[1]
 	pt := reflect.PointerTo(ft)
 	p.ref = (*[2]unsafe.Pointer)(unsafe.Pointer(&pt))[1]
@@ -26217,8 +26219,7 @@ func TnPushField(obj interface{}, key string, value interface{}) {
 }
 
 // The JS value of the field in the object at base (an array by reference)
-func (p *tnFieldPlan) read(base unsafe.Pointer) interface{} {
-	f := unsafe.Add(base, p.offset)
+func (p *tnFieldPlan) read(base unsafe.Pointer) interface{} {	f := unsafe.Add(base, p.offset)
 	var v interface{}
 	switch p.kind {
 	case tnFieldAny:
@@ -26301,6 +26302,18 @@ func (p *tnFieldPlan) write(base unsafe.Pointer, value interface{}) bool {
 			header := *(*[]byte)(e[1])
 			*(**[]byte)(f) = &header
 			return true
+		}
+		// (a dynamic array value for a typed reference — node.directives = []
+		// on a typed node: a converted reference, so pushes through the value
+		// read back mutate the field)
+		if p.fieldT != nil {
+			if rv := reflect.ValueOf(value); rv.Kind() == reflect.Slice || (rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice) {
+				if converted, ok := TnConvertDynamic(value, p.fieldT); ok {
+					iface := converted.Interface()
+					*(*unsafe.Pointer)(f) = (*[2]unsafe.Pointer)(unsafe.Pointer(&iface))[1]
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -26484,8 +26497,62 @@ func TnGet(obj interface{}, key string) interface{} {
 			return v
 		}
 	}
+	// (an array's mutating method read as a value — a?.push?.(x): it runs
+	// through the receiver, so pushes reach the array the value came from)
+	if rv.Kind() == reflect.Slice || (rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice) {
+		if m := tnSliceMethod(obj, rv, key); m != nil {
+			return m
+		}
+	}
 	if key == "length" || key == "size" {
 		return TnLength(obj)
+	}
+	return nil
+}
+
+// A mutating array method of a slice (or a *[]T reference) read as a value:
+// it runs through the receiver, elements converted as JS does
+func tnSliceMethod(obj interface{}, rv reflect.Value, key string) interface{} {
+	sv := rv
+	if sv.Kind() == reflect.Pointer {
+		sv = sv.Elem()
+	}
+	switch key {
+	case "push":
+		return func(args ...interface{}) interface{} {
+			for _, a := range args {
+				sv.Set(reflect.Append(sv, tnConvertTo(a, sv.Type().Elem())))
+			}
+			return float64(sv.Len())
+		}
+	case "pop":
+		return func(args ...interface{}) interface{} {
+			if sv.Len() == 0 {
+				return nil
+			}
+			last := sv.Index(sv.Len() - 1).Interface()
+			sv.SetLen(sv.Len() - 1)
+			return tnPlainValue(last)
+		}
+	case "shift":
+		return func(args ...interface{}) interface{} {
+			if sv.Len() == 0 {
+				return nil
+			}
+			first := sv.Index(0).Interface()
+			sv.Set(sv.Slice(1, sv.Len()))
+			return tnPlainValue(first)
+		}
+	case "unshift":
+		return func(args ...interface{}) interface{} {
+			out := reflect.MakeSlice(sv.Type(), 0, sv.Len()+len(args))
+			for _, a := range args {
+				out = reflect.Append(out, tnConvertTo(a, sv.Type().Elem()))
+			}
+			out = reflect.Append(out, sv)
+			sv.Set(out)
+			return float64(sv.Len())
+		}
 	}
 	return nil
 }
@@ -26918,6 +26985,41 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 		case "unshift":
 			*ref = append(args, *ref...)
 			return float64(len(*ref))
+		}
+	}
+	// a typed array reference (*[]T) held as any: its mutating methods run
+	// through the shared header, elements converted as JS does (a []string
+	// field read off a typed node, pushed through)
+	if rv := reflect.ValueOf(obj); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		sv := rv.Elem()
+		switch name {
+		case "push":
+			for _, a := range args {
+				sv.Set(reflect.Append(sv, tnConvertTo(a, sv.Type().Elem())))
+			}
+			return float64(sv.Len())
+		case "pop":
+			if sv.Len() == 0 {
+				return nil
+			}
+			last := sv.Index(sv.Len() - 1).Interface()
+			sv.SetLen(sv.Len() - 1)
+			return tnPlainValue(last)
+		case "shift":
+			if sv.Len() == 0 {
+				return nil
+			}
+			first := sv.Index(0).Interface()
+			sv.Set(sv.Slice(1, sv.Len()))
+			return tnPlainValue(first)
+		case "unshift":
+			out := reflect.MakeSlice(sv.Type(), 0, sv.Len()+len(args))
+			for _, a := range args {
+				out = reflect.Append(out, tnConvertTo(a, sv.Type().Elem()))
+			}
+			out = reflect.Append(out, sv)
+			sv.Set(out)
+			return float64(sv.Len())
 		}
 	}
 	// a function value's bind: a function calling it with this and the
@@ -28879,7 +28981,15 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 			// prefix of the source's — alias the source's memory (JS object
 			// identity), don't copy
 			if src.CanAddr() && tnPrefixCompatible(src.Type(), t) {
-				return reflect.NewAt(t, unsafe.Pointer(src.UnsafeAddr())), true
+				view := reflect.NewAt(t, unsafe.Pointer(src.UnsafeAddr())).Interface()
+				// (register the view so writes and reads through it resolve to the
+				// origin: a property the view's type has no field for — directives
+				// on a BlockStatementLike view — must land beside the origin, where
+				// the field reads find it)
+				if t.NumField() < src.Type().NumField() {
+					tnRegisterView(view, rv.Interface())
+				}
+				return reflect.ValueOf(view), true
 			}
 			if !src.CanAddr() {
 				copied := reflect.New(src.Type()).Elem()
