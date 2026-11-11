@@ -590,6 +590,12 @@ function nullableArraysOf(scope: AstNode): Set<string> {
 // (dynamic []interface{} arrays stay plain: they flow through runtime helpers)
 function setVarGoType(name: string, goType: string | undefined): void {
   if (!name) return;
+  // (an array reference, *[]T: the variable is the one the field/container holds)
+  if (goType && goType.startsWith('*[]')) {
+    variableGoTypes.set(name, goType);
+    referenceArrays.add(name);
+    return;
+  }
   if (goType && goType.startsWith('[]') && goType !== '[]byte') {
     variableGoTypes.set(name, `*${goType}`);
     referenceArrays.add(name);
@@ -854,6 +860,7 @@ function parseAndLower(code: string): AstNode {
   lowerLiteralPropertyAdditions(sourceFile);
   lowerTopLevelDestructuring(sourceFile);
   lowerPrototypeCalls(sourceFile);
+  lowerAccessorObjectReturns(sourceFile);
   lowerArraySpreadCalls(sourceFile);
   lowerConstructorCalls(sourceFile);
   lowerForOfAssignments(sourceFile);
@@ -1921,6 +1928,53 @@ function isFunctionCallReference(n: AstNode): boolean {
   const base = n.expression;
   return (isIdentifier(base) && base.text === 'Function') ||
     (isPropertyAccessExpression(base) && base.name.text === 'prototype' && isIdentifier(base.expression) && base.expression.text === 'Function');
+}
+
+// A function declared to return an object type literal whose returned object
+// literal has get / set accessors returns it as a dynamic object (any): the
+// accessors stay lazy, run on each read as in JS — zod's
+//   function cached<T>(getter: () => T): { value: T } {
+//     return { get value() { … } };
+//   }
+// computes the value on first read, not when cached() returns
+function lowerAccessorObjectReturns(node: AstNode): void {
+  const isFunctionLike = (n: AstNode): boolean =>
+    isFunctionDeclaration(n) || isFunctionExpression(n) || isArrowFunction(n) || isMethodDeclaration(n);
+  const returnsAccessorObject = (fn: AstNode): boolean => {
+    let found = false;
+    const walk = (n: AstNode): void => {
+      if (found || !n || typeof n.kind !== 'string') return;
+      if (n !== fn && isFunctionLike(n)) return;
+      if (isReturnStatement(n) && n.expression) {
+        const value = unwrapParentheses(n.expression);
+        if (isObjectLiteralExpression(value) && (value.properties ?? []).some((p: AstNode) => isGetAccessor(p) || isSetAccessor(p))) {
+          found = true;
+          return;
+        }
+      }
+      for (const key of Object.keys(n)) {
+        if (key === 'parent') continue;
+        const child = n[key];
+        if (Array.isArray(child)) child.forEach(walk);
+        else if (child && typeof child.kind === 'string') walk(child);
+      }
+    };
+    walk(fn.body);
+    return found;
+  };
+  const visitAll = (n: AstNode): void => {
+    if (!n || typeof n.kind !== 'string') return;
+    if (isFunctionLike(n) && n.type?.kind === 'TypeLiteral' && n.body && isBlock(n.body) && returnsAccessorObject(n)) {
+      n.type = { kind: 'AnyKeyword', parent: n, line: n.type.line, column: n.type.column };
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'parent') continue;
+      const child = n[key];
+      if (Array.isArray(child)) child.forEach(visitAll);
+      else if (child && typeof child.kind === 'string') visitAll(child);
+    }
+  };
+  visitAll(node);
 }
 
 // Built-in prototype methods called on another value:
@@ -3984,7 +4038,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     useHelper('arraySubclass');
     return `(*${visit(node.expression)}.TnItems())`;
   } else if (isElementAccessExpression(node)) {
-    // seq[i] on an Array subclass: its elements
+      // a?.[k].c (the chain goes on past the guard): all of it runs only if a is set
+      if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalChainContinuation(node)) {
+        const continuation = visitOptionalChainContinuation(node);
+        if (continuation !== undefined) return continuation;
+      }
+      // seq[i] on an Array subclass: its elements
     if (node.expression.kind !== 'TnArrayItems' && arraySubclassOf(node.expression) && !isStringLiteral(node.argumentExpression)) {
       node.expression = arrayItemsNode(node.expression);
     }
@@ -4071,12 +4130,24 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // (stack traces are the runtime's own: a function that does nothing)
     return 'func(__args ...interface{}) {}';
   } else if (isPropertyAccessExpression(node)) {
-    // an optional interface method read as a value: the method, or undefined
-    if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalInterfaceMethodAccess(node)) {
+      // a?.b.c (the chain goes on past the guard): all of it runs only if a is set
+      if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalChainContinuation(node)) {
+        const continuation = visitOptionalChainContinuation(node);
+        if (continuation !== undefined) return continuation;
+      }
+      // an optional interface method read as a value: the method, or undefined
+      if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalInterfaceMethodAccess(node)) {
       useHelper('dynamic');
       methodPresenceChecks.add(node.name.text);
       dynamicMethodCalls.add(node.name.text);
       return `TnMethodOf_${dispatcherSuffix(node.name.text)}(${visit(node.expression)})`;
+    }
+    // an Object.prototype method read as a value off an object or record
+    // (const toString = object.toString — jsesc): the own property, else the
+    // prototype's method, which call / apply then run on their receiver
+    if (isObjectProtoMethodRead(node)) {
+      useHelper('dynamic');
+      return `TnProtoMember(${visit(node.expression)}, ${toGoStringLiteral(node.name.text)})`;
     }
     // seq.length on an Array subclass
     if (node.name.text === 'length' && node.expression.kind !== 'TnArrayItems' && arraySubclassOf(node.expression)) {
@@ -4558,7 +4629,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const lookup = getMapLookup(unwrapParentheses(node.initializer));
       // (or rec[k] of a record held as a TnMap)
       const valueType = lookup ? extractMapValueType(inferExpressionType(lookup.mapNode)!) : undefined;
-      if (lookup && valueType && ['string', 'float64', 'bool'].includes(valueType) && comparedToNullish(node.name.text, node)) {
+      // (a string or numeric enum's values too: valueKinds.get(id) ?? Kind.Local)
+      // (an enum's *Kind has no narrowing back to a Kind: only when every
+      // read of the variable is a nullish test)
+      const enumValue = !!valueType && ['string', 'float64'].includes(enumBaseTypes.get(valueType) ?? '') && onlyNullishUses(node.name.text, node);
+      const primitiveValue = !!valueType && (['string', 'float64', 'bool'].includes(valueType) || enumValue);
+      if (lookup && valueType && primitiveValue && comparedToNullish(node.name.text, node)) {
         setVarGoType(node.name.text, `*${valueType}`);
         variableTypes.delete(node.name.text);
         const name = getSafeName(node.name.text);
@@ -4813,6 +4889,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     while (node.expression?.kind === 'NonNullExpression') {
       node.expression = node.expression.expression;
       node.expression.parent = node;
+    }
+    // a?.b.c(…): the chain goes on past the guard, so the call runs only if a is set
+    if (isOptionalChainContinuation(node)) {
+      const continuation = visitOptionalChainContinuation(node);
+      if (continuation !== undefined) return continuation;
     }
     // (a generic function's erased T result: asserted to what the argument binds T to)
     if (!options.skipErasedResult) {
@@ -5112,6 +5193,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     // Handle spread arguments: fn(...arr) → fn(arr...)
     const hasSpreadArg = (node.arguments ?? []).some((a) => isSpreadElement(a));
+    const abSaved = arrayCallWriteBacks;
+    arrayCallWriteBacks = [];
     let args = hasSpreadArg ? visitSpreadCallArguments(node) : visitCallArguments(node);
     // (this.m(…) through a mixin system's __vt: the arguments as its __VT
     // signature takes them — isConstructor?: boolean is a *bool there)
@@ -5179,7 +5262,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     currentReceiverGoType = isPropertyAccessExpression(node.expression)
       ? inferExpressionType(node.expression.expression)
       : undefined;
-    return getCallString(safeCaller, args, typeArgs, objectType);
+    const call = getCallString(safeCaller, args, typeArgs, objectType);
+    const arrayBacks = arrayCallWriteBacks ?? [];
+    arrayCallWriteBacks = abSaved;
+    return arrayBacks.length > 0 ? wrapArrayCallWriteBacks(node, call, arrayBacks) : call;
   } else if (isPrefixUnaryExpression(node)) {
     if (node.operator === 'ExclamationToken') {
       return `!${wrapCondition(toGoCondition(node.operand))}`;
@@ -5660,18 +5746,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('buffer');
       return `${visit(node.left.expression)}[int(${visit(node.left.argumentExpression)})] = TnByte(${visit(node.right)})`;
     }
-    // obj[key] = v on a class instance or typed object: a switch over its fields
+    // obj[key] = v on a class instance or typed object: the field the key
+    // names takes the value (with its declared type); one it does not take —
+    // or a name no field has — is kept beside the object, as JS adds it to
+    // the object
     if (op === '=' && isElementAccessExpression(node.left) && !isStringLiteral(node.left.argumentExpression)) {
       const objectGoType = inferExpressionType(node.left.expression);
-      if (objectGoType && isFieldObjectType(objectGoType) && inferExpressionType(node.left.argumentExpression) !== 'float64') {
-        const fieldNames = objectFieldNames(objectGoType);
-        if (fieldNames.length > 0) {
-          useHelper('dynamic');
-          const cases = fieldNames.map(
-            (f) => `case ${toGoStringLiteral(f)}: o.${goFieldName(f)} = TnAs[${getObjectFieldGoType(objectGoType, f) ?? 'interface{}'}](v)`
-          );
-          return `func(o ${objectGoType}, k string, v interface{}) { switch k { ${cases.join('; ')} } }(${visit(node.left.expression)}, ${toGoValueOfType(node.left.argumentExpression, 'string')}, ${visit(node.right)})`;
-        }
+      if (objectGoType && isFieldObjectType(objectGoType) && inferExpressionType(node.left.argumentExpression) !== 'float64' && objectFieldNames(objectGoType).length > 0) {
+        useHelper('dynamic');
+        return `TnSet(${visit(node.left.expression)}, ${toGoValueOfType(node.left.argumentExpression, 'string')}, ${visit(node.right)})`;
       }
     }
     // arr[i] = v on an array: writing past the end grows it, as in JS
@@ -7301,6 +7384,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           return '';
         })
         .filter((e) => e);
+      // x = {} for an any variable (Babel's addExtra: extra = {}; node.extra =
+      // extra; extra[key] = value): an ordered dynamic object — stored into a
+      // Record field it is that field's own object, so later keys reach it
+      const assignedParent = node.parent;
+      if (entries.length === 0 && (node.properties ?? []).length === 0 && isBinaryExpression(assignedParent) &&
+        assignedParent.operatorToken.kind === 'EqualsToken' && assignedParent.right === node && isIdentifier(unwrapParentheses(assignedParent.left)) &&
+        variableGoTypes.get(unwrapParentheses(assignedParent.left).text) === 'interface{}') {
+        useHelper('orderedMap');
+        return 'TnNewMap[string, interface{}]()';
+      }
       return `map[string]interface{}${compositeBody(entries)}`;
     }
     const recordSpread = visitRecordSpreadLiteral(node);
@@ -7553,8 +7646,13 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     return `TnAs[${goType}](${visit(expr)})`;
   }
   // (a call's *[]T result — a generic V bound to a Map's array values —
-  // into a []T slot: the array)
-  if (goType && goType.startsWith('[]') && goType !== '[]byte' && isCallExpression(unwrapParentheses(expr)) && !isMapArrayGetCall(unwrapParentheses(expr)) && inferExpressionType(expr) === `*${goType}`) {
+  // into a []T slot: the array; an array field's assignment value — the
+  // reference — too)
+  const arrayRefSource = unwrapParentheses(expr);
+  const arrayRefAssignment = isBinaryExpression(arrayRefSource) && isAssignmentOperatorKind(arrayRefSource.operatorToken.kind) && isReferenceArrayTarget(arrayRefSource.left);
+  if (goType && goType.startsWith('[]') && goType !== '[]byte' &&
+    ((arrayRefAssignment && (inferRawExpressionType(arrayRefSource.left) ?? '') === `*${goType}`) ||
+      (!arrayRefAssignment && isCallExpression(arrayRefSource) && !isMapArrayGetCall(arrayRefSource) && inferExpressionType(expr) === `*${goType}`))) {
     useHelper('dynamic');
     return `TnDerefSlice(${visit(expr)})`;
   }
@@ -7595,6 +7693,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
     if (same) {
       // (a narrowed any variable — Array.isArray(tpl) — holds no slice to point at)
       if (isIdentifier(u0) && /^\*?\[\]/.test(withoutNarrowing(() => inferExpressionType(u0)) ?? '')) return referenceArrays.has(u0.text) || isReferenceArrayRead(u0) || (inferExpressionType(u0) ?? '').startsWith('*[]') ? getSafeName(u0.text) : `&${getSafeName(u0.text)}`;
+      // (target = value) whose value is an array reference: the reference itself
+      if (isBinaryExpression(u0) && isAssignmentOperatorKind(u0.operatorToken.kind) && isReferenceArrayTarget(u0.left)) return visit(u0);
       if (isReferenceFieldAccess(u0) && !hasQuestionDot(u0) && isPropertyAccessExpression(u0)) {
         // a typed class's field: its address (a dynamic object's goes through
         // the usual reference read)
@@ -7923,6 +8023,12 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       if (nullableResult || nullishBranch || isOptionalChain(call)) {
         return `func() ${goType} { __v := ${boxedRead()}; if __v == nil { return nil }; return &__v }()`;
       }
+      // a read out of a Map / Record: undefined (nil) when the key is missing,
+      // not a pointer to the map's zero-length value
+      const lookup = getMapLookup(call);
+      if (lookup && (extractMapValueType(inferExpressionType(lookup.mapNode) ?? '') ?? '') === goType.slice(1)) {
+        return `func() ${goType} { if __v, __ok := ${lookup.map}.Lookup(${lookup.key}); __ok { return &__v }; return nil }()`;
+      }
       return `func() ${goType} { __v := ${boxedRead()}; return &__v }()`;
     }
   const code = visit(expr);
@@ -8131,6 +8237,38 @@ function getOptionalChainBase(expr: AstNode): AstNode | undefined {
   return undefined;
 }
 
+// The innermost `?.` of a chain — the link evaluated first (a?.b.c → a?.b)
+function firstOptionalLink(expr: AstNode): AstNode | undefined {
+  let link: AstNode | undefined;
+  let node: AstNode | undefined = expr;
+  while (node) {
+    if (hasQuestionDot(node)) link = node;
+    if (isPropertyAccessExpression(node) || isElementAccessExpression(node) || isCallExpression(node) || isNonNullExpression(node)) {
+      node = node.expression;
+    } else {
+      break;
+    }
+  }
+  return link;
+}
+
+// a?.b.c / a?.b.c() / a?.b().c: the chain goes on past the guarded link, so
+// the whole rest runs only when the link's base is set (JS short-circuits it
+// all: `node?.children.push(x)` pushes nothing when node is nullish)
+function isOptionalChainContinuation(node: AstNode): boolean {
+  if (!isOptionalChain(node)) return false;
+  const parent = node.parent;
+  if (parent && (isPropertyAccessExpression(parent) || isElementAccessExpression(parent) || isCallExpression(parent)) && parent.expression === node) return false;
+  const link = firstOptionalLink(node);
+  // (a link with its own ?. — a?.b.c?.d — is a continuation too when an
+  // earlier link guards: that guard covers the rest, the later ?. included)
+  if (!link || link === node) return false;
+  if (hasQuestionDot(node) && !firstOptionalLink(node.expression)) return false;
+  // a?.m(…) and a?.(): their own guards, in visitOptionalCall
+  if (isCallExpression(node) && link === node.expression) return false;
+  return true;
+}
+
 // Variables known non-null when `condition` evaluates to `whenTrue`
 // The function a call's name refers to when it is a type guard (its result
 // a `v is T` predicate): a declared function, or a const arrow in scope
@@ -8335,6 +8473,16 @@ function isStatementPosition(node: AstNode): boolean {
   return false;
 }
 
+// Whether an assignment target is an array held by reference — an object's
+// array field or an array variable (a Map/record entry holds a value, and an
+// array element is a value too)
+function isReferenceArrayTarget(target: AstNode): boolean {
+  const u = unwrapParentheses(target);
+  if (isIdentifier(u)) return referenceArrays.has(u.text);
+  if (isPropertyAccessExpression(u)) return !hasQuestionDot(u) && (inferRawExpressionType(u) ?? '').startsWith('*[]');
+  return false;
+}
+
 // (target = value) used as a value: assign, then read the target back
 function visitAssignmentValue(node: AstNode): string {
   const statement: AstNode = { kind: 'ExpressionStatement', expression: node, parent: node.parent };
@@ -8342,9 +8490,16 @@ function visitAssignmentValue(node: AstNode): string {
   node.parent = statement;
   const write = visit(node).trim();
   node.parent = savedParent;
+  // (an array field or variable: JS's value is the array reference itself, so
+  // a binding of it is an alias — pushes through it reach the field)
+  const left = unwrapParentheses(node.left);
+  const rawLeft = inferRawExpressionType(left) ?? '';
+  if (isReferenceArrayTarget(left) && rawLeft.startsWith('*[]') && rawLeft.slice(1) === inferExpressionType(left)) {
+    const reference = isIdentifier(left) ? getSafeName(left.text) : visit(left, { rawArrayField: true });
+    return `func() ${rawLeft} { ${write}; return ${reference} }()`;
+  }
   const goType = inferExpressionType(node.left) ?? 'interface{}';
   // (an array reference may have been set to null: read it nil-safely)
-  const left = unwrapParentheses(node.left);
   if (isIdentifier(left) && referenceArrays.has(left.text)) {
     useHelper('dynamic');
     return `func() ${goType} { ${write}; return TnDerefSlice(${getSafeName(left.text)}) }()`;
@@ -9581,12 +9736,32 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   // (a string or array method's name: dispatched when some class or object
   // literal declares the method too — decided at run time for a string receiver)
   const stringOrClassMethod = STRING_ONLY_METHODS.has(method) && classMethodNamed(method);
-  if ((ARRAY_ONLY_METHODS.has(method) || STRING_ONLY_METHODS.has(method)) && !(MUTATING_ARRAY_METHODS.has(method) && classMethodNamed(method)) && !objectLiteralMethodNames.has(method) && !stringOrClassMethod) return undefined;
+  // (an array method's name a class declares too: dispatched when the call
+  // decides between the two at run time — see visitDynamicMethodCall)
+  const classArrayMethod = classMethodNamed(method) && (MUTATING_ARRAY_METHODS.has(method) || dynamicArrayOrDispatch.has(node));
+  if ((ARRAY_ONLY_METHODS.has(method) || STRING_ONLY_METHODS.has(method)) && !classArrayMethod && !objectLiteralMethodNames.has(method) && !stringOrClassMethod) return undefined;
   useHelper('dynamic');
   useHelper('error');
   if (method === 'replace' || method === 'replaceAll') useHelper('replaceAny');
   dynamicMethodCalls.add(method);
-  const args = (node.arguments ?? []).map((a: AstNode) => (isSpreadElement(a) ? `${visit(a.expression)}...` : visit(a)));
+  // (a fresh array literal is handed over as a reference: the callee may keep
+  // it — stack.push([]) stores it as the new top — and later pushes through
+  // that binding must reach the same array, as JS arrays are shared)
+  // (fn.call(null, …): the receiver is JS null, not undefined — toString.call(null))
+  // (an array field or variable is handed over as its reference, as a typed
+  // call does: visitor.visitBlock(fn.body) — the callee's block.length = 0;
+  // block.push(…) must reach fn.body)
+  const arrayReference = (a: AstNode): string | undefined => {
+    const arg = unwrapParentheses(a);
+    const raw = inferRawExpressionType(arg) ?? '';
+    if (!isReferenceArrayTarget(arg) || !raw.startsWith('*[]') || raw.slice(1) !== inferExpressionType(arg)) return undefined;
+    return isIdentifier(arg) ? getSafeName(arg.text) : visit(arg, { rawArrayField: true });
+  };
+  const args = (node.arguments ?? []).map((a: AstNode, i: number) =>
+    isSpreadElement(a) ? `${visit(a.expression)}...`
+      : isArrayLiteralExpression(unwrapParentheses(a)) ? `tnBoxArray(${visit(a)})`
+      : i === 0 && (method === 'call' || method === 'apply') && unwrapParentheses(a).kind === 'NullKeyword' ? 'TnNull'
+      : arrayReference(a) ?? visit(a));
   const hasSpread = (node.arguments ?? []).some((a: AstNode) => isSpreadElement(a));
   const argList = hasSpread
     ? `${visit(receiver)}, append([]interface{}{${args.filter((a: string) => !a.endsWith('...')).join(', ')}}, TnAs[[]interface{}](${args.find((a: string) => a.endsWith('...'))!.slice(0, -3)})...)...`
@@ -10261,6 +10436,7 @@ function objectMemberCommonType(goType: string): string {
 // obj['field'] → obj.field (a getter call for accessors); obj[key] → a switch
 // over the fields and getters ('' when it doesn't apply)
 function visitObjectMemberAccess(node: AstNode, goType: string): string {
+  useHelper('dynamic');
   const key = node.argumentExpression;
   if (inferExpressionType(key) === 'float64') return '';
   const object = visit(node.expression);
@@ -10278,7 +10454,12 @@ function visitObjectMemberAccess(node: AstNode, goType: string): string {
     ...objectFieldNames(goType).map((f) => `case ${toGoStringLiteral(f)}: return o.${goFieldName(f)}`),
     ...getters.map((g) => `case ${toGoStringLiteral(g)}: return o.Get_${goFieldName(g)}()`)
   ];
-  return `func(o ${goType}, k string) ${resultType} { switch k { ${cases.join('; ')} }; var zero ${resultType}; return zero }(${object}, ${toGoValueOfType(key, 'string')})`;
+  const asResult = resultType === 'interface{}' ? '__v' : `TnAs[${resultType}](__v)`;
+  // (a property added to the object after the fact — one whose value didn't
+  // fit a field, or a name no field has — is what the lookup answers, as in
+  // JS; then the fields, then the object's own property lookup)
+  const fallback = resultType === 'interface{}' ? 'TnGet(o, k)' : `TnAs[${resultType}](TnGet(o, k))`;
+  return `func(o ${goType}, k string) ${resultType} { if __v, __ok := tnExpandoGet(o, k); __ok { return ${asResult} }; switch k { ${cases.join('; ')} }; return ${fallback} }(${object}, ${toGoValueOfType(key, 'string')})`;
 }
 
 const ITERATOR_HELPERS = new Set(['next', 'map', 'filter', 'flatMap', 'take', 'drop', 'toArray', 'forEach', 'some', 'every', 'find', 'reduce']);
@@ -10666,6 +10847,18 @@ function getDictionaryValueType(node: AstNode): string {
 // Object literals that are dynamic objects: in an any context, or spreading an any value
 function isDynamicObjectLiteral(node: AstNode): boolean {
   if (isAnyContext(getContextualTypeNode(node))) return true;
+  // { get k() { … } } handed to a function or constructor value of no known
+  // signature (zod: new ZodDefault({ type, get defaultValue() { … } })): a
+  // dynamic object whose accessor stays live — every read runs the getter, as
+  // in JS, however the receiver later reads it
+  if ((node.properties ?? []).some((p: AstNode) => isGetAccessor(p) || isSetAccessor(p)) && !getContextualTypeNode(node)) {
+    const call = node.parent;
+    if ((isNewExpression(call) || isCallExpression(call)) && (call.arguments ?? []).includes(node)) {
+      const callee = unwrapParentheses(call.expression);
+      const knownClass = isNewExpression(call) && isIdentifier(callee) && classNames.has(callee.text);
+      if (!knownClass && (isDynamicValue(callee) || (isIdentifier(callee) && !declaredFunctions.has(callee.text) && !classNames.has(callee.text)))) return true;
+    }
+  }
   // { [key]: v } has no struct shape (a Record context makes a typed map instead)
   if (
     (node.properties ?? []).some((p: AstNode) => p.name?.kind === 'ComputedPropertyName') &&
@@ -10795,10 +10988,67 @@ function mergeObjectUnionMembers(members: AstNode[]): string {
     // (filter, not find: a native find gives '' for no match)
     const pointers = typesOf.filter((t) => t.startsWith('*'));
     let goType = typesOf.length === 0 ? 'interface{}' : bare.size === 1 ? (pointers.length > 0 ? pointers[0] : typesOf[0]) : 'interface{}';
-    if (presence.get(name)! < members.length) goType = makeNullableType(goType);
+    // (a primitive is stored as itself when another member requires it: a
+    // member without the field reads the zero value, as the merged struct's
+    // fields of the members' own types are shared — a narrowed member view
+    // (Place | SpreadPattern as a Place) writes through to the original)
+    const primitiveShared = bare.size === 1 && ['bool', 'string', 'float64'].includes([...bare][0]) && presence.get(name)! < members.length;
+    if (presence.get(name)! < members.length && !primitiveShared) goType = makeNullableType(goType);
     return `${goFieldName(name)} ${goType}`;
   });
+  // (the first member a named type — type Place = { … }, a struct ending in
+  // its key order, __keys: the same slot right after its fields, so the
+  // member's struct is an exact prefix of the merged one and an object of
+  // it held in the union's slot is a view of the same memory, not a copy —
+  // effect writes through either reach the one object, as in JS)
+  const first = members[0];
+  if (isTypeAliasDeclaration(first.parent) && first.parent.type === first && memberStructIsPrefix(first, fields)) {
+    fields.splice((first.members ?? []).length, 0, '__keys *[]string');
+  }
   return `*struct{ ${fields.join('; ')} }`;
+}
+
+// The concrete type a call's callback arguments give the callee's type
+// parameter that parameter `index` is declared as: f<T, C>(…, context: C,
+// enter: (val: T, context: C) => void) called with enter = a function whose
+// matching parameter is declared `context: ScopeTraversalContext` — the
+// first such annotation (a named object type), else undefined
+function typeParameterArgumentFromCallbacks(fn: AstNode, index: number, call: AstNode): AstNode | undefined {
+  const params: AstNode[] = fn.parameters ?? [];
+  const declared = params[index]?.type;
+  if (!isTypeReferenceNode(declared) || !isIdentifier(declared.typeName) || (declared.typeArguments ?? []).length > 0) return undefined;
+  const name = declared.typeName.text;
+  if (!(fn.typeParameters ?? []).some((tp: AstNode) => tp.name?.text === name)) return undefined;
+  const args: AstNode[] = call.arguments ?? [];
+  for (let j = 0; j < params.length && j < args.length; j++) {
+    const fnType = params[j].type;
+    if (j === index || !isFunctionTypeNode(fnType)) continue;
+    const slot = (fnType.parameters ?? []).findIndex((p: AstNode) =>
+      isTypeReferenceNode(p.type) && isIdentifier(p.type.typeName) && p.type.typeName.text === name && (p.type.typeArguments ?? []).length === 0);
+    if (slot < 0) continue;
+    const arg = args[j];
+    const callback = isArrowFunction(arg) || isFunctionExpression(arg)
+      ? arg
+      : isIdentifier(arg) ? calledFunctionDeclaration(arg.text, call) : undefined;
+    const annotation = callback?.parameters?.[slot]?.type;
+    if (isTypeReferenceNode(annotation) && isIdentifier(annotation.typeName) && (annotation.typeArguments ?? []).length === 0 &&
+      (declaredTypeAliases.has(annotation.typeName.text) || declaredInterfaces.has(annotation.typeName.text))) {
+      return annotation;
+    }
+  }
+  return undefined;
+}
+
+// Whether a type alias's struct (its fields as the declaration emits them:
+// names, types, tags) is the merged union struct's leading fields exactly
+function memberStructIsPrefix(literal: AstNode, mergedFields: string[]): boolean {
+  const own = literal.members ?? [];
+  if (own.length > mergedFields.length) return false;
+  return own.every((m: AstNode, i: number) =>
+    isPropertySignature(m) &&
+    isIdentifier(m.name) &&
+    own.findIndex((o: AstNode) => o.name?.text === m.name.text) === i &&
+    `${goFieldName(m.name.text)} ${getObjectFieldNodeType(m.type, !!m.questionToken)}${nullFieldTag(m)}` === mergedFields[i]);
 }
 
 // An object literal's contextual type; of a union of object types (a
@@ -10881,7 +11131,9 @@ function getObjectLiteralGoType(node: AstNode): string {
   for (const p of node.properties ?? []) {
     if (p.kind === 'SpreadAssignment') {
       const srcType = inferExpressionType(p.expression);
-      const parsedFields = parseStructFields((srcType ?? '').replace(/^\*/, ''));
+      const parsedFields = (srcType ?? '').includes('struct{')
+        ? parseStructFields((srcType ?? '').replace(/^\*/, ''))
+        : namedStructSpreadFields(srcType);
       for (const entry of parsedFields) {
         if (!fields.has(entry[0])) fields.set(entry[0], entry[1]);
       }
@@ -11186,6 +11438,18 @@ function dynamicObjectMethod(p: AstNode): string {
   return `func(${paramInfo.signature})${retType} ${body.trimEnd()}`;
 }
 
+// The fields a spread of a named object type's value copies ({ ...def, keys }
+// with def: $ZodObjectDef): its declared properties, as its struct holds them
+// (Go name, type) — none for a class instance or an unknown type
+function namedStructSpreadFields(srcType: string | undefined): [string, string][] {
+  const bare = (srcType ?? '').replace(/^\*/, '');
+  if (!/^[A-Za-z_ǂ$][\wǂ$]*$/.test(bare) || classNames.has(bare)) return [];
+  if (!declaredInterfaces.has(bare) && !declaredTypeAliases.has(bare)) return [];
+  const props = objectTypeFields(bare);
+  if (!props) return [];
+  return [...props.entries()].map(([name, goType]) => [goFieldName(name), goType] as [string, string]);
+}
+
 // Object literal with no contextual type → anonymous struct with inferred fields,
 // or a map when the variable holding it is indexed dynamically (obj[key]).
 // Methods and getters become function fields whose closures capture the
@@ -11207,7 +11471,7 @@ function visitAnonymousStructLiteral(node: AstNode): string {
       const srcType = inferExpressionType(p.expression);
       const srcFields = srcType?.includes('struct{')
         ? parseStructFields(srcType.replace(/^\*/, ''))
-        : [];
+        : namedStructSpreadFields(srcType);
       for (const entry of srcFields) {
         if (!fields.has(entry[0])) fields.set(entry[0], entry[1]);
       }
@@ -11652,6 +11916,14 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
       if ((parent.typeArguments ?? []).length > 0 && (fn.typeParameters ?? []).length === parent.typeArguments.length && params[index]?.type &&
         isFunctionDeclaration(fn) && erasedFunctionTypeParameters(fn).size === 0) {
         return instantiatedParameterType(params[index].type, fn.typeParameters, parent);
+      }
+      // (an object literal for a type parameter, context: TContext, that a
+      // callback argument declares concretely — enter(val, context:
+      // ScopeTraversalContext): that type, so every callback gets the object
+      // itself rather than a converted copy)
+      if (isObjectLiteralExpression(node)) {
+        const concrete = typeParameterArgumentFromCallbacks(fn, index, parent);
+        if (concrete) return concrete;
       }
       return params[index]?.type;
     }
@@ -12690,6 +12962,22 @@ function inferRawExpressionType(expr: AstNode): string | undefined {
 }
 
 function inferExpressionTypeUncached(expr: AstNode): string | undefined {
+  // object.toString read as a value: the method, any (see isObjectProtoMethodRead)
+  if (expr && isObjectProtoMethodRead(expr)) return 'interface{}';
+  // a?.b.c: nullish when the guard's base is (the rest of the chain skips)
+  if (isOptionalChainContinuation(expr)) {
+    const link = firstOptionalLink(expr)!;
+    const baseType = inferExpressionType(link.expression);
+    if (baseType?.startsWith('*')) {
+      const tmp = getTempName('opt');
+      const chain = copyOptionalChain(expr, link, tmp);
+      variableGoTypes.set(tmp, baseType);
+      const narrowed = /^\*[A-Za-z_]/.test(baseType) && !NULLABLE_PRIMITIVE_TYPES.includes(baseType) ? [] : [tmp];
+      const innerType = withNarrowingType(narrowed, () => inferExpressionType(chain));
+      variableGoTypes.delete(tmp);
+      return innerType === undefined ? 'interface{}' : makeNullableType(innerType);
+    }
+  }
   const inferred = inferExpressionTypeOf(expr);
   if (inferred !== undefined) return inferred;
   // x?.m(…): the method's result, nullable (absent when x is)
@@ -14934,6 +15222,8 @@ function getNullishResultType(expr: AstNode): string | undefined {
     leftType && NULLABLE_PRIMITIVE_TYPES.includes(leftType) ? leftType.slice(1) : leftType;
   if (!rightType || rightType === 'nil') return leftType;
   if (rightType === leftValueType) return rightType;
+  // (*Kind ?? Kind.Local — a map read of an enum that may miss — is a Kind)
+  if (leftType === `*${rightType}` && !rightType.startsWith('*') && !rightType.startsWith('[]') && rightType !== 'interface{}') return rightType;
   if (leftValueType && rightType === `*${leftValueType}`) return rightType;
   if (leftValueType === 'interface{}') return 'interface{}';
   // (opts ?? {}: the left side's object type)
@@ -15179,6 +15469,59 @@ function withNarrowingType(names: string[], infer: () => string | undefined): st
   inferMemoPop();
   for (const name of added) narrowedVariables.delete(name);
   return type;
+}
+
+// The chain with its first link's base replaced by the narrowed temp, so the
+// rest of it is visited on a value known to be set
+function copyOptionalChain(node: AstNode, link: AstNode, baseName: string): AstNode {
+  const copyOf = (current: AstNode): AstNode => {
+    if (current === link) {
+      const base: AstNode = { kind: 'Identifier', text: baseName, parent: undefined, line: current.line, column: current.column };
+      const copied: AstNode = { ...current, questionDotToken: undefined, expression: base };
+      base.parent = copied;
+      return copied;
+    }
+    if (isPropertyAccessExpression(current) || isElementAccessExpression(current) || isCallExpression(current) || isNonNullExpression(current)) {
+      const expression = copyOf(current.expression);
+      const copied: AstNode = { ...current, expression };
+      expression.parent = copied;
+      return copied;
+    }
+    return current;
+  };
+  const root = copyOf(node);
+  root.parent = node.parent;
+  return root;
+}
+
+// a?.b.c(…) / a?.b.c: the guard on the first link's base covers the rest of
+// the chain, which is skipped entirely when the base is nullish
+function visitOptionalChainContinuation(node: AstNode): string | undefined {
+  const link = firstOptionalLink(node);
+  if (!link || link === node) return undefined;
+  const base = link.expression;
+  if (!base) return undefined;
+  const baseType = inferExpressionType(base);
+  // (a base that is never nullish — a string, a number: the access is plain)
+  if (!baseType || !baseType.startsWith('*')) return undefined;
+  const baseExpr = visit(base);
+  const tmp = getTempName('opt');
+  const chain = copyOptionalChain(node, link, tmp);
+  variableGoTypes.set(tmp, baseType);
+  // (an object pointer is used as it is; a nullable primitive or array
+  // reference is dereferenced by its reads)
+  const narrowed = /^\*[A-Za-z_]/.test(baseType) && !NULLABLE_PRIMITIVE_TYPES.includes(baseType) ? [] : [tmp];
+  const innerType = withNarrowingType(narrowed, () => inferExpressionType(chain));
+  const innerCode = withNarrowing(narrowed, () => visit(chain));
+  if (isDiscardedValue(node)) {
+    return `func() { ${tmp} := ${baseExpr}; if ${tmp} == nil { return }; ${isCallExpression(node) ? innerCode : `_ = ${innerCode}`} }()`;
+  }
+  if (!innerType) {
+    return `func() interface{} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return nil }; ${innerCode}; return nil }()`;
+  }
+  const resultType = makeNullableType(innerType);
+  const value = resultType === innerType ? innerCode : `func() ${resultType} { __v := ${innerCode}; return &__v }()`;
+  return `func() ${resultType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return *new(${resultType}) }; return ${value} }()`;
 }
 
 function visitOptionalCall(node: AstNode): string {
@@ -16258,6 +16601,20 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     if (merged.size === 0) return getType(typeNode.types[0]);
     if (memberFields.length > 0 && memberFields[0].size === merged.size && isTypeReferenceNode(head)) return getType(head, getArrayType);
     const fields = [...merged].map(([field, fieldType]) => `${goFieldName(field)} ${fieldType}`);
+    // (a head naming an object type — TreeNode<T> & { reactive } — whose
+    // struct ends in its key order, __keys: the same slot right after its
+    // fields, so the head's struct is a prefix of this one and the value
+    // returned as a TreeNode is a view of the same object, not a copy)
+    let headName = isTypeReferenceNode(head) && isIdentifier(head.typeName) ? head.typeName.text : '';
+    // (an alias of another object type — DependencyNode = TreeNode<…> — is that type)
+    for (let hops = 0; hops < 8 && headName; hops++) {
+      const aliased = declaredTypeAliases.get(headName);
+      if (!aliased || !isTypeReferenceNode(aliased) || !isIdentifier(aliased.typeName)) break;
+      headName = aliased.typeName.text;
+    }
+    const headIsStruct = !!headName && (declaredTypeAliases.get(headName)?.kind === 'TypeLiteral' ||
+      (declaredInterfaces.has(headName) && interfaceHasProperties(declaredInterfaces.get(headName)) && !isMethodInterfaceName(headName)));
+    if (headIsStruct && memberFields[0].size > 0 && memberFields[0].size < fields.length) fields.splice(memberFields[0].size, 0, '__keys *[]string');
     return `*struct{ ${fields.join('; ')} }`;
   }
   // [A, B] tuples are slices: []A when all elements share a type, else []interface{}
@@ -17683,9 +18040,12 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     }
     return `strings.Join(${obj}, ${args[0] ?? '","'})`;
   },
+  // (a copy, as in JS: a reslice shares the backing array, and an append to
+  // either side — next ??= block.slice(0, i); next.push(…) — overwrites the other)
   slice: (obj, args) => {
-    if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
-    return `${obj}[${sliceIndex(obj, args[0])}:]`;
+    importedPackages.add('slices');
+    if (args.length >= 2) return `slices.Clone(${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}])`;
+    return `slices.Clone(${obj}[${sliceIndex(obj, args[0])}:])`;
   },
   reverse: (obj) => {
     importedPackages.add('slices');
@@ -18216,6 +18576,21 @@ function isAssignableExpression(expr: AstNode): boolean {
   return isIdentifier(expr) || isPropertyAccessExpression(expr);
 }
 
+// Object.prototype methods an object or record answers when read as values
+const OBJECT_PROTO_VALUE_METHODS = new Set(['hasOwnProperty', 'toString', 'valueOf', 'propertyIsEnumerable', 'isPrototypeOf', 'toLocaleString']);
+
+// obj.toString / obj.hasOwnProperty … read as a value (not called, not
+// written) off an any value, a record or an object without such a field
+function isObjectProtoMethodRead(node: AstNode): boolean {
+  if (!isPropertyAccessExpression(node) || !isIdentifier(node.name) || !OBJECT_PROTO_VALUE_METHODS.has(node.name.text)) return false;
+  if (isCallee(node) || isAssignmentTarget(node) || hasQuestionDot(node)) return false;
+  // (fn.call / .apply / .bind of the method: a call of it — see lowerPrototypeCall)
+  if (isPropertyAccessExpression(node.parent) && node.parent.expression === node && !['call', 'apply'].includes(node.parent.name?.text)) return false;
+  const receiverType = inferExpressionType(node.expression) ?? '';
+  if (receiverType === 'interface{}' || receiverType === 'any' || receiverType === 'map[string]interface{}' || receiverType.startsWith('*TnMap[string, ')) return true;
+  return receiverType.startsWith('*struct{') && !objectFieldNames(receiverType).includes(node.name.text);
+}
+
 const ARRAY_ONLY_METHODS = new Set([
   'map', 'filter', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'forEach', 'reduce',
   'reduceRight', 'join', 'flat', 'flatMap', 'sort', 'reverse', 'toSorted', 'toReversed', 'fill', 'splice',
@@ -18285,7 +18660,10 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
       return `TnPushField(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${toGoValueOfType(node.arguments[0], 'interface{}')})`;
     }
     // (an any variable may reference an array passed to it: stored through)
-    const anyVariable = isIdentifier(receiver) && (variableGoTypes.get(receiver.text) ?? topLevelGoTypes.get(receiver.text)) === 'interface{}';
+    // (or an any field — NodePath's container = node[listKey]: it may hold
+    // the array's reference, through which the change must go)
+    const anyField = isPropertyAccessExpression(receiver) && !hasQuestionDot(receiver) && inferExpressionType(receiver) === 'interface{}' && isAddressable(visit(receiver));
+    const anyVariable = anyField || (isIdentifier(receiver) && (variableGoTypes.get(receiver.text) ?? topLevelGoTypes.get(receiver.text)) === 'interface{}');
     const writeBack = isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression)
       ? `TnSetArrayInPlace(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, ${elements})`
       : anyVariable ? `TnStoreArray(&${visit(receiver)}, ${elements})` : `${visit(receiver)} = ${elements}`;
@@ -18300,9 +18678,10 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
     return `func() ${resultType} { ${stop}${read}; __r := ${op}; ${writeBack}; return __r }()`;
   }
   // a non-mutating array method on an any value whose name an object literal's
-  // function has too (so the call dispatches, as TnCall_m): on its elements,
-  // unless the value dispatches (decided at run time)
-  if (ARRAY_ONLY_METHODS.has(method) && objectLiteralMethodNames.has(method) && !dynamicArrayOrDispatch.has(node)) {
+  // function — or a class's method — has too (so the call dispatches, as
+  // TnCall_m): on its elements, unless the value dispatches (decided at run
+  // time: a Stack<T> union's this.#next.find(fn) runs Node/Empty's find)
+  if (ARRAY_ONLY_METHODS.has(method) && (objectLiteralMethodNames.has(method) || classMethodNamed(method)) && !dynamicArrayOrDispatch.has(node)) {
     dynamicArrayOrDispatch.add(node);
     const dispatched = visitDynamicDispatch(node);
     const arrayPath = (() => {
@@ -18313,8 +18692,10 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
       const call: AstNode = { ...node, expression: { ...node.expression, expression: local } };
       call.expression.parent = call;
       local.parent = call.expression;
-      const resultType = inferExpressionType(call) || 'interface{}';
       const op = visit(call);
+      // (forEach — no result — or a result nothing reads: run for its effects)
+      if (method === 'forEach' || isDiscardedValue(node)) return `func() { ${elements} := TnAs[[]interface{}](${visit(receiver)}); _ = ${elements}; ${op} }()`;
+      const resultType = inferExpressionType(call) || 'interface{}';
       return `func() ${resultType} { ${elements} := TnAs[[]interface{}](${visit(receiver)}); return ${op} }()`;
     })();
     dynamicArrayOrDispatch.delete(node);
@@ -18322,6 +18703,8 @@ function visitDynamicMethodCall(node: AstNode): string | undefined {
       useHelper('dynamic');
       const receiverCode = visit(node.expression.expression);
       if (isDiscardedValue(node)) return `func() { if TnIsSlice(${receiverCode}) { ${arrayPath} } else { ${dispatched} } }()`;
+      // (forEach read as a value: undefined, after the effects)
+      if (method === 'forEach') return `func() interface{} { if TnIsSlice(${receiverCode}) { ${arrayPath} } else { ${dispatched} }; return nil }()`;
       return `func() interface{} { if TnIsSlice(${receiverCode}) { return ${arrayPath} }; return ${dispatched} }()`;
     }
   }
@@ -20183,6 +20566,29 @@ function bindingName(element: AstNode, goName: string): string {
 
 // Whether the code around a declaration tests variable `name` for undefined
 // or null (x === undefined, x ?? y, switch (…x…) { case undefined: })
+// Whether every read of a variable is a nullish test of it — the left of ??,
+// or === / !== against null / undefined — so it can be held as a *T that is
+// never read as a T (an enum's *Kind has no narrowing to a Kind)
+function onlyNullishUses(name: string, declaration: AstNode): boolean {
+  let scope = declaration.parent;
+  while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
+  if (!scope) return false;
+  const nullishTest = (ref: AstNode): boolean => {
+    let at = ref;
+    while (at.parent && isParenthesizedExpression(at.parent)) at = at.parent;
+    const parent = at.parent;
+    if (!isBinaryExpression(parent)) return false;
+    const op = parent.operatorToken.kind;
+    if (op === 'QuestionQuestionToken') return parent.left === at;
+    if (['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken', 'EqualsEqualsToken', 'ExclamationEqualsToken'].includes(op)) {
+      return isNilLiteral(parent.left === at ? parent.right : parent.left);
+    }
+    return false;
+  };
+  return !containsNode(scope.body ?? scope, (n) =>
+    isIdentifier(n) && n.text === name && n !== declaration.name && !(isPropertyAccessExpression(n.parent) && n.parent.name === n) && !nullishTest(n));
+}
+
 function comparedToNullish(name: string, declaration: AstNode): boolean {
   let scope = declaration.parent;
   while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
@@ -20495,6 +20901,87 @@ function identifierOfCastArgument(arg: AstNode): AstNode | undefined {
 // copies to write back (see the ExpressionStatement case)
 let callWriteBacks: { call: AstNode; items: { tmp: string; converted: string; target: string }[] } | undefined;
 
+// The array arguments of the call being visited that are converted copies the
+// callee changes in place: after the call their elements are copied back into
+// the caller's array (JS arrays are shared: retainWhere(array, â€¦) truncates
+// the caller's array too)
+let arrayCallWriteBacks: { tmp: string; converted: string; reference: string; elementType: string }[] | undefined;
+
+// Whether a function changes the array its parameter `name` names in place
+// (push and the other mutators, a length assignment, an element write) â€” or
+// passes the array on to another function that does
+function mutatesArrayParameter(fn: AstNode, name: string, passedOn = new WeakSet<AstNode>()): boolean {
+  const rootIsParam = (n: AstNode): boolean => {
+    let u = unwrapParentheses(n);
+    while (isPropertyAccessExpression(u) || isElementAccessExpression(u) || u.kind === 'NonNullExpression') u = unwrapParentheses(u.expression);
+    return isIdentifier(u) && u.text === name;
+  };
+  const memberOfParam = (n: AstNode): boolean => {
+    const u = unwrapParentheses(n);
+    if (!isPropertyAccessExpression(u) && !isElementAccessExpression(u)) return false;
+    if (!rootIsParam(u)) return false;
+    // (a property of an element, array[0].x = v, is not the array itself)
+    return !isElementAccessExpression(u) || isIdentifier(unwrapParentheses(u.expression)) || isPropertyAccessExpression(unwrapParentheses(u.expression));
+  };
+  let local = false;
+  const calls: AstNode[] = [];
+  containsNode(fn.body, (n) => {
+    if (isBinaryExpression(n) && isAssignmentOperatorKind(n.operatorToken.kind)) {
+      local ||= memberOfParam(n.left);
+    } else if ((isPrefixUnaryExpression(n) || n.kind === 'PostfixUnaryExpression') && ['PlusPlusToken', 'MinusMinusToken'].includes(n.operator)) {
+      local ||= memberOfParam(n.operand);
+    } else if (isCallExpression(n) && isPropertyAccessExpression(n.expression) && MUTATING_ARRAY_METHODS.has(n.expression.name.text)) {
+      local ||= rootIsParam(n.expression.expression);
+    }
+    if (isCallExpression(n) && !isPropertyAccessExpression(n.expression) && !isCallExpression(n.expression)) calls.push(n);
+    return false;
+  });
+  if (local) return true;
+  if (passedOn.has(fn)) return false;
+  passedOn.add(fn);
+  // (the array handed to another call: that function may change it)
+  for (const call of calls) {
+    for (const arg of call.arguments ?? []) {
+      if (isIdentifier(unwrapParentheses(arg)) && unwrapParentheses(arg).text === name) return true;
+    }
+  }
+  return false;
+}
+
+// Where a converted array argument's changes are copied back: the caller's
+// array reference, and its element type
+function arrayWriteBackOf(node: AstNode, paramType: string): { reference: string; elementType: string } | undefined {
+  const target = unwrapParentheses(node);
+  const paramElement = paramType.slice(3);
+  const own = (inferExpressionType(target) ?? '').replace(/^\*/, '');
+  // (the same elements: no copy was made, the callee changes the array itself)
+  if (!paramElement || own === `[]${paramElement}`) return undefined;
+  if (isIdentifier(target)) {
+    const goType = variableGoTypes.get(target.text) ?? topLevelGoTypes.get(target.text) ?? '';
+    if (!goType.startsWith('*[]') || !referenceArrays.has(target.text)) return undefined;
+    return { reference: getSafeName(target.text), elementType: goType.slice(3) };
+  }
+  if (isPropertyAccessExpression(target) && !hasQuestionDot(target) && isReferenceFieldAccess(target)) {
+    const raw = inferRawExpressionType(target) ?? '';
+    if (!raw.startsWith('*[]')) return undefined;
+    return { reference: visit(target, { rawArrayField: true }), elementType: raw.slice(3) };
+  }
+  return undefined;
+}
+
+// A call whose array arguments were converted copies: the callee's changes to
+// them are copied back into the caller's arrays after it returns
+function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: string; converted: string; reference: string; elementType: string }[]): string {
+  useHelper('dynamic');
+  useHelper('arraySubclass');
+  const decls = backs.map((b) => `${b.tmp} := ${b.converted}`).join(';\n\t');
+  const writes = backs.map((b) => `(*${b.reference}) = TnSliceAs[${b.elementType}](*${b.tmp})`).join(';\n\t');
+  const type = inferExpressionType(node) ?? '';
+  const resultType = type && type !== 'undefined' && type !== 'void' && type !== ':' ? type : '';
+  if (!resultType) return `func() {\n\t${decls};\n\t${call};\n\t${writes}\n}()`;
+  return `func() ${resultType} {\n\t${decls};\n\t__wbResult := ${call};\n\t${writes};\n\treturn __wbResult\n}()`;
+}
+
 // Whether a function's body changes fields of its parameter `name`
 // (name.f = …, name.f++, name.f.push(…) and the other array mutators) — or
 // passes the object on to another function that does (a parser handing its
@@ -20660,6 +21147,17 @@ function visitCallArguments(node: AstNode): string[] {
     }
     if (mentioned.length > 0) return visit(arg);
     const converted = toGoValueOfType(arg, paramType);
+    // (an array converted to the parameter's elements: the callee changes it
+    // in place — the copy's elements are copied back after the call, as a JS
+    // array handed to retainWhere(array, â€¦) is truncated for the caller too)
+    if (arrayCallWriteBacks && !isSpreadElement(arg) && paramType.startsWith('*[]') && isIdentifier(param.name) && fn.body && mutatesArrayParameter(fn, param.name.text)) {
+      const back = arrayWriteBackOf(arg, paramType);
+      if (back) {
+        const tmp = getTempName('wb');
+        arrayCallWriteBacks.push({ tmp, converted, reference: back.reference, elementType: back.elementType });
+        return tmp;
+      }
+    }
     // (a converted copy the function changes: written back after the call)
     if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && identifierOfCastArgument(arg) && paramType.startsWith('*') && (isObjectTypeName(paramType.slice(1)) || paramType.slice(1).startsWith('struct{')) && isIdentifier(param.name) && fn.body && mutatesParameterFields(fn, param.name.text)) {
       const tmp = getTempName('wb');
@@ -21352,6 +21850,22 @@ function usageCollectionType(declaration: AstNode): string | undefined {
         let candidate = '';
         if ((method === 'push' || method === 'unshift') && args.length === 1 && isName(args[0]) && receiverType.startsWith('[]')) candidate = receiverType.slice(2);
         if (method === 'set' && args.length === 2 && isName(args[1]) && receiverType.startsWith('TnMap[')) candidate = extractMapValueType(`*${receiverType}`);
+        if (candidate.startsWith('*TnMap[') && !candidate.includes('interface{}')) found = candidate;
+      }
+      // f(…, name, …) with f's parameter there a Map<K, V> / Set<T>: that type
+      // (collectTemporariesSidemapImpl(fn, used, temporaries, null) — a
+      // converted copy would lose every set the callee makes)
+      if (isCallExpression(n) && isIdentifier(n.expression)) {
+        const index = (n.arguments ?? []).findIndex((a: AstNode) => isName(a));
+        const fn = index >= 0 ? calledFunctionDeclaration(n.expression.text, n) : undefined;
+        const param = fn?.parameters?.[index];
+        const candidate = param?.type && !param.dotDotDotToken ? getType(param.type) : '';
+        if (candidate.startsWith('*TnMap[') && !candidate.includes('interface{}')) found = candidate;
+      }
+      // return name, from a function declared to return a Map<K, V> / Set<T>
+      if (isReturnStatement(n) && isName(n.expression)) {
+        const declared = getReturnTypeNode(getEnclosingFunction(n));
+        const candidate = declared ? getType(declared) : '';
         if (candidate.startsWith('*TnMap[') && !candidate.includes('interface{}')) found = candidate;
       }
       for (const child of childNodes(n)) scan(child);
@@ -23540,7 +24054,7 @@ const helperPackages: Record<string, string[]> = {
   weakRefs: ['weak', 'runtime', 'sync'],
   builtins: ['math', 'strconv', 'strings', 'math/big'],
   date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
-  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic'],
+  dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic', 'weak', 'runtime'],
   classes: ['reflect'],
   generatorStep: ['sync'],
   arraySubclass: ['reflect'],
@@ -24837,6 +25351,33 @@ var tnProtoMethodOf func(obj interface{}, key string) (interface{}, bool)
 // properties)
 var tnExpandos sync.Map
 
+// An object's added properties, in the order they were first set (JS property
+// order: Object.keys lists them after the fields, in insertion order)
+type tnExpandoProps struct {
+	mu     sync.Mutex
+	keys   []string
+	values map[string]interface{}
+}
+
+func tnExpandoPropsOf(obj interface{}) (*tnExpandoProps, bool) {
+	props, ok := tnExpandos.Load(obj)
+	if !ok {
+		return nil, false
+	}
+	return props.(*tnExpandoProps), true
+}
+
+// a copy of the object's added property names, in insertion order
+func tnExpandoKeys(obj interface{}) []string {
+	props, ok := tnExpandoPropsOf(obj)
+	if !ok {
+		return nil
+	}
+	props.mu.Lock()
+	defer props.mu.Unlock()
+	return append([]string{}, props.keys...)
+}
+
 // Accessor properties defined on objects whose type is not a TnMap (a class
 // instance: Babel's ParseError defines a 'message' getter that computes and
 // self-assigns). An accessor shadows the property it replaces.
@@ -24901,9 +25442,36 @@ func tnExpandoSet(obj interface{}, key string, value interface{}) bool {
 	}
 	// (keyed by the object itself: a recycled address of a collected object
 	// must not hand its expandos to the new object at the same address)
-	props, _ := tnExpandos.LoadOrStore(obj, &sync.Map{})
-	props.(*sync.Map).Store(key, value)
+	props, _ := tnExpandos.LoadOrStore(obj, &tnExpandoProps{values: map[string]interface{}{}})
+	p := props.(*tnExpandoProps)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, found := p.values[key]; !found {
+		p.keys = append(p.keys, key)
+	}
+	p.values[key] = value
 	return true
+}
+
+// The property is gone: a field write that fits it replaced whatever was set
+// beside the object
+func tnExpandoDelete(obj interface{}, key string) {
+	props, ok := tnExpandoPropsOf(obj)
+	if !ok {
+		return
+	}
+	props.mu.Lock()
+	defer props.mu.Unlock()
+	if _, found := props.values[key]; !found {
+		return
+	}
+	delete(props.values, key)
+	for i, k := range props.keys {
+		if k == key {
+			props.keys = append(props.keys[:i], props.keys[i+1:]...)
+			break
+		}
+	}
 }
 
 func tnExpandoGet(obj interface{}, key string) (interface{}, bool) {
@@ -24918,11 +25486,14 @@ func tnExpandoGet(obj interface{}, key string) (interface{}, bool) {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, false
 	}
-	props, ok := tnExpandos.Load(obj)
+	props, ok := tnExpandoPropsOf(obj)
 	if !ok {
 		return nil, false
 	}
-	return props.(*sync.Map).Load(key)
+	props.mu.Lock()
+	defer props.mu.Unlock()
+	value, found := props.values[key]
+	return value, found
 }
 
 // v instanceof fn, with fn a function given a [Symbol.hasInstance] (zod's
@@ -25051,6 +25622,39 @@ func TnRestArgsAs[T any](args []interface{}, i int) []T {
 	return out
 }
 
+// An Object.prototype method held as a value (jsesc: const hasOwnProperty =
+// object.hasOwnProperty; hasOwnProperty.call(o, k)): its name, run on the
+// receiver call / apply give it
+type tnProtoMethod string
+
+func (m tnProtoMethod) run(self interface{}, args []interface{}) interface{} {
+	switch m {
+	case "hasOwnProperty", "propertyIsEnumerable":
+		if len(args) == 0 {
+			return false
+		}
+		return TnHas(self, args[0])
+	case "toString":
+		return TnObjectTypeTag(self)
+	case "toLocaleString":
+		return TnJSString(self)
+	case "isPrototypeOf":
+		return false
+	}
+	return self // valueOf
+}
+
+// obj.name read as a value, name an Object.prototype method: the object's own
+// property of that name, else the prototype's method
+func TnProtoMember(obj interface{}, name string) interface{} {
+	if !TnIsNil(obj) && TnHas(obj, name) {
+		if v := TnGet(obj, name); v != nil {
+			return v
+		}
+	}
+	return tnProtoMethod(name)
+}
+
 // obj.name(…args) on a dynamic value whose class has no such method: a
 // function-valued property (an object literal's method, a record's function)
 // then / catch / finally on a promise held as any (set when promises are used)
@@ -25093,6 +25697,25 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 		if v, handled := tnDynamicPromiseMethod(reflect.ValueOf(obj), name, args); handled {
 			return v
 		}
+	}
+	// an Object.prototype method read as a value (const toString =
+	// object.toString): call / apply run it on the given receiver
+	if m, ok := obj.(tnProtoMethod); ok && (name == "call" || name == "apply") {
+		var self interface{}
+		rest := []interface{}{}
+		if len(args) > 0 {
+			self = args[0]
+		}
+		if name == "call" && len(args) > 1 {
+			rest = args[1:]
+		} else if name == "apply" && len(args) > 1 && !TnIsNil(args[1]) {
+			if rv := reflect.Indirect(reflect.ValueOf(args[1])); rv.Kind() == reflect.Slice {
+				for i := 0; i < rv.Len(); i++ {
+					rest = append(rest, rv.Index(i).Interface())
+				}
+			}
+		}
+		return m.run(self, rest)
 	}
 	// a function value's call / apply (fn.apply(this, arguments) of a
 	// Function-typed value): the function with those arguments
@@ -25325,6 +25948,13 @@ func TnSetArrayInPlace(obj interface{}, key string, value interface{}) {
 			return
 		}
 	}
+	// (an any field or a dynamic object's entry holding an array reference —
+	// NodePath's container, program.body's own array: the change goes through
+	// the reference, so every holder of the array sees it)
+	if cur := reflect.ValueOf(TnGetRef(obj, key)); cur.Kind() == reflect.Pointer && !cur.IsNil() && cur.Elem().Kind() == reflect.Slice {
+		cur.Elem().Set(tnConvertTo(value, cur.Type().Elem()))
+		return
+	}
 	TnSet(obj, key, value)
 }
 
@@ -25349,11 +25979,46 @@ func tnBoxArray(v interface{}) interface{} {
 	return v
 }
 
+// arr.length = n: the array truncates, or grows with undefineds. Only a
+// reference (*[]T) can: a slice value's header is a copy of the caller's
+func tnSetLength(obj interface{}, value interface{}) bool {
+	rv := reflect.ValueOf(obj)
+	if !rv.IsValid() {
+		return false
+	}
+	var slice reflect.Value
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		slice = rv.Elem()
+	} else if rv.Kind() == reflect.Slice {
+		return true
+	} else {
+		return false
+	}
+	n := int(TnNumber(value))
+	if n < 0 {
+		n = 0
+	}
+	if n <= slice.Len() {
+		slice.SetLen(n)
+		return true
+	}
+	grown := reflect.MakeSlice(slice.Type(), n, n)
+	reflect.Copy(grown, slice)
+	slice.Set(grown)
+	return true
+}
+
 func TnSet(obj interface{}, key string, value interface{}) {
 	// (a view copy — a merged-union narrowing of a wider object — forwards
 	// field writes to its origin: JS object identity)
 	if origin, ok := tnViewOrigin(obj); ok {
 		obj = origin
+	}
+	// arr.length = n: the array truncates, or grows with undefineds
+	if key == "length" {
+		if tnSetLength(obj, value) {
+			return
+		}
 	}
 	if o, ok := obj.(map[string]interface{}); ok {
 		// (an array stored as a reference: see tnBoxArray)
@@ -25390,6 +26055,8 @@ func TnSet(obj interface{}, key string, value interface{}) {
 					value = tnBoxArray(value)
 				}
 				if p.write(base, value) {
+					// (a value set beside the object is replaced by the field's)
+					tnExpandoDelete(obj, key)
 					return
 				}
 				// (a value that doesn't fit the field's Go type replaces the
@@ -25402,7 +26069,11 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		}
 	}
 	// (an expando-stored array is a reference too: see tnBoxArray)
-	if tnSetMember(obj, key, value) || tnExpandoSet(obj, key, tnBoxArray(value)) {
+	if tnSetMember(obj, key, value) {
+		tnExpandoDelete(obj, key)
+		return
+	}
+	if tnExpandoSet(obj, key, tnBoxArray(value)) {
 		return
 	}
 	panic(fmt.Sprintf("TnSet: cannot set property %s of %T", key, obj))
@@ -25454,7 +26125,24 @@ func tnConvertTo(v interface{}, t reflect.Type) reflect.Value {
 	return reflect.Zero(t)
 }
 
+// A property key held as a nullable primitive (let uid; … uid = "_" + name —
+// a *string): its value
+func tnKeyValue(key interface{}) interface{} {
+	switch k := key.(type) {
+	case *string:
+		if k != nil {
+			return *k
+		}
+	case *float64:
+		if k != nil {
+			return *k
+		}
+	}
+	return key
+}
+
 func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
+	key = tnKeyValue(key)
 	switch o := obj.(type) {
 	case map[string]interface{}:
 		if k, ok := key.(string); ok {
@@ -25503,6 +26191,7 @@ func TnSetIndex(obj interface{}, key interface{}, value interface{}) {
 }
 
 func TnIndex(obj interface{}, key interface{}) interface{} {
+	key = tnKeyValue(key)
 	switch o := obj.(type) {
 	case *[]float64:
 		if i, ok := key.(float64); ok && o != nil && i >= 0 && int(i) < len(*o) && i == float64(int(i)) {
@@ -26000,11 +26689,26 @@ func TnObjectTypeTag(v interface{}) string {
 	if _, ok := v.(interface{ TnProp(string) (interface{}, bool) }); ok && strings.HasSuffix(fmt.Sprintf("%T", v), "TnRegex") {
 		return "[object RegExp]"
 	}
-	switch reflect.ValueOf(v).Kind() {
+	// (a Map / Set: by its collection kind; 2 is a Set)
+	if k, ok := v.(interface{ TnJSKind() uint8 }); ok {
+		switch k.TnJSKind() {
+		case 1:
+			return "[object Map]"
+		case 2:
+			return "[object Set]"
+		}
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
 	case reflect.Slice:
 		return "[object Array]"
 	case reflect.Func:
 		return "[object Function]"
+	case reflect.Pointer:
+		// (an array reference, *[]T)
+		if rv.Type().Elem().Kind() == reflect.Slice {
+			return "[object Array]"
+		}
 	}
 	return "[object Object]"
 }
@@ -26143,6 +26847,8 @@ func TnDelete(obj interface{}, key interface{}) bool {
 		// a typed object's field: unset (undefined) again
 		rv := reflect.ValueOf(obj)
 		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+			// (a property set beside the object goes too)
+			tnExpandoDelete(obj, k)
 			f := tnFieldOf(rv.Elem(), k)
 			if f.IsValid() && f.CanAddr() {
 				reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.Zero(f.Type()))
@@ -26192,6 +26898,10 @@ func TnHas(obj interface{}, key interface{}) bool {
 	}
 	// Struct objects: the in operator checks for a field
 	if k, ok := key.(string); ok && obj != nil {
+		// (a property added to the object after the fact: o.extra = v)
+		if _, found := tnExpandoGet(obj, k); found {
+			return true
+		}
 		if p := tnPlanOf(obj, k); p.kind != tnFieldSlow {
 			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
 				return p.set(base)
@@ -26234,6 +26944,27 @@ func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
 	keys := []string{}
 	values := []interface{}{}
 	tnCollectStructProps(rv.Elem(), &keys, &values)
+	// (the object's added properties come after its fields, in insertion
+	// order: a field that didn't take the value reads as undefined, so it is
+	// not listed here, and the value it was given is)
+	for _, key := range tnExpandoKeys(obj) {
+		value, found := tnExpandoGet(obj, key)
+		if !found || value == nil {
+			continue
+		}
+		listed := false
+		for _, k := range keys {
+			if k == key {
+				listed = true
+				break
+			}
+		}
+		if listed {
+			continue
+		}
+		keys = append(keys, key)
+		values = append(values, value)
+	}
 	return keys, values, true
 }
 
@@ -26594,6 +27325,55 @@ func tnPrefixCompatible(from, to reflect.Type) bool {
 	return compatible
 }
 
+// The objects conversions made, by source object and target type: converting
+// one object to one type twice gives one object (an entry goes when its
+// source is collected)
+type tnConvIdentityKey struct {
+	src uintptr // (an address, not a reference: the entry doesn't keep its source alive)
+	dst reflect.Type
+}
+
+// (the source's weak pointer tells a live entry from one whose source died
+// and whose address a new object now has)
+type tnConvIdentity struct {
+	out reflect.Value
+	src weak.Pointer[byte]
+}
+
+var tnConvIdentities = map[tnConvIdentityKey]tnConvIdentity{}
+var tnConvIdentityMu sync.Mutex
+
+// The converted object for src as a *dst: the one made before (cached true),
+// else a new one remembered for src (a zero-size source has no identity of
+// its own: always a new one)
+func tnConvIdentityOf(src unsafe.Pointer, dst reflect.Type, srcSize uintptr) (reflect.Value, bool) {
+	if srcSize == 0 || src == nil {
+		return reflect.New(dst), false
+	}
+	key := tnConvIdentityKey{uintptr(src), dst}
+	self := (*byte)(src)
+	tnConvIdentityMu.Lock()
+	entry, ok := tnConvIdentities[key]
+	if ok && entry.src.Value() != self {
+		ok = false
+	}
+	if !ok {
+		entry = tnConvIdentity{out: reflect.New(dst), src: weak.Make(self)}
+		tnConvIdentities[key] = entry
+	}
+	tnConvIdentityMu.Unlock()
+	if !ok {
+		runtime.AddCleanup(self, func(k tnConvIdentityKey) {
+			tnConvIdentityMu.Lock()
+			if e, has := tnConvIdentities[k]; has && e.src.Value() == nil {
+				delete(tnConvIdentities, k)
+			}
+			tnConvIdentityMu.Unlock()
+		}, key)
+	}
+	return entry.out, ok
+}
+
 var tnConvPlans [1 << 10]atomic.Pointer[tnConvPlan]
 var tnConvPlanIndex = map[[2]unsafe.Pointer]*tnConvPlan{}
 var tnConvPlanMu sync.RWMutex
@@ -26627,10 +27407,12 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 	}
 	p.src, p.dst = rt.Elem(), t.Elem()
 	// a discriminated-union member view: the target's fields are an exact
-	// prefix of the source's — reinterpret the source as the target (JS
-	// object identity: effect writes through the narrowed view reach the
-	// original), instead of copying
-	if tnPrefixCompatible(p.src, p.dst) && !rt.Implements(instance) {
+	// prefix of the source's (a union struct narrowed to the member it holds)
+	// or the source's are of the target's (a member kept in a union struct's
+	// slot) — the source's memory reinterpreted as the target (JS object
+	// identity: effect writes through the narrowed view reach the original),
+	// instead of copied
+	if (tnPrefixCompatible(p.src, p.dst) || tnPrefixCompatible(p.dst, p.src)) && !rt.Implements(instance) {
 		p.view = true
 		p.ok = true
 		return p
@@ -26676,8 +27458,16 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 	if p.view {
 		return reflect.NewAt(p.dst, unsafe.Pointer(reflect.ValueOf(v).Elem().UnsafeAddr()))
 	}
-	out := reflect.New(p.dst)
-	src, dst := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1], out.UnsafePointer()
+	src := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
+	// (one object stays one object: converting it to the same type again gives
+	// the same converted object, its fields refreshed from the source — JS
+	// identity for Set / Map keys and === (a Babel node read as a
+	// t.Identifier: hoistable.has(path.node) finds binding.identifier))
+	out, cached := tnConvIdentityOf(src, p.dst, p.src.Size())
+	dst := out.UnsafePointer()
+	if cached {
+		reflect.NewAt(p.dst, dst).Elem().SetZero()
+	}
 	for i := range p.fields {
 		f := &p.fields[i]
 		a, b := unsafe.Add(src, f.from), unsafe.Add(dst, f.to)
@@ -26716,22 +27506,20 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 	// (a narrowing copy — the source has every target field plus extras — is
 	// registered so field writes through it reach the source: JS object
 	// identity across merged-union member views)
-	if p.src.NumField() > p.dst.NumField() {
+	if p.src.NumField() > p.dst.NumField() && !cached {
 		tnRegisterView(out.Interface(), reflect.NewAt(p.src, src).Interface())
 	}
 	// the properties the object carries beyond its struct (tnExpandos): a
 	// target field of the same name reads them
-	if props, any := tnExpandos.Load(v); any {
-		for _, ef := range p.expandos {
-			value, ok := props.(*sync.Map).Load(ef.name)
-			if !ok || value == nil {
-				continue
-			}
-			df := out.Elem().Field(ef.di)
-			df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
-			if converted, cok := TnConvertDynamic(value, df.Type()); cok {
-				df.Set(converted)
-			}
+	for _, ef := range p.expandos {
+		value, ok := tnExpandoGet(v, ef.name)
+		if !ok || value == nil {
+			continue
+		}
+		df := out.Elem().Field(ef.di)
+		df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
+		if converted, cok := TnConvertDynamic(value, df.Type()); cok {
+			df.Set(converted)
 		}
 	}
 	return out
@@ -26959,21 +27747,19 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 			// same as a conv plan's convert); a same-named one also does —
 			// its value replaced the field's (a JS property assignment whose
 			// value didn't fit the field's Go type)
-			if props, any := tnExpandos.Load(v); any {
-				for j := 0; j < t.NumField(); j++ {
-					name := strings.TrimSuffix(t.Field(j).Name, "_")
-					if strings.HasPrefix(name, "__") {
-						continue
-					}
-					value, vok := props.(*sync.Map).Load(name)
-					if !vok || value == nil {
-						continue
-					}
-					d := out.Field(j)
-					d = reflect.NewAt(d.Type(), unsafe.Pointer(d.UnsafeAddr())).Elem()
-					if converted, cok := TnConvertDynamic(value, d.Type()); cok {
-						d.Set(converted)
-					}
+			for j := 0; j < t.NumField(); j++ {
+				name := strings.TrimSuffix(t.Field(j).Name, "_")
+				if strings.HasPrefix(name, "__") {
+					continue
+				}
+				value, vok := tnExpandoGet(v, name)
+				if !vok || value == nil {
+					continue
+				}
+				d := out.Field(j)
+				d = reflect.NewAt(d.Type(), unsafe.Pointer(d.UnsafeAddr())).Elem()
+				if converted, cok := TnConvertDynamic(value, d.Type()); cok {
+					d.Set(converted)
 				}
 			}
 		// (a narrowing copy registers so field writes through it reach the source:
@@ -27300,6 +28086,16 @@ func TnClassOf(v interface{}) interface{} {
 	case *TnMap[string, interface{}]:
 		if o.TnJSKind() == 0 {
 			return TnClass_Object
+		}
+	}
+	// (a Map / Set: its constructor — zod's isPlainObject tells them apart
+	// from plain objects by it, so shallowClone keeps a Map a Map)
+	if k, ok := v.(interface{ TnJSKind() uint8 }); ok {
+		switch k.TnJSKind() {
+		case 1:
+			return TnClass_Map
+		case 2:
+			return TnClass_Set
 		}
 	}
 	return nil

@@ -84,5 +84,7 @@ disttsparser/tsparser.exe
 .zcode
 dist
 native
+# scratch builds and probe output (conformance-log, probe exes)
+.cache/
 # examples: downloaded test corpora (parity.mjs)
 examples/*/.cache
