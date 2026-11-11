@@ -27650,6 +27650,12 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 			}
 			df := out.Elem().Field(f.di)
 			df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
+			// (a value slice into a pointer-slice field: alias the source's own
+			// header — pushes through either see the other)
+			if sf.Kind() == reflect.Slice && df.Kind() == reflect.Pointer && df.Type().Elem() == sf.Type() {
+				df.Set(reflect.NewAt(df.Type(), unsafe.Pointer(sf.UnsafeAddr())))
+				continue
+			}
 			if sf.Type().AssignableTo(df.Type()) {
 				df.Set(sf)
 			} else if converted, ok := TnConvertDynamic(sf.Interface(), df.Type()); ok {
@@ -27899,6 +27905,13 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 				}
 				d := out.Field(pair[1])
 				d = reflect.NewAt(d.Type(), unsafe.Pointer(d.UnsafeAddr())).Elem()
+				// (a value slice into a pointer-slice field: the field aliases the
+				// source's own header — pushes through either see the other, as JS
+				// array identity across a node conversion requires)
+				if f.Kind() == reflect.Slice && d.Kind() == reflect.Pointer && d.Type().Elem() == f.Type() && src.CanAddr() {
+					d.Set(reflect.NewAt(d.Type(), unsafe.Pointer(f.UnsafeAddr())))
+					continue
+				}
 				if f.Type().AssignableTo(d.Type()) {
 					d.Set(f)
 				} else if converted, cok := TnConvertDynamic(f.Interface(), d.Type()); cok {

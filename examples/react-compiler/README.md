@@ -101,11 +101,12 @@ node parity.mjs
 The remaining failures, by root cause:
 
 - **Directive collection** (mode-annotation, skip-use-no-memo). The vendored
-  parser classifies `"use memo"` statements correctly (they leave `body`), but
-  the `Directive[]` its `parseBlockBody` pushes onto does not reach the body
-  node the compiler reads: the write lands in a struct type whose `directives`
-  field differs from the one `fn.body` ends up holding (the body node is
-  re-viewed/copied between `parseBlockBody` and the assignment). Probes:
+  parser classifies `"use memo"` statements correctly and pushes into its
+  `Directive[]` (traced: `TN_LOOP pushed, len: 1`), but the pushes land on the
+  parser's working node — `startNode`'s undone node type (`*main.Node_2`) —
+  while `fn.body` holds a `*main.BlockStatement` whose `directives` field reads
+  as a fresh empty array. The conversion between the two types loses the array
+  (a layout reinterpretation or header copy). Probes:
   `.cache/probe-directives*.ts` (import main.ts's full vendor graph — a
   parser-only entry resolves types differently). `TN_DEBUG_ERRORS=1` prints
   thrown values and stacks.
