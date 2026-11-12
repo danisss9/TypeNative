@@ -11,13 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler` + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
-  drove a series of transpiler and runtime fixes (below); the pipeline now
-  runs end to end — JSX parses, Scope collects bindings, the HIR builds, and
-  codegen emits memoized output whose CompileSuccess lines match Node's, with
-  simple functions byte-identical — while most fixtures still fail inside the
-  compiler's own passes (effects-inference ordering, nil dereferences in the
-  rewrite passes), tracked in the example's README; `parity.mjs` reports
-  the gap and `bench.mjs` is ready but not yet reporting
+  drove a series of transpiler and runtime fixes (below); every fixture in
+  `parity.mjs` — components, hooks, the compiler's pragmas, JSX outlining,
+  TypeScript syntax and the error paths — now matches Node byte for byte,
+  output, `// CompileSuccess` counts and error code frames included, and
+  `bench.mjs` reports per-call latency and scaling
+- **JS object and array identity across Go conversions:** converting one
+  object to another struct type gives the same converted object every time
+  (Set / Map keys and `===` find it), and union and intersection members are
+  views of the same memory; arrays stay shared through any-typed fields,
+  getters, dynamic calls and `splice`; a callee's changes to a converted
+  argument — an array, a Map or Set, an object's fields, through an
+  override too — are written back to the caller's; `slice` copies
+- **JS semantics at the edges:** object-literal getters stay live (also when
+  a function returns the literal as `{ value: T }`); `Object.prototype`
+  methods read as values (`const toString = {}.toString`) run through
+  `call` / `apply`; default parameters apply to an explicit or forwarded
+  `undefined`; `null` stays apart from `undefined` where a function tests
+  both; Map misses and unset optional enum fields fall back with `??`; keys
+  written as `undefined` are own keys for `Object.keys`; `x.at(i)` and
+  `?.push` work on arrays held as any
 - **Regex `v` flag (`unicodeSets`):** the backtracking VM now reads v-flag
   class set expressions: subtraction (`[\p{L}--[aeiou]]`), intersection
   (`[\p{Lu}&&[A-F]]`), nested and negated classes, and `\q{…}` strings, which
