@@ -28780,15 +28780,9 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 			}
 			df := out.Elem().Field(f.di)
 			df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
-			// (a value slice into a pointer-slice field: alias the source's own
-			// header — pushes through either see the other)
-			if sf.Kind() == reflect.Slice && df.Kind() == reflect.Pointer && df.Type().Elem() == sf.Type() {
-				df.Set(reflect.NewAt(df.Type(), unsafe.Pointer(sf.UnsafeAddr())))
-				continue
-			}
 			if sf.Type().AssignableTo(df.Type()) {
 				df.Set(sf)
-			} else if converted, ok := TnConvertDynamic(sf.Interface(), df.Type()); ok {
+			} else if converted, cok := TnConvertDynamic(sf.Interface(), df.Type()); cok {
 				df.Set(converted)
 			}
 		}
@@ -32723,6 +32717,11 @@ func tnCaughtError(msg string, skip int) *TnError {
 	var pcs [32]uintptr
 	n := runtime.Callers(skip, pcs[:])
 	err.pcs = append(err.pcs, pcs[:n]...)
+	// (the raw Go stack: a reflect panic's location among the helpers, which
+	// the line-directive rendering filters out)
+	buf := make([]byte, 16384)
+	n2 := runtime.Stack(buf, false)
+	err.props["goPanicStack"] = string(buf[:n2])
 	return err
 }
 
@@ -32769,6 +32768,12 @@ func (e *TnError) Get_stack() string {
 		if !more {
 			break
 		}
+	}
+	// (a caught Go panic carries its raw stack: the helper frames the
+	// line-directive rendering filters out)
+	if raw, ok := e.prop("goPanicStack").(string); ok && raw != "" {
+		b.WriteString("\\n--- go panic ---\\n")
+		b.WriteString(raw)
 	}
 	return b.String()
 }

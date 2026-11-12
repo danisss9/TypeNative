@@ -116,6 +116,12 @@ The remaining failures, by root cause:
   `const [x, setX] = useState(...)`.
 - **Runtime gaps**: `Array.prototype.at` on dynamic values (validate-manual-memo),
   member-expression scope lookups (hooks-and-refs).
+- **Uid naming** (mode-annotation's remaining diff after the reflect.Set panic:
+  `_temp` vs `_`). Class methods don't apply default parameters for
+  explicitly-passed `undefined`: `generateUid(name: string = "temp")` is called
+  with `name ?? undefined` (Environment.ts:778) and natively the name arrives
+  empty — `s.uid(undefined)` returns `_` where Node returns `_temp` (plain
+  functions handle it).
 
 ## Benchmark
 
