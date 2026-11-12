@@ -122,32 +122,49 @@ and stops if the two outputs ever differ:
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
 Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 26.5 MB.
+(non-`--release`) build. The binary is 26.6 MB.
 
 (a) `react-compile` (built-in demo), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 347.82 ms | 357.76 ms | 358.24 ms | 378.30 ms |
-| TypeNative | 158.81 ms | 161.81 ms | 165.06 ms | 253.77 ms |
+| Node.js    | 252.72 ms | 256.62 ms | 257.75 ms | 276.64 ms |
+| TypeNative | 131.25 ms | 132.89 ms | 135.04 ms | 179.75 ms |
 
 (b) `react-compile generated-screen.jsx`, 5 runs per size (medians):
 
 | Source            | Node.js   | TypeNative  | TypeNative vs Node |
 | ----------------- | --------- | ----------- | ------------------ |
-| 9 KB, 238 lines   | 457.60 ms | 893.67 ms   | 2.0x slower        |
-| 17 KB, 460 lines  | 521.89 ms | 1,692.28 ms | 3.2x slower        |
-| 32 KB, 892 lines  | 644.74 ms | 3,245.94 ms | 5.0x slower        |
-| 64 KB, 1774 lines | 853.45 ms | 6,615.14 ms | 7.8x slower        |
+| 9 KB, 238 lines   | 362.64 ms | 572.94 ms   | 1.6x slower        |
+| 17 KB, 460 lines  | 429.29 ms | 1,037.11 ms | 2.4x slower        |
+| 32 KB, 892 lines  | 546.02 ms | 1,964.98 ms | 3.6x slower        |
+| 64 KB, 1774 lines | 746.51 ms | 3,861.23 ms | 5.2x slower        |
 
-**Per call, TypeNative is 2.2x faster** (162 ms vs 358 ms, median). Node
+**Per call, TypeNative is 1.9x faster** (133 ms vs 257 ms, median). Node
 spends most of a short run loading and type-stripping the ~470 vendored
 modules; the native binary starts with them compiled in.
 
 **On larger inputs TypeNative is slower, and the gap grows with size:** Node
-compiles each further KB in about 6 ms once V8 has warmed up, the native
-build in about 100 ms. The compiler's passes run through TypeNative's dynamic
-paths — reflection-based struct conversions (the identity-preserving ones
-included), any-typed property reads and method dispatch — on every node of
-every pass, where V8's inline caches make the same operations nearly free.
-Making those paths cheaper is the next step for this example.
+compiles each further KB in about 7 ms once V8 has warmed up, the native
+build in about 60 ms. The compiler's passes run through TypeNative's dynamic
+paths (any-typed property reads, prototype-method dispatch, reflection-based
+struct conversions) on every node of every pass, where V8's inline caches
+make the same operations nearly free.
+
+The native build was about 100 ms per KB before a profiling pass (6.6 s at
+64 KB, now 3.9 s), which made those paths cheaper without changing what they
+do:
+
+- `s += part` on a string field (Babel's output buffer appends thousands of
+  times between flushes) appends in place instead of copying the whole
+  string each time, which made printing quadratic in the output size; it was
+  more than half of all allocation.
+- Accessor, view-copy and added-property registries are skipped for object
+  types that never had an entry, so ordinary property reads stay on the
+  reflection-free fast path.
+- Prototype methods (Babel's `NodePath` methods) are called directly, and the
+  common callback shapes are called and adapted without `reflect`.
+
+What remains is spread thinly over the dynamic paths. The largest single
+item is generator functions, which run as goroutines with a thread wakeup
+per step (about a tenth of the run).

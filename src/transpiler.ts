@@ -5890,7 +5890,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // (a nullable string set before: let uid; … uid = `_x`; uid += i - 1)
     if (op === '+=' && ['string', '*string'].includes(inferExpressionType(node.left) ?? '')) {
       const rightType = inferExpressionType(node.right);
-      if (rightType !== 'string') return `${visit(node.left)} += ${jsStringOf(visit(node.right), rightType)}`;
+      // (a string field or variable — a plain Go selector, evaluated twice
+      // without effects —: appended in place when it is long, see strAppend)
+      const target = visit(node.left);
+      if (inferExpressionType(node.left) === 'string' && /^[A-Za-z_][\wǂ]*(\.[A-Za-z_][\wǂ]*)*$/.test(target)) {
+        useHelper('strAppend');
+        return `${target} = TnStrAppend(${target}, ${rightType === 'string' ? visit(node.right) : jsStringOf(visit(node.right), rightType)})`;
+      }
+      return `${target} += ${rightType === 'string' ? visit(node.right) : jsStringOf(visit(node.right), rightType)}`;
     }
     return `${visit(node.left)} ${op} ${visit(node.right)}`;
   } else if (isParenthesizedExpression(node)) {
@@ -24212,6 +24219,7 @@ const helperPackages: Record<string, string[]> = {
   structuredClone: ['reflect', 'unsafe'],
   globalThis: [],
   getenv: ['os'],
+  strAppend: ['sync', 'unsafe'],
 };
 
 // Go helper sources emitted (once) into the main output file when used.
@@ -24862,8 +24870,9 @@ func TnGetRef(obj interface{}, key string) interface{} {
 			obj = origin
 		}
 	}
-	// (an accessor shadows the property: reads go through it, see TnGet)
-	if obj != nil && tnAnyAccessors.Load() {
+	// (an accessor shadows the property: reads go through it, see TnGet —
+	// only objects of a type that ever had one can)
+	if obj != nil && tnAnyAccessors.Load() && tnAccessorTypes.has(obj) {
 		return tnGetRefSlow(obj, key)
 	}
 	if obj != nil {
@@ -24977,6 +24986,7 @@ type tnFieldPlan struct {
 	own     bool           // it answers property reads itself (see tnHasOwnGet)
 	setter  bool           // writes go through Set_key, or a Map's Set
 	missing bool           // no such field (a getter, or nothing)
+	getter  int            // 1 + the index of its Get_key method (0: none)
 	offset  uintptr
 	field   unsafe.Pointer // the field's type
 	ref     unsafe.Pointer // a pointer to the field's type
@@ -24986,16 +24996,21 @@ type tnFieldPlan struct {
 	fieldT  reflect.Type   // the field's Go type (dynamic value conversions)
 }
 
-var tnFieldPlans [1 << 12]atomic.Pointer[tnFieldPlan]
+var tnFieldPlans [1 << 14]atomic.Pointer[tnFieldPlan]
 var tnFieldPlanIndex = map[tnFieldKey]*tnFieldPlan{}
+
+// The slot of a type and key in the direct-mapped plan tables
+func tnTypeKeySlot(t unsafe.Pointer, key string, bits uint) uintptr {
+	h := uint64(uintptr(t)) >> 4
+	if n := len(key); n > 0 {
+		h ^= uint64(n) ^ uint64(key[0])<<4 ^ uint64(key[n/2])<<11 ^ uint64(key[n-1])<<18
+	}
+	return uintptr((h * 0x9E3779B97F4A7C15) >> (64 - bits))
+}
 
 func tnPlanOf(obj interface{}, key string) *tnFieldPlan {
 	t := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[0]
-	h := uintptr(t) >> 4
-	if n := len(key); n > 0 {
-		h ^= uintptr(n) ^ uintptr(key[0])<<4 ^ uintptr(key[n-1])<<9
-	}
-	h = (h * 0x9E3779B1) >> 12 & (1<<12 - 1)
+	h := tnTypeKeySlot(t, key, 14)
 	if p := tnFieldPlans[h].Load(); p != nil && p.typ == t && p.key == key {
 		return p
 	}
@@ -25025,6 +25040,10 @@ func tnMakeFieldPlan(obj interface{}, key string, t unsafe.Pointer) *tnFieldPlan
 	}
 	if _, ok := rt.MethodByName("Set_" + key); ok || strings.HasPrefix(rt.String(), "*main.TnMap[") {
 		p.setter = true
+	}
+	// (a getter: get x() → Get_x, read when the type has no such field)
+	if m, ok := rt.MethodByName("Get_" + key); ok && m.Type.NumIn() == 1 && m.Type.NumOut() == 1 {
+		p.getter = m.Index + 1
 	}
 	st := rt.Elem()
 	var field reflect.StructField
@@ -25339,25 +25358,43 @@ type tnFieldKey struct {
 var tnFieldIndexes = map[tnFieldKey][]int{}
 var tnFieldIndexesMu sync.RWMutex
 
+type tnFieldIndexEntry struct {
+	t     unsafe.Pointer
+	k     string
+	index []int
+}
+
+var tnFieldIndexCache [1 << 12]atomic.Pointer[tnFieldIndexEntry]
+
 // The field of struct value sv named like JS property key (Go keywords
 // take a trailing _); invalid when there is none. Lookups are cached per
 // type: FieldByName scans every field each time.
 func tnFieldOf(sv reflect.Value, key string) reflect.Value {
 	t := sv.Type()
-	ck := tnFieldKey{(*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1], key}
-	tnFieldIndexesMu.RLock()
-	index, ok := tnFieldIndexes[ck]
-	tnFieldIndexesMu.RUnlock()
-	if !ok {
-		for _, name := range []string{key, key + "_", strings.ReplaceAll(key, "$", "ǂ")} {
-			if f, found := t.FieldByName(name); found {
-				index = f.Index
-				break
+	tp := (*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1]
+	// (hits come from a direct-mapped table: no lock, no hash of the key)
+	h := tnTypeKeySlot(tp, key, 12)
+	var index []int
+	if e := tnFieldIndexCache[h].Load(); e != nil && e.t == tp && e.k == key {
+		index = e.index
+	} else {
+		ck := tnFieldKey{tp, key}
+		tnFieldIndexesMu.RLock()
+		cached, ok := tnFieldIndexes[ck]
+		tnFieldIndexesMu.RUnlock()
+		index = cached
+		if !ok {
+			for _, name := range []string{key, key + "_", strings.ReplaceAll(key, "$", "ǂ")} {
+				if f, found := t.FieldByName(name); found {
+					index = f.Index
+					break
+				}
 			}
+			tnFieldIndexesMu.Lock()
+			tnFieldIndexes[ck] = index
+			tnFieldIndexesMu.Unlock()
 		}
-		tnFieldIndexesMu.Lock()
-		tnFieldIndexes[ck] = index
-		tnFieldIndexesMu.Unlock()
+		tnFieldIndexCache[h].Store(&tnFieldIndexEntry{tp, key, index})
 	}
 	if index == nil {
 		return reflect.Value{}
@@ -25437,8 +25474,10 @@ func TnGet(obj interface{}, key string) interface{} {
 			return nil
 		}
 	}
+	var plan *tnFieldPlan
 	if obj != nil {
-		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && p.kind != tnFieldSlice {
+		plan = tnPlanOf(obj, key)
+		if p := plan; p.kind != tnFieldSlow && p.kind != tnFieldSlice {
 			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
 				if v := p.read(base); !TnIsNil(v) {
 					return v
@@ -25451,7 +25490,12 @@ func TnGet(obj interface{}, key string) interface{} {
 	}
 	rv := reflect.ValueOf(obj)
 	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
-		if f := tnFieldOf(rv.Elem(), key); f.IsValid() {
+		// (the plan knows a missing field: no search for it)
+		var f reflect.Value
+		if !plan.missing {
+			f = tnFieldOf(rv.Elem(), key)
+		}
+		if f.IsValid() {
 			// Unexported field: read it through a pointer to bypass the flag
 			// (a T | undefined field reads as its value, or undefined)
 			value := tnPlainValue(reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface())
@@ -25467,9 +25511,9 @@ func TnGet(obj interface{}, key string) interface{} {
 				return value
 			}
 		} else {
-			// a getter (get x() → Get_x)
-			if m := rv.MethodByName("Get_" + key); m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() == 1 {
-				return m.Call(nil)[0].Interface()
+			// a getter (get x() → Get_x), found once per type and key
+			if plan.getter > 0 {
+				return rv.Method(plan.getter - 1).Call(nil)[0].Interface()
 			}
 		}
 		// a property added to the object after the fact (o.extra = v)
@@ -25560,11 +25604,85 @@ func tnSliceMethod(obj interface{}, rv reflect.Value, key string) interface{} {
 // helper, when classes are used)
 var tnProtoMethodOf func(obj interface{}, key string) (interface{}, bool)
 
+// The function itself that tnProtoMethodOf binds to obj
+var tnProtoFnOf func(obj interface{}, key string) (interface{}, bool)
+
 // Properties set on an object whose type has no such field (JS adds them to
 // the object): kept beside it, keyed by the object itself (which also keeps
 // it alive: a recycled address must not inherit a collected object's
 // properties)
 var tnExpandos sync.Map
+
+// The types of the objects that ever had an added property: a lookup for an
+// object of any other type skips the registry (most never have one)
+var tnExpandoTypes tnTypeSet
+
+// A set of dynamic types (an interface value's type word), read without a
+// lock or a hash of the value: the registries keyed by object (added
+// properties, accessors, view copies) hold objects of a handful of types, and
+// skip every other type on one lookup. Entries are never removed.
+type tnTypeSet struct {
+	mu    sync.Mutex
+	slots atomic.Pointer[[]unsafe.Pointer] // open addressing; a power of two, at most a quarter full
+}
+
+func tnTypeSetSlot(t unsafe.Pointer, mask uintptr) uintptr {
+	return uintptr((uint64(uintptr(t)) * 0x9E3779B97F4A7C15) >> 32) & mask
+}
+
+func (s *tnTypeSet) has(obj interface{}) bool {
+	slots := s.slots.Load()
+	if slots == nil {
+		return false
+	}
+	t := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[0]
+	if t == nil {
+		return false
+	}
+	mask := uintptr(len(*slots) - 1)
+	for i := tnTypeSetSlot(t, mask); ; i = (i + 1) & mask {
+		switch (*slots)[i] {
+		case t:
+			return true
+		case nil:
+			return false
+		}
+	}
+}
+
+func (s *tnTypeSet) add(obj interface{}) {
+	if obj == nil || s.has(obj) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.has(obj) {
+		return
+	}
+	var types []unsafe.Pointer
+	if old := s.slots.Load(); old != nil {
+		for _, t := range *old {
+			if t != nil {
+				types = append(types, t)
+			}
+		}
+	}
+	types = append(types, (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[0])
+	size := 16
+	for size < 4*len(types) {
+		size *= 2
+	}
+	next := make([]unsafe.Pointer, size)
+	mask := uintptr(size - 1)
+	for _, t := range types {
+		i := tnTypeSetSlot(t, mask)
+		for next[i] != nil {
+			i = (i + 1) & mask
+		}
+		next[i] = t
+	}
+	s.slots.Store(&next)
+}
 
 // An object's added properties, in the order they were first set (JS property
 // order: Object.keys lists them after the fields, in insertion order)
@@ -25575,6 +25693,9 @@ type tnExpandoProps struct {
 }
 
 func tnExpandoPropsOf(obj interface{}) (*tnExpandoProps, bool) {
+	if !tnExpandoTypes.has(obj) {
+		return nil, false
+	}
 	props, ok := tnExpandos.Load(obj)
 	if !ok {
 		return nil, false
@@ -25607,8 +25728,11 @@ var tnAccessors sync.Map
 // the registry on one atomic load)
 var tnAnyAccessors atomic.Bool
 
+// The types of the objects that ever had an accessor defined
+var tnAccessorTypes tnTypeSet
+
 func tnAccessorOf(obj interface{}, key string) *tnAccessor {
-	if !tnAnyAccessors.Load() {
+	if !tnAnyAccessors.Load() || !tnAccessorTypes.has(obj) {
 		return nil
 	}
 	if t := reflect.TypeOf(obj); t != nil {
@@ -25668,6 +25792,7 @@ func tnExpandoSet(obj interface{}, key string, value interface{}) bool {
 	}
 	// (keyed by the object itself: a recycled address of a collected object
 	// must not hand its expandos to the new object at the same address)
+	tnExpandoTypes.add(obj)
 	props, _ := tnExpandos.LoadOrStore(obj, &tnExpandoProps{values: map[string]interface{}{}})
 	p := props.(*tnExpandoProps)
 	p.mu.Lock()
@@ -26064,6 +26189,21 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 			return TnCallValue(obj, append(rest, callArgs...)...)
 		}
 	}
+	// a method added to the prototype of obj's class, called on obj: what
+	// TnGet finds for a key that is no field and no getter of the object's
+	// type, when no view, accessor or added property of that type can shadow
+	// it — without binding it first
+	if tnProtoFnOf != nil {
+		if p := tnPlanOf(obj, name); p.missing && p.getter == 0 && !p.own && !tnViewTypes.has(obj) &&
+			!tnExpandoTypes.has(obj) && !(tnAnyAccessors.Load() && tnAccessorTypes.has(obj)) {
+			if method, ok := tnProtoFnOf(obj, name); ok {
+				prev := TnThis
+				TnThis = obj
+				defer func() { TnThis = prev }()
+				return TnCallValue(method, args...)
+			}
+		}
+	}
 	fn := TnGet(obj, name)
 	if fn == nil {
 		panic(TnNodeError("TypeError", "", fmt.Sprintf("%s is not a function", name)))
@@ -26149,6 +26289,21 @@ func TnCallValue(fn interface{}, args ...interface{}) interface{} {
 	case func(interface{}) interface{}:
 		return f(TnArg(args, 0))
 	case func(interface{}, interface{}) interface{}:
+		return f(TnArg(args, 0), TnArg(args, 1))
+	// (an any parameter takes its argument as is — tnConvertTo to interface{}
+	// is the identity — so these need no reflection either)
+	case func(...interface{}) interface{}:
+		// (prototype methods, bound functions: the arguments as a fresh
+		// array, as a reflective variadic call passes them)
+		return f(append([]interface{}{}, args...)...)
+	case func() bool:
+		return f()
+	case func(interface{}) bool:
+		return f(TnArg(args, 0))
+	case func(interface{}, interface{}):
+		f(TnArg(args, 0), TnArg(args, 1))
+		return nil
+	case func(interface{}, interface{}) bool:
 		return f(TnArg(args, 0), TnArg(args, 1))
 	}
 	fv := reflect.ValueOf(fn)
@@ -27613,9 +27768,13 @@ var tnPrefixPlans sync.Map
 var tnViews sync.Map
 var tnAnyViews atomic.Bool
 
+// The types of the objects ever registered as view copies (an object of any
+// other type is no view: its lookup ends there)
+var tnViewTypes tnTypeSet
+
 // Resolves a view copy to its origin object (following chains)
 func tnViewOrigin(obj interface{}) (interface{}, bool) {
-	if !tnAnyViews.Load() {
+	if !tnAnyViews.Load() || !tnViewTypes.has(obj) {
 		return nil, false
 	}
 	if t := reflect.TypeOf(obj); t != nil {
@@ -27638,6 +27797,7 @@ func tnViewOrigin(obj interface{}) (interface{}, bool) {
 }
 
 func tnRegisterView(copy interface{}, orig interface{}) {
+	tnViewTypes.add(copy)
 	tnViews.Store(copy, orig)
 	tnAnyViews.Store(true)
 	rv := reflect.ValueOf(copy)
@@ -27864,6 +28024,57 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 	return out
 }
 
+// The wrappers TnConvertDynamic makes most often (callbacks of the plain
+// shapes), without reflection: an any parameter or result converts as the
+// identity, a dropped result is ignored, missing parameters are undefined and
+// a rest parameter gets a fresh array — what the reflective wrapper does
+var (
+	tnFuncVoidT     = reflect.TypeOf((func())(nil))
+	tnFuncAny1VoidT = reflect.TypeOf((func(interface{}))(nil))
+	tnFuncAny2VoidT = reflect.TypeOf((func(interface{}, interface{}))(nil))
+)
+
+func tnFuncAdapter(v interface{}, t reflect.Type) interface{} {
+	switch t {
+	case tnFuncVoidT:
+		switch f := v.(type) {
+		case func(...interface{}) interface{}:
+			return func() { f([]interface{}{}...) }
+		case func() interface{}:
+			return func() { f() }
+		case func(interface{}):
+			return func() { f(nil) }
+		case func(interface{}) interface{}:
+			return func() { f(nil) }
+		}
+	case tnFuncAny1VoidT:
+		switch f := v.(type) {
+		case func():
+			return func(interface{}) { f() }
+		case func(...interface{}) interface{}:
+			return func(a interface{}) { f([]interface{}{a}...) }
+		case func(interface{}) interface{}:
+			return func(a interface{}) { f(a) }
+		}
+	case tnFuncAny2VoidT:
+		switch f := v.(type) {
+		case func():
+			return func(interface{}, interface{}) { f() }
+		case func(interface{}):
+			return func(a, _ interface{}) { f(a) }
+		case func(interface{}) interface{}:
+			return func(a, _ interface{}) { f(a) }
+		case func(interface{}, interface{}) interface{}:
+			return func(a, b interface{}) { f(a, b) }
+		case func(...interface{}) interface{}:
+			return func(a, b interface{}) { f([]interface{}{a, b}...) }
+		case func(interface{}, ...interface{}) interface{}:
+			return func(a, b interface{}) { f(a, []interface{}{b}...) }
+		}
+	}
+	return nil
+}
+
 // A wrapped function's results as the wrapper's type declares them
 func tnFuncResults(out []reflect.Value, t reflect.Type) []reflect.Value {
 	results := make([]reflect.Value, t.NumOut())
@@ -27938,6 +28149,9 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		// a function of another signature (JS passes any function): a wrapper
 		// converting the arguments and the result
 		if rv.Kind() == reflect.Func && !rv.IsNil() {
+			if w := tnFuncAdapter(v, t); w != nil {
+				return reflect.ValueOf(w), true
+			}
 			return reflect.MakeFunc(t, func(in []reflect.Value) []reflect.Value {
 				ft := rv.Type()
 				args := make([]reflect.Value, 0, ft.NumIn())
@@ -28323,14 +28537,20 @@ func (c *TnClass) Keys() []string {
 
 func init() {
 	tnProtoMethodOf = func(obj interface{}, key string) (interface{}, bool) {
+		if fn, ok := tnProtoFnOf(obj, key); ok {
+			return func(args ...interface{}) interface{} {
+				prev := TnThis
+				TnThis = obj
+				defer func() { TnThis = prev }()
+				return TnCallValue(fn, args...)
+			}, true
+		}
+		return nil, false
+	}
+	tnProtoFnOf = func(obj interface{}, key string) (interface{}, bool) {
 		for k := tnClassesByType[reflect.TypeOf(obj)]; k != nil; k = k.Parent {
 			if fn, ok := k.proto[key]; ok {
-				return func(args ...interface{}) interface{} {
-					prev := TnThis
-					TnThis = obj
-					defer func() { TnThis = prev }()
-					return TnCallValue(fn, args...)
-				}, true
+				return fn, true
 			}
 		}
 		return nil, false
@@ -28618,6 +28838,7 @@ func TnDefineProperty(obj interface{}, key string, descriptor interface{}) {
 			// (functions and other unhashable keys: only the value case works)
 			return
 		}
+		tnAccessorTypes.add(obj)
 		props, _ := tnAccessors.LoadOrStore(obj, &sync.Map{})
 		acc := &tnAccessor{}
 		if g := TnGet(descriptor, "get"); g != nil {
@@ -33497,6 +33718,51 @@ func TnPromiseAll[T any](chs []chan T) chan []T {
 }`,
   getenv: `func TnGetenv(name string) string {
 	return os.Getenv(name)
+}`,
+  strAppend: `// s += part on a string field or variable. Go copies all of s on each +=,
+// so a string built by many appends (an output buffer) costs time quadratic
+// in its length, where JS engines append in place. A long string made here
+// gets spare capacity after it, and an append to a string that ends where
+// its buffer's used part ends writes there instead of copying. The bytes
+// past the used part belong to no string yet: no string ever changes.
+type tnStrTail struct {
+	end uintptr // where the buffer's used part ends (0: a free slot)
+	buf []byte  // the buffer, up to its used part
+}
+
+var tnStrTails [64]tnStrTail
+var tnStrTailsMu sync.Mutex
+
+func tnStrTailSlot(end uintptr) *tnStrTail {
+	return &tnStrTails[(uint64(end)*0x9E3779B97F4A7C15)>>58]
+}
+
+func TnStrAppend(s, part string) string {
+	if len(part) == 0 {
+		return s
+	}
+	// (short strings: a plain copy, no spare capacity kept)
+	if len(s) < 256 {
+		return s + part
+	}
+	tnStrTailsMu.Lock()
+	defer tnStrTailsMu.Unlock()
+	end := uintptr(unsafe.Pointer(unsafe.StringData(s))) + uintptr(len(s))
+	if t := tnStrTailSlot(end); t.end == end && cap(t.buf)-len(t.buf) >= len(part) {
+		buf := append(t.buf, part...)
+		t.end, t.buf = 0, nil
+		next := tnStrTailSlot(end + uintptr(len(part)))
+		next.end, next.buf = end+uintptr(len(part)), buf
+		return unsafe.String(unsafe.StringData(s), len(s)+len(part))
+	}
+	n := len(s) + len(part)
+	buf := make([]byte, n, 2*n)
+	copy(buf, s)
+	copy(buf[len(s):], part)
+	end = uintptr(unsafe.Pointer(&buf[0])) + uintptr(n)
+	next := tnStrTailSlot(end)
+	next.end, next.buf = end, buf
+	return unsafe.String(&buf[0], n)
 }`,
 };
 
