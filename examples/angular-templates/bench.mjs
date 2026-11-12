@@ -118,7 +118,7 @@ function timeBoth(args, count) {
   const node = [];
   const native = [];
   for (let i = 0; i < count; i++) {
-    const a = runOnce(process.execPath, ['--experimental-transform-types', '--no-warnings', 'main.ts', ...args]);
+    const a = runOnce(process.execPath, ['run-node.mjs', ...args]);
     const b = runOnce(exePath, args);
     if (!a.stdout.equals(b.stdout)) {
       console.error('Node and native output differ');
@@ -147,6 +147,10 @@ console.log('Compiling main.ts to a native binary with TypeNative...');
 const build = spawnSync(process.execPath, [cli, '--source', 'main.ts', '--output', exePath], { cwd: here, stdio: 'inherit' });
 if (build.status !== 0) process.exit(build.status ?? 1);
 console.log(`Binary: ${(fs.statSync(exePath).size / (1024 * 1024)).toFixed(1)} MB`);
+
+// Compile main.ts to JavaScript for the Node runs (see run-node.mjs), outside the timings
+const nodeBuild = spawnSync(process.execPath, ['run-node.mjs', '--build'], { cwd: here, stdio: 'inherit' });
+if (nodeBuild.status !== 0) process.exit(nodeBuild.status ?? 1);
 
 // 2. Per-call latency on the demo template.
 console.log(`\n(a) \`ng-compile\` (built-in demo template), ${runs} runs each (full process: spawn -> exit):\n`);

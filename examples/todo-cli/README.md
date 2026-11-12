@@ -53,17 +53,17 @@ Reproduce with `node bench.mjs [runs=30]`. The script compiles `main.ts`, fills
 a temp file with 50 items for each runtime, and then times **complete process
 runs** (spawn to exit) of `todo list` and `todo add`.
 
-**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
+**Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
 TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Command     | Runtime    | min       | median    | mean      | max       |
 |-------------|------------|-----------|-----------|-----------|-----------|
-| `todo list` | Node.js    | 101.69 ms | 107.32 ms | 108.19 ms | 117.98 ms |
-| `todo list` | TypeNative | 14.44 ms  | 15.43 ms  | 16.00 ms  | 24.38 ms  |
-| `todo add`  | Node.js    | 104.70 ms | 109.83 ms | 111.33 ms | 127.90 ms |
-| `todo add`  | TypeNative | 15.85 ms  | 16.86 ms  | 17.46 ms  | 27.49 ms  |
+| `todo list` | Node.js    | 64.82 ms  | 76.07 ms  | 75.08 ms  | 88.16 ms  |
+| `todo list` | TypeNative | 7.94 ms   | 9.26 ms   | 15.17 ms  | 185.65 ms |
+| `todo add`  | Node.js    | 64.27 ms  | 75.78 ms  | 75.47 ms  | 92.32 ms  |
+| `todo add`  | TypeNative | 8.76 ms   | 10.02 ms  | 10.07 ms  | 12.51 ms  |
 
-**TypeNative answers each command 6.5–7.0x faster** (median). At about 16 ms,
-a call feels instant. At about 110 ms, there's a visible pause, and it adds up
+**TypeNative answers each command 7.6–8.2x faster** (median). At about 10 ms,
+a call feels instant. At about 75 ms, there's a noticeable delay, and it adds up
 when the tool runs from a prompt or a hook on every keystroke or commit. The
-binary is a single 3.8 MB file, with no Node install and no `node_modules`.
+binary is a single 4.6 MB file, with no Node install and no `node_modules`.

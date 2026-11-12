@@ -83,21 +83,21 @@ times **spawn until `GET /` answers 200**, which is what the user waits for befo
 the window can paint. It then lists the notes, opens 20 of them, saves one, and
 reads the app's own **resident memory** from `/api/info`.
 
-**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
+**Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
 TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Spawn → first page | min       | median    | mean      | max       |
 |--------------------|-----------|-----------|-----------|-----------|
-| Node.js            | 173.04 ms | 188.87 ms | 188.53 ms | 217.98 ms |
-| TypeNative         | 28.74 ms  | 31.76 ms  | 32.84 ms  | 46.74 ms  |
+| Node.js            | 94.46 ms  | 99.11 ms  | 103.46 ms | 119.13 ms |
+| TypeNative         | 20.61 ms  | 22.41 ms  | 25.95 ms  | 60.24 ms  |
 
 | Resident memory | min      | median   | mean     | max      |
 |-----------------|----------|----------|----------|----------|
-| Node.js         | 70.3 MiB | 71.5 MiB | 71.3 MiB | 71.9 MiB |
-| TypeNative      | 6.8 MiB  | 10.8 MiB | 10.1 MiB | 11.0 MiB |
+| Node.js         | 71.2 MiB | 72.6 MiB | 72.5 MiB | 73.0 MiB |
+| TypeNative      | 7.0 MiB  | 10.8 MiB | 10.5 MiB | 11.0 MiB |
 
-**TypeNative serves the first page 5.9x sooner and uses 6.6x less memory**
-(median). The app is a single 12.6 MiB binary with the UI included. An Electron
+**TypeNative serves the first page 4.4x sooner and uses 6.7x less memory**
+(median). The app is a single 13.9 MiB binary with the UI included. An Electron
 build of the same app would ship about 100 MiB of Chromium and Node. This app uses
 the webview the OS already has, and its backend idles at about 11 MiB.
 

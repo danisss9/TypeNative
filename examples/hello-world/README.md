@@ -47,16 +47,16 @@ the TypeNative CLI, then times **complete process runs** (spawn to exit) of
 the same program under both runtimes. Since the program does no work, the
 numbers are almost entirely startup time.
 
-**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
+**Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
 TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
 
 | Runtime    | min        | median     | mean       | max        |
 |------------|------------|------------|------------|------------|
-| Node.js    | 91.67 ms   | 98.84 ms   | 101.51 ms  | 133.71 ms  |
-| TypeNative | 13.13 ms   | 14.52 ms   | 15.59 ms   | 26.55 ms   |
+| Node.js    | 54.40 ms   | 62.40 ms   | 62.86 ms   | 78.77 ms   |
+| TypeNative | 6.42 ms    | 7.38 ms    | 10.98 ms   | 112.02 ms  |
 
-**TypeNative starts 6.8x faster** (median). The compiled binary is a
-self-contained 2.4 MB executable: there is no runtime to boot, no module
+**TypeNative starts 8.5x faster** (median). The compiled binary is a
+self-contained 2.7 MB executable: there is no runtime to boot, no module
 system to initialize, and no JIT to warm up, so process-to-output latency is
 an order of magnitude lower. For CLI tools that are invoked frequently, this
 is the difference users notice.

@@ -33,13 +33,13 @@ npx typenative --source hello.ts --script
 ## Why use TypeNative
 
 - **Ship one file.** The output is a single self-contained executable: no Node.js install, no `node_modules`, no bundler. Copy it to a server and run it, or cross-compile for Linux, macOS and Windows from any OS with `--target`.
-- **Start instantly.** There is no runtime to boot and no JIT to warm up: a hello world starts in ~15 ms vs ~100 ms under Node, which matters for CLI tools that run often.
-- **Run faster.** Code is compiled ahead of time to machine code through Go. CPU-bound work like recursive `fib(35)` runs ~1.9x faster than Node, and a `node:http` JSON server handles ~1.3x more requests per second with lower median latency.
+- **Start instantly.** There is no runtime to boot and no JIT to warm up: a hello world starts in ~7 ms vs ~60 ms under Node, which matters for CLI tools that run often.
+- **Run faster.** Code is compiled ahead of time to machine code through Go. CPU-bound work like recursive `fib(35)` runs ~2x faster than Node, and hashing a directory tree of files runs ~3x faster.
 - **Keep your TypeScript.** Same syntax, same types, and Node's own APIs (`node:fs`, `node:http`, `node:crypto`, …) with Node's signatures. The [examples](examples/) run unchanged under both `node` and TypeNative.
 - **Reach into Go.** Import any Go package directly (`import { Println } from 'go:fmt'`) when you need something Node doesn't have.
 - **Know what works.** Type errors and unsupported syntax are reported against your `.ts` lines before anything builds, and every supported feature is backed by a runnable probe in [conformance.md](conformance.md).
 
-Numbers are medians from the [examples/](examples/) benchmarks (Windows 11, Ryzen 5 5500U, Node 24, Go 1.26); each example's README has the full methodology. TypeNative compiles a subset of TypeScript, so it fits best for CLIs, servers and tools where you control the code, rather than for running arbitrary existing npm projects.
+Numbers are medians from the [examples/](examples/) benchmarks (Windows 11, Ryzen 5 7600, Node 26, Go 1.27); each example's README has the full methodology. TypeNative compiles a subset of TypeScript, so it fits best for CLIs, servers and tools where you control the code, rather than for running arbitrary existing npm projects.
 
 ## Requirements
 

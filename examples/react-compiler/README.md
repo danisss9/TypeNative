@@ -128,19 +128,19 @@ Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 252.72 ms | 256.62 ms | 257.75 ms | 276.64 ms |
-| TypeNative | 131.25 ms | 132.89 ms | 135.04 ms | 179.75 ms |
+| Node.js    | 356.79 ms | 362.79 ms | 363.00 ms | 368.99 ms |
+| TypeNative | 131.46 ms | 133.23 ms | 134.95 ms | 175.96 ms |
 
 (b) `react-compile generated-screen.jsx`, 5 runs per size (medians):
 
 | Source            | Node.js   | TypeNative  | TypeNative vs Node |
 | ----------------- | --------- | ----------- | ------------------ |
-| 9 KB, 238 lines   | 362.64 ms | 572.94 ms   | 1.6x slower        |
-| 17 KB, 460 lines  | 429.29 ms | 1,037.11 ms | 2.4x slower        |
-| 32 KB, 892 lines  | 546.02 ms | 1,964.98 ms | 3.6x slower        |
-| 64 KB, 1774 lines | 746.51 ms | 3,861.23 ms | 5.2x slower        |
+| 9 KB, 238 lines   | 464.77 ms | 567.89 ms   | 1.2x slower        |
+| 17 KB, 460 lines  | 527.17 ms | 1,039.11 ms | 2.0x slower        |
+| 32 KB, 892 lines  | 634.59 ms | 1,964.48 ms | 3.1x slower        |
+| 64 KB, 1774 lines | 860.94 ms | 3,911.76 ms | 4.5x slower        |
 
-**Per call, TypeNative is 1.9x faster** (133 ms vs 257 ms, median). Node
+**Per call, TypeNative is 2.7x faster** (133 ms vs 363 ms, median). Node
 spends most of a short run loading and type-stripping the ~470 vendored
 modules; the native binary starts with them compiled in.
 

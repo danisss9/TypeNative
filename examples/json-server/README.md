@@ -100,28 +100,29 @@ response) and `POST /todos` (10,000 requests).
 The load generator is built to stay out of the way, like `wrk` or
 `autocannon`: 8 worker threads × 2 raw keep-alive sockets send prebuilt
 request bytes and read each response just far enough to find its end. A
-plain `node:http` client tops out around 8–11k req/s on this machine, so
+plain `node:http` client would cap out far below either server, so
 with it both servers would simply tie at the client's limit.
 
-**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U, Node v24.19.0, Go 1.26.0,
+**Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
 TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build, client
-and server on the same machine. Re-run variation is about ±10%; across runs
-TypeNative was 1.2x Node on GET and 1.1–1.2x on POST.
+and server on the same machine. Re-run variation is about ±20%; across runs
+TypeNative was 0.7x Node on GET and 0.8–0.9x on POST.
 
 | Runtime    | Endpoint    |  req/s | p50 (ms) | p99 (ms) |
 |------------|-------------|-------:|---------:|---------:|
-| Node.js    | GET /todos  |  13922 |     1.04 |     2.72 |
-| TypeNative | GET /todos  |  16933 |     0.73 |     1.86 |
-| Node.js    | POST /todos |  15044 |     0.96 |     2.23 |
-| TypeNative | POST /todos |  17043 |     0.69 |     2.46 |
+| Node.js    | GET /todos  |  60034 |     0.24 |     0.69 |
+| TypeNative | GET /todos  |  44334 |     0.27 |     0.64 |
+| Node.js    | POST /todos |  66687 |     0.21 |     0.44 |
+| TypeNative | POST /todos |  57707 |     0.20 |     0.63 |
 
-**TypeNative serves ~1.2x more requests per second**, with lower median
-latency on both routes. JavaScript still runs one thing at a time, as in
-Node, but the compiled server spreads everything around it — socket reads
-and writes, HTTP parsing — across Go's `net/http` goroutines, and runs the
-handler right on the request's goroutine whenever the event loop is free.
+**Node serves ~1.2–1.4x more requests per second here**, with similar
+median latency on both routes. The compiled server spreads socket reads and
+writes and HTTP parsing across Go's `net/http` goroutines, and runs the
+handler right on the request's goroutine whenever the event loop is free,
+but JavaScript still runs one thing at a time, and at 45–65k req/s the cost
+of handing each request to that one thread outweighs the parallel I/O.
 
-On top of that, the binary starts in ~15 ms instead of ~100 ms and is a
+On top of that, the binary starts in ~7 ms instead of ~60 ms and is a
 single 11.4 MB executable with zero dependencies — `scp` it to a server and
 run it, no Node install, no `node_modules` — and CPU-heavy work inside a
 handler runs ~2x faster (see the [fibonacci example](../fibonacci/README.md)).

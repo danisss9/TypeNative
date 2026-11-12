@@ -3,7 +3,7 @@
 // compiles it to the Ivy instructions of a component definition, printed as
 // JavaScript. The output is the same as running this file under Node.
 //
-//   node --experimental-transform-types main.ts [template.html]
+//   node run-node.mjs [template.html]
 //   typenative --source main.ts --output ng-compile && ./ng-compile [template.html]
 
 import './dom-type-stubs.ts';

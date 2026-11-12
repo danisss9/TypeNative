@@ -29,10 +29,14 @@ the compiler throws prints as `// compile error: …` and exits with code 1.
 
 ## Run it
 
-With Node.js (24 or later runs the TypeScript directly):
+With Node.js. Node runs TypeScript only by stripping types, and Angular's
+compiler source uses enums, which that mode rejects, so `run-node.mjs`
+compiles `main.ts` and everything it imports to JavaScript with the
+repository's `typescript` package once, caches it in `.cache/node/`, and runs
+it:
 
 ```sh
-node --experimental-transform-types main.ts app.component.html
+node run-node.mjs my.component.html
 ```
 
 With TypeNative:
@@ -89,35 +93,36 @@ and checks that the two outputs are identical:
   embedded view (`@if (panels.x) { … }`), the way sections of a real template
   are.
 
-**Environment:** Windows 11 Pro, AMD Ryzen 5 5500U (6 cores, 12 threads),
-Node v24.19.0, Go 1.26.0, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 14.0 MB.
+**Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
+Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
+(non-`--release`) build. The binary is 15.3 MB. Node runs the compiler as
+precompiled JavaScript (see [Run it](#run-it)); that build is done once,
+before timing.
 
 (a) `ng-compile` (built-in demo template), 30 runs each:
 
 | Runtime    | min       | median      | mean        | max         |
 | ---------- | --------- | ----------- | ----------- | ----------- |
-| Node.js    | 953.45 ms | 1,020.78 ms | 1,044.35 ms | 1,268.38 ms |
-| TypeNative | 108.83 ms | 117.35 ms   | 117.90 ms   | 133.38 ms   |
+| Node.js    | 219.27 ms | 223.39 ms   | 223.24 ms   | 227.55 ms   |
+| TypeNative | 58.18 ms  | 60.61 ms    | 61.53 ms    | 94.50 ms    |
 
 (b) `ng-compile generated.component.html`, 5 runs per size (medians):
 
 | Template           | Node.js  | TypeNative | TypeNative vs Node |
 | ------------------ | -------- | ---------- | ------------------ |
-| 9 KB, 186 lines    | 1,105 ms | 303 ms     | 3.7x faster        |
-| 16 KB, 362 lines   | 1,131 ms | 487 ms     | 2.3x faster        |
-| 32 KB, 706 lines   | 1,235 ms | 845 ms     | 1.5x faster        |
-| 65 KB, 1,388 lines | 1,354 ms | 1,620 ms   | 1.2x slower        |
+| 9 KB, 186 lines    | 254 ms   | 140 ms     | 1.8x faster        |
+| 16 KB, 362 lines   | 275 ms   | 222 ms     | 1.2x faster        |
+| 32 KB, 706 lines   | 316 ms   | 392 ms     | 1.2x slower        |
+| 65 KB, 1,388 lines | 386 ms   | 753 ms     | 1.9x slower        |
 
-**Per call, TypeNative is 8.7x faster** (117 ms vs 1,021 ms, median). Almost
+**Per call, TypeNative is 3.7x faster** (61 ms vs 223 ms, median). Almost
 all of both times is fixed: a one-line template takes about as long. Node
-spends its second loading the compiler's 233 TypeScript files and transforming
-them (`--experimental-transform-types`) before it compiles anything. The
-native binary's 0.1 s is mostly the compiler's own module setup, such as the
-DOM schema and entity tables.
+spends it loading and evaluating the compiler's 233 modules before it
+compiles anything. The native binary's 60 ms is mostly the compiler's own
+module setup, such as the DOM schema and entity tables.
 
-**On large templates the native binary loses its lead at about 50 KB.** Past
-startup, compiling costs about 24 ms per KB natively against about 4–5 ms per
+**On large templates the native binary loses its lead at about 25 KB.** Past
+startup, compiling costs about 11 ms per KB natively against about 2–3 ms per
 KB under V8's JIT, so the gap closes as templates grow. Real component
 templates are mostly a few KB, well inside the native binary's lead. In a
 profile of the 64 KB run, about a third of the samples are goroutine handoffs:

@@ -121,6 +121,7 @@ fetchCases();
 const cases = listCases().filter((c) => c.id.includes(filter));
 console.log(`Compiling main.ts with TypeNative ...`);
 run(process.execPath, [cli, '--source', path.join(here, 'main.ts'), '--output', exePath], { cwd: repoRoot });
+run(process.execPath, [path.join(here, 'run-node.mjs'), '--build'], { cwd: here });
 
 fs.rmSync(failuresDir, { recursive: true, force: true });
 fs.rmSync(inputsDir, { recursive: true, force: true });
@@ -137,7 +138,7 @@ async function worker() {
     const input = path.join(inputsDir, `${index}.html`);
     fs.writeFileSync(input, template);
     const [node, native] = await Promise.all([
-      spawnCollect(process.execPath, ['--experimental-transform-types', '--no-warnings', 'main.ts', input]),
+      spawnCollect(process.execPath, [path.join(here, 'run-node.mjs'), input]),
       spawnCollect(exePath, [input])
     ]);
     if (node.stdout === native.stdout && node.stderr === native.stderr && node.code === native.code) {
