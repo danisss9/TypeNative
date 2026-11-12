@@ -322,6 +322,9 @@ if (names.length === 0) {
 
 console.log('Compiling main.ts with TypeNative ...');
 run(process.execPath, [cli, '--source', path.join(here, 'main.ts'), '--output', exePath], { cwd: repoRoot });
+// (the Node build once, up front: fixtures run in parallel, and each
+// run-node.mjs would otherwise rebuild a stale cache at the same time)
+run(process.execPath, ['run-node.mjs', '--build'], { cwd: here });
 
 fs.rmSync(failuresDir, { recursive: true, force: true });
 fs.mkdirSync(failuresDir, { recursive: true });

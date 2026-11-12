@@ -11444,7 +11444,10 @@ function visitObjectLiteralAsStruct(node: AstNode, pointerType: string): string 
     values.push(`${field}: ${toGoValueOfType(isPropertyAssignment(p) ? p.initializer : p.name, fieldType)}`);
   }
   // (keys listed in another order than the type declares them: see literalKeyOrder)
-  const keyOrder = named && objectTypeHasKeyOrder(pointerType.slice(1)) ? literalKeyOrder(node, objectTypeFields(pointerType.slice(1))) : '';
+  // (an anonymous struct with a key list of its own: the same)
+  const keyOrder = named
+    ? (objectTypeHasKeyOrder(pointerType.slice(1)) ? literalKeyOrder(node, objectTypeFields(pointerType.slice(1))) : '')
+    : fields.has('__keys') ? literalKeyOrder(node, new Map([...fields].filter(([k]) => k !== '__keys'))) : '';
   if (keyOrder) values.push(`__keys: ${keyOrder}`);
   return `&${pointerType.slice(1)}${compositeBody(values)}`;
 }
@@ -12133,7 +12136,11 @@ function literalKeyOrder(node: AstNode, fieldTypes: Map<string, string> | undefi
     if ((isPropertyAssignment(p) || isShorthandPropertyAssignment(p) || isMethodDeclaration(p)) && isIdentifier(p.name)) keys.push(p.name.text);
   }
   const declared = [...fieldTypes.keys()].filter((k) => keys.includes(k));
-  if (declared.join(',') === keys.filter((k) => fieldTypes.has(k)).join(',')) return '';
+  // (a key written as undefined — sourceFilename: undefined — is an own key
+  // all the same: Object.keys lists it, so the literal keeps its key list)
+  const explicitUndefined = (node.properties ?? []).some((p: AstNode) =>
+    isPropertyAssignment(p) && isIdentifier(unwrapParentheses(p.initializer)) && unwrapParentheses(p.initializer).text === 'undefined');
+  if (declared.join(',') === keys.filter((k) => fieldTypes.has(k)).join(',') && !explicitUndefined) return '';
   const signature = keys.join(',');
   if (!keyOrderTables.has(signature)) {
     const name = `tnKeys${keyOrderTables.size + 1}`;
@@ -16671,6 +16678,9 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     const headIsStruct = !!headName && (declaredTypeAliases.get(headName)?.kind === 'TypeLiteral' ||
       (declaredInterfaces.has(headName) && interfaceHasProperties(declaredInterfaces.get(headName)) && !isMethodInterfaceName(headName)));
     if (headIsStruct && memberFields[0].size > 0 && memberFields[0].size < fields.length) fields.splice(memberFields[0].size, 0, '__keys *[]string');
+    // (else a key list of its own, at the end: a literal of the type that
+    // writes a key as undefined — Babel's default options — keeps that key)
+    else if (!fields.includes('__keys *[]string')) fields.push('__keys *[]string');
     return `*struct{ ${fields.join('; ')} }`;
   }
   // [A, B] tuples are slices: []A when all elements share a type, else []interface{}
@@ -21004,6 +21014,28 @@ function mutatesArrayParameter(fn: AstNode, name: string, passedOn = new WeakSet
   return false;
 }
 
+// Whether a function changes the Map / Set its parameter `name` names (set,
+// add, delete, clear on it) — or passes it on to another function
+function mutatesCollectionParameter(fn: AstNode, name: string): boolean {
+  const isName = (n: AstNode) => isIdentifier(unwrapParentheses(n)) && unwrapParentheses(n).text === name;
+  return containsNode(fn.body, (n) =>
+    isCallExpression(n) && (
+      (isPropertyAccessExpression(n.expression) && ['set', 'add', 'delete', 'clear'].includes(n.expression.name.text) && isName(n.expression.expression)) ||
+      (!isPropertyAccessExpression(n.expression) && (n.arguments ?? []).some((a: AstNode) => isName(a)))));
+}
+
+// Where a converted Map / Set argument's changes are copied back: the caller's
+// map, when the argument is a variable or field holding one of another type
+// (retainWhere_Set(activeScopes, …) — Set<T> erased to Set<any> — deletes
+// from a converted copy)
+function mapWriteBackOf(node: AstNode, paramType: string, converted: string): string | undefined {
+  const target = unwrapParentheses(node);
+  const own = inferExpressionType(target) ?? '';
+  if (!own.startsWith('*TnMap[') || own === paramType || !converted.startsWith('TnAs[')) return undefined;
+  if (isIdentifier(target) || (isPropertyAccessExpression(target) && !hasQuestionDot(target))) return visit(target);
+  return undefined;
+}
+
 // Where a converted array argument's changes are copied back: the caller's
 // array reference, and its element type
 function arrayWriteBackOf(node: AstNode, paramType: string): { reference: string; elementType: string } | undefined {
@@ -21031,7 +21063,9 @@ function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: stri
   useHelper('dynamic');
   useHelper('arraySubclass');
   const decls = backs.map((b) => `${b.tmp} := ${b.converted}`).join(';\n\t');
-  const writes = backs.map((b) => `(*${b.reference}) = TnSliceAs[${b.elementType}](*${b.tmp})`).join(';\n\t');
+  // (a map's entry — no element type —: its contents copied back)
+  if (backs.some((b) => b.elementType === '')) useHelper('mapAssign');
+  const writes = backs.map((b) => b.elementType === '' ? `TnMapAssign(${b.reference}, ${b.tmp})` : `(*${b.reference}) = TnSliceAs[${b.elementType}](*${b.tmp})`).join(';\n\t');
   const type = inferExpressionType(node) ?? '';
   const resultType = type && type !== 'undefined' && type !== 'void' && type !== ':' ? type : '';
   if (!resultType) return `func() {\n\t${decls};\n\t${call};\n\t${writes}\n}()`;
@@ -21059,7 +21093,9 @@ function mutatesParameterFields(fn: AstNode, name: string, passedOn = new WeakSe
     } else if (isCallExpression(n) && isPropertyAccessExpression(n.expression) && ['push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse', 'fill', 'set', 'add', 'delete', 'clear'].includes(n.expression.name.text)) {
       local ||= isMember(n.expression.expression) && rootIsParam(n.expression.expression);
     }
-    if (isCallExpression(n) && !isPropertyAccessExpression(n.expression) && !isCallExpression(n.expression)) calls.push(n);
+    // (a method call too — this.visitScope(scope, state), its override in a
+    // subclass changing scope.instructions —: the argument is passed on)
+    if (isCallExpression(n) && !isCallExpression(n.expression)) calls.push(n);
     return false;
   });
   if (local) return true;
@@ -21223,6 +21259,16 @@ function visitCallArguments(node: AstNode): string[] {
       if (back) {
         const tmp = getTempName('wb');
         arrayCallWriteBacks.push({ tmp, converted, reference: back.reference, elementType: back.elementType });
+        return tmp;
+      }
+    }
+    // (a Map / Set converted to the parameter's type that the callee changes:
+    // its contents written back into the caller's map after the call)
+    if (arrayCallWriteBacks && !isSpreadElement(arg) && paramType.startsWith('*TnMap[') && isIdentifier(param.name) && fn.body && mutatesCollectionParameter(fn, param.name.text)) {
+      const reference = mapWriteBackOf(arg, paramType, converted);
+      if (reference) {
+        const tmp = getTempName('wb');
+        arrayCallWriteBacks.push({ tmp, converted, reference, elementType: '' });
         return tmp;
       }
     }
@@ -23389,6 +23435,7 @@ const helperRequires: Record<string, string[]> = {
   namedGroups: ['orderedMap', 'regexMatch'],
   fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
   dynamic: ['error', 'strIndex', 'toFixed', 'functionThis'],
+  mapAssign: ['dynamic', 'orderedMap'],
   regexMatch: ['strIndex'],
   stringSearch: ['strIndex'],
   classes: ['dynamic', 'error', 'orderedMap', 'decorators'],
@@ -24760,6 +24807,20 @@ func TnIsArray(v interface{}) bool {
 	}
 	return rv.Kind() == reflect.Slice
 }`,
+  mapAssign: `// A Map / Set's contents replaced by another's (a converted copy a callee
+// changed — retainWhere_Set deleting from it): the caller's map, in the
+// copy's order
+func TnMapAssign[K comparable, V any](dst *TnMap[K, V], src interface{}) {
+	s, ok := src.(interface{ Entries() [][]interface{} })
+	if dst == nil || !ok {
+		return
+	}
+	entries := s.Entries()
+	dst.Clear()
+	for _, e := range entries {
+		dst.Set(TnAs[K](e[0]), TnAs[V](e[1]))
+	}
+}`,
   dynamic: `// Dynamic (any) values: JSON-like objects are map[string]interface{},
 // arrays []interface{}, numbers float64
 // A nullable primitive (*T) as the JS value it holds: its T, or undefined
@@ -25726,10 +25787,20 @@ func TnCopyFieldsBack(dst interface{}, src interface{}) {
 	}
 	for _, pair := range tnStructCopyPlan(sv.Type(), dv.Type()) {
 		sf, df := sv.Field(pair[0]), dv.Field(pair[1])
-		if strings.HasPrefix(dv.Type().Field(pair[1]).Name, "__") || !sf.Type().AssignableTo(df.Type()) {
+		if strings.HasPrefix(dv.Type().Field(pair[1]).Name, "__") {
 			continue
 		}
-		reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem().Set(reflect.NewAt(sf.Type(), unsafe.Pointer(sf.UnsafeAddr())).Elem())
+		value := reflect.NewAt(sf.Type(), unsafe.Pointer(sf.UnsafeAddr())).Elem()
+		target := reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
+		if sf.Type().AssignableTo(df.Type()) {
+			target.Set(value)
+			continue
+		}
+		// (a field of another Go type — a union struct's any field for the
+		// member's array: scopeBlock.instructions = […] —: converted)
+		if converted, ok := TnConvertDynamic(value.Interface(), df.Type()); ok && converted.IsValid() {
+			target.Set(converted)
+		}
 	}
 	// fields the destination's type has no slot for: set beside it
 	for i := 0; i < sv.NumField(); i++ {
@@ -27183,6 +27254,35 @@ func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
 	keys := []string{}
 	values := []interface{}{}
 	tnCollectStructProps(rv.Elem(), &keys, &values)
+	// (a literal's own key list, __keys: its keys in creation order, those it
+	// wrote as undefined included — they are own keys in JS)
+	if order := rv.Elem().FieldByName("__keys"); order.IsValid() && order.Kind() == reflect.Pointer && !order.IsNil() {
+		listed := *(*[]string)(unsafe.Pointer(order.Pointer()))
+		at := map[string]int{}
+		for i, k := range keys {
+			at[k] = i
+		}
+		ordered, orderedValues := make([]string, 0, len(keys)), make([]interface{}, 0, len(values))
+		seen := map[string]bool{}
+		for _, k := range listed {
+			if i, ok := at[k]; ok {
+				ordered, orderedValues = append(ordered, k), append(orderedValues, values[i])
+			} else if f := rv.Elem().FieldByName(k); f.IsValid() {
+				ordered, orderedValues = append(ordered, k), append(orderedValues, nil)
+			} else if f := rv.Elem().FieldByName(k + "_"); f.IsValid() {
+				ordered, orderedValues = append(ordered, k), append(orderedValues, nil)
+			} else {
+				continue
+			}
+			seen[k] = true
+		}
+		for i, k := range keys {
+			if !seen[k] {
+				ordered, orderedValues = append(ordered, k), append(orderedValues, values[i])
+			}
+		}
+		keys, values = ordered, orderedValues
+	}
 	// (the object's added properties come after its fields, in insertion
 	// order: a field that didn't take the value reads as undefined, so it is
 	// not listed here, and the value it was given is)
