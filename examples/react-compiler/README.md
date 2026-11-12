@@ -92,7 +92,7 @@ the compiler over each fixture (components and hooks through
 pragmas, `"use no memo"`, and the error paths) with both runtimes.
 stdout, stderr and the exit code must match byte for byte — including the memo
 slot and block counts in the `// CompileSuccess` lines. Failures are written
-to `.cache/failures/`. Current gap, 3/15:
+to `.cache/failures/`. Current gap, 11/15:
 
 ```sh
 node parity.mjs
@@ -100,28 +100,15 @@ node parity.mjs
 
 The remaining failures, by root cause:
 
-- **Directive collection** (mode-all, closures-and-destructuring partially
-  remain) — FIXED: the parser's directives now reach the compiler (one
-  dynamic array converts to one typed view; see the CHANGELOG). mode-annotation
-  memoizes its Component and fails later on a pre-existing `reflect.Set`
-  panic (`**[]interface{}` not assignable to `*[]interface{}`), visible with
-  `TN_DEBUG_ERRORS=1`.
-- **Reactive-scope classification** (demo-infer, jsx-outlining, error-mutate-prop,
-  error-conditional-hook). `Driver.visitBreak` raises `Expected reactive scope
-  to implicitly break to fallthrough` (BuildReactiveFunction.ts:1202) where
-  Node compiles — the same local/context classification family as fixtures
-  12/14's `consistently local or context references` invariant.
-- **Nested-scope bindings** (mode-all, closures-and-destructuring): BuildHIR's
-  `Todo: Support destructuring of context variables` on every
-  `const [x, setX] = useState(...)`.
-- **Runtime gaps**: `Array.prototype.at` on dynamic values (validate-manual-memo),
-  member-expression scope lookups (hooks-and-refs).
-- **Uid naming** (mode-annotation's remaining diff after the reflect.Set panic:
-  `_temp` vs `_`). Class methods don't apply default parameters for
-  explicitly-passed `undefined`: `generateUid(name: string = "temp")` is called
-  with `name ?? undefined` (Environment.ts:778) and natively the name arrives
-  empty — `s.uid(undefined)` returns `_` where Node returns `_temp` (plain
-  functions handle it).
+- **Reactive-scope classification** (demo-infer, error-conditional-hook).
+  `Driver.visitBreak` raises `Expected reactive scope to implicitly break to
+  fallthrough` (BuildReactiveFunction.ts) where Node compiles.
+- **Pruned-scope counts** (validate-manual-memo): the output is
+  byte-identical except the `// CompileSuccess` line, which reports
+  `0 pruned blocks, 0 pruned values` where Node reports 1 and 1.
+- **Error location file names** (hooks-and-refs): the ref-access error's
+  location (a `RefValue`'s `loc`, ValidateNoRefAccessInRender.ts) arrives
+  without its `filename`, so the `file:line:col` header line is missing.
 
 ## Benchmark
 

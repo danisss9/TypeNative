@@ -5683,7 +5683,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // (x === undefined is false for null)
         const strict = node.operatorToken.kind === 'EqualsEqualsEqualsToken' || node.operatorToken.kind === 'ExclamationEqualsEqualsToken';
         const nilNode = nilOther === node.left ? node.right : node.left;
-        const test = strict && unwrapParentheses(nilNode).kind !== 'NullKeyword' ? 'TnIsUndefined' : 'TnIsNil';
+        // (x === null where the function also tests x === undefined — codegen's
+        // value === null ? nullLiteral : value === undefined ? identifier: the
+        // two told apart, null not matching an unset value)
+        const strictNull = strict && unwrapParentheses(nilNode).kind === 'NullKeyword' && comparedStrictlyToUndefined(nilOther);
+        const test = strict && unwrapParentheses(nilNode).kind !== 'NullKeyword' ? 'TnIsUndefined' : strictNull ? 'TnIsNullStrict' : 'TnIsNil';
         return `${op === '!=' ? '!' : ''}${test}(${visit(nilOther)})`;
       }
       const conditionalNull = visitConditionalNullUndefinedTest(node, op);
@@ -8289,6 +8293,22 @@ function isOptionalChainContinuation(node: AstNode): boolean {
 // Variables known non-null when `condition` evaluates to `whenTrue`
 // The function a call's name refers to when it is a type guard (its result
 // a `v is T` predicate): a declared function, or a const arrow in scope
+// Whether the function around a variable reference also compares it strictly
+// to undefined (x === undefined / x !== undefined): the code tells null and
+// undefined apart there
+function comparedStrictlyToUndefined(expr: AstNode): boolean {
+  const ref = unwrapParentheses(expr);
+  if (!isIdentifier(ref)) return false;
+  let scope = ref.parent;
+  while (scope && !FUNCTION_LIKE_KINDS.has(scope.kind) && !isSourceFile(scope)) scope = scope.parent;
+  if (!scope) return false;
+  const isUndefined = (n: AstNode) => isIdentifier(unwrapParentheses(n)) && unwrapParentheses(n).text === 'undefined';
+  const isRef = (n: AstNode) => isIdentifier(unwrapParentheses(n)) && unwrapParentheses(n).text === ref.text;
+  return containsNode(scope.body ?? scope, (n) =>
+    isBinaryExpression(n) && ['EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken'].includes(n.operatorToken.kind) &&
+    ((isRef(n.left) && isUndefined(n.right)) || (isRef(n.right) && isUndefined(n.left))));
+}
+
 function typeGuardOf(name: string, from: AstNode): AstNode | undefined {
   const isGuard = (fn: AstNode | undefined) => !!fn && fn.type?.kind === 'TypePredicate' && !fn.type.assertsModifier;
   for (let scope = from.parent; scope; scope = scope.parent) {
@@ -11534,8 +11554,10 @@ function visitAnonymousStructLiteral(node: AstNode): string {
     } else {
       const fieldType = objectFieldGoType(toFieldGoType(inferExpressionType(valueNode)));
       fields.set(field, fieldType);
-      // (an array field holds a reference to the array)
-      values.push(`${field}: ${fieldType.startsWith('*[]') ? toGoValueOfType(valueNode, fieldType) : visit(valueNode)}`);
+      // (an array field holds a reference to the array; null in an any field
+      // is JS null — { kind: 'Primitive', value: null } — not undefined)
+      const nullValue = isProp && fieldType === 'interface{}' && unwrapParentheses(valueNode).kind === 'NullKeyword';
+      values.push(`${field}: ${fieldType.startsWith('*[]') || nullValue ? toGoValueOfType(valueNode, fieldType) : visit(valueNode)}`);
     }
   }
   const contextualStruct = (inferExpectedTypeFromContext(node) ?? '').replace(/^\*/, '');
@@ -15304,6 +15326,10 @@ function visitNullishCoalescingExpression(node: AstNode): string {
       steps.push(
         `if ${tmp}, ok := ${lookup.map}.Lookup(${lookup.key}); ok { return ${convertGoValue(tmp, valueType, resultType)} }`
       );
+    } else if (!isLast && operandType && enumBaseTypes.get(operandType) === 'string') {
+      // (a string enum's value is never "": an optional field of one that is
+      // unset reads "" — signature.returnValueReason ?? ValueReason.Other)
+      steps.push(`if ${tmp} := ${visit(operand)}; ${tmp} != "" { return ${convertGoValue(tmp, operandType, resultType)} }`);
     } else if (!isLast && operandType && isNilableGoType(operandType)) {
       // (an any value may hold a nil pointer: unset too)
       const present = operandType === 'interface{}' ? (useHelper('dynamic'), `!TnIsNil(${tmp})`) : `${tmp} != nil`;
@@ -21176,6 +21202,18 @@ function visitCallArguments(node: AstNode): string[] {
       }
     }
     if (mentioned.length > 0) return visit(arg);
+    // (an argument for a defaulted parameter, passed in __defaultArgs: an
+    // undefined one — the literal, or an optional value that is unset — stays
+    // undefined, so the callee's default applies: generateUid(name ?? undefined)
+    // with generateUid(name = "temp"); null is a value, the default doesn't apply)
+    if (param.initializer && !takesEveryParameter(params) && !isSpreadElement(arg)) {
+      const value = unwrapParentheses(arg);
+      if (isIdentifier(value) && value.text === 'undefined') return 'nil';
+      if (value.kind === 'VoidExpression') return `func() interface{} { _ = ${visit(value.expression)}; return nil }()`;
+      if (value.kind === 'NullKeyword') return 'TnNull';
+      const argType = inferExpressionType(arg) ?? '';
+      if (NULLABLE_PRIMITIVE_TYPES.includes(argType) && argType.slice(1) === paramType) return visit(arg);
+    }
     const converted = toGoValueOfType(arg, paramType);
     // (an array converted to the parameter's elements: the callee changes it
     // in place — the copy's elements are copied back after the call, as a JS
@@ -25100,7 +25138,18 @@ func TnPushField(obj interface{}, key string, value interface{}) {
 			}
 		}
 	}
-	elements := append(TnAs[[]interface{}](TnGetRef(obj, key)), value)
+	// (a property read that gives an array reference — a getter returning the
+	// array it holds, Stack's get value() — pushes through that reference)
+	current := TnGetRef(obj, key)
+	if ref, ok := current.(*[]interface{}); ok && ref != nil {
+		*ref = append(*ref, value)
+		return
+	}
+	if rv := reflect.ValueOf(current); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		rv.Elem().Set(reflect.Append(rv.Elem(), tnConvertTo(value, rv.Elem().Type().Elem())))
+		return
+	}
+	elements := append(TnAs[[]interface{}](current), value)
 	// (an expando-stored array — node.body.push(stmt) on a bare parser Node —
 	// has no field to store through: TnSet's paths cover it, as they do maps
 	// and typed fields)
@@ -25849,6 +25898,23 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 			}
 		}
 		return TnCallValue(obj, rest...)
+	}
+	// xs.at(i) on an array held as any (a slice, or an array reference):
+	// negative indices count from the end, out of range is undefined
+	if name == "at" {
+		if rv := reflect.Indirect(reflect.ValueOf(obj)); rv.Kind() == reflect.Slice {
+			i := 0
+			if len(args) > 0 {
+				i = int(TnNumber(args[0]))
+			}
+			if i < 0 {
+				i += rv.Len()
+			}
+			if i < 0 || i >= rv.Len() {
+				return nil
+			}
+			return rv.Index(i).Interface()
+		}
 	}
 	// an array reference (*[]interface{}) held as any — a dynamic object's
 	// array entry: its mutating methods run through the shared header
@@ -28089,6 +28155,12 @@ var TnNull interface{} = &tnNullValue{}
 // x === undefined: unset, not null
 func TnIsUndefined(v interface{}) bool {
 	return v != TnNull && TnIsNil(v)
+}
+
+// x === null where undefined is told apart: JS null (or a nil object a typed
+// value held), not an unset value
+func TnIsNullStrict(v interface{}) bool {
+	return v == TnNull || (v != nil && TnIsNil(v))
 }
 
 func TnIsNil(v interface{}) bool {
