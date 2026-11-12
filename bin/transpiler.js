@@ -3840,7 +3840,9 @@ function visit(node, options = {}) {
 function visitScoped(node, options = {}) {
     // an object's array field holds a *[]T: reads see the array (nil-safe),
     // mutations go through the reference, assignments and nil tests use it
-    if (node && !options.rawArrayField && isReferenceFieldAccess(node)) {
+    // (an optional access or chain derefs what it reads itself: it visits a
+    // plain copy of its links, which this rule covers)
+    if (node && !options.rawArrayField && !hasQuestionDot(node) && isReferenceFieldAccess(node) && !isOptionalChainContinuation(node)) {
         const raw = inferRawExpressionType(node);
         if (raw?.startsWith('*[]')) {
             const code = visitScoped(node, { ...options, rawArrayField: true });
@@ -8306,6 +8308,14 @@ function toGoValueOfType(expr, goType) {
             call.tnArrayReference = false;
             return code;
         }
+        // (m?.get(k) of such a Map: the reference too, nil when m is absent)
+        if (isCallExpression(refCall) && isPropertyAccessExpression(refCall.expression) && refCall.expression.name.text === 'get' &&
+            hasQuestionDot(refCall.expression) && extractMapValueType(inferExpressionType(refCall.expression.expression) ?? '') === goType) {
+            refCall.tnArrayReference = true;
+            const code = visit(refCall);
+            refCall.tnArrayReference = false;
+            return code;
+        }
         if (isCallExpression(refCall) && returnsArrayReference(calledDeclaration(refCall))) {
             refCall.tnArrayReference = true;
             const code = visit(refCall);
@@ -8626,19 +8636,62 @@ function typeGuardOf(name, from) {
     const declared = declaredFunctions.get(name);
     return isGuard(declared) ? declared : undefined;
 }
-function getNarrowedNames(condition, whenTrue) {
+// Whether an expression narrows something by its truth (a comparison, a
+// logical combination, a type guard call): a const alias of one narrows too
+function isNarrowingCondition(expr) {
+    const u = unwrapParentheses(expr);
+    if (isPrefixUnaryExpression(u) && u.operator === 'ExclamationToken')
+        return true;
+    if (isBinaryExpression(u)) {
+        return [
+            'AmpersandAmpersandToken', 'BarBarToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken',
+            'EqualsEqualsToken', 'ExclamationEqualsToken', 'InstanceOfKeyword', 'InKeyword'
+        ].includes(u.operatorToken.kind);
+    }
+    return isCallExpression(u) && isIdentifier(u.expression) && !!typeGuardOf(u.expression.text, u);
+}
+// The initializer of a const variable of this name, when it is one that
+// narrows (`const ok = x !== undefined && …; if (ok) {…}`)
+function aliasedConditionOf(name, from) {
+    const fromDeclaration = (d) => isIdentifier(d.name) && d.name.text === name && isNarrowingCondition(d.initializer) ? d.initializer : undefined;
+    for (let scope = from.parent; scope; scope = scope.parent) {
+        for (const statement of scope.statements ?? []) {
+            if (!isVariableStatement(statement) || statement.declarationList?.declarationKind !== 'const')
+                continue;
+            for (const d of statement.declarationList?.declarations ?? []) {
+                const initializer = fromDeclaration(d);
+                if (initializer)
+                    return initializer;
+            }
+        }
+    }
+    const declared = declaredVariables.get(name);
+    const declaredList = declared?.parent?.parent;
+    if (declared && isVariableStatement(declaredList) && declaredList.declarationList?.declarationKind === 'const')
+        return fromDeclaration(declared);
+    return undefined;
+}
+function getNarrowedNames(condition, whenTrue, seen = new Set()) {
     if (isParenthesizedExpression(condition))
-        return getNarrowedNames(condition.expression, whenTrue);
+        return getNarrowedNames(condition.expression, whenTrue, seen);
     if (whenTrue) {
         const chainBase = getOptionalChainBase(condition);
         if (chainBase)
             return nullableKeys([chainBase]);
     }
+    // (a const holding a condition narrows as the condition does)
+    if (isIdentifier(condition) && !seen.has(condition.text)) {
+        const alias = aliasedConditionOf(condition.text, condition);
+        if (alias) {
+            seen.add(condition.text);
+            return getNarrowedNames(alias, whenTrue, seen);
+        }
+    }
     if (isIdentifier(condition) || isPropertyAccessExpression(condition) || isElementAccessExpression(condition)) {
         return whenTrue ? nullableKeys([condition]) : [];
     }
     if (isPrefixUnaryExpression(condition) && condition.operator === 'ExclamationToken') {
-        return getNarrowedNames(condition.operand, !whenTrue);
+        return getNarrowedNames(condition.operand, !whenTrue, seen);
     }
     // isX(v) of a type guard `(v): v is T` (T not nullable): v is set
     if (whenTrue && isCallExpression(condition) && isIdentifier(condition.expression)) {
@@ -8658,13 +8711,13 @@ function getNarrowedNames(condition, whenTrue) {
         if (!whenTrue)
             return [];
         // (the right side is read with the left side's narrowing: x instanceof C && x.f)
-        const left = getNarrowedNames(condition.left, true);
+        const left = getNarrowedNames(condition.left, true, seen);
         const added = left.filter((n) => !narrowedVariables.has(n));
         for (const name of added)
             narrowedVariables.add(name);
         inferMemoPush();
         try {
-            return [...left, ...getNarrowedNames(condition.right, true)];
+            return [...left, ...getNarrowedNames(condition.right, true, seen)];
         }
         finally {
             inferMemoPop();
@@ -8675,7 +8728,7 @@ function getNarrowedNames(condition, whenTrue) {
     if (kind === 'BarBarToken') {
         return whenTrue
             ? []
-            : [...getNarrowedNames(condition.left, false), ...getNarrowedNames(condition.right, false)];
+            : [...getNarrowedNames(condition.left, false, seen), ...getNarrowedNames(condition.right, false, seen)];
     }
     // x instanceof C on a dynamic variable: x is a *C (C without subclasses)
     if (kind === 'InstanceOfKeyword') {
@@ -12833,6 +12886,12 @@ function visitSpreadArrayLiteral(node, elemType) {
             if (boxed)
                 useHelper('arraySubclass');
             let spreadSource = boxed ? `TnToArray(${source})` : source;
+            // ([...map] into an array of pairs — [string, string][] —: each entry converted)
+            if (!boxed && baseType.startsWith('[]') && sourceType.startsWith('*TnMap[') && extractMapValueType(sourceType) !== 'struct{}') {
+                useHelper('dynamic');
+                useHelper('arraySubclass');
+                spreadSource = `TnSliceAs[${baseType}](${source})`;
+            }
             if (!boxed && baseType !== 'interface{}' && sourceType.startsWith('[]') && sourceType !== `[]${baseType}` && !sourceType.startsWith('[]interface{}')) {
                 useHelper('dynamic');
                 useHelper('arraySubclass');
@@ -13561,7 +13620,16 @@ function referenceFieldUse(node) {
     return 'read';
 }
 function isReferenceFieldAccess(expr) {
-    return !!expr && (isPropertyAccessExpression(expr) || isElementAccessExpression(expr) && isStringLiteral(expr.argumentExpression));
+    if (!expr)
+        return false;
+    if (isPropertyAccessExpression(expr))
+        return true;
+    if (!isElementAccessExpression(expr))
+        return false;
+    if (isStringLiteral(expr.argumentExpression))
+        return true;
+    // (a Record's array value read by a computed key: the reference it holds)
+    return (inferRawExpressionType(expr.expression) ?? '').startsWith('*TnMap[');
 }
 function inferRawExpressionType(expr) {
     if (!expr)
@@ -13601,6 +13669,18 @@ function inferExpressionTypeUncached(expr) {
             const innerType = withNarrowingType(narrowed, () => inferExpressionType(chain));
             variableGoTypes.delete(tmp);
             return innerType === undefined ? 'interface{}' : makeNullableType(innerType);
+        }
+    }
+    // (a narrowed element at a literal index: its type without the pointer — a
+    // branch of `arr[0] && arr[0] !== 'x' ? arr[0] : …` sees the value)
+    if (isElementAccessExpression(expr) && narrowedVariables.size > 0) {
+        const narrowingKey = getNarrowingKey(expr);
+        if (narrowingKey && narrowedVariables.has(narrowingKey) && !isAssignmentTarget(expr)) {
+            narrowedVariables.delete(narrowingKey);
+            const nullableType = inferExpressionType(expr);
+            narrowedVariables.add(narrowingKey);
+            if (nullableType && NULLABLE_PRIMITIVE_TYPES.includes(nullableType))
+                return nullableType.slice(1);
         }
     }
     const inferred = inferExpressionTypeOf(expr);
@@ -14437,17 +14517,6 @@ function inferExpressionTypeOf(expr) {
     if (isPropertyAccessExpression(expr) && (inferExpressionType(expr.expression) ?? '').startsWith('*TnIterResult[')) {
         return expr.name.text === 'done' ? 'bool' : (inferExpressionType(expr.expression) ?? '').slice(14, -1);
     }
-    // (a narrowed element at a literal index: its type without the pointer)
-    if (isElementAccessExpression(expr) && narrowedVariables.size > 0) {
-        const narrowingKey = getNarrowingKey(expr);
-        if (narrowingKey && narrowedVariables.has(narrowingKey) && !isAssignmentTarget(expr)) {
-            narrowedVariables.delete(narrowingKey);
-            const nullableType = inferExpressionType(expr);
-            narrowedVariables.add(narrowingKey);
-            if (nullableType && NULLABLE_PRIMITIVE_TYPES.includes(nullableType))
-                return nullableType.slice(1);
-        }
-    }
     // (an optional interface method read as a value: see TnMethodOf_m)
     if (isPropertyAccessExpression(expr) && !isCallee(expr) && isOptionalInterfaceMethodAccess(expr))
         return 'interface{}';
@@ -14508,6 +14577,9 @@ function inferExpressionTypeOf(expr) {
             return 'interface{}';
         const leftType = inferExpressionType(expr.expression);
         if (expr.name.text === 'length')
+            return 'float64';
+        // (m.size: the number of entries)
+        if (expr.name.text === 'size' && (leftType ?? '').startsWith('*TnMap[') && !isCallee(expr))
             return 'float64';
         if (expr.name.text === 'index' && leftType === '[]string')
             return 'float64';
@@ -15444,7 +15516,9 @@ function truthinessCheck(code, goType) {
         useHelper('dynamic');
         return `TnTruthy(${peekRead(code)})`;
     }
-    if (NULLABLE_PRIMITIVE_TYPES.includes(goType) && !/^[\w.()*]+$/.test(code)) {
+    // (the value is read twice — set, then its value —: anything but a plain
+    // read, a call included, is bound once so it runs once)
+    if (NULLABLE_PRIMITIVE_TYPES.includes(goType) && (!/^[\w.()*]+$/.test(code) || /\w\(/.test(code))) {
         return `func() bool { __t := ${code}; return ${truthinessCheck('__t', goType)} }()`;
     }
     // structs (value types) are always truthy
@@ -16229,12 +16303,19 @@ function visitOptionalPropertyAccess(node) {
     const propertyType = declaredMemberType(className, node.name.text) ??
         getStructFieldGoType(className, node.name.text) ??
         'interface{}';
-    const nullableType = makeNullableType(propertyType);
+    // (an array field holds a reference: a read gives the array — nil when the
+    // object is absent, as a read of the field gives the array)
+    const arrayReference = propertyType.startsWith('*[]');
+    const nullableType = arrayReference ? propertyType.slice(1) : makeNullableType(propertyType);
     const tmp = getTempName('opt');
     // Class getters (also Node classes' accessors such as err.syscall) are calls
-    const propertyAccess = classGetterMethods.has(`${className}.${node.name.text}`)
+    let propertyAccess = classGetterMethods.has(`${className}.${node.name.text}`)
         ? `${tmp}.Get_${visit(node.name)}()`
         : `${tmp}.${visit(node.name)}`;
+    if (arrayReference) {
+        useHelper('dynamic');
+        propertyAccess = `TnDerefSlice(${propertyAccess})`;
+    }
     if (nullableType.startsWith('*') && nullableType.slice(1) === propertyType) {
         const valueTemp = getTempName('optv');
         return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; ${valueTemp} := ${propertyAccess}; return &${valueTemp} }()`;
@@ -16420,18 +16501,24 @@ function visitOptionalCall(node) {
         return `func() ${resultType} { ${guard} := ${baseExpr}; if TnIsNil(${guard}) { var __zero ${resultType}; return __zero }; return ${callCode} }()`;
     }
     // m?.set(k, v) on a Map / Set that may be absent: run only when it is set
-    // (the receiver read again for the call: a variable or a field)
-    if (baseType?.startsWith('*TnMap[') && hasQuestionDot(node.expression) && /^[\w.()*]+$/.test(baseExpr)) {
-        const plainAccess = { ...node.expression, questionDotToken: undefined };
+    // (the receiver bound once, an undefined result when it is not)
+    if (baseType?.startsWith('*TnMap[') && hasQuestionDot(node.expression)) {
+        const tmp = getTempName('optm');
+        variableGoTypes.set(tmp, baseType);
+        const receiver = { kind: 'Identifier', text: tmp };
+        const plainAccess = { ...node.expression, questionDotToken: undefined, expression: receiver };
         const plainCall = { ...node, questionDotToken: undefined, expression: plainAccess };
+        receiver.parent = plainAccess;
         plainAccess.parent = plainCall;
         const callCode = visit(plainCall);
-        const resultType = inferExpressionType(plainCall) ?? '';
+        // (read as an array reference — see toGoValueOfType —: the *[]T itself)
+        const resultType = (node.tnArrayReference ? inferRawExpressionType(plainCall) : inferExpressionType(plainCall)) ?? '';
+        variableGoTypes.delete(tmp);
         if (isDiscardedValue(node) || !resultType)
-            return `func() { if ${baseExpr} != nil { ${callCode} } }()`;
+            return `func() { if ${tmp} := ${baseExpr}; ${tmp} != nil { ${callCode} } }()`;
         const nullable = makeNullableType(resultType);
         const value = nullable === resultType ? callCode : `func() ${nullable} { __v := ${callCode}; return &__v }()`;
-        return `func() ${nullable} { if ${baseExpr} == nil { return *new(${nullable}) }; return ${value} }()`;
+        return `func() ${nullable} { if ${tmp} := ${baseExpr}; ${tmp} != nil { return ${value} }; return *new(${nullable}) }()`;
     }
     // g?.call(…) on a function value: the value itself is what may be nil (an
     // optional parameter's Go func type is nil when absent)
@@ -18919,14 +19006,19 @@ const arrayMethodHandlers = {
         const elementType = receiverElementType();
         if (args.length === 0)
             return `[]${elementType}{}`;
-        const start = `${sliceIndex(obj, args[0])}`;
+        // (an index held as any — a [key, value] pair destructured from a Map —: its number)
+        const indexArg = (i) => {
+            const node = currentCallNode?.arguments?.[i];
+            return node && inferExpressionType(node) === 'interface{}' ? (useHelper('dynamic'), `TnNumber(${args[i]})`) : args[i];
+        };
+        const start = `${sliceIndex(obj, indexArg(0))}`;
         if (args.length === 1) {
             return `func() []${elementType} { __rm := append([]${elementType}{}, ${obj}[${start}:]...); ${obj} = ${obj}[:${start}]; return __rm }()`;
         }
         const insert = args.slice(2);
         // (the deleted count is clamped to the elements after start)
         const inserted = insert.length > 0 ? appendArguments(`${obj}[:__start]`, insert) : `${obj}[:__start]`;
-        return `func() []${elementType} { __start := ${start}; __end := __start + max(0, int(${args[1]})); if __end > len(${obj}) { __end = len(${obj}) }; __rm := append([]${elementType}{}, ${obj}[__start:__end]...); __tail := append([]${elementType}{}, ${obj}[__end:]...); ${obj} = ${inserted}; ${obj} = append(${obj}, __tail...); return __rm }()`;
+        return `func() []${elementType} { __start := ${start}; __end := __start + max(0, int(${indexArg(1)})); if __end > len(${obj}) { __end = len(${obj}) }; __rm := append([]${elementType}{}, ${obj}[__start:__end]...); __tail := append([]${elementType}{}, ${obj}[__end:]...); ${obj} = ${inserted}; ${obj} = append(${obj}, __tail...); return __rm }()`;
     },
     fill: (obj, args) => {
         const elementType = receiverElementType();
@@ -18991,6 +19083,13 @@ const arrayMethodHandlers = {
     // [][]T → []T (one level, like JS's default depth)
     flat: (obj, args) => {
         const elementType = receiverElementType();
+        // (elements of any type — a T | T[] callback's results —: those that
+        // are arrays spread, the rest kept)
+        if (elementType === 'interface{}' && args.length === 0) {
+            useHelper('dynamic');
+            useHelper('arraySubclass');
+            return `func() []interface{} { __flat := []interface{}{}; for _, __inner := range ${obj} { __flat = append(__flat, TnFlatItems(__inner)...) }; return __flat }()`;
+        }
         if (!elementType.startsWith('[]'))
             return obj;
         // flat(depth): one level by default; deeper levels flatten recursively,

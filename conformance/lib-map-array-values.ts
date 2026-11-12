@@ -43,3 +43,14 @@ grouped.get('odd')!.push(9);
 const more = [JSON.stringify(Object.fromEntries(init)), init.get('p')!.length, grouped.get('odd')!.join(',')].join(' ');
 console.log(more);
 assert(more === '{"p":[1,2,5],"q":[3,4]} 3 1,3,9', 'copies share arrays; groupBy');
+// (m?.get(k) on a Map that may be absent: the array itself, pushes reach it)
+let sinks: Map<string, string[]> | null = null;
+function addTo(key: string, line: string): void {
+  const sink = sinks?.get(key);
+  if (sink) sink.push(line);
+}
+addTo('a', 'lost');
+sinks = new Map<string, string[]>([['a', []]]);
+addTo('a', 'kept');
+addTo('b', 'none');
+assert(sinks.get('a')!.join(',') === 'kept' && !sinks.has('b'), 'optional get of an array value is the array');

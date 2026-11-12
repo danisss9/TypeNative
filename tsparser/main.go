@@ -359,4 +359,5 @@ func lowerFirst(s string) string {
 // Field renames to match the TypeScript API's names.
 var fieldRenames = map[string]string{
 	"PostfixToken": "questionToken", // optional property `a?: string`
+	"DefaultType":  "default",       // type parameter default `<S = any>`
 }
