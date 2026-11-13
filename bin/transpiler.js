@@ -3438,6 +3438,8 @@ export function transpileToNative(code, options) {
     helperProvidedPackages.clear();
     mainPackageVariables.length = 0;
     keyOrderTables.clear();
+    mergedUnionStructs.clear();
+    literalSites.clear();
     goInterfaceAdapters.clear();
     classMethodSignatures.clear();
     dynamicMethodCalls.clear();
@@ -3555,7 +3557,28 @@ export function transpileToNative(code, options) {
     // (generated before the helpers: they may use more of them)
     const dispatchCode = dynamicMethodCalls.size > 0 ? `\n\n${emitDynamicDispatchers()}` : '';
     const classCode = (classValuesUsed ? `\n\n${emitClassDescriptors()}` : '') + `\n\n${emitToJSONWrappers()}` + emitMixinSupport();
-    const helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
+    let helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
+    // Object literal allocations: TnLit where the struct may be a strict prefix
+    // of a merged union the program converts objects to, else plain
+    const emittedCode = [mainCode, outsideCode, ...packageVariables, ...localImportFiles.values()];
+    const unionSites = new Set();
+    if (helpersCode.includes('/*TN_UNION_TYPES*/')) {
+        // (the merged unions the emitted code uses: their types are declared)
+        const unions = [...mergedUnionStructs].filter((u) => emittedCode.some((code) => code.includes(localizeGoPaths(u))));
+        for (const site of unionLiteralSites(unions, emittedCode))
+            unionSites.add(site);
+        const types = unions.map((u) => `\n\treflect.TypeFor[${localizeGoPaths(u)}](),`);
+        helpersCode = helpersCode.replace('/*TN_UNION_TYPES*/', types.length > 0 ? `${types.join('')}\n` : '');
+    }
+    if (unionSites.size > 0)
+        helpersCode += `\n${[...unionSites].map((site) => `\nvar ${site} tnLitSite`).join('')}`;
+    const finishLiteralSites = (code) => literalSites.size === 0
+        ? code
+        : code
+            .replace(/&\u0001(tnLit\d+)\u0002/g, (_, site) => (unionSites.has(site) ? `TnLit(&${site}, &` : '&'))
+            .replace(/\u0003(tnLit\d+)\u0004/g, (_, site) => (unionSites.has(site) ? ')' : ''));
+    for (const [file, code] of localImportFiles)
+        localImportFiles.set(file, finishLiteralSites(code));
     const mainImports = [...importedPackages].filter((pkg) => {
         if (!hasGoPackage(pkg))
             return true;
@@ -3622,7 +3645,7 @@ ${outsideCode.trim()}
 ${LINE_RESET}
 ${helpersCode}`.trimEnd();
     return {
-        main: applyLineDirectives(main, goFile),
+        main: applyLineDirectives(finishLiteralSites(main), goFile),
         files: localImportFiles,
         diagnostics: diagnostics.slice(),
         embeds: [...embedPatterns]
@@ -7756,7 +7779,7 @@ function visitNode(node, options = {}) {
                     run.push(p);
             }
             flush();
-            return `TnAssignTo(new(${structName}), ${sources.join(', ')})`;
+            return `TnAssignTo(${literalAllocation(structName, '{}')}, ${sources.join(', ')})`;
         }
         const fieldTypes = typeArgs ? undefined : (objectTypeFields(structName) ?? classPropertyTypes.get(structName));
         const properties = (node.properties ?? [])
@@ -7802,9 +7825,9 @@ function visitNode(node, options = {}) {
             methodSteps.push(`__obj.${goFieldName(p.name.text)} = func(${paramInfo.signature})${result ? ` ${result}` : ''} ${body.trimEnd()}`);
         }
         if (methodSteps.length > 0) {
-            return `func() *${structName} {\n\t\t__obj := &${structName}${compositeBody(properties)}\n\t\t${methodSteps.join('\n\t\t')}\n\t\treturn __obj\n\t}()`;
+            return `func() *${structName} {\n\t\t__obj := ${literalAllocation(structName, compositeBody(properties))}\n\t\t${methodSteps.join('\n\t\t')}\n\t\treturn __obj\n\t}()`;
         }
-        return `&${structName}${compositeBody(properties)}`;
+        return literalAllocation(structName, compositeBody(properties));
     }
     else if (isPropertyAssignment(node)) {
         return `${visit(node.name)}: ${visit(node.initializer)}`;
@@ -8455,6 +8478,13 @@ function toGoValueOfType(expr, goType) {
             const typed = goType.startsWith('*struct{') || isObjectTypeName(goType.slice(1)) ? visitObjectLiteralAsStruct(expr, goType) : undefined;
             if (typed)
                 return typed;
+            // (a literal allocation's markers: see literalAllocation)
+            const unmarked = /^&\u0001(tnLit\d+)\u0002(struct\{[\s\S]*)\u0003\1\u0004$/.exec(code);
+            if (unmarked) {
+                const retyped = retypeStructLiteral(`&${unmarked[2]}`, goType);
+                const named = `&${goType.slice(1)}`;
+                return retyped.startsWith(`${named}{`) ? literalAllocation(goType.slice(1), retyped.slice(named.length)) : retyped;
+            }
             return code.startsWith('&struct{') ? retypeStructLiteral(code, goType) : code;
         }
         if (inferExpressionType(expr) !== goType.slice(1))
@@ -11472,6 +11502,19 @@ function objectLiteralUnionMembers(types) {
 // types differ is any; never contributes nothing)
 // The unions of object types mergedObjectUnionType is merging (their text)
 const unionsMerging = new Set();
+// The merged-union structs (Go type text, no *) whose types are all declared
+// at package level: the runtime allocates an object literal whose struct is
+// a strict prefix of one large enough to be viewed as it (tnUnionTypes)
+const mergedUnionStructs = new Set();
+// Whether a type node names only package-level Go types: outside every
+// generic declaration (its type parameters) and every block (local types)
+function isPackageLevelTypeNode(node) {
+    for (let n = node; n; n = n.parent) {
+        if ((n.typeParameters ?? []).length > 0 || n.kind === 'Block')
+            return false;
+    }
+    return true;
+}
 function mergedObjectUnionType(types) {
     const members = objectLiteralUnionMembers(types);
     if (!members)
@@ -11484,7 +11527,51 @@ function mergedObjectUnionType(types) {
     unionsMerging.add(key);
     const merged = mergeObjectUnionMembers(members);
     unionsMerging.delete(key);
+    if (merged.startsWith('*struct{') && [...types, ...members].every((t) => isPackageLevelTypeNode(t)))
+        mergedUnionStructs.add(merged.slice(1));
     return merged;
+}
+// The allocation of an object literal of struct type structType (no *),
+// body its composite literal's braces. Once the program is emitted, a struct
+// that may be a strict prefix of merged unions keeps TnLit, which allocates
+// it large enough to be viewed as them (a member held in a union's slot stays
+// the one object, as in JS); every other one is the plain &T{…} (see unionLiteralSites)
+const literalSites = new Map();
+function literalAllocation(structType, body) {
+    let site = literalSites.get(structType);
+    if (!site) {
+        site = `tnLit${literalSites.size + 1}`;
+        literalSites.set(structType, site);
+    }
+    // (between markers finishLiteralSites drops, or turns into a TnLit call)
+    return `&\u0001${site}\u0002${structType}${body}\u0003${site}\u0004`;
+}
+// The literal sites whose struct's field names are a strict prefix of a
+// merged union's (of unions, its Go struct text; the runtime checks the
+// fields' types): anonymous structs by their text, named ones by their
+// declaration in the emitted code
+function unionLiteralSites(unions, emittedCode) {
+    if (unions.length === 0)
+        return [];
+    const unionFields = unions.map((u) => parseStructFields(u).map(([name]) => name));
+    const declared = new Map();
+    for (const code of emittedCode) {
+        const plain = code.replace(/\/\*[^*]*\*\//g, '');
+        for (const m of plain.matchAll(/^\s*type ([^\s[=]+)(?:\[[^\]\n]*\])? struct \{\n([\s\S]*?)\n\s*\}/gm)) {
+            declared.set(m[1], m[2].split('\n').map((line) => line.trim().split(/\s+/)[0]).filter((name) => name !== ''));
+        }
+    }
+    const sites = [];
+    for (const [structType, site] of literalSites) {
+        const fields = structType.startsWith('struct{')
+            ? parseStructFields(structType).map(([name]) => name)
+            : declared.get(structType.replace(/\[.*$/, ''));
+        if (!fields || fields.length === 0)
+            continue;
+        if (unionFields.some((u) => u.length > fields.length && fields.every((name, i) => u[i] === name)))
+            sites.push(site);
+    }
+    return sites;
 }
 function mergeObjectUnionMembers(members) {
     const order = [];
@@ -11957,7 +12044,7 @@ function visitObjectLiteralAsStruct(node, pointerType) {
         : fields.has('__keys') ? literalKeyOrder(node, new Map([...fields].filter(([k]) => k !== '__keys'))) : '';
     if (keyOrder)
         values.push(`__keys: ${keyOrder}`);
-    return `&${pointerType.slice(1)}${compositeBody(values)}`;
+    return literalAllocation(pointerType.slice(1), compositeBody(values));
 }
 // Go func type of an object-literal method or getter
 function methodFuncType(member) {
@@ -12087,7 +12174,7 @@ function visitAnonymousStructLiteral(node) {
         : `struct{ ${structFieldsBody(fields)} }`;
     registerStructAccessors(structType, node);
     if (steps.length === 0) {
-        return `&${structType}${compositeBody(values)}`;
+        return literalAllocation(structType, compositeBody(values));
     }
     const self = sawSpread ? '__obj' : getTempName('obj');
     const lines = [];
@@ -28967,6 +29054,8 @@ type tnConvPlan struct {
 	fields   []tnCopyField
 	expandos []tnExpandoField
 	view     bool // the target is a prefix view of the source: reinterpret, not copy
+	narrow   bool // (a view: the source has fields past the target's — its object is noted as at least a source)
+	widen    bool // the source's fields are a prefix of the target's: a view where the object's memory covers the target, else a copy
 }
 
 
@@ -29018,6 +29107,271 @@ func tnRegisterView(copy interface{}, orig interface{}) {
 	if rv.Kind() == reflect.Ptr {
 		runtime.SetFinalizer(rv.Interface(), func(x interface{}) { tnViews.Delete(x) })
 	}
+}
+
+// Which words of a type's memory hold pointers, as the garbage collector
+// scans them: two types whose words agree over the smaller one's size can
+// view the same memory (a pointer field over a pointer word, a scalar over a
+// scalar word)
+var tnPointerWordsCache sync.Map
+
+func tnPointerWords(t reflect.Type) []bool {
+	if v, ok := tnPointerWordsCache.Load(t); ok {
+		return v.([]bool)
+	}
+	const word = unsafe.Sizeof(uintptr(0))
+	words := make([]bool, (t.Size()+word-1)/word)
+	var mark func(t reflect.Type, off uintptr)
+	mark = func(t reflect.Type, off uintptr) {
+		switch t.Kind() {
+		case reflect.Pointer, reflect.UnsafePointer, reflect.Map, reflect.Chan, reflect.Func, reflect.String, reflect.Slice:
+			words[off/word] = true
+		case reflect.Interface:
+			words[off/word] = true
+			words[off/word+1] = true
+		case reflect.Array:
+			for i := 0; i < t.Len(); i++ {
+				mark(t.Elem(), off+uintptr(i)*t.Elem().Size())
+			}
+		case reflect.Struct:
+			for i := 0; i < t.NumField(); i++ {
+				mark(t.Field(i).Type, off+t.Field(i).Offset)
+			}
+		}
+	}
+	mark(t, 0)
+	tnPointerWordsCache.Store(t, words)
+	return words
+}
+
+// Whether memory laid out as alloc can be viewed as a t: t fits in it, and
+// every word t reads as a pointer the collector scans as one (and no other)
+func tnLayoutCovers(alloc, t reflect.Type) bool {
+	if alloc == t {
+		return true
+	}
+	if t.Size() > alloc.Size() {
+		return false
+	}
+	a, b := tnPointerWords(alloc), tnPointerWords(t)
+	for i := range b {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// What the objects views alias are known to be laid out as, by address. A
+// widening view — a member held in a union's slot again — aliases the object
+// only where its memory covers the wider struct; elsewhere it would read and
+// write past the object (another object, or size-class slack the collector
+// doesn't scan), so the conversion copies instead. Known are: a narrowing
+// view's source (a merged-union struct seen as one of its members: the
+// object is at least one), and TnLit's union-sized objects (their slabs)
+type tnAllocation struct {
+	t    reflect.Type
+	self weak.Pointer[byte] // (tells this object from a dead one that had the address)
+}
+
+var tnAllocations = map[uintptr]tnAllocation{}
+var tnAllocationMu sync.Mutex
+var tnAllocationSweep = 1 << 12
+
+// Notes that the object at addr is at least a t
+func tnNoteAllocation(addr unsafe.Pointer, t reflect.Type) {
+	self := (*byte)(addr)
+	tnAllocationMu.Lock()
+	defer tnAllocationMu.Unlock()
+	if e, ok := tnAllocations[uintptr(addr)]; ok && e.t.Size() >= t.Size() && e.self.Value() == self {
+		return
+	}
+	// (the entries of dead objects go once the table has doubled since the
+	// last sweep)
+	if len(tnAllocations) >= tnAllocationSweep {
+		for k, e := range tnAllocations {
+			if e.self.Value() == nil {
+				delete(tnAllocations, k)
+			}
+		}
+		tnAllocationSweep = max(1<<12, 2*len(tnAllocations))
+	}
+	tnAllocations[uintptr(addr)] = tnAllocation{t: t, self: weak.Make(self)}
+}
+
+// Union-sized objects are handed out from slabs (arrays of them): one weak
+// pointer per slab, not per object, tells a live slab's memory from memory a
+// dead one had. Slabs are found by the pages they span
+type tnSlab struct {
+	base, end, elem uintptr
+	t               reflect.Type
+	self            weak.Pointer[byte]
+}
+
+const tnSlabLen = 32
+const tnSlabPage = 12
+
+var tnSlabPages = map[uintptr][]*tnSlab{}
+var tnSlabCount, tnSlabSweep = 0, 1 << 10
+
+type tnSlabAllocator struct {
+	mu    sync.Mutex
+	t     reflect.Type
+	array reflect.Type
+	cur   unsafe.Pointer // (the current slab, kept alive while elements remain)
+	next  int
+}
+
+func (a *tnSlabAllocator) alloc() unsafe.Pointer {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cur == nil || a.next == tnSlabLen {
+		a.cur = reflect.New(a.array).UnsafePointer()
+		a.next = 0
+		base := uintptr(a.cur)
+		slab := &tnSlab{base: base, end: base + a.array.Size(), elem: a.t.Size(), t: a.t, self: weak.Make((*byte)(a.cur))}
+		tnAllocationMu.Lock()
+		if tnSlabCount >= tnSlabSweep {
+			tnSlabCount = 0
+			for page, slabs := range tnSlabPages {
+				live := slabs[:0]
+				for _, s := range slabs {
+					if s.self.Value() != nil {
+						live = append(live, s)
+					}
+				}
+				if len(live) == 0 {
+					delete(tnSlabPages, page)
+				} else {
+					tnSlabPages[page] = live
+				}
+			}
+			seen := map[*tnSlab]bool{}
+			for _, slabs := range tnSlabPages {
+				for _, s := range slabs {
+					seen[s] = true
+				}
+			}
+			tnSlabCount = len(seen)
+			tnSlabSweep = max(1<<10, 2*tnSlabCount)
+		}
+		for page := slab.base >> tnSlabPage; page <= (slab.end-1)>>tnSlabPage; page++ {
+			tnSlabPages[page] = append(tnSlabPages[page], slab)
+		}
+		tnSlabCount++
+		tnAllocationMu.Unlock()
+	}
+	p := unsafe.Add(a.cur, uintptr(a.next)*a.t.Size())
+	a.next++
+	return p
+}
+
+var tnSlabAllocators sync.Map
+
+func tnSlabAllocatorFor(t reflect.Type) *tnSlabAllocator {
+	if a, ok := tnSlabAllocators.Load(t); ok {
+		return a.(*tnSlabAllocator)
+	}
+	a, _ := tnSlabAllocators.LoadOrStore(t, &tnSlabAllocator{t: t, array: reflect.ArrayOf(tnSlabLen, t)})
+	return a.(*tnSlabAllocator)
+}
+
+// Whether the object at addr is known to be laid out as (at least) a t
+func tnAllocationCovers(addr unsafe.Pointer, t reflect.Type) bool {
+	at := uintptr(addr)
+	tnAllocationMu.Lock()
+	e, ok := tnAllocations[at]
+	slabs := tnSlabPages[at>>tnSlabPage]
+	tnAllocationMu.Unlock()
+	if ok && e.self.Value() == (*byte)(addr) && tnLayoutCovers(e.t, t) {
+		return true
+	}
+	for _, s := range slabs {
+		if at >= s.base && at < s.end && (at-s.base)%s.elem == 0 && s.self.Value() != nil {
+			return tnLayoutCovers(s.t, t)
+		}
+	}
+	return false
+}
+
+// The merged-union structs of the program (a union of object types as one
+// struct): an object literal whose struct is a strict prefix of some is
+// allocated large enough to be viewed as them
+var tnUnionTypes = []reflect.Type{/*TN_UNION_TYPES*/}
+
+type tnLitInfo struct {
+	t    reflect.Type
+	wide *tnSlabAllocator // nil: as itself
+}
+
+var tnWideTypes sync.Map
+
+// The struct an object of struct type t is allocated as, so that the merged
+// unions t is a strict prefix of can view it (a member held in a union's
+// slot, as JS object identity requires): t followed by the words of the
+// largest such union — the ones whose pointer words agree with them can view
+// it too; nil when there is none
+func tnWideAllocationType(t reflect.Type) reflect.Type {
+	if v, ok := tnWideTypes.Load(t); ok {
+		w, _ := v.(reflect.Type)
+		return w
+	}
+	var wide reflect.Type
+	if t.Kind() == reflect.Struct && t.NumField() > 0 {
+		var largest reflect.Type
+		for _, u := range tnUnionTypes {
+			if u.Kind() == reflect.Struct && u.NumField() > t.NumField() && u.Size() > t.Size() && tnPrefixCompatible(t, u) && (largest == nil || u.Size() > largest.Size()) {
+				largest = u
+			}
+		}
+		if largest != nil {
+			const word = unsafe.Sizeof(uintptr(0))
+			words := tnPointerWords(largest)
+			fields := []reflect.StructField{{Name: "T", Type: t}}
+			for i := (t.Size() + word - 1) / word; i < uintptr(len(words)); i++ {
+				ft := reflect.TypeOf(uintptr(0))
+				if words[i] {
+					ft = reflect.TypeOf(unsafe.Pointer(nil))
+				}
+				fields = append(fields, reflect.StructField{Name: "W" + strconv.Itoa(int(i)), Type: ft})
+			}
+			if w := reflect.StructOf(fields); tnLayoutCovers(w, largest) {
+				wide = w
+			}
+		}
+	}
+	tnWideTypes.Store(t, wide)
+	return wide
+}
+
+// A new object literal (*v, a struct) as a pointer: allocated as its struct,
+// or — a strict prefix of merged unions — as the wider struct those unions
+// can view (see tnWideAllocationType). (v doesn't escape: its literal can
+// stay on the stack)
+func TnLit[T any](site *tnLitSite, v *T) *T {
+	info := site.info.Load()
+	if info == nil {
+		t := reflect.TypeFor[T]()
+		info = &tnLitInfo{t: t}
+		if w := tnWideAllocationType(t); w != nil {
+			info.wide = tnSlabAllocatorFor(w)
+		}
+		site.info.Store(info)
+	}
+	if info.wide == nil || info.t != reflect.TypeFor[T]() {
+		p := new(T)
+		*p = *v
+		return p
+	}
+	u := info.wide.alloc()
+	*(*T)(u) = *v
+	return (*T)(u)
+}
+
+// An object literal's allocation site: what its struct is allocated as
+// (decided at its first allocation)
+type tnLitSite struct {
+	info atomic.Pointer[tnLitInfo]
 }
 
 func tnPrefixCompatible(from, to reflect.Type) bool {
@@ -29121,15 +29475,20 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 	p.src, p.dst = rt.Elem(), t.Elem()
 	// a discriminated-union member view: the target's fields are an exact
 	// prefix of the source's (a union struct narrowed to the member it holds)
-	// or the source's are of the target's (a member kept in a union struct's
-	// slot) — the source's memory reinterpreted as the target (JS object
-	// identity: effect writes through the narrowed view reach the original),
-	// instead of copied
-	if (tnPrefixCompatible(p.src, p.dst) || tnPrefixCompatible(p.dst, p.src)) && !rt.Implements(instance) {
+	// — the source's memory reinterpreted as the target (JS object identity:
+	// effect writes through the narrowed view reach the original), instead
+	// of copied
+	if tnPrefixCompatible(p.dst, p.src) && !rt.Implements(instance) {
 		p.view = true
+		p.narrow = p.src.Size() > p.dst.Size()
 		p.ok = true
 		return p
 	}
+	// the source's fields a prefix of the target's (a member kept in a union
+	// struct's slot): a view where the object's memory is known to cover the
+	// target (a union narrowed and widened back, a literal TnLit allocated
+	// union-sized), else a copy below
+	p.widen = tnPrefixCompatible(p.src, p.dst) && !rt.Implements(instance)
 	for _, pair := range tnStructCopyPlan(p.src, p.dst) {
 		sf, df := p.src.Field(pair[0]), p.dst.Field(pair[1])
 		field := tnCopyField{from: sf.Offset, to: df.Offset, si: pair[0], di: pair[1]}
@@ -29168,10 +29527,16 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 
 // v (a non-nil pointer to a struct) as a new value of the plan's target type
 func (p *tnConvPlan) convert(v interface{}) reflect.Value {
-	if p.view {
-		return reflect.NewAt(p.dst, unsafe.Pointer(reflect.ValueOf(v).Elem().UnsafeAddr()))
-	}
 	src := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
+	if p.view {
+		if p.narrow {
+			tnNoteAllocation(src, p.src)
+		}
+		return reflect.NewAt(p.dst, src)
+	}
+	if p.widen && tnAllocationCovers(src, p.dst) {
+		return reflect.NewAt(p.dst, src)
+	}
 	// (one object stays one object: converting it to the same type again gives
 	// the same converted object, its fields refreshed from the source — JS
 	// identity for Set / Map keys and === (a Babel node read as a
@@ -29495,10 +29860,10 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		_, isInstance := v.(interface{ TnClassInstance() })
 		toClass := reflect.PointerTo(t).Implements(reflect.TypeOf((*interface{ TnClassInstance() })(nil)).Elem())
 		if src := reflect.Indirect(rv); !ok && !isEntries && !(isInstance && toClass) && src.Kind() == reflect.Struct && t.NumField() > 0 {
-			// a discriminated-union member view: the target's fields are an exact
-			// prefix of the source's — alias the source's memory (JS object
-			// identity), don't copy
-			if src.CanAddr() && tnPrefixCompatible(src.Type(), t) {
+			// a discriminated-union member view: the source's fields are an exact
+			// prefix of the target's — alias the source's memory (JS object
+			// identity) where it covers the target, don't copy
+			if src.CanAddr() && tnPrefixCompatible(src.Type(), t) && (t.Size() <= src.Type().Size() || tnAllocationCovers(unsafe.Pointer(src.UnsafeAddr()), t)) {
 				view := reflect.NewAt(t, unsafe.Pointer(src.UnsafeAddr())).Interface()
 				// (register the view so writes and reads through it resolve to the
 				// origin: a property the view's type has no field for — directives

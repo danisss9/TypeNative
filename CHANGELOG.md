@@ -88,6 +88,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Converting an object to a wider struct no longer reads or writes past
+  it:** a conversion whose source struct's fields are a prefix of the
+  target's (a member held in a merged union's slot) used to view the source's
+  memory as the target, so the target's extra fields lay past the object — in
+  the next object, or in size-class slack the garbage collector doesn't scan
+  for pointers. Such a view is now made only where the object's memory is
+  known to cover the target: a union narrowed to a member and widened back,
+  or an object literal allocated union-sized (an object literal whose struct
+  is a strict prefix of merged unions now gets room for their fields, with
+  the pointer layout they share, so a member held in a union's slot stays the
+  one object). Every other such conversion copies, through the identity
+  cache
 - **Module initialization order:** a program's module-level code now runs in
   the import graph's evaluation order, as JS evaluates it — each module after
   the modules it imports, with an import cycle's back edge not waiting (the
