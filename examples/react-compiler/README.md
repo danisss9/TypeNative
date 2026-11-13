@@ -121,39 +121,40 @@ and stops if the two outputs ever differ:
   fixed-seed generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 26.6 MB.
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.0, default (non-`--release`) build.
+The binary is 28.1 MB.
 
 (a) `react-compile` (built-in demo), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 356.79 ms | 362.79 ms | 363.00 ms | 368.99 ms |
-| TypeNative | 131.46 ms | 133.23 ms | 134.95 ms | 175.96 ms |
+| Node.js    | 367.37 ms | 379.79 ms | 385.00 ms | 455.83 ms |
+| TypeNative | 127.72 ms | 131.44 ms | 136.20 ms | 181.73 ms |
 
 (b) `react-compile generated-screen.jsx`, 5 runs per size (medians):
 
 | Source            | Node.js   | TypeNative  | TypeNative vs Node |
 | ----------------- | --------- | ----------- | ------------------ |
-| 9 KB, 238 lines   | 464.77 ms | 567.89 ms   | 1.2x slower        |
-| 17 KB, 460 lines  | 527.17 ms | 1,039.11 ms | 2.0x slower        |
-| 32 KB, 892 lines  | 634.59 ms | 1,964.48 ms | 3.1x slower        |
-| 64 KB, 1774 lines | 860.94 ms | 3,911.76 ms | 4.5x slower        |
+| 9 KB, 238 lines   | 522.52 ms | 530.65 ms   | even               |
+| 17 KB, 460 lines  | 599.45 ms | 884.03 ms   | 1.5x slower        |
+| 32 KB, 892 lines  | 748.17 ms | 1,681.87 ms | 2.2x slower        |
+| 64 KB, 1774 lines | 937.80 ms | 3,291.51 ms | 3.5x slower        |
 
-**Per call, TypeNative is 2.7x faster** (133 ms vs 363 ms, median). Node
-spends most of a short run loading and type-stripping the ~470 vendored
-modules; the native binary starts with them compiled in.
+**Per call, TypeNative is 2.9x faster** (131 ms vs 380 ms, median). Node
+spends most of a short run loading and compiling the ~470 vendored modules;
+the native binary starts with them compiled in.
 
-**On larger inputs TypeNative is slower, and the gap grows with size:** Node
-compiles each further KB in about 7 ms once V8 has warmed up, the native
-build in about 60 ms. The compiler's passes run through TypeNative's dynamic
-paths (any-typed property reads, prototype-method dispatch, reflection-based
-struct conversions) on every node of every pass, where V8's inline caches
-make the same operations nearly free.
+**On larger inputs TypeNative is slower, and the gap grows with size:** the
+two break even at about 9 KB of source, and most component files are smaller.
+Past that, Node compiles each further KB in about 7.5 ms once V8 has warmed
+up, the native build in about 50 ms. The compiler's passes run through
+TypeNative's dynamic paths (any-typed property reads, prototype-method
+dispatch, reflection-based struct conversions) on every node of every pass,
+where V8's inline caches make the same operations nearly free.
 
-The native build was about 100 ms per KB before a profiling pass (6.6 s at
-64 KB, now 3.9 s), which made those paths cheaper without changing what they
-do:
+The native build was about 100 ms per KB before two profiling passes (6.6 s
+at 64 KB, then 3.9 s, now 3.3 s), which made those paths cheaper without
+changing what they do:
 
 - `s += part` on a string field (Babel's output buffer appends thousands of
   times between flushes) appends in place instead of copying the whole
@@ -164,7 +165,12 @@ do:
   reflection-free fast path.
 - Prototype methods (Babel's `NodePath` methods) are called directly, and the
   common callback shapes are called and adapted without `reflect`.
+- Generators no longer run as goroutines with a thread wakeup per step (about
+  a tenth of the run before): a generator iterated by `for…of`, `yield*`,
+  spread or `Array.from` runs as a Go range function, through dynamic
+  dispatch too.
+- A method that every class of a hierarchy declares with the same signature
+  is called through a typed dispatcher, and `for` loop counters are Go
+  integers.
 
-What remains is spread thinly over the dynamic paths. The largest single
-item is generator functions, which run as goroutines with a thread wakeup
-per step (about a tenth of the run).
+What remains is spread thinly over the dynamic paths.

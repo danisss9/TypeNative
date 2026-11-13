@@ -17,7 +17,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **8.4x faster per call** (14 vs 119 ms); 1.6x slower on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.1x faster per answer** (716 vs 780 ms streamed)          |
 | [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **3.7x faster per template** (61 vs 223 ms); 1.9x slower at 64 KB§ |
-| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form | in progress — the full pipeline runs; simple functions compile byte-identically, runtime panics remain in the compiler's passes¶ |
+| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form, 100% Node parity | **2.9x faster per file** (131 vs 380 ms); 3.5x slower at 64 KB¶ |
 
 \* Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4, TypeNative
 0.5.0 (unreleased changes), all examples. See each example's README for full
@@ -37,17 +37,13 @@ per run; most component templates are a few KB. angular-templates'
 byte for byte on the templates of Angular's compiler compliance suite (612
 templates).
 
-¶ The largest codebase TypeNative compiles. The binary builds and
-initializes all ~470 vendored modules in Node's evaluation order (see the
-TypeNative CHANGELOG for what that took); the whole pipeline runs natively —
-JSX parses, Scope collects bindings, the HIR builds, and codegen emits
-memoized output whose CompileSuccess lines match Node's. Simple functions
-compile byte-identically; the remaining fixtures fail inside the compiler's
-own passes (effects-inference ordering, nil dereferences in instruction
-rewriting), tracked in
-[the example's README](react-compiler/README.md#status-what-works-natively);
-[parity.mjs](react-compiler/parity.mjs) reports the current gap and
-[bench.mjs](react-compiler/bench.mjs) is ready.
+¶ The largest codebase TypeNative compiles. The two break even at about
+9 KB of component source per run; most component files are smaller.
+react-compiler's [parity.mjs](react-compiler/parity.mjs) checks every output
+against Node byte for byte (memoized code, `// CompileSuccess` memo slot and
+block counts, and compile errors with their code frames) on 15 fixtures
+covering components, hooks, the compiler's pragmas, JSX outlining, TypeScript
+syntax and the error paths.
 
 ## Running an example
 

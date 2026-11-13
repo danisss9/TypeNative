@@ -295,7 +295,7 @@ also from unmodified source, matching Node on all 2,859 cases of marked's spec
 suites (CommonMark, GFM, its own tests and ReDoS inputs). The newest,
 [react-compiler](examples/react-compiler/), compiles the React Compiler
 itself (`babel-plugin-react-compiler` on Babel 7.29 and zod 4 — the largest
-codebase yet) and is one runtime gap away from its benchmarks.
+codebase yet), matching Node on every parity fixture and 2.9x faster per file.
 
 ## How it works
 
