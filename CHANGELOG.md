@@ -12,8 +12,10 @@ compiles React components and hooks to their auto-memoized form, natively, and a
 OpenAI-compatible chat client streams answers token by token. Getting there drove the round's
 transpiler fixes: JS object identity and callee write-back across Go conversions, one
 backtracking regex VM with JS semantics for every pattern, and module initialization in the
-import graph's evaluation order. TypeNative now requires Node.js 26, and a `--profile` flag
-plus a batch of hot-path fixes narrow the gap with Node on the large examples.
+import graph's evaluation order. TypeNative now requires Node.js 26. A `--profile` flag
+and two rounds of hot-path fixes (bitwise and `%` arithmetic, generators, Map / Set deletes,
+class dispatch, async functions and `JSON.parse`) narrow the gap with Node on the large
+examples: react-compiler runs 26% faster at 64 KB and angular-templates 17% faster.
 
 ### Added
 
@@ -115,6 +117,20 @@ plus a batch of hot-path fixes narrow the gap with Node on the large examples.
   129 ms, `%` loops 4527 → 162 ms, generators 1843 → 12 ms (now 4.4x faster
   than Node), `Set` churn 1556 → 97 ms. examples/react-compiler at 64 KB
   runs 26% faster (7.5 s → 5.6 s, interleaved against the previous build)
+- **Dispatch, async and JSON hot paths:** a generator method called on a
+  value typed as a base class or interface (`unit.ops()`) runs its push form
+  through `TnCallSeq_<m>`, lazily as JS does (it used to collect every value
+  before the loop ran), and spread / `Array.from` of a generator collect its
+  push form into a typed slice; a method call through a class or interface
+  hierarchy whose implementations share a signature goes through a typed
+  dispatcher, without boxing; async functions that never wait on anything
+  pending run on the caller's goroutine, and settling a promise no longer
+  allocates when nobody waits; `JSON.parse(text) as T[]` decodes straight
+  into `T` when the text matches it; `for` loop counters and bitwise-result
+  consts are Go integers. Probe medians: `async-await` 1985 → 201 ms,
+  `class-dispatch` 709 → 124 ms, `json-roundtrip` 347 → 97 ms, `num-bitwise`
+  128 → 114 ms; examples/angular-templates at 64 KB runs 17% faster (721 →
+  601 ms, interleaved against the previous build)
 
 ### Fixed
 
@@ -129,7 +145,9 @@ plus a batch of hot-path fixes narrow the gap with Node on the large examples.
   is a generator of its own; subclasses inherit all of it. Spreads that are
   not the only argument of a rest parameter (`f(1, ...xs, 2)`,
   `f(...xs, ...ys)`) now compile, for arrays too
-
+- **Spread of a generator into arguments:** `f(...gen())` into a rest
+  parameter failed to compile, and `xs.push(...unit.ops())` through a
+  dynamic receiver asserted the generator's channel to an array
 - **`(-Infinity).toFixed(n)`** returns `"-Infinity"` (it printed `-Inf`)
 
 - **Namespaces of types only:** `namespace Tokens { export interface Def … }`

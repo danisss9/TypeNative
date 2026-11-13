@@ -95,7 +95,7 @@ console.log(`elapsed: ${elapsed.toFixed(2)} ms`);
 
 <!-- perf-results:start -->
 
-Last run 2026-11-12: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, Node v26.13.0, go1.27.4 windows/amd64, TypeNative 0.5.0, 7 interleaved runs per probe.
+Last run 2026-11-13 (only `gen-for-of` probes updated): Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, Node v26.13.0, go1.27.4 windows/amd64, TypeNative 0.5.0, 15 interleaved runs per probe.
 
 | Probe | Measures | Node ms (min / median) | TypeNative ms (min / median) | TypeNative vs Node (median) |
 | ----- | -------- | ---------------------: | ---------------------------: | :-------------------------- |
@@ -104,20 +104,20 @@ Last run 2026-11-12: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, N
 | [arr-hof](arr-hof.ts) | `map` / `filter` / `reduce` / `some` chains with closure callbacks | 89.8 / 91.6 | 26.9 / 27.7 | **3.3x faster** |
 | [arr-push-index](arr-push-index.ts) | `push`, indexed reads/writes and `length` on number arrays | 52.5 / 54.3 | 55.0 / 55.7 | 1.0x slower |
 | [arr-sort](arr-sort.ts) | `sort` of numbers with a comparator and of strings in default order | 125 / 127 | 347 / 354 | 2.8x slower |
-| [async-await](async-await.ts) | `await` chains of async functions that resolve immediately | 102 / 105 | 1985 / 2040 | 19.5x slower |
-| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 71.8 / 71.9 | 709 / 730 | 10.2x slower |
+| [async-await](async-await.ts) | `await` chains of async functions that resolve immediately | 99.5 / 104 | 201 / 206 | 2.0x slower |
+| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 68.6 / 71.7 | 124 / 127 | 1.8x slower |
 | [events-emit](events-emit.ts) | `EventEmitter` `emit` to listeners taking 0, 1 and 2 arguments | 73.6 / 73.9 | 655 / 658 | 8.9x slower |
 | [exc-throw-rare](exc-throw-rare.ts) | `try`/`catch`/`finally` in a hot loop where nothing throws | 204 / 205 | 241 / 242 | 1.2x slower |
 | [exc-try-catch](exc-try-catch.ts) | `try`/`catch`/`finally` in a hot loop where one call in 1,024 throws | 24.7 / 24.9 | 60.8 / 61.1 | 2.5x slower |
 | [fn-closures](fn-closures.ts) | creating closures over mutable state and calling them indirectly | 144 / 145 | 58.6 / 60.0 | **2.4x faster** |
 | [fn-recursion-tree](fn-recursion-tree.ts) | building and walking binary trees (recursion plus allocation) | 101 / 103 | 149 / 152 | 1.5x slower |
-| [gen-for-of](gen-for-of.ts) | sync generators (a method, `*[Symbol.iterator]()`, `yield*`) consumed by `for…of` | 52.6 / 53.1 | 11.6 / 12.1 | **4.4x faster** |
-| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 38.4 / 38.6 | 347 / 350 | 9.1x slower |
+| [gen-for-of](gen-for-of.ts) | sync generators (a method, `*[Symbol.iterator]()`, `yield*`) consumed by `for…of` | 52.5 / 53.6 | 11.6 / 12.2 | **4.4x faster** |
+| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 38.5 / 39.9 | 96.9 / 99.5 | 2.5x slower |
 | [map-delete](map-delete.ts) | `Map<string, number>` insert/delete churn (an LRU-style sliding window) | 29.3 / 36.0 | 165 / 167 | 4.6x slower |
 | [map-string-keys](map-string-keys.ts) | `Map<string, number>` `set` / `get` / `has` word counting | 92.3 / 93.5 | 118 / 119 | 1.3x slower |
 | [num-arith-loop](num-arith-loop.ts) | tight float64 loop with `%`, `*` and `Math.floor` | 76.5 / 77.4 | 159 / 162 | 2.1x slower |
-| [num-bitwise](num-bitwise.ts) | bitwise and, or, xor and shifts (`<<`, `>>`, `>>>`) on integers, and flag tests | 22.1 / 22.6 | 128 / 129 | 5.7x slower |
-| [num-mod-int](num-mod-int.ts) | `%` on integer operands (hash buckets, cycling indexes) | 64.2 / 64.6 | 187 / 188 | 2.9x slower |
+| [num-bitwise](num-bitwise.ts) | bitwise and, or, xor and shifts (`<<`, `>>`, `>>>`) on integers, and flag tests | 21.6 / 22.3 | 114 / 116 | 5.2x slower |
+| [num-mod-int](num-mod-int.ts) | `%` on integer operands (hash buckets, cycling indexes) | 62.5 / 63.8 | 187 / 191 | 3.0x slower |
 | [num-to-string](num-to-string.ts) | number/string conversion: `String(n)`, `toFixed`, `Number(str)`, `parseInt` | 102 / 105 | 402 / 416 | 4.0x slower |
 | [obj-alloc](obj-alloc.ts) | allocating many short-lived object literals and class instances | 62.5 / 63.4 | 187 / 191 | 3.0x slower |
 | [regex-exec](regex-exec.ts) | regex `test`, `exec` with groups and global `replace` over log lines | 67.9 / 69.5 | 105 / 107 | 1.5x slower |
@@ -156,19 +156,20 @@ the reference machine.
 | `num-to-string` | `toFixed` formatted 1100 digits on every call to round exactly. | `strconv` already rounds to nearest. Only a value exactly on a tie (its last binary fraction digit at 2^-(d+1)) takes the exact path. | 667 → 416 ms |
 | `events-emit` | `TnInvoke` called every listener through `reflect.Value.Call`. `emit` copied the listener list and built a `kept` list on every call. | Typed fast paths for `func()`, `func(any)`, `func(any, any)`, `func(...any)`, `func(float64)` and `func(string)`. `emit` uses the copy-on-write listener slice as its snapshot. | 1372 → 658 ms |
 | `regex-site` | Each evaluation of a regex literal looked its compiled program up again (key concatenation and a mutex). | One package-level `TnRegexSite` per literal shares the program and RE2 fallbacks. Each evaluation is still a new `RegExp` with its own `lastIndex`. | 177 → 168 ms |
+| `gen-for-of` (examples) | Generators called through dynamic dispatch (`unit.ops()` on an abstract `CompilationUnit`, 26 phases of angular-templates) still ran as goroutines, and `for…of` over them collected every value first; spread and `Array.from` of a generator received through reflect. | `TnCallSeq_<m>[T]` dispatches a generator method on a dynamic receiver to the class's push form (its channel in lockstep for a generator without one, any other value's elements otherwise), for `for…of`, `yield*` and `super.m()`. A spread or `Array.from` of a generator call collects its push form into a typed slice (`TnGeneratorItems`). | angular-templates at 64 KB: 721 → 601 ms |
+| `class-dispatch` | A call on an abstract base class or an interface went through `TnCall_<m>(recv, args ...interface{})`: arguments and the result boxed, then unboxed with `TnAs`. | When every class of the receiver's declared hierarchy declares the method with the same Go signature, the call goes through `TnCall_<C>_<m>(recv, a P0, …) R`: a type switch calling the method with its own types, the boxed dispatcher only for any other receiver. The call's inferred type is `R`, so the value isn't boxed again where it's used. | 709 → 124 ms |
+| `async-await` | Each async call started a goroutine and handed the JS baton over twice, and each settle allocated two wake-up channels even with nobody waiting. | An async function that awaits only calls of other such functions (whose promises are settled when they return), with no `for await` and no promise returned, runs on the caller's goroutine (`TnRunAsyncInline`). `TnAsyncSend` / `TnAsyncClose` allocate a wake-up channel only for a parked awaiter. | 1985 → 201 ms |
+| `json-roundtrip` | `JSON.parse` built a `TnMap` per object from `encoding/json` tokens, then `as Item[]` converted every map to a struct through `TnConvertDynamic`. | `JSON.parse(text)` into a typed slot is `TnJSONParseTyped[T]`: a scanner decodes the text straight into `T` (per-type plans over field offsets) when every object has `T`'s keys in its field order and every value its kind; anything else (other keys, null, any fields, invalid text) decodes and converts as before. | 347 → 97 ms |
+| `num-bitwise` | Loop counters and flag locals were `float64`, so every bitwise operand converted float64 to int32 through `TnInt32`. | A `for` loop's `let` counter (an integer literal start, `++` / `--`, never written in the body) is a Go `int`, and a block `const` holding a bitwise result an `int32`, when every read is an arithmetic, comparison, bitwise, index or template operand: reads are `float64(i)`, bitwise operands take the integer directly. | 128 → 114 ms |
 
 ### Open
 
 | Probe | Cause | Status |
 | ----- | ----- | ------ |
-| `async-await` | Each `await` resumes its async function through a goroutine hand-off (an OS-thread wakeup, `semawakeup` about a fifth of the profile), about 2 µs per `await` where V8 takes 0.1 µs. Running a resolved `await` on the spot would avoid it. | open |
-| `class-dispatch` | A call on an abstract base class goes through `TnCall_<method>(recv, args ...interface{})`: arguments and results are boxed (`convT64` and allocation are about 40% of the profile) and unboxed with `TnAs`. A typed dispatcher per hierarchy whose overrides share a signature would remove the boxing. | open |
-| `json-roundtrip` | `JSON.parse` streams `encoding/json` tokens into a `TnMap` per object, then `as Item[]` converts the maps to structs through `TnConvertDynamic` (about 45%). Decoding straight into the target type would skip both. | open |
 | `any-dynamic` | What remains is the representation: an `any` object is a Go `map[string]interface{}`, so every property access hashes its key (`memHashAES` and map lookups are about 45%), where V8 reads a slot through a hidden class. | open |
 | `events-emit` | Listener shapes other than the fast paths (here `(a: number, b: string)`) still go through `reflect.Value.Call` (about a third), and each `emit` hashes the event name. | open |
 | `str-short-scan`, `str-char-scan` | Indexes under 64 still rescan their prefix for ASCII (`tnStrIsASCII` is 40% of `str-short-scan`). A loop over `s.charCodeAt(i)` could test `s` once before the loop. | open |
-| `num-bitwise`, `num-mod-int` | Loop counters are `float64`, so every integer operation converts float64 to int and back. Inferring integer loop variables (`for (let i = 0; i < n; i++)` where `i` stays integral) would remove the conversions. | open |
-| `gen-for-of` (examples) | Generators still run as goroutines when they're called through dynamic dispatch (`unit.ops()` on a polymorphic `CompilationUnit` in angular-templates), and when they're spread or passed to `Array.from` (`TnToArray` receives through reflect). | open |
+| `num-mod-int`, `num-bitwise` | Integer loop counters are Go `int`s now, but `%` still runs on `float64` (`TnMod` converts both operands and checks them, then divides with `idiv`), and other integral locals (`k = (k + i) % 97`, module constants such as `F_A = 1 << 0`) stay `float64`. A `TnMod` by a constant divisor would let Go multiply instead of divide, but any fallback call puts the helper over Go's inlining budget; it would have to be emitted inline. | open |
 
 Bugs found while writing the probes (not performance, not fixed here):
 `'x' + null` and `'x' + undefined` render `<nil>`, and a `-0` concatenated
@@ -177,3 +178,18 @@ subclass of a class with `*[Symbol.iterator]()` can't be iterated (the
 generator isn't copied into it); and examples/marked-cli's parity run fails
 69 `--tokens` cases at this commit and before (a `def` token's unmatched
 `title` group prints `""` where Node omits `undefined`).
+
+Found while pinning the fixes above (also before them, not fixed here): an
+`await` of a promise that is already settled resumes on the spot, so in
+`const p = f(); log('x')` the part of `f` after its first `await` runs
+before `x` (JS runs it after); a `for…of` over an array doesn't see elements
+pushed during the loop; a class method returning `null` (`next(): Base |
+null`) and a typed field read from JSON `null` compare `=== null` as
+`undefined`, and `await` of a `Promise<void>` gives `{}`; an object literal
+typed as an interface, called through a dynamic receiver, throws `area is
+not a function`; a class whose arrow-function field implements an interface
+method, and `[...shapes]` of a `Base[]` into a `Shape[]`, don't compile;
+`.length` counts a character outside the BMP once (JS counts two UTF-16
+units); `JSON.parse` of a number past the float range (`1e400`) throws
+where JS gives `Infinity`; and a JSON object whose keys come in another
+order than its type's fields loses that order once converted to the type.

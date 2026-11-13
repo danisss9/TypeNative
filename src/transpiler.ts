@@ -3389,6 +3389,9 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   goInterfaceAdapters.clear();
   classMethodSignatures.clear();
   dynamicMethodCalls.clear();
+  dynamicSeqCalls.clear();
+  typedDispatchers.clear();
+  hierarchySignatureCache.clear();
   adapterOptionalMethods.clear();
   methodPresenceChecks.clear();
   // Every linked module's classes are known before any is emitted (a
@@ -3762,6 +3765,15 @@ function visit(node: AstNode, options: VisitNodeOptions = {}): string {
 }
 
 function visitScoped(node: AstNode, options: VisitNodeOptions = {}): string {
+  // (a read of an integer local: the number it is)
+  if (node && node.kind === 'Identifier' && intLocalReads.has(node)) return `float64(${intLocalReads.get(node)!.name})`;
+  // (const x = a & b in a block: an int32, see visitInt32Const)
+  if (node && node.kind === 'VariableStatement') {
+    const int32Const = visitInt32Const(node);
+    if (int32Const) return int32Const;
+  }
+  // (a generator call spread — [...g()], f(...g()) —: collected through its push form)
+  if (node && (node.kind === 'CallExpression' || node.kind === 'NewExpression' || node.kind === 'ArrayLiteralExpression')) rewriteGeneratorSpreads(node);
   // an object's array field holds a *[]T: reads see the array (nil-safe),
   // mutations go through the reference, assignments and nil tests use it
   // (an optional access or chain derefs what it reads itself: it visits a
@@ -4083,6 +4095,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (node.kind === 'TnArrayItems') {
     useHelper('arraySubclass');
     return `(*${visit(node.expression)}.TnItems())`;
+  } else if (node.kind === 'TnGeneratorItems') {
+    return visitGeneratorItems(node);
   } else if (isElementAccessExpression(node)) {
       // a?.[k].c (the chain goes on past the guard): all of it runs only if a is set
       if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalChainContinuation(node)) {
@@ -4740,6 +4754,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const srcName = (unwrapParentheses(node.initializer) as AstNode).text;
       const srcType = variableGoTypes.get(srcName) ?? inferExpressionType(node.initializer);
       setVarGoType(node.name.text, srcType?.startsWith('*') ? srcType.slice(1) : srcType);
+      // (its declared type, as other declarations record theirs)
+      if (node.type) variableTypeNodes.set(node.name.text, node.type);
+      else variableTypeNodes.delete(node.name.text);
       const stored = variableGoTypes.get(node.name.text) ?? '*[]interface{}';
       const aliasTop = isVariableStatement(node.parent?.parent) && isSourceFile(node.parent?.parent?.parent);
       if (aliasTop) {
@@ -5185,9 +5202,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const isArrayLikeStruct = sourceType.startsWith('*struct{') && /\blength /.test(sourceType);
       // an iterable (array, Set, Map, string, Array subclass): [...source],
       // mapped like map((v, i) => fn(v, i))
+      // (a generator call: collected through its push form, see generatorItemsNode)
+      const generatorItems = sourceType.startsWith('chan ') ? generatorItemsNode(sourceNode) : undefined;
       const iterable =
         sourceType.startsWith('[]') || sourceType.startsWith('*[]') || sourceType.startsWith('*TnMap[') ||
-        sourceType === 'string' || !!arraySubclassOf(sourceNode);
+        sourceType === 'string' || !!arraySubclassOf(sourceNode) || !!generatorItems;
       if (iterable && !isArrayLikeStruct) {
         const spread: AstNode = { kind: 'ArrayLiteralExpression', elements: [], parent: node, line: node.line, column: node.column };
         const element: AstNode = { kind: 'SpreadElement', expression: sourceNode, parent: spread };
@@ -5203,7 +5222,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       if (!isArrayLikeStruct) {
         useHelper('arraySubclass');
-        return `TnToArrayMapped(${visit(sourceNode)}, ${callbackNode ? visit(callbackNode) : 'nil'})`;
+        // (a generator method on a dynamic receiver: its values collected
+        // through its push form)
+        const dynamicItems = isDynamicValue(sourceNode) ? generatorItemsNode(sourceNode) : undefined;
+        return `TnToArrayMapped(${dynamicItems ? visitGeneratorItems(dynamicItems) : visit(sourceNode)}, ${callbackNode ? visit(callbackNode) : 'nil'})`;
       }
       const paramTypes = ['interface{}', 'float64'];
       if (callbackNode && (isArrowFunction(callbackNode) || isFunctionExpression(callbackNode))) {
@@ -6132,6 +6154,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isForStatement(node)) {
     const multi = visitMultiForHeader(node);
     if (multi) return multi;
+    const intCounter = visitIntCounterFor(node);
+    if (intCounter) return intCounter;
     // (`for (i; …)`: an initializer that is a bare name does nothing)
     const bareInit = node.initializer && (isIdentifier(unwrapParentheses(node.initializer)) || isNumericLiteral(unwrapParentheses(node.initializer)));
     return `for ${node.initializer && !bareInit ? forHeaderInit(visit(node.initializer, { inline: true })) : ''}; ${
@@ -6178,6 +6202,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (iterNode.kind !== 'TnArrayItems' && arraySubclassOf(iterNode)) {
         iterNode = arrayItemsNode(iterNode);
         node.expression = iterNode;
+      }
+      // (a generator method called on a dynamic receiver — unit.ops() on an
+      // abstract class —: its push form, through TnCallSeq_m)
+      const forDecl = isVariableDeclarationList(node.initializer) ? node.initializer.declarations?.[0] : undefined;
+      if (forDecl && isIdentifier(forDecl.name) && isCallExpression(unwrapParentheses(iterNode)) && mayHaveGeneratorSeq(unwrapParentheses(iterNode)) && isDynamicValue(iterNode)) {
+        const callCode = visit(iterNode, { inline: true });
+        const found = generatorSeqOf(iterNode, callCode);
+        if (found) {
+          registerLocalVariable(forDecl.name.text, found.elem);
+          const loopVar = visit(forDecl.name);
+          return `for ${loopVar} := range ${found.seq}${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
+        }
       }
       // (a dynamic iterable — array, Map, Set, string — as its elements)
       const dynamicIterable = isDynamicValue(iterNode);
@@ -7707,6 +7743,9 @@ function isNilPlaceholder(expr: AstNode): boolean {
 }
 
 function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
+  // (JSON.parse(text) as T[]: decoded straight into the type, see TnJSONParseTyped)
+  const typedJSON = typedJSONParse(expr, goType);
+  if (typedJSON) return typedJSON;
   // `undefined!` / `null!` (a placeholder until definitely assigned): the type's zero value
   if (goType && goType !== ':' && isNilPlaceholder(expr)) return `*new(${goType})`;
   // (null into a plain boolean, string or number slot — Babel's builders
@@ -9382,10 +9421,133 @@ const bitwiseOps: Record<string, string> = {
   GreaterThanGreaterThanGreaterThanToken: '>>>'
 };
 
+// Integer locals: a for loop's counter (let i = 0; …; i++, never written in
+// the body) is a Go int, and a const whose value is a bitwise expression
+// (const flags = x >> 3 & 0xff) a Go int32, while the program reads them as
+// the numbers they are: each read is float64(i) (intLocalReads), and a
+// bitwise operand takes the integer directly (see nestedBitwise). Only when
+// every read is an operand of arithmetic, a comparison, a bitwise operator,
+// an index or a template, so no other emitter sees the Go integer.
+const intLocalReads = new WeakMap<AstNode, { name: string; kind: 'int' | 'int32' }>();
+
+const INT_LOCAL_OPERATORS = new Set([
+  'PlusToken', 'MinusToken', 'AsteriskToken', 'SlashToken', 'PercentToken', 'AsteriskAsteriskToken',
+  'LessThanToken', 'GreaterThanToken', 'LessThanEqualsToken', 'GreaterThanEqualsToken',
+  'EqualsEqualsToken', 'ExclamationEqualsToken', 'EqualsEqualsEqualsToken', 'ExclamationEqualsEqualsToken',
+  'AmpersandToken', 'BarToken', 'CaretToken', 'LessThanLessThanToken', 'GreaterThanGreaterThanToken', 'GreaterThanGreaterThanGreaterThanToken'
+]);
+
+// The reads of name in scopes (the loop's condition and body, the rest of a
+// block), when every one is in a position intLocalReads covers; undefined
+// when one isn't, or the name is written or declared again there
+function intLocalReadsIn(name: string, scopes: AstNode[], skip?: AstNode): AstNode[] | undefined {
+  const reads: AstNode[] = [];
+  let ok = true;
+  const walk = (n: AstNode | undefined): void => {
+    if (!n || !ok || n === skip) return;
+    if (isIdentifier(n) && n.text === name) {
+      const parent = n.parent;
+      // (a property's name, not the variable)
+      if (parent && (isPropertyAccessExpression(parent) && parent.name === n || parent.kind === 'PropertyAssignment' && parent.name === n ||
+        (isMethodDeclaration(parent) || isPropertyDeclaration(parent) || isGetAccessor(parent) || parent.kind === 'SetAccessor' || parent.kind === 'PropertySignature' || parent.kind === 'MethodSignature') && parent.name === n)) return;
+      let child: AstNode = n;
+      let up = parent;
+      while (up && isParenthesizedExpression(up)) {
+        child = up;
+        up = up.parent;
+      }
+      const safe = !!up && (
+        (isBinaryExpression(up) && INT_LOCAL_OPERATORS.has(up.operatorToken.kind)) ||
+        (isElementAccessExpression(up) && up.argumentExpression === child) ||
+        up.kind === 'TemplateSpan' ||
+        (isPrefixUnaryExpression(up) && ['MinusToken', 'PlusToken', 'TildeToken'].includes(up.operator))
+      );
+      if (!safe) ok = false;
+      else reads.push(n);
+      return;
+    }
+    // (a declaration of the same name anywhere: left as it is)
+    if ((n.kind === 'VariableDeclaration' || n.kind === 'Parameter' || isFunctionDeclaration(n) || isClassDeclaration(n) || n.kind === 'BindingElement') && n.name && isIdentifier(n.name) && n.name.text === name) {
+      ok = false;
+      return;
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'parent') continue;
+      const v = (n as any)[key];
+      if (Array.isArray(v)) {
+        for (const c of v) if (c && typeof c === 'object' && typeof c.kind === 'string') walk(c);
+      } else if (v && typeof v === 'object' && typeof v.kind === 'string') walk(v);
+    }
+  };
+  for (const scope of scopes) walk(scope);
+  return ok ? reads : undefined;
+}
+
+// for (let i = <int>; <cond>; i++ / i--) with i an integer local: the header
+// with i a Go int, or undefined
+function visitIntCounterFor(node: AstNode): string | undefined {
+  const list = node.initializer;
+  if (!list || !isVariableDeclarationList(list) || list.declarationKind !== 'let' || (list.declarations ?? []).length !== 1) return undefined;
+  const decl = list.declarations[0];
+  if (!isIdentifier(decl.name) || decl.type || !decl.initializer || literalInt32(decl.initializer) === undefined || !isNumericLiteral(unwrapParentheses(decl.initializer)) && !isPrefixUnaryExpression(unwrapParentheses(decl.initializer))) return undefined;
+  const inc = node.incrementor;
+  if (!inc || !(isPostfixUnaryExpression(inc) || isPrefixUnaryExpression(inc)) || !['PlusPlusToken', 'MinusMinusToken'].includes(inc.operator) || !isIdentifier(inc.operand) || inc.operand.text !== decl.name.text) return undefined;
+  const name: string = decl.name.text;
+  const reads = intLocalReadsIn(name, [node.condition, node.statement].filter(Boolean));
+  if (!reads) return undefined;
+  const init = forHeaderInit(visit(node.initializer, { inline: true }));
+  const goName = getSafeName(name);
+  if (variableGoTypes.get(name) !== 'float64') return undefined;
+  const value = literalInt32(decl.initializer)!;
+  if (!new RegExp(`^${goName} := (float64\\()?-?\\(?${Math.abs(value)}\\)?\\)?$`).test(init.trim()) && init.trim() !== `${goName} := float64(${value})`) return undefined;
+  const step = visit(inc, { inline: true }).trim().replace(/;$/, '');
+  if (step !== `${goName}++` && step !== `${goName}--`) return undefined;
+  for (const r of reads) intLocalReads.set(r, { name: goName, kind: 'int' });
+  return `for ${goName} := ${value}; ${node.condition ? toGoCondition(node.condition) : ''}; ${step}${visitLoopBody(node.statement)}`;
+}
+
+// const x = <bitwise expression> in a block, x an integer local (int32): the
+// declaration with x a Go int32, or undefined
+function visitInt32Const(node: AstNode): string | undefined {
+  const list = node.declarationList;
+  if (!list || list.declarationKind !== 'const' || (list.declarations ?? []).length !== 1) return undefined;
+  const block = node.parent;
+  if (!block || (block.kind !== 'Block' && block.kind !== 'CaseClause' && block.kind !== 'DefaultClause')) return undefined;
+  const decl = list.declarations[0];
+  if (!isIdentifier(decl.name) || decl.type || !decl.initializer) return undefined;
+  const init = unwrapParentheses(decl.initializer);
+  if (!isBinaryExpression(init)) return undefined;
+  const bitOp = bitwiseOps[init.operatorToken.kind];
+  if (!bitOp || bitOp === '>>>') return undefined;
+  if (inferExpressionType(init.left) === '*tnbig.Int' || inferExpressionType(init.right) === '*tnbig.Int') return undefined;
+  const name: string = decl.name.text;
+  const statements: AstNode[] = block.statements ?? [];
+  const at = statements.indexOf(node);
+  const reads = intLocalReadsIn(name, statements.slice(at + 1));
+  // (before it, in the same block: not ours to change)
+  if (!reads || intLocalReadsIn(name, statements.slice(0, at)) === undefined) return undefined;
+  const code = visitNode(node);
+  const goName = getSafeName(name);
+  const head = `${goName} := float64(`;
+  const trimmed = code.trimStart();
+  if (!trimmed.startsWith(head)) return undefined;
+  const close = goParenEnd(trimmed, head.length - 1);
+  if (close < 0 || variableGoTypes.get(name) !== 'float64') return undefined;
+  const rest = trimmed.slice(close + 1);
+  if (!/^\s*;?\s*(_ = [A-Za-z0-9_]+;?\s*)?$/.test(rest)) return undefined;
+  const value = bitwiseInt(init, bitOp);
+  if (value.unsigned) return undefined;
+  for (const r of reads) intLocalReads.set(r, { name: goName, kind: 'int32' });
+  return `${goName} := int32(${value.code})${rest}`;
+}
+
 // A bitwise operand that is itself a (non-bigint) bitwise expression: its
 // int32 / uint32 result, without the float64 round trip (flags >> 3 & 0xff)
 function nestedBitwise(side: AstNode): { code: string; unsigned: boolean } | undefined {
   while (isParenthesizedExpression(side)) side = side.expression;
+  // (an integer local: its Go integer)
+  const intLocal = isIdentifier(side) ? intLocalReads.get(side) : undefined;
+  if (intLocal) return { code: intLocal.kind === 'int32' ? intLocal.name : `int32(${intLocal.name})`, unsigned: false };
   if (!isBinaryExpression(side)) return undefined;
   const bitOp = bitwiseOps[side.operatorToken.kind];
   if (!bitOp) return undefined;
@@ -9838,6 +10000,18 @@ function visitSeqYield(node: AstNode, yieldType: string): string {
   const delegatedType = inferExpressionType(node.expression) ?? '';
   const convert = (fromType: string): string =>
     fromType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
+  // (a call with a push form — a generator function or method, super.m(),
+  // a method dispatched on a dynamic receiver —: ranged directly)
+  const delegatedCall = unwrapParentheses(node.expression);
+  if (isCallExpression(delegatedCall) && mayHaveGeneratorSeq(delegatedCall) && (delegatedType.startsWith('chan ') || delegatedType === 'interface{}' || delegatedCall.expression?.expression?.kind === 'SuperKeyword')) {
+    const code = visit(node.expression);
+    const found = generatorSeqOf(node.expression, code);
+    if (found) return `for __yv := range ${found.seq} {\n\t\t${step(convert(found.elem))}\n\t\t}`;
+    if (!delegatedType.startsWith('chan ')) {
+      useHelper('arraySubclass');
+      return `for _, __yv := range TnToArray(${code}) {\n\t\t${step(convert('interface{}'))}\n\t\t}`;
+    }
+  }
   if (delegatedType.startsWith('chan ')) {
     const code = visit(node.expression);
     const seq = generatorSeqCall(node.expression, code);
@@ -9879,6 +10053,14 @@ function findClassGenerator(className: string, genName: string, depth = 0): AstN
 // called generator has one: f(a) → f__seq(a), o.m(a) → o.m__seq(a). code is
 // the call as emitted; undefined leaves the channel form.
 function generatorSeqCall(expr: AstNode, code: string): string | undefined {
+  return generatorSeqOf(expr, code)?.seq;
+}
+
+// generatorSeqCall's range function and the type it yields: also super.m(a)
+// → self.Base.m__seq(a), and recv.m(a) on a dynamic receiver (emitted as
+// TnCall_m(recv, a)) → TnCallSeq_m[T](recv, a), which dispatches to the
+// receiver class's push form (see emitDynamicDispatchers)
+function generatorSeqOf(expr: AstNode, code: string): { seq: string; elem: string } | undefined {
   const call = unwrapParentheses(expr);
   if (!isCallExpression(call) || call.questionDotToken) return undefined;
   const callee = call.expression;
@@ -9887,21 +10069,148 @@ function generatorSeqCall(expr: AstNode, code: string): string | undefined {
     if (!decl || !isFunctionDeclaration(decl) || decl.parent?.kind !== 'SourceFile' || !generatorSeqEligible(decl)) return undefined;
     const goName = getSafeName(callee.text);
     if (!code.startsWith(`${goName}(`) && !code.startsWith(`${goName}[`)) return undefined;
-    return `${goName}__seq${code.slice(goName.length)}`;
+    const callType = inferExpressionType(call) ?? '';
+    return { seq: `${goName}__seq${code.slice(goName.length)}`, elem: callType.startsWith('chan ') ? callType.slice(5) : getGeneratorYieldType(decl) };
   }
-  if (isPropertyAccessExpression(callee) && !hasQuestionDot(callee) && isIdentifier(callee.name)) {
-    const recvType = inferExpressionType(callee.expression) ?? '';
-    if (!recvType.startsWith('*') || recvType.startsWith('*[]')) return undefined;
-    const className = recvType.slice(1).replace(/\[.*\]$/, '');
-    const member = findClassGenerator(className, callee.name.text);
-    if (!member || !generatorSeqEligible(member)) return undefined;
-    const marker = `.${callee.name.text}(`;
+  if (!isPropertyAccessExpression(callee) || hasQuestionDot(callee) || !isIdentifier(callee.name)) return undefined;
+  const method: string = callee.name.text;
+  const marker = `.${method}(`;
+  const toSeq = (prefix: string): string | undefined => {
     const at = code.indexOf(marker);
     // (the receiver as emitted, then the call: o.m(args) exactly once)
-    if (at <= 0 || code.indexOf(marker, at + 1) >= 0 || !code.endsWith(')')) return undefined;
-    return `${code.slice(0, at)}.${callee.name.text}__seq(${code.slice(at + marker.length)}`;
+    if (at <= 0 || code.indexOf(marker, at + 1) >= 0 || !code.endsWith(')') || !code.startsWith(prefix)) return undefined;
+    return `${code.slice(0, at)}.${method}__seq(${code.slice(at + marker.length)}`;
+  };
+  // super.m(a) in a subclass: the base class's own generator
+  if (callee.expression.kind === 'SuperKeyword') {
+    const className = getEnclosingClassName(call);
+    const parent = className ? classParentNames.get(className) : undefined;
+    const parentDecl = parent ? declaredClasses.get(parent) : undefined;
+    if (!parent || !parentDecl || (parentDecl.typeParameters ?? []).length > 0) return undefined;
+    const member = findClassGenerator(parent, method);
+    if (!member || !generatorSeqEligible(member)) return undefined;
+    const seq = toSeq(`self.${getSafeName(parent)}.`);
+    return seq ? { seq, elem: getGeneratorYieldType(member) } : undefined;
   }
-  return undefined;
+  if (isDynamicValue(callee.expression)) return dynamicGeneratorSeq(call, method, code);
+  const recvType = inferExpressionType(callee.expression) ?? '';
+  if (!recvType.startsWith('*') || recvType.startsWith('*[]')) return undefined;
+  const className = recvType.slice(1).replace(/\[.*\]$/, '');
+  const member = findClassGenerator(className, method);
+  if (!member || !generatorSeqEligible(member)) return undefined;
+  const seq = toSeq('');
+  const callType = inferExpressionType(call) ?? '';
+  return seq ? { seq, elem: callType.startsWith('chan ') ? callType.slice(5) : getGeneratorYieldType(member) } : undefined;
+}
+
+// recv.m(a) dispatched on a dynamic receiver, as emitted — TnCall_m(recv, a),
+// or TnAs[chan T](TnCall_m(recv, a)) when the declared class names the
+// yield type —: TnCallSeq_m[T](recv, a). Only for methods some class
+// declares as a generator with a push form.
+function dynamicGeneratorSeq(call: AstNode, method: string, code: string): { seq: string; elem: string } | undefined {
+  if ((call.arguments ?? []).some((a: AstNode) => isSpreadElement(a)) || !eligibleGeneratorMethodNames().has(method)) return undefined;
+  const suffix = dispatcherSuffix(method);
+  const head = `TnCall_${suffix}(`;
+  let elem = 'interface{}';
+  let inner = code;
+  if (code.startsWith('TnAs[chan ')) {
+    const at = code.indexOf(`](${head}`);
+    if (at < 0 || goParenEnd(code, at + 1) !== code.length - 1) return undefined;
+    elem = code.slice('TnAs[chan '.length, at);
+    inner = code.slice(at + 2, -1);
+  }
+  if (!inner.startsWith(head) || goParenEnd(inner, head.length - 1) !== inner.length - 1) return undefined;
+  dynamicSeqCalls.add(method);
+  dynamicMethodCalls.add(method);
+  useHelper('generatorSeq');
+  return { seq: `TnCallSeq_${suffix}[${elem}](${inner.slice(head.length)}`, elem };
+}
+
+// The index of the ) closing the ( at open in emitted Go (string, raw string
+// and rune literals skipped); -1 when unbalanced
+function goParenEnd(code: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    const c = code[i];
+    if (c === '"' || c === "'") {
+      for (i++; i < code.length && code[i] !== c; i++) if (code[i] === '\\') i++;
+    } else if (c === '`') {
+      i = code.indexOf('`', i + 1);
+      if (i < 0) return -1;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+// Methods some class declares as a generator with a push form (*m() …)
+let eligibleGeneratorMethodsCache: { classes: Map<string, AstNode>; size: number; names: Set<string> } | undefined;
+function eligibleGeneratorMethodNames(): Set<string> {
+  const cache = eligibleGeneratorMethodsCache;
+  if (cache && cache.classes === declaredClasses && cache.size === declaredClasses.size) return cache.names;
+  const names = new Set<string>();
+  for (const decl of declaredClasses.values()) {
+    for (const member of decl.members ?? []) {
+      if (isMethodDeclaration(member) && member.asteriskToken && member.name && isIdentifier(member.name) && generatorSeqEligible(member)) names.add(member.name.text);
+    }
+  }
+  eligibleGeneratorMethodsCache = { classes: declaredClasses, size: declaredClasses.size, names };
+  return names;
+}
+
+// Generator methods called through TnCallSeq_m (see dynamicGeneratorSeq)
+const dynamicSeqCalls = new Set<string>();
+
+// [...g(a)] / f(...g(a)) / new C(...g(a)) of a generator call with a push
+// form: the spread's operand becomes a TnGeneratorItems node, the values
+// collected through the push form as a []T (no goroutine, no reflection)
+function rewriteGeneratorSpreads(node: AstNode): void {
+  const items: AstNode[] | undefined = isArrayLiteralExpression(node) ? node.elements : node.arguments;
+  if (!items) return;
+  for (const item of items) {
+    if (!isSpreadElement(item) || item.expression?.kind === 'TnGeneratorItems') continue;
+    const replacement = generatorItemsNode(item.expression);
+    if (replacement) {
+      replacement.parent = item;
+      item.expression = replacement;
+    }
+  }
+}
+
+// A generator call whose values a spread collects (see rewriteGeneratorSpreads)
+function generatorItemsNode(expr: AstNode): AstNode | undefined {
+  const call = unwrapParentheses(expr);
+  if (!isCallExpression(call) || call.questionDotToken || !mayHaveGeneratorSeq(call)) return undefined;
+  const callType = inferExpressionType(call) ?? '';
+  const isChan = callType.startsWith('chan ');
+  if (!isChan && callType !== 'interface{}' && callType !== 'any') return undefined;
+  const elem = isChan ? callType.slice(5) || 'interface{}' : 'interface{}';
+  return { kind: 'TnGeneratorItems', expression: expr, goType: `[]${elem}`, chanType: isChan ? callType : undefined, parent: expr.parent, line: expr.line, column: expr.column };
+}
+
+// Whether generatorSeqOf may find a push form for a call (decided by its shape)
+function mayHaveGeneratorSeq(call: AstNode): boolean {
+  const callee = call.expression;
+  if (isIdentifier(callee)) {
+    const decl = declaredFunctions.get(callee.text);
+    return !!decl && isFunctionDeclaration(decl) && decl.parent?.kind === 'SourceFile' && generatorSeqEligible(decl);
+  }
+  if (!isPropertyAccessExpression(callee) || hasQuestionDot(callee) || !isIdentifier(callee.name)) return false;
+  return eligibleGeneratorMethodNames().has(callee.name.text);
+}
+
+// A TnGeneratorItems node: its call's values as a []T
+function visitGeneratorItems(node: AstNode): string {
+  const elem = (node.goType as string).slice(2);
+  const code = visit(node.expression);
+  const found = generatorSeqOf(node.expression, code);
+  if (found) {
+    useHelper('generatorSeq');
+    return found.elem === elem ? `tnSeqCollect(${found.seq})` : `tnSeqCollect(tnSeqAs[${elem}](${found.seq}))`;
+  }
+  if (node.chanType) return `func() []${elem} { __out := []${elem}{}; for __v := range ${code} { __out = append(__out, __v) }; return __out }()`;
+  useHelper('arraySubclass');
+  return `TnToArray(${code})`;
 }
 
 // The trailing parameters an override lacks of the method it overrides
@@ -10201,6 +10510,10 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   // decides between the two at run time — see visitDynamicMethodCall)
   const classArrayMethod = classMethodNamed(method) && (MUTATING_ARRAY_METHODS.has(method) || dynamicArrayOrDispatch.has(node));
   if ((ARRAY_ONLY_METHODS.has(method) || STRING_ONLY_METHODS.has(method)) && !classArrayMethod && !objectLiteralMethodNames.has(method) && !stringOrClassMethod) return undefined;
+  // (a receiver declared as a class or interface whose hierarchy agrees on
+  // m's signature: a typed dispatcher)
+  const typed = visitTypedDispatch(node, receiver, method);
+  if (typed) return typed;
   useHelper('dynamic');
   useHelper('error');
   if (method === 'replace' || method === 'replaceAll') useHelper('replaceAny');
@@ -10252,6 +10565,198 @@ function visitDynamicDispatch(node: AstNode): string | undefined {
   const resultType = method === 'toString' ? 'string' : inferExpressionType(node);
   if (!resultType || resultType === 'interface{}' || resultType === 'any' || resultType === 'nil') return call;
   return NULLABLE_PRIMITIVE_TYPES.includes(resultType) ? `TnAsPtr[${resultType.slice(1)}](${call})` : `TnAs[${resultType}](${call})`;
+}
+
+// JSON.parse(text) converted to a typed slot — an array of objects, an
+// object type — : TnJSONParseTyped[T](text, convert), which decodes the text
+// straight into T when it matches T exactly, and otherwise converts the
+// dynamic value as the slot always did (convert: that conversion of __jv)
+function typedJSONParse(expr: AstNode, goType: string | undefined): string | undefined {
+  if (!goType || !(goType.startsWith('*[]') || goType.startsWith('[]') || /^\*[A-Za-z_][A-Za-z0-9_]*$/.test(goType))) return undefined;
+  let call = unwrapParentheses(expr);
+  while (call && (isAsExpression(call) || call.kind === 'NonNullExpression' || call.kind === 'SatisfiesExpression')) call = unwrapParentheses(call.expression);
+  if (!isCallExpression(call) || call.questionDotToken || (call.arguments ?? []).length !== 1 || isSpreadElement(call.arguments[0])) return undefined;
+  const callee = call.expression;
+  if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression) || callee.expression.text !== 'JSON' || !isIdentifier(callee.name) || callee.name.text !== 'parse') return undefined;
+  if (variableGoTypes.has('JSON')) return undefined;
+  // (a class's instances aren't what JSON.parse makes: converted as before)
+  const target = goType.replace(/^\*?\[\]/, '').replace(/^\*/, '');
+  if (classNames.has(target) || NULLABLE_PRIMITIVE_TYPES.includes(goType) || goType === '*[]interface{}' || goType === '[]interface{}') return undefined;
+  const code = visit(call);
+  if (!code.startsWith('TnJSONParse(') || goParenEnd(code, 'TnJSONParse'.length) !== code.length - 1) return undefined;
+  const text = code.slice('TnJSONParse('.length, -1);
+  // (the slot's conversion of the dynamic value, as it was)
+  const name = getTempName('jv');
+  const ident: AstNode = { kind: 'Identifier', text: name, parent: expr.parent, line: expr.line, column: expr.column };
+  const saved = variableGoTypes.get(name);
+  variableGoTypes.set(name, 'interface{}');
+  let converted: string;
+  try {
+    converted = toGoValueOfType(ident, goType);
+  } finally {
+    if (saved === undefined) variableGoTypes.delete(name);
+    else variableGoTypes.set(name, saved);
+  }
+  useHelper('jsonTyped');
+  return `TnJSONParseTyped[${goType}](${text}, func(${name} interface{}) ${goType} { return ${converted} })`;
+}
+
+// Typed dispatchers: recv.m(a) on a dynamic receiver whose declared type is
+// a class or interface C, when every class of C's hierarchy (C, its
+// subclasses, the classes implementing it) that has m declares it with the
+// same Go parameter and result types: TnCall_C_m(recv, a0 P0, …) R calls the
+// receiver class's method directly, without boxing the arguments and result.
+// Any other receiver (an object literal, a class with another signature)
+// goes through TnCall_m, as before.
+type TypedDispatcher = { method: string; params: string[]; result: string; classes: string[] };
+const typedDispatchers = new Map<string, TypedDispatcher>();
+
+// The types a typed dispatcher passes unconverted: scalars, any, class and
+// struct pointers
+function isTypedDispatchType(goType: string): boolean {
+  if (['float64', 'string', 'bool', 'interface{}'].includes(goType)) return true;
+  return /^\*[A-Za-z_][A-Za-z0-9_]*$/.test(goType) && !NULLABLE_PRIMITIVE_TYPES.includes(goType) && !goType.startsWith('*Tn');
+}
+
+// The class or interface a dynamic receiver is declared as (non-generic)
+function staticReceiverTypeName(receiver: AstNode): string | undefined {
+  const expr = unwrapParentheses(receiver);
+  const declared = isIdentifier(expr) ? declaredTypeNodeOf(expr) ?? getExpressionTypeNode(expr) : getExpressionTypeNode(expr);
+  let name: string | undefined;
+  if (declared && isTypeReferenceNode(declared) && isIdentifier(declared.typeName) && !(declared.typeArguments ?? []).length) name = declared.typeName.text;
+  else if (!declared && isIdentifier(expr)) name = variableClassNames.get(expr.text);
+  if (!name) return undefined;
+  const cls = declaredClasses.get(name);
+  if (cls) return (cls.typeParameters ?? []).length ? undefined : name;
+  const iface = declaredInterfaces.get(name);
+  return iface && !(iface.typeParameters ?? []).length ? name : undefined;
+}
+
+// The classes a receiver declared as C can be: C, its subclasses, and the
+// classes implementing interface C (and their subclasses)
+function dispatchHierarchy(typeName: string): string[] {
+  if (declaredClasses.has(typeName)) return [typeName, ...subclassNames(typeName)];
+  const out: string[] = [];
+  for (const className of declaredClasses.keys()) {
+    if (implementedInterfacesOf(className).some((i: AstNode) => i.name?.text === typeName)) out.push(className);
+  }
+  return out;
+}
+
+// A method declaration's Go parameter types and result, when typed dispatch
+// can take it (no optional, rest or destructured parameters, no type parameters)
+function typedDispatchSignature(member: AstNode): { params: string[]; result: string } | undefined {
+  if ((member.typeParameters ?? []).length) return undefined;
+  if ((member.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword' || m.kind === 'StaticKeyword') || member.asteriskToken) return undefined;
+  const params: string[] = [];
+  for (const p of member.parameters ?? []) {
+    if (p.dotDotDotToken || p.initializer || p.questionToken || !isIdentifier(p.name) || !p.type) return undefined;
+    if (p.name.text === 'this') return undefined;
+    const goType = getParameterGoType(p);
+    if (!isTypedDispatchType(goType)) return undefined;
+    params.push(goType);
+  }
+  if (!member.type) return undefined;
+  const result = member.type.kind === 'VoidKeyword' ? '' : getType(member.type);
+  if (result !== '' && !isTypedDispatchType(result)) return undefined;
+  return { params, result };
+}
+
+// The method m as the classes of a hierarchy declare it (each class's own or
+// inherited declaration), when they all agree with the declared type's own
+const hierarchySignatureCache = new Map<string, { params: string[]; result: string; classes: string[] } | undefined>();
+function hierarchySignature(typeName: string, method: string): { params: string[]; result: string; classes: string[] } | undefined {
+  const key = `${typeName}.${method}`;
+  if (hierarchySignatureCache.has(key)) return hierarchySignatureCache.get(key);
+  const sig = hierarchySignatureUncached(typeName, method);
+  hierarchySignatureCache.set(key, sig);
+  return sig;
+}
+
+function hierarchySignatureUncached(typeName: string, method: string): { params: string[]; result: string; classes: string[] } | undefined {
+  let declared: AstNode | undefined;
+  if (declaredClasses.has(typeName)) declared = findClassMethod(typeName, method);
+  else {
+    const iface = declaredInterfaces.get(typeName);
+    const members = (iface?.members ?? []).filter((m: AstNode) => isMethodSignature(m) && isIdentifier(m.name) && m.name.text === method);
+    if (members.length !== 1) return undefined;
+    declared = members[0];
+  }
+  if (!declared || declared.questionToken) return undefined;
+  const sig = typedDispatchSignature(declared);
+  if (!sig) return undefined;
+  const key = `${sig.params.join(',')}->${sig.result}`;
+  const classes: string[] = [];
+  for (const className of dispatchHierarchy(typeName)) {
+    const cls = declaredClasses.get(className);
+    if (!cls || (cls.typeParameters ?? []).length) return undefined;
+    const member = findClassMethod(className, method);
+    if (!member) continue;
+    const own = typedDispatchSignature(member);
+    if (!own || `${own.params.join(',')}->${own.result}` !== key) return undefined;
+    classes.push(className);
+  }
+  return classes.length > 0 ? { ...sig, classes } : undefined;
+}
+
+// The typed dispatcher a call recv.m(a) on a dynamic receiver goes through
+// (its result type is the call's, see inferExpressionType), if any
+function typedDispatchFor(node: AstNode): { name: string; method: string; params: string[]; result: string; classes: string[] } | undefined {
+  if (!isCallExpression(node) || node.questionDotToken || !isPropertyAccessExpression(node.expression) || hasQuestionDot(node.expression) || !isIdentifier(node.expression.name)) return undefined;
+  const receiver = node.expression.expression;
+  if (receiver.kind === 'SuperKeyword' || receiver.kind === 'ThisKeyword') return undefined;
+  const method: string = node.expression.name.text;
+  const args: AstNode[] = node.arguments ?? [];
+  if (args.some((a) => isSpreadElement(a))) return undefined;
+  if (['call', 'apply', 'bind', 'toString', 'replace', 'replaceAll', 'constructor'].includes(method)) return undefined;
+  if (ARRAY_ONLY_METHODS.has(method) || STRING_ONLY_METHODS.has(method) || MUTATING_ARRAY_METHODS.has(method)) return undefined;
+  const typeName = staticReceiverTypeName(receiver);
+  if (!typeName) return undefined;
+  const sig = hierarchySignature(typeName, method);
+  if (!sig || sig.params.length !== args.length) return undefined;
+  const name = `${dispatcherSuffix(typeName)}_${dispatcherSuffix(method)}`;
+  const existing = typedDispatchers.get(name);
+  if (existing && (existing.params.join(',') !== sig.params.join(',') || existing.result !== sig.result)) return undefined;
+  return { name, method, ...sig };
+}
+
+// recv.m(a) through a typed dispatcher, or undefined for the boxed one
+function visitTypedDispatch(node: AstNode, receiver: AstNode, method: string): string | undefined {
+  const args: AstNode[] = node.arguments ?? [];
+  const sig = typedDispatchFor(node);
+  if (!sig || !isDynamicValue(receiver)) return undefined;
+  // (a void method only as a statement: its call has no value)
+  if (sig.result === '' && !isDiscardedValue(node)) return undefined;
+  const name = sig.name;
+  typedDispatchers.set(name, { method, params: sig.params, result: sig.result, classes: sig.classes });
+  useHelper('dynamic');
+  useHelper('error');
+  dynamicMethodCalls.add(method);
+  const goArgs = args.map((a, i) => (sig.params[i] === 'interface{}' ? visit(a) : toGoValueOfType(a, sig.params[i])));
+  return `TnCall_${name}(${[visit(receiver), ...goArgs].join(', ')})`;
+}
+
+// The TnCall_C_m dispatchers (see visitTypedDispatch)
+function emitTypedDispatchers(): string {
+  const out: string[] = [];
+  for (const [name, d] of [...typedDispatchers].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const params = d.params.map((t, i) => `__a${i} ${t}`);
+    const argNames = d.params.map((_, i) => `__a${i}`);
+    const cases: string[] = [];
+    for (const className of d.classes) {
+      const sig = classMethodSignatures.get(className)?.get(d.method);
+      if (!sig || sig.result !== d.result) continue;
+      const types = sig.params ? goFuncParamTypes(`func(${sig.params})`) : [];
+      if (types.join(',') !== d.params.join(',')) continue;
+      const call = `o.${sig.goName}(${argNames.join(', ')})`;
+      cases.push(`\tcase *${getSafeName(className)}:\n\t\t${d.result ? `return ${call}` : `${call}\n\t\treturn`}`);
+    }
+    const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
+    const boxed = `TnCall_${dispatcherSuffix(d.method)}(${['__recv', ...argNames].join(', ')})`;
+    const fallback = d.result === '' ? `\t${boxed}\n` : d.result === 'interface{}' ? `\treturn ${boxed}\n` : `\treturn TnAs[${d.result}](${boxed})\n`;
+    out.push(`func TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${fallback}}`);
+  }
+  return out.join('\n\n');
 }
 
 function dispatcherSuffix(method: string): string {
@@ -10344,6 +10849,26 @@ function emitDynamicDispatchers(): string {
     // (a number's toString(radix) in that radix)
     const fallback = method === 'toString' ? 'TnToStringOf(__recv, __args...)' : `TnCallMember(__recv, ${toGoStringLiteral(method)}, __args...)`;
     out.push(`func TnCall_${suffix}(__recv interface{}, __args ...interface{}) interface{} {\n${body}\treturn ${fallback}\n}`);
+  }
+  const typed = emitTypedDispatchers();
+  if (typed) out.push(typed);
+  // TnCallSeq_m[T]: a generator method called on a dynamic receiver, as a
+  // range function — the class's push form when it has one, its channel
+  // received in step otherwise, any other value's elements
+  for (const method of [...dynamicSeqCalls].sort()) {
+    const cases: string[] = [];
+    for (const [className, methods] of classMethodSignatures) {
+      const sig = methods.get(method);
+      if (!sig || !sig.result.startsWith('chan ')) continue;
+      const paramTypes = sig.params ? goFuncParamTypes(`func(${sig.params})`) : [];
+      const callArgs = paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ');
+      const member = findClassGenerator(className, method);
+      const seq = !!member && generatorSeqEligible(member);
+      cases.push(`\tcase *${getSafeName(className)}:\n\t\treturn ${seq ? `tnSeqAs[T](o.${sig.goName}__seq(${callArgs}))` : `tnSeqChan[T](o.${sig.goName}(${callArgs}))`}`);
+    }
+    const suffix = dispatcherSuffix(method);
+    const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
+    out.push(`func TnCallSeq_${suffix}[T any](__recv interface{}, __args ...interface{}) func(func(T) bool) {\n${body}\treturn tnSeqAny[T](TnCall_${suffix}(__recv, __args...))\n}`);
   }
   // x.m read as a value, m an optional method: the method value, or nil
   // (undefined) when the value's type has none
@@ -13637,8 +14162,9 @@ function inferExpressionTypeUncached(expr: AstNode): string | undefined {
     }
   }
   // a method called on a dynamic value goes through a dispatcher: any result
+  // (a typed dispatcher's: its result type)
   if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && !hasQuestionDot(expr.expression) && expr.expression.expression.kind !== 'SuperKeyword' && isDynamicValue(expr.expression.expression)) {
-    return 'interface{}';
+    return typedDispatchFor(expr)?.result || 'interface{}';
   }
   return undefined;
 }
@@ -13840,6 +14366,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   // (the global object, as emitted: TnGlobalThis)
   if (isIdentifier(expr) && ((expr.text === 'globalThis' && !variableGoTypes.has('globalThis')) || isNodeGlobalObject(expr))) return 'map[string]interface{}';
   if (expr?.kind === 'TnArrayItems') return '[]interface{}';
+  if (expr?.kind === 'TnGeneratorItems') return expr.goType;
   // a class as a value (let cls = Parser): its class descriptor
   if (isIdentifier(expr) && classNames.has(expr.text) && !variableGoTypes.has(expr.text) && expr.parent && isClassValueReference(expr) && !isLocallyBound(expr)) return '*TnClass';
   // a?.b?.m(…) on any values: an any value (undefined when the chain stops)
@@ -14267,10 +14794,13 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     const source = (expr.arguments ?? [])[0];
     const callback = (expr.arguments ?? [])[1];
     const sourceType = (source ? inferExpressionType(source) ?? '' : '').replace(/^\*\[\]/, '[]');
+    // (a generator call: its values, see generatorItemsNode)
+    const generatorSource = sourceType.startsWith('chan ') && !!source && isCallExpression(unwrapParentheses(source)) && !unwrapParentheses(source).questionDotToken && mayHaveGeneratorSeq(unwrapParentheses(source));
     if (callback) {
       const result = goFuncReturnType(functionValueGoType(callback) ?? '');
-      return result && (sourceType.startsWith('[]') || sourceType.startsWith('*TnMap[') || sourceType === 'string') ? `[]${result}` : '[]interface{}';
+      return result && (sourceType.startsWith('[]') || sourceType.startsWith('*TnMap[') || sourceType === 'string' || generatorSource) ? `[]${result}` : '[]interface{}';
     }
+    if (generatorSource) return `[]${sourceType.slice(5) || 'interface{}'}`;
     // (a Uint8Array's bytes: numbers)
     if (sourceType === '[]byte') return '[]float64';
     if (sourceType.startsWith('[]') && !arraySubclassOf(source)) return sourceType;
@@ -22290,6 +22820,64 @@ function getPromiseChannelType(node: AstNode): string {
   return 'interface{}';
 }
 
+// An async function whose body never parks: it awaits only calls of other
+// such functions (their promises are settled by the time they return, and
+// TnAwait resumes on the spot on a settled promise), has no for await, and
+// returns no promise (whose value it would await). Called, it runs to its end
+// at once, so it runs on the caller's goroutine (TnRunAsyncInline) instead of
+// a goroutine of its own handing the JS baton back and forth (TnStartAsync).
+const asyncInlineCache = new Map<AstNode, boolean>();
+function asyncInlineEligible(fn: AstNode, visiting = new Set<AstNode>()): boolean {
+  const cached = asyncInlineCache.get(fn);
+  if (cached !== undefined) return cached;
+  if (!fn?.body || !isBlock(fn.body) || fn.asteriskToken || !(fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return false;
+  if (visiting.has(fn)) return false;
+  visiting.add(fn);
+  // (a value that can't be a promise: what `return` settles with directly)
+  const plainValue = (expr: AstNode): boolean => {
+    const e = unwrapParentheses(expr);
+    if (isIdentifier(e)) {
+      if (e.text === 'undefined') return true;
+      // (a parameter or local declared with a non-promise type, or holding an await's value)
+      let decl: AstNode | undefined;
+      for (const p of fn.parameters ?? []) if (isIdentifier(p.name) && p.name.text === e.text) decl = p;
+      containsNode(fn.body, (n) => {
+        if (n.kind === 'VariableDeclaration' && isIdentifier(n.name) && n.name.text === e.text && getEnclosingFunction(n) === fn) decl = n;
+        return false;
+      });
+      if (!decl) return false;
+      if (decl.type) return !(isTypeReferenceNode(decl.type) && isIdentifier(decl.type.typeName) && ['Promise', 'PromiseLike'].includes(decl.type.typeName.text)) && decl.type.kind !== 'AnyKeyword' && decl.type.kind !== 'UnknownKeyword';
+      return !!decl.initializer && plainValue(decl.initializer);
+    }
+    if (isNumericLiteral(e) || isStringLiteral(e) || e.kind === 'NoSubstitutionTemplateLiteral' || e.kind === 'TemplateExpression' || e.kind === 'TrueKeyword' || e.kind === 'FalseKeyword' || e.kind === 'NullKeyword') return true;
+    if (e.kind === 'AwaitExpression') return true;
+    if (isBinaryExpression(e)) {
+      const op = e.operatorToken.kind;
+      if (['QuestionQuestionToken', 'BarBarToken', 'AmpersandAmpersandToken', 'CommaToken'].includes(op) || ASSIGNMENT_OPERATORS.has(op)) return false;
+      return true;
+    }
+    if (isPrefixUnaryExpression(e) || isPostfixUnaryExpression(e)) return true;
+    return false;
+  };
+  const blocked = containsNode(fn.body, (n) => {
+    if (getEnclosingFunction(n) !== fn) return false;
+    if (n.kind === 'ForOfStatement' && n.awaitModifier) return true;
+    if (n.kind === 'YieldExpression') return true;
+    if (n.kind === 'AwaitExpression') {
+      const operand = unwrapParentheses(n.expression);
+      if (!isCallExpression(operand) || operand.questionDotToken || !isIdentifier(operand.expression)) return true;
+      const decl = declaredFunctions.get(operand.expression.text);
+      return !decl || !isFunctionDeclaration(decl) || decl.parent?.kind !== 'SourceFile' || !asyncInlineEligible(decl, visiting);
+    }
+    if (isReturnStatement(n) && n.expression && !plainValue(n.expression)) return true;
+    return false;
+  });
+  visiting.delete(fn);
+  // (a verdict reached inside a cycle may depend on it: only the outermost is kept)
+  if (visiting.size === 0 || !blocked) asyncInlineCache.set(fn, !blocked);
+  return !blocked;
+}
+
 // A function whose body runs in a goroutine and communicates over a channel:
 // async functions (return sends) and generators (yield sends)
 // `header` replaces `func name[T]` (methods: `func (self *C) name`)
@@ -22319,9 +22907,11 @@ function emitChannelFunction(node: AstNode, isAsync: boolean, header?: string): 
   asyncChannelIsAsync = prevIsAsync;
   if (isAsync) {
     // The body runs synchronously until its first await, holding the JS baton
+    // (a body that never parks runs on the caller's goroutine: see asyncInlineEligible)
     useHelper('eventLoop');
+    const start = asyncInlineEligible(node) ? 'TnRunAsyncInline' : 'TnStartAsync';
     return (
-      `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
+      `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\t${start}(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
     );
   }
   // (a top-level generator declaration: also its push form, see generatorSeqEligible)
@@ -24007,6 +24597,7 @@ function needPkg(pkg: string): void {
 // Marks a Go helper as used; also registers the packages the helper needs,
 // since the import list is serialized before helpers are emitted.
 const helperRequires: Record<string, string[]> = {
+  generatorSeq: ['generatorStep', 'dynamic', 'arraySubclass'],
   regexReplaceFunc: ['strIndex'],
   replaceAny: ['fancyRegex', 'regexReplaceFunc', 'dynamic'],
   regexObject: ['fancyRegex', 'dynamic', 'error'],
@@ -24021,6 +24612,7 @@ const helperRequires: Record<string, string[]> = {
   recordView: ['dynamic', 'orderedMap'],
   bigint: ['error'],
   jsonStringify: ['error', 'dynamic', 'orderedMap'],
+  jsonTyped: ['jsonStringify'],
   dynamicSpread: ['dynamic', 'orderedMap'],
   weakRefs: ['eventLoop', 'dynamic'],
   builtins: ['error', 'dynamic', 'bigint'],
@@ -24761,6 +25353,7 @@ const helperPackages: Record<string, string[]> = {
   entryPoints: ['os'],
   orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort', 'unsafe'],
   jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time', 'sync', 'unicode/utf8'],
+  jsonTyped: ['reflect', 'strings', 'strconv', 'sync', 'unsafe', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
   objectAssignTo: ['reflect', 'unsafe', 'sort', 'fmt', 'strings'],
   typeOf: ['reflect'],
@@ -24772,6 +25365,7 @@ const helperPackages: Record<string, string[]> = {
   dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic', 'weak', 'runtime'],
   classes: ['reflect'],
   generatorStep: ['sync'],
+  generatorSeq: [],
   arraySubclass: ['reflect'],
   numTruthy: ['math'],
   iterable: ['reflect'],
@@ -24819,6 +25413,57 @@ const helperPackages: Record<string, string[]> = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers: Record<string, string> = {
+  generatorSeq: `// A generator's push form (a range function) yielding T: the same function
+// when it yields T already, else each value converted
+func tnSeqAs[T any, S any](s func(func(S) bool)) func(func(T) bool) {
+	if t, ok := any(s).(func(func(T) bool)); ok {
+		return t
+	}
+	return func(yield func(T) bool) {
+		s(func(v S) bool { return yield(TnAs[T](any(v))) })
+	}
+}
+
+// A generator's channel as a range function: received in step with the
+// consumer, as for…of does (see TnGenLockstep)
+func tnSeqChan[T any, S any](ch chan S) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		g := TnGenLockstep(ch)
+		for first := true; ; first = false {
+			if !first {
+				TnGenAck(g)
+			}
+			v, ok := <-g
+			if !ok {
+				TnGenDone(g)
+				return
+			}
+			if !yield(TnAs[T](any(v))) {
+				return
+			}
+		}
+	}
+}
+
+// Any other iterable as a range function (its elements, as TnToArray reads them)
+func tnSeqAny[T any](v interface{}) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		for _, x := range TnToArray(v) {
+			if !yield(TnAs[T](x)) {
+				return
+			}
+		}
+	}
+}
+
+// [...g()]: every value a push form yields
+func tnSeqCollect[T any](s func(func(T) bool)) []T {
+	out := []T{}
+	for v := range s {
+		out = append(out, v)
+	}
+	return out
+}`,
   generatorStep: `// A generator consumed by for…of runs in step with the loop: after each
 // yield it waits until the loop body has run for that value (JS resumes a
 // generator only on next()), so the body sees the state the generator saw
@@ -30491,6 +31136,464 @@ func TnDeref[T any](p *T) T {
 	}
 	return "object"
 }`,
+  jsonTyped: `// JSON.parse(text) as T: decoded straight into T when the text matches T
+// exactly — objects with every key of T's struct, in its field order;
+// arrays; numbers, strings and booleans where T has them —, without the
+// dynamic value and its conversion. Anything else (another key, a missing
+// one, null, an any field, invalid JSON) takes the dynamic value converted,
+// as before (so the result, and a SyntaxError, are what they were).
+func TnJSONParseTyped[T any](text string, convert func(interface{}) T) T {
+	var out T
+	plan := tnJTPlanOf(reflect.TypeOf((*T)(nil)).Elem())
+	if plan.ok {
+		d := tnJTDecoder{s: text}
+		if d.value(plan, unsafe.Pointer(&out)) && d.end() {
+			return out
+		}
+		out = *new(T)
+	}
+	return convert(TnJSONParse(text))
+}
+
+const (
+	tnJTFloat = iota + 1
+	tnJTString
+	tnJTBool
+	tnJTPtrFloat
+	tnJTPtrString
+	tnJTPtrBool
+	tnJTPtrStruct
+	tnJTSlice
+	tnJTPtrSlice
+)
+
+type tnJTField struct {
+	key  string
+	off  uintptr
+	plan *tnJTPlan
+}
+
+type tnJTPlan struct {
+	kind   int
+	t      reflect.Type // the struct (tnJTPtrStruct) or slice (tnJTSlice, tnJTPtrSlice) type
+	elem   *tnJTPlan
+	fields []tnJTField
+	ok     bool
+}
+
+var tnJTPlans sync.Map
+
+func tnJTPlanOf(t reflect.Type) *tnJTPlan {
+	if p, ok := tnJTPlans.Load(t); ok {
+		return p.(*tnJTPlan)
+	}
+	p := tnJTBuild(t, map[reflect.Type]*tnJTPlan{})
+	tnJTFinal(p, map[*tnJTPlan]bool{})
+	tnJTPlans.Store(t, p)
+	return p
+}
+
+func tnJTBuild(t reflect.Type, building map[reflect.Type]*tnJTPlan) *tnJTPlan {
+	if p, ok := building[t]; ok {
+		return p
+	}
+	p := &tnJTPlan{}
+	building[t] = p
+	if _, custom := tnTypeConverters[t]; custom {
+		return p
+	}
+	switch t.Kind() {
+	case reflect.Float64:
+		p.kind, p.ok = tnJTFloat, t == reflect.TypeOf(float64(0))
+	case reflect.String:
+		p.kind, p.ok = tnJTString, t == reflect.TypeOf("")
+	case reflect.Bool:
+		p.kind, p.ok = tnJTBool, t == reflect.TypeOf(false)
+	case reflect.Slice:
+		p.kind, p.t = tnJTSlice, t
+		p.elem = tnJTBuild(t.Elem(), building)
+		p.ok = true
+	case reflect.Pointer:
+		e := t.Elem()
+		if _, custom := tnTypeConverters[e]; custom {
+			return p
+		}
+		switch e.Kind() {
+		case reflect.Float64:
+			p.kind, p.ok = tnJTPtrFloat, e == reflect.TypeOf(float64(0))
+		case reflect.String:
+			p.kind, p.ok = tnJTPtrString, e == reflect.TypeOf("")
+		case reflect.Bool:
+			p.kind, p.ok = tnJTPtrBool, e == reflect.TypeOf(false)
+		case reflect.Slice:
+			p.kind, p.t = tnJTPtrSlice, e
+			p.elem = tnJTBuild(e.Elem(), building)
+			p.ok = true
+		case reflect.Struct:
+			// (not a class instance, a Map / Record type or an embedding struct)
+			if t.Implements(reflect.TypeOf((*interface{ TnClassInstance() })(nil)).Elem()) {
+				return p
+			}
+			if _, isMap := reflect.New(e).Interface().(interface {
+				TnFill([][]interface{}, func(interface{}, reflect.Type) (reflect.Value, bool)) bool
+			}); isMap {
+				return p
+			}
+			p.kind, p.t = tnJTPtrStruct, e
+			p.ok = e.NumField() > 0
+			for i := 0; i < e.NumField() && p.ok; i++ {
+				f := e.Field(i)
+				if f.Anonymous {
+					p.ok = false
+					break
+				}
+				if strings.HasPrefix(f.Name, "__") {
+					// (__keys: the key order, unset when the text's is the fields')
+					continue
+				}
+				fp := tnJTBuild(f.Type, building)
+				p.fields = append(p.fields, tnJTField{key: strings.TrimSuffix(f.Name, "_"), off: f.Offset, plan: fp})
+			}
+			if len(p.fields) == 0 {
+				p.ok = false
+			}
+			// (a field's plan built later in a cycle is checked when decoding)
+		}
+	}
+	return p
+}
+
+// A plan is ok when every plan under it is (a recursive type's back
+// references assumed ok: decoding checks each plan again)
+func tnJTFinal(p *tnJTPlan, seen map[*tnJTPlan]bool) bool {
+	if v, ok := seen[p]; ok {
+		return v
+	}
+	seen[p] = true
+	ok := p.ok
+	if ok && p.elem != nil {
+		ok = tnJTFinal(p.elem, seen)
+	}
+	for _, f := range p.fields {
+		if ok {
+			ok = tnJTFinal(f.plan, seen)
+		}
+	}
+	seen[p] = ok
+	p.ok = ok
+	return ok
+}
+
+type tnJTDecoder struct {
+	s string
+	i int
+}
+
+func (d *tnJTDecoder) ws() {
+	for d.i < len(d.s) {
+		switch d.s[d.i] {
+		case ' ', '\\t', '\\n', '\\r':
+			d.i++
+		default:
+			return
+		}
+	}
+}
+
+func (d *tnJTDecoder) end() bool {
+	d.ws()
+	return d.i == len(d.s)
+}
+
+// The next value, decoded into the T at p (false: the text doesn't match T)
+func (d *tnJTDecoder) value(p *tnJTPlan, at unsafe.Pointer) bool {
+	if !p.ok {
+		return false
+	}
+	d.ws()
+	if d.i >= len(d.s) {
+		return false
+	}
+	switch p.kind {
+	case tnJTFloat:
+		n, ok := d.number()
+		*(*float64)(at) = n
+		return ok
+	case tnJTPtrFloat:
+		n, ok := d.number()
+		*(**float64)(at) = &n
+		return ok
+	case tnJTString:
+		s, ok := d.str()
+		*(*string)(at) = s
+		return ok
+	case tnJTPtrString:
+		s, ok := d.str()
+		*(**string)(at) = &s
+		return ok
+	case tnJTBool, tnJTPtrBool:
+		var b bool
+		if strings.HasPrefix(d.s[d.i:], "true") {
+			b, d.i = true, d.i+4
+		} else if strings.HasPrefix(d.s[d.i:], "false") {
+			d.i += 5
+		} else {
+			return false
+		}
+		if p.kind == tnJTBool {
+			*(*bool)(at) = b
+		} else {
+			*(**bool)(at) = &b
+		}
+		return true
+	case tnJTPtrStruct:
+		if d.s[d.i] != '{' {
+			return false
+		}
+		d.i++
+		obj := reflect.New(p.t).UnsafePointer()
+		for n, f := range p.fields {
+			d.ws()
+			if n > 0 {
+				if d.i >= len(d.s) || d.s[d.i] != ',' {
+					return false
+				}
+				d.i++
+				d.ws()
+			}
+			key, ok := d.str()
+			if !ok || key != f.key {
+				return false
+			}
+			d.ws()
+			if d.i >= len(d.s) || d.s[d.i] != ':' {
+				return false
+			}
+			d.i++
+			if !d.value(f.plan, unsafe.Add(obj, f.off)) {
+				return false
+			}
+		}
+		d.ws()
+		if d.i >= len(d.s) || d.s[d.i] != '}' {
+			return false
+		}
+		d.i++
+		*(*unsafe.Pointer)(at) = obj
+		return true
+	case tnJTSlice:
+		return d.slice(p, reflect.NewAt(p.t, at).Elem())
+	case tnJTPtrSlice:
+		sp := reflect.New(p.t)
+		if !d.slice(p, sp.Elem()) {
+			return false
+		}
+		*(*unsafe.Pointer)(at) = sp.UnsafePointer()
+		return true
+	}
+	return false
+}
+
+// A JSON array into the slice sv (settable)
+func (d *tnJTDecoder) slice(p *tnJTPlan, sv reflect.Value) bool {
+	if d.s[d.i] != '[' {
+		return false
+	}
+	d.i++
+	items := reflect.MakeSlice(p.t, 0, 8)
+	n := 0
+	for {
+		d.ws()
+		if d.i >= len(d.s) {
+			return false
+		}
+		if d.s[d.i] == ']' && n == 0 {
+			d.i++
+			break
+		}
+		if n == items.Cap() {
+			grown := reflect.MakeSlice(p.t, n, n*2)
+			reflect.Copy(grown, items)
+			items = grown
+		}
+		items = items.Slice(0, n+1)
+		if !d.value(p.elem, items.Index(n).Addr().UnsafePointer()) {
+			return false
+		}
+		n++
+		d.ws()
+		if d.i >= len(d.s) {
+			return false
+		}
+		if d.s[d.i] == ',' {
+			d.i++
+			continue
+		}
+		if d.s[d.i] != ']' {
+			return false
+		}
+		d.i++
+		break
+	}
+	sv.Set(items)
+	return true
+}
+
+// A JSON number (its exact grammar; anything else, or out of range, doesn't match)
+func (d *tnJTDecoder) number() (float64, bool) {
+	start := d.i
+	s := d.s
+	if d.i < len(s) && s[d.i] == '-' {
+		d.i++
+	}
+	if d.i >= len(s) {
+		return 0, false
+	}
+	if s[d.i] == '0' {
+		d.i++
+	} else if s[d.i] >= '1' && s[d.i] <= '9' {
+		for d.i < len(s) && s[d.i] >= '0' && s[d.i] <= '9' {
+			d.i++
+		}
+	} else {
+		return 0, false
+	}
+	if d.i < len(s) && s[d.i] == '.' {
+		d.i++
+		digits := d.i
+		for d.i < len(s) && s[d.i] >= '0' && s[d.i] <= '9' {
+			d.i++
+		}
+		if d.i == digits {
+			return 0, false
+		}
+	}
+	if d.i < len(s) && (s[d.i] == 'e' || s[d.i] == 'E') {
+		d.i++
+		if d.i < len(s) && (s[d.i] == '+' || s[d.i] == '-') {
+			d.i++
+		}
+		digits := d.i
+		for d.i < len(s) && s[d.i] >= '0' && s[d.i] <= '9' {
+			d.i++
+		}
+		if d.i == digits {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseFloat(s[start:d.i], 64)
+	return n, err == nil
+}
+
+// A JSON string (valid UTF-8, escapes decoded; a lone surrogate doesn't match)
+func (d *tnJTDecoder) str() (string, bool) {
+	s := d.s
+	if d.i >= len(s) || s[d.i] != '"' {
+		return "", false
+	}
+	d.i++
+	start := d.i
+	ascii := true
+	for d.i < len(s) {
+		c := s[d.i]
+		if c == '"' {
+			out := s[start:d.i]
+			d.i++
+			if !ascii && !utf8.ValidString(out) {
+				return "", false
+			}
+			return out, true
+		}
+		if c == '\\\\' {
+			return d.escaped(start)
+		}
+		if c < 0x20 {
+			return "", false
+		}
+		if c >= 0x80 {
+			ascii = false
+		}
+		d.i++
+	}
+	return "", false
+}
+
+func (d *tnJTDecoder) escaped(start int) (string, bool) {
+	s := d.s
+	var b strings.Builder
+	b.WriteString(s[start:d.i])
+	hex4 := func() (rune, bool) {
+		if d.i+4 > len(s) {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(s[d.i:d.i+4], 16, 32)
+		if err != nil {
+			return 0, false
+		}
+		d.i += 4
+		return rune(v), true
+	}
+	for d.i < len(s) {
+		c := s[d.i]
+		switch {
+		case c == '"':
+			d.i++
+			out := b.String()
+			if !utf8.ValidString(out) {
+				return "", false
+			}
+			return out, true
+		case c < 0x20:
+			return "", false
+		case c != '\\\\':
+			b.WriteByte(c)
+			d.i++
+			continue
+		}
+		d.i++
+		if d.i >= len(s) {
+			return "", false
+		}
+		e := s[d.i]
+		d.i++
+		switch e {
+		case '"', '\\\\', '/':
+			b.WriteByte(e)
+		case 'b':
+			b.WriteByte('\\b')
+		case 'f':
+			b.WriteByte('\\f')
+		case 'n':
+			b.WriteByte('\\n')
+		case 'r':
+			b.WriteByte('\\r')
+		case 't':
+			b.WriteByte('\\t')
+		case 'u':
+			r, ok := hex4()
+			if !ok {
+				return "", false
+			}
+			if r >= 0xD800 && r < 0xDC00 {
+				if d.i+6 > len(s) || s[d.i] != '\\\\' || s[d.i+1] != 'u' {
+					return "", false
+				}
+				d.i += 2
+				lo, ok := hex4()
+				if !ok || lo < 0xDC00 || lo >= 0xE000 {
+					return "", false
+				}
+				r = 0x10000 + (r-0xD800)<<10 + (lo - 0xDC00)
+			} else if r >= 0xDC00 && r < 0xE000 {
+				return "", false
+			}
+			b.WriteRune(r)
+		default:
+			return "", false
+		}
+	}
+	return "", false
+}`,
   jsonStringify: `// JSON.stringify: JS's SerializeJSONProperty over TypeNative values
 // (unexported struct fields included; Go's encoder would skip them)
 type tnJSONWriter struct {
@@ -33724,6 +34827,14 @@ func tnRelease() {
 	tnBaton <- struct{}{}
 }
 
+// Runs the body of an async function that never parks (it awaits only
+// promises that are already settled) to its end, on the caller's goroutine
+func TnRunAsyncInline(body func()) {
+	ctx := tnAsyncCtx
+	body()
+	tnAsyncCtx = ctx
+}
+
 // Runs an async function body: synchronously until its first await (or the
 // end), then the caller continues while the body waits
 func TnStartAsync(body func()) {
@@ -34459,7 +35570,7 @@ func TnRejectExecutor[T any](ch chan T) {
 // microtasks; a bare channel wake would race for the baton and resume out of
 // order on a starved machine
 func TnAsyncSend[T any](ch chan T, v T) {
-	tok := make(chan struct{})
+	var tok chan struct{}
 	handoff := false
 	tnWakeMu.Lock()
 	select {
@@ -34478,7 +35589,7 @@ func TnAsyncSend[T any](ch chan T, v T) {
 }
 
 func TnAsyncClose[T any](ch chan T) {
-	tok := make(chan struct{})
+	var tok chan struct{}
 	handoff := false
 	tnWakeMu.Lock()
 	close(ch)
@@ -35804,6 +36915,16 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
   } else if (binding && isIdentifier(binding)) {
     const name = visit(binding);
     registerLocalVariable(binding.text, elementType);
+    // (elements held as any, declared as a class or interface — shapes:
+    // Shape[] —: the binding keeps that declared type, for typed dispatch)
+    if (elementType === 'interface{}' && !declaration?.type) {
+      const elementNode = resolveTypeNode(getExpressionTypeNode(node.expression));
+      const declaredElement = isArrayTypeNode(elementNode) ? elementNode.elementType : undefined;
+      if (declaredElement && isTypeReferenceNode(declaredElement) && isIdentifier(declaredElement.typeName) && !(declaredElement.typeArguments ?? []).length &&
+        (declaredClasses.has(declaredElement.typeName.text) || declaredInterfaces.has(declaredElement.typeName.text))) {
+        variableTypeNodes.set(binding.text, declaredElement);
+      }
+    }
     // (a binding the body never reads is still declared: `_ =` uses it)
     if (iterType === 'string') {
       prefix = `${name} := string(${item})\n\t\t_ = ${name}\n\t\t`;
