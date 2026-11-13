@@ -5,7 +5,15 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-13
+
+The React Compiler itself (`babel-plugin-react-compiler` + Babel + zod, ~470 vendored files)
+compiles React components and hooks to their auto-memoized form, natively, and an
+OpenAI-compatible chat client streams answers token by token. Getting there drove the round's
+transpiler fixes: JS object identity and callee write-back across Go conversions, one
+backtracking regex VM with JS semantics for every pattern, and module initialization in the
+import graph's evaluation order. TypeNative now requires Node.js 26, and a `--profile` flag
+plus a batch of hot-path fixes narrow the gap with Node on the large examples.
 
 ### Added
 
@@ -110,7 +118,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`null` is not `undefined`:** `typeof null` is `"object"` (it gave
+  `"undefined"`), `String(null)` and `null` in `+` / template strings give
+  `"null"` (`String(null)` printed `<nil>`), and `null` declared or assigned
+  into an `any` / `unknown` variable stays JS null
+- **Classes with `*[Symbol.iterator]()`:** instances destructure
+  (`const [a, b] = bag`, reading only as many values as are bound, so an
+  endless iterator ends and its `finally` runs), spread into call and `new`
+  arguments (`Math.max(...bag)`, `f(...bag)`), and `bag[Symbol.iterator]()`
+  is a generator of its own; subclasses inherit all of it. Spreads that are
+  not the only argument of a rest parameter (`f(1, ...xs, 2)`,
+  `f(...xs, ...ys)`) now compile, for arrays too
+
 - **`(-Infinity).toFixed(n)`** returns `"-Infinity"` (it printed `-Inf`)
+
+- **Namespaces of types only:** `namespace Tokens { export interface Def … }`
+  is flattened like any namespace (`Tokens_Def`) instead of being dropped, so
+  `Tokens.Def` resolves to its declaration (an unmatched regex group stored in
+  one of its `string` fields stays `undefined` and `JSON.stringify` leaves it
+  out: marked's `--tokens` printed `"title": ""` for a link definition without
+  a title). Only type references `Ns.T` are rewritten for such a namespace, so
+  a class merged with it keeps its value reads (`Scope.x`, `typeof Scope.x`)
+
 - **Converting an object to a wider struct no longer reads or writes past
   it:** a conversion whose source struct's fields are a prefix of the
   target's (a member held in a merged union's slot) used to view the source's
@@ -122,7 +151,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a strict prefix of merged unions now gets room for their fields, with
   the pointer layout they share, so a member held in a union's slot stays the
   one object). Every other such conversion copies, through the identity
-  cache
+  cache. (A literal's struct read as the interface it matches plus the
+  interface's key list `__keys` read the key list from whatever followed
+  the literal: `JSON.stringify` crashed on marked's table cells)
 - **Module initialization order:** a program's module-level code now runs in
   the import graph's evaluation order, as JS evaluates it — each module after
   the modules it imports, with an import cycle's back edge not waiting (the

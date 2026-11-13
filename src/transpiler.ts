@@ -1426,24 +1426,28 @@ function flattenNamespaces(statements: AstNode[]): { statements: AstNode[]; name
   return { statements: out, namespaces };
 }
 
-// N.x / N.Inner.x (expressions) and N.T (types) → the flattened identifiers
-function rewriteNamespaceAccess(nodes: AstNode[], namespaces: Set<string>): void {
-  const rewrite = (node: AstNode): AstNode => {
+// N.x / N.Inner.x (expressions) and N.T (types) → the flattened identifiers;
+// a type-only namespace's name only in types (N.T)
+function rewriteNamespaceAccess(nodes: AstNode[], namespaces: Set<string>, typeNamespaces: Set<string> = new Set()): void {
+  // (inTypeQuery: typeof N.x names a value, not a type)
+  const rewrite = (node: AstNode, inTypeQuery: boolean): AstNode => {
+    const childInTypeQuery = inTypeQuery || node.kind === 'TypeQuery';
     for (const key of Object.keys(node)) {
       if (key === 'parent') continue;
       const value = node[key];
-      if (Array.isArray(value)) node[key] = value.map((v) => (v && typeof v.kind === 'string' ? rewrite(v) : v));
-      else if (value && typeof value.kind === 'string') node[key] = rewrite(value);
+      if (Array.isArray(value)) node[key] = value.map((v) => (v && typeof v.kind === 'string' ? rewrite(v, childInTypeQuery) : v));
+      else if (value && typeof value.kind === 'string') node[key] = rewrite(value, childInTypeQuery);
     }
     const left = node.kind === 'PropertyAccessExpression' ? node.expression : node.kind === 'QualifiedName' ? node.left : undefined;
     const right = node.kind === 'PropertyAccessExpression' ? node.name : node.kind === 'QualifiedName' ? node.right : undefined;
-    if (isIdentifier(left) && namespaces.has(left.text) && isIdentifier(right)) {
+    const isNamespace = isIdentifier(left) && (namespaces.has(left.text) || (node.kind === 'QualifiedName' && !inTypeQuery && typeNamespaces.has(left.text)));
+    if (isNamespace && isIdentifier(right)) {
       const flattened: AstNode = { kind: 'Identifier', text: `${left.text}_${right.text}` };
       return flattened;
     }
     return node;
   };
-  for (let i = 0; i < nodes.length; i++) nodes[i] = rewrite(nodes[i]);
+  for (let i = 0; i < nodes.length; i++) nodes[i] = rewrite(nodes[i], false);
 }
 
 // &struct{ a T; b U }{a: …, b: …} as &Named{a: …, b: …} (its keyed fields are
@@ -1596,19 +1600,34 @@ function linkFlattenedNamespaceTypes(asts: AstNode[]): void {
 }
 
 function lowerNamespaces(sourceFile: AstNode): void {
-  // (a namespace of types only — namespace Scope { export type Binding = … }
-  // merged with a class — declares no value: dropped, so the name stays the
-  // class's)
+  // (a namespace of types only — namespace Tokens { export interface Def … },
+  // or namespace Scope { export type Binding = … } merged with a class —
+  // declares no value: its types are flattened like any namespace's (Ns_T),
+  // but only type references Ns.T are rewritten, so a value read Scope.x stays
+  // the class's)
   const typeOnly = (st: AstNode): boolean => {
     if (st.kind !== 'ModuleDeclaration' || !st.body) return false;
-    const body = st.body.kind === 'ModuleDeclaration' ? st.body : st.body;
-    if (body.kind === 'ModuleDeclaration') return typeOnly(body);
-    return (body.statements ?? []).every((m: AstNode) => ['TypeAliasDeclaration', 'InterfaceDeclaration'].includes(m.kind));
+    if (st.body.kind === 'ModuleDeclaration') return typeOnly(st.body);
+    return (st.body.statements ?? []).every((m: AstNode) => ['TypeAliasDeclaration', 'InterfaceDeclaration'].includes(m.kind));
   };
-  sourceFile.statements = (sourceFile.statements ?? []).filter((st: AstNode) => !typeOnly(st));
+  // (a namespace declared again with values — namespace N { const x } — is a
+  // value namespace)
+  const typeOnlyNames = new Set<string>();
+  const valueNames = new Set<string>();
+  for (const st of sourceFile.statements ?? []) {
+    if (st.kind !== 'ModuleDeclaration' || !isIdentifier(st.name)) continue;
+    (typeOnly(st) ? typeOnlyNames : valueNames).add(st.name.text);
+  }
+  for (const n of valueNames) typeOnlyNames.delete(n);
   const flat = flattenNamespaces(sourceFile.statements ?? []);
   sourceFile.statements = flat.statements;
-  if (flat.namespaces.length > 0) rewriteNamespaceAccess(sourceFile.statements, new Set(flat.namespaces));
+  if (flat.namespaces.length > 0) {
+    // (namespace A.B { … } flattens to A and A_B: both are A's, so both type-only)
+    const isTypeOnly = (n: string): boolean => [...typeOnlyNames].some((t) => n === t || n.startsWith(`${t}_`));
+    const valueNamespaces = new Set(flat.namespaces.filter((n) => !isTypeOnly(n)));
+    const typeNamespaces = new Set(flat.namespaces.filter(isTypeOnly));
+    rewriteNamespaceAccess(sourceFile.statements, valueNamespaces, typeNamespaces);
+  }
 }
 
 // Destructuring the declaration code handles flat patterns only; nested
@@ -3974,7 +3993,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (template.kind === 'NoSubstitutionTemplateLiteral') return raw(template);
     const pieces = [raw(template.head)];
     for (const span of template.templateSpans ?? []) {
-      pieces.push(jsStringOf(visit(span.expression), inferExpressionType(span.expression)), raw(span.literal));
+      pieces.push(jsStringOfExpr(span.expression), raw(span.literal));
     }
     return `(${pieces.join(' + ')})`;
   } else if (node.kind === 'TaggedTemplateExpression' && isIdentifier(node.tag) && declaredFunctions.has(node.tag.text)) {
@@ -4572,6 +4591,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         initExpr = `${initExpr}.Keys()`;
         initGoType = `[]${extractMapKeyType(initGoType)}`;
       }
+      // (const [a, b] = bag of a class with *[Symbol.iterator](): the values
+      // it yields — as many as are bound, every one for a ...rest)
+      const iterableClass = iterableClassOf(initGoType);
+      if (iterableClass) {
+        const elements = node.name.elements ?? [];
+        const hasRest = elements.some((el: AstNode) => !isOmittedExpression(el) && el.dotDotDotToken);
+        initExpr = iterableClassValues(initExpr, iterableClass, hasRest ? undefined : elements.length);
+        initGoType = `[]${iterableClass.elemType}`;
+      }
       const tmpVar = getTempName('arr');
       // (a record's array value is the reference it holds: destructure its elements)
       if (initGoType?.startsWith('*[]')) {
@@ -4798,7 +4826,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     let initializer = node.initializer ? `= ${visit(node.initializer)}` : '';
     // Wrap non-nil values assigned to nullable primitive pointer types
     // Only wrap for primitive pointers (*string, *float64, *bool), not class pointers
-    if (node.initializer && (type.startsWith('*') || isDynamicValue(node.initializer) || (type !== ':' && isNilPlaceholder(node.initializer)))) {
+    // (null into an any variable: JS null, distinct from undefined — see toGoValueOfType)
+    if (node.initializer && (type.startsWith('*') || isDynamicValue(node.initializer) || (type !== ':' && isNilPlaceholder(node.initializer)) ||
+      (type === 'interface{}' && unwrapParentheses(node.initializer).kind === 'NullKeyword'))) {
       initializer = `= ${toGoValueOfType(node.initializer, type)}`;
     } else if (node.initializer && type.startsWith('func(') && (isFunctionExpression(unwrapParentheses(node.initializer)) || isArrowFunction(unwrapParentheses(node.initializer)))) {
       // (a function literal into a typed slot: adapted when its annotated
@@ -4918,6 +4948,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (isExpressionStatement(node.parent) || discardedExpressions.has(node)) return code;
     return `(*${code})`;
   } else if (isCallExpression(node)) {
+    spreadIterableClassArguments(node);
+    // bag[Symbol.iterator](): the generator the class's *[Symbol.iterator]() makes
+    if (iterableClassIteratorCall(node)) return `${visit(unwrapParentheses(node.expression).expression)}.Symbol_iterator()`;
     // obj.fn!(…): the non-null assertion has no run-time effect
     while (node.expression?.kind === 'NonNullExpression') {
       node.expression = node.expression.expression;
@@ -5896,6 +5929,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // nullable primitive, asserts a dynamic one …)
     if (op === '=' && isIdentifier(node.left)) {
       let leftType = variableGoTypes.get(node.left.text);
+      // (null into an any variable: JS null, distinct from undefined)
+      if (leftType === 'interface{}' && unwrapParentheses(node.right).kind === 'NullKeyword' && !referenceArrays.has(node.left.text)) {
+        return `${visit(node.left)} = ${toGoValueOfType(node.right, 'interface{}')}`;
+      }
       // (an array variable that is not an array reference holds the slice)
       if (leftType?.startsWith('*[]') && !referenceArrays.has(node.left.text)) leftType = leftType.slice(1);
       if (leftType && leftType !== 'interface{}' && leftType !== ':') {
@@ -5911,10 +5948,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const leftType = inferExpressionType(node.left);
       const rightType = inferExpressionType(node.right);
       if (leftType === 'string' && rightType !== 'string') {
-        return `${visit(node.left)} + ${jsStringOf(visit(node.right), rightType)}`;
+        return `${visit(node.left)} + ${jsStringOfExpr(node.right)}`;
       }
       if (rightType === 'string' && leftType !== 'string') {
-        return `${jsStringOf(visit(node.left), leftType)} + ${visit(node.right)}`;
+        return `${jsStringOfExpr(node.left)} + ${visit(node.right)}`;
       }
     }
     // x += y on a dynamic (any) variable: JS's + (concatenation or sum)
@@ -7211,6 +7248,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
 
     return result.replace(MOCK_SLOTS_MARK, mockSlots.join('\n')).trim();
   } else if (isNewExpression(node)) {
+    spreadIterableClassArguments(node);
     const nodeNew = visitNodeNew(node);
     if (nodeNew !== undefined) return nodeNew;
     const goTarget = goNewTarget(node);
@@ -9199,8 +9237,17 @@ function jsStringOf(code: string, goType: string | undefined): string {
     useHelper('error');
     return `TnJSString(${code})`;
   }
+  // (undefined: its own name — Go's %v would print <nil>)
+  if (goType === 'nil' && code === 'nil') return '"undefined"';
   importedPackages.add('fmt');
   return `fmt.Sprintf("%v", ${code})`;
+}
+
+// An expression as the string JS would produce for it: jsStringOf, with the
+// null literal as "null" (its Go code, nil, is undefined's too)
+function jsStringOfExpr(expr: AstNode): string {
+  if (unwrapParentheses(expr).kind === 'NullKeyword') return '"null"';
+  return jsStringOf(visit(expr), inferExpressionType(expr));
 }
 
 // JS bitwise operators work on 32-bit integers (ToInt32 / ToUint32)
@@ -9461,6 +9508,19 @@ function visitSpreadCallArguments(node: AstNode): string[] {
         const generic = (fn?.typeParameters ?? []).some((tp: AstNode) => tp.name?.text && new RegExp(`\\b${tp.name.text}\\b`).test(paramType));
         result.push(generic || params[i].initializer || params[i].dotDotDotToken ? `TnAt(${source}, ${i - start})` : convertBetweenGoTypes(`TnAt(${source}, ${i - start})`, 'interface{}', paramType));
       }
+    }
+  }
+  // f(1, ...xs, 2) / f(...xs, ...ys) into a declared rest parameter: Go takes
+  // a spread only as the one variadic argument, so the rest's values are
+  // appended into a single slice
+  const restParam = fn && params.length > 0 ? params[params.length - 1] : undefined;
+  if (restParam?.dotDotDotToken && isVariadic) {
+    const restStart = params.length - 1;
+    const tail = result.slice(restStart);
+    const restType = getParameterGoType(restParam);
+    if (tail.length > 1 && tail.some((piece) => piece.endsWith('...')) && restType.startsWith('...')) {
+      const collected = tail.reduce((acc, piece) => `append(${acc}, ${piece})`, `[]${restType.slice(3)}{}`);
+      return [...result.slice(0, restStart), `${collected}...`];
     }
   }
   return result;
@@ -12494,7 +12554,7 @@ function getArrayLiteralElementType(node: AstNode): string {
       else if (spreadType === 'string') spreadElement = 'string';
       // (a generator's channel: what it yields; an iterable class instance's)
       else if (spreadType?.startsWith('chan ')) spreadElement = spreadType.slice(5);
-      else if (spreadType?.startsWith('*') && classIteratorMethods.has(spreadType.slice(1).replace(/\[.*\]$/, ''))) spreadElement = classIteratorMethods.get(spreadType.slice(1).replace(/\[.*\]$/, ''));
+      else if (iterableClassOf(spreadType)) spreadElement = iterableClassOf(spreadType)!.elemType;
       else if (spreadType?.startsWith('*TnMap[') && extractMapValueType(spreadType) === 'struct{}') spreadElement = extractMapKeyType(spreadType);
       else if (spreadType?.startsWith('*TnMap[')) return '[]interface{}';
       else if (!spreadType || spreadType === 'interface{}') return 'interface{}';
@@ -12707,6 +12767,64 @@ function toGoStringLiteral(value: string): string {
     .replace(/\\(\\|u[dD][89a-fA-F][0-9a-fA-F]{2})/g, (escape: string, body: string) => (body === '\\' ? escape : '\\uFFFD'));
 }
 
+// The class of an instance whose class defines *[Symbol.iterator](), and
+// the type it yields (undefined for other values)
+function iterableClassOf(goType: string | undefined): { className: string, elemType: string } | undefined {
+  if (!goType?.startsWith('*')) return undefined;
+  const className = goType.slice(1).replace(/\[.*\]$/, '');
+  const elemType = classIteratorYieldType(className);
+  return elemType ? { className, elemType } : undefined;
+}
+
+// What a class's *[Symbol.iterator]() yields, its own or inherited
+function classIteratorYieldType(className: string): string | undefined {
+  for (let name: string | undefined = className, depth = 0; name && depth < 16; name = classParentNames.get(name), depth++) {
+    const elemType = classIteratorMethods.get(name);
+    if (elemType) return elemType;
+  }
+  return undefined;
+}
+
+// The values an iterable class instance yields, as a Go []T. With a limit
+// (const [a, b] = bag: only that many are read), the generator's push form
+// stops there — its finally blocks run, an endless one ends — as JS's
+// iterator close does
+function iterableClassValues(code: string, iterable: { className: string, elemType: string }, limit?: number): string {
+  const { className, elemType } = iterable;
+  const member = findClassGenerator(className, 'Symbol_iterator');
+  if (limit !== undefined && member && generatorSeqEligible(member)) {
+    if (limit === 0) return `func() []${elemType} { _ = ${code}; return []${elemType}{} }()`;
+    return `func() []${elemType} { __out := []${elemType}{}; for __v := range ${code}.Symbol_iterator__seq() { __out = append(__out, __v); if len(__out) == ${limit} { break } }; return __out }()`;
+  }
+  return `func() []${elemType} { __out := []${elemType}{}; for __v := range ${code}.Symbol_iterator() { __out = append(__out, __v) }; return __out }()`;
+}
+
+// bag[Symbol.iterator]() of a class with *[Symbol.iterator](): its class
+// and what it yields (undefined for any other expression)
+function iterableClassIteratorCall(node: AstNode): { className: string, elemType: string } | undefined {
+  if (!node || !isCallExpression(node) || (node.arguments ?? []).length > 0 || hasQuestionDot(node)) return undefined;
+  const callee = unwrapParentheses(node.expression);
+  if (!isElementAccessExpression(callee) || hasQuestionDot(callee)) return undefined;
+  const key = unwrapParentheses(callee.argumentExpression);
+  if (!isPropertyAccessExpression(key) || !isIdentifier(key.expression) || key.expression.text !== 'Symbol' || key.name.text !== 'iterator') return undefined;
+  if (callee.expression.kind === 'SuperKeyword') return undefined;
+  return iterableClassOf(inferExpressionType(callee.expression));
+}
+
+// f(...bag) / new C(...bag) of a class with *[Symbol.iterator](): rewritten
+// to f(...[...bag]), so every call path spreads the slice of what it yields
+function spreadIterableClassArguments(node: AstNode): void {
+  for (const arg of node.arguments ?? []) {
+    if (!isSpreadElement(arg) || !iterableClassOf(inferExpressionType(arg.expression))) continue;
+    const source = arg.expression;
+    const array: AstNode = { kind: 'ArrayLiteralExpression', elements: [], parent: arg, pos: source.pos, end: source.end, line: source.line, column: source.column };
+    const inner: AstNode = { kind: 'SpreadElement', expression: source, parent: array, pos: source.pos, end: source.end };
+    array.elements = [inner];
+    source.parent = inner;
+    arg.expression = array;
+  }
+}
+
 // A spread source as a Go slice; Sets spread their elements (map keys) and
 // strings spread into []string of runes (like JS [...str])
 function visitSpreadSource(expr: AstNode): string {
@@ -12722,10 +12840,8 @@ function visitSpreadSource(expr: AstNode): string {
   }
   if (isTypedArrayGoType(sourceType)) return `${visit(expr)}.tnFloats()`;
   // [...iterable] of a class with a *[Symbol.iterator]() method: what it yields
-  const iterableClass = sourceType?.startsWith('*') ? classIteratorMethods.get(sourceType.slice(1).replace(/\[.*\]$/, '')) : undefined;
-  if (iterableClass) {
-    return `func() []${iterableClass} { __out := []${iterableClass}{}; for __v := range ${visit(expr)}.Symbol_iterator() { __out = append(__out, __v) }; return __out }()`;
-  }
+  const iterableClass = iterableClassOf(sourceType);
+  if (iterableClass) return iterableClassValues(visit(expr), iterableClass);
   // [...generator()]: every value it yields
   if (sourceType?.startsWith('chan ')) {
     const element = sourceType.slice(5);
@@ -12803,7 +12919,7 @@ function visitTemplateExpression(node: AstNode): string {
       useHelper('dynamic');
       parts.push(`TnFormat(${visit(span.expression)})`);
     } else {
-      parts.push(jsStringOf(visit(span.expression), spanType));
+      parts.push(jsStringOfExpr(span.expression));
     }
 
     if (span.literal.text.length > 0) {
@@ -13457,6 +13573,9 @@ function inferRawExpressionType(expr: AstNode): string | undefined {
 }
 
 function inferExpressionTypeUncached(expr: AstNode): string | undefined {
+  // bag[Symbol.iterator](): the generator of what the class yields
+  const classIterator = iterableClassIteratorCall(expr);
+  if (classIterator) return `chan ${classIterator.elemType}`;
   // object.toString read as a value: the method, any (see isObjectProtoMethodRead)
   if (expr && isObjectProtoMethodRead(expr)) return 'interface{}';
   // a?.b.c: nullish when the guard's base is (the rest of the chain skips)
@@ -18030,7 +18149,8 @@ const callHandlers: Record<string, CallHandler> = {
     if (arg && isIdentifier(arg) && referenceArrays.has(arg.text) && (variableGoTypes.get(arg.text) ?? '').startsWith('*[]')) return `(${getSafeName(arg.text)} != nil)`;
     return `TnIsArray(${args[0]})`;
   },
-  'String': (_caller, args) => jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
+  // (String(null): "null" — the literal's Go code, nil, is undefined's too)
+  'String': (_caller, args) => currentCallArgNodes[0] && unwrapParentheses(currentCallArgNodes[0]).kind === 'NullKeyword' ? '"null"' : jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
   'String.fromCharCode': (_caller, args) => `string(rune(int(${args[0] ? numericArgument(args[0], 0) : '0'})))`,
   // Symbol(description) — unique values for record keys
   Symbol: (_caller, args) => {
@@ -19052,6 +19172,8 @@ function visitTypeOf(node: AstNode): string {
     useHelper('typeOf');
     return `TnTypeOf(interface{}(${visit(node.expression)}))`;
   }
+  // (typeof null is "object": the literal's Go type, nil, is undefined's too)
+  if (operand.kind === 'NullKeyword') return toGoStringLiteral('object');
   const known: Record<string, string> = { string: 'string', float64: 'number', bool: 'boolean', nil: 'undefined', '*tnbig.Int': 'bigint', '*TnSymbol': 'symbol' };
   if (goType && known[goType]) return toGoStringLiteral(known[goType]);
   // (a function or object value held in a variable or field may be unset)
@@ -35588,7 +35710,7 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
   // An iterable class instance: range its Symbol_iterator channel
   if (iterType?.startsWith('*')) {
     const iterClass = iterType.slice(1).replace(/\[.*\]$/, '');
-    const yieldType = classIteratorMethods.get(iterClass);
+    const yieldType = classIteratorYieldType(iterClass);
     if (yieldType) {
       const declaration = isVariableDeclarationList(node.initializer)
         ? node.initializer.declarations[0]
