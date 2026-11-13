@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--profile`:** the built program writes a CPU profile (`runtime/pprof`) to
+  `$TYPENATIVE_CPUPROFILE` (default `cpu.pprof`) when it exits, on every exit
+  path, for `go tool pprof`
+- **Performance probes:** `num-bitwise`, `num-mod-int`, `map-delete`,
+  `gen-for-of`, `str-short-scan`, `str-concat-plus`, `regex-site`,
+  `events-emit`, `async-await` and `exc-throw-rare`, covering what the large
+  examples stress; `performance/README.md` lists each fixed and open cause
 - **examples/react-compiler:** the React Compiler (`babel-plugin-react-compiler` + Babel 7.29 parser/traverse/generator + zod 4, ~470 vendored files) compiling
   React components and hooks to their auto-memoized form, natively. The build
   drove a series of transpiler and runtime fixes (below); every fixture in
@@ -85,9 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slower than Node and examples/yaml-cli from 3.8x to 1.9x (the native binary
   now finishes first up to about 1–2 MB per run), and marked's ReDoS inputs from
   over 72 s to 4.7 s in total
+- **Hot paths:** bitwise operators no longer call `math.Mod` (`TnInt32`
+  converts in-range values directly, literal operands fold, nested bitwise
+  expressions stay int32); `%` on integers is an `int64` remainder; a sync
+  generator iterated by `for…of` runs as a Go range function instead of a
+  goroutine in lockstep (break and throw keep JS's `finally` / `catch`
+  semantics); `Map` / `Set` deletes are O(1) and key handling takes no
+  reflection; `s = s + …` appends in place like `s += …`; `charCodeAt` over
+  short strings no longer rescans the string; `toFixed` skips exact
+  1100-digit formatting except on ties; any-typed objects read their map
+  first; `Record<string, any>` views of an any object share its map;
+  common listener shapes are called without reflection; regex literals
+  share their compiled program per site. Probe medians: bitwise 2160 →
+  129 ms, `%` loops 4527 → 162 ms, generators 1843 → 12 ms (now 4.4x faster
+  than Node), `Set` churn 1556 → 97 ms. examples/react-compiler at 64 KB
+  runs 26% faster (7.5 s → 5.6 s, interleaved against the previous build)
 
 ### Fixed
 
+- **`(-Infinity).toFixed(n)`** returns `"-Infinity"` (it printed `-Inf`)
 - **Converting an object to a wider struct no longer reads or writes past
   it:** a conversion whose source struct's fields are a prefix of the
   target's (a member held in a merged union's slot) used to view the source's

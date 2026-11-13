@@ -174,20 +174,25 @@ func (e *TnEventEmitter) removeAllListeners(event ...string) *TnEventEmitter {
 func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 	s := e.st()
 	s.mu.Lock()
-	list := append([]*tnListener{}, s.events[event]...)
+	// (listener lists are copy-on-write — adds append past this length, removals
+	// build a new slice — so the list as it is now is the emit's snapshot)
+	list := s.events[event]
 	// once listeners are removed before they run
-	kept := []*tnListener{}
-	for _, l := range s.events[event] {
-		if !l.once {
-			kept = append(kept, l)
+	for i, l := range list {
+		if l.once {
+			kept := append([]*tnListener{}, list[:i]...)
+			for _, rest := range list[i+1:] {
+				if !rest.once {
+					kept = append(kept, rest)
+				}
+			}
+			e.setListeners(event, kept)
+			break
 		}
 	}
-	if len(kept) != len(s.events[event]) {
-		e.setListeners(event, kept)
-	}
-	monitors := []*tnListener{}
+	var monitors []*tnListener
 	if event == "error" {
-		monitors = append(monitors, s.events[TnErrorMonitor]...)
+		monitors = s.events[TnErrorMonitor]
 	}
 	capture := s.captureRejections
 	s.mu.Unlock()

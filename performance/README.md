@@ -40,7 +40,8 @@ suite on an idle machine before committing new numbers.
 ## Writing a probe
 
 A probe is `performance/<area>-<name>.ts`. Areas: `num`, `str`, `arr`, `map`,
-`set`, `obj`, `class`, `union`, `any`, `fn`, `regex`, `json`, `exc`.
+`set`, `obj`, `class`, `union`, `any`, `fn`, `gen`, `regex`, `json`, `exc`,
+`events`, `async`.
 
 ```ts
 // perf: one line saying what this measures (shown in the results table)
@@ -84,9 +85,11 @@ console.log(`elapsed: ${elapsed.toFixed(2)} ms`);
   feedback that a large program rarely gets. Use the ratios here to rank hot
   paths against each other and to track them over time. They are not a
   prediction for whole programs; see [examples/](../examples/) for those.
-- To find out *why* a probe is slow, write its Go with
-  `node bin/cli.js --source performance/<probe>.ts --emit-go <dir>` and profile
-  it with `runtime/pprof` (`go tool pprof -top -cum`).
+- To find out *why* a probe (or any program) is slow, build it with `--profile`:
+  the binary writes a CPU profile to `$TYPENATIVE_CPUPROFILE` (default
+  `cpu.pprof`) when it exits. Read it with `go tool pprof -top -cum <exe> <profile>`.
+  For example, `node bin/cli.js --source performance/num-bitwise.ts --output bw.exe --profile`.
+  `--emit-go <dir>` shows the Go the profile's lines refer to.
 
 ## Results
 
@@ -96,41 +99,81 @@ Last run 2026-11-12: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, N
 
 | Probe | Measures | Node ms (min / median) | TypeNative ms (min / median) | TypeNative vs Node (median) |
 | ----- | -------- | ---------------------: | ---------------------------: | :-------------------------- |
-| [any-dynamic](any-dynamic.ts) | property reads and writes on `any` objects (nested objects, arrays) | 51.0 / 51.5 | 3771 / 3812 (4 runs) | 74.0x slower |
-| [any-record-view](any-record-view.ts) | viewing an `any` object as `Record<string, any>` and reading keys through it | 5.3 / 5.4 | 1686 / 1696 | 316.3x slower |
-| [arr-hof](arr-hof.ts) | `map` / `filter` / `reduce` / `some` chains with closure callbacks | 87.1 / 87.9 | 63.5 / 64.2 | **1.4x faster** |
-| [arr-push-index](arr-push-index.ts) | `push`, indexed reads/writes and `length` on number arrays | 50.7 / 53.0 | 139 / 141 | 2.7x slower |
-| [arr-sort](arr-sort.ts) | `sort` of numbers with a comparator and of strings in default order | 116 / 122 | 310 / 324 | 2.7x slower |
-| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 69.2 / 78.0 | 720 / 743 | 9.5x slower |
-| [exc-try-catch](exc-try-catch.ts) | `try`/`catch`/`finally` in a hot loop where one call in 1,024 throws | 23.7 / 24.1 | 267 / 267 | 11.1x slower |
-| [fn-closures](fn-closures.ts) | creating closures over mutable state and calling them indirectly | 151 / 173 | 271 / 350 | 2.0x slower |
-| [fn-recursion-tree](fn-recursion-tree.ts) | building and walking binary trees (recursion plus allocation) | 101 / 103 | 150 / 152 | 1.5x slower |
-| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 37.0 / 38.8 | 321 / 324 | 8.3x slower |
-| [map-string-keys](map-string-keys.ts) | `Map<string, number>` `set` / `get` / `has` word counting | 90.2 / 92.4 | 119 / 123 | 1.3x slower |
-| [num-arith-loop](num-arith-loop.ts) | tight float64 loop with `%`, `*` and `Math.floor` | 73.8 / 74.3 | 4485 / 4527 (4 runs) | 61.0x slower |
-| [num-to-string](num-to-string.ts) | number/string conversion: `String(n)`, `toFixed`, `Number(str)`, `parseInt` | 98.2 / 101 | 659 / 667 | 6.6x slower |
-| [obj-alloc](obj-alloc.ts) | allocating many short-lived object literals and class instances | 62.1 / 63.2 | 332 / 333 | 5.3x slower |
-| [regex-exec](regex-exec.ts) | regex `test`, `exec` with groups and global `replace` over log lines | 65.5 / 66.2 | 107 / 109 | 1.6x slower |
-| [set-ops](set-ops.ts) | `Set<number>` `add` / `has` / `delete` on a 16,384-entry set | 36.8 / 37.3 | 1552 / 1556 | 41.7x slower |
-| [str-char-scan](str-char-scan.ts) | lexer-style scan of a large string with `charCodeAt` and `str[i]` | 77.3 / 77.8 | 316 / 318 | 4.1x slower |
-| [str-concat](str-concat.ts) | growing ~20 KB strings with `s += x` and `s = s + …` (each pass starts empty) | 9.9 / 10.2 | 50.7 / 51.5 | 5.1x slower |
-| [str-split-join](str-split-join.ts) | `split`, `join`, `indexOf`, `slice` and `trim` on CSV-like lines | 54.8 / 56.6 | 38.0 / 39.1 | **1.4x faster** |
-| [str-template](str-template.ts) | template literals mixing strings, integers, floats and booleans | 50.5 / 51.1 | 104 / 105 | 2.1x slower |
-| [union-switch](union-switch.ts) | evaluating an expression tree of a discriminated union with `switch (e.kind)` | 87.9 / 91.1 | 311 / 319 | 3.5x slower |
+| [any-dynamic](any-dynamic.ts) | property reads and writes on `any` objects (nested objects, arrays) | 51.8 / 53.3 | 2474 / 2501 (6 runs) | 46.9x slower |
+| [any-record-view](any-record-view.ts) | viewing an `any` object as `Record<string, any>` and reading keys through it | 5.6 / 6.1 | 269 / 273 | 45.0x slower |
+| [arr-hof](arr-hof.ts) | `map` / `filter` / `reduce` / `some` chains with closure callbacks | 89.8 / 91.6 | 26.9 / 27.7 | **3.3x faster** |
+| [arr-push-index](arr-push-index.ts) | `push`, indexed reads/writes and `length` on number arrays | 52.5 / 54.3 | 55.0 / 55.7 | 1.0x slower |
+| [arr-sort](arr-sort.ts) | `sort` of numbers with a comparator and of strings in default order | 125 / 127 | 347 / 354 | 2.8x slower |
+| [async-await](async-await.ts) | `await` chains of async functions that resolve immediately | 102 / 105 | 1985 / 2040 | 19.5x slower |
+| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 71.8 / 71.9 | 709 / 730 | 10.2x slower |
+| [events-emit](events-emit.ts) | `EventEmitter` `emit` to listeners taking 0, 1 and 2 arguments | 73.6 / 73.9 | 655 / 658 | 8.9x slower |
+| [exc-throw-rare](exc-throw-rare.ts) | `try`/`catch`/`finally` in a hot loop where nothing throws | 204 / 205 | 241 / 242 | 1.2x slower |
+| [exc-try-catch](exc-try-catch.ts) | `try`/`catch`/`finally` in a hot loop where one call in 1,024 throws | 24.7 / 24.9 | 60.8 / 61.1 | 2.5x slower |
+| [fn-closures](fn-closures.ts) | creating closures over mutable state and calling them indirectly | 144 / 145 | 58.6 / 60.0 | **2.4x faster** |
+| [fn-recursion-tree](fn-recursion-tree.ts) | building and walking binary trees (recursion plus allocation) | 101 / 103 | 149 / 152 | 1.5x slower |
+| [gen-for-of](gen-for-of.ts) | sync generators (a method, `*[Symbol.iterator]()`, `yield*`) consumed by `for…of` | 52.6 / 53.1 | 11.6 / 12.1 | **4.4x faster** |
+| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 38.4 / 38.6 | 347 / 350 | 9.1x slower |
+| [map-delete](map-delete.ts) | `Map<string, number>` insert/delete churn (an LRU-style sliding window) | 29.3 / 36.0 | 165 / 167 | 4.6x slower |
+| [map-string-keys](map-string-keys.ts) | `Map<string, number>` `set` / `get` / `has` word counting | 92.3 / 93.5 | 118 / 119 | 1.3x slower |
+| [num-arith-loop](num-arith-loop.ts) | tight float64 loop with `%`, `*` and `Math.floor` | 76.5 / 77.4 | 159 / 162 | 2.1x slower |
+| [num-bitwise](num-bitwise.ts) | bitwise and, or, xor and shifts (`<<`, `>>`, `>>>`) on integers, and flag tests | 22.1 / 22.6 | 128 / 129 | 5.7x slower |
+| [num-mod-int](num-mod-int.ts) | `%` on integer operands (hash buckets, cycling indexes) | 64.2 / 64.6 | 187 / 188 | 2.9x slower |
+| [num-to-string](num-to-string.ts) | number/string conversion: `String(n)`, `toFixed`, `Number(str)`, `parseInt` | 102 / 105 | 402 / 416 | 4.0x slower |
+| [obj-alloc](obj-alloc.ts) | allocating many short-lived object literals and class instances | 62.5 / 63.4 | 187 / 191 | 3.0x slower |
+| [regex-exec](regex-exec.ts) | regex `test`, `exec` with groups and global `replace` over log lines | 67.9 / 69.5 | 105 / 107 | 1.5x slower |
+| [regex-site](regex-site.ts) | `/g` regex literals evaluated inside a hot function, and `.index` on long input | 78.2 / 83.8 | 159 / 168 | 2.0x slower |
+| [set-ops](set-ops.ts) | `Set<number>` `add` / `has` / `delete` on a 16,384-entry set | 38.6 / 39.5 | 95.5 / 97.0 | 2.5x slower |
+| [str-char-scan](str-char-scan.ts) | lexer-style scan of a large string with `charCodeAt` and `str[i]` | 79.8 / 81.0 | 326 / 327 | 4.0x slower |
+| [str-concat](str-concat.ts) | growing ~20 KB strings with `s += x` and `s = s + …` (each pass starts empty) | 10.1 / 10.6 | 25.5 / 26.4 | 2.5x slower |
+| [str-concat-plus](str-concat-plus.ts) | growing strings with `s = s + x` (not `+=`), each pass starting empty | 30.5 / 31.8 | 97.1 / 101 | 3.2x slower |
+| [str-short-scan](str-short-scan.ts) | `charCodeAt(i)` / `s[i]` scans of many short (< 512 byte) lines | 30.8 / 31.1 | 195 / 196 | 6.3x slower |
+| [str-split-join](str-split-join.ts) | `split`, `join`, `indexOf`, `slice` and `trim` on CSV-like lines | 56.0 / 57.2 | 40.5 / 40.8 | **1.4x faster** |
+| [str-template](str-template.ts) | template literals mixing strings, integers, floats and booleans | 53.5 / 54.7 | 84.1 / 84.6 | 1.5x slower |
+| [union-switch](union-switch.ts) | evaluating an expression tree of a discriminated union with `switch (e.kind)` | 120 / 125 | 488 / 495 | 4.0x slower |
 
 <!-- perf-results:end -->
 
 ## Findings
 
 Causes behind the worst rows. Each one is checked against the generated Go
-(`--emit-go`) or the runtime source in [src/transpiler.ts](../src/transpiler.ts).
-Update this section when a fix lands or a new cause is confirmed.
+(`--emit-go`), a `--profile` CPU profile, or the runtime source in
+[src/transpiler.ts](../src/transpiler.ts). Update this section when a fix
+lands or a new cause is confirmed. Before/after figures are native medians on
+the reference machine.
+
+### Fixed
+
+| Probe | Cause | Fix | Before → after |
+| ----- | ----- | --- | -------------- |
+| `num-bitwise` (and every probe that uses `&`) | Every bitwise operand went through `TnInt32`, which called `math.Mod(f, 2^32)`: about 90% of the probe's time. | `TnInt32` converts in-range values directly and falls back to `math.Mod` only past ±2^63. Literal operands fold at compile time, and nested bitwise expressions stay `int32` between operators. | 2160 → 129 ms |
+| `num-arith-loop`, `num-mod-int` | `a % b` compiled to `math.Mod`, whose cost grows with the exponent gap between the operands (about 150 ns for `2e8 % 13`). | `TnMod`: an `int64` remainder when both operands are integers that fit, keeping a `-0` result; `math.Mod` otherwise. | 4527 → 162 ms; 2827 → 188 ms |
+| `gen-for-of` | A generator ran as a goroutine sending on a channel, in lockstep with the loop: two goroutine hand-offs and two `sync.Map` lookups per value. | A sync generator also compiles to a push form, `name__seq(args)`: a Go range function whose `yield` runs the loop body. `for…of` over a direct generator call (or a class's `*[Symbol.iterator]()`) uses it. A break unwinds the generator through its `finally` blocks, and a throw from the loop body passes its `catch` clauses, as in JS. `.next()`, spread and stored generators keep the channel form. | 1843 → 12 ms |
+| `set-ops`, `map-delete` | `TnMap.Delete` scanned and spliced the insertion-order key slice, so each delete was O(size). Every `Get`/`Has`/`Set` also called `reflect.TypeFor[K]().Kind()`. | Deletes mark the key's slot dead in O(1) (an index map built on the first delete of a map past 16 keys) and dead slots are compacted before keys are read. The key-kind check is made once per map. | 1556 → 97 ms; 367 → 167 ms |
+| `any-record-view` | Viewing an `any` object as `Record<string, any>` rebuilt it through reflection on every conversion. | `TnRecordOf` wraps the object's own map in a `TnMap` (writes through the record reach the object, as in JS). | 1696 → 273 ms |
+| `str-concat`, `str-concat-plus` | `s = s + a + b` compiled to Go string concatenation, which copies all of `s`: O(n²) for a growing string. `TnStrAppend` also locked with `defer`. | `s = s + …` on a string variable or field (the target as the leftmost operand) compiles to `TnStrAppend`, like `s += …`, and the lock no longer uses `defer`. | 51.5 → 26.4 ms; 3365 → 101 ms |
+| `str-short-scan` | For strings under 512 bytes, `charCodeAt(i)` rescanned `s[:i+1]` for ASCII and `s.length` rescanned all of `s`, so walking a line was O(n²). | The ASCII answer for the last short string asked about is remembered (the entry holds the string). Indexes under 64 still scan their few bytes. | 300 → 196 ms |
+| `any-dynamic` | Reads of `any` objects missed the field-plan table and went through accessor and reflect checks before reaching the map. Writes boxed every value through `reflect.ValueOf`. | `TnGetRef`/`TnGetPeek` read a `map[string]interface{}` first. `tnBoxArray` returns scalars and maps without reflect. | 3812 → 2501 ms |
+| `num-to-string` | `toFixed` formatted 1100 digits on every call to round exactly. | `strconv` already rounds to nearest. Only a value exactly on a tie (its last binary fraction digit at 2^-(d+1)) takes the exact path. | 667 → 416 ms |
+| `events-emit` | `TnInvoke` called every listener through `reflect.Value.Call`. `emit` copied the listener list and built a `kept` list on every call. | Typed fast paths for `func()`, `func(any)`, `func(any, any)`, `func(...any)`, `func(float64)` and `func(string)`. `emit` uses the copy-on-write listener slice as its snapshot. | 1372 → 658 ms |
+| `regex-site` | Each evaluation of a regex literal looked its compiled program up again (key concatenation and a mutex). | One package-level `TnRegexSite` per literal shares the program and RE2 fallbacks. Each evaluation is still a new `RegExp` with its own `lastIndex`. | 177 → 168 ms |
+
+### Open
 
 | Probe | Cause | Status |
 | ----- | ----- | ------ |
-| `str-concat` | Typed `string` `+=` and `s = s + …` compile to Go string `+=`, which copies the whole string on every append, so a growing string costs O(n²). V8 uses ropes. The runtime's in-place `tnConcat` buffer is only used for dynamic (`any`) `+`. At 200,000 appends one string took 39 s. | open |
-| `any-record-view` | Assigning an `any` object to `Record<string, any>` emits `TnAsPtr[TnMap[string, interface{}]](r)`. The value is a `map[string]interface{}`, not a `TnMap`, so `TnAsPtr` falls through to the reflect-based `TnConvertDynamic` and rebuilds the map on every access. | open |
-| `num-arith-loop` | `a % b` compiles to `math.Mod`, whose cost grows with the exponent gap between the operands: about 150 ns per call for `2e8 % 13`. The same loop with `*` in place of `%` runs in 150 ms instead of 7.7 s. A fast path for integral operands (`int64` modulo when both fit) would cover almost every real use. | open |
-| `set-ops` | `TnMap.Delete` (shared by `Map` and `Set`) scans the insertion-order `keys` slice and splices it, so each delete is O(size) and clearing a set is O(n²). | open |
-| `any-dynamic` | Every read and write on an `any` object goes through the dynamic helpers (`TnGetRef`, `TnGetPeek`, `TnSet`, `TnDynamicAdd`, `TnAs`), about 320 ns per record per pass (seven property accesses). Not profiled yet. | open |
-| `num-to-string`, `json-roundtrip`, `class-dispatch` | 10–13x slower. Not profiled yet. | open |
+| `async-await` | Each `await` resumes its async function through a goroutine hand-off (an OS-thread wakeup, `semawakeup` about a fifth of the profile), about 2 µs per `await` where V8 takes 0.1 µs. Running a resolved `await` on the spot would avoid it. | open |
+| `class-dispatch` | A call on an abstract base class goes through `TnCall_<method>(recv, args ...interface{})`: arguments and results are boxed (`convT64` and allocation are about 40% of the profile) and unboxed with `TnAs`. A typed dispatcher per hierarchy whose overrides share a signature would remove the boxing. | open |
+| `json-roundtrip` | `JSON.parse` streams `encoding/json` tokens into a `TnMap` per object, then `as Item[]` converts the maps to structs through `TnConvertDynamic` (about 45%). Decoding straight into the target type would skip both. | open |
+| `any-dynamic` | What remains is the representation: an `any` object is a Go `map[string]interface{}`, so every property access hashes its key (`memHashAES` and map lookups are about 45%), where V8 reads a slot through a hidden class. | open |
+| `events-emit` | Listener shapes other than the fast paths (here `(a: number, b: string)`) still go through `reflect.Value.Call` (about a third), and each `emit` hashes the event name. | open |
+| `str-short-scan`, `str-char-scan` | Indexes under 64 still rescan their prefix for ASCII (`tnStrIsASCII` is 40% of `str-short-scan`). A loop over `s.charCodeAt(i)` could test `s` once before the loop. | open |
+| `num-bitwise`, `num-mod-int` | Loop counters are `float64`, so every integer operation converts float64 to int and back. Inferring integer loop variables (`for (let i = 0; i < n; i++)` where `i` stays integral) would remove the conversions. | open |
+| `gen-for-of` (examples) | Generators still run as goroutines when they're called through dynamic dispatch (`unit.ops()` on a polymorphic `CompilationUnit` in angular-templates), and when they're spread or passed to `Array.from` (`TnToArray` receives through reflect). | open |
+
+Bugs found while writing the probes (not performance, not fixed here):
+`'x' + null` and `'x' + undefined` render `<nil>`, and a `-0` concatenated
+into a string renders `-0e+0` (JS gives `null`, `undefined` and `0`); a
+subclass of a class with `*[Symbol.iterator]()` can't be iterated (the
+generator isn't copied into it); and examples/marked-cli's parity run fails
+69 `--tokens` cases at this commit and before (a `def` token's unmatched
+`title` group prints `""` where Node omits `undefined`).

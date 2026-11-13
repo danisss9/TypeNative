@@ -11,6 +11,48 @@ import { platform } from 'node:os';
 import * as childProcess from 'node:child_process';
 import { transpileToNative, GENERATED_HEADER } from './transpiler.js';
 import { VERSION } from './version.js';
+// --profile: starts a CPU profile before any module initializes and stops
+// it on every exit path (see profiled() in the build)
+const PROFILE_GO = `${GENERATED_HEADER}
+
+package main
+
+import (
+	"os"
+	"runtime/pprof"
+)
+
+var tnProfileOut *os.File
+
+func init() {
+	path := os.Getenv("TYPENATIVE_CPUPROFILE")
+	if path == "" {
+		path = "cpu.pprof"
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return
+	}
+	if pprof.StartCPUProfile(f) != nil {
+		f.Close()
+		return
+	}
+	tnProfileOut = f
+}
+
+func tnProfileStop() {
+	if tnProfileOut != nil {
+		pprof.StopCPUProfile()
+		tnProfileOut.Close()
+		tnProfileOut = nil
+	}
+}
+
+func tnProfileExit(code int) {
+	tnProfileStop()
+	os.Exit(code)
+}
+`;
 // The minimum Go toolchain generated code needs
 const MIN_GO_MAJOR = 1;
 const MIN_GO_MINOR = 26;
@@ -30,6 +72,8 @@ Options:
   --gui                Windowed app: no console window on Windows (ignored elsewhere)
   --cover              Build with coverage counters, for go:runtime/coverage
                        (set GOCOVERDIR to also write a profile at exit)
+  --profile            Write a CPU profile at exit, to $TYPENATIVE_CPUPROFILE
+                       (default cpu.pprof); read it with go tool pprof
   --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
   --no-typecheck       Skip type-checking
   -h, --help           Show this help
@@ -52,6 +96,7 @@ export function parseCliArgs(argv) {
         release: false,
         gui: false,
         cover: false,
+        profile: false,
         source: null,
         output: null,
         target: null,
@@ -82,6 +127,8 @@ export function parseCliArgs(argv) {
             args.gui = true;
         else if (arg === '--cover')
             args.cover = true;
+        else if (arg === '--profile')
+            args.profile = true;
         else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
             if (value === null) {
                 if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
@@ -484,11 +531,22 @@ export function run(opts) {
         else if (existing.endsWith('.go') && (!opts.emitGo || fs.readFileSync(file, 'utf-8').startsWith(GENERATED_HEADER)))
             fs.rmSync(file);
     }
-    fs.writeFileSync(path.join(outDir, 'code.go'), transpileResult.main);
+    // --profile: every exit path (process.exit, the end of the event loop)
+    // stops the profile first, so os.Exit goes through tnProfileExit
+    // (and a main that returns stops it too)
+    const profiled = (content) => (opts.profile ? content.replace(/\bos\.Exit\(/g, 'tnProfileExit(') : content);
+    const mainGo = opts.profile
+        ? transpileResult.main.replace(/^func main\(\) \{$/m, 'func main() {\n\tdefer tnProfileStop()')
+        : transpileResult.main;
+    fs.writeFileSync(path.join(outDir, 'code.go'), profiled(mainGo));
     const goFiles = ['code.go'];
     for (const [filename, content] of transpileResult.files) {
-        fs.writeFileSync(path.join(outDir, filename), content);
+        fs.writeFileSync(path.join(outDir, filename), profiled(content));
         goFiles.push(filename);
+    }
+    if (opts.profile) {
+        fs.writeFileSync(path.join(outDir, 'tn_profile.go'), PROFILE_GO);
+        goFiles.push('tn_profile.go');
     }
     if (sourceDir)
         copyEmbeds(sourceDir, transpileResult.embeds, outDir);

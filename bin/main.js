@@ -56,6 +56,7 @@ import { VERSION } from './version.js';
         release: args.release,
         gui: args.gui,
         cover: args.cover,
+        profile: args.profile,
         emitGo: args.emitGo
     });
 })();

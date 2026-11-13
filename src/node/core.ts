@@ -9,6 +9,39 @@ type TnCallback = func(...interface{})
 // Calls a JS callback of any Go func type with JS arguments: extra arguments
 // are dropped, missing ones are zero values, numbers convert between kinds
 func TnInvoke(fn interface{}, args ...interface{}) interface{} {
+	// (the common listener and callback shapes, called without reflect)
+	switch f := fn.(type) {
+	case func():
+		if f != nil {
+			f()
+		}
+		return nil
+	case func(...interface{}):
+		if f != nil {
+			f(args...)
+		}
+		return nil
+	case func(interface{}):
+		if f != nil {
+			f(tnInvokeAt(args, 0))
+		}
+		return nil
+	case func(interface{}, interface{}):
+		if f != nil {
+			f(tnInvokeAt(args, 0), tnInvokeAt(args, 1))
+		}
+		return nil
+	case func(float64):
+		if a, ok := tnInvokeAt(args, 0).(float64); ok && f != nil {
+			f(a)
+			return nil
+		}
+	case func(string):
+		if a, ok := tnInvokeAt(args, 0).(string); ok && f != nil {
+			f(a)
+			return nil
+		}
+	}
 	fv := reflect.ValueOf(fn)
 	if !fv.IsValid() || fv.Kind() != reflect.Func || fv.IsNil() {
 		return nil
@@ -33,6 +66,14 @@ func TnInvoke(fn interface{}, args ...interface{}) interface{} {
 	out := fv.Call(in)
 	if len(out) > 0 {
 		return out[0].Interface()
+	}
+	return nil
+}
+
+// args[i], or nil past the end (a missing argument is undefined)
+func tnInvokeAt(args []interface{}, i int) interface{} {
+	if i < len(args) {
+		return args[i]
 	}
 	return nil
 }

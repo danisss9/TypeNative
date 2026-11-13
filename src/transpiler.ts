@@ -488,6 +488,9 @@ const asyncFunctionNames = new Set<string>();
 const generatorFunctionNames = new Set<string>();
 // While emitting an async/generator function body: `return`/`yield` send here
 let asyncChannelVar: string | undefined;
+// Emitting a generator's push form (name__seq): yield calls the consumer's
+// loop body instead of sending on a channel (see emitGeneratorSeq)
+let generatorSeqMode = false;
 let asyncFunctionNode: AstNode | undefined;
 // True while emitting the body of an async function (not a generator): its
 // return settles the promise (ordered wake); a generator's sends stay raw
@@ -3361,6 +3364,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   helperProvidedPackages.clear();
   mainPackageVariables.length = 0;
   keyOrderTables.clear();
+  regexSites.clear();
   mergedUnionStructs.clear();
   literalSites.clear();
   goInterfaceAdapters.clear();
@@ -4022,7 +4026,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // real RE2 regex is one (see staysPlainRegex)
     if (needsStatefulRegex(pattern, flags) || !staysPlainRegex(node)) {
       useHelper('fancyRegex');
-      return `TnRegexCompile("${goPattern}", "${flags}", ${toGoStringLiteral(pattern)})`;
+      return `TnRegexAt(&${regexSiteFor(pattern, flags)}, "${goPattern}", "${flags}", ${toGoStringLiteral(pattern)})`;
     }
     importedPackages.add('regexp');
     const goFlags = jsRegexFlagsToGo(flags);
@@ -5598,7 +5602,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const r = operand(node.right, bigRight);
       if (op === '%') {
         importedPackages.add('math');
-        return `math.Mod(${l}, ${r})`;
+        useHelper('dynamic');
+        return `TnMod(${l}, ${r})`;
       }
       if (op === '**') {
         importedPackages.add('math');
@@ -5626,7 +5631,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const dr = asMillis(node.right, bigRight);
       if (op === '%') {
         importedPackages.add('math');
-        return `math.Mod(${dl}, ${dr})`;
+        useHelper('dynamic');
+        return `TnMod(${dl}, ${dr})`;
       }
       if (op === '**') {
         importedPackages.add('math');
@@ -5664,12 +5670,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (op === '%') {
       importedPackages.add('math');
       useHelper('dynamic');
-      return `math.Mod(${asNumber(node.left)}, ${asNumber(node.right)})`;
+      return `TnMod(${asNumber(node.left)}, ${asNumber(node.right)})`;
     }
     if (op === '%=') {
       importedPackages.add('math');
+      useHelper('dynamic');
       const left = visit(node.left);
-      return `${left} = math.Mod(${left}, ${visit(node.right)})`;
+      return `${left} = TnMod(${left}, ${visit(node.right)})`;
     }
     if (['<', '>', '<=', '>=', '-', '*', '/', '+', '+=', '-=', '*=', '/='].includes(op)) {
       const dynamicArithmetic = visitDynamicArithmetic(node, op);
@@ -5806,6 +5813,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `TnSetIndex(${visit(base)}, ${visit(node.left.argumentExpression)}, ${visit(node.right)})`;
       }
     }
+    // s = s + a + b on a string field or variable: an append, as s += a + b
+    // (in place when s is long, see strAppend), not a copy of all of s
+    if (op === '=' && isBinaryExpression(node.right) && node.right.operatorToken.kind === 'PlusToken') {
+      const append = visitSelfAppend(node.left, node.right);
+      if (append) return append;
+    }
     // (err.name = … / err.framesToPop = …: an Error's own properties)
     if (op === '=' && isPropertyAccessExpression(node.left) && isIdentifier(node.left.name) && (isUndeclaredErrorMember(node.left) ||
       (node.left.name.text === 'name' && inferExpressionType(node.left.expression) === '*TnError'))) {
@@ -5940,6 +5953,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
       // (the value converted to what the generator's channel carries)
       const yieldType = asyncFunctionNode ? getGeneratorYieldType(asyncFunctionNode) : 'interface{}';
+      if (generatorSeqMode) return visitSeqYield(node, yieldType);
       if (node.asteriskToken) {
         // yield* other(): forward every value of the delegated generator
         // (each in step with this generator's consumer)
@@ -8097,6 +8111,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   if (goType && goType !== 'interface{}' && goType !== ':' && (isDynamicValue(expr) || dynamicCall)) {
     useHelper('dynamic');
     // T | undefined: box the dynamic value (nil when missing or of another type)
+    // (an any object as a Record<string, any>: a view of the same object)
+    if (goType === '*TnMap[string, interface{}]') {
+      useHelper('recordView');
+      return `TnRecordOf(${code})`;
+    }
     if (goType.startsWith('*')) return `TnAsPtr[${goType.slice(1)}](${code})`;
     return `TnAs[${goType}](${goType === 'string' || goType === 'float64' ? peekRead(code) : code})`;
   }
@@ -9199,6 +9218,66 @@ function asFloatOperand(node: AstNode, code: string): string {
   return code;
 }
 
+// Whether a and b name the same variable or field path (s, this.buf, a.b.c)
+function sameReference(a: AstNode, b: AstNode): boolean {
+  if (isIdentifier(a) && isIdentifier(b)) return a.text === b.text;
+  if (a?.kind === 'ThisKeyword' && b?.kind === 'ThisKeyword') return true;
+  if (isPropertyAccessExpression(a) && isPropertyAccessExpression(b)) {
+    if (hasQuestionDot(a) || hasQuestionDot(b) || !isIdentifier(a.name) || !isIdentifier(b.name)) return false;
+    return a.name.text === b.name.text && sameReference(a.expression, b.expression);
+  }
+  return false;
+}
+
+// target = target + x + y … where target is a string variable or field held
+// as a plain Go selector: TnStrAppend(target, x + y …), each part rendered as
+// JS renders it (the left operand of every + is already a string)
+function visitSelfAppend(target: AstNode, sum: AstNode): string | undefined {
+  if (!(isIdentifier(target) || isPropertyAccessExpression(target)) || inferExpressionType(target) !== 'string') return undefined;
+  const parts: AstNode[] = [];
+  let leftmost = sum;
+  while (isBinaryExpression(leftmost) && leftmost.operatorToken.kind === 'PlusToken') {
+    parts.unshift(leftmost.right);
+    leftmost = leftmost.left;
+  }
+  if (!sameReference(leftmost, target)) return undefined;
+  // (parts of other types — null, undefined, objects — keep the + path)
+  if (parts.some((part) => !['string', 'float64', 'bool'].includes(inferExpressionType(part) ?? ''))) return undefined;
+  const code = visit(target);
+  if (!/^[A-Za-z_][\wǂ]*(\.[A-Za-z_][\wǂ]*)*$/.test(code)) return undefined;
+  useHelper('strAppend');
+  const rendered = parts.map((part) => {
+    const partType = inferExpressionType(part);
+    return partType === 'string' ? visit(part) : jsStringOf(visit(part), partType);
+  });
+  return `${code} = TnStrAppend(${code}, ${rendered.join(' + ')})`;
+}
+
+// A numeric literal (or a negated one, in parentheses or not) as JS ToInt32
+// sees it, or undefined for any other expression
+function literalInt32(node: AstNode): number | undefined {
+  while (isParenthesizedExpression(node)) node = node.expression;
+  let sign = 1;
+  if (isPrefixUnaryExpression(node) && (node.operator === 'MinusToken' || node.operator === 'PlusToken')) {
+    if (node.operator === 'MinusToken') sign = -1;
+    node = node.operand;
+    while (isParenthesizedExpression(node)) node = node.expression;
+  }
+  // (a bitwise expression of literals, 1 << 4 | 1 << 7, folds whole)
+  if (sign === 1 && isBinaryExpression(node)) {
+    const op = bitwiseOps[node.operatorToken.kind];
+    const a = op ? literalInt32(node.left) : undefined;
+    const b = op ? literalInt32(node.right) : undefined;
+    if (a === undefined || b === undefined) return undefined;
+    const folded: Record<string, number> = { '&': a & b, '|': a | b, '^': a ^ b, '<<': a << b, '>>': a >> b, '>>>': a >>> b };
+    return folded[op] | 0;
+  }
+  if (!isNumericLiteral(node)) return undefined;
+  const value = Number(String(node.text).replace(/_/g, ''));
+  if (!Number.isFinite(value)) return undefined;
+  return (sign * value) | 0;
+}
+
 function visitBitwise(node: AstNode, op: string): string | undefined {
   const kind = node.operatorToken.kind;
   const base: Record<string, string> = {
@@ -9240,14 +9319,67 @@ function visitBitwise(node: AstNode, op: string): string | undefined {
     return isAssignment ? `${bl} = ${bigValue}` : bigValue;
   }
   useHelper('dynamic');
-  const left = asFloatOperand(node.left, visit(node.left));
-  const right = asFloatOperand(node.right, visit(node.right));
-  let value: string;
-  if (bitOp === '>>>') value = `float64(TnUint32(${left}) >> (TnUint32(${right}) & 31))`;
-  else if (bitOp === '<<' || bitOp === '>>') {
-    value = `float64(TnInt32(${left}) ${bitOp} (TnUint32(${right}) & 31))`;
-  } else value = `float64(TnInt32(${left}) ${bitOp} TnInt32(${right}))`;
-  return isAssignment ? `${left} = ${value}` : value;
+  if (isAssignment) {
+    const left = asFloatOperand(node.left, visit(node.left));
+    return `${left} = float64(${bitwiseInt(node, bitOp, left).code})`;
+  }
+  return `float64(${bitwiseInt(node, bitOp).code})`;
+}
+
+const bitwiseOps: Record<string, string> = {
+  AmpersandToken: '&',
+  BarToken: '|',
+  CaretToken: '^',
+  LessThanLessThanToken: '<<',
+  GreaterThanGreaterThanToken: '>>',
+  GreaterThanGreaterThanGreaterThanToken: '>>>'
+};
+
+// A bitwise operand that is itself a (non-bigint) bitwise expression: its
+// int32 / uint32 result, without the float64 round trip (flags >> 3 & 0xff)
+function nestedBitwise(side: AstNode): { code: string; unsigned: boolean } | undefined {
+  while (isParenthesizedExpression(side)) side = side.expression;
+  if (!isBinaryExpression(side)) return undefined;
+  const bitOp = bitwiseOps[side.operatorToken.kind];
+  if (!bitOp) return undefined;
+  if (inferExpressionType(side.left) === '*tnbig.Int' || inferExpressionType(side.right) === '*tnbig.Int') return undefined;
+  return bitwiseInt(side, bitOp);
+}
+
+// The Go int32 (or, for >>>, uint32) expression of a number bitwise op.
+// Literal operands convert at compile time (i & 1023, x >> 3); a compound
+// assignment passes its target's code as leftCode.
+function bitwiseInt(node: AstNode, bitOp: string, leftCode?: string): { code: string; unsigned: boolean } {
+  const leftConst = leftCode !== undefined ? undefined : literalInt32(node.left);
+  const rightConst = literalInt32(node.right);
+  // (both literals: the whole result, as Go rejects a constant shift that overflows)
+  if (leftConst !== undefined && rightConst !== undefined) {
+    const folded: Record<string, number> = { '&': leftConst & rightConst, '|': leftConst | rightConst, '^': leftConst ^ rightConst, '<<': leftConst << rightConst, '>>': leftConst >> rightConst, '>>>': leftConst >>> rightConst };
+    return { code: `${folded[bitOp]}`, unsigned: bitOp === '>>>' };
+  }
+  const leftNested = leftCode !== undefined || leftConst !== undefined ? undefined : nestedBitwise(node.left);
+  const rightNested = rightConst !== undefined ? undefined : nestedBitwise(node.right);
+  const left = leftCode ?? (leftConst !== undefined || leftNested ? '' : asFloatOperand(node.left, visit(node.left)));
+  const right = rightConst !== undefined || rightNested ? '' : asFloatOperand(node.right, visit(node.right));
+  const int32Of = (code: string, constant: number | undefined, nested: { code: string; unsigned: boolean } | undefined): string => {
+    if (constant !== undefined) return `int32(${constant})`;
+    if (nested) return nested.unsigned ? `int32(${nested.code})` : nested.code;
+    return `TnInt32(${code})`;
+  };
+  const uint32Of = (code: string, constant: number | undefined, nested: { code: string; unsigned: boolean } | undefined): string => {
+    if (constant !== undefined) return `uint32(${constant >>> 0})`;
+    if (nested) return nested.unsigned ? nested.code : `uint32(${nested.code})`;
+    return `TnUint32(${code})`;
+  };
+  const shiftOf = (code: string, constant: number | undefined, nested: { code: string; unsigned: boolean } | undefined): string =>
+    constant !== undefined ? String(constant & 31) : `(${uint32Of(code, undefined, nested)} & 31)`;
+  if (bitOp === '>>>') {
+    return { code: `(${uint32Of(left, leftConst, leftNested)} >> ${shiftOf(right, rightConst, rightNested)})`, unsigned: true };
+  }
+  if (bitOp === '<<' || bitOp === '>>') {
+    return { code: `(${int32Of(left, leftConst, leftNested)} ${bitOp} ${shiftOf(right, rightConst, rightNested)})`, unsigned: false };
+  }
+  return { code: `(${int32Of(left, leftConst, leftNested)} ${bitOp} ${int32Of(right, rightConst, rightNested)})`, unsigned: false };
 }
 
 // delete obj.key / delete obj[key] on maps (Records and dynamic objects)
@@ -9568,7 +9700,148 @@ function emitGeneratorMethod(className: string, typeParamNames: string, member: 
   asyncFunctionNode = prevFn;
   asyncChannelIsAsync = prevIsAsync;
   if (genName !== 'Symbol_iterator') recordMethodSignature(className, memberKey(member.name) ?? genName, genName, methodParameterInfo.signature, `chan ${yieldType}`);
-  return `${lineMarker(member)}func (self *${className}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n`;
+  const seq = generatorSeqEligible(member)
+    ? `${lineMarker(member)}${emitGeneratorSeq(member, `func (self *${className}${typeParamNames}) ${genName}__seq`, methodParameterInfo, '')}\n\n`
+    : '';
+  return `${lineMarker(member)}func (self *${className}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n${seq}`;
+}
+
+// A sync generator a for…of can run without a goroutine: its push form
+// name__seq(args) is a Go range function whose yield runs the loop body (so
+// the body sees the generator's state as JS's next() would, with no channel
+// or thread hand-off). Not for generators whose yields are values (x = yield
+// v, next(v) only), that return a value, or that hold declarations the body
+// would emit twice (nested functions and classes)
+const generatorSeqCache = new Map<AstNode, boolean>();
+function generatorSeqEligible(fn: AstNode): boolean {
+  if (!fn?.asteriskToken || !fn.body || !isBlock(fn.body)) return false;
+  if ((fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return false;
+  const cached = generatorSeqCache.get(fn);
+  if (cached !== undefined) return cached;
+  const blocked = containsNode(fn.body, (n) => {
+    if (isFunctionDeclaration(n) || n.kind === 'ClassDeclaration' || n.kind === 'ClassExpression') return true;
+    if ((isFunctionExpression(n) || isMethodDeclaration(n)) && n.asteriskToken) return true;
+    if (n.kind === 'YieldExpression' && getEnclosingFunction(n) === fn && !isExpressionStatement(n.parent)) return true;
+    if (isReturnStatement(n) && n.expression && getEnclosingFunction(n) === fn) return true;
+    if (isIdentifier(n) && n.text === 'arguments') return true;
+    return false;
+  });
+  generatorSeqCache.set(fn, !blocked);
+  return !blocked;
+}
+
+// The push form of a generator (see generatorSeqEligible). A consumer's
+// break makes yield return false: the body unwinds by panicking its own stop
+// token (finally blocks run, as on JS's return()), recovered on the way out.
+// While the consumer runs (__yc), a panic is the consumer's own: the body's
+// catch clauses pass it on (seqCatchGuard), as JS never routes a loop body's
+// throw into the generator.
+function emitGeneratorSeq(fn: AstNode, header: string, parameterInfo: { signature: string; prefixBlockContent?: string }, prologue: string): string {
+  const yieldType = getGeneratorYieldType(fn);
+  const prevChannel = asyncChannelVar;
+  const prevFn = asyncFunctionNode;
+  const prevIsAsync = asyncChannelIsAsync;
+  const prevSeq = generatorSeqMode;
+  asyncChannelVar = '__ch';
+  asyncFunctionNode = fn;
+  asyncChannelIsAsync = false;
+  generatorSeqMode = true;
+  let body: string;
+  try {
+    body = visit(fn.body, { prefixBlockContent: parameterInfo.prefixBlockContent });
+  } finally {
+    asyncChannelVar = prevChannel;
+    asyncFunctionNode = prevFn;
+    asyncChannelIsAsync = prevIsAsync;
+    generatorSeqMode = prevSeq;
+  }
+  useHelper('generatorStep');
+  return `${header}(${parameterInfo.signature}) func(func(${yieldType}) bool) {\n\t${prologue}return func(__yield func(${yieldType}) bool) {\n\t\t__stop := new(tnGenStop)\n\t\t__yc := false\n\t\t_, _ = __stop, __yc\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil && r != interface{}(__stop) {\n\t\t\t\tpanic(r)\n\t\t\t}\n\t\t}()\n\t\t${body.trim()}\n\t}\n}`;
+}
+
+// A catch clause in a generator's push form: a panic raised while the
+// consumer's loop body ran (or the stop of a break) is not the generator's
+function seqCatchGuard(): string {
+  return generatorSeqMode ? 'if __yc {\n\t\t\t\t\tpanic(r)\n\t\t\t\t}\n\t\t\t\t' : '';
+}
+
+// One yield of a generator's push form: the consumer's loop body runs for the
+// value; false (a break, a return out of the loop) stops the generator
+function visitSeqYield(node: AstNode, yieldType: string): string {
+  const step = (value: string): string => `__yc = true\n\t\tif !__yield(${value}) {\n\t\t\tpanic(__stop)\n\t\t}\n\t\t__yc = false`;
+  if (!node.asteriskToken) {
+    return step(node.expression ? toGoValueOfType(node.expression, yieldType) : 'nil');
+  }
+  // yield* xs: every value of the delegated generator (its own push form when
+  // it has one), or of an array or other iterable
+  useHelper('dynamic');
+  const delegatedType = inferExpressionType(node.expression) ?? '';
+  const convert = (fromType: string): string =>
+    fromType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
+  if (delegatedType.startsWith('chan ')) {
+    const code = visit(node.expression);
+    const seq = generatorSeqCall(node.expression, code);
+    if (seq) return `for __yv := range ${seq} {\n\t\t${step(convert(delegatedType.slice(5)))}\n\t\t}`;
+    useHelper('generatorStep');
+    return `func() {\n\t\t__yg := TnGenLockstep(${code})\n\t\tfor __yfirst := true; ; __yfirst = false {\n\t\t\tif !__yfirst {\n\t\t\t\tTnGenAck(__yg)\n\t\t\t}\n\t\t\t__yv, __yok := <-__yg\n\t\t\tif !__yok {\n\t\t\t\tTnGenDone(__yg)\n\t\t\t\treturn\n\t\t\t}\n\t\t\t${step(convert(delegatedType.slice(5)))}\n\t\t}\n\t\t}()`;
+  }
+  const arrayType = delegatedType.replace(/^\*\[\]/, '[]');
+  const arrayElement = arrayType.startsWith('[]') ? arrayType.slice(2) : '';
+  const source = arrayElement ? (delegatedType.startsWith('*[]') ? `(*${visit(node.expression)})` : visit(node.expression)) : `TnToArray(${visit(node.expression)})`;
+  if (!arrayElement) useHelper('arraySubclass');
+  return `for _, __yv := range ${source} {\n\t\t${step(convert(arrayElement || 'interface{}'))}\n\t\t}`;
+}
+
+// The generator method a class (or the nearest ancestor defining it) has
+// under a name: Symbol_iterator for *[Symbol.iterator]()
+function findClassGenerator(className: string, genName: string, depth = 0): AstNode | undefined {
+  const decl = declaredClasses.get(className);
+  if (!decl || depth > 16) return undefined;
+  for (const member of decl.members ?? []) {
+    if (!isMethodDeclaration(member) && !isPropertyDeclaration(member) && !isGetAccessor(member)) continue;
+    let name: string | undefined;
+    if (member.name?.kind === 'ComputedPropertyName') {
+      const e = member.name.expression;
+      if (isPropertyAccessExpression(e) && isIdentifier(e.expression) && e.expression.text === 'Symbol' && e.name.text === 'iterator') name = 'Symbol_iterator';
+    } else if (member.name && isIdentifier(member.name)) name = member.name.text;
+    if (name !== genName) continue;
+    return isMethodDeclaration(member) && member.asteriskToken ? member : undefined;
+  }
+  for (const clause of decl.heritageClauses ?? []) {
+    if (clause.token !== 'ExtendsKeyword') continue;
+    const base = clause.types?.[0]?.expression;
+    if (base && isIdentifier(base)) return findClassGenerator(base.text, genName, depth + 1);
+  }
+  return undefined;
+}
+
+// The push form of a generator call a for…of (or yield*) iterates, when the
+// called generator has one: f(a) → f__seq(a), o.m(a) → o.m__seq(a). code is
+// the call as emitted; undefined leaves the channel form.
+function generatorSeqCall(expr: AstNode, code: string): string | undefined {
+  const call = unwrapParentheses(expr);
+  if (!isCallExpression(call) || call.questionDotToken) return undefined;
+  const callee = call.expression;
+  if (isIdentifier(callee)) {
+    const decl = declaredFunctions.get(callee.text);
+    if (!decl || !isFunctionDeclaration(decl) || decl.parent?.kind !== 'SourceFile' || !generatorSeqEligible(decl)) return undefined;
+    const goName = getSafeName(callee.text);
+    if (!code.startsWith(`${goName}(`) && !code.startsWith(`${goName}[`)) return undefined;
+    return `${goName}__seq${code.slice(goName.length)}`;
+  }
+  if (isPropertyAccessExpression(callee) && !hasQuestionDot(callee) && isIdentifier(callee.name)) {
+    const recvType = inferExpressionType(callee.expression) ?? '';
+    if (!recvType.startsWith('*') || recvType.startsWith('*[]')) return undefined;
+    const className = recvType.slice(1).replace(/\[.*\]$/, '');
+    const member = findClassGenerator(className, callee.name.text);
+    if (!member || !generatorSeqEligible(member)) return undefined;
+    const marker = `.${callee.name.text}(`;
+    const at = code.indexOf(marker);
+    // (the receiver as emitted, then the call: o.m(args) exactly once)
+    if (at <= 0 || code.indexOf(marker, at + 1) >= 0 || !code.endsWith(')')) return undefined;
+    return `${code.slice(0, at)}.${callee.name.text}__seq(${code.slice(at + marker.length)}`;
+  }
+  return undefined;
 }
 
 // The trailing parameters an override lacks of the method it overrides
@@ -12270,6 +12543,21 @@ function objectTypeHasKeyOrder(name: string): boolean {
 }
 
 const keyOrderTables = new Map<string, string>();
+
+// One TnRegexSite per distinct regex literal (flags/pattern): every
+// evaluation makes its own RegExp, and they share the compiled program
+const regexSites = new Map<string, string>();
+
+function regexSiteFor(pattern: string, flags: string): string {
+  const key = `${flags}/${pattern}`;
+  let name = regexSites.get(key);
+  if (!name) {
+    name = `tnRxSite${regexSites.size + 1}`;
+    regexSites.set(key, name);
+    mainPackageVariables.push(`var ${name} TnRegexSite`);
+  }
+  return name;
+}
 
 // &tnKeysN (a package-level []string of the literal's keys) when the
 // literal's keys aren't in the type's declared order, else ''
@@ -19961,7 +20249,7 @@ function visitDynamicCompoundAssignment(node: AstNode, target: AstNode): string 
     const op = operatorTokenText(node.operatorToken).slice(0, -1);
     importedPackages.add('math');
     const combined =
-      op === '%' ? `math.Mod(TnNumber(${read}), TnNumber(${rhs}))`
+      op === '%' ? `TnMod(TnNumber(${read}), TnNumber(${rhs}))`
         : op === '**' ? `math.Pow(TnNumber(${read}), TnNumber(${rhs}))`
           : ['&', '|', '^', '<<', '>>', '>>>'].includes(op) ? `float64(TnInt32(TnNumber(${read})) ${op === '>>>' ? '>>' : op} TnInt32(TnNumber(${rhs})))`
             : `TnNumber(${read}) ${op} TnNumber(${rhs})`;
@@ -21914,8 +22202,12 @@ function emitChannelFunction(node: AstNode, isAsync: boolean, header?: string): 
       `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\tTnStartAsync(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
     );
   }
+  // (a top-level generator declaration: also its push form, see generatorSeqEligible)
+  const seq = !header && isFunctionDeclaration(node) && node.parent?.kind === 'SourceFile' && generatorSeqEligible(node)
+    ? `\n\n${emitGeneratorSeq(node, `func ${name}__seq${typeParams}`, parameterInfo, prologue)}`
+    : '';
   return (
-    `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}`
+    `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}` + seq
   );
 }
 
@@ -23604,6 +23896,7 @@ const helperRequires: Record<string, string[]> = {
   functionValue: [],
   goMust: ['error'],
   goMaps: ['orderedMap'],
+  recordView: ['dynamic', 'orderedMap'],
   bigint: ['error'],
   jsonStringify: ['error', 'dynamic', 'orderedMap'],
   dynamicSpread: ['dynamic', 'orderedMap'],
@@ -24341,7 +24634,7 @@ registerModuleV8(nodeRegistry);
 // Go packages required by each helper, registered when the helper is used.
 const helperPackages: Record<string, string[]> = {
   regexReplaceFirst: ['regexp'],
-  toFixed: ['math', 'strconv', 'strings'],
+  toFixed: ['math', 'math/bits', 'strconv', 'strings'],
   dynamicSpread: ['sort'],
   entryPoints: ['os'],
   orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort', 'unsafe'],
@@ -24370,7 +24663,7 @@ const helperPackages: Record<string, string[]> = {
   error: ['runtime', 'strings', 'fmt'],
   bigint: ['math/big', 'math'],
   symbol: [],
-  fancyRegex: ['regexp', 'strings', 'strconv', 'unicode/utf8'],
+  fancyRegex: ['regexp', 'strings', 'strconv', 'unicode/utf8', 'sync/atomic'],
   regexEngine: ['strings', 'fmt', 'strconv', 'sync', 'sync/atomic', 'unicode', 'unicode/utf8'],
   namedGroups: ['regexp', 'unicode/utf8'],
   regexMatch: ['regexp', 'math', 'strconv', 'unsafe', 'unicode/utf8'],
@@ -24408,6 +24701,10 @@ const goHelpers: Record<string, string> = {
 // yield it waits until the loop body has run for that value (JS resumes a
 // generator only on next()), so the body sees the state the generator saw
 var tnGenAcks sync.Map
+
+// A generator push form's stop token (one per run: a nested generator's
+// stop passes through the outer one). Not zero-sized, so each is unique
+type tnGenStop struct{ _ byte }
 
 // Marks a generator's channel as consumed in step (before its first receive)
 func TnGenLockstep[T any](ch chan T) chan T {
@@ -25041,6 +25338,10 @@ func tnPlainValue(v interface{}) interface{} {
 // reference to it — JS arrays are shared, so a push or splice through the
 // value read changes the field
 func TnGetRef(obj interface{}, key string) interface{} {
+	// (a JSON-like object: no views, accessors or fields, a missing key is undefined)
+	if o, ok := obj.(map[string]interface{}); ok {
+		return o[key]
+	}
 	// (a view copy reads stale fields once the origin was written directly;
 	// resolve to the origin so reads and writes agree — JS object identity)
 	if obj != nil && tnAnyViews.Load() {
@@ -25073,6 +25374,9 @@ func TnGetRef(obj interface{}, key string) interface{} {
 // a conversion): a string or number stays in its field instead of being
 // boxed, so the result must not outlive the expression
 func TnGetPeek(obj interface{}, key string) interface{} {
+	if o, ok := obj.(map[string]interface{}); ok {
+		return o[key]
+	}
 	if obj != nil {
 		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.own {
 			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
@@ -26587,7 +26891,7 @@ func tnBoxArray(v interface{}) interface{} {
 	switch a := v.(type) {
 	case []interface{}:
 		return &a
-	case []byte:
+	case nil, float64, string, bool, []byte, map[string]interface{}, *[]interface{}:
 		return v
 	}
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice {
@@ -27464,8 +27768,21 @@ func TnParseInt(s string, radix float64) float64 {
 	return sign * float64(v)
 }
 
-// JS ToInt32 / ToUint32 (wrapping modulo 2^32; NaN and Infinity → 0)
+// JS ToInt32 / ToUint32 (wrapping modulo 2^32; NaN and Infinity → 0).
+// Almost every operand of a bitwise op is already an int32 (flags, masks,
+// indexes): that path is one compare and a conversion, small enough to inline
 func TnInt32(f float64) int32 {
+	if f >= -2147483648 && f <= 2147483647 {
+		return int32(f)
+	}
+	return tnInt32Wide(f)
+}
+
+func tnInt32Wide(f float64) int32 {
+	// (|f| < 2^63: int64 truncates toward zero, int32 keeps its low 32 bits)
+	if f > -9.2e18 && f < 9.2e18 {
+		return int32(int64(f))
+	}
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0
 	}
@@ -27473,6 +27790,22 @@ func TnInt32(f float64) int32 {
 }
 
 func TnUint32(f float64) uint32 { return uint32(TnInt32(f)) }
+
+// a % b. On integers (indexes, buckets, counters) an int64 remainder is
+// exact and far cheaper than math.Mod, whose cost grows with the operands'
+// exponent gap; the sign follows the dividend in both, as in JS
+func TnMod(a, b float64) float64 {
+	if a > -9.2e18 && a < 9.2e18 && b > -9.2e18 && b < 9.2e18 {
+		ia, ib := int64(a), int64(b)
+		if ib != 0 && float64(ia) == a && float64(ib) == b {
+			if r := ia % ib; r != 0 || !math.Signbit(a) {
+				return float64(r)
+			}
+			return math.Copysign(0, -1)
+		}
+	}
+	return math.Mod(a, b)
+}
 
 func TnDelete(obj interface{}, key interface{}) bool {
 	if record, ok := obj.(interface{ Delete(string) bool }); ok {
@@ -29550,6 +29883,29 @@ var tnStrIdxNext atomic.Uint32
 var tnStrIdxBig [4]atomic.Pointer[tnStrIdx]
 var tnStrIdxBigNext atomic.Uint32
 
+// Whether a short string is all ASCII, remembered for the last one asked
+// about: a lexer reads each character of one line with charCodeAt(i) and
+// tests i < line.length, which would otherwise rescan the line every time
+// (the entry holds the string, so its memory can't be reused by another)
+type tnStrShortEntry struct {
+	s     string
+	ascii bool
+}
+
+var tnStrShortLast atomic.Pointer[tnStrShortEntry]
+
+func tnStrShortASCII(s string) bool {
+	if len(s) <= 64 {
+		return tnStrIsASCII(s)
+	}
+	if c := tnStrShortLast.Load(); c != nil && len(c.s) == len(s) && unsafe.StringData(c.s) == unsafe.StringData(s) {
+		return c.ascii
+	}
+	ascii := tnStrIsASCII(s)
+	tnStrShortLast.Store(&tnStrShortEntry{s, ascii})
+	return ascii
+}
+
 func tnStrIsASCII(s string) bool {
 	i := 0
 	for ; i+8 <= len(s); i += 8 {
@@ -29629,7 +29985,7 @@ func (c *tnStrIdx) slice(p *byte, n int) *tnStrIdx {
 
 // The number of code points
 func tnStrCount(s string) int {
-	if len(s) < tnStrShort && tnStrIsASCII(s) {
+	if len(s) < tnStrShort && tnStrShortASCII(s) {
 		return len(s)
 	}
 	c := tnStrIndexOf(s)
@@ -29701,7 +30057,7 @@ func TnStrLength(s string) float64 { return float64(tnStrCount(s)) }
 // Whether code points are bytes in s (an operation asks once, not per offset)
 func tnStrASCII(s string) bool {
 	if len(s) < tnStrShort {
-		return tnStrIsASCII(s)
+		return tnStrShortASCII(s)
 	}
 	return tnStrIndexOf(s).ascii
 }
@@ -29712,7 +30068,11 @@ func tnStrDirect(s string, n int) bool {
 		return false
 	}
 	if len(s) < tnStrShort {
-		return tnStrIsASCII(s[:n+1])
+		// (an early index needs only its prefix; a later one asks once per string)
+		if n < 64 {
+			return tnStrIsASCII(s[:n+1])
+		}
+		return tnStrShortASCII(s) || tnStrIsASCII(s[:n+1])
 	}
 	return tnStrIndexOf(s).ascii
 }
@@ -30655,6 +31015,13 @@ type TnMap[K comparable, V any] struct {
 	// with get/set), and its non-enumerable keys (defineProperty's default)
 	accessors map[K]*TnAccessor
 	hidden    map[K]bool
+	// O(1) delete: once a key is deleted from a map that isn't tiny, pos
+	// holds each live key's index in keys and the deleted ones stay in keys,
+	// marked dead, until compact drops them (before any read of keys)
+	pos     map[K]int
+	dead    []bool
+	deadN   int
+	keyMode uint8 // hk: 0 not known yet, 1 keys are stored as they are, 2 K is an interface
 }
 
 // An accessor property of a dynamic object: reading it calls Get, writing it
@@ -30682,9 +31049,38 @@ func (m *TnMap[K, V]) read(k K) (V, bool) {
 	return v, ok
 }
 
+// Appends a new key (keeping pos / dead in step when a delete made them)
+func (m *TnMap[K, V]) pushKey(k K) {
+	m.keys = append(m.keys, k)
+	if m.pos != nil {
+		m.pos[m.hk(k)] = len(m.keys) - 1
+		m.dead = append(m.dead, false)
+	}
+}
+
+// Drops deleted keys from keys: every reader of keys calls it first
+func (m *TnMap[K, V]) compact() {
+	if m.deadN == 0 {
+		return
+	}
+	live := make([]K, 0, len(m.keys)-m.deadN)
+	for i, k := range m.keys {
+		if !m.dead[i] {
+			live = append(live, k)
+		}
+	}
+	m.keys, m.pos, m.dead, m.deadN = live, nil, nil, 0
+}
+
+// The live keys in insertion order (no copy: callers must not change it)
+func (m *TnMap[K, V]) liveKeys() []K {
+	m.compact()
+	return m.keys
+}
+
 func (m *TnMap[K, V]) addKey(k K) {
 	if _, ok := m.values[m.hk(k)]; !ok {
-		m.keys = append(m.keys, k)
+		m.pushKey(k)
 		if _, isIndex := tnIndexKey(any(k)); isIndex {
 			m.indexKeys = true
 		}
@@ -30765,6 +31161,7 @@ func (m *TnMap[K, V]) visibleKeys(keys []K) []K {
 // The keys in iteration order: insertion order, except that a plain object
 // (not a Map or Set) lists its array-index keys first, ascending, as JS does
 func (m *TnMap[K, V]) orderedKeys() []K {
+	m.compact()
 	if !m.indexKeys || m.jsKind != 0 {
 		return m.visibleKeys(m.keys)
 	}
@@ -30814,8 +31211,22 @@ type tnIdentityKey struct {
 }
 
 func (m *TnMap[K, V]) hk(k K) K {
-	if reflect.TypeFor[K]().Kind() != reflect.Interface {
+	if m.keyMode == 1 {
 		return k
+	}
+	return m.hkSlow(k)
+}
+
+func (m *TnMap[K, V]) hkSlow(k K) K {
+	if m.keyMode == 0 {
+		// (asked once per map, not per key: reflect is the slow part)
+		m.keyMode = 1
+		if reflect.TypeFor[K]().Kind() == reflect.Interface {
+			m.keyMode = 2
+		}
+		if m.keyMode == 1 {
+			return k
+		}
 	}
 	switch any(k).(type) {
 	case nil, string, float64, bool:
@@ -30859,13 +31270,14 @@ func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
 			return m
 		}
 	}
-	if _, ok := m.values[m.hk(k)]; !ok {
-		m.keys = append(m.keys, k)
+	h := m.hk(k)
+	if _, ok := m.values[h]; !ok {
+		m.pushKey(k)
 		if _, isIndex := tnIndexKey(any(k)); isIndex {
 			m.indexKeys = true
 		}
 	}
-	m.values[m.hk(k)] = v
+	m.values[h] = v
 	return m
 }
 
@@ -30922,21 +31334,57 @@ func (m *TnMap[K, V]) Has(k K) bool {
 }
 
 func (m *TnMap[K, V]) Delete(k K) bool {
-	if _, ok := m.values[m.hk(k)]; !ok {
+	h := m.hk(k)
+	if _, ok := m.values[h]; !ok {
 		return false
 	}
-	delete(m.values, m.hk(k))
+	delete(m.values, h)
 	if m.accessors != nil {
-		delete(m.accessors, m.hk(k))
+		delete(m.accessors, h)
 	}
 	if m.hidden != nil {
-		delete(m.hidden, m.hk(k))
+		delete(m.hidden, h)
 	}
-	for i, key := range m.keys {
-		if m.hk(key) == m.hk(k) {
-			m.keys = append(m.keys[:i], m.keys[i+1:]...)
-			break
+	n := len(m.keys)
+	// the newest key (a stack), or a small map: removed from keys right away
+	if m.deadN == 0 && n > 0 && m.hk(m.keys[n-1]) == h {
+		m.keys = m.keys[:n-1]
+		if m.pos != nil {
+			delete(m.pos, h)
+			m.dead = m.dead[:n-1]
 		}
+		return true
+	}
+	if m.pos == nil && n <= 16 {
+		for i, key := range m.keys {
+			if m.hk(key) == h {
+				m.keys = append(m.keys[:i], m.keys[i+1:]...)
+				break
+			}
+		}
+		return true
+	}
+	// otherwise the key's slot is marked dead: O(1), where a splice is O(n)
+	if m.pos == nil {
+		m.pos = make(map[K]int, n)
+		for i, key := range m.keys {
+			m.pos[m.hk(key)] = i
+		}
+		m.dead = make([]bool, n)
+	}
+	if i, ok := m.pos[h]; ok {
+		delete(m.pos, h)
+		m.dead[i] = true
+		m.deadN++
+	}
+	// (mostly dead: compact, and index the live keys again)
+	if m.deadN > 32 && m.deadN*2 > n {
+		m.compact()
+		m.pos = make(map[K]int, len(m.keys))
+		for i, key := range m.keys {
+			m.pos[m.hk(key)] = i
+		}
+		m.dead = make([]bool, len(m.keys))
 	}
 	return true
 }
@@ -30944,10 +31392,10 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 // Set operations (ES2025), in the receiver's insertion order then the argument's
 func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
-	for _, k := range m.keys {
+	for _, k := range m.liveKeys() {
 		r.Set(k, m.values[m.hk(k)])
 	}
-	for _, k := range o.keys {
+	for _, k := range o.liveKeys() {
 		r.Set(k, o.values[o.hk(k)])
 	}
 	return r
@@ -30955,7 +31403,7 @@ func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
 
 func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
-	for _, k := range m.keys {
+	for _, k := range m.liveKeys() {
 		if o.Has(k) {
 			r.Set(k, m.values[m.hk(k)])
 		}
@@ -30965,7 +31413,7 @@ func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
 
 func (m *TnMap[K, V]) Difference(o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
-	for _, k := range m.keys {
+	for _, k := range m.liveKeys() {
 		if !o.Has(k) {
 			r.Set(k, m.values[m.hk(k)])
 		}
@@ -30978,7 +31426,7 @@ func (m *TnMap[K, V]) SymmetricDifference(o *TnMap[K, V]) *TnMap[K, V] {
 }
 
 func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
-	for _, k := range m.keys {
+	for _, k := range m.liveKeys() {
 		if !o.Has(k) {
 			return false
 		}
@@ -30987,7 +31435,7 @@ func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
 }
 
 func (m *TnMap[K, V]) Clear() {
-	m.keys = nil
+	m.keys, m.pos, m.dead, m.deadN = nil, nil, nil, 0
 	m.values = map[K]V{}
 	m.accessors = nil
 	m.hidden = nil
@@ -30997,7 +31445,7 @@ func (m *TnMap[K, V]) Len() int {
 	if m == nil {
 		return 0
 	}
-	return len(m.keys) - len(m.hidden)
+	return len(m.keys) - m.deadN - len(m.hidden)
 }
 
 func (m *TnMap[K, V]) Keys() []K {
@@ -31048,7 +31496,7 @@ func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return fmt.Errorf("json: cannot unmarshal %v into an object", tok)
 	}
-	m.keys = nil
+	m.keys, m.pos, m.dead, m.deadN = nil, nil, nil, 0
 	m.values = map[K]V{}
 	for dec.More() {
 		tok, err := dec.Token()
@@ -31101,13 +31549,28 @@ func TnToFixed(x float64, digits float64) string {
 	if math.IsNaN(x) {
 		return "NaN"
 	}
-	if math.IsInf(x, 0) || math.Abs(x) >= 1e21 {
+	if math.IsInf(x, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(x, -1) {
+		return "-Infinity"
+	}
+	if math.Abs(x) >= 1e21 {
 		return strconv.FormatFloat(x, 'g', -1, 64)
 	}
 	sign := ""
 	if x < 0 {
 		sign = "-"
 		x = -x
+	}
+	// strconv rounds the exact value to nearest, as JS does; they differ only
+	// on an exact tie, which needs the value's last binary fraction digit at
+	// 2^-(d+1) (2.5 for d = 0, 1.125 for d = 2). Anything else formats directly.
+	if b := math.Float64bits(x); b>>52&0x7ff != 0 {
+		mant := b&(1<<52-1) | 1<<52
+		if low := int(b>>52&0x7ff) - 1075 + bits.TrailingZeros64(mant); -low != d+1 {
+			return sign + strconv.FormatFloat(x, 'f', d, 64)
+		}
 	}
 	exact := strconv.FormatFloat(x, 'f', 1100, 64)
 	dot := strings.IndexByte(exact, '.')
@@ -31334,21 +31797,52 @@ type TnRegex struct {
 	sticky    bool
 	source    string
 	flags     string
+	site      *TnRegexSite
 }
 
 func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
 	return &TnRegex{vm: true, global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags, pattern: pattern}
 }
 
+// A regex literal's site. Each evaluation of the literal is a new RegExp
+// (its own lastIndex), but all of them share what compiling it found: the
+// VM's program and RE2's regexes, looked up once instead of per evaluation
+type TnRegexSite struct {
+	resolved atomic.Bool
+	prog     atomic.Pointer[tnRxProg]
+	re       atomic.Pointer[regexp.Regexp]
+	anchored atomic.Pointer[regexp.Regexp]
+}
+
+func TnRegexAt(site *TnRegexSite, pattern string, flags string, source string) *TnRegex {
+	r := TnRegexCompile(pattern, flags, source)
+	r.site = site
+	if site.resolved.Load() {
+		r.vm = false
+		r.prog = site.prog.Load()
+	}
+	return r
+}
+
 func (r *TnRegex) program() *tnRxProg {
 	if r.vm {
 		r.vm = false
 		r.prog = tnRxProgramOf(r.source, r.flags)
+		if r.site != nil {
+			r.site.prog.Store(r.prog)
+			r.site.resolved.Store(true)
+		}
 	}
 	return r.prog
 }
 
 func (r *TnRegex) re2() *regexp.Regexp {
+	if r.re == nil && r.site != nil {
+		if re := r.site.re.Load(); re != nil {
+			r.re, r.anchored = re, r.site.anchored.Load()
+			return re
+		}
+	}
 	if r.re == nil {
 		prefix := ""
 		for _, f := range "ims" {
@@ -31367,6 +31861,10 @@ func (r *TnRegex) re2() *regexp.Regexp {
 		// /y matches only at lastIndex: anchored, so a miss costs no scan
 		if r.sticky {
 			r.anchored = regexp.MustCompile(prefix + "\\\\A(?:" + r.pattern + ")")
+		}
+		if r.site != nil {
+			r.site.anchored.Store(r.anchored)
+			r.site.re.Store(r.re)
 		}
 	}
 	return r.re
@@ -32660,8 +33158,8 @@ func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
 	if m == nil {
 		return nil
 	}
-	out := make(map[K]V, len(m.keys))
-	for _, k := range m.keys {
+	out := make(map[K]V, len(m.values))
+	for _, k := range m.liveKeys() {
 		out[k] = m.values[m.hk(k)]
 	}
 	return out
@@ -34175,6 +34673,28 @@ func TnPromiseAll[T any](chs []chan T) chan []T {
   getenv: `func TnGetenv(name string) string {
 	return os.Getenv(name)
 }`,
+  recordView: `// An any value as a Record<string, any>. A JSON-like object (a Go map) is
+// viewed in place, sharing its map, so writes through the record reach the
+// object as in JS; its keys list in the order a conversion gives them
+// (sorted: a Go map keeps none). Anything else converts as TnAsPtr does.
+func TnRecordOf(v interface{}) *TnMap[string, interface{}] {
+	if m, ok := v.(map[string]interface{}); ok && m != nil {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		r := &TnMap[string, interface{}]{keys: keys, values: m, keyMode: 1}
+		for _, k := range keys {
+			if _, isIndex := tnIndexKey(k); isIndex {
+				r.indexKeys = true
+				break
+			}
+		}
+		return r
+	}
+	return TnAsPtr[TnMap[string, interface{}]](v)
+}`,
   strAppend: `// s += part on a string field or variable. Go copies all of s on each +=,
 // so a string built by many appends (an output buffer) costs time quadratic
 // in its length, where JS engines append in place. A long string made here
@@ -34201,23 +34721,27 @@ func TnStrAppend(s, part string) string {
 	if len(s) < 256 {
 		return s + part
 	}
+	// (no defer: nothing in here panics, and this runs once per append)
 	tnStrTailsMu.Lock()
-	defer tnStrTailsMu.Unlock()
 	end := uintptr(unsafe.Pointer(unsafe.StringData(s))) + uintptr(len(s))
 	if t := tnStrTailSlot(end); t.end == end && cap(t.buf)-len(t.buf) >= len(part) {
 		buf := append(t.buf, part...)
 		t.end, t.buf = 0, nil
 		next := tnStrTailSlot(end + uintptr(len(part)))
 		next.end, next.buf = end+uintptr(len(part)), buf
+		tnStrTailsMu.Unlock()
 		return unsafe.String(unsafe.StringData(s), len(s)+len(part))
 	}
+	tnStrTailsMu.Unlock()
 	n := len(s) + len(part)
 	buf := make([]byte, n, 2*n)
 	copy(buf, s)
 	copy(buf[len(s):], part)
 	end = uintptr(unsafe.Pointer(&buf[0])) + uintptr(n)
+	tnStrTailsMu.Lock()
 	next := tnStrTailSlot(end)
 	next.end, next.buf = end, buf
+	tnStrTailsMu.Unlock()
 	return unsafe.String(&buf[0], n)
 }`,
 };
@@ -35071,6 +35595,11 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
         : undefined;
       if (declaration && isIdentifier(declaration.name)) {
         registerLocalVariable(declaration.name.text, yieldType);
+        const iteratorMember = findClassGenerator(iterClass, 'Symbol_iterator');
+        if (iteratorMember && generatorSeqEligible(iteratorMember)) {
+          const loopVar = visit(declaration.name);
+          return `for ${loopVar} := range ${iterExpr}.Symbol_iterator__seq()${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
+        }
         return lockstepRange(visit(declaration.name), `${iterExpr}.Symbol_iterator()`, node.statement);
       }
       return `for _ = range ${iterExpr}.Symbol_iterator()${visitLoopBody(node.statement)}`;
@@ -35106,6 +35635,11 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     }
     if (declaration && isIdentifier(declaration.name)) {
       registerLocalVariable(declaration.name.text, elemType);
+      const seq = generatorSeqCall(node.expression, iterExpr);
+      if (seq) {
+        const loopVar = visit(declaration.name);
+        return `for ${loopVar} := range ${seq}${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
+      }
       return lockstepRange(visit(declaration.name), iterExpr, node.statement);
     }
     // for await (const [a, b] of channel) → a := item[0]; b := item[1]
@@ -35193,7 +35727,7 @@ function visitReturningTryStatement(node: AstNode, fn: AstNode, options: VisitNo
     const catchBody = blockCode(node.catchClause.block, true);
     useHelper('error');
     deferreds.push(
-      `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
+      `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${seqCatchGuard()}${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
     );
   }
   const tryBody = blockCode(node.tryBlock, false);
@@ -35319,7 +35853,7 @@ function visitTryStatement(node: AstNode, options: VisitNodeOptions): string {
     const catchBody = coverageEnter(node.catchClause.block) + (node.catchClause.block.statements ?? []).map((s) => visit(s)).join('\t');
     useHelper('error');
     deferreds.push(
-      `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
+      `defer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\t${seqCatchGuard()}${catchVar} := TnCaught(r)\n\t\t\t\t_ = ${catchVar}\n\t\t\t\t${catchBody}\t\t\t}\n\t\t\t}()`
     );
   }
 
