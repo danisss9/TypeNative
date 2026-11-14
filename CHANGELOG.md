@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Iterating class iterators through dynamic values:** `TnToArray` (used by
+  spread, `Array.from`, destructuring and `for…of` on a dynamically typed
+  value) recognizes a class's generator push form directly
+  (`Symbol_iterator__seq`) and iterates it in place instead of finding
+  `*[Symbol.iterator]()` through reflection, calling it and draining its
+  channel on a goroutine. An interface-yield channel method also gets a direct
+  type assertion. This is what Angular's `OpList` hit through an op's dynamic
+  `handlerOps` / `trackByOps` fields; angular-templates' 64 KB run fell from
+  about 600 ms to 305 ms (now 1.2x faster than Node), and per-call latency is
+  4.4x Node's (50 vs 219 ms).
 - **yaml-cli throughput:** `yaml --json` on a large, plain stream is split
   before the `---` lines that start its documents, and up to six worker
   processes compose runs of them and print their JSON arrays, which the main

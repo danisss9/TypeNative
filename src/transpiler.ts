@@ -30967,6 +30967,12 @@ func TnFlatItems(v interface{}) []interface{} {
 	return []interface{}{v}
 }
 
+// (a class whose *[Symbol.iterator]() has a push form, e.g. an OpList: its
+// values without reflection, a channel or a goroutine)
+type tnSeqIter interface {
+	Symbol_iterator__seq() func(func(interface{}) bool)
+}
+
 func TnToArray(v interface{}) []interface{} {
 	switch t := v.(type) {
 	case nil:
@@ -30975,6 +30981,18 @@ func TnToArray(v interface{}) []interface{} {
 		return append([]interface{}{}, t...)
 	case tnArrayLike:
 		return append([]interface{}{}, (*t.TnItems())...)
+	case tnSeqIter:
+		out := []interface{}{}
+		for x := range t.Symbol_iterator__seq() {
+			out = append(out, x)
+		}
+		return out
+	case interface{ Symbol_iterator() chan interface{} }:
+		out := []interface{}{}
+		for x := range t.Symbol_iterator() {
+			out = append(out, x)
+		}
+		return out
 	case string:
 		out := []interface{}{}
 		for _, r := range t {

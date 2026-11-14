@@ -94,8 +94,8 @@ and checks that the two outputs are identical:
   are.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 15.3 MB. Node runs the compiler as
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.0 (unreleased changes), default
+(non-`--release`) build. The binary is 16.1 MB. Node runs the compiler as
 precompiled JavaScript (see [Run it](#run-it)); that build is done once,
 before timing.
 
@@ -103,34 +103,36 @@ before timing.
 
 | Runtime    | min       | median      | mean        | max         |
 | ---------- | --------- | ----------- | ----------- | ----------- |
-| Node.js    | 219.27 ms | 223.39 ms   | 223.24 ms   | 227.55 ms   |
-| TypeNative | 58.18 ms  | 60.61 ms    | 61.53 ms    | 94.50 ms    |
+| Node.js    | 212.76 ms | 219.11 ms   | 218.77 ms   | 223.15 ms   |
+| TypeNative | 48.51 ms  | 49.96 ms    | 51.36 ms    | 86.89 ms    |
 
 (b) `ng-compile generated.component.html`, 5 runs per size (medians):
 
 | Template           | Node.js  | TypeNative | TypeNative vs Node |
 | ------------------ | -------- | ---------- | ------------------ |
-| 9 KB, 186 lines    | 254 ms   | 140 ms     | 1.8x faster        |
-| 16 KB, 362 lines   | 275 ms   | 222 ms     | 1.2x faster        |
-| 32 KB, 706 lines   | 316 ms   | 392 ms     | 1.2x slower        |
-| 65 KB, 1,388 lines | 386 ms   | 753 ms     | 1.9x slower        |
+| 9 KB, 186 lines    | 246 ms   | 80 ms      | 3.1x faster        |
+| 16 KB, 362 lines   | 271 ms   | 110 ms     | 2.5x faster        |
+| 32 KB, 706 lines   | 305 ms   | 176 ms     | 1.7x faster        |
+| 65 KB, 1,388 lines | 376 ms   | 305 ms     | 1.2x faster        |
 
-**Per call, TypeNative is 3.7x faster** (61 ms vs 223 ms, median). Almost
+**Per call, TypeNative is 4.4x faster** (50 ms vs 219 ms, median). Almost
 all of both times is fixed: a one-line template takes about as long. Node
 spends it loading and evaluating the compiler's 233 modules before it
-compiles anything. The native binary's 60 ms is mostly the compiler's own
+compiles anything. The native binary's 50 ms is mostly the compiler's own
 module setup, such as the DOM schema and entity tables.
 
-**On large templates the native binary loses its lead at about 25 KB.** Past
-startup, compiling costs about 11 ms per KB natively against about 2–3 ms per
-KB under V8's JIT, so the gap closes as templates grow. Real component
-templates are mostly a few KB, well inside the native binary's lead. In a
-profile of the 64 KB run, about a third of the samples are goroutine handoffs:
-TypeNative runs each generator as a goroutine that passes every value to its
-consumer over a channel, in lockstep, and the compiler iterates its operation
-lists (`OpList`) through generators in each of its 74 phases. Property access
-through reflection on dynamically typed values and garbage collection are the
-next largest costs.
+**The native binary is faster at every size measured, including 65 KB
+(1.2x).** Past startup, compiling costs about 5 ms per KB natively against
+about 2–3 ms per KB under V8's JIT, so the gap narrows as templates grow. Most
+of the 64 KB run is the compiler's operation traversal: its 74 phases each
+iterate the operation lists (`OpList`), and the garbage collector scans the
+IR they build. Before this was fixed, about a third of the samples were
+goroutine hand-offs: iterating an `OpList` reached through a dynamically
+typed op field (`op.handlerOps`, `op.trackByOps`) went through reflection to
+its `*[Symbol.iterator]()` channel, one goroutine per list. `TnToArray` now
+recognizes the generator's push form directly (`Symbol_iterator__seq`) and
+iterates it in place, with no reflection, channel or goroutine per list; the
+64 KB run fell from about 600 ms to 305 ms.
 
 A template whose sections all share the root view is another matter: Angular
 copies every `@let` and `#ref` of a view into each of its child views, so with

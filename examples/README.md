@@ -16,7 +16,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **11.9x faster per call** (9 vs 105 ms); 1.1x faster on 10 MB† |
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **8.2x faster per call** (13 vs 104 ms); 1.2x faster on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.1x faster per answer** (716 vs 780 ms streamed)          |
-| [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **3.7x faster per template** (61 vs 223 ms); 1.9x slower at 64 KB§ |
+| [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **4.4x faster per template** (50 vs 219 ms); 1.2x faster at 64 KB§ |
 | [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form, 100% Node parity | **2.9x faster per file** (131 vs 380 ms); 3.5x slower at 64 KB¶ |
 
 \* Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4, TypeNative
@@ -34,8 +34,8 @@ sections each, at top-level heading boundaries; a single process is still about
 [parity.mjs](marked-cli/parity.mjs) checks every output against Node byte for
 byte on marked's spec suites (2,859 cases).
 
-§ The native binary is faster up to about 25 KB of template
-per run; most component templates are a few KB. angular-templates'
+§ The native binary is faster at every template size measured (3.1x at 9 KB,
+1.2x at 65 KB); most component templates are a few KB. angular-templates'
 [parity.mjs](angular-templates/parity.mjs) checks every output against Node
 byte for byte on the templates of Angular's compiler compliance suite (612
 templates).
