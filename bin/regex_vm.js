@@ -188,7 +188,7 @@ func (m *tnRxMatcher) groups(n int, lo int, hi int) []string {
 	s := m.s
 	// (capped at their hidden slots: an append moves them out of the chunk)
 	if len(m.chunk) < n+2 {
-		m.chunk = make([]string, max(n+2, 256))
+		m.chunk = make([]string, max(n+2, 4096))
 	}
 	groups := m.chunk[:n:n+2]
 	m.chunk = m.chunk[n+2:]
@@ -442,6 +442,34 @@ vm:
 			}
 		case tnRxRepGreedy:
 			set, count := in.set, 0
+			// (everything but one ASCII byte — [^\\n]+ and the like — is a
+			// byte scan, not a rune-by-rune one)
+			if in.neg && in.max < 0 {
+				start := pos
+				for pos < len(s) {
+					i := strings.IndexByte(s[pos:], in.c)
+					if i < 0 {
+						pos = len(s)
+						break
+					}
+					if i == 0 {
+						break
+					}
+					pos += i
+				}
+				count = pos - start
+				if count > 0 && !tnStrIsASCII(s[start:pos]) {
+					count = utf8.RuneCountInString(s[start:pos])
+				}
+				if count >= int(in.min) {
+					if extra := count - int(in.min); extra > 0 && !in.possessive {
+						st = append(st, tnRxFrame{kind: tnRxGreedy, pc: pc, pos: pos, n: extra})
+					}
+					pc++
+					continue
+				}
+				break
+			}
 			for pos < len(s) && (in.max < 0 || count < int(in.max)) {
 				if c := s[pos]; c < utf8.RuneSelf {
 					if !set.ascii[c] {
@@ -767,6 +795,21 @@ func (c *tnRxCompiler) setOf(n *tnBtNode) *tnRxCharSet {
 	return set
 }
 
+// A set matching every byte but one (all runes but that ASCII byte), which a
+// run can find with IndexByte instead of testing byte by byte
+func tnRxExcludedByte(set *tnRxCharSet) (byte, bool) {
+	if !set.high {
+		return 0, false
+	}
+	excluded, count := 0, 0
+	for b, in := range set.ascii {
+		if !in {
+			excluded, count = b, count+1
+		}
+	}
+	return byte(excluded), count == 1
+}
+
 func tnBtIsSingle(n *tnBtNode) bool {
 	return n.op == "char" || n.op == "any" || n.op == "class"
 }
@@ -1069,9 +1112,14 @@ func (c *tnRxCompiler) rep(n *tnBtNode, tail []*tnBtNode, end bool) {
 		return
 	}
 	if tnBtIsSingle(n.child) {
-		in := tnRxInst{op: tnRxRepGreedy, greedy: n.greedy, set: c.setOf(n.child), min: int32(n.min), max: int32(n.max), next: -1}
+		set := c.setOf(n.child)
+		in := tnRxInst{op: tnRxRepGreedy, greedy: n.greedy, set: set, min: int32(n.min), max: int32(n.max), next: -1}
 		if !n.greedy {
 			in.op = tnRxRepLazy
+		}
+		// (a run of everything but one ASCII byte: found with IndexByte)
+		if ex, ok := tnRxExcludedByte(set); ok {
+			in.neg, in.c = true, ex
 		}
 		c.repHints(&in, tail, end)
 		next := in.next

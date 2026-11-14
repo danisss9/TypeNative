@@ -1114,7 +1114,7 @@ func TnStdin() *TnStream {
 			}
 		}()
 	}
-	s.hooks["_stdinRef"] = func(flowing bool) {
+	s.setHook("_stdinRef", func(flowing bool) {
 		if flowing && !refHeld && !s.readEnded {
 			refHeld = true
 			TnLoopRef()
@@ -1122,7 +1122,7 @@ func TnStdin() *TnStream {
 			refHeld = false
 			TnLoopUnref()
 		}
-	}
+	})
 	return s
 }`;
 const fileStreamHelper = `// fs.createReadStream / createWriteStream

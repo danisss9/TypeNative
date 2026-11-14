@@ -21,11 +21,14 @@
 // 64 KB).
 import { promises } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { availableParallelism, homedir, tmpdir } from 'node:os';
+import { Buffer } from 'node:buffer';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { marked } from './vendor/marked/src/marked.ts';
 import type { MarkedExtension, MarkedOptions } from './vendor/marked/src/marked.ts';
 
-const { access, readFile, writeFile } = promises;
+const { access, readFile, unlink, writeFile } = promises;
 
 const VERSION = '18.1.2';
 
@@ -53,6 +56,117 @@ interface CliError {
   code?: string;
   path?: string;
   message: string;
+}
+
+// Large documents are parsed in a few processes, one contiguous run of
+// sections each: marked renders top-level blocks independently, so the
+// concatenation is the whole document's HTML (checked byte for byte by
+// bench.mjs). Splits happen only before a top-level ATX heading that follows
+// a blank line and is outside a code fence; documents with reference link
+// definitions, raw HTML blocks or CRLF line endings take the sequential path,
+// as the pieces would not stand on their own. Between the processes a section
+// run travels in workerData, and its HTML comes back gzipped through one small
+// temporary file (the worker IPC handles one compact message, not megabytes).
+const PARALLEL_MIN_BYTES = 512 * 1024;
+
+function splitForParallel(data: string, options: MarkedOptions): string[] | undefined {
+  if (data.length < PARALLEL_MIN_BYTES || data.includes('\r')) return undefined;
+  if (options.extensions || options.hooks || options.walkTokens) return undefined;
+  // a reference definition is shared by the whole document
+  if (/(^|\n) {0,3}\[[^\]\n]+\]:/.test(data)) return undefined;
+  // a cut line inside one of these would not be a top-level heading
+  if (/<(?:pre|script|style|textarea)\b/i.test(data) || data.includes('<!--') || data.includes('<?') || data.includes('<![CDATA[')) return undefined;
+
+  const lines = data.split('\n');
+  const cuts: number[] = [0];
+  let fence = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (open) {
+      if (!fence) fence = open[1][0];
+      else if (open[1][0] === fence) fence = '';
+      continue;
+    }
+    if (fence) continue;
+    if (i > 0 && lines[i - 1] === '' && /^#{1,6} /.test(line)) cuts.push(i);
+  }
+  cuts.push(lines.length);
+  if (cuts.length < 3) return undefined;
+
+  // One contiguous run of chunks per process, balanced by size
+  const chunks: string[] = [];
+  let total = 0;
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    const chunk = lines.slice(cuts[i], cuts[i + 1]).join('\n');
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  const requested = Number(process.env.MARKED_WORKERS ?? '0') || availableParallelism();
+  const count = Math.min(6, Math.max(1, requested));
+  if (count < 2) return undefined;
+  const parts: string[] = [];
+  let at = 0;
+  let size = 0;
+  for (let m = 0; m < count && at < chunks.length; m++) {
+    const target = total * (m + 1) / count;
+    const start = at;
+    while (at < chunks.length && (at === start || size < target)) {
+      size += chunks[at].length;
+      at++;
+    }
+    parts.push(chunks.slice(start, at).join('\n'));
+  }
+  return parts.length > 1 ? parts : undefined;
+}
+
+interface ParseJob {
+  text: string;
+  output: string;
+  options: MarkedOptions;
+}
+
+async function parseHtml(data: string, options: MarkedOptions): Promise<string> {
+  const parts = splitForParallel(data, options);
+  if (!parts) return await marked.parse(data, options);
+  const base = tmpdir() + '/marked-' + process.pid + '-' + Date.now();
+  const htmls: string[] = await Promise.all(parts.map((text, index) => new Promise<string>((resolve, reject) => {
+    const output = base + '-' + index + '.html';
+    const cleanup = () => unlink(output).catch(() => {});
+    (async () => {
+      try {
+        const worker = new Worker(new URL(import.meta.url), { workerData: { text, output, options } as ParseJob });
+        worker.on('message', async () => {
+          try {
+            resolve(gunzipSync(await readFile(output)).toString('utf8'));
+          } catch (err) {
+            reject(err);
+          } finally {
+            cleanup();
+          }
+          worker.terminate();
+        });
+        worker.on('error', (err) => {
+          cleanup();
+          reject(err);
+        });
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    })();
+  }))) as string[];
+  return htmls.join('');
+}
+
+async function workerMain() {
+  const job = workerData as ParseJob;
+  const options = job.options as MarkedOptions;
+  const text = job.text as string;
+  const output = job.output as string;
+  await writeFile(output, gzipSync(Buffer.from(await marked.parse(text, options), 'utf8')));
+  parentPort!.postMessage('ok');
+  parentPort!.close();
 }
 
 export async function main() {
@@ -223,7 +337,7 @@ export async function main() {
 
     const html = tokens
       ? JSON.stringify(marked.lexer(data, options as MarkedOptions), null, 2)
-      : await marked.parse(data, options as MarkedOptions);
+      : await parseHtml(data, options as MarkedOptions);
 
     if (output) {
       try {
@@ -289,4 +403,8 @@ export async function main() {
   }
 }
 
-main();
+if (isMainThread) {
+  main();
+} else {
+  workerMain();
+}

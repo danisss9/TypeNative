@@ -1760,7 +1760,7 @@ func TnDuplexFromWeb(pair interface{}, options ...interface{}) *TnStream {
 	r.on("data", func(chunk interface{}) { d.push(chunk) })
 	r.TnEventEmitter.once("end", func() { d.push(nil) })
 	r.TnEventEmitter.once("error", func(err interface{}) { d.destroy(err) })
-	d.hooks["_read"] = func(size float64) {}
+	d.setHook("_read", func(size float64) {})
 	return d
 }
 
@@ -1806,7 +1806,7 @@ func TnCompose(streams ...interface{}) *TnStream {
 		}
 	}
 	if last.readableSide {
-		d.hooks["_read"] = func(size float64) {}
+		d.setHook("_read", func(size float64) {})
 		last.on("data", func(chunk interface{}) { d.push(chunk) })
 		last.TnEventEmitter.once("end", func() { d.push(nil) })
 	}

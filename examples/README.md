@@ -14,7 +14,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [mandelbrot-png](mandelbrot-png/) | Fractal render + hand-written PNG encoder on `node:zlib`, no image library | **1.1x faster** (452 ms vs 514 ms)                           |
 | [desktop-notes](desktop-notes/)   | Notes app in a native webview window, UI compiled into one binary          | **4.4x faster launch, 6.7x less memory** (11 vs 73 MiB)      |
 | [yaml-cli](yaml-cli/)             | The `yaml` package's own CLI from its unmodified source, 100% Node parity  | **13x faster per call** (9 vs 117 ms); 3.9x slower on 10 MB† |
-| [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **8.4x faster per call** (14 vs 119 ms); 1.6x slower on 10 MB‡ |
+| [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **8.2x faster per call** (13 vs 104 ms); 1.2x faster on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.1x faster per answer** (716 vs 780 ms streamed)          |
 | [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **3.7x faster per template** (61 vs 223 ms); 1.9x slower at 64 KB§ |
 | [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form, 100% Node parity | **2.9x faster per file** (131 vs 380 ms); 3.5x slower at 64 KB¶ |
@@ -27,9 +27,11 @@ methodology and numbers.
 yaml-cli's [parity.mjs](yaml-cli/parity.mjs) also checks every output against
 Node byte for byte on the yaml-test-suite (1,608 cases).
 
-‡ The native binary is faster up to about 1–1.5 MB of markdown per run.
-marked-cli's [parity.mjs](marked-cli/parity.mjs) checks every output against
-Node byte for byte on marked's spec suites (2,859 cases).
+‡ Large inputs are parsed in up to six worker processes, one contiguous run of
+sections each, at top-level heading boundaries; a single process is still about
+1.5x slower than Node on 10 MB. marked-cli's
+[parity.mjs](marked-cli/parity.mjs) checks every output against Node byte for
+byte on marked's spec suites (2,859 cases).
 
 § The native binary is faster up to about 25 KB of template
 per run; most component templates are a few KB. angular-templates'

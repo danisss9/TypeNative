@@ -5,6 +5,30 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **marked-cli throughput:** large markdown documents are parsed in up to six
+  worker processes, one contiguous run of top-level sections each, with a
+  sequential fallback (small inputs, reference link definitions, raw HTML
+  blocks, CRLF, `--tokens`). On the example's 10 MB benchmark the complete
+  process run is now 1.2x faster than Node (512 ms vs 596 ms); parity stays
+  2,859/2,859. The single-process parse also got faster: `[...s].length` /
+  `[...s][i]` / `[...s].at(i)` no longer build rune arrays, truthiness-only
+  `re.exec` runs `re.test`, nullable regex results box only on a match, greedy
+  `[^x]+` runs use `IndexByte`, and the long-string ASCII cache and regex
+  replacement builders no longer allocate per token.
+
+### Fixed
+
+- **process.stdin:** `TnStdin` sets its `_stdinRef` hook through `setHook`
+  again after the lazy emitter/hook state change; reading stdin no longer
+  panics with `assignment to entry in nil map`.
+- **events.errorMonitor:** with only the two inline listeners, an `'error'`
+  event calls an `errorMonitor` listener before the error listeners again (the
+  lazy listener path skipped it, so the conformance probe saw `handler` first).
+
 ## [0.6.0] - 2026-11-13
 
 The React Compiler itself (`babel-plugin-react-compiler` + Babel + zod, ~470 vendored files)

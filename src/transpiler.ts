@@ -4136,6 +4136,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('getenv');
       return `TnGetenv(${visit(node.argumentExpression)})`;
     }
+    // [...s][i]: the i-th code point, without building the array of them
+    const spreadString = stringSpreadSource(node.expression);
+    if (spreadString && !isAssignmentTarget(node)) {
+      useHelper('dynamic');
+      return `TnCharAt(${visit(spreadString)}, ${numericIndex(node.argumentExpression)})`;
+    }
     // Maps (Record/Map) and string keys index directly; arrays/strings need an int index
     const targetType = inferExpressionType(node.expression);
     if (targetType === 'string') {
@@ -4397,6 +4403,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       // the declaration's name (member names only rename Go keywords)
       if (owner) return `${owner}_${node.name.kind === 'PrivateIdentifier' ? visit(node.name) : goFieldName(memberName)}`;
+    }
+    // [...s].length: the string's code point count, without building the array
+    if (node.name.text === 'length' && !isCallee(node) && !isAssignmentTarget(node)) {
+      const spreadString = stringSpreadSource(node.expression);
+      if (spreadString) {
+        useHelper('strIndex');
+        return `TnStrLength(${visit(spreadString)})`;
+      }
     }
     const leftSide = visit(node.expression);
     const rightSide = visit(node.name);
@@ -8152,7 +8166,10 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       // re.exec(s) / s.match(re): no match is null, not an empty array
       const call = unwrapParentheses(expr);
       if (isCallExpression(call) && isPropertyAccessExpression(call.expression) && MAYBE_MISSING_METHODS.has(call.expression.name.text)) {
-        return `func() ${goType} { __v := ${visit(expr)}; if __v == nil { return nil }; return &__v }()`;
+        // (a helper allocates the box only on a match: a miss returns nil
+        // without the closure object and box a local `&__v` costs every call)
+        useHelper('slicePtr');
+        return `TnSlicePtr(${visit(expr)})`;
       }
       // f() declared to return T[] | undefined, c ? xs : undefined: undefined stays nil
       const declaredResult = isCallExpression(call) && isIdentifier(call.expression) ? declaredFunctions.get(call.expression.text)?.type : undefined;
@@ -8171,13 +8188,15 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
           : () => visit(expr);
       // (an optional chain: a?.items is undefined when a is)
       if (nullableResult || nullishBranch || isOptionalChain(call)) {
-        return `func() ${goType} { __v := ${boxedRead()}; if __v == nil { return nil }; return &__v }()`;
+        useHelper('slicePtr');
+        return `TnSlicePtr(${boxedRead()})`;
       }
       // a read out of a Map / Record: undefined (nil) when the key is missing,
       // not a pointer to the map's zero-length value
       const lookup = getMapLookup(call);
       if (lookup && (extractMapValueType(inferExpressionType(lookup.mapNode) ?? '') ?? '') === goType.slice(1)) {
-        return `func() ${goType} { if __v, __ok := ${lookup.map}.Lookup(${lookup.key}); __ok { return &__v }; return nil }()`;
+        useHelper('slicePtr');
+        return `func() ${goType} { if __v, __ok := ${lookup.map}.Lookup(${lookup.key}); __ok { return TnSlicePtr(__v) }; return nil }()`;
       }
       return `func() ${goType} { __v := ${boxedRead()}; return &__v }()`;
     }
@@ -13350,6 +13369,17 @@ function spreadIterableClassArguments(node: AstNode): void {
   }
 }
 
+// The string behind [...s] (an array literal holding just that spread), when
+// the array is only built to be measured or indexed: [...s].length is the code
+// point count and [...s][i] the i-th code point, without building the array
+function stringSpreadSource(expr: AstNode): AstNode | undefined {
+  const node = unwrapParentheses(expr);
+  if (!isArrayLiteralExpression(node) || (node.elements ?? []).length !== 1) return undefined;
+  const element = node.elements[0];
+  if (!element || !isSpreadElement(element)) return undefined;
+  return inferExpressionType(element.expression) === 'string' ? element.expression : undefined;
+}
+
 // A spread source as a Go slice; Sets spread their elements (map keys) and
 // strings spread into []string of runes (like JS [...str])
 function visitSpreadSource(expr: AstNode): string {
@@ -15040,6 +15070,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     }
     if (ownerType === '*regexp.Regexp' || ownerType === '*TnRegex') {
       if (methodName === 'exec') {
+        // (only tested for presence: a boolean)
+        if (onlyTestedForTruthiness(expr)) return 'bool';
         // Named-group patterns return a match object with a .groups record
         const receiver = expr.expression.expression;
         // (on the RE2 path: the backtracking engine's exec gives the match array)
@@ -19049,6 +19081,28 @@ function regexSubject(arg: string): string {
   return argType === '*string' ? `TnJSString(TnPtrValue(${arg}))` : `TnJSString(interface{}(${arg}))`;
 }
 
+// Whether a value is only read for its truthiness (!!x, if (a || x), …): a
+// regex exec there can test without building the match array
+function onlyTestedForTruthiness(node: AstNode): boolean {
+  let child = node;
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (isParenthesizedExpression(parent) || parent.kind === 'NonNullExpression') {
+      child = parent;
+      continue;
+    }
+    if (parent.kind === 'PrefixUnaryExpression' && parent.operatorToken?.kind === 'ExclamationToken') return true;
+    if (isBinaryExpression(parent) && ['AmpersandAmpersandToken', 'BarBarToken'].includes(parent.operatorToken?.kind)) {
+      child = parent;
+      continue;
+    }
+    if (isIfStatement(parent) && parent.expression === child) return true;
+    if (isWhileStatement(parent) && parent.expression === child) return true;
+    if (isConditionalExpression(parent) && parent.condition === child) return true;
+    return false;
+  }
+  return false;
+}
+
 const regexpMethodHandlers: Record<string, MethodHandler> = {
   test: (obj, args) =>
     currentReceiverGoType === '*TnRegex'
@@ -19056,6 +19110,11 @@ const regexpMethodHandlers: Record<string, MethodHandler> = {
       : `${obj}.MatchString(${regexSubject(args[0])})`,
   exec: (obj, args) => {
     args = [regexSubject(args[0])];
+    // only its presence is tested (!!re.exec(s), if (a || re.exec(s))): no
+    // match array to build
+    if (currentReceiverGoType === '*TnRegex' && currentCallNode && onlyTestedForTruthiness(currentCallNode)) {
+      return `${obj}.Test(${args[0]})`;
+    }
     if (currentReceiverGoType === '*TnRegex') return `${obj}.Find(${args[0]})`;
     // Named groups come back as a match object with a .groups record
     if (obj.includes('(?P<')) {
@@ -19332,6 +19391,15 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   // padStart / padEnd for string arrays (rarely used, but added for completeness)
   // (undefined past either end: a primitive element is T | undefined, *T)
   at: (obj, args) => {
+    // [...s].at(i): its i-th code point, without building the array of them
+    const spreadString = currentCallNode && isPropertyAccessExpression(currentCallNode.expression)
+      ? stringSpreadSource(currentCallNode.expression.expression)
+      : undefined;
+    if (spreadString) {
+      useHelper('dynamic');
+      useHelper('strIndex');
+      return `func() *string { __s := ${visit(spreadString)}; __n := int(TnStrLength(__s)); __i := int(${args[0]}); if __i < 0 { __i += __n }; if __i < 0 || __i >= __n { return nil }; __v := TnCharAt(__s, float64(__i)); return &__v }()`;
+    }
     const element = receiverElementType();
     const primitive = ['string', 'float64', 'bool'].includes(element);
     const resultType = primitive ? `*${element}` : element;
@@ -25383,7 +25451,7 @@ const helperPackages: Record<string, string[]> = {
   regexEngine: ['strings', 'fmt', 'strconv', 'sync', 'sync/atomic', 'unicode', 'unicode/utf8'],
   namedGroups: ['regexp', 'unicode/utf8'],
   regexMatch: ['regexp', 'math', 'strconv', 'unsafe', 'unicode/utf8'],
-  strIndex: ['unicode/utf8', 'sync/atomic', 'unsafe', 'math', 'strings', 'sort'],
+  strIndex: ['unicode/utf8', 'sync', 'sync/atomic', 'unsafe', 'math', 'strings', 'sort'],
   jsReplacement: ['strings'],
   moduleUrl: ['os'],
   asyncWait: [],
@@ -25413,6 +25481,16 @@ const helperPackages: Record<string, string[]> = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers: Record<string, string> = {
+  slicePtr: `// A *[]T slot from a slice: nil stays nil (no match, undefined), and the box
+// is allocated only for a value, not for every call a local &v would cost
+func TnSlicePtr[T any](v []T) *[]T {
+	if v == nil {
+		return nil
+	}
+	p := new([]T)
+	*p = v
+	return p
+}`,
   generatorSeq: `// A generator's push form (a range function) yielding T: the same function
 // when it yields T already, else each value converted
 func tnSeqAs[T any, S any](s func(func(S) bool)) func(func(T) bool) {
@@ -30659,17 +30737,27 @@ type tnStrShortEntry struct {
 	ascii bool
 }
 
-var tnStrShortLast atomic.Pointer[tnStrShortEntry]
+// (guarded by a mutex: a pointer published then replaced would race with a
+// reader, and an entry per miss is an allocation per inline token)
+var tnStrShortMu sync.Mutex
+var tnStrShortS string
+var tnStrShortA bool
 
 func tnStrShortASCII(s string) bool {
 	if len(s) <= 64 {
 		return tnStrIsASCII(s)
 	}
-	if c := tnStrShortLast.Load(); c != nil && len(c.s) == len(s) && unsafe.StringData(c.s) == unsafe.StringData(s) {
-		return c.ascii
+	tnStrShortMu.Lock()
+	if len(tnStrShortS) == len(s) && unsafe.StringData(tnStrShortS) == unsafe.StringData(s) {
+		ascii := tnStrShortA
+		tnStrShortMu.Unlock()
+		return ascii
 	}
+	tnStrShortMu.Unlock()
 	ascii := tnStrIsASCII(s)
-	tnStrShortLast.Store(&tnStrShortEntry{s, ascii})
+	tnStrShortMu.Lock()
+	tnStrShortS, tnStrShortA = s, ascii
+	tnStrShortMu.Unlock()
 	return ascii
 }
 
@@ -33640,6 +33728,8 @@ func TnRegexWrapReplaceFirst(r *TnRegex, s string, repl string) string {
 
 func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string, int) string, all bool) string {
 	var out strings.Builder
+	// (a replacement keeps the length roughly: grow once, not by doubling)
+	out.Grow(len(s))
 	last := 0
 	ascii := tnStrASCII(s)
 	r.scan(s, true, func(groups []string, lo int, hi int) bool {
@@ -33661,6 +33751,7 @@ func TnRegexReplaceFuncW(r *TnRegex, s string, fn func([]string, int) string, al
 
 func (r *TnRegex) replace(s string, repl string, all bool) string {
 	var out strings.Builder
+	out.Grow(len(s) + max(0, len(repl)-1))
 	last := 0
 	plain := strings.IndexByte(repl, '$') < 0
 	r.scan(s, !plain, func(groups []string, lo int, hi int) bool {

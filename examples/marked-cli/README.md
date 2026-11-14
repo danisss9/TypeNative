@@ -100,38 +100,41 @@ Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 112.27 ms | 118.78 ms | 119.48 ms | 128.69 ms |
-| TypeNative | 13.10 ms  | 14.12 ms  | 20.74 ms  | 210.83 ms |
+| Node.js    | 101.08 ms | 103.58 ms | 106.68 ms | 119.02 ms |
+| TypeNative | 11.98 ms  | 12.67 ms  | 20.14 ms  | 235.52 ms |
 
 (b) `marked < generated.md` (10.0 MB, 114,893 lines), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 1,187 ms | 1,197 ms | 1,197 ms | 1,206 ms | 8.35          |
-| TypeNative | 1,880 ms | 1,890 ms | 1,909 ms | 1,968 ms | 5.29          |
+| Node.js    | 585.94 ms | 595.71 ms | 592.98 ms | 597.79 ms | 16.79         |
+| TypeNative | 500.79 ms | 511.86 ms | 509.63 ms | 513.24 ms | 19.54         |
 
-**Per call, TypeNative is 8.4x faster** (14 ms vs 119 ms, median). Node's
+**Per call, TypeNative is 8.2x faster** (12.7 ms vs 103.6 ms, median). Node's
 cost here is mostly startup: it loads and type-strips the 13 TypeScript files
 and compiles marked's regexes on every run. That's what you feel when a docs
 build or a hook renders one file per process.
 
-**On bulk throughput, TypeNative is 1.6x slower.** On a long input V8's JIT
-and its regex engine (Irregexp compiles hot patterns to machine code) still run
-marked faster than the compiled Go does. In a profile of the native run on
-10 MB, about 30% of the main thread is TypeNative's regex VM, which interprets
-marked's patterns where Irregexp runs them as machine code, and allocation is
-about 15%: each token is an object and each match a few strings. Garbage
-collection runs on other cores and hardly affects the wall clock. Both costs
-grow linearly with the input, while Node's head start is fixed, so the native
-binary finishes first up to about 1–1.5 MB of markdown per process:
+**On bulk throughput, TypeNative is 1.2x faster** (512 ms vs 596 ms). A
+loaded document is cut before top-level ATX headings that follow a blank line
+and are outside a code fence; up to six worker processes each parse one
+contiguous run of sections, and their HTML is concatenated. Parsing the
+sections separately is byte-for-byte identical to parsing the whole document
+here (bench.mjs checks it), because marked renders top-level blocks
+independently. `main.ts` falls back to one process for inputs under 512 KB, for
+documents with reference link definitions, raw HTML blocks or CRLF line
+endings, and for `--tokens`; `parity.mjs`'s spec cases all take that path, so
+their behavior is unchanged. The workers pass their assignment in `workerData`
+and return gzipped HTML through one temporary file: the worker IPC carries a
+single compact message, not several megabytes.
 
-| Input  | Node.js | TypeNative |
-| ------ | ------- | ---------- |
-| 512 KB | 162 ms  | 100 ms     |
-| 1 MB   | 203 ms  | 186 ms     |
-| 2 MB   | 294 ms  | 359 ms     |
-
-(Medians of 5 full process runs each, same generator.)
+**A single process is still about 1.5x slower than Node on 10 MB.** The
+parallel path is what closes the gap; per section the remaining cost is
+TypeNative's regex VM, which interprets marked's patterns where V8's Irregexp
+compiles them to machine code, plus the object and match-array allocation each
+token costs. The fixes below cut the single-process time from 1,890 ms to
+about 1,620 ms before the parallel path; the parallel run then has six of those
+processes working on independent sections.
 
 The ReDoS inputs now favor the native binary: all of them together take 4.7 s
 natively and 13 s under Node, though most of Node's time there is starting up
@@ -158,3 +161,15 @@ general:
   string share its index instead of rebuilding it.
 - Type inference is memoized per query. marked's
   `edit(re).replace(…).replace(…)…` chains took exponential time to compile.
+- `[...s].length`, `[...s][i]` and `[...s].at(i)` are the code point count, the
+  i-th code point and the i-th code point (from the end), without building an
+  array of every rune; marked uses those for every emphasis delimiter.
+- `re.exec(s)` where only its presence is tested (`!!re.exec(s)`, an `if`
+  condition) runs `re.test(s)`: no match array is built.
+- A nullable regex result is boxed only when it matched (`TnSlicePtr`), not by
+  a closure and a heap box on every miss.
+- Greedy runs of "everything but one ASCII byte" (`[^\\n]+`, `[^*]+`) use
+  `IndexByte` instead of testing each byte.
+- The ASCII cache for long strings is a mutex-guarded entry, not a new atomic
+  entry per inline token.
+- Regex replacement builders are grown once to the input's length.

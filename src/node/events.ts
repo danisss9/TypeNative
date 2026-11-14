@@ -241,6 +241,16 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 		if e.fn1 != nil && e.ev1 == event {
 			f1 = e.fn1
 		}
+		// events.errorMonitor sees an 'error' before the error listeners,
+		// whatever their registration order
+		if event == "error" {
+			if e.fn0 != nil && e.ev0 == TnErrorMonitor {
+				TnInvoke(e.fn0, args...)
+			}
+			if e.fn1 != nil && e.ev1 == TnErrorMonitor {
+				TnInvoke(e.fn1, args...)
+			}
+		}
 		if f0 == nil && f1 == nil {
 			if event == "error" {
 				if len(args) > 0 {
