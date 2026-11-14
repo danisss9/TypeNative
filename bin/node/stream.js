@@ -86,7 +86,7 @@ func tnStreamOption(options interface{}, key string) interface{} {
 }
 
 func tnNewStreamBase(options []interface{}) *TnStream {
-	s := &TnStream{flowing: -1, decodeStrings: true, hooks: map[string]interface{}{}, asyncCtx: TnAsyncSnapshot()}
+	s := &TnStream{flowing: -1, decodeStrings: true, asyncCtx: TnAsyncSnapshot()}
 	if len(options) > 0 && options[0] != nil {
 		s.options = options[0]
 		if b, ok := tnStreamOption(s.options, "objectMode").(bool); ok {
@@ -100,7 +100,7 @@ func tnNewStreamBase(options []interface{}) *TnStream {
 		}
 		for _, name := range []string{"read", "write", "transform", "flush", "final", "destroy"} {
 			if fn := tnStreamOption(s.options, name); fn != nil && reflect.ValueOf(fn).Kind() == reflect.Func && !reflect.ValueOf(fn).IsNil() {
-				s.hooks["_"+name] = fn
+				s.setHook("_"+name, fn)
 			}
 		}
 	}
@@ -229,7 +229,24 @@ func (s *TnStream) flow() {
 	for s.flowing == 1 && len(s.queue) > 0 {
 		chunk := s.queue[0]
 		s.queue = s.queue[1:]
-		s.emit("data", chunk)
+		if s.state == nil {
+			if s.fn0 != nil && s.ev0 == "data" {
+				if f, ok := s.fn0.(func(interface{})); ok {
+					f(chunk)
+				} else {
+					TnInvoke(s.fn0, chunk)
+				}
+			}
+			if s.fn1 != nil && s.ev1 == "data" {
+				if f, ok := s.fn1.(func(interface{})); ok {
+					f(chunk)
+				} else {
+					TnInvoke(s.fn1, chunk)
+				}
+			}
+		} else {
+			s.emit("data", chunk)
+		}
 	}
 	if len(s.queue) == 0 && s.readEnded {
 		s.emitEnd()
@@ -286,9 +303,31 @@ func (s *TnStream) emitEnd() {
 		return
 	}
 	s.endEmitted = true
-	s.emit("end")
+	if s.state == nil {
+		if s.fn0 != nil && s.ev0 == "end" {
+			if f, ok := s.fn0.(func()); ok {
+				f()
+			} else {
+				TnInvoke(s.fn0)
+			}
+		}
+		if s.fn1 != nil && s.ev1 == "end" {
+			if f, ok := s.fn1.(func()); ok {
+				f()
+			} else {
+				TnInvoke(s.fn1)
+			}
+		}
+	} else {
+		s.emit("end")
+	}
 	if !s.writableSide || s.finished {
-		s.emitClose()
+		if s.listenerCount("close") == 0 {
+			s.closed = true
+			s.releaseHandle()
+		} else {
+			s.emitClose()
+		}
 	}
 }
 
@@ -592,6 +631,11 @@ func (s *TnStream) processWrites() {
 		}
 		s.post(s.processWrites)
 	}
+	if s.sink == nil && s.tnSelf != nil {
+		if init, ok := s.tnSelf.(interface{ tnInitSink() }); ok {
+			init.tnInitSink()
+		}
+	}
 	switch {
 	case s.sink != nil:
 		s.sink(req.chunk, func(err interface{}) { done(err) })
@@ -705,6 +749,11 @@ func (s *TnStream) finish() {
 	if fn := s.hook("_final"); fn != nil {
 		TnInvoke(fn, complete)
 		return
+	}
+	if s.sinkFinal == nil && s.tnSelf != nil {
+		if init, ok := s.tnSelf.(interface{ tnInitSink() }); ok {
+			init.tnInitSink()
+		}
 	}
 	if s.sinkFinal != nil {
 		s.sinkFinal(func(err interface{}) { complete(err) })

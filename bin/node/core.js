@@ -39,6 +39,11 @@ func TnInvoke(fn interface{}, args ...interface{}) interface{} {
 			f(a)
 			return nil
 		}
+	case func([]byte):
+		if a, ok := tnInvokeAt(args, 0).([]byte); ok && f != nil {
+			f(a)
+			return nil
+		}
 	}
 	fv := reflect.ValueOf(fn)
 	if !fv.IsValid() || fv.Kind() != reflect.Func || fv.IsNil() {

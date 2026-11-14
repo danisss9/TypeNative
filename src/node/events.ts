@@ -28,6 +28,10 @@ var TnCaptureRejections = false
 // EventEmitter: embeddable (class X extends EventEmitter), state allocated lazily
 type TnEventEmitter struct {
 	state *tnEmitterState
+	ev0   string
+	fn0   interface{}
+	ev1   string
+	fn1   interface{}
 }
 
 // Anything that embeds an EventEmitter (events.once(emitter, …) accepts subclasses)
@@ -38,10 +42,10 @@ type tnEmitterLike interface {
 var TnDefaultMaxListeners = 10.0
 
 func TnNewEventEmitter(options ...interface{}) *TnEventEmitter {
-	e := &TnEventEmitter{state: &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}, captureRejections: TnCaptureRejections}}
+	e := &TnEventEmitter{}
 	if len(options) > 0 && options[0] != nil {
 		if b, ok := TnGetValue(options[0], "captureRejections").(bool); ok {
-			e.state.captureRejections = b
+			e.st().captureRejections = b
 		}
 	}
 	return e
@@ -51,7 +55,20 @@ func (e *TnEventEmitter) tnEmitter() *TnEventEmitter { return e }
 
 func (e *TnEventEmitter) st() *tnEmitterState {
 	if e.state == nil {
-		e.state = &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, warned: map[string]bool{}, captureRejections: TnCaptureRejections}
+		s := &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, captureRejections: TnCaptureRejections}
+		if e.fn0 != nil {
+			s.order = append(s.order, e.ev0)
+			s.events[e.ev0] = []*tnListener{{fn: e.fn0}}
+			e.ev0, e.fn0 = "", nil
+		}
+		if e.fn1 != nil {
+			if _, ok := s.events[e.ev1]; !ok {
+				s.order = append(s.order, e.ev1)
+			}
+			s.events[e.ev1] = append(s.events[e.ev1], &tnListener{fn: e.fn1})
+			e.ev1, e.fn1 = "", nil
+		}
+		e.state = s
 	}
 	return e.state
 }
@@ -86,6 +103,16 @@ func (e *TnEventEmitter) prependOnceListener(event string, fn interface{}) *TnEv
 }
 
 func (e *TnEventEmitter) add(event string, fn interface{}, prepend bool, once bool) *TnEventEmitter {
+	if e.state == nil && !prepend && !once && !TnCaptureRejections && event != "newListener" {
+		if e.fn0 == nil {
+			e.ev0, e.fn0 = event, fn
+			return e
+		}
+		if e.fn1 == nil {
+			e.ev1, e.fn1 = event, fn
+			return e
+		}
+	}
 	s := e.st()
 	if len(s.events["newListener"]) > 0 {
 		e.emit("newListener", event, fn)
@@ -107,6 +134,9 @@ func (e *TnEventEmitter) add(event string, fn interface{}, prepend bool, once bo
 	}
 	warn := max > 0 && float64(count) > max && !s.warned[event]
 	if warn {
+		if s.warned == nil {
+			s.warned = map[string]bool{}
+		}
 		s.warned[event] = true
 	}
 	s.mu.Unlock()
@@ -117,6 +147,22 @@ func (e *TnEventEmitter) add(event string, fn interface{}, prepend bool, once bo
 }
 
 func (e *TnEventEmitter) removeListener(event string, fn interface{}) *TnEventEmitter {
+	if e.state == nil {
+		if e.fn0 == nil && e.fn1 == nil {
+			return e
+		}
+		id := tnFuncID(fn)
+		if e.fn1 != nil && e.ev1 == event && tnFuncID(e.fn1) == id {
+			e.ev1, e.fn1 = "", nil
+			return e
+		}
+		if e.fn0 != nil && e.ev0 == event && tnFuncID(e.fn0) == id {
+			e.ev0, e.fn0 = e.ev1, e.fn1
+			e.ev1, e.fn1 = "", nil
+			return e
+		}
+		return e
+	}
 	s := e.st()
 	s.mu.Lock()
 	list := s.events[event]
@@ -159,6 +205,21 @@ func (e *TnEventEmitter) setListeners(event string, list []*tnListener) {
 }
 
 func (e *TnEventEmitter) removeAllListeners(event ...string) *TnEventEmitter {
+	if e.state == nil {
+		if len(event) == 0 {
+			e.ev0, e.fn0 = "", nil
+			e.ev1, e.fn1 = "", nil
+			return e
+		}
+		if e.fn1 != nil && e.ev1 == event[0] {
+			e.ev1, e.fn1 = "", nil
+		}
+		if e.fn0 != nil && e.ev0 == event[0] {
+			e.ev0, e.fn0 = e.ev1, e.fn1
+			e.ev1, e.fn1 = "", nil
+		}
+		return e
+	}
 	s := e.st()
 	s.mu.Lock()
 	if len(event) > 0 {
@@ -172,6 +233,34 @@ func (e *TnEventEmitter) removeAllListeners(event ...string) *TnEventEmitter {
 }
 
 func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
+	if e.state == nil {
+		var f0, f1 interface{}
+		if e.fn0 != nil && e.ev0 == event {
+			f0 = e.fn0
+		}
+		if e.fn1 != nil && e.ev1 == event {
+			f1 = e.fn1
+		}
+		if f0 == nil && f1 == nil {
+			if event == "error" {
+				if len(args) > 0 {
+					if _, ok := args[0].(error); ok {
+						panic(args[0])
+					}
+					panic(TnNodeError("Error", "ERR_UNHANDLED_ERROR", "Unhandled error. ("+fmt.Sprint(args[0])+")"))
+				}
+				panic(TnNodeError("Error", "ERR_UNHANDLED_ERROR", "Unhandled error."))
+			}
+			return false
+		}
+		if f0 != nil {
+			TnInvoke(f0, args...)
+		}
+		if f1 != nil {
+			TnInvoke(f1, args...)
+		}
+		return true
+	}
 	s := e.st()
 	s.mu.Lock()
 	// (listener lists are copy-on-write — adds append past this length, removals
@@ -290,6 +379,16 @@ func TnAddAbortListener(signal *TnAbortSignal, listener interface{}) *TnDisposab
 }
 
 func (e *TnEventEmitter) listeners(event string) []interface{} {
+	if e.state == nil {
+		out := []interface{}{}
+		if e.fn0 != nil && e.ev0 == event {
+			out = append(out, e.fn0)
+		}
+		if e.fn1 != nil && e.ev1 == event {
+			out = append(out, e.fn1)
+		}
+		return out
+	}
 	s := e.st()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -303,6 +402,21 @@ func (e *TnEventEmitter) listeners(event string) []interface{} {
 func (e *TnEventEmitter) rawListeners(event string) []interface{} { return e.listeners(event) }
 
 func (e *TnEventEmitter) listenerCount(event string, fn ...interface{}) float64 {
+	if e.state == nil {
+		n := 0
+		wantFilter := len(fn) > 0 && fn[0] != nil
+		var wantID uintptr
+		if wantFilter {
+			wantID = tnFuncID(fn[0])
+		}
+		if e.fn0 != nil && e.ev0 == event && (!wantFilter || tnFuncID(e.fn0) == wantID) {
+			n++
+		}
+		if e.fn1 != nil && e.ev1 == event && (!wantFilter || tnFuncID(e.fn1) == wantID) {
+			n++
+		}
+		return float64(n)
+	}
 	s := e.st()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -319,6 +433,16 @@ func (e *TnEventEmitter) listenerCount(event string, fn ...interface{}) float64 
 }
 
 func (e *TnEventEmitter) eventNames() []string {
+	if e.state == nil {
+		out := []string{}
+		if e.fn0 != nil {
+			out = append(out, e.ev0)
+		}
+		if e.fn1 != nil && (e.fn0 == nil || e.ev1 != e.ev0) {
+			out = append(out, e.ev1)
+		}
+		return out
+	}
 	s := e.st()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,10 +455,10 @@ func (e *TnEventEmitter) setMaxListeners(n float64) *TnEventEmitter {
 }
 
 func (e *TnEventEmitter) getMaxListeners() float64 {
-	if e.st().maxListeners < 0 {
+	if e.state == nil || e.state.maxListeners < 0 {
 		return TnDefaultMaxListeners
 	}
-	return e.st().maxListeners
+	return e.state.maxListeners
 }
 
 // events.once(emitter, name): a promise of the event's arguments; 'error' rejects it

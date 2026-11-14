@@ -32852,23 +32852,36 @@ func (d *tnJTDecoder) escaped(start int) (string, bool) {
     jsonStringify: `// JSON.stringify: JS's SerializeJSONProperty over TypeNative values
 // (unexported struct fields included; Go's encoder would skip them)
 type tnJSONWriter struct {
-	buf      bytes.Buffer
+	buf      []byte
 	indent   string
 	replacer func(key string, value interface{}) interface{}
 	allow    map[string]bool
 	stack    []uintptr
 }
 
+var tnJSONWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &tnJSONWriter{buf: make([]byte, 0, 512)}
+	},
+}
+
 func TnJSONStringify(v interface{}, indent string) string {
-	w := &tnJSONWriter{indent: indent}
+	w := tnJSONWriterPool.Get().(*tnJSONWriter)
+	w.buf = w.buf[:0]
+	w.indent = indent
+	w.stack = w.stack[:0]
 	w.property("", v, 0)
-	return w.buf.String()
+	s := string(w.buf)
+	if cap(w.buf) <= 65536 {
+		tnJSONWriterPool.Put(w)
+	}
+	return s
 }
 
 // JSON.stringify(value, replacer, space): the replacer is a key/value
 // function or a list of keys; space a number of spaces or a string (≤ 10)
 func TnJSONStringifyWith(v interface{}, replacer interface{}, space interface{}) string {
-	w := &tnJSONWriter{}
+	w := &tnJSONWriter{buf: make([]byte, 0, 256)}
 	switch s := space.(type) {
 	case float64:
 		w.indent = strings.Repeat(" ", int(math.Max(0, math.Min(10, s))))
@@ -32903,7 +32916,7 @@ func TnJSONStringifyWith(v interface{}, replacer interface{}, space interface{})
 	if !w.property("", v, 0) {
 		return ""
 	}
-	return w.buf.String()
+	return string(w.buf)
 }
 
 // Values being written, innermost last: meeting one again is a cycle
@@ -32924,10 +32937,22 @@ func (w *tnJSONWriter) newline(depth int) {
 	if w.indent == "" {
 		return
 	}
-	w.buf.WriteByte('\\n')
+	w.buf = append(w.buf, '\\n')
 	for i := 0; i < depth; i++ {
-		w.buf.WriteString(w.indent)
+		w.buf = append(w.buf, w.indent...)
 	}
+}
+
+func tnJSONAppendNum(buf []byte, f float64) []byte {
+	if f > -9007199254740992 && f < 9007199254740992 {
+		if i := int64(f); float64(i) == f {
+			return strconv.AppendInt(buf, i, 10)
+		}
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return append(buf, "null"...)
+	}
+	return append(buf, TnNumStr(f)...)
 }
 
 // toJSON() methods (Dates' included): the value serialized in their place
@@ -32966,27 +32991,41 @@ func tnJSONFieldName(name string) string {
 
 // Writes one value; false when it serializes to undefined (functions)
 func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
-	v = tnJSONToJSON(v)
 	switch t := v.(type) {
-	case nil, interface{ TnIsNullValue() }:
-		w.buf.WriteString("null")
+	case nil, *tnNullValue:
+		w.buf = append(w.buf, "null"...)
 		return true
 	case bool:
 		if t {
-			w.buf.WriteString("true")
+			w.buf = append(w.buf, "true"...)
 		} else {
-			w.buf.WriteString("false")
+			w.buf = append(w.buf, "false"...)
 		}
 		return true
 	case float64:
-		if math.IsNaN(t) || math.IsInf(t, 0) {
-			w.buf.WriteString("null")
-		} else {
-			w.buf.WriteString(TnNumStr(t))
-		}
+		w.buf = tnJSONAppendNum(w.buf, t)
 		return true
 	case string:
-		tnJSONQuote(&w.buf, t)
+		w.buf = tnJSONAppendQuote(w.buf, t)
+		return true
+	}
+	v = tnJSONToJSON(v)
+	switch t := v.(type) {
+	case nil, interface{ TnIsNullValue() }:
+		w.buf = append(w.buf, "null"...)
+		return true
+	case bool:
+		if t {
+			w.buf = append(w.buf, "true"...)
+		} else {
+			w.buf = append(w.buf, "false"...)
+		}
+		return true
+	case float64:
+		w.buf = tnJSONAppendNum(w.buf, t)
+		return true
+	case string:
+		w.buf = tnJSONAppendQuote(w.buf, t)
 		return true
 	case []byte:
 		// a Buffer serializes through its toJSON(): { type, data }
@@ -33000,25 +33039,39 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 		})
 	}
 	rv := reflect.ValueOf(v)
-	if rv.Type().String() == "*big.Int" {
+	if rv.Kind() == reflect.Pointer && rv.Type().Elem().Kind() != reflect.Struct && rv.Type().Elem().Kind() != reflect.Slice && rv.Type().String() == "*big.Int" {
 		panic(TnNodeError("TypeError", "", "Do not know how to serialize a BigInt"))
+	}
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice && w.replacer == nil && w.allow == nil {
+		w.enter(rv.Pointer())
+		defer w.leave()
+		rv = rv.Elem()
 	}
 	switch rv.Kind() {
 	case reflect.Func:
 		return false
 	case reflect.Pointer, reflect.Interface:
 		if rv.IsNil() {
-			w.buf.WriteString("null")
+			w.buf = append(w.buf, "null"...)
 			return true
 		}
 		if rv.Kind() == reflect.Pointer {
+			if rv.Elem().Kind() == reflect.Struct && w.replacer == nil && w.allow == nil {
+				plan := tnJSONGetPlan(rv.Elem().Type())
+				if !plan.hasCustom {
+					return w.fastStructPtr(rv.UnsafePointer(), plan, depth)
+				}
+				if rv.Type().String() == "*big.Int" {
+					panic(TnNodeError("TypeError", "", "Do not know how to serialize a BigInt"))
+				}
+			}
 			// Records and Maps: insertion order; Maps and Sets serialize as {}
 			if m, ok := v.(interface {
 				Entries() [][]interface{}
 				TnJSKind() uint8
 			}); ok {
 				if m.TnJSKind() != 0 {
-					w.buf.WriteString("{}")
+					w.buf = append(w.buf, "{}"...)
 					return true
 				}
 				return w.object(depth, func(emit func(string, interface{})) {
@@ -33026,9 +33079,6 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 						emit(fmt.Sprint(e[0]), e[1])
 					}
 				})
-			}
-			if rv.Elem().Kind() == reflect.Struct && w.replacer == nil && w.allow == nil && !rv.Elem().Type().Implements(tnJSONMarshalerType) {
-				return w.fastStruct(rv, depth)
 			}
 			if rv.Elem().Kind() == reflect.Struct || rv.Elem().Kind() == reflect.Slice || rv.Elem().Kind() == reflect.Map {
 				w.enter(rv.Pointer())
@@ -33042,33 +33092,60 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 		return w.property(key, reflect.NewAt(elem.Type(), unsafe.Pointer(elem.UnsafeAddr())).Elem().Interface(), depth)
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
-			w.buf.WriteString("[]")
+			w.buf = append(w.buf, "[]"...)
 			return true
 		}
-		if rv.Len() == 0 {
-			w.buf.WriteString("[]")
+		n := rv.Len()
+		if n == 0 {
+			w.buf = append(w.buf, "[]"...)
 			return true
 		}
 		if rv.Kind() == reflect.Slice {
 			w.enter(rv.Pointer())
 			defer w.leave()
+			if w.replacer == nil && w.allow == nil {
+				et := rv.Type().Elem()
+				if et.Kind() == reflect.Pointer && et.Elem().Kind() == reflect.Struct {
+					plan := tnJSONGetPlan(et.Elem())
+					if !plan.hasCustom {
+						ptrs := unsafe.Slice((*unsafe.Pointer)(rv.UnsafePointer()), n)
+						w.buf = append(w.buf, '[')
+						for i, p := range ptrs {
+							if i > 0 {
+								w.buf = append(w.buf, ',')
+							}
+							w.newline(depth + 1)
+							if p == nil {
+								w.buf = append(w.buf, "null"...)
+							} else {
+								w.fastStructPtr(p, plan, depth+1)
+							}
+						}
+						w.newline(depth)
+						w.buf = append(w.buf, ']')
+						return true
+					}
+				}
+			}
 		}
-		w.buf.WriteByte('[')
-		for i := 0; i < rv.Len(); i++ {
+		w.buf = append(w.buf, '[')
+		for i := 0; i < n; i++ {
 			if i > 0 {
-				w.buf.WriteByte(',')
+				w.buf = append(w.buf, ',')
 			}
 			w.newline(depth + 1)
 			item := rv.Index(i).Interface()
+			var itemKey string
 			if w.replacer != nil {
-				item = w.replacer(strconv.Itoa(i), item)
+				itemKey = strconv.Itoa(i)
+				item = w.replacer(itemKey, item)
 			}
-			if !w.property(strconv.Itoa(i), item, depth+1) {
-				w.buf.WriteString("null")
+			if !w.property(itemKey, item, depth+1) {
+				w.buf = append(w.buf, "null"...)
 			}
 		}
 		w.newline(depth)
-		w.buf.WriteByte(']')
+		w.buf = append(w.buf, ']')
 		return true
 	case reflect.Map:
 		// Dynamic objects (JSON.parse results): Go maps keep no order, keys sort
@@ -33090,7 +33167,7 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 	case reflect.Struct:
 		if m, ok := v.(json.Marshaler); ok {
 			if data, err := m.MarshalJSON(); err == nil {
-				w.buf.Write(data)
+				w.buf = append(w.buf, data...)
 				return true
 			}
 		}
@@ -33098,10 +33175,10 @@ func (w *tnJSONWriter) property(key string, v interface{}, depth int) bool {
 	}
 	data, err := tnJSONMarshal(v)
 	if err != nil {
-		w.buf.WriteString("null")
+		w.buf = append(w.buf, "null"...)
 		return true
 	}
-	w.buf.Write(data)
+	w.buf = append(w.buf, data...)
 	return true
 }
 
@@ -33180,51 +33257,48 @@ func (w *tnJSONWriter) structFieldsInOrder(rv reflect.Value, emit func(string, i
 
 // A JSON string as JSON.stringify writes it: U+2028 / U+2029 stay raw (Go's
 // encoder escapes them), invalid UTF-8 becomes \\ufffd
-func tnJSONQuote(buf *bytes.Buffer, s string) {
+func tnJSONAppendQuote(buf []byte, s string) []byte {
 	const hex = "0123456789abcdef"
-	buf.WriteByte('"')
+	buf = append(buf, '"')
 	start := 0
 	for i := 0; i < len(s); {
 		c := s[i]
-		if c >= utf8.RuneSelf {
-			r, size := utf8.DecodeRuneInString(s[i:])
-			if r == utf8.RuneError && size == 1 {
-				buf.WriteString(s[start:i])
-				buf.WriteString("\\\\ufffd")
-				start = i + 1
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != '"' && c != '\\\\' {
+				i++
+				continue
 			}
-			i += size
-			continue
-		}
-		if c >= 0x20 && c != '"' && c != '\\\\' {
+			buf = append(buf, s[start:i]...)
+			switch c {
+			case '"', '\\\\':
+				buf = append(buf, '\\\\', c)
+			case '\\n':
+				buf = append(buf, '\\\\', 'n')
+			case '\\r':
+				buf = append(buf, '\\\\', 'r')
+			case '\\t':
+				buf = append(buf, '\\\\', 't')
+			case '\\b':
+				buf = append(buf, '\\\\', 'b')
+			case '\\f':
+				buf = append(buf, '\\\\', 'f')
+			default:
+				buf = append(buf, '\\\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
+			}
 			i++
+			start = i
 			continue
 		}
-		buf.WriteString(s[start:i])
-		buf.WriteByte('\\\\')
-		switch c {
-		case '"', '\\\\':
-			buf.WriteByte(c)
-		case '\\n':
-			buf.WriteByte('n')
-		case '\\r':
-			buf.WriteByte('r')
-		case '\\t':
-			buf.WriteByte('t')
-		case '\\b':
-			buf.WriteByte('b')
-		case '\\f':
-			buf.WriteByte('f')
-		default:
-			buf.WriteString("u00")
-			buf.WriteByte(hex[c>>4])
-			buf.WriteByte(hex[c&0xF])
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			buf = append(buf, s[start:i]...)
+			buf = append(buf, "\\\\ufffd"...)
+			start = i + 1
 		}
-		i++
-		start = i
+		i += size
 	}
-	buf.WriteString(s[start:])
-	buf.WriteByte('"')
+	buf = append(buf, s[start:]...)
+	return append(buf, '"')
 }
 
 // A struct type's JSON fields (structFields' rules), resolved once per type:
@@ -33239,14 +33313,35 @@ type tnJSONField struct {
 	null   bool // (T | null: nil is null, not undefined)
 }
 
-var tnJSONPlans sync.Map
-var tnJSONMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+type tnJSONStructPlan struct {
+	typ        reflect.Type
+	fields     []tnJSONField
+	hasKeys    bool
+	keysOffset uintptr
+	cycleFree  bool
+	hasCustom  bool
+}
 
-func tnJSONPlan(t reflect.Type) []tnJSONField {
+var (
+	tnJSONPlans         sync.Map
+	tnJSONMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	tnToJSONStrType     = reflect.TypeOf((*interface{ toJSON() string })(nil)).Elem()
+	tnToJSONFloatType   = reflect.TypeOf((*interface{ toJSON() float64 })(nil)).Elem()
+	tnToJSONBoolType    = reflect.TypeOf((*interface{ toJSON() bool })(nil)).Elem()
+	tnToJSONAnyType     = reflect.TypeOf((*interface{ toJSON() interface{} })(nil)).Elem()
+	tnTnToJSONType      = reflect.TypeOf((*interface{ TnToJSON(string) interface{} })(nil)).Elem()
+	tnTnItemsType       = reflect.TypeOf((*interface{ TnItems() *[]interface{} })(nil)).Elem()
+	tnJSKindType        = reflect.TypeOf((*interface{ TnJSKind() uint8 })(nil)).Elem()
+	tnEntriesType       = reflect.TypeOf((*interface{ Entries() [][]interface{} })(nil)).Elem()
+	tnTimeType          = reflect.TypeOf(time.Time{})
+)
+
+func tnJSONGetPlan(t reflect.Type) *tnJSONStructPlan {
 	if plan, ok := tnJSONPlans.Load(t); ok {
-		return plan.([]tnJSONField)
+		return plan.(*tnJSONStructPlan)
 	}
 	fields := []tnJSONField{}
+	cycleFree := true
 	var walk func(t reflect.Type, base uintptr)
 	walk = func(t reflect.Type, base uintptr) {
 		for i := 0; i < t.NumField(); i++ {
@@ -33261,9 +33356,8 @@ func tnJSONPlan(t reflect.Type) []tnJSONField {
 				continue
 			}
 			name := tnJSONFieldName(f.Name)
-			var key bytes.Buffer
-			tnJSONQuote(&key, name)
-			key.WriteByte(':')
+			key := tnJSONAppendQuote(make([]byte, 0, len(name)+3), name)
+			key = append(key, ':')
 			kind := uint8(0)
 			switch f.Type {
 			case reflect.TypeOf(float64(0)):
@@ -33272,65 +33366,90 @@ func tnJSONPlan(t reflect.Type) []tnJSONField {
 				kind = 2
 			case reflect.TypeOf(false):
 				kind = 3
+			default:
+				cycleFree = false
 			}
-			fields = append(fields, tnJSONField{offset: base + f.Offset, typ: f.Type, name: name, key: key.String(), kind: kind, null: f.Tag.Get("tn") == "null"})
+			fields = append(fields, tnJSONField{offset: base + f.Offset, typ: f.Type, name: name, key: string(key), kind: kind, null: f.Tag.Get("tn") == "null"})
 		}
 	}
 	walk(t, 0)
-	tnJSONPlans.Store(t, fields)
-	return fields
+	var hasKeys bool
+	var keysOffset uintptr
+	if kf, ok := t.FieldByName("__keys"); ok && kf.Type == reflect.TypeOf((*[]string)(nil)) {
+		hasKeys = true
+		keysOffset = kf.Offset
+	}
+	pt := reflect.PointerTo(t)
+	hasCustom := t == tnTimeType || pt.String() == "*big.Int" ||
+		t.Implements(tnJSONMarshalerType) || pt.Implements(tnJSONMarshalerType) ||
+		pt.Implements(tnToJSONStrType) || pt.Implements(tnToJSONFloatType) ||
+		pt.Implements(tnToJSONBoolType) || pt.Implements(tnToJSONAnyType) ||
+		pt.Implements(tnTnToJSONType) || pt.Implements(tnTnItemsType) ||
+		pt.Implements(tnJSKindType) || pt.Implements(tnEntriesType)
+	plan := &tnJSONStructPlan{
+		typ:        t,
+		fields:     fields,
+		hasKeys:    hasKeys,
+		keysOffset: keysOffset,
+		cycleFree:  cycleFree,
+		hasCustom:  hasCustom,
+	}
+	tnJSONPlans.Store(t, plan)
+	return plan
 }
 
 // A struct behind a pointer, written in place: no copy of the struct, no
 // boxing of its numbers, strings and booleans
-func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
+func (w *tnJSONWriter) fastStructPtr(base unsafe.Pointer, plan *tnJSONStructPlan, depth int) bool {
 	// (an object whose keys were created in another order: see structFields)
-	if tnHasKeyOrder(rv.Elem().Type()) && !rv.Elem().FieldByName("__keys").IsNil() {
-		w.enter(rv.Pointer())
+	if plan.hasKeys && *(**[]string)(unsafe.Add(base, plan.keysOffset)) != nil {
+		w.enter(uintptr(base))
 		defer w.leave()
-		return w.object(depth, func(emit func(string, interface{})) { w.structFields(rv.Elem(), emit) })
+		elem := reflect.NewAt(plan.typ, base).Elem()
+		return w.object(depth, func(emit func(string, interface{})) { w.structFields(elem, emit) })
 	}
-	w.enter(rv.Pointer())
-	defer w.leave()
-	base := rv.UnsafePointer()
-	w.buf.WriteByte('{')
+	if !plan.cycleFree {
+		w.enter(uintptr(base))
+		defer w.leave()
+	}
+	w.buf = append(w.buf, '{')
 	wrote := false
-	for _, f := range tnJSONPlan(rv.Elem().Type()) {
-		mark := w.buf.Len()
+	for _, f := range plan.fields {
+		mark := len(w.buf)
 		if wrote {
-			w.buf.WriteByte(',')
+			w.buf = append(w.buf, ',')
 		}
 		w.newline(depth + 1)
-		w.buf.WriteString(f.key)
+		w.buf = append(w.buf, f.key...)
 		if w.indent != "" {
-			w.buf.WriteByte(' ')
+			w.buf = append(w.buf, ' ')
 		}
 		p := unsafe.Add(base, f.offset)
 		switch f.kind {
 		case 1:
-			if x := *(*float64)(p); math.IsNaN(x) || math.IsInf(x, 0) {
-				w.buf.WriteString("null")
-			} else {
-				w.buf.WriteString(TnNumStr(x))
-			}
+			w.buf = tnJSONAppendNum(w.buf, *(*float64)(p))
 		case 2:
-			tnJSONQuote(&w.buf, *(*string)(p))
+			w.buf = tnJSONAppendQuote(w.buf, *(*string)(p))
 		case 3:
-			w.buf.WriteString(strconv.FormatBool(*(*bool)(p)))
+			if *(*bool)(p) {
+				w.buf = append(w.buf, "true"...)
+			} else {
+				w.buf = append(w.buf, "false"...)
+			}
 		default:
 			// (an unset field — a nil pointer or any — is undefined: no key, as in JS)
 			fv := reflect.NewAt(f.typ, p).Elem()
 			if (fv.Kind() == reflect.Pointer || fv.Kind() == reflect.Interface) && fv.IsNil() {
 				if f.null {
-					w.buf.WriteString("null")
+					w.buf = append(w.buf, "null"...)
 					wrote = true
 					continue
 				}
-				w.buf.Truncate(mark)
+				w.buf = w.buf[:mark]
 				continue
 			}
 			if !w.property(f.name, fv.Interface(), depth+1) {
-				w.buf.Truncate(mark) // undefined values leave the key out
+				w.buf = w.buf[:mark] // undefined values leave the key out
 				continue
 			}
 		}
@@ -33339,12 +33458,12 @@ func (w *tnJSONWriter) fastStruct(rv reflect.Value, depth int) bool {
 	if wrote {
 		w.newline(depth)
 	}
-	w.buf.WriteByte('}')
+	w.buf = append(w.buf, '}')
 	return true
 }
 
 func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}))) bool {
-	w.buf.WriteByte('{')
+	w.buf = append(w.buf, '{')
 	wrote := false
 	each(func(key string, value interface{}) {
 		if w.allow != nil && !w.allow[key] {
@@ -33353,18 +33472,18 @@ func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}
 		if w.replacer != nil {
 			value = w.replacer(key, value)
 		}
-		mark := w.buf.Len()
+		mark := len(w.buf)
 		if wrote {
-			w.buf.WriteByte(',')
+			w.buf = append(w.buf, ',')
 		}
 		w.newline(depth + 1)
-		tnJSONQuote(&w.buf, key)
-		w.buf.WriteByte(':')
+		w.buf = tnJSONAppendQuote(w.buf, key)
+		w.buf = append(w.buf, ':')
 		if w.indent != "" {
-			w.buf.WriteByte(' ')
+			w.buf = append(w.buf, ' ')
 		}
 		if !w.property(key, value, depth+1) {
-			w.buf.Truncate(mark) // undefined values leave the key out
+			w.buf = w.buf[:mark] // undefined values leave the key out
 			return
 		}
 		wrote = true
@@ -33372,12 +33491,239 @@ func (w *tnJSONWriter) object(depth int, each func(emit func(string, interface{}
 	if wrote {
 		w.newline(depth)
 	}
-	w.buf.WriteByte('}')
+	w.buf = append(w.buf, '}')
 	return true
 }
 
 // JSON.parse: a SyntaxError for invalid input, as in JS
 // Objects decode into ordered records, so their keys keep the text's order
+func tnFastJSONWS(s string, i int) int {
+	for i < len(s) {
+		c := s[i]
+		if c != ' ' && c != '\\t' && c != '\\n' && c != '\\r' {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+func tnFastJSONString(s string, i int) (string, int, bool) {
+	if i >= len(s) || s[i] != '"' {
+		return "", 0, false
+	}
+	i++
+	start := i
+	for i < len(s) {
+		c := s[i]
+		if c == '"' {
+			return s[start:i], i + 1, true
+		}
+		if c == '\\\\' || c < 0x20 || c >= 0x80 {
+			break
+		}
+		i++
+	}
+	if i >= len(s) || s[i] < 0x20 {
+		return "", 0, false
+	}
+	buf := make([]byte, 0, (len(s)-start)+8)
+	buf = append(buf, s[start:i]...)
+	for i < len(s) {
+		c := s[i]
+		if c == '"' {
+			return string(buf), i + 1, true
+		}
+		if c < 0x20 || c >= 0x80 {
+			return "", 0, false
+		}
+		if c != '\\\\' {
+			buf = append(buf, c)
+			i++
+			continue
+		}
+		if i+1 >= len(s) {
+			return "", 0, false
+		}
+		esc := s[i+1]
+		switch esc {
+		case '"', '\\\\', '/':
+			buf = append(buf, esc)
+		case 'b':
+			buf = append(buf, '\\b')
+		case 'f':
+			buf = append(buf, '\\f')
+		case 'n':
+			buf = append(buf, '\\n')
+		case 'r':
+			buf = append(buf, '\\r')
+		case 't':
+			buf = append(buf, '\\t')
+		default:
+			return "", 0, false
+		}
+		i += 2
+	}
+	return "", 0, false
+}
+
+func tnFastJSONValue(s string, i int, depth int) (interface{}, int, bool) {
+	if depth > 512 {
+		return nil, 0, false
+	}
+	i = tnFastJSONWS(s, i)
+	if i >= len(s) {
+		return nil, 0, false
+	}
+	switch s[i] {
+	case '{':
+		m := TnNewMap[string, interface{}]()
+		i = tnFastJSONWS(s, i+1)
+		if i < len(s) && s[i] == '}' {
+			return m, i + 1, true
+		}
+		for {
+			k, next, ok := tnFastJSONString(s, i)
+			if !ok {
+				return nil, 0, false
+			}
+			i = tnFastJSONWS(s, next)
+			if i >= len(s) || s[i] != ':' {
+				return nil, 0, false
+			}
+			val, next, ok := tnFastJSONValue(s, i+1, depth+1)
+			if !ok {
+				return nil, 0, false
+			}
+			m.Set(k, val)
+			i = tnFastJSONWS(s, next)
+			if i >= len(s) {
+				return nil, 0, false
+			}
+			if s[i] == '}' {
+				return m, i + 1, true
+			}
+			if s[i] != ',' {
+				return nil, 0, false
+			}
+			i = tnFastJSONWS(s, i+1)
+			if i < len(s) && s[i] == '}' {
+				return nil, 0, false
+			}
+		}
+	case '[':
+		arr := []interface{}{}
+		i = tnFastJSONWS(s, i+1)
+		if i < len(s) && s[i] == ']' {
+			return arr, i + 1, true
+		}
+		for {
+			val, next, ok := tnFastJSONValue(s, i, depth+1)
+			if !ok {
+				return nil, 0, false
+			}
+			arr = append(arr, val)
+			i = tnFastJSONWS(s, next)
+			if i >= len(s) {
+				return nil, 0, false
+			}
+			if s[i] == ']' {
+				return arr, i + 1, true
+			}
+			if s[i] != ',' {
+				return nil, 0, false
+			}
+			i = tnFastJSONWS(s, i+1)
+			if i < len(s) && s[i] == ']' {
+				return nil, 0, false
+			}
+		}
+	case '"':
+		return tnFastJSONString(s, i)
+	case 't':
+		if i+4 <= len(s) && s[i:i+4] == "true" {
+			return true, i + 4, true
+		}
+		return nil, 0, false
+	case 'f':
+		if i+5 <= len(s) && s[i:i+5] == "false" {
+			return false, i + 5, true
+		}
+		return nil, 0, false
+	case 'n':
+		if i+4 <= len(s) && s[i:i+4] == "null" {
+			return TnNull, i + 4, true
+		}
+		return nil, 0, false
+	default:
+		start := i
+		neg := false
+		if s[i] == '-' {
+			neg = true
+			i++
+			if i >= len(s) {
+				return nil, 0, false
+			}
+		}
+		if s[i] == '0' {
+			i++
+			if i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				return nil, 0, false
+			}
+		} else if s[i] >= '1' && s[i] <= '9' {
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		} else {
+			return nil, 0, false
+		}
+		isInt := true
+		if i < len(s) && s[i] == '.' {
+			isInt = false
+			i++
+			if i >= len(s) || s[i] < '0' || s[i] > '9' {
+				return nil, 0, false
+			}
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		}
+		if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+			isInt = false
+			i++
+			if i < len(s) && (s[i] == '+' || s[i] == '-') {
+				i++
+			}
+			if i >= len(s) || s[i] < '0' || s[i] > '9' {
+				return nil, 0, false
+			}
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		}
+		digits := start
+		if neg {
+			digits++
+		}
+		if isInt && i-digits <= 15 {
+			var u uint64
+			for j := digits; j < i; j++ {
+				u = u*10 + uint64(s[j]-'0')
+			}
+			f := float64(u)
+			if neg {
+				f = -f
+			}
+			return f, i, true
+		}
+		f, err := strconv.ParseFloat(s[start:i], 64)
+		if err != nil {
+			return nil, 0, false
+		}
+		return f, i, true
+	}
+}
+
 func tnJSONDecodeOrdered(dec *json.Decoder) (interface{}, error) {
 	tok, err := dec.Token()
 	if err != nil {
@@ -33420,6 +33766,9 @@ func tnJSONDecodeOrdered(dec *json.Decoder) (interface{}, error) {
 }
 
 func TnJSONParse(text string) interface{} {
+	if v, end, ok := tnFastJSONValue(text, 0, 0); ok && tnFastJSONWS(text, end) == len(text) {
+		return v
+	}
 	dec := json.NewDecoder(strings.NewReader(text))
 	if ordered, err := tnJSONDecodeOrdered(dec); err == nil {
 		if _, extra := dec.Token(); extra == io.EOF {
@@ -36036,6 +36385,7 @@ func TnTimeNow() time.Time {
 // as tasks. Refs (pending timers, async work, open handles) keep it alive.
 var tnLoopMu sync.Mutex
 var tnLoopTasks []func()
+var tnHasLoopTasks int32
 var tnLoopSignal = make(chan struct{}, 1)
 var tnLoopRefs int64
 
@@ -36115,13 +36465,15 @@ func tnLoopNotify() {
 func TnLoopRef() { atomic.AddInt64(&tnLoopRefs, 1) }
 
 func TnLoopUnref() {
-	atomic.AddInt64(&tnLoopRefs, -1)
-	tnLoopNotify()
+	if atomic.AddInt64(&tnLoopRefs, -1) <= 0 {
+		tnLoopNotify()
+	}
 }
 
 func TnLoopPost(fn func()) {
 	tnLoopMu.Lock()
 	tnLoopTasks = append(tnLoopTasks, fn)
+	atomic.StoreInt32(&tnHasLoopTasks, 1)
 	tnLoopMu.Unlock()
 	tnLoopNotify()
 }
@@ -36139,6 +36491,7 @@ func tnLoopRunOrPost(fn func()) {
 	}
 	tnLoopMu.Lock()
 	tnLoopTasks = append(tnLoopTasks, fn)
+	atomic.StoreInt32(&tnHasLoopTasks, 1)
 	tnLoopMu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
@@ -36146,6 +36499,22 @@ func tnLoopRunOrPost(fn func()) {
 			select {}
 		}
 	}()
+	TnRunMicrotasks()
+	TnLoopRunPending()
+	tnRelease()
+}
+
+func tnLoopRun(fn func()) {
+	<-tnBaton
+	defer func() {
+		if r := recover(); r != nil {
+			go func() { panic(r) }()
+			select {}
+		}
+	}()
+	TnRunMicrotasks()
+	TnLoopRunPending()
+	tnRunTask(fn)
 	TnRunMicrotasks()
 	TnLoopRunPending()
 	tnRelease()
@@ -36164,19 +36533,31 @@ func TnLoopCall(fn func()) {
 
 // (baton holder) Runs the queued tasks, each followed by its microtasks
 func TnLoopRunPending() bool {
+	if atomic.LoadInt32(&tnHasLoopTasks) == 0 {
+		return false
+	}
 	ran := false
 	for {
 		tnLoopMu.Lock()
 		if len(tnLoopTasks) == 0 {
+			atomic.StoreInt32(&tnHasLoopTasks, 0)
 			tnLoopMu.Unlock()
 			return ran
 		}
 		fn := tnLoopTasks[0]
+		tnLoopTasks[0] = nil
 		tnLoopTasks = tnLoopTasks[1:]
+		if len(tnLoopTasks) == 0 {
+			tnLoopTasks = tnLoopTasks[:0]
+			atomic.StoreInt32(&tnHasLoopTasks, 0)
+		}
 		tnLoopMu.Unlock()
 		ran = true
 		tnRunTask(fn)
 		TnRunMicrotasks()
+		if atomic.LoadInt32(&tnHasLoopTasks) == 0 {
+			return true
+		}
 	}
 }
 
@@ -36281,6 +36662,7 @@ func tnWakeQueue(tok chan struct{}) {
 	}
 	tnMicrotasksMu.Lock()
 	tnMicrotasks = append(tnMicrotasks, func() { tnDeliver(tok) })
+	atomic.StoreInt32(&tnHasMicrotasks, 1)
 	tnMicrotasksMu.Unlock()
 	tnLoopNotify()
 }
@@ -36422,25 +36804,39 @@ func (tnLoopGroup) Wait()     { TnRunLoop() }
 // queueMicrotask: run after the current synchronous code (end of main or of a loop task)
 var tnMicrotasks []func()
 var tnMicrotasksMu sync.Mutex
+var tnHasMicrotasks int32
 
 func TnQueueMicrotask(fn func()) {
 	fn = TnAsyncWrap(fn)
 	tnMicrotasksMu.Lock()
 	tnMicrotasks = append(tnMicrotasks, fn)
+	atomic.StoreInt32(&tnHasMicrotasks, 1)
 	tnMicrotasksMu.Unlock()
 }
 
 func TnRunMicrotasks() {
+	if atomic.LoadInt32(&tnHasMicrotasks) == 0 {
+		return
+	}
 	for {
 		tnMicrotasksMu.Lock()
 		if len(tnMicrotasks) == 0 {
+			atomic.StoreInt32(&tnHasMicrotasks, 0)
 			tnMicrotasksMu.Unlock()
 			return
 		}
 		fn := tnMicrotasks[0]
+		tnMicrotasks[0] = nil
 		tnMicrotasks = tnMicrotasks[1:]
+		if len(tnMicrotasks) == 0 {
+			tnMicrotasks = tnMicrotasks[:0]
+			atomic.StoreInt32(&tnHasMicrotasks, 0)
+		}
 		tnMicrotasksMu.Unlock()
 		TnAsyncRun(nil, fn)
+		if atomic.LoadInt32(&tnHasMicrotasks) == 0 {
+			return
+		}
 	}
 }`,
     uri: `// encodeURIComponent: escapes everything except A-Z a-z 0-9 - _ . ! ~ * ' ( )

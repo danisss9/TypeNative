@@ -46,7 +46,19 @@ func tnInvalidURL(input string) *TnError {
 
 // Percent-encodes the bytes of s that are in the set (C0 controls and non-ASCII always)
 func tnPercentEncode(s string, set string) string {
+	need := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7E || strings.IndexByte(set, c) >= 0 {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return s
+	}
 	var sb strings.Builder
+	sb.Grow(len(s) + 8)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c < 0x20 || c > 0x7E || strings.IndexByte(set, c) >= 0 {
@@ -71,6 +83,9 @@ func (u *TnURL) special() bool {
 
 // RFC 3986 remove_dot_segments on a "/"-separated path
 func tnRemoveDotSegments(path string) string {
+	if strings.IndexByte(path, '.') < 0 && strings.IndexByte(path, '%') < 0 {
+		return path
+	}
 	segments := strings.Split(path, "/")
 	out := []string{}
 	for i, seg := range segments {
@@ -230,7 +245,9 @@ func tnCopyURL(b *TnURL) *TnURL {
 }
 
 func tnParseURLString(input string, base *TnURL) (*TnURL, bool) {
-	input = strings.TrimFunc(input, func(r rune) bool { return r <= 0x20 })
+	if len(input) > 0 && (input[0] <= 0x20 || input[len(input)-1] <= 0x20) {
+		input = strings.TrimFunc(input, func(r rune) bool { return r <= 0x20 })
+	}
 	if strings.ContainsAny(input, "\\t\\n\\r") {
 		input = tnURLStrip.Replace(input)
 	}
@@ -349,6 +366,8 @@ func tnResolveRelative(input string, query string, hasQuery bool, fragment strin
 	return u, true
 }
 
+var tnURLBaseCache sync.Map
+
 func tnURLBase(base []interface{}) (*TnURL, bool, string) {
 	if len(base) == 0 || base[0] == nil {
 		return nil, true, ""
@@ -357,7 +376,13 @@ func tnURLBase(base []interface{}) (*TnURL, bool, string) {
 	case *TnURL:
 		return b, true, ""
 	case string:
+		if cached, ok := tnURLBaseCache.Load(b); ok {
+			return cached.(*TnURL), true, b
+		}
 		parsed, ok := tnParseURLString(b, nil)
+		if ok && len(b) <= 128 {
+			tnURLBaseCache.Store(b, parsed)
+		}
 		return parsed, ok, b
 	}
 	s := fmt.Sprint(base[0])
@@ -833,7 +858,7 @@ export function registerUrl(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeUrl',
-    ['encoding/hex', 'fmt', 'net/url', 'path/filepath', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'unicode/utf16', 'unsafe'],
+    ['encoding/hex', 'fmt', 'net/url', 'path/filepath', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'sync', 'unicode/utf16', 'unsafe'],
     ['error', 'dynamic', 'punycode', 'pathToFileURL', 'nodeInvoke'],
     urlHelper
   );

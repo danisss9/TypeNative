@@ -8,7 +8,7 @@ Node vs TypeNative on the same workload and a README documenting the results.
 |-----------------------------------|----------------------------------------------------------------------------|--------------------------------------------------------------|
 | [hello-world](hello-world/)       | `console.log`, `process.argv`, template literals                           | **8.5x faster startup** (7.4 ms vs 62.4 ms)                  |
 | [fibonacci](fibonacci/)           | Recursion, `perf_hooks` timing, CPU-bound number crunching                 | **2.0x faster compute** (36.4 ms vs 73.8 ms)                 |
-| [json-server](json-server/)       | `node:http` web server with GET + POST JSON routes, zero dependencies      | 0.7x Node's HTTP throughput (44.3k vs 60.0k GET req/s)       |
+| [json-server](json-server/)       | `node:http` web server with GET + POST JSON routes, zero dependencies      | **1.7x Node's HTTP throughput** (106k vs 62k GET req/s)      |
 | [todo-cli](todo-cli/)             | A to-do CLI persisting to a JSON file, run many times a day                | **8.2x faster per command** (9.3 ms vs 76.1 ms)              |
 | [dupe-finder](dupe-finder/)       | Recursive directory walk, SHA-256 hashing, JSON report written to disk     | **2.9x faster scan** (224 ms vs 645 ms, 2,000 files)         |
 | [mandelbrot-png](mandelbrot-png/) | Fractal render + hand-written PNG encoder on `node:zlib`, no image library | **1.1x faster** (452 ms vs 514 ms)                           |
@@ -95,10 +95,10 @@ cd examples/react-compiler  && node parity.mjs   # and node bench.mjs
 TypeNative's clearest wins are process startup and memory. Startup is about
 8x faster, which is what you feel in a CLI like todo-cli. A long-running app
 like desktop-notes idles at about a seventh of Node's memory. Disk- and
-hash-bound work (dupe-finder) runs about 3x faster, while HTTP serving
-(json-server) handles fewer requests per second than Node 26. Pure
-floating-point loops (mandelbrot-png) run at about the same speed as V8's
-JIT, and recursion-heavy code (fibonacci) runs about 2x faster. Every example
+hash-bound work (dupe-finder) runs about 3x faster, HTTP serving (json-server)
+handles about 1.7x more requests per second than Node 26, pure floating-point
+loops (mandelbrot-png) run at about the same speed as V8's JIT, and
+recursion-heavy code (fibonacci) runs about 2x faster. Every example
 also ships as one dependency-free binary. The READMEs report what was
 measured, including run-to-run variation and how each load was generated.
 

@@ -7,7 +7,7 @@
 // Client: http.request returns a ClientRequest (a Writable); the request goes
 // out on the first write or on end(), the response is an IncomingMessage.
 // Like Node: no redirects are followed and bodies are not decompressed.
-import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { defineClass, defineHelper, defineModule, setResults, isStringNode, isObjectLiteral, goString } from './registry.js';
 import { STREAM_METHODS, STREAM_GETTERS, streamListenerTypes } from './stream.js';
 import { SERVER_METHODS } from './net.js';
 const httpHelper = `// node:http
@@ -127,79 +127,133 @@ func tnHeaderStrings(v interface{}) []string {
 	return []string{TnJSString(v)}
 }
 
-// Outgoing headers: case-insensitive, keeping the first spelling and the order
-type tnHeaderStore struct {
-	names  map[string]string
-	values map[string]interface{}
-	order  []string
+func tnLowerASCII(s string) string {
+	if s == "Content-Length" {
+		return "content-length"
+	}
+	if s == "Content-Type" {
+		return "content-type"
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || c >= 0x80 {
+			return strings.ToLower(s)
+		}
+	}
+	return s
 }
 
-func newTnHeaderStore() *tnHeaderStore {
-	return &tnHeaderStore{names: map[string]string{}, values: map[string]interface{}{}}
+type tnHeaderEntry struct {
+	key   string
+	name  string
+	value interface{}
+}
+
+// Outgoing headers: case-insensitive, keeping the first spelling and the order
+type tnHeaderStore struct {
+	entries []tnHeaderEntry
+	buf     [4]tnHeaderEntry
 }
 
 func (h *tnHeaderStore) set(name string, value interface{}) {
-	key := strings.ToLower(name)
-	if _, ok := h.values[key]; !ok {
-		h.order = append(h.order, key)
-		h.names[key] = name
+	key := tnLowerASCII(name)
+	for i := range h.entries {
+		if h.entries[i].key == key {
+			h.entries[i].value = value
+			return
+		}
 	}
-	h.values[key] = value
+	if h.entries == nil {
+		h.entries = h.buf[:0]
+	}
+	h.entries = append(h.entries, tnHeaderEntry{key: key, name: name, value: value})
 }
 
-func (h *tnHeaderStore) get(name string) interface{} { return h.values[strings.ToLower(name)] }
+func (h *tnHeaderStore) get(name string) interface{} {
+	key := tnLowerASCII(name)
+	for i := range h.entries {
+		if h.entries[i].key == key {
+			return h.entries[i].value
+		}
+	}
+	return nil
+}
 
 func (h *tnHeaderStore) has(name string) bool {
-	_, ok := h.values[strings.ToLower(name)]
-	return ok
+	key := tnLowerASCII(name)
+	for i := range h.entries {
+		if h.entries[i].key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *tnHeaderStore) remove(name string) {
-	key := strings.ToLower(name)
-	if _, ok := h.values[key]; !ok {
-		return
-	}
-	delete(h.values, key)
-	delete(h.names, key)
-	for i, k := range h.order {
-		if k == key {
-			h.order = append(h.order[:i], h.order[i+1:]...)
-			break
+	key := tnLowerASCII(name)
+	for i := range h.entries {
+		if h.entries[i].key == key {
+			h.entries = append(h.entries[:i], h.entries[i+1:]...)
+			return
 		}
 	}
 }
 
 func (h *tnHeaderStore) record() *TnMap[string, interface{}] {
 	m := TnNewMap[string, interface{}]()
-	for _, k := range h.order {
-		m.Set(k, h.values[k])
+	for i := range h.entries {
+		m.Set(h.entries[i].key, h.entries[i].value)
 	}
 	return m
 }
 
 func (h *tnHeaderStore) keys() []string {
-	return append([]string{}, h.order...)
+	out := make([]string, len(h.entries))
+	for i := range h.entries {
+		out[i] = h.entries[i].key
+	}
+	return out
 }
 
 func (h *tnHeaderStore) rawNames() []string {
-	out := []string{}
-	for _, k := range h.order {
-		out = append(out, h.names[k])
+	out := make([]string, len(h.entries))
+	for i := range h.entries {
+		out[i] = h.entries[i].name
 	}
 	return out
 }
 
 func (h *tnHeaderStore) toGo(dst http.Header) {
-	for _, k := range h.order {
-		name := h.names[k]
+	for i := range h.entries {
+		name := h.entries[i].name
+		canon := http.CanonicalHeaderKey(name)
 		dst.Del(name)
-		for _, v := range tnHeaderStrings(h.values[k]) {
-			dst[http.CanonicalHeaderKey(name)] = append(dst[http.CanonicalHeaderKey(name)], v)
+		for _, v := range tnHeaderStrings(h.entries[i].value) {
+			dst[canon] = append(dst[canon], v)
 		}
 	}
 }
 
 func (h *tnHeaderStore) setAll(headers interface{}) {
+	if headers == nil {
+		return
+	}
+	switch m := headers.(type) {
+	case *TnMap[string, string]:
+		if m != nil {
+			for k, v := range m.All() {
+				h.set(k, v)
+			}
+		}
+		return
+	case *TnMap[string, interface{}]:
+		if m != nil {
+			for k, v := range m.All() {
+				h.set(k, v)
+			}
+		}
+		return
+	}
 	for _, e := range tnEntries(headers) {
 		h.set(fmt.Sprint(e[0]), e[1])
 	}
@@ -213,42 +267,145 @@ type TnIncomingMessage struct {
 	httpVersion      string
 	httpVersionMajor float64
 	httpVersionMinor float64
-	headers          *TnMap[string, string]
-	headersDistinct  *TnMap[string, []string]
-	rawHeaders       []string
-	trailers         *TnMap[string, string]
+	hdrs             *TnMap[string, string]
+	hdrsDistinct     *TnMap[string, []string]
+	rawHdrs          []string
+	trlrs            *TnMap[string, string]
 	statusCode       float64
 	statusMessage    string
 	complete         bool
 	aborted          bool
 	socket           *TnSocket
+	rawGoHeader      http.Header
+	rawHost          string
+	rawChunked       bool
+	rawH2            bool
+	rawTLS           bool
+	rawHeaderBlock   []byte
+	rawLocal         net.Addr
+	rawRemote        string
 }
 
-func (m *TnIncomingMessage) Get_socket() *TnSocket     { return m.socket }
-func (m *TnIncomingMessage) Get_connection() *TnSocket { return m.socket }
+func (m *TnIncomingMessage) ensureSocket() *TnSocket {
+	if m.socket == nil && (m.rawLocal != nil || m.rawRemote != "") {
+		m.socket = tnInfoSocket(m.rawLocal, m.rawRemote)
+		if m.rawTLS {
+			m.socket.encrypted = true
+		}
+	}
+	return m.socket
+}
+
+func (m *TnIncomingMessage) Get_socket() *TnSocket     { return m.ensureSocket() }
+func (m *TnIncomingMessage) Get_connection() *TnSocket { return m.ensureSocket() }
 func (m *TnIncomingMessage) setTimeout(ms float64, cb ...interface{}) *TnIncomingMessage {
-	if m.socket != nil {
-		m.socket.setTimeout(ms, cb...)
+	if s := m.ensureSocket(); s != nil {
+		s.setTimeout(ms, cb...)
 	}
 	return m
 }
 
+func (m *TnIncomingMessage) ensureHeaders() {
+	if m.hdrs != nil {
+		return
+	}
+	if len(m.rawHeaderBlock) > 0 {
+		tnIncomingHeadersRaw(m, m.rawHeaderBlock)
+		return
+	}
+	tnBuildIncomingHeaders(m, m.rawGoHeader, m.rawHost, m.rawChunked)
+	if m.rawH2 {
+		tnPseudoHeaders(m)
+	}
+}
+
+func (m *TnIncomingMessage) Get_headers() *TnMap[string, string] {
+	m.ensureHeaders()
+	return m.hdrs
+}
+
+func (m *TnIncomingMessage) Get_headersDistinct() *TnMap[string, []string] {
+	m.ensureHeaders()
+	return m.hdrsDistinct
+}
+
+func (m *TnIncomingMessage) Get_rawHeaders() []string {
+	m.ensureHeaders()
+	return m.rawHdrs
+}
+
+func (m *TnIncomingMessage) Get_trailers() *TnMap[string, string] {
+	if m.trlrs == nil {
+		m.trlrs = TnNewMap[string, string]()
+	}
+	return m.trlrs
+}
+
+func tnIncomingHeadersRaw(m *TnIncomingMessage, raw []byte) {
+	m.hdrs = TnNewMap[string, string]()
+	m.hdrsDistinct = TnNewMap[string, []string]()
+	m.rawHdrs = []string{}
+	rest := raw
+	for len(rest) > 0 {
+		idx := bytes.IndexByte(rest, '\\n')
+		var line []byte
+		if idx < 0 {
+			line = rest
+			rest = nil
+		} else {
+			line = rest[:idx]
+			rest = rest[idx+1:]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) == 0 {
+			break
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			continue
+		}
+		name := string(bytes.TrimSpace(line[:colon]))
+		val := string(bytes.TrimSpace(line[colon+1:]))
+		key := tnLowerASCII(name)
+		m.rawHdrs = append(m.rawHdrs, name, val)
+		if existing, ok := m.hdrsDistinct.Lookup(key); ok {
+			m.hdrsDistinct.Set(key, append(existing, val))
+			sep := ", "
+			if key == "cookie" {
+				sep = "; "
+			}
+			m.hdrs.Set(key, m.hdrs.Get(key)+sep+val)
+		} else {
+			m.hdrsDistinct.Set(key, []string{val})
+			m.hdrs.Set(key, val)
+		}
+	}
+}
+
 // Headers as Node shows them: lower-case names, repeated values joined
 func tnIncomingHeaders(m *TnIncomingMessage, h http.Header, host string, chunked bool) {
-	m.headers = TnNewMap[string, string]()
-	m.headersDistinct = TnNewMap[string, []string]()
-	m.rawHeaders = []string{}
+	m.rawGoHeader = h
+	m.rawHost = host
+	m.rawChunked = chunked
+}
+
+func tnBuildIncomingHeaders(m *TnIncomingMessage, h http.Header, host string, chunked bool) {
+	m.hdrs = TnNewMap[string, string]()
+	m.hdrsDistinct = TnNewMap[string, []string]()
+	m.rawHdrs = []string{}
 	add := func(name string, values []string) {
-		key := strings.ToLower(name)
+		key := tnLowerASCII(name)
 		for _, v := range values {
-			m.rawHeaders = append(m.rawHeaders, name, v)
+			m.rawHdrs = append(m.rawHdrs, name, v)
 		}
-		m.headersDistinct.Set(key, append([]string{}, values...))
+		m.hdrsDistinct.Set(key, append([]string{}, values...))
 		sep := ", "
 		if key == "cookie" {
 			sep = "; "
 		}
-		m.headers.Set(key, strings.Join(values, sep))
+		m.hdrs.Set(key, strings.Join(values, sep))
 	}
 	if host != "" {
 		add("Host", []string{host})
@@ -261,16 +418,18 @@ func tnIncomingHeaders(m *TnIncomingMessage, h http.Header, host string, chunked
 	for _, name := range names {
 		add(name, h[name])
 	}
-	if chunked && !m.headers.Has("transfer-encoding") {
+	if chunked && !m.hdrs.Has("transfer-encoding") {
 		add("Transfer-Encoding", []string{"chunked"})
 	}
 }
 
 func tnNewIncoming() *TnIncomingMessage {
 	m := &TnIncomingMessage{}
-	m.TnStream = *TnNewReadable()
+	m.flowing = -1
+	m.decodeStrings = true
+	m.readableSide = true
+	m.asyncCtx = TnAsyncSnapshot()
 	m.tnSelf = m
-	m.trailers = TnNewMap[string, string]()
 	return m
 }
 
@@ -341,14 +500,15 @@ func tnInfoSocket(local net.Addr, remote string) *TnSocket {
 
 // One operation of a response, applied by the handler goroutine
 type tnResOp struct {
-	status  int
-	header  http.Header
-	trailer http.Header
-	data   []byte
-	end    bool
+	status    int
+	statusMsg string
+	header    http.Header
+	trailer   http.Header
+	data      []byte
+	end       bool
 	// Header ops: send the headers now (flushHeaders) instead of with the body
-	flush  bool
-	done   func(err error)
+	flush     bool
+	done      func(err error)
 }
 
 // http.ServerResponse
@@ -358,8 +518,12 @@ type TnServerResponse struct {
 	statusMessage string
 	sendDate      bool
 	headersSent   bool
+	wroteHead     bool
 	wroteData     bool
-	store         *tnHeaderStore
+	inSyncTurn    bool
+	fastEnd       bool
+	fastBody      []byte
+	store         tnHeaderStore
 	req           *TnIncomingMessage
 	mu            sync.Mutex
 	ops           []tnResOp
@@ -370,9 +534,19 @@ type TnServerResponse struct {
 	endPosted     bool
 }
 
-func (res *TnServerResponse) Get_headersSent() bool       { return res.headersSent }
+func (res *TnServerResponse) Get_headersSent() bool       { return res.headersSent || res.wroteHead }
 func (res *TnServerResponse) Get_req() *TnIncomingMessage { return res.req }
-func (res *TnServerResponse) Get_socket() *TnSocket       { return res.req.socket }
+func (res *TnServerResponse) Get_socket() *TnSocket       { return res.req.Get_socket() }
+
+func (res *TnServerResponse) sig() chan struct{} {
+	res.mu.Lock()
+	if res.signal == nil {
+		res.signal = make(chan struct{}, 1)
+	}
+	ch := res.signal
+	res.mu.Unlock()
+	return ch
+}
 
 // Queues an op without waking the handler goroutine (it goes out with the next post)
 func (res *TnServerResponse) queue(op tnResOp) {
@@ -382,9 +556,15 @@ func (res *TnServerResponse) queue(op tnResOp) {
 }
 
 func (res *TnServerResponse) post(op tnResOp) {
-	res.queue(op)
+	res.mu.Lock()
+	res.ops = append(res.ops, op)
+	if res.signal == nil {
+		res.signal = make(chan struct{}, 1)
+	}
+	ch := res.signal
+	res.mu.Unlock()
 	select {
-	case res.signal <- struct{}{}:
+	case ch <- struct{}{}:
 	default:
 	}
 }
@@ -404,11 +584,12 @@ func (res *TnServerResponse) headerOp() tnResOp {
 		h["Date"] = nil
 	}
 	res.headersSent = true
-	return tnResOp{status: int(res.statusCode), header: h}
+	res.wroteHead = true
+	return tnResOp{status: int(res.statusCode), statusMsg: res.statusMessage, header: h}
 }
 
 func (res *TnServerResponse) setHeader(name string, value interface{}) *TnServerResponse {
-	if res.headersSent {
+	if res.headersSent || res.wroteHead {
 		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot set headers after they are sent to the client"))
 	}
 	res.store.set(name, value)
@@ -416,9 +597,10 @@ func (res *TnServerResponse) setHeader(name string, value interface{}) *TnServer
 }
 
 func (res *TnServerResponse) setHeaders(headers interface{}) *TnServerResponse {
-	for _, e := range tnEntries(headers) {
-		res.setHeader(fmt.Sprint(e[0]), e[1])
+	if res.headersSent || res.wroteHead {
+		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot set headers after they are sent to the client"))
 	}
+	res.store.setAll(headers)
 	return res
 }
 
@@ -447,9 +629,19 @@ func (res *TnServerResponse) getHeaderNames() []string { return res.store.keys()
 func (res *TnServerResponse) hasHeader(name string) bool { return res.store.has(name) }
 func (res *TnServerResponse) removeHeader(name string) { res.store.remove(name) }
 
+func (res *TnServerResponse) writeHeadKV(status float64, k string, v string) *TnServerResponse {
+	if res.headersSent || res.wroteHead {
+		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot write headers after they are sent to the client"))
+	}
+	res.statusCode = status
+	res.store.set(k, v)
+	res.wroteHead = true
+	return res
+}
+
 // writeHead(status, [statusMessage], [headers])
 func (res *TnServerResponse) writeHead(status float64, args ...interface{}) *TnServerResponse {
-	if res.headersSent {
+	if res.headersSent || res.wroteHead {
 		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot write headers after they are sent to the client"))
 	}
 	res.statusCode = status
@@ -457,13 +649,10 @@ func (res *TnServerResponse) writeHead(status float64, args ...interface{}) *TnS
 		if s, ok := a.(string); ok {
 			res.statusMessage = s
 		} else if a != nil {
-			for _, e := range tnEntries(a) {
-				res.store.set(fmt.Sprint(e[0]), e[1])
-			}
+			res.store.setAll(a)
 		}
 	}
-	// As in Node, the headers go out with the first write or end()
-	res.queue(res.headerOp())
+	res.wroteHead = true
 	return res
 }
 
@@ -479,7 +668,40 @@ func (res *TnServerResponse) writeContinue() {}
 
 // end(data?): a body written in one piece gets a Content-Length, as in Node
 func (res *TnServerResponse) end(args ...interface{}) *TnServerResponse {
-	if !res.headersSent && !res.wroteData && !res.store.has("content-length") && !res.store.has("transfer-encoding") {
+	// writeHead() only records the status and headers (headersSent stays false),
+	// so the whole response can still be built on the connection goroutine.
+	if res.inSyncTurn && !res.headersSent && !res.wroteData && !res.writeEnded && !res.destroyed &&
+		len(res.ops) == 0 && len(res.writeQueue) == 0 && res.trailer == nil &&
+		res.state == nil && res.fn0 == nil && res.fn1 == nil && len(args) <= 1 {
+		if len(args) == 0 || args[0] == nil {
+			res.fastEnd = true
+			res.wroteHead = true
+			res.writeEnded = true
+			res.finished = true
+			res.closed = true
+			return res
+		}
+		switch d := args[0].(type) {
+		case string:
+			res.fastBody = unsafe.Slice(unsafe.StringData(d), len(d))
+			res.fastEnd = true
+			res.wroteHead = true
+			res.writeEnded = true
+			res.finished = true
+			res.closed = true
+			return res
+		case []byte:
+			res.fastBody = d
+			res.fastEnd = true
+			res.wroteHead = true
+			res.writeEnded = true
+			res.finished = true
+			res.closed = true
+			return res
+		}
+	}
+	st := int(res.statusCode)
+	if !res.headersSent && !res.wroteData && st >= 200 && st != 204 && st != 304 && !res.store.has("content-length") && !res.store.has("transfer-encoding") {
 		size := 0
 		if len(args) > 0 {
 			switch d := args[0].(type) {
@@ -511,10 +733,10 @@ func (res *TnServerResponse) setTimeout(ms float64, cb ...interface{}) *TnServer
 	return res
 }
 
-func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
-	res := &TnServerResponse{statusCode: 200, sendDate: true, store: newTnHeaderStore(), req: req, signal: make(chan struct{}, 1)}
-	res.TnStream = *TnNewWritable()
-	res.tnSelf = res
+func (res *TnServerResponse) tnInitSink() {
+	if res.sink != nil {
+		return
+	}
 	res.sink = func(chunk interface{}, done func(err interface{})) {
 		if !res.headersSent {
 			res.queue(res.headerOp())
@@ -555,20 +777,359 @@ func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
 			TnLoopPost(func() { done(nil) })
 		}})
 	}
+}
+
+func tnNewServerResponse(req *TnIncomingMessage) *TnServerResponse {
+	res := &TnServerResponse{statusCode: 200, sendDate: true, req: req}
+	res.flowing = -1
+	res.decodeStrings = true
+	res.writableSide = true
+	res.asyncCtx = TnAsyncSnapshot()
+	res.tnSelf = res
 	return res
 }
 
-// http.Server: a net.Server whose connections are served by net/http
+type tnHttpConn struct {
+	conn   net.Conn
+	active int32
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (hc *tnHttpConn) closeConn() {
+	hc.once.Do(func() {
+		close(hc.closed)
+		hc.conn.Close()
+	})
+}
+
+var (
+	tnDateSec atomic.Int64
+	tnDateVal atomic.Value
+	tnDateMu  sync.Mutex
+)
+
+func tnAppendDateHeader(buf []byte) []byte {
+	now := time.Now()
+	sec := now.Unix()
+	if sec == tnDateSec.Load() {
+		if s, ok := tnDateVal.Load().(string); ok {
+			return append(buf, s...)
+		}
+	}
+	tnDateMu.Lock()
+	if sec != tnDateSec.Load() {
+		var b [64]byte
+		s := append(b[:0], "Date: "...)
+		s = now.UTC().AppendFormat(s, http.TimeFormat)
+		s = append(s, '\\r', '\\n')
+		tnDateVal.Store(string(s))
+		tnDateSec.Store(sec)
+	}
+	s, _ := tnDateVal.Load().(string)
+	tnDateMu.Unlock()
+	return append(buf, s...)
+}
+
+func tnAppendStatusLine(buf []byte, status int, msg string) []byte {
+	if msg == "" {
+		switch status {
+		case 200:
+			return append(buf, "HTTP/1.1 200 OK\\r\\n"...)
+		case 201:
+			return append(buf, "HTTP/1.1 201 Created\\r\\n"...)
+		case 204:
+			return append(buf, "HTTP/1.1 204 No Content\\r\\n"...)
+		case 400:
+			return append(buf, "HTTP/1.1 400 Bad Request\\r\\n"...)
+		case 404:
+			return append(buf, "HTTP/1.1 404 Not Found\\r\\n"...)
+		case 500:
+			return append(buf, "HTTP/1.1 500 Internal Server Error\\r\\n"...)
+		}
+		msg = tnStatusText(status)
+	}
+	buf = append(buf, "HTTP/1.1 "...)
+	buf = strconv.AppendInt(buf, int64(status), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, msg...)
+	return append(buf, '\\r', '\\n')
+}
+
+func tnInternMethod(b []byte) string {
+	switch len(b) {
+	case 3:
+		if b[0] == 'G' && b[1] == 'E' && b[2] == 'T' {
+			return "GET"
+		}
+		if b[0] == 'P' && b[1] == 'U' && b[2] == 'T' {
+			return "PUT"
+		}
+	case 4:
+		if b[0] == 'P' && b[1] == 'O' && b[2] == 'S' && b[3] == 'T' {
+			return "POST"
+		}
+		if b[0] == 'H' && b[1] == 'E' && b[2] == 'A' && b[3] == 'D' {
+			return "HEAD"
+		}
+	case 5:
+		if b[0] == 'P' && b[1] == 'A' && b[2] == 'T' && b[3] == 'C' && b[4] == 'H' {
+			return "PATCH"
+		}
+	case 6:
+		if b[0] == 'D' && b[1] == 'E' && b[2] == 'L' && b[3] == 'E' && b[4] == 'T' && b[5] == 'E' {
+			return "DELETE"
+		}
+	case 7:
+		if b[0] == 'O' && b[1] == 'P' && b[2] == 'T' && b[3] == 'I' && b[4] == 'O' && b[5] == 'N' && b[6] == 'S' {
+			return "OPTIONS"
+		}
+	}
+	return string(b)
+}
+
+type tnHttp1ResponseWriter struct {
+	conn          net.Conn
+	reqMethod     string
+	protoMinor    int
+	keepAlive     bool
+	closeAfter    bool
+	header        http.Header
+	status        int
+	statusMessage string
+	hasStatus     bool
+	wroteHeader   bool
+	chunked       bool
+	buf           []byte
+}
+
+func (w *tnHttp1ResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+	return w.header
+}
+
+func (w *tnHttp1ResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader || w.hasStatus {
+		return
+	}
+	w.status = status
+	w.hasStatus = true
+}
+
+func (w *tnHttp1ResponseWriter) appendHeaders(ending bool, endLen int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	if !w.hasStatus {
+		w.status = 200
+		w.hasStatus = true
+	}
+	if w.protoMinor == 0 {
+		msg := w.statusMessage
+		if msg == "" {
+			msg = tnStatusText(w.status)
+		}
+		w.buf = append(w.buf[:0], "HTTP/1.0 "...)
+		w.buf = strconv.AppendInt(w.buf, int64(w.status), 10)
+		w.buf = append(w.buf, ' ')
+		w.buf = append(w.buf, msg...)
+		w.buf = append(w.buf, '\\r', '\\n')
+	} else {
+		w.buf = tnAppendStatusLine(w.buf[:0], w.status, w.statusMessage)
+	}
+	hasCL := false
+	hasTE := false
+	hasDate := false
+	omitDate := false
+	hasConn := false
+	for k, vals := range w.header {
+		if strings.HasPrefix(k, http.TrailerPrefix) {
+			continue
+		}
+		lk := tnLowerASCII(k)
+		switch lk {
+		case "content-length":
+			if len(vals) > 0 {
+				hasCL = true
+			}
+		case "transfer-encoding":
+			if len(vals) > 0 {
+				hasTE = true
+				for _, v := range vals {
+					if strings.Contains(strings.ToLower(v), "chunked") {
+						w.chunked = true
+					}
+				}
+			}
+		case "date":
+			if vals == nil {
+				omitDate = true
+			} else {
+				hasDate = true
+			}
+		case "connection":
+			if len(vals) > 0 {
+				hasConn = true
+				for _, v := range vals {
+					if strings.Contains(strings.ToLower(v), "close") {
+						w.closeAfter = true
+					}
+				}
+			}
+		}
+		for _, v := range vals {
+			w.buf = append(w.buf, k...)
+			w.buf = append(w.buf, ':', ' ')
+			w.buf = append(w.buf, v...)
+			w.buf = append(w.buf, '\\r', '\\n')
+		}
+	}
+	if !hasDate && !omitDate {
+		w.buf = tnAppendDateHeader(w.buf)
+	}
+	noBody := w.reqMethod == "HEAD" || w.status < 200 || w.status == 204 || w.status == 304
+	if !noBody && !hasCL && !hasTE {
+		if ending {
+			w.buf = append(w.buf, "Content-Length: "...)
+			w.buf = strconv.AppendInt(w.buf, int64(endLen), 10)
+			w.buf = append(w.buf, '\\r', '\\n')
+		} else if w.protoMinor >= 1 {
+			w.chunked = true
+			w.buf = append(w.buf, "Transfer-Encoding: chunked\\r\\n"...)
+		} else {
+			w.closeAfter = true
+		}
+	}
+	if !hasConn {
+		if !w.keepAlive || w.closeAfter {
+			w.buf = append(w.buf, "Connection: close\\r\\n"...)
+		} else if w.protoMinor == 0 {
+			w.buf = append(w.buf, "Connection: keep-alive\\r\\n"...)
+		}
+	}
+	w.buf = append(w.buf, '\\r', '\\n')
+}
+
+func (w *tnHttp1ResponseWriter) Flush() error {
+	if !w.wroteHeader {
+		w.appendHeaders(false, 0)
+		_, err := w.conn.Write(w.buf)
+		return err
+	}
+	return nil
+}
+
+func (w *tnHttp1ResponseWriter) Write(data []byte) (int, error) {
+	noBody := w.reqMethod == "HEAD" || (w.hasStatus && (w.status < 200 || w.status == 204 || w.status == 304))
+	if !w.wroteHeader {
+		w.appendHeaders(false, 0)
+		if noBody || len(data) == 0 {
+			_, err := w.conn.Write(w.buf)
+			return len(data), err
+		}
+		if w.chunked {
+			w.buf = strconv.AppendInt(w.buf, int64(len(data)), 16)
+			w.buf = append(w.buf, '\\r', '\\n')
+			w.buf = append(w.buf, data...)
+			w.buf = append(w.buf, '\\r', '\\n')
+		} else {
+			w.buf = append(w.buf, data...)
+		}
+		_, err := w.conn.Write(w.buf)
+		return len(data), err
+	}
+	if noBody || len(data) == 0 {
+		return len(data), nil
+	}
+	w.buf = w.buf[:0]
+	if w.chunked {
+		w.buf = strconv.AppendInt(w.buf, int64(len(data)), 16)
+		w.buf = append(w.buf, '\\r', '\\n')
+		w.buf = append(w.buf, data...)
+		w.buf = append(w.buf, '\\r', '\\n')
+		_, err := w.conn.Write(w.buf)
+		return len(data), err
+	}
+	return w.conn.Write(data)
+}
+
+func (w *tnHttp1ResponseWriter) finish(data []byte, trailer http.Header) error {
+	if !w.wroteHeader {
+		w.appendHeaders(true, len(data))
+		noBody := w.reqMethod == "HEAD" || w.status < 200 || w.status == 204 || w.status == 304
+		if !noBody {
+			if w.chunked {
+				if len(data) > 0 {
+					w.buf = strconv.AppendInt(w.buf, int64(len(data)), 16)
+					w.buf = append(w.buf, '\\r', '\\n')
+					w.buf = append(w.buf, data...)
+					w.buf = append(w.buf, '\\r', '\\n')
+				}
+				w.buf = append(w.buf, "0\\r\\n"...)
+				for k, vals := range trailer {
+					for _, v := range vals {
+						w.buf = append(w.buf, k...)
+						w.buf = append(w.buf, ':', ' ')
+						w.buf = append(w.buf, v...)
+						w.buf = append(w.buf, '\\r', '\\n')
+					}
+				}
+				w.buf = append(w.buf, '\\r', '\\n')
+			} else if len(data) > 0 {
+				w.buf = append(w.buf, data...)
+			}
+		}
+		_, err := w.conn.Write(w.buf)
+		return err
+	}
+	noBody := w.reqMethod == "HEAD" || w.status < 200 || w.status == 204 || w.status == 304
+	w.buf = w.buf[:0]
+	if !noBody {
+		if w.chunked {
+			if len(data) > 0 {
+				w.buf = strconv.AppendInt(w.buf, int64(len(data)), 16)
+				w.buf = append(w.buf, '\\r', '\\n')
+				w.buf = append(w.buf, data...)
+				w.buf = append(w.buf, '\\r', '\\n')
+			}
+			w.buf = append(w.buf, "0\\r\\n"...)
+			for k, vals := range trailer {
+				for _, v := range vals {
+					w.buf = append(w.buf, k...)
+					w.buf = append(w.buf, ':', ' ')
+					w.buf = append(w.buf, v...)
+					w.buf = append(w.buf, '\\r', '\\n')
+				}
+			}
+			w.buf = append(w.buf, '\\r', '\\n')
+		} else if len(data) > 0 {
+			w.buf = append(w.buf, data...)
+		}
+	}
+	if len(w.buf) > 0 {
+		_, err := w.conn.Write(w.buf)
+		return err
+	}
+	return nil
+}
+
+// http.Server: a net.Server whose connections are served directly (HTTP/1.x) or by net/http (HTTP/2)
 type TnHttpServer struct {
 	TnNetServer
-	httpServer     *http.Server
-	tlsConfig      *tls.Config
-	inFlight       sync.WaitGroup
-	timeout        float64
+	httpServer       *http.Server
+	tlsConfig        *tls.Config
+	inFlight         sync.WaitGroup
+	connMu           sync.Mutex
+	httpConns        map[*tnHttpConn]struct{}
+	closing          int32
+	timeout          float64
 	keepAliveTimeout float64
-	headersTimeout float64
-	requestTimeout float64
-	maxHeadersCount interface{}
+	headersTimeout   float64
+	requestTimeout   float64
+	maxHeadersCount  interface{}
 	// node:http2 servers (pseudo-headers, the 'stream' API)
 	h2 bool
 }
@@ -576,18 +1137,522 @@ type TnHttpServer struct {
 // Set by node:http2: serves an HTTP/2 request through the 'stream' API (false when not handled)
 var tnHttp2StreamHook func(hs *TnHttpServer, w http.ResponseWriter, r *http.Request) bool
 
-func (hs *TnHttpServer) Get_timeout() float64          { return hs.timeout }
-func (hs *TnHttpServer) Set_timeout(v float64)         { hs.timeout = v }
-func (hs *TnHttpServer) Get_keepAliveTimeout() float64 { return hs.keepAliveTimeout }
+func (hs *TnHttpServer) Get_timeout() float64           { return hs.timeout }
+func (hs *TnHttpServer) Set_timeout(v float64)          { hs.timeout = v }
+func (hs *TnHttpServer) Get_keepAliveTimeout() float64  { return hs.keepAliveTimeout }
 func (hs *TnHttpServer) Set_keepAliveTimeout(v float64) { hs.keepAliveTimeout = v }
-func (hs *TnHttpServer) Get_headersTimeout() float64   { return hs.headersTimeout }
-func (hs *TnHttpServer) Set_headersTimeout(v float64)  { hs.headersTimeout = v }
-func (hs *TnHttpServer) Get_requestTimeout() float64   { return hs.requestTimeout }
-func (hs *TnHttpServer) Set_requestTimeout(v float64)  { hs.requestTimeout = v }
+func (hs *TnHttpServer) Get_headersTimeout() float64    { return hs.headersTimeout }
+func (hs *TnHttpServer) Set_headersTimeout(v float64)   { hs.headersTimeout = v }
+func (hs *TnHttpServer) Get_requestTimeout() float64    { return hs.requestTimeout }
+func (hs *TnHttpServer) Set_requestTimeout(v float64)   { hs.requestTimeout = v }
 
 func (hs *TnHttpServer) setTimeout(ms float64, cb ...interface{}) *TnHttpServer {
 	hs.timeout = ms
 	return hs
+}
+
+func (hs *TnHttpServer) serveConn(hc *tnHttpConn, local net.Addr) {
+	upgraded := false
+	defer func() {
+		if !upgraded {
+			hc.closeConn()
+		}
+		hs.connMu.Lock()
+		delete(hs.httpConns, hc)
+		hs.connMu.Unlock()
+		hs.inFlight.Done()
+	}()
+	if tc, ok := hc.conn.(*tls.Conn); ok {
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+	}
+	remoteAddr := ""
+	if ra := hc.conn.RemoteAddr(); ra != nil {
+		remoteAddr = ra.String()
+	}
+	br := bufio.NewReaderSize(hc.conn, 8192)
+	outBuf := make([]byte, 0, 4096)
+	for {
+		atomic.StoreInt32(&hc.active, 0)
+		if atomic.LoadInt32(&hs.closing) != 0 {
+			return
+		}
+		if _, err := br.Peek(1); err != nil {
+			return
+		}
+		atomic.StoreInt32(&hc.active, 1)
+		if atomic.LoadInt32(&hs.closing) != 0 {
+			return
+		}
+		if handled, ka := hs.tryFastHTTP1(hc, br, local, remoteAddr, &outBuf); handled {
+			if !ka || atomic.LoadInt32(&hs.closing) != 0 {
+				return
+			}
+			continue
+		}
+		r, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		ka, upg := hs.serveHTTP1(hc, br, r, local, remoteAddr)
+		if upg {
+			upgraded = true
+			return
+		}
+		if !ka || atomic.LoadInt32(&hs.closing) != 0 {
+			return
+		}
+	}
+}
+
+func (hs *TnHttpServer) tryFastHTTP1(hc *tnHttpConn, br *bufio.Reader, local net.Addr, remoteAddr string, outBuf *[]byte) (bool, bool) {
+	n := br.Buffered()
+	if n < 16 {
+		return false, false
+	}
+	buf, _ := br.Peek(n)
+	hdrEnd := bytes.Index(buf, []byte("\\r\\n\\r\\n"))
+	if hdrEnd < 0 {
+		return false, false
+	}
+	lineEnd := bytes.Index(buf[:hdrEnd], []byte("\\r\\n"))
+	if lineEnd < 0 {
+		return false, false
+	}
+	reqLine := buf[:lineEnd]
+	sp1 := bytes.IndexByte(reqLine, ' ')
+	if sp1 <= 0 {
+		return false, false
+	}
+	sp2 := bytes.IndexByte(reqLine[sp1+1:], ' ')
+	if sp2 <= 0 {
+		return false, false
+	}
+	sp2 += sp1 + 1
+	proto := reqLine[sp2+1:]
+	if len(proto) != 8 || proto[0] != 'H' || proto[1] != 'T' || proto[2] != 'T' || proto[3] != 'P' || proto[4] != '/' || proto[5] != '1' || proto[6] != '.' || proto[7] != '1' {
+		return false, false
+	}
+	methodBytes := reqLine[:sp1]
+	if len(methodBytes) == 7 && string(methodBytes) == "CONNECT" {
+		return false, false
+	}
+	hdrBlock := buf[lineEnd+2 : hdrEnd]
+	contentLen := 0
+	keepAlive := true
+	rest := hdrBlock
+	for len(rest) > 0 {
+		nl := bytes.IndexByte(rest, '\\n')
+		var line []byte
+		if nl < 0 {
+			line = rest
+			rest = nil
+		} else {
+			line = rest[:nl]
+			rest = rest[nl+1:]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\\r' {
+			line = line[:len(line)-1]
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			return false, false
+		}
+		k := line[:colon]
+		v := line[colon+1:]
+		for len(v) > 0 && (v[0] == ' ' || v[0] == '\\t') {
+			v = v[1:]
+		}
+		for len(v) > 0 && (v[len(v)-1] == ' ' || v[len(v)-1] == '\\t') {
+			v = v[:len(v)-1]
+		}
+		switch len(k) {
+		case 6: // Expect
+			if (k[0]|0x20) == 'e' && strings.EqualFold(string(k), "expect") {
+				return false, false
+			}
+		case 7: // Upgrade
+			if (k[0]|0x20) == 'u' && strings.EqualFold(string(k), "upgrade") {
+				return false, false
+			}
+		case 10: // Connection
+			if (k[0]|0x20) == 'c' && strings.EqualFold(string(k), "connection") {
+				if len(v) == 10 && (v[0]|0x20) == 'k' {
+					// keep-alive
+				} else if len(v) == 5 && (v[0]|0x20) == 'c' && strings.EqualFold(string(v), "close") {
+					keepAlive = false
+				} else {
+					lv := bytes.ToLower(v)
+					if bytes.Contains(lv, []byte("upgrade")) {
+						return false, false
+					}
+					if bytes.Contains(lv, []byte("close")) {
+						keepAlive = false
+					}
+				}
+			}
+		case 14: // Content-Length
+			if (k[0]|0x20) == 'c' && (k[8]|0x20) == 'l' && strings.EqualFold(string(k), "content-length") {
+				if len(v) == 0 {
+					return false, false
+				}
+				cl := 0
+				for i := 0; i < len(v); i++ {
+					if v[i] < '0' || v[i] > '9' {
+						return false, false
+					}
+					cl = cl*10 + int(v[i]-'0')
+					if cl > 65536 {
+						return false, false
+					}
+				}
+				contentLen = cl
+			}
+		case 17: // Transfer-Encoding
+			if (k[0]|0x20) == 't' && strings.EqualFold(string(k), "transfer-encoding") {
+				return false, false
+			}
+		}
+	}
+	totalLen := hdrEnd + 4 + contentLen
+	if n < totalLen {
+		if totalLen > 8192 {
+			return false, false
+		}
+		if _, err := br.Peek(totalLen); err != nil {
+			return false, false
+		}
+		buf, _ = br.Peek(totalLen)
+		hdrBlock = buf[lineEnd+2 : hdrEnd]
+	}
+	var body []byte
+	if contentLen > 0 {
+		body = make([]byte, contentLen)
+		copy(body, buf[hdrEnd+4:totalLen])
+	}
+	method := tnInternMethod(buf[:sp1])
+	reqURL := string(buf[sp1+1 : sp2])
+
+	var req *TnIncomingMessage
+	var res *TnServerResponse
+	tnLoopRun(func() {
+		prevCtx := tnAsyncCtx
+		tnAsyncCtx = hs.asyncCtx
+		defer func() { tnAsyncCtx = prevCtx }()
+
+		req = tnNewIncoming()
+		req.method = method
+		req.url = reqURL
+		req.httpVersion = "1.1"
+		req.httpVersionMajor = 1
+		req.httpVersionMinor = 1
+		req.rawHeaderBlock = hdrBlock
+		req.rawTLS = hs.tlsConfig != nil
+		req.rawLocal = local
+		req.rawRemote = remoteAddr
+
+		res = tnNewServerResponse(req)
+		res.inSyncTurn = true
+		req.flowScheduled = true
+		hs.emit("request", req, res)
+		if !req.destroyed && req.flowing == 1 && !req.readableListening && len(req.queue) == 0 && req.decoder == nil {
+			if len(body) > 0 {
+				req.bytesRead += float64(len(body))
+				if req.state == nil {
+					if req.fn0 != nil && req.ev0 == "data" {
+						if f, ok := req.fn0.(func([]byte)); ok {
+							f(body)
+						} else if f, ok := req.fn0.(func(interface{})); ok {
+							f(body)
+						} else {
+							TnInvoke(req.fn0, body)
+						}
+					}
+					if req.fn1 != nil && req.ev1 == "data" {
+						if f, ok := req.fn1.(func([]byte)); ok {
+							f(body)
+						} else if f, ok := req.fn1.(func(interface{})); ok {
+							f(body)
+						} else {
+							TnInvoke(req.fn1, body)
+						}
+					}
+				} else {
+					req.emit("data", body)
+				}
+			}
+			if !req.destroyed && req.flowing == 1 && len(req.queue) == 0 {
+				req.complete = true
+				req.readEnded = true
+				req.flowScheduled = false
+				req.emitEnd()
+			} else {
+				req.complete = true
+				req.push(nil)
+				req.flowScheduled = false
+				if !req.destroyed {
+					req.flow()
+				}
+			}
+		} else {
+			if !req.destroyed {
+				if len(body) > 0 {
+					req.push(body)
+				}
+				req.complete = true
+				req.push(nil)
+			}
+			req.flowScheduled = false
+			if !req.destroyed {
+				req.flow()
+			}
+		}
+		TnRunMicrotasks()
+		res.inSyncTurn = false
+	})
+
+	if !res.fastEnd && req.hdrs == nil && len(req.rawHeaderBlock) > 0 {
+		req.rawHeaderBlock = append([]byte(nil), req.rawHeaderBlock...)
+	}
+	br.Discard(totalLen)
+
+	if res.fastEnd {
+		status := int(res.statusCode)
+		b := tnAppendStatusLine((*outBuf)[:0], status, res.statusMessage)
+		hasCL := false
+		hasTE := false
+		hasDate := false
+		hasConn := false
+		for i := range res.store.entries {
+			e := &res.store.entries[i]
+			switch e.key {
+			case "content-length":
+				hasCL = true
+			case "transfer-encoding":
+				hasTE = true
+			case "date":
+				hasDate = true
+			case "connection":
+				hasConn = true
+				if s, ok := e.value.(string); ok && strings.Contains(strings.ToLower(s), "close") {
+					keepAlive = false
+				}
+			}
+			if s, ok := e.value.(string); ok {
+				b = append(b, e.name...)
+				b = append(b, ':', ' ')
+				b = append(b, s...)
+				b = append(b, '\\r', '\\n')
+			} else if num, ok := e.value.(float64); ok {
+				b = append(b, e.name...)
+				b = append(b, ':', ' ')
+				b = strconv.AppendFloat(b, num, 'f', -1, 64)
+				b = append(b, '\\r', '\\n')
+			} else {
+				for _, v := range tnHeaderStrings(e.value) {
+					b = append(b, e.name...)
+					b = append(b, ':', ' ')
+					b = append(b, v...)
+					b = append(b, '\\r', '\\n')
+				}
+			}
+		}
+		if res.sendDate && !hasDate {
+			b = tnAppendDateHeader(b)
+		}
+		if !keepAlive && !hasConn {
+			b = append(b, "Connection: close\\r\\n"...)
+		}
+		noBody := req.method == "HEAD" || status < 200 || status == 204 || status == 304
+		if !noBody && !hasCL && !hasTE {
+			b = append(b, "Content-Length: "...)
+			b = strconv.AppendInt(b, int64(len(res.fastBody)), 10)
+			b = append(b, '\\r', '\\n')
+		}
+		b = append(b, '\\r', '\\n')
+		if !noBody && len(res.fastBody) > 0 {
+			b = append(b, res.fastBody...)
+		}
+		*outBuf = b
+		if _, err := hc.conn.Write(b); err != nil {
+			return true, false
+		}
+		return true, keepAlive
+	}
+
+	w := &tnHttp1ResponseWriter{
+		conn:       hc.conn,
+		reqMethod:  req.method,
+		protoMinor: 1,
+		keepAlive:  keepAlive,
+		buf:        (*outBuf)[:0],
+	}
+	closedDone := make(chan struct{})
+	close(closedDone)
+	tnServeOps1(w, hc, res, func() {
+		if !res.finished {
+			req.aborted = true
+			res.destroy()
+		}
+	}, closedDone)
+	*outBuf = w.buf[:0]
+	return true, w.keepAlive && !w.closeAfter
+}
+
+func (hs *TnHttpServer) serveUpgrade1(hc *tnHttpConn, br *bufio.Reader, r *http.Request, local net.Addr) (bool, bool) {
+	event := ""
+	if r.Method == http.MethodConnect {
+		event = "connect"
+	} else if r.Header.Get("Upgrade") != "" && tnHeaderHasToken(r.Header, "Connection", "upgrade") {
+		event = "upgrade"
+	}
+	if event == "" {
+		return false, false
+	}
+	listening := false
+	tnLoopRun(func() { listening = hs.listenerCount(event) > 0 })
+	if !listening {
+		if event == "upgrade" {
+			return false, false
+		}
+		return true, false
+	}
+	head := []byte{}
+	if n := br.Buffered(); n > 0 {
+		peeked, _ := br.Peek(n)
+		head = append(head, peeked...)
+	}
+	tnLoopRun(func() {
+		TnAsyncRun(hs.asyncCtx, func() {
+			req := hs.incoming(r, local)
+			req.complete = true
+			req.push(nil)
+			socket := TnNewSocket()
+			socket.attach(hc.conn)
+			if r.TLS != nil {
+				socket.encrypted = true
+			}
+			req.socket = socket
+			hs.emit(event, req, socket, head)
+		})
+	})
+	return true, true
+}
+
+func (hs *TnHttpServer) serveHTTP1(hc *tnHttpConn, br *bufio.Reader, r *http.Request, local net.Addr, remoteAddr string) (bool, bool) {
+	TnLoopRef()
+	defer TnLoopUnref()
+	r.RemoteAddr = remoteAddr
+	if hs.tlsConfig != nil {
+		if tc, ok := hc.conn.(*tls.Conn); ok {
+			st := tc.ConnectionState()
+			r.TLS = &st
+		} else {
+			r.TLS = &tls.ConnectionState{}
+		}
+	}
+	if handled, upg := hs.serveUpgrade1(hc, br, r, local); handled {
+		return false, upg
+	}
+	if r.Header.Get("Expect") != "" && strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
+		hc.conn.Write([]byte("HTTP/1.1 100 Continue\\r\\n\\r\\n"))
+	}
+	bodyDone := make(chan struct{})
+	var small []byte
+	var smallErr error
+	if r.ContentLength > 0 && r.ContentLength <= 65536 && r.Header.Get("Expect") == "" {
+		small = make([]byte, r.ContentLength)
+		_, smallErr = io.ReadFull(r.Body, small)
+		r.Body.Close()
+	}
+	var req *TnIncomingMessage
+	var res *TnServerResponse
+	tnLoopRun(func() {
+		TnAsyncRun(hs.asyncCtx, func() {
+			req = hs.incoming(r, local)
+			res = tnNewServerResponse(req)
+			hs.emit("request", req, res)
+			if small != nil {
+				if smallErr != nil {
+					req.aborted = true
+					req.destroy(TnNodeError("Error", "ECONNRESET", "aborted"))
+				} else {
+					req.push(small)
+					req.complete = true
+					req.push(nil)
+				}
+				close(bodyDone)
+			} else if r.Body == nil || r.Body == http.NoBody {
+				req.complete = true
+				req.push(nil)
+				close(bodyDone)
+			} else {
+				tnPumpBody(r.Body, req, nil, func() { close(bodyDone) })
+			}
+		})
+	})
+	keepAlive := !r.Close && (r.ProtoMajor > 1 || (r.ProtoMajor == 1 && r.ProtoMinor >= 1) || tnHeaderHasToken(r.Header, "Connection", "keep-alive"))
+	w := &tnHttp1ResponseWriter{
+		conn:       hc.conn,
+		reqMethod:  r.Method,
+		protoMinor: r.ProtoMinor,
+		keepAlive:  keepAlive,
+	}
+	tnServeOps1(w, hc, res, func() {
+		if !res.finished {
+			req.aborted = true
+			res.destroy()
+		}
+	}, bodyDone)
+	if r.Body != nil {
+		r.Body.Close()
+	}
+	return w.keepAlive && !w.closeAfter, false
+}
+
+func tnServeOps1(w *tnHttp1ResponseWriter, hc *tnHttpConn, res *TnServerResponse, abort func(), bodyDone chan struct{}) {
+	for {
+		ended := false
+		for _, op := range res.take() {
+			switch {
+			case op.header != nil:
+				for k, v := range op.header {
+					if v == nil {
+						w.Header()[k] = nil
+					} else {
+						w.Header()[k] = v
+					}
+				}
+				w.statusMessage = op.statusMsg
+				w.WriteHeader(op.status)
+				if op.flush {
+					w.Flush()
+				}
+			case op.end:
+				err := w.finish(op.data, op.trailer)
+				ended = true
+				op.done(err)
+			default:
+				_, err := w.Write(op.data)
+				if err == nil {
+					err = w.Flush()
+				}
+				op.done(err)
+			}
+		}
+		if ended {
+			break
+		}
+		select {
+		case <-res.sig():
+		case <-hc.closed:
+			TnLoopPost(abort)
+			<-bodyDone
+			return
+		}
+	}
+	<-bodyDone
 }
 
 func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -620,10 +1685,6 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tnLoopRunOrPost(func() {
 		TnAsyncRun(hs.asyncCtx, func() {
 			req := hs.incoming(r, local)
-			req.socket = tnInfoSocket(local, r.RemoteAddr)
-			if r.TLS != nil {
-				req.socket.encrypted = true
-			}
 			res := tnNewServerResponse(req)
 			created <- res
 			hs.emit("request", req, res)
@@ -662,12 +1723,21 @@ func (hs *TnHttpServer) incoming(r *http.Request, local net.Addr) *TnIncomingMes
 	req := tnNewIncoming()
 	req.method = r.Method
 	req.url = r.RequestURI
-	req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
-	req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
-	tnIncomingHeaders(req, r.Header, r.Host, len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked")
-	if hs.h2 && r.ProtoMajor == 2 {
-		tnPseudoHeaders(req, r)
+	if r.ProtoMajor == 1 && r.ProtoMinor == 1 {
+		req.httpVersion = "1.1"
+	} else if r.ProtoMajor == 1 && r.ProtoMinor == 0 {
+		req.httpVersion = "1.0"
+	} else {
+		req.httpVersion = strconv.Itoa(r.ProtoMajor) + "." + strconv.Itoa(r.ProtoMinor)
 	}
+	req.httpVersionMajor, req.httpVersionMinor = float64(r.ProtoMajor), float64(r.ProtoMinor)
+	req.rawGoHeader = r.Header
+	req.rawHost = r.Host
+	req.rawChunked = len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked"
+	req.rawH2 = hs.h2 && r.ProtoMajor == 2
+	req.rawTLS = r.TLS != nil
+	req.rawLocal = local
+	req.rawRemote = r.RemoteAddr
 	return req
 }
 
@@ -733,22 +1803,22 @@ func (hs *TnHttpServer) serveUpgrade(w http.ResponseWriter, r *http.Request, loc
 }
 
 // HTTP/2 requests carry :method / :scheme / :authority / :path first, as in Node
-func tnPseudoHeaders(req *TnIncomingMessage, r *http.Request) {
+func tnPseudoHeaders(req *TnIncomingMessage) {
 	scheme := "http"
-	if r.TLS != nil {
+	if req.rawTLS {
 		scheme = "https"
 	}
 	headers := TnNewMap[string, string]()
-	headers.Set(":method", r.Method)
+	headers.Set(":method", req.method)
 	headers.Set(":scheme", scheme)
-	headers.Set(":authority", r.Host)
-	headers.Set(":path", r.RequestURI)
-	for k, v := range req.headers.All() {
+	headers.Set(":authority", req.rawHost)
+	headers.Set(":path", req.url)
+	for k, v := range req.hdrs.All() {
 		if k != "host" {
 			headers.Set(k, v)
 		}
 	}
-	req.headers = headers
+	req.hdrs = headers
 }
 
 // Applies a response's queued operations on the handler goroutine until it ends
@@ -795,7 +1865,7 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 			break
 		}
 		select {
-		case <-res.signal:
+		case <-res.sig():
 		case <-r.Context().Done():
 			TnLoopPost(abort)
 			<-bodyDone
@@ -806,7 +1876,7 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 }
 
 func TnNewHttpServer(secure bool, args ...interface{}) *TnHttpServer {
-	hs := &TnHttpServer{keepAliveTimeout: 5000, headersTimeout: 60000, requestTimeout: 300000}
+	hs := &TnHttpServer{keepAliveTimeout: 5000, headersTimeout: 60000, requestTimeout: 300000, httpConns: map[*tnHttpConn]struct{}{}}
 	hs.TnNetServer = *TnNewNetServer()
 	hs.connectionEvent = "connection"
 	for _, a := range args {
@@ -825,8 +1895,29 @@ func TnNewHttpServer(secure bool, args ...interface{}) *TnHttpServer {
 		if hs.tlsConfig != nil {
 			ln = tls.NewListener(ln, hs.tlsConfig)
 		}
-		hs.httpServer.IdleTimeout = time.Duration(hs.keepAliveTimeout * float64(time.Millisecond))
-		hs.httpServer.Serve(ln)
+		if hs.h2 {
+			hs.httpServer.IdleTimeout = time.Duration(hs.keepAliveTimeout * float64(time.Millisecond))
+			hs.httpServer.Serve(ln)
+			return
+		}
+		local := ln.Addr()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			hc := &tnHttpConn{conn: conn, closed: make(chan struct{})}
+			hs.connMu.Lock()
+			if atomic.LoadInt32(&hs.closing) != 0 {
+				hs.connMu.Unlock()
+				conn.Close()
+				return
+			}
+			hs.httpConns[hc] = struct{}{}
+			hs.inFlight.Add(1)
+			hs.connMu.Unlock()
+			go hs.serveConn(hc, local)
+		}
 	}
 	return hs
 }
@@ -845,13 +1936,22 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 	if hs.ln == nil {
 		return hs
 	}
+	hs.connMu.Lock()
+	atomic.StoreInt32(&hs.closing, 1)
+	hs.connMu.Unlock()
 	// Closing the listener first also covers a Serve that has not started yet
 	hs.ln.Close()
 	hs.ln = nil
 	hs.listening = false
+	hs.closeIdleConnections()
 	TnLoopRef()
 	go func() {
-		hs.httpServer.Shutdown(context.Background())
+		if hs.h2 {
+			hs.httpServer.Shutdown(context.Background())
+		} else {
+			hs.inFlight.Wait()
+			hs.closeAllConnections()
+		}
 		TnLoopPost(func() {
 			defer TnLoopUnref()
 			if hs.refd {
@@ -865,15 +1965,37 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 }
 
 func (hs *TnHttpServer) closeAllConnections() {
-	if hs.httpServer != nil {
+	if hs.h2 && hs.httpServer != nil {
 		hs.httpServer.Close()
+		return
+	}
+	hs.connMu.Lock()
+	conns := make([]*tnHttpConn, 0, len(hs.httpConns))
+	for hc := range hs.httpConns {
+		conns = append(conns, hc)
+	}
+	hs.connMu.Unlock()
+	for _, hc := range conns {
+		hc.closeConn()
 	}
 }
 
 func (hs *TnHttpServer) closeIdleConnections() {
-	if hs.httpServer != nil {
+	if hs.h2 && hs.httpServer != nil {
 		hs.httpServer.SetKeepAlivesEnabled(false)
 		hs.httpServer.SetKeepAlivesEnabled(true)
+		return
+	}
+	hs.connMu.Lock()
+	var idle []*tnHttpConn
+	for hc := range hs.httpConns {
+		if atomic.LoadInt32(&hc.active) == 0 {
+			idle = append(idle, hc)
+		}
+	}
+	hs.connMu.Unlock()
+	for _, hc := range idle {
+		hc.closeConn()
 	}
 }
 
@@ -929,7 +2051,7 @@ type TnClientRequest struct {
 	host        string
 	protocol    string
 	port        string
-	store       *tnHeaderStore
+	store       tnHeaderStore
 	started     bool
 	aborted     bool
 	gotResponse bool
@@ -1282,8 +2404,8 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 			res.httpVersionMajor, res.httpVersionMinor = float64(resp.ProtoMajor), float64(resp.ProtoMinor)
 			chunked := len(resp.TransferEncoding) > 0 && resp.TransferEncoding[0] == "chunked"
 			tnIncomingHeaders(res, resp.Header, "", chunked)
-			if resp.ContentLength >= 0 && !res.headers.Has("content-length") && cr.method != "HEAD" {
-				res.headers.Set("content-length", strconv.FormatInt(resp.ContentLength, 10))
+			if resp.ContentLength >= 0 && !res.Get_headers().Has("content-length") && cr.method != "HEAD" {
+				res.Get_headers().Set("content-length", strconv.FormatInt(resp.ContentLength, 10))
 			}
 			res.socket = tnInfoSocket(nil, net.JoinHostPort(host, port))
 			if resp.TLS != nil {
@@ -1314,7 +2436,7 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 			// The trailers are read with the end of the body, before 'end'
 			tnPumpBody(resp.Body, res, func() {
 				for k, v := range resp.Trailer {
-					res.trailers.Set(strings.ToLower(k), strings.Join(v, ", "))
+					res.Get_trailers().Set(strings.ToLower(k), strings.Join(v, ", "))
 				}
 			}, func() {
 				TnLoopPost(func() {
@@ -1355,11 +2477,14 @@ func tnClientURL(cr *TnClientRequest, raw string) {
 
 // http.request(url | options, [options], [callback]) / https.request
 func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
-	cr := &TnClientRequest{method: "GET", path: "/", host: "localhost", protocol: "http:", store: newTnHeaderStore(), setHost: true}
+	cr := &TnClientRequest{method: "GET", path: "/", host: "localhost", protocol: "http:", setHost: true}
 	if secure {
 		cr.protocol = "https:"
 	}
-	cr.TnStream = *TnNewWritable()
+	cr.flowing = -1
+	cr.decodeStrings = true
+	cr.writableSide = true
+	cr.asyncCtx = TnAsyncSnapshot()
 	cr.tnSelf = cr
 	cr.closeHeld = true
 	var options interface{}
@@ -1503,9 +2628,9 @@ function eventName(nodes) {
 export function registerHttp(r) {
     defineModule(r, 'http');
     defineModule(r, 'https');
-    defineHelper(r, 'nodeHttp', ['bufio', 'bytes', 'context', 'crypto/tls', 'errors', 'fmt', 'io', 'log', 'math', 'net', 'net/http', 'net/url', 'reflect', 'sort', 'strconv', 'strings', 'sync', 'time', 'unsafe'], ['nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'buffer', 'tlsConfig'], httpHelper);
+    defineHelper(r, 'nodeHttp', ['bufio', 'bytes', 'context', 'crypto/tls', 'errors', 'fmt', 'io', 'log', 'math', 'net', 'net/http', 'net/url', 'reflect', 'sort', 'strconv', 'strings', 'sync', 'sync/atomic', 'time', 'unsafe'], ['nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'buffer', 'tlsConfig'], httpHelper);
     const use = () => r.helper('nodeHttp');
-    defineClass(r, 'http.IncomingMessage', '*TnIncomingMessage', 'class', STREAM_METHODS + '; setTimeout=*TnIncomingMessage', 'method=string; url=string; httpVersion=string; httpVersionMajor=float64; httpVersionMinor=float64; headers=*TnMap[string, string]; headersDistinct=*TnMap[string, []string]; rawHeaders=[]string; trailers=*TnMap[string, string]; statusCode=float64; statusMessage=string; complete=bool; aborted=bool', STREAM_GETTERS + '; socket=*TnSocket; connection=*TnSocket', '');
+    defineClass(r, 'http.IncomingMessage', '*TnIncomingMessage', 'class', STREAM_METHODS + '; setTimeout=*TnIncomingMessage', 'method=string; url=string; httpVersion=string; httpVersionMajor=float64; httpVersionMinor=float64; statusCode=float64; statusMessage=string; complete=bool; aborted=bool', STREAM_GETTERS + '; headers=*TnMap[string, string]; headersDistinct=*TnMap[string, []string]; rawHeaders=[]string; trailers=*TnMap[string, string]; socket=*TnSocket; connection=*TnSocket', '');
     defineClass(r, 'http.ServerResponse', '*TnServerResponse', 'class', SERVER_RESPONSE_METHODS, 'statusCode=float64; statusMessage=string; sendDate=bool', STREAM_GETTERS + '; headersSent=bool; req=*TnIncomingMessage; socket=*TnSocket', '');
     defineClass(r, 'http.ClientRequest', '*TnClientRequest', 'class', CLIENT_REQUEST_METHODS, 'method=string; path=string; host=string; protocol=string; aborted=bool; reusedSocket=bool; maxHeadersCount=interface{}', STREAM_GETTERS + '; headersSent=bool; socket=*TnSocket', '');
     defineClass(r, 'http.Server', '*TnHttpServer', 'class', SERVER_METHODS.replace('listen=*TnNetServer', 'listen=*TnHttpServer').replace('close=*TnNetServer', 'close=*TnHttpServer') +
@@ -1521,6 +2646,19 @@ export function registerHttp(r) {
         };
         r.typers[`http.${cls}#pipe`] = (c) => c.types[0] || '*TnStream';
     }
+    r.methods['http.ServerResponse#writeHead'] = (c) => {
+        if (c.nodes.length === 2 && isObjectLiteral(c.nodes[1])) {
+            const props = c.nodes[1].properties ?? [];
+            if (props.length === 1 && props[0].kind === 'PropertyAssignment' && props[0].name && isStringNode(props[0].initializer)) {
+                const k = props[0].name.kind === 'Identifier' || props[0].name.kind === 'StringLiteral' ? String(props[0].name.text) : '';
+                if (k !== '') {
+                    return `${c.recv}.writeHeadKV(${c.args[0]}, ${goString(k)}, ${goString(String(props[0].initializer.text))})`;
+                }
+            }
+        }
+        return `${c.recv}.writeHead(${c.args.join(', ')})`;
+    };
+    r.methods['https.ServerResponse#writeHead'] = r.methods['http.ServerResponse#writeHead'];
     r.paramTypers['http.IncomingMessage#on'] = streamListenerTypes;
     r.paramTypers['http.IncomingMessage#once'] = streamListenerTypes;
     r.paramTypers['http.ServerResponse#on'] = streamListenerTypes;

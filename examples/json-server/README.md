@@ -104,23 +104,26 @@ plain `node:http` client would cap out far below either server, so
 with it both servers would simply tie at the client's limit.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
-TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build, client
+TypeNative 0.6.0 (unreleased changes), default (non-`--release`) build, client
 and server on the same machine. Re-run variation is about ±20%; across runs
-TypeNative was 0.7x Node on GET and 0.8–0.9x on POST.
+TypeNative was 1.6–1.8x Node on GET and 1.6–1.8x on POST. The numbers below are
+medians over three runs.
 
 | Runtime    | Endpoint    |  req/s | p50 (ms) | p99 (ms) |
 |------------|-------------|-------:|---------:|---------:|
-| Node.js    | GET /todos  |  60034 |     0.24 |     0.69 |
-| TypeNative | GET /todos  |  44334 |     0.27 |     0.64 |
-| Node.js    | POST /todos |  66687 |     0.21 |     0.44 |
-| TypeNative | POST /todos |  57707 |     0.20 |     0.63 |
+| Node.js    | GET /todos  |  61957 |     0.23 |     0.63 |
+| TypeNative | GET /todos  | 106483 |     0.14 |     0.38 |
+| Node.js    | POST /todos |  68097 |     0.21 |     0.46 |
+| TypeNative | POST /todos | 114066 |     0.13 |     0.40 |
 
-**Node serves ~1.2–1.4x more requests per second here**, with similar
-median latency on both routes. The compiled server spreads socket reads and
-writes and HTTP parsing across Go's `net/http` goroutines, and runs the
-handler right on the request's goroutine whenever the event loop is free,
-but JavaScript still runs one thing at a time, and at 45–65k req/s the cost
-of handing each request to that one thread outweighs the parallel I/O.
+**TypeNative serves ~1.7x more requests per second here**, with lower median
+latency on both routes. The compiled server reads requests and writes
+responses on each connection's goroutine, and a handler that answers
+synchronously (`writeHead` + `end`, as both routes do) builds the response
+bytes right there, in one write: it never queues an operation for the event
+loop, which keeps the per-request hand-off to JavaScript to a single baton
+pass. JavaScript still runs one thing at a time, but at 105–115k req/s the
+parallel socket I/O and HTTP handling stay ahead of that one thread.
 
 On top of that, the binary starts in ~7 ms instead of ~60 ms and is a
 single 11.4 MB executable with zero dependencies — `scp` it to a server and
