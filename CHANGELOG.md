@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **yaml-cli throughput:** `yaml --json` on a large, plain stream is split
+  before the `---` lines that start its documents, and up to six worker
+  processes compose runs of them and print their JSON arrays, which the main
+  process joins. Directives, errors, warnings, CR line endings and
+  collection-valued keys fall back to the normal `cli()` path (the example
+  runs under Node too). On the 10 MB benchmark the complete process run is
+  now 754 ms vs Node's 851 ms (median, 1.1x); the single-process path also
+  got faster.
+- **Object conversions and dynamic writes:** conversion identity holds one
+  weak pointer per conversion, sweeps dead entries in batches and keeps a
+  recent cache; a fresh local object converted once is copied without an
+  identity entry (`TnAsCopy`), and a conversion between two statically known
+  struct types is emitted as a struct literal. `Object.assign({ defaults },
+  typedSource)` sets the target's fields directly instead of through
+  reflection, `obj[key] = v` on a plain object skips reflection
+  (`TnSetProp`), and `s += chunk` for an untyped chunk appends in place
+  instead of copying the whole string.
+- **List building:** a single-value `push` grows the backing slice by 2x
+  (`TnPush`) rather than Go's 1.25x, whose repeated copies add up to about
+  five times a long list's final memory.
 - **marked-cli throughput:** large markdown documents are parsed in up to six
   worker processes, one contiguous run of top-level sections each, with a
   sequential fallback (small inputs, reference link definitions, raw HTML

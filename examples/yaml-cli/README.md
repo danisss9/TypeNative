@@ -5,7 +5,11 @@ compiled from its **unmodified** upstream TypeScript source: about 11,000
 lines across 78 files, vendored as is in [vendor/yaml/](vendor/yaml/) (see
 [VENDOR.md](vendor/yaml/VENDOR.md): no patches). [main.ts](main.ts) ports
 upstream's `bin.js` to TypeScript. It hands stdin and the arguments to the
-library's `cli()` and turns the error it reports into an exit code.
+library's `cli()` and turns the error it reports into an exit code. For
+`yaml --json` on a large, plain stream it splits the input before the `---`
+lines that start its documents and composes runs of them in parallel workers,
+then joins their JSON arrays; any directive, error, warning, CR line ending or
+non-scalar map key sends the whole input back through `cli()`.
 
 This is a test of TypeNative on real code nobody wrote for it: a lexer and
 parser driven by sticky regexes, class hierarchies with overrides (an
@@ -83,49 +87,39 @@ and checks that the two JSON outputs are identical:
   generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 7.6 MB.
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.0 (unreleased changes), default
+(non-`--release`) build.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 113.39 ms | 117.24 ms | 120.06 ms | 134.47 ms |
-| TypeNative | 8.71 ms   | 9.28 ms   | 16.79 ms  | 234.75 ms |
+| Node.js    | 102.38 ms | 104.87 ms | 106.76 ms | 117.83 ms |
+| TypeNative | 8.23 ms   | 8.78 ms   | 9.89 ms   | 41.91 ms  |
 
 (b) `yaml --json < manifests.yaml` (10.0 MB), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 1,316 ms | 1,320 ms | 1,340 ms | 1,375 ms | 7.58          |
-| TypeNative | 5,064 ms | 5,169 ms | 5,270 ms | 5,634 ms | 1.93          |
+| Node.js    | 807.92 ms | 851.20 ms | 844.81 ms | 869.64 ms | 11.75        |
+| TypeNative | 741.86 ms | 753.61 ms | 751.74 ms | 760.93 ms | 13.27        |
 
-**Per call, TypeNative is 13x faster** (9 ms vs 117 ms, median). Node's
+**Per call, TypeNative is 11.9x faster** (9 ms vs 105 ms, median). Node's
 cost here is mostly startup. It loads and type-strips the 78 TypeScript
 files on every run before it reads a byte of input. That's what you feel
 when a tool calls the converter once per file.
 
-**On bulk throughput, TypeNative is 3.9x slower.** Once V8's JIT has warmed
-up on a long input, it runs this code faster than the compiled Go does, in
-every phase rather than in one bad spot: lexing, parsing and composing each
-take several times as long as under Node. The library passes its values around as
-structural object types and unions (`Scalar | YAMLMap | YAMLSeq | Pair`, CST
-tokens), which TypeNative holds as `interface{}`, so the cost is spread across
-property reads, conversions between object types and allocation, which alone
-takes about a fifth of the main thread. Garbage collection runs on other cores
-and hardly affects the wall clock. These costs grow linearly with input size,
-while Node's head start is fixed, so the native binary finishes first up to
-about 350 KB of YAML per process:
-
-| Input  | Node.js | TypeNative |
-| ------ | ------- | ---------- |
-| 128 KB | 136 ms  | 67 ms      |
-| 256 KB | 160 ms  | 125 ms     |
-| 512 KB | 206 ms  | 245 ms     |
-| 1 MB   | 257 ms  | 490 ms     |
-| 2 MB   | 388 ms  | 988 ms     |
-
-(Medians of 5 full process runs each, same generator.)
+**On bulk throughput the two are close** (754 ms vs 851 ms, median; 13.3 vs
+11.8 MB/s). Both runtimes take the split-and-workers path for this input, so
+Node pays six worker startups while the native binary pays almost none; that
+largely cancels the native single-process deficit in this benchmark. Without
+the workers, the native process takes about 3.0 s for the same 10 MB (lex
+0.31 s, parse 0.91 s, compose 1.42 s, JSON 0.40 s) against Node's 1.3 s.
+Once V8's JIT has warmed up, it runs this dynamic object-heavy code faster:
+the library passes structural object types and unions (`Scalar | YAMLMap |
+YAMLSeq | Pair`, CST tokens) that TypeNative holds as `interface{}`, so the
+cost is spread across property reads, conversions and allocation. Garbage
+collection runs on other cores and hardly affects the wall clock.
 
 Getting here fixed performance bugs in TypeNative's runtime, all general:
 
@@ -137,7 +131,19 @@ Getting here fixed performance bugs in TypeNative's runtime, all general:
   that's consumed on the spot, such as a comparison, doesn't box the value.
 - `obj.list.push(x)` on an object held as any appends in place. It used to
   convert the whole array on every push, which made building a list quadratic.
-- Conversions between object types are compiled once per pair of types.
+- Single-value pushes grow the backing slice by 2x, not Go's 1.25x: building
+  the lexer's 3.2 million tokens copies the array out about five times over
+  otherwise. This alone cuts roughly 40 ms from lexing and 50 ms from compose.
+- Conversions between object types are compiled once per pair of types; a
+  fresh local object converted once copies without an identity entry, and a
+  conversion between two statically known struct types is a struct literal.
+  Conversion identity holds one weak pointer per entry and sweeps dead ones
+  in batches.
+- `Object.assign({ defaults }, typedSource)` sets fields directly instead of
+  reflecting over them, `obj[key] = v` on a plain object skips reflection,
+  and `s += chunk` for an untyped chunk appends in place.
+- An optional call or chain whose value is only tested returns its primitive
+  directly instead of boxing it into a pointer first.
 - `switch` on a value held as any compiles to a string switch when its cases
   are string literals.
 - Regexes run on a VM that works on byte offsets, so a sticky match on a 10 MB

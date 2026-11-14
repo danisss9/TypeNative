@@ -1465,6 +1465,144 @@ function findLocalConst(name) {
     }
     return undefined;
 }
+// Whether converting expr to another object type is the only conversion its
+// object ever gets, so the copy needs no identity entry (TnAsCopy). It holds
+// when expr names a const of the enclosing function whose object was made
+// right there (an object literal, or a call of a function declaration whose
+// every return is an object literal) and nothing else ever sees that object:
+// every other use of the name is a field read (v.f), the uses that aren't
+// are call arguments of which at most one runs per call (any two sit in the
+// opposite branches of a ?: or an if), and no loop or function lies between
+// the declaration and such a use (it runs at most once per object)
+const unsharedSources = new WeakMap();
+function unsharedConversionSource(expr) {
+    const id = unwrapParentheses(expr);
+    if (!isIdentifier(id))
+        return false;
+    const declaration = findLocalConst(id);
+    if (!declaration)
+        return false;
+    let unshared = unsharedSources.get(declaration);
+    if (unshared === undefined) {
+        unshared = isUnsharedConst(declaration, id);
+        unsharedSources.set(declaration, unshared);
+    }
+    return unshared;
+}
+function isUnsharedConst(declaration, use) {
+    const list = declaration.parent;
+    const block = list?.parent?.parent;
+    if (!isIdentifier(declaration.name) || list?.kind !== 'VariableDeclarationList' || list.declarationKind !== 'const')
+        return false;
+    if (!isVariableStatement(list.parent) || block?.kind !== 'Block' || !getEnclosingFunction(declaration))
+        return false;
+    if (!makesFreshObject(declaration.initializer, declaration))
+        return false;
+    const name = declaration.name.text;
+    const passes = [];
+    let ok = true;
+    const walk = (node) => {
+        if (!ok || !node)
+            return;
+        if (isIdentifier(node) && node.text === name && node !== declaration.name) {
+            const parent = node.parent;
+            // (a name that isn't a reference: a property's, a declaration's)
+            if (parent?.name === node && parent.kind !== 'ShorthandPropertyAssignment')
+                return;
+            if (isPropertyAccessExpression(parent) && parent.expression === node) {
+                // (a method call would hand the object over as this)
+                if (isCallExpression(parent.parent) && parent.parent.expression === parent)
+                    ok = false;
+                return;
+            }
+            if (isCallExpression(parent) && (parent.arguments ?? []).includes(node))
+                passes.push(node);
+            else
+                ok = false;
+            return;
+        }
+        for (const child of childNodes(node))
+            walk(child);
+    };
+    walk(block);
+    if (!ok || !passes.includes(use))
+        return false;
+    // each pass runs at most once per object…
+    for (const pass of passes) {
+        for (let n = pass.parent; n && n !== block; n = n.parent) {
+            if (FUNCTION_LIKE_KINDS.has(n.kind) || LOOP_KINDS.includes(n.kind))
+                return false;
+        }
+    }
+    // …and no two in one call
+    for (let i = 0; i < passes.length; i++) {
+        for (let j = i + 1; j < passes.length; j++) {
+            if (!exclusiveBranches(passes[i], passes[j], block))
+                return false;
+        }
+    }
+    return true;
+}
+// Whether a and b (under root) sit in the opposite branches of a ?: or an if
+function exclusiveBranches(a, b, root) {
+    const childOnPath = new Map();
+    for (let child = a, n = a.parent; n && child !== root; child = n, n = n.parent)
+        childOnPath.set(n, child);
+    for (let child = b, n = b.parent; n && child !== root; child = n, n = n.parent) {
+        const fromA = childOnPath.get(n);
+        if (fromA === undefined)
+            continue;
+        if (isConditionalExpression(n)) {
+            return (fromA === n.whenTrue && child === n.whenFalse) || (fromA === n.whenFalse && child === n.whenTrue);
+        }
+        if (isIfStatement(n)) {
+            return (fromA === n.thenStatement && child === n.elseStatement) || (fromA === n.elseStatement && child === n.thenStatement);
+        }
+        return false;
+    }
+    return false;
+}
+// Whether an initializer makes a new object no one else holds: an object
+// literal, or a call of a function declaration (not shadowed where it's
+// called) whose every return is an object literal
+function makesFreshObject(init, at) {
+    const e = init ? unwrapParentheses(init) : undefined;
+    if (!e)
+        return false;
+    if (isObjectLiteralExpression(e))
+        return true;
+    if (!isCallExpression(e) || !isIdentifier(e.expression) || e.questionDotToken)
+        return false;
+    const callee = e.expression.text;
+    const fn = declaredFunctions.get(callee);
+    if (!fn || !isFunctionDeclaration(fn) || !fn.body || fn.asteriskToken || asyncFunctionNames.has(callee))
+        return false;
+    if (findLocalConst(e.expression))
+        return false;
+    for (let f = getEnclosingFunction(at); f; f = getEnclosingFunction(f)) {
+        if ((f.parameters ?? []).some((p) => isIdentifier(p.name) && p.name.text === callee))
+            return false;
+    }
+    let returns = 0;
+    let fresh = true;
+    const walk = (node) => {
+        if (!fresh || !node)
+            return;
+        if (node !== fn.body && FUNCTION_LIKE_KINDS.has(node.kind))
+            return;
+        if (isReturnStatement(node)) {
+            returns++;
+            const value = node.expression ? unwrapParentheses(node.expression) : undefined;
+            if (!value || !isObjectLiteralExpression(value))
+                fresh = false;
+            return;
+        }
+        for (const child of childNodes(node))
+            walk(child);
+    };
+    walk(fn.body);
+    return fresh && returns > 0;
+}
 function maybeUndefinedPrimitive(expr, consts, depth = 0) {
     const e = unwrapParentheses(expr);
     if (!e || depth > 4)
@@ -8045,6 +8183,65 @@ function isNilPlaceholder(expr) {
     const u = unwrapParentheses(expr);
     return isNonNullExpression(u) && isNilLiteral(unwrapParentheses(u.expression));
 }
+// The Go fields of an object type (named or anonymous), as name → type
+function goStructFields(bare) {
+    if (bare.startsWith('struct{'))
+        return parseStructFields(bare);
+    if (classNames.has(bare))
+        return undefined;
+    const properties = objectTypeFields(bare);
+    if (!properties)
+        return undefined;
+    const fields = [...properties].map(([name, type]) => [goFieldName(name), type]);
+    if (objectTypeHasKeyOrder(bare))
+        fields.push(['__keys', '*[]string']);
+    return fields;
+}
+// A conversion between two statically known struct types whose fields line up
+// by name: a struct literal, instead of the reflective TnAs plan. Only for a
+// source no other conversion can see (see unsharedConversionSource), so the
+// copy needs no identity entry. A target __keys field the source lacks stays
+// zero, as TnAs leaves it.
+function staticStructConversion(expr, goType, code) {
+    if (!goType.startsWith('*') || goType.startsWith('*TnMap[') || goType.startsWith('*[]'))
+        return undefined;
+    const target = goType.slice(1);
+    const targetFields = goStructFields(target);
+    if (!targetFields)
+        return undefined;
+    const exprType = inferExpressionType(expr) ?? '';
+    if (!exprType.startsWith('*'))
+        return undefined;
+    const source = exprType.slice(1);
+    if (source === target)
+        return undefined;
+    const sourceFields = goStructFields(source);
+    if (!sourceFields)
+        return undefined;
+    // (a prefix relationship is a union member view in TnAs — identity, not a copy)
+    const targetNames = targetFields.map(([name]) => name);
+    const sourceNames = sourceFields.map(([name]) => name);
+    const isPrefix = (a, b) => a.length <= b.length && a.every((name, i) => name === b[i]);
+    if (isPrefix(targetNames, sourceNames) || isPrefix(sourceNames, targetNames))
+        return undefined;
+    const sourceByName = new Map(sourceFields);
+    const parts = [];
+    for (const [name, fieldType] of targetFields) {
+        if (name === '__keys')
+            continue;
+        const from = sourceByName.get(name);
+        // (a target field the source lacks reads the source's expandos: a copy)
+        if (from === undefined)
+            return undefined;
+        parts.push(`${name}: ${from === fieldType ? `__s.${name}` : convertBetweenGoTypes(`__s.${name}`, from, fieldType)}`);
+    }
+    if (parts.length === 0 || !unsharedConversionSource(expr))
+        return undefined;
+    // (the key order is the source's own, when it has one)
+    if (sourceByName.has('__keys') && targetFields.some(([name]) => name === '__keys'))
+        parts.push('__keys: __s.__keys');
+    return `func() ${goType} { __s := ${code}; _ = __s; return &${target}{${parts.join(', ')}} }()`;
+}
 function toGoValueOfType(expr, goType) {
     // (JSON.parse(text) as T[]: decoded straight into the type, see TnJSONParseTyped)
     const typedJSON = typedJSONParse(expr, goType);
@@ -8586,14 +8783,20 @@ function toGoValueOfType(expr, goType) {
         }
     }
     // a value of another object type where a struct is expected (TS types are
-    // structural): converted field by field (a copy)
+    // structural): a struct literal when both types are known, else converted
+    // field by field at run time (a copy)
     if (goType?.startsWith('*') && isStructGoType(goType.slice(1)) && !isNilLiteral(expr) && !isObjectLiteralExpression(unwrapParentheses(expr))) {
+        const statically = staticStructConversion(expr, goType, code);
+        if (statically)
+            return statically;
         const exprType = inferExpressionType(expr) ?? '';
         // (a class instance as an object type: its fields, copied)
         const fromClass = classNames.has(exprType.slice(1)) && !isPolymorphicClass(exprType.slice(1));
         if (exprType.startsWith('*') && exprType !== goType && (isStructGoType(exprType.slice(1)) || fromClass) && !classNames.has(goType.slice(1))) {
             useHelper('dynamic');
-            return `TnAs[${goType}](interface{}(${code}))`;
+            // (an object no other conversion can see: copied without an identity entry)
+            const as = !fromClass && unsharedConversionSource(expr) ? 'TnAsCopy' : 'TnAs';
+            return `${as}[${goType}](interface{}(${code}))`;
         }
     }
     // *Struct slot: take the address (shares the value, like a JS object reference)
@@ -9383,6 +9586,15 @@ function visitDynamicArithmetic(node, op) {
             : `TnAs[float64](${visit(node.left)}) ${binOp} ${operand(node.right, rightDynamic)}`;
         useHelper('dynamic');
         return `${visit(node.left)} = ${converted}`;
+    }
+    // s += x on a string variable or field, x dynamic (a stream's data chunk):
+    // appended in place when s is long, as for a string x (see strAppend)
+    if (op === '+=' && isConcat && inferExpressionType(node.left) === 'string') {
+        const target = visit(node.left);
+        if (/^[A-Za-z_][\wǂ]*(\.[A-Za-z_][\wǂ]*)*$/.test(target)) {
+            useHelper('strAppend');
+            return `${target} = TnStrAppend(${target}, ${operand(node.right, rightDynamic)})`;
+        }
     }
     return `${operand(node.left, leftDynamic && !isCompound)} ${op} ${operand(node.right, rightDynamic)}`;
 }
@@ -11549,6 +11761,11 @@ let currentCallNode;
 // Expressions emitted as statements though their parent would use the value
 // (a void arrow's expression body)
 const discardedExpressions = new Set();
+// The expressions whose truthiness (only) is used — a condition, an operand
+// of ! or && / || — and the primitive type an optional chain emitted for one
+// (its undefined is its zero value, which is falsy too: no boxed pointer)
+const truthinessOperands = new WeakSet();
+const truthinessPrimitiveType = new WeakMap();
 function isDiscardedValue(node) {
     if (discardedExpressions.has(node))
         return true;
@@ -16615,6 +16832,7 @@ function isLogicalOperator(token) {
 }
 // JS truthiness of an expression as a Go bool, by its Go type
 function toGoCondition(expr) {
+    truthinessOperands.add(expr);
     if (isParenthesizedExpression(expr))
         return `(${toGoCondition(expr.expression)})`;
     if (isPrefixUnaryExpression(expr) && expr.operator === 'ExclamationToken') {
@@ -16632,7 +16850,11 @@ function toGoCondition(expr) {
     // and is undefined: false)
     if (isCallExpression(unwrapParentheses(expr)) && emitsNoValue(expr))
         return `func() bool { ${visit(expr, { inline: true })}; return false }()`;
-    return truthinessCheck(visit(expr, { inline: true }), inferExpressionType(expr));
+    const type = inferExpressionType(expr);
+    const code = visit(expr, { inline: true });
+    // (an optional chain's primitive result for a truthiness operand is emitted
+    // unboxed — no pointer to test)
+    return truthinessCheck(code, truthinessPrimitiveType.get(expr) ?? type);
 }
 // Whether every case of a switch is a distinct, non-empty string literal
 function switchHasOnlyStringCases(node) {
@@ -17251,6 +17473,67 @@ function objectAssignTargetType(call) {
     }
     return undefined;
 }
+// Object.assign({ defaults }, typedSource, …) with a struct target and typed
+// struct sources: the target type's fields set directly, instead of through
+// the reflective TnAssignTo. A source field that is unset (nil) leaves the
+// default, as tnAssignFields does.
+function staticObjectAssign(call, targetType, argCodes) {
+    if (!targetType.startsWith('*') || targetType.startsWith('*TnMap['))
+        return undefined;
+    const target = targetType.slice(1);
+    const targetFields = goStructFields(target);
+    if (!targetFields)
+        return undefined;
+    const fields = new Map(targetFields);
+    const args = call.arguments ?? [];
+    const targetNode = unwrapParentheses(args[0]);
+    // (a literal's duplicate keys: the last value is the property's)
+    const defaults = new Map();
+    const simple = (e) => isIdentifier(e) || isNumericLiteral(e) || isStringLiteral(e) || isPropertyAccessExpression(e) ||
+        ['TrueKeyword', 'FalseKeyword', 'NullKeyword'].includes(e.kind);
+    for (const p of targetNode.properties ?? []) {
+        if (!(isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) || !isIdentifier(p.name))
+            return undefined;
+        const field = goFieldName(p.name.text);
+        const fieldType = fields.get(field);
+        if (fieldType === undefined)
+            return undefined;
+        const value = isPropertyAssignment(p) ? p.initializer : p.name;
+        // (visited already as part of the call's arguments: only plain reads again)
+        if (!simple(unwrapParentheses(value)))
+            return undefined;
+        defaults.set(field, toGoValueOfType(value, fieldType));
+    }
+    const parts = [...defaults].map(([field, value]) => `${field}: ${value}`);
+    const targetTemp = getTempName('asg');
+    const steps = [];
+    for (let i = 1; i < args.length; i++) {
+        const sourceNode = unwrapParentheses(args[i]);
+        // (a literal source's explicit undefined properties: the dynamic path)
+        if (isObjectLiteralExpression(sourceNode) || isObjectCreateNull(sourceNode))
+            return undefined;
+        const sourceType = inferExpressionType(sourceNode) ?? '';
+        if (!sourceType.startsWith('*'))
+            return undefined;
+        const sourceFields = goStructFields(sourceType.slice(1));
+        if (!sourceFields)
+            return undefined;
+        const sourceTemp = getTempName('src');
+        const assignments = [];
+        for (const [name, from] of sourceFields) {
+            if (name === '__keys')
+                continue;
+            const to = fields.get(name);
+            if (to === undefined)
+                continue;
+            const read = `${sourceTemp}.${name}`;
+            const write = from === to ? read : convertBetweenGoTypes(read, from, to);
+            assignments.push(isNilableGoType(from) ? `if ${read} != nil { ${targetTemp}.${name} = ${write} }` : `${targetTemp}.${name} = ${write}`);
+        }
+        steps.push(`${sourceTemp} := ${argCodes[i]}; _ = ${sourceTemp}; if ${sourceTemp} != nil { ${assignments.join('; ')} }`);
+    }
+    return `func() ${targetType} { ${targetTemp} := &${target}{${parts.join(', ')}}; ${steps.join('; ')}; return ${targetTemp} }()`;
+}
 // A fresh empty value of a pointer Go type (&S{}, an empty Map)
 function newGoValueOf(goType) {
     const mapArgs = goType.startsWith('*TnMap[') ? splitMapTypeArgs(goType) : undefined;
@@ -17595,6 +17878,13 @@ function visitOptionalChainContinuation(node) {
     if (!innerType) {
         return `func() interface{} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return nil }; ${innerCode}; return nil }()`;
     }
+    // (a primitive whose value is only tested: an absent chain's undefined is
+    // falsy, so the zero value needs no boxed pointer)
+    if (truthinessOperands.has(node) && ['bool', 'string', 'float64'].includes(innerType)) {
+        const zero = innerType === 'string' ? '""' : innerType === 'float64' ? '0' : 'false';
+        truthinessPrimitiveType.set(node, innerType);
+        return `func() ${innerType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return ${zero} }; return ${innerCode} }()`;
+    }
     const resultType = makeNullableType(innerType);
     const value = resultType === innerType ? innerCode : `func() ${resultType} { __v := ${innerCode}; return &__v }()`;
     return `func() ${resultType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return *new(${resultType}) }; return ${value} }()`;
@@ -17628,6 +17918,13 @@ function visitOptionalCall(node) {
             if (isDiscardedValue(node))
                 return `func() { if ${fn} := ${visit(node.expression)}; ${fn} != nil { ${fn}(${args}) } }()`;
             return `func() interface{} { if ${fn} := ${visit(node.expression)}; ${fn} != nil { ${fn}(${args}) }; return nil }()`;
+        }
+        // (a primitive whose value is only tested: an absent function's undefined
+        // is falsy, so the zero value needs no boxed pointer)
+        if (['bool', 'string', 'float64'].includes(returnType) && truthinessOperands.has(node)) {
+            const zero = returnType === 'string' ? '""' : returnType === 'float64' ? '0' : 'false';
+            truthinessPrimitiveType.set(node, returnType);
+            return `func() ${returnType} { ${fn} := ${visit(node.expression)}; if ${fn} == nil { return ${zero} }; return ${fn}(${args}) }()`;
         }
         const resultType = makeNullableType(returnType);
         const value = resultType === returnType ? `${fn}(${args})` : `func() ${resultType} { v := ${fn}(${args}); return &v }()`;
@@ -19552,10 +19849,15 @@ const callHandlers = {
         // (an existing object is updated in place and returned, whatever its type)
         const existingTarget = !!call && (call.arguments ?? []).length > 0 && !isObjectLiteralExpression(unwrapParentheses(call.arguments[0])) && !isObjectCreateNull(unwrapParentheses(call.arguments[0])) && !(call.arguments ?? []).some((a) => isSpreadElement(a));
         if (call && (targetType || existingTarget)) {
-            useHelper('objectAssignTo');
             const target = unwrapParentheses(call.arguments[0]);
             // a literal target: a fresh value of the type, its own properties first
             const literal = isObjectLiteralExpression(target) || isObjectCreateNull(target);
+            if (literal && !existingTarget && targetType && targetType !== 'interface{}') {
+                const statically = staticObjectAssign(call, targetType, args);
+                if (statically)
+                    return statically;
+            }
+            useHelper('objectAssignTo');
             const head = !literal ? args[0] : targetType === 'interface{}' ? `TnEmptyLike(${args[1]})` : newGoValueOf(targetType ?? '');
             // (a literal source's explicit undefined properties are copied too)
             const setsUndefined = (a) => isObjectLiteralExpression(a) && (a.properties ?? []).some((p) => isPropertyAssignment(p) && isIdentifier(p.initializer) && p.initializer.text === 'undefined');
@@ -20115,7 +20417,13 @@ const dateMethodHandlers = {
 };
 // append(base, args…) where some arguments are spreads (`x...`): one
 // append per run, as Go allows a spread only as the last argument
-function appendArguments(base, args) {
+function appendArguments(base, args, elementType) {
+    // (one value: the 2x growth helper — building a long list with Go's 1.25x
+    // growth copies it out about five times over)
+    if (args.length === 1 && !args[0].endsWith('...') && elementType) {
+        useHelper('arrayPush');
+        return `TnPush[${elementType}](${base}, ${args[0]})`;
+    }
     if (!args.some((a) => a.endsWith('...')))
         return `append(${[base, ...args].join(', ')})`;
     let out = base;
@@ -20135,6 +20443,7 @@ function appendArguments(base, args) {
 const arrayMethodHandlers = {
     // push / unshift return the new length when their value is used
     push: (obj, args) => {
+        const element = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType.slice(2) : undefined;
         // (an array a call returns — a getter's — is no Go variable: appended to a copy)
         // (a field through a call's pointer result — getter().items — is addressable)
         const receiver = currentCallNode && isPropertyAccessExpression(currentCallNode.expression) ? currentCallNode.expression.expression : undefined;
@@ -20142,24 +20451,24 @@ const arrayMethodHandlers = {
             // (a call returning an array reference — a Map of arrays' value through
             // getOrInsertWith — appends to the array it refers to)
             if (receiver && inferRawExpressionType(receiver)?.startsWith('*[]')) {
-                return `func() float64 { __p := ${obj}; *__p = ${appendArguments('*__p', args)}; return float64(len(*__p)) }()`;
+                return `func() float64 { __p := ${obj}; *__p = ${appendArguments('*__p', args, element)}; return float64(len(*__p)) }()`;
             }
             // (a read out of a container — FLIPPED_ALIAS_KEYS[alias], a Map's value
             // —: the array lives in it, so the appended one is stored back, as push
             // mutates it in JS)
             if (receiver && isElementAccessExpression(receiver) && (hasDynamicProperties(receiver.expression) || (inferExpressionType(receiver.expression) ?? '').startsWith('*TnMap['))) {
-                return (`func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args)}; ` +
+                return (`func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; ` +
                     `TnSetIndex(${visit(receiver.expression)}, ${visit(receiver.argumentExpression)}, __s); return float64(len(__s)) }()`);
             }
             if (receiver && isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression) && !hasQuestionDot(receiver)) {
-                return (`func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args)}; ` +
+                return (`func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; ` +
                     `TnSet(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, __s); return float64(len(__s)) }()`);
             }
-            return `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args)}; return float64(len(__s)) }()`;
+            return `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; return float64(len(__s)) }()`;
         }
         return currentCallNode && !isDiscardedValue(currentCallNode)
-            ? `func() float64 { ${obj} = ${appendArguments(obj, args)}; return float64(len(${obj})) }()`
-            : `${obj} = ${appendArguments(obj, args)}`;
+            ? `func() float64 { ${obj} = ${appendArguments(obj, args, element)}; return float64(len(${obj})) }()`
+            : `${obj} = ${appendArguments(obj, args, element)}`;
     },
     pop: (obj) => {
         const elementType = receiverElementType();
@@ -20176,7 +20485,7 @@ const arrayMethodHandlers = {
         return `func() ${elementType} { if len(${obj}) == 0 { var __zero ${elementType}; return __zero }; __first := ${obj}[0]; ${obj} = ${obj}[1:]; return __first }()`;
     },
     unshift: (obj, args) => {
-        const prefix = appendArguments(`[]${receiverElementType()}{}`, args);
+        const prefix = appendArguments(`[]${receiverElementType()}{}`, args, receiverElementType());
         return currentCallNode && !isDiscardedValue(currentCallNode)
             ? `func() float64 { ${obj} = append(${prefix}, ${obj}...); return float64(len(${obj})) }()`
             : `${obj} = append(${prefix}, ${obj}...)`;
@@ -20219,7 +20528,7 @@ const arrayMethodHandlers = {
         }
         const insert = args.slice(2);
         // (the deleted count is clamped to the elements after start)
-        const inserted = insert.length > 0 ? appendArguments(`${obj}[:__start]`, insert) : `${obj}[:__start]`;
+        const inserted = insert.length > 0 ? appendArguments(`${obj}[:__start]`, insert, elementType) : `${obj}[:__start]`;
         return `func() []${elementType} { __start := ${start}; __end := __start + max(0, int(${indexArg(1)})); if __end > len(${obj}) { __end = len(${obj}) }; __rm := append([]${elementType}{}, ${obj}[__start:__end]...); __tail := append([]${elementType}{}, ${obj}[__end:]...); ${obj} = ${inserted}; ${obj} = append(${obj}, __tail...); return __rm }()`;
     },
     fill: (obj, args) => {
@@ -26741,6 +27050,21 @@ const helperPackages = {
 // Field names are intentionally lowercase: every generated file is `package main`,
 // so `result.stdout` in emitted code resolves to the struct field directly.
 const goHelpers = {
+    arrayPush: `// append with geometric (2x) growth: Go grows a large slice by 1.25x, so the
+// repeated copies when a list is built by pushes add up to about five times
+// its final memory
+func TnPush[T any](s []T, v T) []T {
+	if len(s) == cap(s) {
+		n := len(s) * 2
+		if n < 16 {
+			n = 16
+		}
+		ns := make([]T, len(s), n)
+		copy(ns, s)
+		s = ns
+	}
+	return append(s, v)
+}`,
     slicePtr: `// A *[]T slot from a slice: nil stays nil (no match, undefined), and the box
 // is allocated only for a value, not for every call a local &v would cost
 func TnSlicePtr[T any](v []T) *[]T {
@@ -29076,6 +29400,12 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		}
 		return
 	}
+	// (a record — a TnMap held as any, such as a {} literal: its key, as
+	// tnSetMember's Set call stores it, without reflection)
+	if r, ok := obj.(interface{ TnSetProp(string, interface{}) bool }); ok && r.TnSetProp(key, value) {
+		tnExpandoDelete(obj, key)
+		return
+	}
 	if obj != nil {
 		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.setter {
 			if base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]; base != nil {
@@ -30756,6 +31086,90 @@ func tnConvIdentityOf(src unsafe.Pointer, dst reflect.Type, srcSize uintptr) (re
 	return entry.out, ok
 }
 
+// The objects struct conversions (tnConvPlan.convert) made, by source object
+// and target type. An entry holds its source, so the address names no other
+// object while the entry lives, and its converted object weakly: once nothing
+// else holds that object, a new one can't be told from it. (One weak pointer
+// per conversion, no cleanup or finalizer: those made every conversion of a
+// short-lived object cost a few garbage-collector specials.) Entries whose
+// object was collected go in a sweep, run when the index has doubled since
+// the last one.
+type tnStructIdentityKey struct {
+	src uintptr
+	dst unsafe.Pointer // (the target type's descriptor)
+}
+
+type tnStructIdentity struct {
+	src unsafe.Pointer
+	out weak.Pointer[byte]
+}
+
+var tnStructIdentities = map[tnStructIdentityKey]tnStructIdentity{}
+var tnStructIdentityMu sync.Mutex
+var tnStructIdentitySweepAt = 1 << 12
+
+// The entries found or made last, by a hash of their key: an object
+// converted again and again (an options object read per node) skips the
+// index. A slot holds its object, so its key's entry in the index stays the
+// one it names (an entry is only replaced once its object is gone): at most
+// one object per slot is kept alive this way
+var tnStructIdentityRecent [1 << 8]struct {
+	key tnStructIdentityKey
+	out unsafe.Pointer
+}
+
+// The converted object for src as a dst (memory of dst's type): the one made
+// before (cached true), else a new one remembered for src
+func tnStructIdentityOf(src unsafe.Pointer, dst reflect.Type, srcSize uintptr) (unsafe.Pointer, bool) {
+	if srcSize == 0 || src == nil || dst.Size() == 0 {
+		return reflect.New(dst).UnsafePointer(), false
+	}
+	key := tnStructIdentityKey{uintptr(src), (*[2]unsafe.Pointer)(unsafe.Pointer(&dst))[1]}
+	slot := &tnStructIdentityRecent[((key.src>>4)^(uintptr(key.dst)>>5))*0x9E3779B1>>16&(1<<8-1)]
+	tnStructIdentityMu.Lock()
+	if slot.key == key && slot.out != nil {
+		out := slot.out
+		tnStructIdentityMu.Unlock()
+		return out, true
+	}
+	if e, ok := tnStructIdentities[key]; ok {
+		if out := e.out.Value(); out != nil {
+			slot.key, slot.out = key, unsafe.Pointer(out)
+			tnStructIdentityMu.Unlock()
+			return unsafe.Pointer(out), true
+		}
+	}
+	if len(tnStructIdentities) >= tnStructIdentitySweepAt {
+		for k, e := range tnStructIdentities {
+			if e.out.Value() == nil {
+				delete(tnStructIdentities, k)
+			}
+		}
+		tnStructIdentitySweepAt = max(1<<12, 2*len(tnStructIdentities))
+	}
+	out := reflect.New(dst).UnsafePointer()
+	e := tnStructIdentity{src: src, out: weak.Make((*byte)(out))}
+	tnStructIdentities[key] = e
+	slot.key, slot.out = key, out
+	tnStructIdentityMu.Unlock()
+	return out, false
+}
+
+// TnAs for a conversion the compiler knows is the only one its source object
+// ever gets (see unsharedConversionSource): a fresh object that nothing else
+// holds, converted once, needs no identity entry — a plain copy
+func TnAsCopy[T any](v interface{}) T {
+	if t, ok := v.(T); ok {
+		return t
+	}
+	if v != nil {
+		if p := tnConvPlanOf(v, reflect.TypeOf((*T)(nil)).Elem()); p.ok && (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1] != nil {
+			return p.convertTo(v, false).Interface().(T)
+		}
+	}
+	return TnAs[T](v)
+}
+
 var tnConvPlans [1 << 10]atomic.Pointer[tnConvPlan]
 var tnConvPlanIndex = map[[2]unsafe.Pointer]*tnConvPlan{}
 var tnConvPlanMu sync.RWMutex
@@ -30842,6 +31256,11 @@ func tnMakeConvPlan(v interface{}, t reflect.Type, from unsafe.Pointer, to unsaf
 
 // v (a non-nil pointer to a struct) as a new value of the plan's target type
 func (p *tnConvPlan) convert(v interface{}) reflect.Value {
+	return p.convertTo(v, true)
+}
+
+// (identity false: a copy no other conversion will look for — TnAsCopy)
+func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 	src := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
 	if p.view {
 		if p.narrow {
@@ -30856,8 +31275,14 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 	// the same converted object, its fields refreshed from the source — JS
 	// identity for Set / Map keys and === (a Babel node read as a
 	// t.Identifier: hoistable.has(path.node) finds binding.identifier))
-	out, cached := tnConvIdentityOf(src, p.dst, p.src.Size())
-	dst := out.UnsafePointer()
+	var dst unsafe.Pointer
+	cached := false
+	if identity {
+		dst, cached = tnStructIdentityOf(src, p.dst, p.src.Size())
+	} else {
+		dst = reflect.New(p.dst).UnsafePointer()
+	}
+	out := reflect.NewAt(p.dst, dst)
 	if cached {
 		reflect.NewAt(p.dst, dst).Elem().SetZero()
 	}
@@ -30896,14 +31321,12 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 			}
 		}
 	}
-	// (a narrowing copy — the source has every target field plus extras — is
-	// registered so field writes through it reach the source: JS object
-	// identity across merged-union member views)
-	if p.src.NumField() > p.dst.NumField() && !cached {
-		tnRegisterView(out.Interface(), reflect.NewAt(p.src, src).Interface())
-	}
 	// the properties the object carries beyond its struct (tnExpandos): a
-	// target field of the same name reads them
+	// target field of the same name reads them (only an object of a type
+	// that ever had one can: tnExpandoPropsOf)
+	if !tnExpandoTypes.has(v) {
+		return out
+	}
 	for _, ef := range p.expandos {
 		value, ok := tnExpandoGet(v, ef.name)
 		if !ok || value == nil {
@@ -30986,25 +31409,30 @@ func tnFuncResults(out []reflect.Value, t reflect.Type) []reflect.Value {
 	return results
 }
 
+// The conversion plan from v's type to t (v non-nil)
+func tnConvPlanOf(v interface{}, t reflect.Type) *tnConvPlan {
+	from, to := (*[2]unsafe.Pointer)(unsafe.Pointer(&v)), (*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1]
+	h := ((uintptr(from[0])>>4 ^ uintptr(to)>>7) * 0x9E3779B1) >> 12 & (1<<10 - 1)
+	p := tnConvPlans[h].Load()
+	if p == nil || p.from != from[0] || p.to != to {
+		key := [2]unsafe.Pointer{from[0], to}
+		tnConvPlanMu.RLock()
+		p = tnConvPlanIndex[key]
+		tnConvPlanMu.RUnlock()
+		if p == nil {
+			p = tnMakeConvPlan(v, t, from[0], to)
+			tnConvPlanMu.Lock()
+			tnConvPlanIndex[key] = p
+			tnConvPlanMu.Unlock()
+		}
+		tnConvPlans[h].Store(p)
+	}
+	return p
+}
+
 func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 	if v != nil {
-		from, to := (*[2]unsafe.Pointer)(unsafe.Pointer(&v)), (*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1]
-		h := ((uintptr(from[0])>>4 ^ uintptr(to)>>7) * 0x9E3779B1) >> 12 & (1<<10 - 1)
-		p := tnConvPlans[h].Load()
-		if p == nil || p.from != from[0] || p.to != to {
-			key := [2]unsafe.Pointer{from[0], to}
-			tnConvPlanMu.RLock()
-			p = tnConvPlanIndex[key]
-			tnConvPlanMu.RUnlock()
-			if p == nil {
-				p = tnMakeConvPlan(v, t, from[0], to)
-				tnConvPlanMu.Lock()
-				tnConvPlanIndex[key] = p
-				tnConvPlanMu.Unlock()
-			}
-			tnConvPlans[h].Store(p)
-		}
-		if p.ok && from[1] != nil {
+		if p := tnConvPlanOf(v, t); p.ok && (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1] != nil {
 			return p.convert(v), true
 		}
 	}
@@ -34237,6 +34665,25 @@ func (m *TnMap[K, V]) TnProp(key string) (interface{}, bool) {
 	}
 	v, present := m.read(k)
 	return v, present
+}
+
+// obj[key] = value on a record held in a dynamic value (a plain object
+// literal, {}): the key set without reflection, as tnSetMember's Set call
+// would. False when the key or value isn't already of the map's types (the
+// reflective path converts those)
+func (m *TnMap[K, V]) TnSetProp(key string, value interface{}) bool {
+	k, ok := any(key).(K)
+	if !ok || m == nil {
+		return false
+	}
+	var v V
+	if value != nil {
+		if v, ok = value.(V); !ok {
+			return false
+		}
+	}
+	m.Set(k, v)
+	return true
 }
 
 func (m *TnMap[K, V]) Lookup(k K) (V, bool) {
