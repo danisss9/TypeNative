@@ -20511,6 +20511,29 @@ function visitRegexReplace(node: AstNode): string | undefined {
   else if (isRegularExpressionLiteral(pattern)) isGlobal = pattern.text.substring(pattern.text.lastIndexOf('/') + 1).includes('g') ? 'true' : 'false';
   // (an expression read twice must be pure: a name, fields, a Record lookup)
   else if (reIsWrapper && /^[\w.]+(\.Get\("[^"\\]*"\))?[\w.]*$/.test(re)) isGlobal = `${re}.global`;
+  else if (reIsWrapper) {
+    // new RegExp(p, 'g…') written out: its flags are known here
+    const flags = newRegExpLiteralFlags(pattern);
+    if (flags !== undefined) isGlobal = flags.includes('g') ? 'true' : 'false';
+    // any other RegExp (a call's result, new RegExp(p, flags)): evaluated
+    // once, its g flag tested at run time
+    else return `func() string { __rx := ${re}; return ${emitRegexReplace(pattern, replacement, target, reIsWrapper, '__rx', '__rx.global')} }()`;
+  }
+  return emitRegexReplace(pattern, replacement, target, reIsWrapper, re, isGlobal);
+}
+
+// The flags of new RegExp(p) / new RegExp(p, 'literal flags'); undefined for
+// any other expression or flags computed at run time
+function newRegExpLiteralFlags(node: AstNode): string | undefined {
+  const expr = unwrapParentheses(node);
+  if (!isNewExpression(expr) || !isIdentifier(expr.expression) || expr.expression.text !== 'RegExp') return undefined;
+  const args = expr.arguments ?? [];
+  if (args.length < 2) return args.length === 1 && isRegularExpressionLiteral(unwrapParentheses(args[0])) ? undefined : '';
+  const flags = unwrapParentheses(args[1]);
+  return isStringLiteral(flags) || isNoSubstitutionTemplateLiteral(flags) ? flags.text : undefined;
+}
+
+function emitRegexReplace(pattern: AstNode, replacement: AstNode, target: string, reIsWrapper: boolean, re: string, isGlobal: string): string {
   importedPackages.add('regexp');
 
   if (isArrowFunction(replacement) || isFunctionExpression(replacement)) {

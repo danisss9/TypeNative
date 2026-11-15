@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `leftGoType?.startsWith('*') && leftGoType.slice(1)` became a `bool` in the
   Go build. It is now written as a ternary that yields a string or
   `undefined`.
+- **`replace` with an inline `new RegExp(…, 'g')`:** only the first match was
+  replaced, because the `g` flag was only seen on a regex literal or a
+  `RegExp` read from a variable. Flags written out in `new RegExp(p, 'flags')`
+  are now read at compile time, and any other `RegExp` expression (a call's
+  result, flags computed at run time) is evaluated once and its `g` flag
+  tested at run time. The self-hosted compiler relied on this to map string
+  enums to `string` in `tnCallValueTyped`, so its build of
+  examples/react-compiler failed with `duplicate case func(string,
+  MemoizationLevel) MemoizationLevel in type switch`.
 
 ### Changed
 
