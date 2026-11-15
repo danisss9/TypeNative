@@ -19550,6 +19550,21 @@ function appendArguments(base: string, args: string[], elementType?: string): st
   return run.length > 0 ? `append(${[out, ...run].join(', ')})` : out;
 }
 
+// target = append(target, args…) as a statement. One value pushed onto a
+// variable or field (target a plain path, (*p) or *p) is TnPushTo(&target, v),
+// which stores the slice only when it grows; anything else (a map's value
+// m[k], spreads, several values) assigns the appended slice back.
+function pushStatement(target: string, args: string[], elementType?: string): string {
+  if (args.length === 1 && !args[0].endsWith('...') && elementType) {
+    const deref = /^\(\*([\w.]+)\)$/.exec(target) ?? /^\*([\w.]+)$/.exec(target);
+    if (deref || /^[\w.]+$/.test(target)) {
+      useHelper('arrayPush');
+      return `TnPushTo[${elementType}](${deref ? deref[1] : `&${target}`}, ${args[0]})`;
+    }
+  }
+  return `${target} = ${appendArguments(target, args, elementType)}`;
+}
+
 const arrayMethodHandlers: Record<string, MethodHandler> = {
   // push / unshift return the new length when their value is used
   push: (obj, args) => {
@@ -19561,28 +19576,28 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
       // (a call returning an array reference — a Map of arrays' value through
       // getOrInsertWith — appends to the array it refers to)
       if (receiver && inferRawExpressionType(receiver)?.startsWith('*[]')) {
-        return `func() float64 { __p := ${obj}; *__p = ${appendArguments('*__p', args, element)}; return float64(len(*__p)) }()`;
+        return `func() float64 { __p := ${obj}; ${pushStatement('*__p', args, element)}; return float64(len(*__p)) }()`;
       }
       // (a read out of a container — FLIPPED_ALIAS_KEYS[alias], a Map's value
       // —: the array lives in it, so the appended one is stored back, as push
       // mutates it in JS)
       if (receiver && isElementAccessExpression(receiver) && (hasDynamicProperties(receiver.expression) || (inferExpressionType(receiver.expression) ?? '').startsWith('*TnMap['))) {
         return (
-          `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; ` +
+          `func() float64 { __s := ${obj}; ${pushStatement('__s', args, element)}; ` +
           `TnSetIndex(${visit(receiver.expression)}, ${visit(receiver.argumentExpression)}, __s); return float64(len(__s)) }()`
         );
       }
       if (receiver && isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression) && !hasQuestionDot(receiver)) {
         return (
-          `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; ` +
+          `func() float64 { __s := ${obj}; ${pushStatement('__s', args, element)}; ` +
           `TnSet(${visit(receiver.expression)}, ${toGoStringLiteral(receiver.name.text)}, __s); return float64(len(__s)) }()`
         );
       }
-      return `func() float64 { __s := ${obj}; __s = ${appendArguments('__s', args, element)}; return float64(len(__s)) }()`;
+      return `func() float64 { __s := ${obj}; ${pushStatement('__s', args, element)}; return float64(len(__s)) }()`;
     }
     return currentCallNode && !isDiscardedValue(currentCallNode)
-      ? `func() float64 { ${obj} = ${appendArguments(obj, args, element)}; return float64(len(${obj})) }()`
-      : `${obj} = ${appendArguments(obj, args, element)}`;
+      ? `func() float64 { ${pushStatement(obj, args, element)}; return float64(len(${obj})) }()`
+      : pushStatement(obj, args, element);
   },
   pop: (obj) => {
     const elementType = receiverElementType();
@@ -25893,15 +25908,31 @@ const goHelpers: Record<string, string> = {
 // its final memory
 func TnPush[T any](s []T, v T) []T {
 	if len(s) == cap(s) {
-		n := len(s) * 2
-		if n < 16 {
-			n = 16
-		}
-		ns := make([]T, len(s), n)
-		copy(ns, s)
-		s = ns
+		s = tnPushGrow(s)
 	}
 	return append(s, v)
+}
+
+// arr.push(v) on an array variable or field, in place: the slice is stored
+// only when it grows, so a push into spare capacity writes just its length,
+// as x = append(x, v) does (x = TnPush(x, v) stores the whole slice, with a
+// GC write barrier, on every push)
+func TnPushTo[T any](s *[]T, v T) {
+	if len(*s) == cap(*s) {
+		*s = tnPushGrow(*s)
+	}
+	*s = append(*s, v)
+}
+
+// A full slice's copy with twice its capacity (at least 16)
+func tnPushGrow[T any](s []T) []T {
+	n := len(s) * 2
+	if n < 16 {
+		n = 16
+	}
+	ns := make([]T, len(s), n)
+	copy(ns, s)
+	return ns
 }`,
   slicePtr: `// A *[]T slot from a slice: nil stays nil (no match, undefined), and the box
 // is allocated only for a value, not for every call a local &v would cost
@@ -33259,6 +33290,32 @@ type TnMap[K comparable, V any] struct {
 	dead    []bool
 	deadN   int
 	keyMode uint8 // hk: 0 not known yet, 1 keys are stored as they are, 2 K is an interface
+	// keys not listed yet: values is an any object's map, viewed as a record
+	// (TnRecordOf), and listKeys lists them when something first needs keys
+	view bool
+}
+
+// A record view's keys, listed the first time they're needed: sorted (a Go
+// map keeps no order), as converting the object would list them
+func (m *TnMap[K, V]) listKeys() {
+	if !m.view {
+		return
+	}
+	m.view = false
+	keys := make([]K, 0, len(m.values))
+	for k := range m.values {
+		keys = append(keys, k)
+	}
+	if ks, ok := any(keys).([]string); ok {
+		sort.Strings(ks)
+	}
+	m.keys = keys
+	for _, k := range keys {
+		if _, isIndex := tnIndexKey(any(k)); isIndex {
+			m.indexKeys = true
+			break
+		}
+	}
 }
 
 // An accessor property of a dynamic object: reading it calls Get, writing it
@@ -33288,6 +33345,7 @@ func (m *TnMap[K, V]) read(k K) (V, bool) {
 
 // Appends a new key (keeping pos / dead in step when a delete made them)
 func (m *TnMap[K, V]) pushKey(k K) {
+	m.listKeys()
 	m.keys = append(m.keys, k)
 	if m.pos != nil {
 		m.pos[m.hk(k)] = len(m.keys) - 1
@@ -33297,6 +33355,7 @@ func (m *TnMap[K, V]) pushKey(k K) {
 
 // Drops deleted keys from keys: every reader of keys calls it first
 func (m *TnMap[K, V]) compact() {
+	m.listKeys()
 	if m.deadN == 0 {
 		return
 	}
@@ -33601,6 +33660,11 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 	if m.hidden != nil {
 		delete(m.hidden, h)
 	}
+	if m.view {
+		// (a view's keys are listed now, without the deleted one)
+		m.listKeys()
+		return true
+	}
 	n := len(m.keys)
 	// the newest key (a stack), or a small map: removed from keys right away
 	if m.deadN == 0 && n > 0 && m.hk(m.keys[n-1]) == h {
@@ -33691,7 +33755,7 @@ func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
 }
 
 func (m *TnMap[K, V]) Clear() {
-	m.keys, m.pos, m.dead, m.deadN = nil, nil, nil, 0
+	m.keys, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, 0, false
 	m.values = map[K]V{}
 	m.accessors = nil
 	m.hidden = nil
@@ -33701,6 +33765,7 @@ func (m *TnMap[K, V]) Len() int {
 	if m == nil {
 		return 0
 	}
+	m.listKeys()
 	return len(m.keys) - m.deadN - len(m.hidden)
 }
 
@@ -33752,7 +33817,7 @@ func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return fmt.Errorf("json: cannot unmarshal %v into an object", tok)
 	}
-	m.keys, m.pos, m.dead, m.deadN = nil, nil, nil, 0
+	m.keys, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, 0, false
 	m.values = map[K]V{}
 	for dec.More() {
 		tok, err := dec.Token()
@@ -36990,22 +37055,11 @@ func TnPromiseAll[T any](chs []chan T) chan []T {
   recordView: `// An any value as a Record<string, any>. A JSON-like object (a Go map) is
 // viewed in place, sharing its map, so writes through the record reach the
 // object as in JS; its keys list in the order a conversion gives them
-// (sorted: a Go map keeps none). Anything else converts as TnAsPtr does.
+// (sorted: a Go map keeps none), listed only when something first needs them
+// (a record read by key never does). Anything else converts as TnAsPtr does.
 func TnRecordOf(v interface{}) *TnMap[string, interface{}] {
 	if m, ok := v.(map[string]interface{}); ok && m != nil {
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		r := &TnMap[string, interface{}]{keys: keys, values: m, keyMode: 1}
-		for _, k := range keys {
-			if _, isIndex := tnIndexKey(k); isIndex {
-				r.indexKeys = true
-				break
-			}
-		}
-		return r
+		return &TnMap[string, interface{}]{values: m, keyMode: 1, view: true}
 	}
 	return TnAsPtr[TnMap[string, interface{}]](v)
 }`,

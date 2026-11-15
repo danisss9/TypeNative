@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Record<string, any>` views of `any` objects:** taking the view no longer
+  lists, sorts and scans the object's keys each time. They are listed the
+  first time something needs them (`Object.keys`, `for…in`, a delete, a new
+  key), so a record read only by key costs one allocation. The
+  `any-record-view` probe goes from 263 ms to 96.5 ms. A key added through
+  the `any` object before the view's keys are first listed now shows up in
+  them, as in JS.
+- **`push` regression fixed:** since 0.6.1, a single-value `arr.push(v)` was
+  `arr = TnPush(arr, v)`, which stored the whole slice, with a GC write
+  barrier, on every push. A push onto a variable or field is now
+  `TnPushTo(&arr, v)`, which keeps the 2x growth and stores the slice only
+  when it grows. `arr-push-index` goes from 105 ms back to 49.2 ms (it was
+  56 ms before the regression). The new probe `arr-push-local` measures
+  pushes into short local and field arrays.
+
 ## [0.6.2] - 2026-11-15
 
 ### Fixed
