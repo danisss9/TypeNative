@@ -4618,7 +4618,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       !leftGoType?.startsWith('*[]')
     ) {
       // (a plain function's this typed as a class: its getters too)
-      const typedClass = leftGoType?.startsWith('*') && leftGoType.slice(1).replace(/\[.*\]$/, '');
+      const typedClass = leftGoType?.startsWith('*') ? leftGoType.slice(1).replace(/\[.*\]$/, '') : undefined;
       const className =
         typedClass && classNames.has(typedClass)
           ? typedClass
