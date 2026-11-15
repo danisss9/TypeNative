@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-15
+
+### Fixed
+
+- **Self-hosted native build:** `npm run build:native` failed with `cannot use
+  typedClass (variable of type bool) as string value`. The transpiler typed
+  `a && b` by its left operand, so a getter-lookup helper written as
+  `leftGoType?.startsWith('*') && leftGoType.slice(1)` became a `bool` in the
+  Go build. It is now written as a ternary that yields a string or
+  `undefined`.
+
+### Changed
+
+- **tsparser:** `github.com/go-json-experiment/json` bumped to v1.27.2.
+
 ## [0.6.1] - 2026-11-15
 
 ### Changed
