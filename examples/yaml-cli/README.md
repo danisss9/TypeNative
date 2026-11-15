@@ -87,7 +87,7 @@ and checks that the two JSON outputs are identical:
   generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.6.0 (unreleased changes), default
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.1, default
 (non-`--release`) build.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:

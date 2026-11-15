@@ -104,7 +104,7 @@ plain `node:http` client would cap out far below either server, so
 with it both servers would simply tie at the client's limit.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
-TypeNative 0.6.0 (unreleased changes), default (non-`--release`) build, client
+TypeNative 0.6.1, default (non-`--release`) build, client
 and server on the same machine. Re-run variation is about ±20%; across runs
 TypeNative was 1.6–1.8x Node on GET and 1.6–1.8x on POST. The numbers below are
 medians over three runs.

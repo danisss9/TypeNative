@@ -10,6 +10,9 @@
 // the compiler's own fixtures: `// @compilationMode:"infer" @enableJsxOutlining`.
 
 import * as fs from 'node:fs';
+import * as nodePath from 'node:path';
+import * as nodeOs from 'node:os';
+import { spawn } from 'node:child_process';
 import { parse, type ParserPlugin } from './vendor/babel/parser/src/index.ts';
 import traverse, { type NodePath } from './vendor/babel/traverse/src/index.ts';
 import generate from './vendor/babel/generator/src/index.ts';
@@ -88,6 +91,11 @@ function describe(event: LoggerEvent): string {
 }
 
 function compile(source: string, filename: string): string {
+  const { code, events } = compileParts(source, filename);
+  return [code, ...events].join('\n');
+}
+
+function compileParts(source: string, filename: string): { code: string; events: string[] } {
   const firstLine = source.substring(0, source.indexOf('\n'));
   const flow = firstLine.includes('@flow');
   const plugins: ParserPlugin[] = flow
@@ -132,17 +140,153 @@ function compile(source: string, filename: string): string {
     },
   });
 
-  const out = [generate(ast, {}, source).code];
-  for (const event of events) out.push(describe(event));
-  return out.join('\n');
+  const code = generate(ast, {}, source).code;
+  return { code, events: events.map(describe) };
 }
 
-const file = process.argv[2];
+// Large files of independent top-level functions: a worker process compiles
+// each contiguous run of functions, and the parent joins their output. The
+// per-function output is independent, and each chunk is padded so source
+// positions (the // CompileSuccess lines) stay the ones of the whole file.
+// Under Node each worker re-imports the compiler (expensive); TypeNative's
+// workers start from the compiled binary. TN_PARALLEL=0 disables it.
+const MAX_WORKERS = 6;
+const MIN_FUNCTIONS = 8;
+
+type Chunk = { first: string; text: string };
+
+function splitSource(source: string): Chunk[] | undefined {
+  // (compiler temps are renamed per chunk; a source using such a name keeps
+  // the single-process path)
+  if (/\b_temp\d*\b/.test(source)) return undefined;
+  const lines = source.split('\n');
+  const starts: { name: string; line: number }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/.exec(lines[i]);
+    if (match) starts.push({ name: match[1], line: i });
+  }
+  if (starts.length < MIN_FUNCTIONS) return undefined;
+  // (the header must be imports / comments only: the chunks share it)
+  const header = lines.slice(0, starts[0].line);
+  if (header.some((l) => l.trim() !== '' && !/^(import\b|\/\/|\/\*|\*|'use |"use )/.test(l.trim()))) return undefined;
+  // (each function runs to the line before the next one; brace-counted, so
+  // templates and strings with braces could fool it — then no parallelism)
+  const ranges: { name: string; start: number; end: number }[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i].line;
+    const limit = i + 1 < starts.length ? starts[i + 1].line : lines.length;
+    let depth = 0;
+    let end = -1;
+    for (let j = start; j < limit; j++) {
+      for (const ch of lines[j]) {
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+      }
+      if (depth === 0 && j > start) { end = j; break; }
+    }
+    if (end < 0 || !/^\}/.test(lines[end])) return undefined;
+    // (only functions are split: anything else between them — variables,
+    // statements — would be dropped, so such a file compiles in one process)
+    if (i + 1 < starts.length) {
+      for (let j = end + 1; j < starts[i + 1].line; j++) {
+        const text = lines[j].trim();
+        if (text !== '' && !/^(\/\/|\/\*|\*)/.test(text)) return undefined;
+      }
+    }
+    ranges.push({ name: starts[i].name, start, end });
+  }
+  const workers = Math.min(MAX_WORKERS, Math.ceil(ranges.length / 10));
+  // (one worker would only add a process start: compile in this one)
+  if (workers < 2) return undefined;
+  const chunks: Chunk[] = [];
+  const per = Math.ceil(ranges.length / workers);
+  for (let i = 0; i < ranges.length; i += per) {
+    const group = ranges.slice(i, i + per);
+    const firstStart = group[0].start;
+    const padding = Math.max(0, firstStart - header.length);
+    const pad: string[] = [];
+    for (let k = 0; k < padding; k++) pad.push('');
+    const body = lines.slice(firstStart, group[group.length - 1].end + 1);
+    // the last chunk carries the rest of the file (export default …)
+    const tail = i + per >= ranges.length ? lines.slice(group[group.length - 1].end + 1) : [];
+    chunks.push({
+      first: group[0].name,
+      text: [...header, ...pad, ...body, ...tail].join('\n'),
+    });
+  }
+  return chunks;
+}
+
+function runWorkerProcess(chunkFile: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const nodeMain = process.env.TN_NODE_MAIN;
+    const args = nodeMain ? [nodeMain, chunkFile, '--worker'] : [chunkFile, '--worker'];
+    const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout?.on('data', (data: unknown) => (out += String(data)));
+    child.stderr?.on('data', (data: unknown) => (err += String(data)));
+    child.on('error', (e: unknown) => {
+      reject(e);
+    });
+    child.on('close', (code: number | null) => {
+      if (code === 0) {
+        resolve(out);
+      } else {
+        reject(new Error(err || `worker exited with ${code}`));
+      }
+    });
+  });
+}
+
+async function parallelCompile(source: string, filename: string, chunks: Chunk[]): Promise<string> {
+  const dir = fs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'tn-react-compile-'));
+  try {
+    const files: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const file = nodePath.join(dir, `chunk${i}.jsx`);
+      fs.writeFileSync(file, chunks[i].text);
+      files.push(file);
+    }
+    const outputs: string[] = await Promise.all(files.map(runWorkerProcess));
+    const codes: string[] = [];
+    const events: string[] = [];
+    for (const text of outputs) {
+      const part = JSON.parse(text) as { code: string; events: string[] };
+      codes.push(part.code);
+      for (const event of part.events) events.push(event);
+    }
+    let prefix = '';
+    const sections: string[] = [];
+    let needsMemoCache = false;
+    for (let i = 0; i < codes.length; i++) {
+      const marker = `function ${chunks[i].first}(`;
+      const at = codes[i].indexOf(marker);
+      if (at < 0) throw new Error(`chunk ${i}: ${marker} not found`);
+      if (i === 0) prefix = codes[i].slice(0, at);
+      if (codes[i].includes('react/compiler-runtime')) needsMemoCache = true;
+      // (each chunk numbers its generated _temp functions from 0: keep them
+      // apart across the merged program)
+      const section = codes[i].slice(at).replace(/\b_temp(\d*)\b/g, (_m, n: string) => `_temp${n}__tn${i}`).trimEnd();
+      sections.push(section);
+    }
+    // (chunk 0 may not need the memo cache import when a later one does)
+    if (needsMemoCache && !prefix.includes('react/compiler-runtime')) {
+      prefix = `import { c as _c } from "react/compiler-runtime";\n${prefix}`;
+    }
+    return [prefix + sections.join('\n'), ...events].join('\n');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const workerMode = process.argv.includes('--worker');
+const fileArgs = process.argv.slice(1).filter((a) => !a.startsWith('--'));
+const file = workerMode ? fileArgs[fileArgs.length - 1] : process.argv[2];
 const source = file ? fs.readFileSync(file, 'utf-8') : DEMO;
 const filename = file ?? 'demo.jsx';
-try {
-  console.log(compile(source, filename));
-} catch (e) {
+
+function printError(e: unknown): void {
   // (an error the compiler or the parser throws, as a comment: the same
   // under both runtimes)
   const message = e instanceof CompilerError ? e.withPrintedMessage(source, { eslint: false }).message : (e as Error).message;
@@ -155,4 +299,26 @@ try {
     if (stack) console.log(stack);
   }
   process.exitCode = 1;
+}
+
+if (workerMode) {
+  try {
+    console.log(JSON.stringify(compileParts(source, filename)));
+  } catch (e) {
+    printError(e);
+  }
+} else {
+  try {
+    // (a worker re-runs this module; under Node it needs the module's path)
+    const nodeRuntime = !process.env.TN_NODE_MAIN && /(^|[\\/])node(\.exe)?$/i.test(process.execPath);
+    const chunks = process.env.TN_PARALLEL === '0' || nodeRuntime ? undefined : splitSource(source);
+    console.log(chunks ? await parallelCompile(source, filename, chunks) : compile(source, filename));
+  } catch {
+    // (a worker failed: the whole file, compiled in this process)
+    try {
+      console.log(compile(source, filename));
+    } catch (e) {
+      printError(e);
+    }
+  }
 }

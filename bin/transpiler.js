@@ -3372,6 +3372,24 @@ function calledFunctionDeclaration(name, at) {
 }
 function linkParents(node, parent) {
     node.parent = parent;
+    // A generic type parameter, or a type declared inside a function, names no
+    // package-level Go type: a dynamic call's dispatcher cannot mention it
+    if (Array.isArray(node.typeParameters)) {
+        for (const tp of node.typeParameters)
+            if (tp.name?.text) {
+                genericGoParams.add(tp.name.text);
+                genericGoParams.add(getSafeName(tp.name.text));
+            }
+    }
+    if ((node.kind === 'TypeAliasDeclaration' || node.kind === 'InterfaceDeclaration' || node.kind === 'ClassDeclaration' || node.kind === 'EnumDeclaration') && node.name?.text) {
+        for (let p = parent; p && p.kind !== 'SourceFile' && p.kind !== 'ModuleBlock'; p = p.parent) {
+            if (FUNCTION_LIKE_KINDS.has(p.kind)) {
+                localGoTypes.add(node.name.text);
+                localGoTypes.add(getSafeName(node.name.text));
+                break;
+            }
+        }
+    }
     // f!(…) / o.m!(…): the assertion has no run-time effect — the plain call
     while (node.kind === 'CallExpression' && node.expression?.kind === 'NonNullExpression')
         node.expression = node.expression.expression;
@@ -3466,6 +3484,16 @@ const defaultImportNamespaces = new Set();
 // Go helper functions required by the current transpilation (e.g. 'exec', 'readFile').
 // Helper sources are appended to every generated Go file that references them.
 const usedHelpers = new Set();
+// The Go func types of the function values this program creates (see
+// tnCallValueTyped): dynamic calls of those run without reflect.Value.Call.
+const dynamicFuncTypes = new Set();
+// Type names a function value's Go type cannot mention outside its own scope:
+// types declared inside functions, and generic type parameters
+const localGoTypes = new Set();
+const genericGoParams = new Set();
+// Enum Go types emitted as aliases of a primitive (type Kind = string): a
+// function type mentioning one is the primitive's type (deduped for Go)
+const primitiveEnumGoTypes = new Map();
 // Packages that were imported only because a helper needs them. Tracked so
 // per-file import lists can exclude them (helpers are emitted once, in the
 // main file, which carries these imports instead).
@@ -3495,6 +3523,9 @@ export function transpileToNative(code, options) {
     declaredInterfaces.clear();
     interfacesByOriginalName.clear();
     declaredTypeAliases.clear();
+    // (rebuilt by linkParents while the files are parsed below)
+    localGoTypes.clear();
+    genericGoParams.clear();
     variableTypeNodes.clear();
     goRefVariables.clear();
     narrowedVariables.clear();
@@ -3596,6 +3627,8 @@ export function transpileToNative(code, options) {
     functionsUsedAsValuesCache = undefined;
     referenceArrays.clear();
     usedHelpers.clear();
+    dynamicFuncTypes.clear();
+    primitiveEnumGoTypes.clear();
     helperProvidedPackages.clear();
     mainPackageVariables.length = 0;
     keyOrderTables.clear();
@@ -4786,13 +4819,17 @@ function visitNode(node, options = {}) {
             !leftGoType?.startsWith('*TnMap[') &&
             !leftGoType?.includes('struct{') &&
             !leftGoType?.startsWith('*[]')) {
-            const className = node.expression.kind === 'ThisKeyword'
-                ? getEnclosingClassName(node)
-                : leftGoType
-                    ? leftGoType.slice(1).replace(/\[.*\]$/, '')
-                    : undefined;
+            // (a plain function's this typed as a class: its getters too)
+            const typedClass = leftGoType?.startsWith('*') && leftGoType.slice(1).replace(/\[.*\]$/, '');
+            const className = typedClass && classNames.has(typedClass)
+                ? typedClass
+                : node.expression.kind === 'ThisKeyword'
+                    ? getEnclosingClassName(node)
+                    : leftGoType
+                        ? leftGoType.slice(1).replace(/\[.*\]$/, '')
+                        : undefined;
             const accessorName = memberKey(node.name);
-            if (className && classGetterMethods.has(`${className}.${accessorName}`)) {
+            if (className && (classGetterMethods.has(`${className}.${accessorName}`) || classMember(className, 'get', accessorName))) {
                 return `${leftSide}.Get_${rightSide}()`;
             }
         }
@@ -5364,7 +5401,7 @@ function visitNode(node, options = {}) {
             const args = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
             return `TnCallValue(${visit(node.expression)}${args})`;
         }
-        if (isUndeclaredClassMember(node.expression) && !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
+        if (isUndeclaredClassMember(node.expression) && !hasQuestionDot(node.expression) && !(node.arguments ?? []).some((a) => isSpreadElement(a))) {
             useHelper('dynamic');
             useHelper('error');
             const args = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
@@ -6300,7 +6337,7 @@ function visitNode(node, options = {}) {
                     ? getEnclosingClassName(node)
                     : undefined;
             const setterName = memberKey(node.left.name);
-            if (setterClass && classSetterMethods.has(`${setterClass}.${setterName}`)) {
+            if (setterClass && (classSetterMethods.has(`${setterClass}.${setterName}`) || classMember(setterClass, 'set', setterName))) {
                 return `${visit(node.left.expression)}.Set_${visit(node.left.name)}(${visit(node.right)})`;
             }
         }
@@ -6942,12 +6979,11 @@ function visitNode(node, options = {}) {
             return '';
         }
         const typeParams = getTypeParameters(node.typeParameters, node);
+        // (before the parameters: a default `p = this` reads __this)
+        const thisPrologueCode = !isPropertyAssignment(node.parent) ? thisPrologue(node) : '';
         const parameterInfo = withContextualParameters(node, getFunctionParametersInfo(node.parameters ?? []));
-        if (!isPropertyAssignment(node.parent)) {
-            const prologue = thisPrologue(node);
-            if (prologue)
-                parameterInfo.prefixBlockContent = prologue + (parameterInfo.prefixBlockContent ?? '');
-        }
+        if (thisPrologueCode)
+            parameterInfo.prefixBlockContent = thisPrologueCode + (parameterInfo.prefixBlockContent ?? '');
         if (node.body && isBlock(node.body)) {
             prescanVariableDeclarations(node.body);
         }
@@ -6959,6 +6995,7 @@ function visitNode(node, options = {}) {
         // (a function returning one of its arguments' array fields returns a
         // reference to it: see returnsArrayReference)
         const returnType = inferredRetType ? ` ${returnsArrayReference(node) ? '*' : ''}${inferredRetType}` : '';
+        registerFunctionGoType(emittedFuncGoType(parameterInfo.signature, returnType));
         if (options.isOutside) {
             // async functions run their body in a goroutine sending over a channel
             const isAsync = (node.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
@@ -7024,6 +7061,7 @@ function visitNode(node, options = {}) {
             ? withFunctionScopeTypes(node, () => inferFunctionBodyReturnType(node) ?? '') || undefined
             : inferFunctionBodyReturnType(node);
         const returnType = inferredRetType ? ` ${inferredRetType}` : '';
+        registerFunctionGoType(emittedFuncGoType(parameterInfo.signature, returnType));
         if (parameterInfo.prefixBlockContent && !isBlock(node.body)) {
             return `func(${parameterInfo.signature})${returnType} {\n\t\t${coverageEnter(node)}${parameterInfo.prefixBlockContent}return ${toGoValueOfType(node.body, inferredRetType)};\n\t}`;
         }
@@ -17736,6 +17774,13 @@ function isNilableGoType(goType) {
 function visitOptionalPropertyAccess(node) {
     const baseExpr = visit(node.expression);
     const baseType = inferExpressionType(node.expression);
+    // (a member the class doesn't declare — a prototype method added at run
+    // time: read by name, which finds it in the class's prototype table)
+    if (isUndeclaredClassMember(node)) {
+        useHelper('dynamic');
+        const tmp = getTempName('opt');
+        return `func() interface{} { ${tmp} := ${baseExpr}; if ${tmp} == nil { return nil }; return TnGet(${tmp}, ${toGoStringLiteral(node.name.text)}) }()`;
+    }
     // m?.size of a Map / Set that may be absent: its size, or undefined
     if (baseType?.startsWith('*TnMap[') && node.name.text === 'size' && hasQuestionDot(node)) {
         return `func() *float64 { if __m := ${baseExpr}; __m != nil { __n := float64(__m.Len()); return &__n }; return nil }()`;
@@ -17900,6 +17945,16 @@ function visitOptionalCall(node) {
             const guardedCall = { args: callArgs.map((a) => visit(a)), nodes: callArgs, types: callArgs.map((a) => inferExpressionType(a) ?? ''), recv: '' };
             return guarded(guardedCall);
         }
+        // a?.m(…) of a member the class doesn't declare (a prototype method added
+        // at run time): called by name, when the receiver is set
+        if (isPropertyAccessExpression(node.expression) && isUndeclaredClassMember(node.expression)) {
+            useHelper('dynamic');
+            useHelper('error');
+            const recv = getTempName('optc');
+            const method = memberKey(node.expression.name) ?? '';
+            const callArgs = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
+            return `func() interface{} { ${recv} := ${visit(node.expression.expression)}; if TnIsNil(${recv}) { return nil }; return TnCallMember(${recv}, ${toGoStringLiteral(method)}${callArgs}) }()`;
+        }
         const fnType = inferExpressionType(node.expression) ?? '';
         const returnType = fnType.startsWith('func(') ? goFuncReturnType(fnType) : undefined;
         const fn = getTempName('fn');
@@ -17940,6 +17995,15 @@ function visitOptionalCall(node) {
     const args = (node.arguments ?? []).map((a) => visit(a)).join(', ');
     if (baseType && NULLABLE_PRIMITIVE_TYPES.includes(baseType)) {
         return visitNullablePrimitiveOptionalCall(node, baseExpr, baseType);
+    }
+    // a?.m(…) of a member the class doesn't declare (a prototype method added
+    // at run time): called by name, when the receiver is set
+    if (hasQuestionDot(node.expression) && isUndeclaredClassMember(node.expression)) {
+        useHelper('dynamic');
+        useHelper('error');
+        const recv = getTempName('optc');
+        const callArgs = (node.arguments ?? []).map((a) => `, ${toGoValueOfType(a, 'interface{}')}`).join('');
+        return `func() interface{} { ${recv} := ${baseExpr}; if TnIsNil(${recv}) { return nil }; return TnCallMember(${recv}, ${toGoStringLiteral(methodName)}${callArgs}) }()`;
     }
     // a?.m(…) on any value: undefined when a is nullish (no call)
     // a?.push(x) on any value: the mutator's own path (it writes the array
@@ -18717,6 +18781,9 @@ function enumHasComputedMember(node) {
 function visitEnumDeclaration(node, inPlace = false) {
     const enumName = getSafeName(node.name.text);
     const baseType = enumBaseTypes.get(node.name.text) ?? getEnumBaseType(node);
+    // (a string enum is a Go alias: its type is the string's)
+    if (baseType === 'string' || baseType === 'interface{}')
+        primitiveEnumGoTypes.set(enumName, baseType);
     let nextNumericValue = 0;
     let canAutoIncrement = true;
     let hasComputedMember = false;
@@ -19079,6 +19146,11 @@ function getType(typeNode, getArrayType = false) {
     }
     if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
         const name = typeNode.typeName.text;
+        // (a union member — `parentPath: NodePath_Final | null` — that names a
+        // class whose type alias a generic conditional hides: the class)
+        if (typeNode.parent?.kind === 'UnionType' && classNames.has(name) && (typeNode.typeArguments ?? []).length === 0 && !isTypeParameterInScope(name, typeNode)) {
+            return isPolymorphicClass(name) ? 'interface{}' : `*${name}`;
+        }
         if (valueShadowedTypeNames.has(name) || openObjectTypeNames.has(name))
             return 'interface{}';
         // (an object type of several call signatures plus properties — Babel's
@@ -21762,7 +21834,17 @@ function isDescriptorMethod(n) {
 // A plain function's this: its `this: T` annotation's Go type, else any
 function plainFunctionThisType(fn) {
     const declared = fn.tnThisType ? getType(fn.tnThisType) : '';
-    return declared && declared !== ':' && declared.startsWith('*') ? declared : 'interface{}';
+    if (declared && declared !== ':' && declared.startsWith('*'))
+        return declared;
+    // (a class's name that a type alias also uses — Babel's NodePath_Final<T>,
+    // a default import of its class: `this: NodePath` is the class's instances)
+    const typeNode = fn.tnThisType;
+    if (typeNode?.kind === 'TypeReference' && isIdentifier(typeNode.typeName)) {
+        const name = typeNode.typeName.text;
+        if (classNames.has(name) && !isPolymorphicClass(name) && !isTypeParameterInScope(name, typeNode))
+            return `*${name}`;
+    }
+    return 'interface{}';
 }
 // A plain function using its own this reads it once, on entry, into __this
 // (the value its caller set, TnThis): arrows in it keep seeing that one
@@ -21876,13 +21958,35 @@ function goFuncParamTypes(funcType) {
     funcType = funcType.trim();
     const result = goFuncReturnType(funcType);
     const paramList = funcType.slice(5, funcType.length - (result ? result.length + 1 : 0) - 1).trim();
-    return splitGoParameters(paramList).map((p) => {
-        const space = p.indexOf(' ');
-        const first = space > 0 ? p.slice(0, space) : p;
-        // (ǂ stands for $ and _ in names: see goIdentifierChars)
-        const isName = space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_ǂ][\wǂ]*$/.test(first);
-        return isName ? p.slice(space + 1) : p;
-    });
+    return splitGoParameters(paramList).map(goParameterType);
+}
+// A Go parameter declaration without its name ('__this interface{}' → 'interface{}')
+function goParameterType(p) {
+    const space = p.indexOf(' ');
+    const first = space > 0 ? p.slice(0, space) : p;
+    // (ǂ stands for $ and _ in names: see goIdentifierChars)
+    const isName = space > 0 && !['chan', 'func', 'map', 'struct', 'interface'].includes(first) && /^[A-Za-z_ǂ][\wǂ]*$/.test(first);
+    return isName ? p.slice(space + 1) : p;
+}
+// The Go func type of a function emitted with this parameter signature and
+// result ('a int, b string', ' bool' → 'func(int, string) bool')
+function emittedFuncGoType(signature, returnType) {
+    const params = splitGoParameters(signature).map(goParameterType).join(', ');
+    return `func(${params})${returnType}`.replace(/\bany\b/g, 'interface{}');
+}
+// A function value of this Go type may be called dynamically: tnCallValueTyped
+// gets a case for it, so the call needs no reflect.Value.Call
+function registerFunctionGoType(funcType) {
+    if (!funcType.startsWith('func(') || funcType.startsWith('func['))
+        return;
+    // (one spelling per Go type: spacing and `any` do not change it)
+    const normalized = funcType.replace(/\bany\b/g, 'interface{}').replace(/\s+/g, ' ').replace(/interface \{\}/g, 'interface{}');
+    // (a local or generic type has no package-level Go type to name)
+    for (const match of normalized.matchAll(/[A-Za-z_ǂ][\wǂ]*/g)) {
+        if (localGoTypes.has(match[0]) || genericGoParams.has(match[0]))
+            return;
+    }
+    dynamicFuncTypes.add(normalized);
 }
 // f.call(thisArg, a, b) → f(a, b); f.apply(thisArg, args) → f(args[0], args[1], …);
 // f.bind(thisArg, a) → a closure over the bound arguments (this is TnThis)
@@ -22328,7 +22432,7 @@ function collectClassImplementedInterfaces() {
 // member of a class TypeScript narrowed it to — called / read by name
 // (this counts in plain functions, whose this may be any instance)
 function isUndeclaredClassMember(access) {
-    if (!isPropertyAccessExpression(access) || hasQuestionDot(access) || access.name?.kind === 'PrivateIdentifier')
+    if (!isPropertyAccessExpression(access) || access.name?.kind === 'PrivateIdentifier')
         return false;
     // (this.isScope() in a class whose prototype gets methods assigned —
     // Object.assign(NodePath.prototype, validators) —: called by name)
@@ -22339,7 +22443,27 @@ function isUndeclaredClassMember(access) {
     if (access.expression.kind === 'SuperKeyword')
         return false;
     const receiverType = inferExpressionType(access.expression) ?? '';
-    return receiverType.startsWith('*') && classNames.has(receiverType.slice(1)) && !classHasMember(receiverType.slice(1), memberKey(access.name) ?? '');
+    const className = receiverType.startsWith('*') ? receiverType.slice(1).replace(/\[.*\]$/, '') : '';
+    const member = memberKey(access.name) ?? '';
+    if (!className || !classNames.has(className))
+        return false;
+    if (!classHasMember(className, member))
+        return true;
+    // (set-only: a read is undefined, and the Go struct has only Set_x)
+    return !isCallee(access) && !!classMember(className, 'set', member) && !classMember(className, 'get', member) && !classHasDataField(className, member);
+}
+// Whether a class declares a data field (or parameter property) of the name
+function classHasDataField(className, member) {
+    for (let name = className, depth = 0; name && depth < 20; name = classParentNames.get(name), depth++) {
+        const declaration = declaredClasses.get(name);
+        if (!declaration)
+            return false;
+        if ((declaration.members ?? []).some((m) => isPropertyDeclaration(m) && !hasModifier(m, 'StaticKeyword') && memberKey(m.name) === member))
+            return true;
+        if (getParameterProperties(declaration).some((p) => p.name?.text === member))
+            return true;
+    }
+    return false;
 }
 // x.f on an object type (an interface's struct) that has no f — Babel's
 // generator reads node.handlers under @ts-expect-error —: read by name
@@ -29177,6 +29301,33 @@ func tnCallCollection(obj interface{}, isSet bool, name string, args []interface
 	return nil, false
 }
 
+// A dynamic call's argument as a parameter's Go type (undefined / null is the
+// zero value, a value of another type is converted as tnConvertTo does)
+func tnCoerceArg[T any](v interface{}) T {
+	if x, ok := v.(T); ok {
+		return x
+	}
+	var zero T
+	if v == nil {
+		return zero
+	}
+	if rv, ok := TnConvertDynamic(v, reflect.TypeFor[T]()); ok && rv.IsValid() {
+		if x, ok := rv.Interface().(T); ok {
+			return x
+		}
+	}
+	return zero
+}
+
+// A variadic parameter's values from a dynamic call's arguments
+func tnCoerceArgs[T any](args []interface{}, from int) []T {
+	var out []T
+	for ; from < len(args); from++ {
+		out = append(out, tnCoerceArg[T](args[from]))
+	}
+	return out
+}
+
 // Calls a function value held as any, converting the arguments to its
 // parameter types; its result (or nil)
 func TnCallValue(fn interface{}, args ...interface{}) interface{} {
@@ -29216,6 +29367,10 @@ func TnCallValue(fn interface{}, args ...interface{}) interface{} {
 		return nil
 	case func(interface{}, interface{}) bool:
 		return f(TnArg(args, 0), TnArg(args, 1))
+	}
+	// (the program's own function types: called without reflect)
+	if v, ok := tnCallValueTyped(fn, args); ok {
+		return v
 	}
 	fv := reflect.ValueOf(fn)
 	if fv.Kind() != reflect.Func {
@@ -38190,6 +38345,48 @@ func TnStrAppend(s, part string) string {
 	return unsafe.String(&buf[0], n)
 }`,
 };
+// tnCallValueTyped: a case per Go func type this program builds, converting
+// the dynamic call's arguments and calling it — the same work TnCallValue's
+// reflective path does, without reflect.Value.Call (which is most of a
+// dynamic call's cost). Shapes TnCallValue's own switch covers stay there.
+function emitTypedDynamicCalls() {
+    const cases = [];
+    // (aliases of a primitive are the primitive's type: one case for both)
+    const types = new Set();
+    for (const raw of dynamicFuncTypes) {
+        let t = raw;
+        for (const [name, base] of primitiveEnumGoTypes) {
+            t = t.replace(new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), base);
+        }
+        types.add(t);
+    }
+    for (const fnType of [...types].sort()) {
+        if (!fnType.startsWith('func('))
+            continue;
+        const result = goFuncReturnType(fnType);
+        const params = goFuncParamTypes(fnType);
+        const variadic = params.length > 0 && params[params.length - 1].startsWith('...');
+        const fixed = variadic ? params.length - 1 : params.length;
+        const argExprs = params.slice(0, fixed).map((p, i) => `tnCoerceArg[${p}](TnArg(args, ${i}))`);
+        if (variadic) {
+            const elem = params[params.length - 1].slice(3);
+            argExprs.push(`tnCoerceArgs[${elem}](args, ${fixed})...`);
+        }
+        const call = `f(${argExprs.join(', ')})`;
+        const results = result ? splitGoParameters(result) : [];
+        let body;
+        if (results.length === 0)
+            body = `${call}; return nil, true`;
+        else if (results.length === 1)
+            body = `return ${call}, true`;
+        else
+            body = `${results.map((_, i) => (i === 0 ? '__r0' : '_')).join(', ')} := ${call}; return __r0, true`;
+        cases.push(`\tcase ${fnType}:\n\t\t${body}`);
+    }
+    if (cases.length === 0)
+        return 'func tnCallValueTyped(fn interface{}, args []interface{}) (interface{}, bool) {\n\treturn nil, false\n}';
+    return `// Dynamic calls of the program's own function types, without reflection\nfunc tnCallValueTyped(fn interface{}, args []interface{}) (interface{}, bool) {\n\tswitch f := fn.(type) {\n${cases.join('\n')}\n\t}\n\treturn nil, false\n}`;
+}
 // Returns the Go source for all helpers used in this transpilation, or '' if none.
 // Emitted only into the main output file: every generated file shares `package main`,
 // so helpers are visible across files and must not be duplicated.
@@ -38198,6 +38395,8 @@ function emitGoHelpers() {
         .sort()
         .map((id) => goHelpers[id] ?? nodeRegistry.goHelpers[id])
         .filter(Boolean);
+    if (usedHelpers.has('dynamic'))
+        sources.push(emitTypedDynamicCalls());
     if (usedHelpers.has('nodeUtil')) {
         const names = [...classNames].sort().map((name) => `${toGoStringLiteral(getSafeName(name))}: true`);
         sources.push(`// Classes util.inspect prints as \`Name { … }\`\nvar tnInspectClassNames = map[string]bool{${names.join(', ')}}`);

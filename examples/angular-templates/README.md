@@ -94,7 +94,7 @@ and checks that the two outputs are identical:
   are.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.6.0 (unreleased changes), default
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.1, default
 (non-`--release`) build. The binary is 16.1 MB. Node runs the compiler as
 precompiled JavaScript (see [Run it](#run-it)); that build is done once,
 before timing.

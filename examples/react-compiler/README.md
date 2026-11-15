@@ -112,7 +112,8 @@ node parity.mjs
 Reproduce with `node bench.mjs [runs=30] [sizeRuns=5] [kilobytes=8,16,32,64]`.
 The script compiles `main.ts`, then times **complete process runs** (spawn to
 exit) of `react-compile` under both runtimes, alternating Node and native runs,
-and stops if the two outputs ever differ:
+and stops if the two outputs ever differ. `TN_PARALLEL=0` forces the
+single-process path for both runtimes:
 
 - **(a) per-call latency:** the built-in demo (a `TodoList` component and a
   `useTotal` hook), the size of a file a build compiles once per process.
@@ -121,56 +122,64 @@ and stops if the two outputs ever differ:
   fixed-seed generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.6.0, default (non-`--release`) build.
-The binary is 28.1 MB.
+Node v26.13.0, Go 1.27.4, TypeNative 0.6.1, default (non-`--release`) build.
+The binary is 29.9 MB.
 
-(a) `react-compile` (built-in demo), 30 runs each:
+(a) `react-compile` (built-in demo), 5 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 367.37 ms | 379.79 ms | 385.00 ms | 455.83 ms |
-| TypeNative | 127.72 ms | 131.44 ms | 136.20 ms | 181.73 ms |
+| Node.js    | 347.32 ms | 348.88 ms | 349.49 ms | 353.65 ms |
+| TypeNative |  97.67 ms |  99.61 ms | 107.70 ms | 142.96 ms |
 
 (b) `react-compile generated-screen.jsx`, 5 runs per size (medians):
 
-| Source            | Node.js   | TypeNative  | TypeNative vs Node |
-| ----------------- | --------- | ----------- | ------------------ |
-| 9 KB, 238 lines   | 522.52 ms | 530.65 ms   | even               |
-| 17 KB, 460 lines  | 599.45 ms | 884.03 ms   | 1.5x slower        |
-| 32 KB, 892 lines  | 748.17 ms | 1,681.87 ms | 2.2x slower        |
-| 64 KB, 1774 lines | 937.80 ms | 3,291.51 ms | 3.5x slower        |
+| Source            | Node.js    | TypeNative | TypeNative vs Node |
+| ----------------- | ---------- | ---------- | ------------------ |
+| 9 KB, 238 lines   |  704.90 ms |  275.08 ms | 2.6x faster        |
+| 17 KB, 460 lines  |  761.71 ms |  332.94 ms | 2.3x faster        |
+| 32 KB, 892 lines  |  874.53 ms |  418.38 ms | 2.1x faster        |
+| 64 KB, 1774 lines | 1,030.31 ms|  615.05 ms | 1.7x faster        |
 
-**Per call, TypeNative is 2.9x faster** (131 ms vs 380 ms, median). Node
+**Per call, TypeNative is 3.5x faster** (100 ms vs 349 ms, median). Node
 spends most of a short run loading and compiling the ~470 vendored modules;
 the native binary starts with them compiled in.
 
-**On larger inputs TypeNative is slower, and the gap grows with size:** the
-two break even at about 9 KB of source, and most component files are smaller.
-Past that, Node compiles each further KB in about 7.5 ms once V8 has warmed
-up, the native build in about 50 ms. The compiler's passes run through
-TypeNative's dynamic paths (any-typed property reads, prototype-method
-dispatch, reflection-based struct conversions) on every node of every pass,
-where V8's inline caches make the same operations nearly free.
+**TypeNative is now faster on large inputs too.** Most of the gap was the
+compiler's passes running through TypeNative's dynamic paths (any-typed
+property reads, prototype-method dispatch, reflection-based struct
+conversions) on every node of every pass, where V8's inline caches make the
+same operations nearly free. Two rounds of profiling narrowed it:
 
-The native build was about 100 ms per KB before two profiling passes (6.6 s
-at 64 KB, then 3.9 s, now 3.3 s), which made those paths cheaper without
-changing what they do:
+- The plain functions Babel assigns to `NodePath.prototype` (`visit`,
+  `setScope`, `setContext`, …) declare `this: NodePath`; that now types
+  `__this` as `*NodePath_Final`, so `this.opts`, `this.parentPath` and the
+  rest are direct field reads and writes instead of plan lookups on every
+  AST node.
+- Dynamic calls of the program's own function types (the visitor callbacks,
+  prototype methods and Babel's `call`/`apply` shapes) go through a generated
+  `tnCallValueTyped` case per Go func type, converting arguments directly
+  instead of `reflect.Value.Call`.
+- Getters and setters of a class are recognized while a module is emitting
+  even before its class is visited (`classMember`), and optional calls to
+  members a class adds to its prototype at run time go through the guarded
+  dynamic call.
+- Earlier work still applies: in-place `s += part` on Babel's output buffer
+  (printing was quadratic in the output size), the accessor / view-copy /
+  added-property registries skipped for types that never had an entry,
+  prototype methods called directly, generators as Go range functions, typed
+  dispatchers for shared method signatures, and Go integer loop counters.
 
-- `s += part` on a string field (Babel's output buffer appends thousands of
-  times between flushes) appends in place instead of copying the whole
-  string each time, which made printing quadratic in the output size; it was
-  more than half of all allocation.
-- Accessor, view-copy and added-property registries are skipped for object
-  types that never had an entry, so ordinary property reads stay on the
-  reflection-free fast path.
-- Prototype methods (Babel's `NodePath` methods) are called directly, and the
-  common callback shapes are called and adapted without `reflect`.
-- Generators no longer run as goroutines with a thread wakeup per step (about
-  a tenth of the run before): a generator iterated by `for…of`, `yield*`,
-  spread or `Array.from` runs as a Go range function, through dynamic
-  dispatch too.
-- A method that every class of a hierarchy declares with the same signature
-  is called through a typed dispatcher, and `for` loop counters are Go
-  integers.
-
-What remains is spread thinly over the dynamic paths.
+**Large files compile their independent top-level functions in parallel.**
+`main.ts` splits the input at top-level function boundaries when the file has
+enough of them for at least two workers and nothing but imports/comments
+before the first (and only blanks/comments between); each contiguous run is
+padded to keep the
+original line numbers, compiled by a worker process, and the parent joins the
+per-function output. Compiler-generated `_temp` functions are suffixed per
+chunk so the merged program has no name collisions. Under Node the same code
+spawns Node workers, which must re-import the compiler per worker; a
+TypeNative worker starts from the compiled binary, which is why the native
+build now wins on the large sizes instead of only on startup. The merged
+output is byte-identical between the two runtimes (and the small fixtures,
+below eight functions, take the single-process path).

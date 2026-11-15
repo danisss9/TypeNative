@@ -83,6 +83,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   buildNode();
   if (process.argv[2] !== '--build') {
     process.argv = [process.argv[0], nodeMain, ...process.argv.slice(2)];
+    // (a worker process the compiler spawns runs this same module)
+    process.env.TN_NODE_MAIN = nodeMain;
     await import(pathToFileURL(nodeMain).href);
   }
 }

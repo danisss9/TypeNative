@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-15
+
 ### Changed
 
+- **examples/react-compiler: faster than Node at 64 KB.** The React Compiler
+  now runs a 64 KB component file in 615 ms vs Node's 1,030 ms (1.7x faster;
+  it was 3.5x slower), and per call is 3.5x faster (100 vs 349 ms). Plain
+  functions assigned to `NodePath.prototype` declare `this: NodePath`; that
+  now types `__this` as the class, so Babel's per-node path maintenance
+  (`visit`, `setScope`, `setContext`, `parentPath` walks) is direct field
+  access instead of dynamic plan lookups. Dynamic calls of the program's own
+  function types go through a generated `tnCallValueTyped` case per Go func
+  type (no `reflect.Value.Call`), and optional calls to prototype methods
+  added at run time are guarded dynamic calls. For large files the example
+  compiles independent top-level functions in parallel worker processes and
+  joins their output; under Node each worker re-imports the compiler, while a
+  TypeNative worker starts from the compiled binary.
 - **Iterating class iterators through dynamic values:** `TnToArray` (used by
   spread, `Array.from`, destructuring and `for…of` on a dynamically typed
   value) recognizes a class's generator push form directly
