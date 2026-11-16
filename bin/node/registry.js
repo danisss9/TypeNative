@@ -27,6 +27,7 @@ export function createNodeRegistry() {
         namespaces: {},
         objects: {},
         iterators: {},
+        records: {},
         optionTypers: {},
         hookPrefixes: {},
         hookParams: {},

@@ -3,7 +3,8 @@
 // Today that is node:sqlite's driver, github.com/ncruces/go-sqlite3 (SQLite
 // compiled to Wasm and translated to Go: no cgo), zlib's Brotli codec
 // (github.com/andybalholm/brotli, pure Go), fs.watch's file-system
-// notifications (github.com/fsnotify/fsnotify), and their dependencies.
+// notifications (github.com/fsnotify/fsnotify), the WebAssembly runtime
+// (github.com/tetratelabs/wazero), and their dependencies.
 //
 // Bump a version in MODULES, run `npm run vendor:go`, then `npm run conformance`.
 import { spawnSync } from 'node:child_process';
@@ -15,7 +16,15 @@ const MODULES = [
   ['github.com/ncruces/go-sqlite3', 'v0.35.6'],
   ['github.com/andybalholm/brotli', 'v1.2.6'],
   ['github.com/fsnotify/fsnotify', 'v1.10.1'],
-  ['github.com/jchv/go-webview2', 'v0.0.0-20260205173254-56598839c808']
+  ['github.com/jchv/go-webview2', 'v0.0.0-20260205173254-56598839c808'],
+  // the WebAssembly global and node:wasi's runtime (pure Go, no cgo); `go mod
+  // vendor` only copies imported packages, so the subpackages the helpers use
+  // are listed too
+  [
+    'github.com/tetratelabs/wazero',
+    'v1.12.0',
+    ['api', 'experimental', 'imports/wasi_snapshot_preview1', 'sys'].map((p) => `github.com/tetratelabs/wazero/${p}`)
+  ]
 ];
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -31,7 +40,7 @@ try {
   writeFileSync(path.join(work, 'go.mod'), 'module tnvendor\n\ngo 1.26.0\n');
   writeFileSync(
     path.join(work, 'main.go'),
-    `package main\n\nimport (\n${MODULES.map(([mod]) => `\t_ "${mod}"\n`).join('')})\n\nfunc main() {}\n`
+    `package main\n\nimport (\n${MODULES.flatMap(([mod, , extra]) => [mod, ...(extra ?? [])].map((p) => `\t_ "${p}"\n`)).join('')})\n\nfunc main() {}\n`
   );
   run(['get', ...MODULES.map(([mod, version]) => `${mod}@${version}`)]);
   run(['mod', 'tidy']);

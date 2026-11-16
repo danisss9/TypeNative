@@ -46,7 +46,13 @@ export const goPathAliases = {
     'html/template': 'htmltemplate',
     'golang.org/x/text/unicode/norm': 'tnnorm',
     // node:sqlite's driver: the package name differs from the last path element
-    'github.com/ncruces/go-sqlite3': 'sqlite3'
+    'github.com/ncruces/go-sqlite3': 'sqlite3',
+    // the WebAssembly global / node:wasi's runtime: short package names that
+    // would collide with user identifiers (api, sys, experimental)
+    'github.com/tetratelabs/wazero/api': 'wazeroapi',
+    'github.com/tetratelabs/wazero/sys': 'wazerosys',
+    'github.com/tetratelabs/wazero/experimental': 'wazeroexp',
+    'github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1': 'wazerowasi'
 };
 export const goExcluded = {
     plugin: 'Loads plugins with `dlopen`: needs cgo and `-buildmode=plugin` (no Windows support)',

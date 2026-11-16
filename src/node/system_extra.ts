@@ -7,7 +7,28 @@
 import { NodeRegistry, NodeCall, defineClass, defineHelper, setResults } from './registry.js';
 
 const uncaughtHelper = `// process.on('uncaughtException') & co.
+// set/addUncaughtExceptionCaptureCallback: the set one takes every error; an
+// added one takes it when it returns true
+var tnCaptureCallback interface{}
+var tnCaptureCallbacks []interface{}
+
+func TnSetCaptureCallback(fn interface{}) {
+	if fn != nil && tnCaptureCallback != nil {
+		panic(TnNodeError("Error", "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET", "\`process.setupUncaughtExceptionCapture()\` was called while a capture callback was already active"))
+	}
+	tnCaptureCallback = fn
+}
+
 func tnHandleUncaught(err interface{}) bool {
+	if tnCaptureCallback != nil {
+		TnInvoke(tnCaptureCallback, err)
+		return true
+	}
+	for _, cb := range tnCaptureCallbacks {
+		if TnTruthy(TnInvoke(cb, err)) {
+			return true
+		}
+	}
 	if tnProcessEmitter.listenerCount("uncaughtExceptionMonitor") > 0 {
 		tnProcessEmitter.emit("uncaughtExceptionMonitor", err, "uncaughtException")
 	}
@@ -511,6 +532,122 @@ func (h *TnHistogram) Get_percentiles() *TnMap[float64, float64] {
 	return m
 }
 
+// Node 26 histogram statistics over the recorded values
+func (h *TnHistogram) countAt(v float64) float64 {
+	n := 0
+	for _, x := range h.values {
+		if x == v {
+			n++
+		}
+	}
+	return float64(n)
+}
+
+// cdf(v): the share of values at or below v; ccdf(v): above it
+func (h *TnHistogram) cdf(v float64) float64 {
+	if len(h.values) == 0 {
+		return 0
+	}
+	n := 0
+	for _, x := range h.values {
+		if x <= v {
+			n++
+		}
+	}
+	return float64(n) / float64(len(h.values))
+}
+
+func (h *TnHistogram) ccdf(v float64) float64 {
+	if len(h.values) == 0 {
+		return 0
+	}
+	return 1 - h.cdf(v)
+}
+
+// The population's central moments m2, m3, m4
+func (h *TnHistogram) moments() (float64, float64, float64) {
+	n := float64(len(h.values))
+	if n == 0 {
+		return 0, 0, 0
+	}
+	mean := h.Get_mean()
+	var m2, m3, m4 float64
+	for _, x := range h.values {
+		d := x - mean
+		m2 += d * d
+		m3 += d * d * d
+		m4 += d * d * d * d
+	}
+	return m2 / n, m3 / n, m4 / n
+}
+
+func (h *TnHistogram) Get_skewness() float64 {
+	m2, m3, _ := h.moments()
+	if m2 == 0 {
+		return 0
+	}
+	return m3 / math.Pow(m2, 1.5)
+}
+
+// kurtosis: the excess kurtosis (a normal distribution's is 0)
+func (h *TnHistogram) Get_kurtosis() float64 {
+	m2, _, m4 := h.moments()
+	if m2 == 0 {
+		return 0
+	}
+	return m4/(m2*m2) - 3
+}
+
+// recordCorrected(value, expectedInterval): the samples a stalled recorder
+// missed are added too (value - interval, value - 2·interval, …)
+func (h *TnHistogram) recordCorrected(value interface{}, interval float64) {
+	h.record(value)
+	v, ok := value.(float64)
+	if !ok || interval <= 0 {
+		return
+	}
+	for missing := v - interval; missing >= interval; missing -= interval {
+		h.values = append(h.values, missing)
+	}
+}
+
+// add(other) / subtract(other): other's values merged in or taken out
+func (h *TnHistogram) add(other *TnHistogram) {
+	h.values = append(h.values, other.values...)
+	h.exceeds += other.exceeds
+}
+
+func (h *TnHistogram) subtract(other *TnHistogram) {
+	for _, v := range other.values {
+		for i, x := range h.values {
+			if x == v {
+				h.values = append(h.values[:i], h.values[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// snapshot(): the statistics as a plain object
+func (h *TnHistogram) snapshot() *TnMap[string, interface{}] {
+	m := TnNewMap[string, interface{}]()
+	m.Set("count", h.Get_count())
+	m.Set("min", h.Get_min())
+	m.Set("max", h.Get_max())
+	m.Set("mean", h.Get_mean())
+	m.Set("exceeds", h.Get_exceeds())
+	m.Set("stddev", h.Get_stddev())
+	m.Set("skewness", h.Get_skewness())
+	m.Set("kurtosis", h.Get_kurtosis())
+	percentiles := TnNewMap[string, interface{}]()
+	pm := h.Get_percentiles()
+	for _, k := range pm.Keys() {
+		percentiles.Set(TnNumStr(k), pm.Get(k))
+	}
+	m.Set("percentiles", percentiles)
+	return m
+}
+
 func (h *TnHistogram) reset() {
 	h.values = nil
 	h.exceeds = 0
@@ -637,6 +774,23 @@ export function registerSystemExtra(r: NodeRegistry): void {
   defineHelper(r, 'nodeSystem', ['math', 'os', 'os/exec', 'runtime', 'runtime/metrics', 'strconv', 'strings', 'time'], ['nodeSystemOS@os'], systemHelper);
   defineHelper(r, 'nodePerfExtra', ['math', 'math/big', 'reflect', 'sort', 'time'], ['nodePerf', 'nodeSystem', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap'], perfExtraHelper);
 
+  // uncaught exception capture callbacks
+  r.functions['process.setUncaughtExceptionCaptureCallback'] = (c: NodeCall) => {
+    r.helper('nodeUncaught');
+    return `TnSetCaptureCallback(${c.args[0] ?? 'nil'})`;
+  };
+  r.results['process.setUncaughtExceptionCaptureCallback'] = '';
+  r.functions['process.addUncaughtExceptionCaptureCallback'] = (c: NodeCall) => {
+    r.helper('nodeUncaught');
+    return `func() { tnCaptureCallbacks = append(tnCaptureCallbacks, ${c.args[0]}) }()`;
+  };
+  r.results['process.addUncaughtExceptionCaptureCallback'] = '';
+  r.functions['process.hasUncaughtExceptionCaptureCallback'] = (_c: NodeCall) => {
+    r.helper('nodeUncaught');
+    return 'tnCaptureCallback != nil';
+  };
+  r.results['process.hasUncaughtExceptionCaptureCallback'] = 'bool';
+
   // process events handled by the loop
   for (const name of ['process.on', 'process.once', 'process.addListener']) {
     const base = r.functions[name];
@@ -722,9 +876,9 @@ export function registerSystemExtra(r: NodeRegistry): void {
     'perf_hooks.Histogram',
     '*TnHistogram',
     'class',
-    'record=; recordDelta=; percentile=float64; reset=; enable=bool; disable=bool',
+    'record=; recordDelta=; recordCorrected=; percentile=float64; reset=; enable=bool; disable=bool; countAt=float64; cdf=float64; ccdf=float64; add=; subtract=; snapshot=*TnMap[string, interface{}]',
     '',
-    'count=float64; min=float64; max=float64; mean=float64; stddev=float64; exceeds=float64; percentiles=*TnMap[float64, float64]',
+    'count=float64; min=float64; max=float64; mean=float64; stddev=float64; exceeds=float64; percentiles=*TnMap[float64, float64]; skewness=float64; kurtosis=float64',
     ''
   );
   for (const name of ['RecordableHistogram', 'IntervalHistogram']) r.classes[`perf_hooks.${name}`] = r.classes['perf_hooks.Histogram'];

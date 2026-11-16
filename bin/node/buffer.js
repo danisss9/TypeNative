@@ -400,6 +400,289 @@ func TnBufferSwap(b []byte, size int) []byte {
 	return b
 }
 
+// buf.indexOf(value, byteOffset, end, encoding): the first match within [byteOffset, end)
+func TnBufferIndexOfRange(b []byte, value interface{}, offset float64, end float64, enc string) float64 {
+	start, stop := tnBufferBounds(len(b), offset, end)
+	if stop < start {
+		return -1
+	}
+	i := bytes.Index(b[start:stop], tnBufferBytes(value, enc))
+	if i < 0 {
+		return -1
+	}
+	return float64(start + i)
+}
+
+// buf.lastIndexOf(value, byteOffset, encoding): the last match starting at or before byteOffset
+func TnBufferLastIndexOfAt(b []byte, value interface{}, offset float64, enc string) float64 {
+	needle := tnBufferBytes(value, enc)
+	from := len(b) - len(needle)
+	if !math.IsNaN(offset) {
+		o := int(math.Trunc(offset))
+		if offset < 0 {
+			o = len(b) + o
+		}
+		if o < from {
+			from = o
+		}
+	}
+	for i := from; i >= 0; i-- {
+		if bytes.Equal(b[i:i+len(needle)], needle) {
+			return float64(i)
+		}
+	}
+	return -1
+}
+
+// buffer.isLatin1(string): every code point is at most U+00FF
+func TnIsLatin1(s string) bool {
+	for _, r := range s {
+		if r > 0xff {
+			return false
+		}
+	}
+	return true
+}
+
+// Buffer.stringLength(bytes, encoding): the UTF-16 length of the decoded string
+func TnBufferStringLength(b []byte, enc string) float64 {
+	n := 0
+	for _, r := range TnBufferToString(b, enc) {
+		n++
+		if r > 0xffff {
+			n++
+		}
+	}
+	return float64(n)
+}
+
+// ES2026 Uint8Array base64 / hex (strict: a SyntaxError on bad input)
+type TnReadWritten struct {
+	read    float64
+	written float64
+}
+
+func tnBase64Options(options interface{}) (bool, string, bool) {
+	url, last, omitPadding := false, "loose", false
+	if options != nil {
+		if a, ok := TnGetValue(options, "alphabet").(string); ok {
+			if a == "base64url" {
+				url = true
+			} else if a != "base64" {
+				panic(TnNodeError("TypeError", "", "expected alphabet to be either \\"base64\\" or \\"base64url\\""))
+			}
+		}
+		if l, ok := TnGetValue(options, "lastChunkHandling").(string); ok {
+			if l != "loose" && l != "strict" && l != "stop-before-partial" {
+				panic(TnNodeError("TypeError", "", "expected lastChunkHandling to be either \\"loose\\", \\"strict\\", or \\"stop-before-partial\\""))
+			}
+			last = l
+		}
+		omitPadding = TnTruthy(TnGetValue(options, "omitPadding"))
+	}
+	return url, last, omitPadding
+}
+
+// u8.toBase64({ alphabet, omitPadding })
+func TnUint8ToBase64(b []byte, options interface{}) string {
+	url, _, omit := tnBase64Options(options)
+	enc := base64.StdEncoding
+	if url {
+		enc = base64.URLEncoding
+	}
+	if omit {
+		enc = enc.WithPadding(base64.NoPadding)
+	}
+	return enc.EncodeToString(b)
+}
+
+func tnBase64Digit(c byte, url bool) int {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return int(c - 'A')
+	case c >= 'a' && c <= 'z':
+		return int(c-'a') + 26
+	case c >= '0' && c <= '9':
+		return int(c-'0') + 52
+	case (c == '+' && !url) || (c == '-' && url):
+		return 62
+	case (c == '/' && !url) || (c == '_' && url):
+		return 63
+	}
+	return -1
+}
+
+func tnBase64Space(c byte) bool {
+	return c == ' ' || c == '\\t' || c == '\\n' || c == '\\f' || c == '\\r'
+}
+
+// The proposal's FromBase64: the bytes decoded (at most maxLength), the
+// characters read, and an error message ("" for none)
+func tnFromBase64(s string, url bool, last string, maxLength int) ([]byte, int, string) {
+	out := []byte{}
+	read := 0
+	if maxLength == 0 {
+		return out, 0, ""
+	}
+	chunk := make([]int, 0, 4)
+	decode := func(strict bool) string {
+		n := len(chunk)
+		for len(chunk) < 4 {
+			chunk = append(chunk, 0)
+		}
+		v := chunk[0]<<18 | chunk[1]<<12 | chunk[2]<<6 | chunk[3]
+		bs := []byte{byte(v >> 16), byte(v >> 8), byte(v)}
+		if n == 2 {
+			if strict && bs[1] != 0 {
+				return "Invalid base64: extra bits"
+			}
+			out = append(out, bs[0])
+		} else if n == 3 {
+			if strict && bs[2] != 0 {
+				return "Invalid base64: extra bits"
+			}
+			out = append(out, bs[0], bs[1])
+		} else {
+			out = append(out, bs...)
+		}
+		chunk = chunk[:0]
+		return ""
+	}
+	i := 0
+	for {
+		for i < len(s) && tnBase64Space(s[i]) {
+			i++
+		}
+		if i == len(s) {
+			if len(chunk) > 0 {
+				if last == "stop-before-partial" {
+					return out, read, ""
+				}
+				if last == "strict" || len(chunk) == 1 {
+					return out, read, "Invalid base64: incomplete chunk"
+				}
+				decode(false)
+			}
+			return out, len(s), ""
+		}
+		c := s[i]
+		i++
+		if c == '=' {
+			if len(chunk) < 2 {
+				return out, read, "Invalid base64: unexpected padding"
+			}
+			for i < len(s) && tnBase64Space(s[i]) {
+				i++
+			}
+			if len(chunk) == 2 {
+				if i == len(s) {
+					if last == "stop-before-partial" {
+						return out, read, ""
+					}
+					return out, read, "Invalid base64: incomplete padding"
+				}
+				if s[i] == '=' {
+					i++
+					for i < len(s) && tnBase64Space(s[i]) {
+						i++
+					}
+				}
+			}
+			if i < len(s) {
+				return out, read, "Invalid base64: data after padding"
+			}
+			if msg := decode(last == "strict"); msg != "" {
+				return out, read, msg
+			}
+			return out, len(s), ""
+		}
+		d := tnBase64Digit(c, url)
+		if d < 0 {
+			return out, read, "Invalid base64 character"
+		}
+		remaining := maxLength - len(out)
+		if (remaining == 1 && len(chunk) == 2) || (remaining == 2 && len(chunk) == 3) {
+			return out, read, ""
+		}
+		chunk = append(chunk, d)
+		if len(chunk) == 4 {
+			decode(false)
+			read = i
+			if len(out) >= maxLength {
+				return out, read, ""
+			}
+		}
+	}
+}
+
+// Uint8Array.fromBase64(s, { alphabet, lastChunkHandling })
+func TnUint8FromBase64(s string, options interface{}) []byte {
+	url, last, _ := tnBase64Options(options)
+	out, _, msg := tnFromBase64(s, url, last, math.MaxInt)
+	if msg != "" {
+		panic(TnNodeError("SyntaxError", "", msg))
+	}
+	return out
+}
+
+// u8.setFromBase64(s, options): decoded into u8; { read, written }
+func TnUint8SetFromBase64(dst []byte, s string, options interface{}) *TnReadWritten {
+	url, last, _ := tnBase64Options(options)
+	out, read, msg := tnFromBase64(s, url, last, len(dst))
+	copy(dst, out)
+	if msg != "" {
+		panic(TnNodeError("SyntaxError", "", msg))
+	}
+	return &TnReadWritten{read: float64(read), written: float64(len(out))}
+}
+
+func tnFromHex(s string, maxLength int) ([]byte, int, string) {
+	if len(s)%2 != 0 {
+		return []byte{}, 0, "Invalid hex: odd length"
+	}
+	out := []byte{}
+	read := 0
+	for read < len(s) && len(out) < maxLength {
+		b, err := hex.DecodeString(s[read : read+2])
+		if err != nil {
+			return out, read, "Invalid hex character"
+		}
+		out = append(out, b[0])
+		read += 2
+	}
+	return out, read, ""
+}
+
+// Uint8Array.fromHex(s)
+func TnUint8FromHex(s string) []byte {
+	out, _, msg := tnFromHex(s, math.MaxInt)
+	if msg != "" {
+		panic(TnNodeError("SyntaxError", "", msg))
+	}
+	return out
+}
+
+// u8.setFromHex(s): { read, written }
+func TnUint8SetFromHex(dst []byte, s string) *TnReadWritten {
+	out, read, msg := tnFromHex(s, len(dst))
+	copy(dst, out)
+	if msg != "" {
+		panic(TnNodeError("SyntaxError", "", msg))
+	}
+	return &TnReadWritten{read: float64(read), written: float64(len(out))}
+}
+
+// arrayBuffer.transfer(newLength): a copy (resized, zero-filled)
+func TnArrayBufferTransfer(b []byte, length ...float64) []byte {
+	n := len(b)
+	if len(length) > 0 && !math.IsNaN(length[0]) {
+		n = int(length[0])
+	}
+	out := make([]byte, n)
+	copy(out, b)
+	return out
+}
+
 func TnIsAscii(b []byte) bool {
 	for _, c := range b {
 		if c > 127 {
@@ -636,6 +919,15 @@ export function registerBuffer(r) {
             return `float64(len(${call.args[0]}))`;
         return `float64(len(TnBufferFromString(${call.args[0]}, ${encArg(call, 1)})))`;
     };
+    // Buffer.stringLength(bytes, encoding): the length of the string they decode to
+    r.functions['buffer.Buffer.stringLength'] = (call) => {
+        use();
+        return `TnBufferStringLength(${call.args[0]}, ${encArg(call, 1)})`;
+    };
+    r.results['buffer.Buffer.stringLength'] = 'float64';
+    // Buffer.poolSize: 64 KiB (Node 26)
+    r.values['buffer.Buffer.poolSize'] = (_c) => 'float64(65536)';
+    r.valueTypes['buffer.Buffer.poolSize'] = 'float64';
     r.functions['buffer.Buffer.isBuffer'] = (call) => {
         use();
         return `TnIsBuffer(${call.args[0]})`;
@@ -656,6 +948,17 @@ export function registerBuffer(r) {
         return `TnBufferFromString(${call.args[0]}, "base64")`;
     };
     r.results['globals.Uint8Array.fromBase64'] = '[]byte';
+    // (with options: strict decoding, alphabet / lastChunkHandling)
+    r.functions['globals.Uint8Array.fromBase64'] = (call) => {
+        use();
+        return `TnUint8FromBase64(${call.args[0]}, ${call.args[1] ?? 'nil'})`;
+    };
+    r.functions['globals.Uint8Array.fromHex'] = (call) => {
+        use();
+        return `TnUint8FromHex(${call.args[0]})`;
+    };
+    r.results['globals.Uint8Array.fromHex'] = '[]byte';
+    defineClass(r, 'globals.Uint8ArrayReadWritten', '*TnReadWritten', 'class', '', 'read=float64; written=float64', '', '');
     r.functions['buffer.atob'] = (call) => {
         use();
         return `TnAtob(${call.args[0]})`;
@@ -676,6 +979,11 @@ export function registerBuffer(r) {
         r.pkg('unicode/utf8');
         return `utf8.Valid(${call.args[0]})`;
     };
+    r.functions['buffer.isLatin1'] = (call) => {
+        use();
+        return `TnIsLatin1(${call.args[0]})`;
+    };
+    r.results['buffer.isLatin1'] = 'bool';
     r.functions['buffer.isAscii'] = (call) => {
         use();
         return `TnIsAscii(${call.args[0]})`;
@@ -736,15 +1044,28 @@ export function registerBuffer(r) {
             r.results[`buffer.Buffer#${name}`] = result;
     };
     method('toString', 'string', (c) => `TnBufferToString(${c.recv}, ${encArg(c, 0)}${boundsArgs(c, 1)})`);
-    method('toBase64', 'string', (c) => `TnBufferToString(${c.recv}, "base64")`);
+    method('toBase64', 'string', (c) => (c.args.length > 0 ? `TnUint8ToBase64(${c.recv}, ${c.args[0]})` : `TnBufferToString(${c.recv}, "base64")`));
+    method('toHex', 'string', (c) => `TnBufferToString(${c.recv}, "hex")`);
+    method('setFromBase64', '*TnReadWritten', (c) => `TnUint8SetFromBase64(${c.recv}, ${c.args[0]}, ${c.args[1] ?? 'nil'})`);
+    method('setFromHex', '*TnReadWritten', (c) => `TnUint8SetFromHex(${c.recv}, ${c.args[0]})`);
     method('toJSON', '*TnMap[string, interface{}]', (c) => `TnBufferToJSON(${c.recv})`);
     method('equals', 'bool', (c) => `bytes.Equal(${c.recv}, ${c.args[0]})`);
     method('compare', 'float64', (c) => `float64(bytes.Compare(${c.recv}, ${c.args[0]}))`);
     method('subarray', '[]byte', (c) => `TnBufferSlice(${c.recv}${boundsArgs(c, 0)})`);
     method('slice', '[]byte', (c) => `TnBufferSlice(${c.recv}${boundsArgs(c, 0)})`);
-    method('indexOf', 'float64', (c) => `TnBufferIndexOf(${c.recv}, ${c.args[0]}, ${c.types[1] === 'float64' ? c.args[1] : '0'}, ${c.types[1] === 'string' ? c.args[1] : encArg(c, 2)})`);
-    method('lastIndexOf', 'float64', (c) => `TnBufferLastIndexOf(${c.recv}, ${c.args[0]}, ${encArg(c, 2)})`);
-    method('includes', 'bool', (c) => `(TnBufferIndexOf(${c.recv}, ${c.args[0]}, ${c.types[1] === 'float64' ? c.args[1] : '0'}, ${encArg(c, 2)}) >= 0)`);
+    // indexOf / includes (value, byteOffset?, end?, encoding?): an end bounds the search (Node 26)
+    const indexOf = (c) => {
+        if (c.types[1] === 'float64' && c.types[2] === 'float64') {
+            return `TnBufferIndexOfRange(${c.recv}, ${c.args[0]}, ${c.args[1]}, ${c.args[2]}, ${encArg(c, 3)})`;
+        }
+        return `TnBufferIndexOf(${c.recv}, ${c.args[0]}, ${c.types[1] === 'float64' ? c.args[1] : '0'}, ${c.types[1] === 'string' ? c.args[1] : encArg(c, 2)})`;
+    };
+    method('indexOf', 'float64', indexOf);
+    method('lastIndexOf', 'float64', (c) => {
+        r.pkg('math');
+        return `TnBufferLastIndexOfAt(${c.recv}, ${c.args[0]}, ${c.types[1] === 'float64' ? c.args[1] : 'math.NaN()'}, ${c.types[1] === 'string' ? c.args[1] : encArg(c, 2)})`;
+    });
+    method('includes', 'bool', (c) => `(${indexOf(c)} >= 0)`);
     method('fill', '[]byte', (c) => {
         const enc = c.types[1] === 'string' ? c.args[1] : '""';
         const bounds = c.types[1] === 'string' ? '' : boundsArgs(c, 1);

@@ -567,6 +567,12 @@ export function registerUtilExtra(r) {
     r.results['util.MIMEParams#entries'] = '[][]string';
     r.iterators['*TnMIMEParams'] = 'entries';
     r.classes['util.MIMEParams'].methods['entries'] = '[][]string';
+    // MIMEType.parse(s): null instead of throwing (Node 26)
+    r.functions['util.MIMEType.parse'] = (c) => {
+        r.helper('nodeUtilExtra');
+        return `func() (m *TnMIMEType) { defer func() { if recover() != nil { m = nil } }(); return TnNewMIMEType(${c.args[0]}) }()`;
+    };
+    r.results['util.MIMEType.parse'] = '*TnMIMEType';
     r.constructors['util.MIMEType'] = (c) => {
         use();
         return `TnNewMIMEType(${c.args[0]})`;

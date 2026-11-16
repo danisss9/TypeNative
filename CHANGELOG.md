@@ -7,7 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **WebAssembly and `node:wasi`:** the `WebAssembly` global (`validate`,
+  `compile`, `instantiate`, `Module`, `Instance`, `Memory`, `Global`, the
+  `Module` descriptors and `CompileError` / `LinkError` / `RuntimeError`) and
+  `node:wasi`'s `WASI` (preview1: args, env, preopens, stdio, `start` /
+  `initialize`). Both run on [wazero](https://github.com/tetratelabs/wazero),
+  a pure-Go runtime vendored in `govendor/`, so there is still no cgo and
+  cross-compiling still works. JS functions can be imports, and memories,
+  globals and functions can be shared between instances.
+- **Plain objects with Map-like keys:** an object's own function property
+  named like a Map method (`exports.add(…)`, `handlers.get(…)`) calls that
+  function, and a `Record`'s `.size` reads its `size` key (not an entry count).
+  `x instanceof ns.Class` works for Node classes reached through a namespace.
+- **ES2025 / ES2026 built-ins:** `Math.f16round`, `Array.fromAsync`,
+  `Iterator.concat`, `Map` / `WeakMap` `getOrInsert` /
+  `getOrInsertComputed`, `RegExp.escape` and the `d` flag (`hasIndices`,
+  `indices`), `Error.isError`, `DOMException` / `QuotaExceededError` (AbortSignal
+  reasons are DOMExceptions), `Reflect.construct`, `Float16Array`,
+  `BigInt64Array` / `BigUint64Array`, `DataView` `get` / `setFloat16`,
+  `ArrayBuffer` `transfer`, and `Uint8Array` `toHex` / `fromHex` /
+  `setFromBase64` / `setFromHex` with the base64 options (strict decoding).
+- **Well-known symbols on classes:** `async *[Symbol.asyncIterator]()` for
+  `for await`, `[Symbol.toPrimitive](hint)`, a `[Symbol.toStringTag]` getter,
+  a static `[Symbol.hasInstance]`, and `[util.inspect.custom]()`.
+- **Locale-aware strings:** `localeCompare` follows the root collation (base
+  letters, then accents, then case) with `sensitivity`, `numeric`,
+  `caseFirst` and `ignorePunctuation`; `Number#toLocaleString` formats in
+  en-US (decimal, percent, currency).
+- **Node 25 / 26 APIs:** `fs` `glob` / `globSync` / `fs/promises` `glob`,
+  `statfs`, `openAsBlob(Sync)`, the `readFile` `buffer` option and `signal`
+  on `stat`; `process.ref` / `unref`, `execve` and the uncaught exception
+  capture callbacks; `require()` of modules through `createRequire`,
+  `module.findPackageJSON` and Node 26's `builtinModules`; `v8` heap space
+  and code statistics; `util` `getCallSites`, `isPartialDeepStrictEqual`,
+  `markPromiseAsHandled`, `MIMEType.parse` and hex colours in `styleText`;
+  printf-style and function messages in `assert`, and
+  `assert.partialDeepStrictEqual`; legacy `url.parse` / `url.resolve`;
+  `crypto.randomUUIDv7` and `createMac` (HMAC, KMAC, AES-CMAC); histogram
+  statistics; symbol event names and `EventEmitterAsyncResource`; real
+  `executionAsyncId` / `triggerAsyncId` and `createHook` callbacks;
+  `Buffer.stringLength`, `buffer.isLatin1`, `blob.textStream()`, an `end` for
+  `buf.indexOf` / `includes` and `Buffer.poolSize`; `tty.ReadStream` /
+  `WriteStream`; `http` `writeInformation`, `req.signal`, header checks and
+  WebSocket masking; `node:test` `t.log`, `getTestContext`, tags and mock
+  call assertions; `node:sqlite` `Database` / `Statement` and statement
+  `close` / `stat` / `resetStats`.
+- **Web globals:** `navigator`, `CustomEvent`, `ErrorEvent`, `Storage`,
+  `sessionStorage` and a file-backed `localStorage` (`TN_LOCALSTORAGE_FILE`).
+- **WebSocket (client):** the WHATWG `WebSocket` global over `net` / `tls`
+  (RFC 6455), as Node's: the handshake, subprotocols and custom `headers`,
+  text and binary messages (`Blob`, or `ArrayBuffer` via `binaryType`),
+  `bufferedAmount`, pings answered with pongs, and the close handshake
+  (client- and server-initiated) with undici's constructor, `send` and `close`
+  errors; plus the `MessageEvent` / `CloseEvent` globals.
+- **`URLPattern`** (global and `node:url`): string / init inputs, base URLs,
+  named groups, wildcards, custom regexps, `ignoreCase`, and the component
+  `groups` of `exec`.
+- **`util.debounce` / `util.throttle`:** callable functions with `cancel` /
+  `flush` / `ref` / `unref` (and `hasImmediateCapacity` on a throttle), over
+  the event loop's timers.
+- **ZIP archives:** `ZipEntry`, `ZipBuffer`, `ZipFile`, `createZipArchive(Sync)`,
+  `zipFiles` and `get` / `setMaxZipContentSize`, over Go's `archive/zip`
+  (streaming entries and `contentIterator` are not included).
+
 ### Changed
+
+- `process.version` reports Node 26 (`v26.0.0`).
+- Removed, as in Node 25: `fs.F_OK` / `R_OK` / `W_OK` / `X_OK` (use
+  `fs.constants`) and the `recursive` option of `rmdir`.
+- `assert.strictEqual` follows a custom message with the comparison, as
+  Node 26 does.
+- `concat` on an `any` value spreads a typed array argument instead of
+  nesting it.
 
 - **`Record<string, any>` views of `any` objects:** taking the view no longer
   lists, sorts and scans the object's keys each time. They are listed the
@@ -23,6 +96,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when it grows. `arr-push-index` goes from 105 ms back to 49.2 ms (it was
   56 ms before the regression). The new probe `arr-push-local` measures
   pushes into short local and field arrays.
+
+### Fixed
+
+- **`??` on an array reference no longer turns null into an empty array:** a
+  `RegExp.exec` miss or a `T[] | null` result used to be boxed as `&slice`,
+  a non-nil `*[]T`, so `a ?? b` picked the null value. Boxing an array value
+  into an array-reference slot now goes through `TnSlicePtr`, which keeps a
+  nil slice nil (`lib-nullish-array-ref.ts`). This also lets the
+  self-hosted compiler keep its concise `exec(...) ?? exec(...)` in
+  `pushStatement`, and the bootstrap fixpoint still holds.
+- **A push on an array a container returns reaches the container:**
+  `m.get(k)!.push(x)`, `m.getOrInsert(k, v).push(x)` and
+  `m.getOrInsertComputed(k, fn).push(x)` now append through the stored
+  reference instead of a local copy (`semantics-container-array-push.ts`).
+  Local aliases of Map / Record elements and array fields share the
+  reference too, and an `any[]` passed to a function is shared with the
+  callee (`semantics-any-array-param.ts`). The same lowering covers a
+  generic helper returning `V` bound to an array and an Array subclass's
+  `push` (through its `TnItems()` reference), which also unbreaks the
+  react-compiler example build.
+- **Optional access on a missed match:** `re.exec(s)?.[i]` is `undefined`
+  when there is no match (the Go value is a nil `[]string`), not `''`, so a
+  following `??` applies. It is also typed as nullable, so a variable holds
+  the boxed value (`lib-nullish-array-ref.ts`).
 
 ## [0.6.2] - 2026-11-15
 

@@ -2,7 +2,7 @@
 // rules, ported), isDeepStrictEqual, types.*, deprecate, styleText,
 // stripVTControlCharacters. console.log formats non-string arguments with it.
 
-import { NodeRegistry, NodeCall, defineHelper, defineModule, setResults } from './registry.js';
+import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
 
 const utilHelper = `// node:util — inspect / format over TypeNative values (Node's layout rules)
 type tnInspector struct {
@@ -173,6 +173,18 @@ func tnFunctionName(rv reflect.Value) string {
 }
 
 func (ins *tnInspector) format(v interface{}, depth int) string {
+	// (a class's [util.inspect.custom]: its result, inspected unless a string)
+	if c, ok := v.(interface {
+		TnInspectCustom(float64, interface{}) interface{}
+	}); ok && v != nil {
+		r := c.TnInspectCustom(float64(2-depth), nil)
+		if s, isString := r.(string); isString {
+			return s
+		}
+		if r != v {
+			return ins.format(r, depth)
+		}
+	}
 	switch x := v.(type) {
 	case nil:
 		return "undefined"
@@ -880,6 +892,125 @@ func TnUtilFormat(args ...interface{}) string {
 }
 
 // isDeepStrictEqual / assert.deepStrictEqual (strict) and deepEqual (loose)
+// util.isPartialDeepStrictEqual / assert.partialDeepStrictEqual: expected's
+// properties (recursively) are actual's; an expected array is a subsequence
+// of the actual one, a Set / Map's entries a subset
+func TnPartialDeepEqual(actual interface{}, expected interface{}) bool {
+	return tnPartialDeepEqual(reflect.ValueOf(actual), reflect.ValueOf(expected), 0)
+}
+
+func tnPartialDeepEqual(a reflect.Value, b reflect.Value, level int) bool {
+	a, b = tnDeref(a), tnDeref(b)
+	if tnIsNilValue(a) || tnIsNilValue(b) {
+		return tnIsNilValue(a) && tnIsNilValue(b)
+	}
+	if level > 100 {
+		return true
+	}
+	if a.Kind() == reflect.Slice && b.Kind() == reflect.Slice && a.Type() != reflect.TypeOf([]byte(nil)) {
+		j := 0
+		for i := 0; i < b.Len(); i++ {
+			found := false
+			for ; j < a.Len(); j++ {
+				if tnPartialDeepEqual(a.Index(j), b.Index(i), level+1) {
+					found = true
+					j++
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	if tnInspectSetLike(a) && tnInspectSetLike(b) {
+		ae, _ := tnEntriesOf(a)
+		be, _ := tnEntriesOf(b)
+		for _, x := range be {
+			found := false
+			for _, y := range ae {
+				if tnDeepEqual(reflect.ValueOf(y[0]), reflect.ValueOf(x[0]), true, level+1) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	if af, _, aok := tnObjectFields(a); aok {
+		if bf, _, bok := tnObjectFields(b); bok {
+			for _, x := range bf {
+				found := false
+				for _, y := range af {
+					if y.name == x.name {
+						if !tnPartialDeepEqual(reflect.ValueOf(y.value), reflect.ValueOf(x.value), level+1) {
+							return false
+						}
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return tnDeepEqual(a, b, true, level)
+}
+
+// util.getCallSites(frames, options): the TS frames of the current stack
+type TnCallSite struct {
+	functionName string
+	scriptName   string
+	scriptId     string
+	lineNumber   float64
+	columnNumber float64
+	column       float64
+}
+
+func TnGetCallSites(frames ...interface{}) []*TnCallSite {
+	limit := 10
+	if len(frames) > 0 {
+		if n, ok := frames[0].(float64); ok {
+			limit = int(n)
+		}
+	}
+	pcs := make([]uintptr, 64)
+	n := runtime.Callers(2, pcs)
+	iter := runtime.CallersFrames(pcs[:n])
+	out := []*TnCallSite{}
+	for len(out) < limit {
+		frame, more := iter.Next()
+		if strings.HasSuffix(frame.File, ".ts") || strings.HasSuffix(frame.File, ".tsx") {
+			name := frame.Function
+			if i := strings.LastIndex(name, "."); i >= 0 {
+				name = name[i+1:]
+			}
+			if name == "main" || strings.HasPrefix(name, "func") {
+				name = ""
+			}
+			out = append(out, &TnCallSite{functionName: name, scriptName: frame.File, scriptId: "0", lineNumber: float64(frame.Line), columnNumber: 1, column: 1})
+		}
+		if !more {
+			break
+		}
+	}
+	return out
+}
+
+// util.markPromiseAsHandled(promise): its rejection is not reported as unhandled
+func TnMarkPromiseAsHandled(p interface{}) {
+	if p != nil {
+		tnHandledPromises.Store(p, true)
+	}
+}
+
 func TnDeepEqual(a interface{}, b interface{}, strict bool) bool {
 	return tnDeepEqual(reflect.ValueOf(a), reflect.ValueOf(b), strict, 0)
 }
@@ -1268,6 +1399,17 @@ func TnStyleText(format interface{}, text string, options ...interface{}) string
 		}
 	}
 	for i := len(names) - 1; i >= 0; i-- {
+		// (#rrggbb / #rgb: a 24-bit foreground colour)
+		if hexColor := names[i]; strings.HasPrefix(hexColor, "#") && (len(hexColor) == 7 || len(hexColor) == 4) {
+			digits := hexColor[1:]
+			if len(digits) == 3 {
+				digits = string([]byte{digits[0], digits[0], digits[1], digits[1], digits[2], digits[2]})
+			}
+			if rgb, err := strconv.ParseUint(digits, 16, 32); err == nil {
+				text = fmt.Sprintf("\x1b[38;2;%d;%d;%dm%s\x1b[39m", rgb>>16, (rgb>>8)&0xff, rgb&0xff, text)
+				continue
+			}
+		}
 		codes, ok := tnStyles[names[i]]
 		if !ok {
 			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'format' must be one of the color names. Received "+tnQuoteJS(names[i])))
@@ -1275,6 +1417,271 @@ func TnStyleText(format interface{}, text string, options ...interface{}) string
 		text = fmt.Sprintf("\\x1b[%dm%s\\x1b[%dm", codes[0], text, codes[1])
 	}
 	return text
+}`;
+
+const utilDebounceHelper = `// node:util debounce / throttle: callable functions with cancel / flush /
+// ref / unref properties (a function value's own properties via expando slots)
+type tnDebouncedState struct {
+	mu       sync.Mutex
+	fn       interface{}
+	wait     float64
+	leading  bool
+	timer    *TnTimeout
+	args     []interface{}
+	pending  bool
+	promises []chan interface{}
+}
+
+func (s *tnDebouncedState) take() ([]interface{}, []chan interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	args, promises := s.args, s.promises
+	s.args, s.promises, s.pending = nil, nil, false
+	return args, promises
+}
+
+func tnDebounceResolve(promises []chan interface{}, value interface{}) {
+	for _, ch := range promises {
+		ch <- value
+	}
+}
+
+func TnDebounce(args ...interface{}) interface{} {
+	s := &tnDebouncedState{fn: args[0]}
+	if len(args) > 1 {
+		s.wait = TnNumber(args[1])
+	}
+	if len(args) > 2 {
+		if flag, ok := TnGet(args[2], "leading").(bool); ok {
+			s.leading = flag
+		}
+	}
+	var out func(values ...interface{}) interface{}
+	out = func(values ...interface{}) interface{} {
+		promise := make(chan interface{}, 1)
+		s.mu.Lock()
+		s.args = append([]interface{}{}, values...)
+		s.pending = true
+		s.promises = append(s.promises, promise)
+		leading := s.leading && s.timer == nil
+		s.mu.Unlock()
+		if leading {
+			fnArgs, promises := s.take()
+			result := TnCallValue(s.fn, fnArgs...)
+			tnDebounceResolve(promises, result)
+			tnExpandoSet(out, "pending", nil)
+		}
+		s.mu.Lock()
+		if s.timer != nil {
+			TnClearTimeout(s.timer)
+		}
+		s.mu.Unlock()
+		timer := TnSetTimeout(s.wait, func() {
+			fnArgs, promises := s.take()
+			if fnArgs == nil && len(promises) == 0 {
+				return
+			}
+			tnDebounceResolve(promises, TnCallValue(s.fn, fnArgs...))
+			tnExpandoSet(out, "pending", nil)
+		})
+		s.mu.Lock()
+		s.timer = timer
+		s.mu.Unlock()
+		tnExpandoSet(out, "pending", promise)
+		return promise
+	}
+	tnExpandoSet(out, "cancel", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		timer := s.timer
+		s.timer = nil
+		s.mu.Unlock()
+		if timer != nil {
+			TnClearTimeout(timer)
+		}
+		_, promises := s.take()
+		tnDebounceResolve(promises, nil)
+		tnExpandoSet(out, "pending", nil)
+		return nil
+	})
+	tnExpandoSet(out, "flush", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		timer := s.timer
+		s.timer = nil
+		s.mu.Unlock()
+		if timer != nil {
+			TnClearTimeout(timer)
+		}
+		fnArgs, promises := s.take()
+		tnDebounceResolve(promises, TnCallValue(s.fn, fnArgs...))
+		tnExpandoSet(out, "pending", nil)
+		return nil
+	})
+	tnExpandoSet(out, "ref", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.timer != nil {
+			s.timer.ref()
+		}
+		return nil
+	})
+	tnExpandoSet(out, "unref", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.timer != nil {
+			s.timer.unref()
+		}
+		return nil
+	})
+	return out
+}
+
+type tnThrottledState struct {
+	mu          sync.Mutex
+	fn          interface{}
+	limit       int
+	interval    float64
+	used        int
+	windowStart time.Time
+	timer       *TnTimeout
+	queue       [][]interface{}
+	promises    []chan interface{}
+}
+
+// A fresh or expired interval window: the calls it has admitted
+func (s *tnThrottledState) hasRoom() bool {
+	now := time.Now()
+	if s.windowStart.IsZero() || now.Sub(s.windowStart) >= time.Duration(s.interval*float64(time.Millisecond)) {
+		s.windowStart = now
+		s.used = 0
+	}
+	return s.used < s.limit
+}
+
+// Whether a call can run right now (no queued call ahead of it)
+func (s *tnThrottledState) capacity() bool {
+	return s.hasRoom() && len(s.queue) == 0
+}
+
+func (s *tnThrottledState) reserve() {
+	s.used++
+}
+
+func TnThrottle(args ...interface{}) interface{} {
+	s := &tnThrottledState{fn: args[0], limit: 1}
+	if len(args) > 1 {
+		s.limit = int(TnNumber(args[1]))
+	}
+	if len(args) > 2 {
+		s.interval = TnNumber(args[2])
+	}
+	if s.limit < 1 {
+		s.limit = 1
+	}
+	var out func(values ...interface{}) interface{}
+	var pump func()
+	invoke := func(values []interface{}, promise chan interface{}) {
+		result := TnCallValue(s.fn, values...)
+		if promise != nil {
+			promise <- result
+		}
+	}
+	arm := func() {
+		s.mu.Lock()
+		if s.timer != nil || len(s.queue) == 0 {
+			s.mu.Unlock()
+			return
+		}
+		wait := s.interval
+		if !s.windowStart.IsZero() {
+			remaining := time.Until(s.windowStart.Add(time.Duration(s.interval * float64(time.Millisecond))))
+			if remaining > 0 {
+				wait = float64(remaining.Nanoseconds()) / 1e6
+			} else {
+				wait = 0
+			}
+		}
+		s.timer = TnSetTimeout(wait, func() {
+			s.mu.Lock()
+			s.timer = nil
+			s.mu.Unlock()
+			pump()
+		})
+		s.mu.Unlock()
+	}
+	pump = func() {
+		for {
+			s.mu.Lock()
+			if !s.hasRoom() || len(s.queue) == 0 {
+				s.mu.Unlock()
+				break
+			}
+			values := s.queue[0]
+			s.queue = s.queue[1:]
+			var promise chan interface{}
+			if len(s.promises) > 0 {
+				promise = s.promises[0]
+				s.promises = s.promises[1:]
+			}
+			s.reserve()
+			s.mu.Unlock()
+			invoke(values, promise)
+		}
+		arm()
+	}
+	out = func(values ...interface{}) interface{} {
+		promise := make(chan interface{}, 1)
+		s.mu.Lock()
+		if s.capacity() {
+			s.reserve()
+			s.mu.Unlock()
+			invoke(values, promise)
+			return promise
+		}
+		s.queue = append(s.queue, append([]interface{}{}, values...))
+		s.promises = append(s.promises, promise)
+		s.mu.Unlock()
+		arm()
+		tnExpandoSet(out, "pending", promise)
+		return promise
+	}
+	tnExpandoSet(out, "cancel", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		timer := s.timer
+		s.timer = nil
+		promises := s.promises
+		s.promises = nil
+		s.queue = nil
+		s.used = s.limit
+		s.mu.Unlock()
+		if timer != nil {
+			TnClearTimeout(timer)
+		}
+		tnDebounceResolve(promises, nil)
+		tnExpandoSet(out, "pending", nil)
+		return nil
+	})
+	tnExpandoSet(out, "hasImmediateCapacity", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.capacity()
+	})
+	tnExpandoSet(out, "ref", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.timer != nil {
+			s.timer.ref()
+		}
+		return nil
+	})
+	tnExpandoSet(out, "unref", func(_ ...interface{}) interface{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.timer != nil {
+			s.timer.unref()
+		}
+		return nil
+	})
+	return out
 }`;
 
 export function registerUtil(r: NodeRegistry): void {
@@ -1304,6 +1711,29 @@ export function registerUtil(r: NodeRegistry): void {
     const isMap = !!node && nodeIsMapVariable(r, node);
     return `${isMap ? 'TnInspectMap' : 'TnInspect'}(${call.args.join(', ')})`;
   };
+  r.functions['util.isPartialDeepStrictEqual'] = (call: NodeCall) => {
+    use();
+    return `TnPartialDeepEqual(${call.args[0]}, ${call.args[1]})`;
+  };
+  r.results['util.isPartialDeepStrictEqual'] = 'bool';
+  defineClass(r, 'util.CallSite', '*TnCallSite', 'class', '', 'functionName=string; scriptName=string; scriptId=string; lineNumber=float64; columnNumber=float64; column=float64', '', '');
+  r.functions['util.getCallSites'] = (call: NodeCall) => {
+    use();
+    return `TnGetCallSites(${call.args.join(', ')})`;
+  };
+  r.results['util.getCallSites'] = '[]*TnCallSite';
+  r.functions['util.markPromiseAsHandled'] = (call: NodeCall) => {
+    use();
+    return `TnMarkPromiseAsHandled(${call.args[0]})`;
+  };
+  r.results['util.markPromiseAsHandled'] = '';
+  // util.inspect.custom: Symbol.for('nodejs.util.inspect.custom')
+  r.objects['util.inspect'] = true;
+  r.values['util.inspect.custom'] = (_c: NodeCall) => {
+    r.helper('symbol');
+    return 'TnSymbolFor("nodejs.util.inspect.custom")';
+  };
+  r.valueTypes['util.inspect.custom'] = '*TnSymbol';
   r.functions['util.isDeepStrictEqual'] = (call: NodeCall) => {
     use();
     return `TnDeepEqual(${call.args[0]}, ${call.args[1]}, true)`;
@@ -1335,10 +1765,20 @@ export function registerUtil(r: NodeRegistry): void {
     r.pkg('reflect');
     return `(reflect.ValueOf(${call.args[0]}).Kind() == reflect.Slice)`;
   };
+  // debounce / throttle: a function value with cancel / flush / ref / unref
+  defineHelper(r, 'nodeUtilDebounce', ['sync', 'time'], ['timerWait', 'dynamic'], utilDebounceHelper);
+  r.functions['util.debounce'] = (call: NodeCall) => {
+    r.helper('nodeUtilDebounce');
+    return `TnDebounce(${call.args.join(', ')})`;
+  };
+  r.functions['util.throttle'] = (call: NodeCall) => {
+    r.helper('nodeUtilDebounce');
+    return `TnThrottle(${call.args.join(', ')})`;
+  };
   setResults(
     r,
     'util',
-    'format=string; formatWithOptions=string; inspect=string; isDeepStrictEqual=bool; stripVTControlCharacters=string; styleText=string; isArray=bool'
+    'format=string; formatWithOptions=string; inspect=string; isDeepStrictEqual=bool; stripVTControlCharacters=string; styleText=string; isArray=bool; debounce=interface{}; throttle=interface{}'
   );
 
   // util.types / node:util/types

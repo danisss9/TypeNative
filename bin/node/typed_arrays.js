@@ -18,8 +18,15 @@ export const TYPED_ARRAY_KINDS = {
     Int32Array: 'int32',
     Uint32Array: 'uint32',
     Float32Array: 'float32',
-    Float64Array: 'float64'
+    Float64Array: 'float64',
+    // (binary16 bits; reads and writes convert, see num / conv)
+    Float16Array: 'uint16'
 };
+// BigInt64Array / BigUint64Array: one Go type of uint64 elements read as bigints
+export const BIGINT_ARRAY_KINDS = ['BigInt64Array', 'BigUint64Array'];
+export function isBigIntArrayGoType(goType) {
+    return goType === '*TnBigIntArray';
+}
 const ELEMENT_SIZES = {
     int8: 1,
     uint8: 1,
@@ -45,6 +52,8 @@ type TnTypedArray[T tnTypedElem] struct {
 	data    []T
 	kind    string
 	clamped bool
+	// Float16Array: the uint16 elements are binary16 bits
+	half bool
 }
 
 type TnInt8Array = TnTypedArray[int8]
@@ -55,6 +64,23 @@ type TnInt32Array = TnTypedArray[int32]
 type TnUint32Array = TnTypedArray[uint32]
 type TnFloat32Array = TnTypedArray[float32]
 type TnFloat64Array = TnTypedArray[float64]
+type TnFloat16Array = TnTypedArray[uint16]
+
+// An element as a number / a number as an element (Float16Array converts
+// through binary16)
+func (a *TnTypedArray[T]) num(v T) float64 {
+	if a.half {
+		return TnF16ToF64(uint16(v))
+	}
+	return float64(v)
+}
+
+func (a *TnTypedArray[T]) conv(v float64) T {
+	if a.half {
+		return T(TnF64ToF16(v))
+	}
+	return tnTypedConv[T](v, a.clamped)
+}
 
 func tnTypedSize[T tnTypedElem]() int {
 	var zero T
@@ -122,21 +148,25 @@ func tnTypedFloats(src interface{}) []float64 {
 func tnTypedOf[T tnTypedElem](kind string, clamped bool, values []float64) *TnTypedArray[T] {
 	data := make([]T, len(values))
 	for i, v := range values {
-		data[i] = tnTypedConv[T](v, clamped)
+		if kind == "Float16Array" {
+			data[i] = T(TnF64ToF16(v))
+		} else {
+			data[i] = tnTypedConv[T](v, clamped)
+		}
 	}
-	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped}
+	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped, half: kind == "Float16Array"}
 }
 
 // new XArray(), new XArray(length), new XArray(array-like or typed array): a copy
 func TnNewTypedArray[T tnTypedElem](kind string, clamped bool, src ...interface{}) *TnTypedArray[T] {
 	if len(src) == 0 || src[0] == nil {
-		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped}
+		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped, half: kind == "Float16Array"}
 	}
 	if n, ok := src[0].(float64); ok {
 		if !(n >= 0) || n != math.Trunc(n) || n > 4294967295 {
 			panic(tnTypedRangeError("Invalid typed array length: " + TnNumStr(n)))
 		}
-		return &TnTypedArray[T]{data: make([]T, int(n)), kind: kind, clamped: clamped}
+		return &TnTypedArray[T]{data: make([]T, int(n)), kind: kind, clamped: clamped, half: kind == "Float16Array"}
 	}
 	return tnTypedOf[T](kind, clamped, tnTypedFloats(src[0]))
 }
@@ -167,10 +197,10 @@ func TnTypedArrayView[T tnTypedElem](kind string, clamped bool, buf []byte, args
 		length = (len(buf) - offset) / size
 	}
 	if length == 0 {
-		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped}
+		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped, half: kind == "Float16Array"}
 	}
 	data := unsafe.Slice((*T)(unsafe.Pointer(&buf[offset])), length)
-	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped}
+	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped, half: kind == "Float16Array"}
 }
 
 // XArray.from(source[, mapFn]) / XArray.of(...items)
@@ -193,13 +223,13 @@ func (a *TnTypedArray[T]) Get(i float64) float64 {
 	if !(i >= 0) || i >= float64(len(a.data)) || i != math.Trunc(i) {
 		return 0
 	}
-	return float64(a.data[int(i)])
+	return a.num(a.data[int(i)])
 }
 
 // Element writes: out-of-range indices are ignored, as in JS
 func (a *TnTypedArray[T]) Set(i float64, v float64) float64 {
 	if i >= 0 && i < float64(len(a.data)) && i == math.Trunc(i) {
-		a.data[int(i)] = tnTypedConv[T](v, a.clamped)
+		a.data[int(i)] = a.conv(v)
 	}
 	return v
 }
@@ -207,7 +237,7 @@ func (a *TnTypedArray[T]) Set(i float64, v float64) float64 {
 func (a *TnTypedArray[T]) tnFloats() []float64 {
 	out := make([]float64, len(a.data))
 	for i, v := range a.data {
-		out[i] = float64(v)
+		out[i] = a.num(v)
 	}
 	return out
 }
@@ -256,7 +286,7 @@ func tnTypedBounds(n int, args []float64) (int, int) {
 
 func (a *TnTypedArray[T]) fill(v float64, args ...float64) *TnTypedArray[T] {
 	start, end := tnTypedBounds(len(a.data), args)
-	value := tnTypedConv[T](v, a.clamped)
+	value := a.conv(v)
 	for i := start; i < end; i++ {
 		a.data[i] = value
 	}
@@ -274,19 +304,19 @@ func (a *TnTypedArray[T]) set(src interface{}, offset ...float64) {
 		panic(tnTypedRangeError("offset is out of bounds"))
 	}
 	for i, v := range values {
-		a.data[at+i] = tnTypedConv[T](v, a.clamped)
+		a.data[at+i] = a.conv(v)
 	}
 }
 
 // subarray shares memory; slice copies
 func (a *TnTypedArray[T]) subarray(args ...float64) *TnTypedArray[T] {
 	start, end := tnTypedBounds(len(a.data), args)
-	return &TnTypedArray[T]{data: a.data[start:end:end], kind: a.kind, clamped: a.clamped}
+	return &TnTypedArray[T]{data: a.data[start:end:end], kind: a.kind, clamped: a.clamped, half: a.half}
 }
 
 func (a *TnTypedArray[T]) slice(args ...float64) *TnTypedArray[T] {
 	start, end := tnTypedBounds(len(a.data), args)
-	return &TnTypedArray[T]{data: append([]T{}, a.data[start:end]...), kind: a.kind, clamped: a.clamped}
+	return &TnTypedArray[T]{data: append([]T{}, a.data[start:end]...), kind: a.kind, clamped: a.clamped, half: a.half}
 }
 
 func (a *TnTypedArray[T]) at(i float64) float64 {
@@ -299,7 +329,7 @@ func (a *TnTypedArray[T]) at(i float64) float64 {
 func (a *TnTypedArray[T]) indexOf(v float64, from ...float64) float64 {
 	start, _ := tnTypedBounds(len(a.data), from)
 	for i := start; i < len(a.data); i++ {
-		if float64(a.data[i]) == v {
+		if a.num(a.data[i]) == v {
 			return float64(i)
 		}
 	}
@@ -316,7 +346,7 @@ func (a *TnTypedArray[T]) lastIndexOf(v float64, from ...float64) float64 {
 		end = min(int(f), end)
 	}
 	for i := end; i >= 0; i-- {
-		if float64(a.data[i]) == v {
+		if a.num(a.data[i]) == v {
 			return float64(i)
 		}
 	}
@@ -327,7 +357,7 @@ func (a *TnTypedArray[T]) lastIndexOf(v float64, from ...float64) float64 {
 func (a *TnTypedArray[T]) includes(v float64, from ...float64) bool {
 	start, _ := tnTypedBounds(len(a.data), from)
 	for i := start; i < len(a.data); i++ {
-		x := float64(a.data[i])
+		x := a.num(a.data[i])
 		if x == v || (x != x && v != v) {
 			return true
 		}
@@ -342,7 +372,7 @@ func (a *TnTypedArray[T]) join(sep ...string) string {
 	}
 	parts := make([]string, len(a.data))
 	for i, v := range a.data {
-		parts[i] = TnNumStr(float64(v))
+		parts[i] = TnNumStr(a.num(v))
 	}
 	return strings.Join(parts, separator)
 }
@@ -367,7 +397,7 @@ func (a *TnTypedArray[T]) sort(compare ...interface{}) *TnTypedArray[T] {
 	if len(compare) > 0 && compare[0] != nil {
 		cmp := compare[0]
 		sort.SliceStable(a.data, func(i, j int) bool {
-			x, y := float64(a.data[i]), float64(a.data[j])
+			x, y := a.num(a.data[i]), a.num(a.data[j])
 			if f, ok := cmp.(func(float64, float64) float64); ok {
 				return f(x, y) < 0
 			}
@@ -376,7 +406,7 @@ func (a *TnTypedArray[T]) sort(compare ...interface{}) *TnTypedArray[T] {
 		return a
 	}
 	sort.SliceStable(a.data, func(i, j int) bool {
-		x, y := float64(a.data[i]), float64(a.data[j])
+		x, y := a.num(a.data[i]), a.num(a.data[j])
 		if x != x {
 			return false
 		}
@@ -404,7 +434,7 @@ func (a *TnTypedArray[T]) with(i float64, v float64) *TnTypedArray[T] {
 		panic(tnTypedRangeError("Invalid typed array index"))
 	}
 	out := a.slice()
-	out.data[int(index)] = tnTypedConv[T](v, a.clamped)
+	out.data[int(index)] = a.conv(v)
 	return out
 }
 
@@ -436,7 +466,7 @@ func TnIsView(v interface{}) bool {
 	switch v.(type) {
 	case []byte, *TnDataView:
 		return true
-	case interface{ tnFloats() []float64 }:
+	case interface{ tnFloats() []float64 }, *TnBigIntArray:
 		return true
 	}
 	return false
@@ -504,6 +534,12 @@ func (d *TnDataView) getUint32(o float64, little ...bool) float64 {
 func (d *TnDataView) getFloat32(o float64, little ...bool) float64 {
 	return float64(math.Float32frombits(tnDataViewOrder(little).Uint32(d.at(o, 4))))
 }
+func (d *TnDataView) getFloat16(o float64, little ...bool) float64 {
+	return TnF16ToF64(tnDataViewOrder(little).Uint16(d.at(o, 2)))
+}
+func (d *TnDataView) setFloat16(o float64, v float64, little ...bool) {
+	tnDataViewOrder(little).PutUint16(d.at(o, 2), TnF64ToF16(v))
+}
 func (d *TnDataView) getFloat64(o float64, little ...bool) float64 {
 	return math.Float64frombits(tnDataViewOrder(little).Uint64(d.at(o, 8)))
 }
@@ -547,13 +583,219 @@ func (d *TnDataView) setBigUint64(o float64, v *tnbig.Int, little ...bool) {
 	tnDataViewOrder(little).PutUint64(d.at(o, 8), tnDataViewUint64(v))
 }
 
+// BigInt64Array / BigUint64Array: 64-bit integers, read and written as
+// bigints (writes wrap modulo 2^64, like DataView's setBigInt64)
+type TnBigIntArray struct {
+	data     []uint64
+	kind     string
+	unsigned bool
+}
+
+func (a *TnBigIntArray) big(v uint64) *tnbig.Int {
+	if a.unsigned {
+		return new(tnbig.Int).SetUint64(v)
+	}
+	return tnbig.NewInt(int64(v))
+}
+
+func tnBigIntBits(v interface{}) uint64 {
+	switch x := v.(type) {
+	case *tnbig.Int:
+		return tnDataViewUint64(x)
+	case float64:
+		panic(TnNodeError("TypeError", "", "Cannot convert "+TnNumStr(x)+" to a BigInt"))
+	}
+	panic(TnNodeError("TypeError", "", "Cannot convert value to a BigInt"))
+}
+
+// new BigInt64Array(length | bigint[] | BigInt64Array)
+func TnNewBigIntArray(kind string, src ...interface{}) *TnBigIntArray {
+	a := &TnBigIntArray{data: []uint64{}, kind: kind, unsigned: kind == "BigUint64Array"}
+	if len(src) == 0 || src[0] == nil {
+		return a
+	}
+	switch s := src[0].(type) {
+	case float64:
+		if !(s >= 0) || s != math.Trunc(s) || s > 4294967295 {
+			panic(tnTypedRangeError("Invalid typed array length: " + TnNumStr(s)))
+		}
+		a.data = make([]uint64, int(s))
+	case *TnBigIntArray:
+		a.data = append([]uint64{}, s.data...)
+	case []*tnbig.Int:
+		a.data = make([]uint64, len(s))
+		for i, v := range s {
+			a.data[i] = tnDataViewUint64(v)
+		}
+	case []interface{}:
+		a.data = make([]uint64, len(s))
+		for i, v := range s {
+			a.data[i] = tnBigIntBits(v)
+		}
+	default:
+		panic(TnNodeError("TypeError", "", "Cannot convert argument to a "+kind))
+	}
+	return a
+}
+
+// new BigInt64Array(buffer[, byteOffset[, length]]): a view sharing its memory
+func TnBigIntArrayView(kind string, buf []byte, args ...float64) *TnBigIntArray {
+	offset := 0
+	if len(args) > 0 {
+		offset = int(args[0])
+	}
+	if offset%8 != 0 || offset > len(buf) {
+		panic(tnTypedRangeError("start offset of " + kind + " should be a multiple of 8"))
+	}
+	length := (len(buf) - offset) / 8
+	if len(args) > 1 {
+		length = int(args[1])
+		if length < 0 || offset+length*8 > len(buf) {
+			panic(tnTypedRangeError("Invalid typed array length: " + strconv.Itoa(length)))
+		}
+	} else if (len(buf)-offset)%8 != 0 {
+		panic(tnTypedRangeError("byte length of " + kind + " should be a multiple of 8"))
+	}
+	a := &TnBigIntArray{data: []uint64{}, kind: kind, unsigned: kind == "BigUint64Array"}
+	if length > 0 {
+		a.data = unsafe.Slice((*uint64)(unsafe.Pointer(&buf[offset])), length)
+	}
+	return a
+}
+
+// BigInt64Array.from(source) / .of(...items)
+func TnBigIntArrayFrom(kind string, src interface{}) *TnBigIntArray {
+	return TnNewBigIntArray(kind, src)
+}
+
+func TnBigIntArrayOf(kind string, items ...*tnbig.Int) *TnBigIntArray {
+	return TnNewBigIntArray(kind, items)
+}
+
+// a[i]: undefined (nil) out of range
+func (a *TnBigIntArray) Get(i float64) *tnbig.Int {
+	if !(i >= 0) || i >= float64(len(a.data)) || i != math.Trunc(i) {
+		return nil
+	}
+	return a.big(a.data[int(i)])
+}
+
+func (a *TnBigIntArray) Set(i float64, v *tnbig.Int) *tnbig.Int {
+	if i >= 0 && i < float64(len(a.data)) && i == math.Trunc(i) {
+		a.data[int(i)] = tnDataViewUint64(v)
+	}
+	return v
+}
+
+func (a *TnBigIntArray) Get_length() float64            { return float64(len(a.data)) }
+func (a *TnBigIntArray) Get_byteLength() float64        { return float64(len(a.data) * 8) }
+func (a *TnBigIntArray) Get_byteOffset() float64        { return 0 }
+func (a *TnBigIntArray) Get_BYTES_PER_ELEMENT() float64 { return 8 }
+
+func (a *TnBigIntArray) Get_buffer() []byte {
+	if len(a.data) == 0 {
+		return []byte{}
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&a.data[0])), len(a.data)*8)
+}
+
+func (a *TnBigIntArray) values() []*tnbig.Int {
+	out := make([]*tnbig.Int, len(a.data))
+	for i, v := range a.data {
+		out[i] = a.big(v)
+	}
+	return out
+}
+
+func (a *TnBigIntArray) keys() []float64 {
+	out := make([]float64, len(a.data))
+	for i := range a.data {
+		out[i] = float64(i)
+	}
+	return out
+}
+
+func (a *TnBigIntArray) fill(v *tnbig.Int, args ...float64) *TnBigIntArray {
+	start, end := tnTypedBounds(len(a.data), args)
+	bits := tnDataViewUint64(v)
+	for i := start; i < end; i++ {
+		a.data[i] = bits
+	}
+	return a
+}
+
+func (a *TnBigIntArray) set(src interface{}, offset ...float64) {
+	at := 0
+	if len(offset) > 0 {
+		at = int(offset[0])
+	}
+	values := TnNewBigIntArray(a.kind, src).data
+	if at < 0 || at+len(values) > len(a.data) {
+		panic(tnTypedRangeError("offset is out of bounds"))
+	}
+	copy(a.data[at:], values)
+}
+
+func (a *TnBigIntArray) subarray(args ...float64) *TnBigIntArray {
+	start, end := tnTypedBounds(len(a.data), args)
+	return &TnBigIntArray{data: a.data[start:end:end], kind: a.kind, unsigned: a.unsigned}
+}
+
+func (a *TnBigIntArray) slice(args ...float64) *TnBigIntArray {
+	start, end := tnTypedBounds(len(a.data), args)
+	return &TnBigIntArray{data: append([]uint64{}, a.data[start:end]...), kind: a.kind, unsigned: a.unsigned}
+}
+
+func (a *TnBigIntArray) at(i float64) *tnbig.Int {
+	if i < 0 {
+		i += float64(len(a.data))
+	}
+	return a.Get(math.Trunc(i))
+}
+
+func (a *TnBigIntArray) indexOf(v *tnbig.Int, from ...float64) float64 {
+	start, _ := tnTypedBounds(len(a.data), from)
+	for i := start; i < len(a.data); i++ {
+		if a.big(a.data[i]).Cmp(v) == 0 {
+			return float64(i)
+		}
+	}
+	return -1
+}
+
+func (a *TnBigIntArray) includes(v *tnbig.Int, from ...float64) bool {
+	return a.indexOf(v, from...) >= 0
+}
+
+func (a *TnBigIntArray) join(sep ...string) string {
+	separator := ","
+	if len(sep) > 0 {
+		separator = sep[0]
+	}
+	parts := make([]string, len(a.data))
+	for i, v := range a.data {
+		parts[i] = a.big(v).String()
+	}
+	return strings.Join(parts, separator)
+}
+
+func (a *TnBigIntArray) toString() string { return a.join(",") }
+func (a *TnBigIntArray) String() string   { return a.join(",") }
+
+func (a *TnBigIntArray) reverse() *TnBigIntArray {
+	for i, j := 0, len(a.data)-1; i < j; i, j = i+1, j-1 {
+		a.data[i], a.data[j] = a.data[j], a.data[i]
+	}
+	return a
+}
+
 // ArrayBuffer#slice copies (a Uint8Array's subarray / Buffer's slice share)
 func TnArrayBufferSlice(b []byte, args ...float64) []byte {
 	start, end := tnTypedBounds(len(b), args)
 	return append([]byte{}, b[start:end]...)
 }`;
 export function registerTypedArrays(r) {
-    defineHelper(r, 'typedArrays', ['encoding/binary', 'math', 'math/big', 'sort', 'strconv', 'strings', 'unsafe'], ['error', 'dynamic', 'nodeInvoke'], typedArrayHelper);
+    defineHelper(r, 'typedArrays', ['encoding/binary', 'math', 'math/big', 'sort', 'strconv', 'strings', 'unsafe'], ['error', 'dynamic', 'nodeInvoke', 'builtins'], typedArrayHelper);
     const use = () => r.helper('typedArrays');
     for (const name of Object.keys(TYPED_ARRAY_KINDS)) {
         const elem = TYPED_ARRAY_KINDS[name];
@@ -587,7 +829,34 @@ export function registerTypedArrays(r) {
         r.values[`${key}.BYTES_PER_ELEMENT`] = (_c) => `float64(${ELEMENT_SIZES[elem]})`;
         r.valueTypes[`${key}.BYTES_PER_ELEMENT`] = 'float64';
     }
-    defineClass(r, 'globals.DataView', '*TnDataView', 'class', 'getInt8=float64; getUint8=float64; getInt16=float64; getUint16=float64; getInt32=float64; getUint32=float64; getFloat32=float64; getFloat64=float64; getBigInt64=*tnbig.Int; getBigUint64=*tnbig.Int; setInt8=; setUint8=; setInt16=; setUint16=; setInt32=; setUint32=; setFloat32=; setFloat64=; setBigInt64=; setBigUint64=', '', 'buffer=[]byte; byteOffset=float64; byteLength=float64', '');
+    // BigInt64Array / BigUint64Array
+    for (const name of BIGINT_ARRAY_KINDS) {
+        const key = `globals.${name}`;
+        const goType = '*TnBigIntArray';
+        defineClass(r, key, goType, 'class', `fill=${goType}; set=; subarray=${goType}; slice=${goType}; at=*tnbig.Int; indexOf=float64; includes=bool; join=string; toString=string; reverse=${goType}; keys=[]float64; values=[]*tnbig.Int`, '', 'length=float64; byteLength=float64; byteOffset=float64; BYTES_PER_ELEMENT=float64; buffer=[]byte', '');
+        r.globals[name] = key;
+        r.iterators[goType] = 'values';
+        r.constructors[key] = (call) => {
+            use();
+            if (call.args.length > 0 && r.isArrayBuffer(call.nodes[0])) {
+                return `TnBigIntArrayView(${JSON.stringify(name)}, ${call.args.join(', ')})`;
+            }
+            return `TnNewBigIntArray(${JSON.stringify(name)}${call.args.length > 0 ? ', ' + call.args[0] : ''})`;
+        };
+        r.functions[`${key}.from`] = (call) => {
+            use();
+            return `TnBigIntArrayFrom(${JSON.stringify(name)}, ${call.args[0]})`;
+        };
+        r.functions[`${key}.of`] = (call) => {
+            use();
+            return `TnBigIntArrayOf(${JSON.stringify(name)}${call.args.length > 0 ? ', ' + call.args.join(', ') : ''})`;
+        };
+        setResults(r, key, `from=${goType}; of=${goType}`);
+        r.values[`${key}.BYTES_PER_ELEMENT`] = (_c) => 'float64(8)';
+        r.valueTypes[`${key}.BYTES_PER_ELEMENT`] = 'float64';
+    }
+    r.classByGoType['*TnBigIntArray'] = 'globals.BigInt64Array';
+    defineClass(r, 'globals.DataView', '*TnDataView', 'class', 'getInt8=float64; getUint8=float64; getInt16=float64; getUint16=float64; getInt32=float64; getUint32=float64; getFloat16=float64; getFloat32=float64; getFloat64=float64; getBigInt64=*tnbig.Int; getBigUint64=*tnbig.Int; setInt8=; setUint8=; setInt16=; setUint16=; setInt32=; setUint32=; setFloat16=; setFloat32=; setFloat64=; setBigInt64=; setBigUint64=', '', 'buffer=[]byte; byteOffset=float64; byteLength=float64', '');
     r.globals['DataView'] = 'globals.DataView';
     r.constructors['globals.DataView'] = (call) => {
         use();

@@ -286,6 +286,7 @@ type TnIncomingMessage struct {
 	rawHeaderBlock   []byte
 	rawLocal         net.Addr
 	rawRemote        string
+	sig              *TnAbortSignal
 }
 
 func (m *TnIncomingMessage) ensureSocket() *TnSocket {
@@ -510,6 +511,8 @@ type tnResOp struct {
 	end       bool
 	// Header ops: send the headers now (flushHeaders) instead of with the body
 	flush     bool
+	// a 1xx informational response (writeInformation), before the real one
+	info      bool
 	done      func(err error)
 }
 
@@ -667,6 +670,93 @@ func (res *TnServerResponse) flushHeaders() {
 }
 
 func (res *TnServerResponse) writeContinue() {}
+
+// res.writeInformation(status, headers): a 1xx response before the final one
+func (res *TnServerResponse) writeInformation(status float64, headers ...interface{}) {
+	if res.headersSent {
+		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot write headers after they are sent to the client"))
+	}
+	if status < 100 || status > 199 || status != math.Trunc(status) {
+		panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "The value of \\"statusCode\\" is out of range. It must be >= 100 && <= 199. Received "+TnNumStr(status)))
+	}
+	if status == 101 {
+		panic(TnNodeError("RangeError", "ERR_HTTP_INVALID_STATUS_CODE", "Invalid status code: 101"))
+	}
+	h := http.Header{}
+	if len(headers) > 0 && headers[0] != nil {
+		for _, k := range TnKeys(headers[0]) {
+			h.Set(k, TnJSString(TnGetValue(headers[0], k)))
+		}
+	}
+	res.post(tnResOp{info: true, status: int(status), header: h})
+}
+
+// http.isValidHeaderName / isValidHeaderValue
+func TnIsValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_\\x60|~", c) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func TnIsValidHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c != '\t' && (c < 0x20 || c == 0x7f) {
+			return false
+		}
+	}
+	return true
+}
+
+// http.websocketMask(source, key, output, offset, length) / websocketUnmask(buffer, key)
+func tnWebsocketKey(key interface{}) [4]byte {
+	var k [4]byte
+	switch v := key.(type) {
+	case []byte:
+		copy(k[:], v)
+	case float64:
+		n := uint32(v)
+		k = [4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+	return k
+}
+
+func TnWebsocketMask(source []byte, key interface{}, output []byte, offset float64, length float64) {
+	k := tnWebsocketKey(key)
+	o := int(offset)
+	for i := 0; i < int(length) && i < len(source) && o+i < len(output); i++ {
+		output[o+i] = source[i] ^ k[i%4]
+	}
+}
+
+func TnWebsocketUnmask(buffer []byte, key interface{}) {
+	k := tnWebsocketKey(key)
+	for i := range buffer {
+		buffer[i] ^= k[i%4]
+	}
+}
+
+// req.signal: aborted when the request is (the client goes away before the
+// response ends); a request that completes leaves it alone
+func (m *TnIncomingMessage) Get_signal() *TnAbortSignal {
+	if m.sig == nil {
+		sig := TnNewAbortSignal()
+		m.sig = sig
+		m.once("close", func(args ...interface{}) {
+			if m.aborted && !sig.aborted {
+				sig.abort(nil)
+			}
+		})
+	}
+	return m.sig
+}
 
 // end(data?): a body written in one piece gets a Content-Length, as in Node
 func (res *TnServerResponse) end(args ...interface{}) *TnServerResponse {
@@ -910,6 +1000,22 @@ func (w *tnHttp1ResponseWriter) Header() http.Header {
 		w.header = http.Header{}
 	}
 	return w.header
+}
+
+// A 1xx response written straight away (the final response follows)
+func (w *tnHttp1ResponseWriter) writeInfo(status int, header http.Header) error {
+	if w.wroteHeader {
+		return nil
+	}
+	buf := []byte("HTTP/1.1 " + strconv.Itoa(status) + " " + tnStatusText(status) + "\\r\\n")
+	for k, vs := range header {
+		for _, v := range vs {
+			buf = append(buf, k+": "+v+"\\r\\n"...)
+		}
+	}
+	buf = append(buf, '\\r', '\\n')
+	_, err := w.conn.Write(buf)
+	return err
 }
 
 func (w *tnHttp1ResponseWriter) WriteHeader(status int) {
@@ -1618,6 +1724,8 @@ func tnServeOps1(w *tnHttp1ResponseWriter, hc *tnHttpConn, res *TnServerResponse
 		ended := false
 		for _, op := range res.take() {
 			switch {
+			case op.info:
+				w.writeInfo(op.status, op.header)
 			case op.header != nil:
 				for k, v := range op.header {
 					if v == nil {
@@ -1831,6 +1939,19 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 		ended := false
 		for _, op := range res.take() {
 			switch {
+			case op.info:
+				// (net/http sends a 1xx with the header map, then the map is the final one's again)
+				saved := w.Header().Clone()
+				for k, v := range op.header {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(op.status)
+				for k := range w.Header() {
+					delete(w.Header(), k)
+				}
+				for k, v := range saved {
+					w.Header()[k] = v
+				}
 			case op.header != nil:
 				for k, v := range op.header {
 					if v == nil {
@@ -2626,7 +2747,7 @@ const CLIENT_REQUEST_METHODS =
   '; setHeader=*TnClientRequest; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; getRawHeaderNames=[]string; hasHeader=bool; removeHeader=; flushHeaders=; setTimeout=*TnClientRequest; setNoDelay=; setSocketKeepAlive=; abort=';
 const SERVER_RESPONSE_METHODS =
   STREAM_METHODS.replace('end=*TnStream', 'end=*TnServerResponse') +
-  '; setHeader=*TnServerResponse; setHeaders=*TnServerResponse; appendHeader=*TnServerResponse; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; hasHeader=bool; removeHeader=; addTrailers=; writeHead=*TnServerResponse; flushHeaders=; writeContinue=; setTimeout=*TnServerResponse';
+  '; setHeader=*TnServerResponse; setHeaders=*TnServerResponse; appendHeader=*TnServerResponse; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; hasHeader=bool; removeHeader=; addTrailers=; writeHead=*TnServerResponse; flushHeaders=; writeContinue=; writeInformation=; setTimeout=*TnServerResponse';
 
 function eventName(nodes: any[]): string {
   const event = nodes[0];
@@ -2652,7 +2773,7 @@ export function registerHttp(r: NodeRegistry): void {
     'class',
     STREAM_METHODS + '; setTimeout=*TnIncomingMessage',
     'method=string; url=string; httpVersion=string; httpVersionMajor=float64; httpVersionMinor=float64; statusCode=float64; statusMessage=string; complete=bool; aborted=bool',
-    STREAM_GETTERS + '; headers=*TnMap[string, string]; headersDistinct=*TnMap[string, []string]; rawHeaders=[]string; trailers=*TnMap[string, string]; socket=*TnSocket; connection=*TnSocket',
+    STREAM_GETTERS + '; headers=*TnMap[string, string]; headersDistinct=*TnMap[string, []string]; rawHeaders=[]string; trailers=*TnMap[string, string]; socket=*TnSocket; connection=*TnSocket; signal=*TnAbortSignal',
     ''
   );
   defineClass(
@@ -2775,6 +2896,13 @@ export function registerHttp(r: NodeRegistry): void {
     return 'TnHttpStatusCodes()';
   };
   r.valueTypes['http.STATUS_CODES'] = '*TnMap[float64, string]';
+  for (const [name, result] of [['isValidHeaderName', 'bool'], ['isValidHeaderValue', 'bool'], ['websocketMask', ''], ['websocketUnmask', '']]) {
+    r.functions[`http.${name}`] = (c: NodeCall) => {
+      use();
+      return `Tn${name[0].toUpperCase()}${name.slice(1)}(${c.args.join(', ')})`;
+    };
+    r.results[`http.${name}`] = result;
+  }
   r.values['http.maxHeaderSize'] = (_c: NodeCall) => '16384.0';
   r.valueTypes['http.maxHeaderSize'] = 'float64';
 }

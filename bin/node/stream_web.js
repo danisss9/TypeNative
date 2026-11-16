@@ -1906,6 +1906,11 @@ func (b *TnBlob) arrayBuffer() chan []byte { return b.bytes() }
 
 func (b *TnBlob) stream() *TnReadableStream { return tnWebFromBytes(b.data) }
 
+// blob.textStream(): its bytes decoded as UTF-8 text chunks
+func (b *TnBlob) textStream() *TnReadableStream {
+	return tnWebFromBytes(b.data).pipeThrough(TnNewTextDecoderStream())
+}
+
 // slice(start?, end?, contentType?)
 func (b *TnBlob) slice(args ...interface{}) *TnBlob {
 	size := len(b.data)
@@ -2234,7 +2239,7 @@ export function registerStreamWeb(r) {
     bridge('stream.Duplex.fromWeb', 'TnDuplexFromWeb', '*TnStream');
     bridge('stream.compose', 'TnCompose', '*TnStream');
     // Blob / File (node:buffer and globals)
-    const blobCls = defineClass(r, 'buffer.Blob', '*TnBlob', 'class', 'text=chan string; bytes=chan []byte; arrayBuffer=chan []byte; slice=*TnBlob; stream=*TnReadableStream', '', 'size=float64; type=string; name=string; lastModified=float64', '');
+    const blobCls = defineClass(r, 'buffer.Blob', '*TnBlob', 'class', 'text=chan string; bytes=chan []byte; arrayBuffer=chan []byte; slice=*TnBlob; stream=*TnReadableStream; textStream=*TnReadableStream', '', 'size=float64; type=string; name=string; lastModified=float64', '');
     r.classes['buffer.File'] = blobCls;
     r.globals['Blob'] = 'buffer.Blob';
     r.globals['File'] = 'buffer.File';

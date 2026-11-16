@@ -66,6 +66,8 @@ declare module 'node:buffer' {
     const kStringMaxLength: number;
     function isUtf8(input: Uint8Array): boolean;
     function isAscii(input: Uint8Array): boolean;
+    /** Whether a string has only code points up to U+00FF */
+    function isLatin1(input: string): boolean;
     function transcode(source: Uint8Array, fromEnc: BufferEncoding, toEnc: BufferEncoding): Buffer;
     const Blob: typeof globalThis.Blob;
     type Blob = globalThis.Blob;
@@ -154,14 +156,28 @@ declare module 'node:fs' {
       readonly S_IFDIR: number;
       readonly S_IFLNK: number;
     };
-    const F_OK: number;
-    const R_OK: number;
-    const W_OK: number;
-    const X_OK: number;
+    interface StatsFs {
+      type: number;
+      bsize: number;
+      frsize: number;
+      blocks: number;
+      bfree: number;
+      bavail: number;
+      files: number;
+      ffree: number;
+    }
+    interface GlobOptions {
+      cwd?: string;
+      exclude?: string[] | ((path: string) => boolean);
+      followSymlinks?: boolean;
+      maxDepth?: number;
+    }
 
     // --- sync ---
     function readFileSync(path: PathLike | number, options?: { encoding?: null; flag?: string } | null): Buffer;
     function readFileSync(path: PathLike | number, options: BufferEncoding | { encoding: BufferEncoding; flag?: string }): string;
+    /** Reads into options.buffer: a view of its leading bytes */
+    function readFileSync(path: PathLike | number, options: { buffer: Uint8Array; encoding?: null; flag?: string }): Buffer;
     function writeFileSync(file: PathLike | number, data: string | Uint8Array, options?: WriteFileOptions | BufferEncoding): void;
     function appendFileSync(file: PathLike | number, data: string | Uint8Array, options?: WriteFileOptions | BufferEncoding): void;
     function existsSync(path: PathLike): boolean;
@@ -173,9 +189,14 @@ declare module 'node:fs' {
     function lstatSync(path: PathLike, options?: { throwIfNoEntry?: true }): Stats;
     function lstatSync(path: PathLike, options: { throwIfNoEntry: false }): Stats | undefined;
     function fstatSync(fd: number): Stats;
+    function statfsSync(path: PathLike, options?: { bigint?: false }): StatsFs;
+    function openAsBlobSync(path: PathLike, options?: { type?: string }): Blob;
+    function openAsBlob(path: PathLike, options?: { type?: string }): Promise<Blob>;
+    function globSync(pattern: string | readonly string[], options?: GlobOptions & { withFileTypes?: false }): string[];
+    function globSync(pattern: string | readonly string[], options: GlobOptions & { withFileTypes: true }): Dirent[];
     function renameSync(oldPath: PathLike, newPath: PathLike): void;
     function rmSync(path: PathLike, options?: RmOptions): void;
-    function rmdirSync(path: PathLike, options?: { recursive?: boolean }): void;
+    function rmdirSync(path: PathLike): void;
     function unlinkSync(path: PathLike): void;
     function copyFileSync(src: PathLike, dest: PathLike, mode?: number): void;
     function cpSync(source: string, destination: string, options?: { recursive?: boolean; force?: boolean }): void;
@@ -213,7 +234,13 @@ declare module 'node:fs' {
     function readdir(path: PathLike, options: { withFileTypes?: false; recursive?: boolean } | BufferEncoding, callback: (err: NodeJS.ErrnoException | null, files: string[]) => void): void;
     function readdir(path: PathLike, options: { withFileTypes: true; recursive?: boolean }, callback: (err: NodeJS.ErrnoException | null, files: Dirent[]) => void): void;
     function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function stat(path: PathLike, options: { signal?: AbortSignal }, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
     function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function lstat(path: PathLike, options: { signal?: AbortSignal }, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function fstat(fd: number, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+    function statfs(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: StatsFs) => void): void;
+    function glob(pattern: string | readonly string[], callback: (err: NodeJS.ErrnoException | null, matches: string[]) => void): void;
+    function glob(pattern: string | readonly string[], options: GlobOptions & { withFileTypes?: false }, callback: (err: NodeJS.ErrnoException | null, matches: string[]) => void): void;
     function unlink(path: PathLike, callback: NoParamCallback): void;
     function rm(path: PathLike, callback: NoParamCallback): void;
     function rm(path: PathLike, options: RmOptions, callback: NoParamCallback): void;
@@ -285,7 +312,7 @@ declare module 'node:fs/promises' {
       appendFile(data: string | Uint8Array, options?: fs.WriteFileOptions | BufferEncoding): Promise<void>;
       read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Buffer }>;
       write(data: string | Uint8Array, ...args: any[]): Promise<{ bytesWritten: number; buffer: any }>;
-      stat(): Promise<fs.Stats>;
+      stat(options?: { signal?: AbortSignal }): Promise<fs.Stats>;
       truncate(len?: number): Promise<void>;
       sync(): Promise<void>;
       close(): Promise<void>;
@@ -298,11 +325,14 @@ declare module 'node:fs/promises' {
     function mkdir(path: fs.PathLike, options?: fs.MakeDirectoryOptions | number): Promise<string | undefined>;
     function readdir(path: fs.PathLike, options?: BufferEncoding | { withFileTypes?: false; recursive?: boolean }): Promise<string[]>;
     function readdir(path: fs.PathLike, options: { withFileTypes: true; recursive?: boolean }): Promise<fs.Dirent[]>;
-    function stat(path: fs.PathLike): Promise<fs.Stats>;
-    function lstat(path: fs.PathLike): Promise<fs.Stats>;
+    function stat(path: fs.PathLike, options?: { signal?: AbortSignal }): Promise<fs.Stats>;
+    function lstat(path: fs.PathLike, options?: { signal?: AbortSignal }): Promise<fs.Stats>;
+    function statfs(path: fs.PathLike): Promise<fs.StatsFs>;
+    function glob(pattern: string | readonly string[], options?: fs.GlobOptions & { withFileTypes?: false }): AsyncIterable<string>;
+    function glob(pattern: string | readonly string[], options: fs.GlobOptions & { withFileTypes: true }): AsyncIterable<fs.Dirent>;
     function unlink(path: fs.PathLike): Promise<void>;
     function rm(path: fs.PathLike, options?: fs.RmOptions): Promise<void>;
-    function rmdir(path: fs.PathLike, options?: { recursive?: boolean }): Promise<void>;
+    function rmdir(path: fs.PathLike): Promise<void>;
     function rename(oldPath: fs.PathLike, newPath: fs.PathLike): Promise<void>;
     function copyFile(src: fs.PathLike, dest: fs.PathLike, mode?: number): Promise<void>;
     function cp(source: string, destination: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
@@ -331,11 +361,37 @@ declare module 'node:url' {
     type URL = globalThis.URL;
     const URLSearchParams: typeof globalThis.URLSearchParams;
     type URLSearchParams = globalThis.URLSearchParams;
+    const URLPattern: typeof globalThis.URLPattern;
+    type URLPattern = globalThis.URLPattern;
+    type URLPatternInput = globalThis.URLPatternInput;
+    type URLPatternInit = globalThis.URLPatternInit;
+    type URLPatternOptions = globalThis.URLPatternOptions;
+    type URLPatternResult = globalThis.URLPatternResult;
+    type URLPatternComponentResult = globalThis.URLPatternComponentResult;
     function fileURLToPath(url: string | URL): string;
     function pathToFileURL(path: string): URL;
     function format(url: URL | string): string;
     function domainToASCII(domain: string): string;
     function domainToUnicode(domain: string): string;
+    /** Legacy (deprecated) parser: missing parts are null */
+    interface Url {
+      protocol: string | null;
+      slashes: boolean | null;
+      auth: string | null;
+      host: string | null;
+      port: string | null;
+      hostname: string | null;
+      hash: string | null;
+      search: string | null;
+      query: string | null | any;
+      pathname: string | null;
+      path: string | null;
+      href: string;
+    }
+    /** @deprecated use new URL() */
+    function parse(urlString: string, parseQueryString?: boolean, slashesDenoteHost?: boolean): Url;
+    /** @deprecated use new URL(to, from) */
+    function resolve(from: string, to: string): string;
   }
   export = url;
 }
@@ -474,9 +530,27 @@ declare module 'node:util' {
     function format(format?: any, ...param: any[]): string;
     function formatWithOptions(inspectOptions: InspectOptions, format?: any, ...param: any[]): string;
     function inspect(object: any, options?: InspectOptions): string;
+    namespace inspect {
+      /** Symbol.for('nodejs.util.inspect.custom'): a class method under it is what inspect prints */
+      const custom: unique symbol;
+    }
     function isDeepStrictEqual(val1: unknown, val2: unknown): boolean;
     function deprecate<T extends (...args: any[]) => any>(fn: T, msg: string, code?: string): T;
     function stripVTControlCharacters(str: string): string;
+    /** Like isDeepStrictEqual, but only expected's properties (an array: a subsequence) must be in actual */
+    function isPartialDeepStrictEqual(actual: unknown, expected: unknown): boolean;
+    interface CallSiteObject {
+      functionName: string;
+      scriptName: string;
+      scriptId: string;
+      lineNumber: number;
+      columnNumber: number;
+      column: number;
+    }
+    /** The TS frames of the current stack (columns are not recorded: 1) */
+    function getCallSites(frameCount?: number, options?: { sourceMap?: boolean }): CallSiteObject[];
+    /** The promise's rejection is not reported as unhandled */
+    function markPromiseAsHandled(promise: Promise<unknown>): void;
     function styleText(format: string | string[], text: string, options?: { validateStream?: boolean }): string;
     /** @deprecated */
     function isArray(object: unknown): object is unknown[];
@@ -491,6 +565,10 @@ declare module 'node:util' {
     function promisify<T, A extends any[]>(fn: (...args: [...A, (err: any, result?: T) => void]) => void): (...args: A) => Promise<T>;
     function promisify(fn: Function): (...args: any[]) => Promise<any>;
     function callbackify<T, A extends any[]>(fn: (...args: A) => Promise<T>): (...args: [...A, (err: unknown, result: T) => void]) => void;
+    /** A debounced callable (call it, or use cancel / flush / ref / unref) */
+    function debounce(fn: Function, wait: number, options?: { leading?: boolean; rejectOnCancel?: boolean; signal?: AbortSignal }): any;
+    /** A throttled callable (limit calls per interval; cancel / hasImmediateCapacity / ref / unref) */
+    function throttle(fn: Function, limit: number, interval: number, options?: { concurrency?: number; maxPending?: number; overflow?: 'queue' | 'drop'; signal?: AbortSignal; strict?: boolean }): any;
     const types: typeof import('node:util/types');
     interface ParseArgsOptionConfig {
       type: 'string' | 'boolean';
@@ -542,6 +620,8 @@ declare module 'node:util' {
       readonly params: MIMEParams;
       toString(): string;
       toJSON(): string;
+      /** null instead of throwing on an invalid MIME type (Node 26) */
+      static parse(input: string): MIMEType | null;
     }
     class MIMEParams {
       get(name: string): string | null;
@@ -578,8 +658,11 @@ declare module 'node:util/types' {
 }
 
 declare module 'node:assert' {
-  function assert(value: unknown, message?: string | Error): asserts value;
+  function assert(value: unknown, message?: assert.AssertMessage, ...args: unknown[]): asserts value;
   namespace assert {
+    /** A message, a printf-style format (with ...args) or a function of actual and expected (Node 26) */
+    type AssertMessage = string | Error | ((actual: any, expected: any) => string);
+    function partialDeepStrictEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
     class AssertionError extends Error {
       actual: unknown;
       expected: unknown;
@@ -588,24 +671,24 @@ declare module 'node:assert' {
       code: 'ERR_ASSERTION';
     }
     type ErrorValidator = RegExp | Function | { message?: string | RegExp; code?: string; name?: string } | ((err: any) => boolean);
-    function ok(value: unknown, message?: string | Error): asserts value;
-    function equal(actual: unknown, expected: unknown, message?: string | Error): void;
-    function notEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-    function strictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T;
-    function notStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-    function deepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-    function notDeepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-    function deepStrictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T;
-    function notDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-    function throws(block: () => unknown, message?: string | Error): void;
-    function throws(block: () => unknown, error: ErrorValidator, message?: string | Error): void;
-    function doesNotThrow(block: () => unknown, message?: string | Error): void;
-    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
-    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, error: ErrorValidator, message?: string | Error): Promise<void>;
-    function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
-    function match(value: string, regExp: RegExp, message?: string | Error): void;
-    function doesNotMatch(value: string, regExp: RegExp, message?: string | Error): void;
-    function fail(message?: string | Error): never;
+    function ok(value: unknown, message?: AssertMessage, ...args: unknown[]): asserts value;
+    function equal(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function notEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function strictEqual<T>(actual: unknown, expected: T, message?: AssertMessage, ...args: unknown[]): asserts actual is T;
+    function notStrictEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function deepEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function notDeepEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function deepStrictEqual<T>(actual: unknown, expected: T, message?: AssertMessage, ...args: unknown[]): asserts actual is T;
+    function notDeepStrictEqual(actual: unknown, expected: unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function throws(block: () => unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function throws(block: () => unknown, error: ErrorValidator, message?: AssertMessage, ...args: unknown[]): void;
+    function doesNotThrow(block: () => unknown, message?: AssertMessage, ...args: unknown[]): void;
+    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, message?: AssertMessage, ...args: unknown[]): Promise<void>;
+    function rejects(block: (() => Promise<unknown>) | Promise<unknown>, error: ErrorValidator, message?: AssertMessage, ...args: unknown[]): Promise<void>;
+    function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: AssertMessage, ...args: unknown[]): Promise<void>;
+    function match(value: string, regExp: RegExp, message?: AssertMessage, ...args: unknown[]): void;
+    function doesNotMatch(value: string, regExp: RegExp, message?: AssertMessage, ...args: unknown[]): void;
+    function fail(message?: AssertMessage, ...args: unknown[]): never;
     function ifError(value: unknown): asserts value is null | undefined;
     const strict: typeof assert;
   }
@@ -658,6 +741,20 @@ declare module 'node:crypto' {
     function getCiphers(): string[];
     function randomBytes(size: number): Buffer;
     function randomUUID(): string;
+    /** A version 7 UUID: a millisecond timestamp, then random bits */
+    function randomUUIDv7(): string;
+    interface Mac {
+      update(data: BinaryLike, inputEncoding?: BufferEncoding): Mac;
+      final(): Buffer;
+      final(outputEncoding: BufferEncoding): string;
+    }
+    /** 'hmac' (options.digest), 'kmac128' / 'kmac256' (outputLength, customization), 'cmac' (options.cipher: an AES-CBC name) */
+    function createMac(
+      algorithm: string,
+      key: BinaryLike,
+      options?: { digest?: string; outputLength?: number; customization?: BinaryLike; cipher?: string }
+    ): Mac;
+    function getMacs(): string[];
     function randomInt(max: number): number;
     function randomInt(min: number, max: number): number;
     function getRandomValues<T extends Uint8Array>(typedArray: T): T;
@@ -1061,6 +1158,88 @@ declare module 'node:zlib' {
       readonly BROTLI_DECODER_RESULT_ERROR: number;
       readonly BROTLI_DECODER_RESULT_SUCCESS: number;
     };
+    interface ZipEntryCreateOptionsBase {
+      comment?: string;
+      modified?: Date;
+      mode?: number;
+    }
+    interface ZipEntryCreateOptions extends ZipEntryCreateOptionsBase {
+      method?: 'deflate' | 'store' | 'zstd';
+    }
+    interface CreateZipArchiveOptions {
+      comment?: string;
+      baseOffset?: number;
+    }
+    type ZipInputType = string | Uint8Array;
+    class ZipEntry {
+      static createSync(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): ZipEntry;
+      static create(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): Promise<ZipEntry>;
+      static createSymlink(filename: string, target: string, options?: ZipEntryCreateOptionsBase): ZipEntry;
+      readonly name: string;
+      readonly nameBuffer: Buffer;
+      readonly comment: string;
+      readonly modified: Date;
+      readonly method: number;
+      readonly crc32: number;
+      readonly mode: number;
+      readonly flags: number;
+      readonly size: number;
+      readonly compressedSize: number;
+      readonly compressed: boolean;
+      readonly isDirectory: boolean;
+      readonly isFile: boolean;
+      readonly isSymlink: boolean;
+      readonly rawContent: Buffer | null;
+      contentSync(options?: { maxSize?: number }): Buffer;
+      content(options?: { maxSize?: number }): Promise<Buffer>;
+      dispose(): void;
+    }
+    class ZipBuffer {
+      constructor(buffer: ZipInputType);
+      addSync(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): ZipEntry;
+      add(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): Promise<ZipEntry>;
+      addEntry(entry: ZipEntry): ZipEntry;
+      clear(): void;
+      delete(name: string): boolean;
+      entries(): [string, ZipEntry][];
+      get(name: string): ZipEntry;
+      has(name: string): boolean;
+      keys(): string[];
+      values(): ZipEntry[];
+      toBufferSync(options?: string | CreateZipArchiveOptions): Buffer;
+      toBuffer(options?: string | CreateZipArchiveOptions): Promise<Buffer>;
+      readonly comment: string;
+      readonly size: number;
+      readonly writable: boolean;
+    }
+    class ZipFile {
+      static openSync(filename: string, options?: { writable?: boolean }): ZipFile;
+      static open(filename: string, options?: { writable?: boolean }): Promise<ZipFile>;
+      addSync(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): ZipEntry;
+      add(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): Promise<ZipEntry>;
+      addEntrySync(entry: ZipEntry): ZipEntry;
+      addEntry(entry: ZipEntry): Promise<ZipEntry>;
+      deleteSync(name: string): boolean;
+      delete(name: string): Promise<boolean>;
+      getSync(name: string): ZipEntry;
+      get(name: string): Promise<ZipEntry>;
+      has(name: string): boolean;
+      compactSync(comment?: string): Buffer;
+      compact(comment?: string): Promise<Buffer>;
+      closeSync(): void;
+      close(): Promise<void>;
+      entriesSync(): [string, ZipEntry][];
+      keys(): string[];
+      valuesSync(): ZipEntry[];
+      readonly comment: string;
+      readonly size: number;
+      readonly writable: boolean;
+    }
+    function createZipArchiveSync(entries: ZipEntry[], options?: string | CreateZipArchiveOptions): Buffer[];
+    function createZipArchive(entries: ZipEntry[], options?: string | CreateZipArchiveOptions): Promise<Buffer[]>;
+    function zipFiles(files: [string, string][], options?: string | CreateZipArchiveOptions): Buffer;
+    function getMaxZipContentSize(): number;
+    function setMaxZipContentSize(size: number): void;
   }
   export = zlib;
 }
@@ -1114,10 +1293,33 @@ declare module 'node:perf_hooks' {
       readonly percentiles: Map<number, number>;
       percentile(percentile: number): number;
       reset(): void;
+      /** Node 26: skewness / excess kurtosis of the values */
+      readonly skewness: number;
+      readonly kurtosis: number;
+      /** The number of values equal to value */
+      countAt(value: number): number;
+      /** The share of values at or below value / above it */
+      cdf(value: number): number;
+      ccdf(value: number): number;
+      snapshot(): {
+        count: number;
+        min: number;
+        max: number;
+        mean: number;
+        exceeds: number;
+        stddev: number;
+        skewness: number;
+        kurtosis: number;
+        percentiles: Record<string, number>;
+      };
     }
     interface RecordableHistogram extends Histogram {
       record(val: number | bigint): void;
       recordDelta(): void;
+      /** Records value plus the samples a stalled recorder missed (value - interval, …) */
+      recordCorrected(val: number, expectedInterval: number): void;
+      add(other: RecordableHistogram): void;
+      subtract(other: RecordableHistogram): void;
     }
     interface IntervalHistogram extends Histogram {
       enable(): boolean;
@@ -1130,8 +1332,32 @@ declare module 'node:perf_hooks' {
 }
 
 declare module 'node:tty' {
+  import { Readable, Writable } from 'node:stream';
   namespace tty {
     function isatty(fd: number): boolean;
+    /** process.stdin as a terminal stream */
+    class ReadStream extends Readable {
+      constructor(fd: number);
+      readonly isRaw: boolean;
+      readonly isTTY: boolean;
+      readonly fd: number;
+      setRawMode(mode: boolean): this;
+    }
+    /** process.stdout (fd 1) or stderr (fd 2) as a terminal stream */
+    class WriteStream extends Writable {
+      constructor(fd: number);
+      readonly columns: number;
+      readonly rows: number;
+      readonly isTTY: boolean;
+      readonly fd: number;
+      getWindowSize(): [number, number];
+      getColorDepth(env?: object): number;
+      hasColors(count?: number, env?: object): boolean;
+      clearLine(dir: -1 | 0 | 1, callback?: () => void): boolean;
+      clearScreenDown(callback?: () => void): boolean;
+      cursorTo(x: number, y?: number, callback?: () => void): boolean;
+      moveCursor(dx: number, dy: number, callback?: () => void): boolean;
+    }
   }
   export = tty;
 }
@@ -1191,6 +1417,14 @@ declare module 'node:events' {
   }
   namespace EventEmitter {
     export { EventEmitter };
+    /** An EventEmitter whose listeners run in the async context it was created in */
+    export class EventEmitterAsyncResource extends EventEmitter {
+      constructor(options?: { name?: string; triggerAsyncId?: number; captureRejections?: boolean });
+      readonly asyncResource: import('node:async_hooks').AsyncResource;
+      readonly asyncId: number;
+      readonly triggerAsyncId: number;
+      emitDestroy(): void;
+    }
     const defaultMaxListeners: number;
     function once(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): Promise<any[]>;
     function on(emitter: EventEmitter, eventName: string | symbol, options?: { signal?: AbortSignal }): AsyncIterableIterator<any[]>;
@@ -1712,15 +1946,18 @@ declare module 'node:readline/promises' {
 
 declare module 'node:module' {
   namespace Module {
-    /** Node's built-in module names (without the node:-only ones such as node:test) */
+    /** Node 26's built-in module names (the node:-only ones with their scheme) */
     const builtinModules: string[];
+    /** The nearest package.json at or above specifier (resolved from base), else undefined */
+    function findPackageJSON(specifier: string | URL, base?: string | URL): string | undefined;
     /** Whether the specifier names a built-in module ('fs', 'node:fs', 'node:test') */
     function isBuiltin(moduleName: string): boolean;
     interface Require {
-      /** require('./data.json'): JSON files only, read at compile time */
+      /** require('./data.json') reads JSON at compile time; require('node:fs') / require('./mod') of a literal
+       *  specifier, in a top-level const, imports the module */
       (id: string): any;
     }
-    /** const require = createRequire(import.meta.url): its require() loads JSON files */
+    /** const require = createRequire(import.meta.url) */
     function createRequire(path: string | URL): Require;
   }
   export = Module;
@@ -1746,6 +1983,23 @@ declare module 'node:v8' {
     }
     /** From Go's runtime.MemStats; the limit is GOMEMLIMIT, else 4 GiB */
     function getHeapStatistics(): HeapInfo;
+    interface HeapSpaceInfo {
+      space_name: string;
+      space_size: number;
+      space_used_size: number;
+      space_available_size: number;
+      physical_space_size: number;
+    }
+    interface HeapCodeStatistics {
+      code_and_metadata_size: number;
+      bytecode_and_metadata_size: number;
+      external_script_source_size: number;
+      cpu_profiler_metadata_size: number;
+    }
+    /** V8's space names; old_space is Go's heap, the rest are empty */
+    function getHeapSpaceStatistics(): HeapSpaceInfo[];
+    /** All zero: a Go binary has no bytecode or script source */
+    function getHeapCodeStatistics(): HeapCodeStatistics;
     /** The structured-clone codec workers use (not V8's wire format) */
     function serialize(value: any): Buffer;
     function deserialize(buffer: Uint8Array): any;
@@ -2170,6 +2424,8 @@ declare module 'node:http' {
       // A TLSSocket (encrypted: true) for https requests
       readonly socket: net.Socket & { readonly encrypted?: boolean };
       readonly connection: net.Socket;
+      /** Aborted once the request closes (Node 26) */
+      readonly signal: AbortSignal;
       setTimeout(msecs: number, callback?: () => void): this;
     }
     class OutgoingMessage extends Writable {
@@ -2193,6 +2449,8 @@ declare module 'node:http' {
       writeHead(statusCode: number, statusMessage?: string, headers?: OutgoingHttpHeaders | string[]): this;
       writeHead(statusCode: number, headers?: OutgoingHttpHeaders | string[]): this;
       writeContinue(): void;
+      /** A 1xx informational response (not 101) before the final one (Node 26) */
+      writeInformation(statusCode: number, headers?: OutgoingHttpHeaders): void;
       setTimeout(msecs: number, callback?: () => void): this;
       /** Trailing headers, sent after a chunked body (not with a Content-Length) */
       addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void;
@@ -2267,6 +2525,13 @@ declare module 'node:http' {
     const METHODS: string[];
     const STATUS_CODES: Record<number, string>;
     const maxHeaderSize: number;
+    /** RFC 9110 token / field-value checks (Node 26) */
+    function isValidHeaderName(name: string): boolean;
+    function isValidHeaderValue(value: string): boolean;
+    /** output[offset + i] = source[i] ^ key[i % 4] for i < length */
+    function websocketMask(source: Uint8Array, key: Uint8Array | number, output: Uint8Array, offset: number, length: number): void;
+    /** buffer[i] ^= key[i % 4], in place */
+    function websocketUnmask(buffer: Uint8Array, key: Uint8Array | number): void;
     const globalAgent: Agent;
     function createServer(requestListener?: RequestListener): Server;
     function createServer(options: ServerOptions, requestListener?: RequestListener): Server;
@@ -2489,6 +2754,8 @@ declare module 'node:test' {
       skip?: boolean | string;
       todo?: boolean | string;
       only?: boolean;
+      /** Labels the test carries (t.tags; a subtest adds its parents') */
+      tags?: string[];
       timeout?: number;
       concurrency?: number | boolean;
     }
@@ -2543,22 +2810,28 @@ declare module 'node:test' {
       reset(): void;
     }
     export interface TestContextAssert {
-      ok(value: unknown, message?: string | Error): void;
-      equal(actual: unknown, expected: unknown, message?: string | Error): void;
-      notEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-      strictEqual<T>(actual: unknown, expected: T, message?: string | Error): void;
-      notStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-      deepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-      notDeepEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-      deepStrictEqual<T>(actual: unknown, expected: T, message?: string | Error): void;
-      notDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void;
-      throws(block: () => unknown, error?: unknown, message?: string | Error): void;
-      doesNotThrow(block: () => unknown, message?: string | Error): void;
-      rejects(block: (() => Promise<unknown>) | Promise<unknown>, error?: unknown, message?: string | Error): Promise<void>;
-      doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: string | Error): Promise<void>;
-      match(value: string, regExp: RegExp, message?: string | Error): void;
-      doesNotMatch(value: string, regExp: RegExp, message?: string | Error): void;
-      fail(message?: string | Error): never;
+      ok(value: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      equal(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      notEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      strictEqual<T>(actual: unknown, expected: T, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      notStrictEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      deepEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      notDeepEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      deepStrictEqual<T>(actual: unknown, expected: T, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      notDeepStrictEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      throws(block: () => unknown, error?: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      doesNotThrow(block: () => unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      rejects(block: (() => Promise<unknown>) | Promise<unknown>, error?: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): Promise<void>;
+      doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, message?: import('node:assert').AssertMessage, ...args: unknown[]): Promise<void>;
+      match(value: string, regExp: RegExp, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      doesNotMatch(value: string, regExp: RegExp, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      fail(message?: import('node:assert').AssertMessage, ...args: unknown[]): never;
+      partialDeepStrictEqual(actual: unknown, expected: unknown, message?: import('node:assert').AssertMessage, ...args: unknown[]): void;
+      /** Mock call checks (Node 26) */
+      called(fn: Function, message?: string): void;
+      callCount(fn: Function, count: number, message?: string): void;
+      nthCalledWith(fn: Function, n: number, ...args: unknown[]): void;
+      lastCalledWith(fn: Function, ...args: unknown[]): void;
       ifError(value: unknown): void;
       /** Compares with (or, with --test-update-snapshots, writes) the test file's <file>.snapshot entry */
       snapshot(value: any, options?: AssertSnapshotOptions): void;
@@ -2581,6 +2854,15 @@ declare module 'node:test' {
       skip(message?: string): void;
       todo(message?: string): void;
       diagnostic(message: string): void;
+      /** A message in the report, formatted like console.log */
+      log(...args: unknown[]): void;
+      /** Whether the test has finished and passed */
+      readonly passed: boolean;
+      /** The retry attempt (0: there are no retries) */
+      readonly attempt: number;
+      /** run()'s isolated worker id (undefined here) */
+      readonly workerId: number | undefined;
+      readonly tags: string[];
       plan(count: number): void;
       runOnly(shouldRunOnlyTests: boolean): void;
       before(fn?: HookFn): void;
@@ -2588,6 +2870,8 @@ declare module 'node:test' {
       beforeEach(fn?: HookFn): void;
       afterEach(fn?: HookFn): void;
     }
+    /** The running test's context (undefined outside a test) */
+    export function getTestContext(): TestContext | undefined;
     export interface SuiteContext {
       readonly name: string;
       readonly fullName: string;
@@ -2795,6 +3079,28 @@ declare module 'node:worker_threads' {
   export = worker_threads;
 }
 
+declare module 'node:wasi' {
+  // WASI preview1, run by wazero. The import object's namespace links the
+  // instance to it; start() runs _start and returns proc_exit's code
+  interface WASIOptions {
+    version: 'preview1' | 'unstable';
+    args?: readonly string[];
+    env?: Record<string, string | undefined>;
+    preopens?: Record<string, string>;
+    returnOnExit?: boolean;
+    stdin?: number;
+    stdout?: number;
+    stderr?: number;
+  }
+  class WASI {
+    constructor(options: WASIOptions);
+    readonly wasiImport: Record<string, any>;
+    getImportObject(): WebAssembly.Imports;
+    start(instance: WebAssembly.Instance): number;
+    initialize(instance: WebAssembly.Instance): void;
+  }
+}
+
 declare module 'node:sqlite' {
   namespace sqlite {
     type SQLInputValue = null | number | bigint | string | Uint8Array;
@@ -2907,7 +3213,18 @@ declare module 'node:sqlite' {
       setAllowUnknownNamedParameters(enabled: boolean): void;
       setReadBigInts(enabled: boolean): void;
       setReturnArrays(enabled: boolean): void;
+      /** Finalizes the statement now (later calls throw ERR_INVALID_STATE) */
+      close(): void;
+      [Symbol.dispose](): void;
+      /** One of SQLite's statement counters */
+      stat(counter: 'fullscanStep' | 'sort' | 'autoindex' | 'vmStep' | 'reprepare' | 'run' | 'filterMiss' | 'filterHit' | 'memused'): number;
+      resetStats(): void;
     }
+    /** Node 26's names for DatabaseSync / StatementSync */
+    const Database: typeof DatabaseSync;
+    type Database = DatabaseSync;
+    const Statement: typeof StatementSync;
+    type Statement = StatementSync;
     interface SQLTagStore {
       readonly size: number;
       readonly capacity: number;
@@ -2991,6 +3308,7 @@ declare module 'querystring' { import m = require('node:querystring'); export = 
 declare module 'punycode' { import m = require('node:punycode'); export = m; }
 declare module 'module' { import m = require('node:module'); export = m; }
 declare module 'v8' { import m = require('node:v8'); export = m; }
+declare module 'wasi' { import m = require('node:wasi'); export = m; }
 declare module 'string_decoder' { import m = require('node:string_decoder'); export = m; }
 declare module 'os' { import m = require('node:os'); export = m; }
 declare module 'process' { import m = require('node:process'); export = m; }

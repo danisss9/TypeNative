@@ -531,6 +531,212 @@ func (h *TnHash) once(event string, fn interface{}) *TnEventEmitter {
 func (h *TnHash) read(size ...float64) interface{} { return h.tnStream().read(size...) }
 
 func (h *TnHash) setEncoding(enc string) *TnStream { return h.tnStream().setEncoding(enc) }`;
+const cryptoMacHelper = `// crypto.randomUUIDv7(): a millisecond Unix timestamp, then random bits
+func TnRandomUUIDv7() string {
+	b := TnRandomBytes(16)
+	ms := uint64(time.Now().UnixMilli())
+	for i := 0; i < 6; i++ {
+		b[i] = byte(ms >> (40 - 8*i))
+	}
+	b[6] = (b[6] & 0x0f) | 0x70
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
+// crypto.createMac(algorithm, key, options): HMAC (options.digest), KMAC128 /
+// KMAC256 (options.outputLength / customization) and AES-CMAC (options.cipher)
+type TnMac struct {
+	alg       string
+	h         hash.Hash
+	kmac      *sha3.SHAKE
+	outLen    int
+	cmac      cipher.Block
+	data      []byte
+	finalized bool
+}
+
+func TnGetMacs() []string {
+	return []string{"cmac", "hmac", "kmac-128", "kmac-256", "kmac128", "kmac256"}
+}
+
+func tnLeftEncode(x uint64) []byte {
+	n := 1
+	for v := x >> 8; v > 0; v >>= 8 {
+		n++
+	}
+	b := make([]byte, n+1)
+	b[0] = byte(n)
+	for i := n; i >= 1; i-- {
+		b[i] = byte(x)
+		x >>= 8
+	}
+	return b
+}
+
+func tnRightEncode(x uint64) []byte {
+	l := tnLeftEncode(x)
+	return append(append([]byte{}, l[1:]...), l[0])
+}
+
+func tnBytepad(x []byte, w int) []byte {
+	z := append(tnLeftEncode(uint64(w)), x...)
+	for len(z)%w != 0 {
+		z = append(z, 0)
+	}
+	return z
+}
+
+func TnCreateMac(alg string, key interface{}, options ...interface{}) *TnMac {
+	var opts interface{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	option := func(name string) interface{} {
+		if opts == nil {
+			return nil
+		}
+		return TnGetValue(opts, name)
+	}
+	k := tnCryptoBytes(key, "")
+	m := &TnMac{alg: strings.ToLower(alg)}
+	switch m.alg {
+	case "hmac":
+		digest, _ := option("digest").(string)
+		if digest == "" {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.digest' is required for HMAC"))
+		}
+		m.h = hmac.New(tnHashFactory(digest), k)
+	case "kmac128", "kmac-128", "kmac256", "kmac-256":
+		if len(k) < 4 {
+			panic(TnNodeError("Error", "ERR_OSSL_INVALID_KEY_LENGTH", "error:1C800069:Provider routines::invalid key length"))
+		}
+		custom := []byte{}
+		if c := option("customization"); c != nil {
+			custom = tnCryptoBytes(c, "")
+		}
+		rate := 168
+		m.outLen = 32
+		if strings.Contains(m.alg, "256") {
+			rate = 136
+			m.outLen = 64
+		}
+		if n, ok := option("outputLength").(float64); ok {
+			m.outLen = int(n)
+		}
+		if rate == 168 {
+			m.kmac = sha3.NewCSHAKE128([]byte("KMAC"), custom)
+		} else {
+			m.kmac = sha3.NewCSHAKE256([]byte("KMAC"), custom)
+		}
+		m.kmac.Write(tnBytepad(append(tnLeftEncode(uint64(len(k))*8), k...), rate))
+	case "cmac":
+		name, _ := option("cipher").(string)
+		if !strings.HasPrefix(strings.ToLower(name), "aes-") {
+			panic(TnNodeError("Error", "ERR_CRYPTO_INVALID_CIPHER", "Invalid cipher: "+name))
+		}
+		block, err := aes.NewCipher(k)
+		if err != nil {
+			panic(TnNodeError("Error", "ERR_OSSL_INVALID_KEY_LENGTH", "error:1C800069:Provider routines::invalid key length"))
+		}
+		m.cmac = block
+	default:
+		panic(TnNodeError("Error", "ERR_CRYPTO_INVALID_DIGEST", "Invalid MAC algorithm: "+alg))
+	}
+	return m
+}
+
+func (m *TnMac) update(data interface{}, enc ...string) *TnMac {
+	if m.finalized {
+		panic(TnNodeError("Error", "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"))
+	}
+	e := ""
+	if len(enc) > 0 {
+		e = enc[0]
+	}
+	b := tnCryptoBytes(data, e)
+	switch {
+	case m.h != nil:
+		m.h.Write(b)
+	case m.kmac != nil:
+		m.kmac.Write(b)
+	default:
+		m.data = append(m.data, b...)
+	}
+	return m
+}
+
+// AES-CMAC (RFC 4493)
+func tnCmac(block cipher.Block, msg []byte) []byte {
+	shift := func(in []byte) []byte {
+		out := make([]byte, 16)
+		carry := byte(0)
+		for i := 15; i >= 0; i-- {
+			out[i] = in[i]<<1 | carry
+			carry = in[i] >> 7
+		}
+		if in[0]&0x80 != 0 {
+			out[15] ^= 0x87
+		}
+		return out
+	}
+	l := make([]byte, 16)
+	block.Encrypt(l, l)
+	k1 := shift(l)
+	k2 := shift(k1)
+	n := (len(msg) + 15) / 16
+	complete := n > 0 && len(msg)%16 == 0
+	if n == 0 {
+		n = 1
+	}
+	last := make([]byte, 16)
+	if complete {
+		copy(last, msg[(n-1)*16:])
+		for i := range last {
+			last[i] ^= k1[i]
+		}
+	} else {
+		rest := msg[(n-1)*16:]
+		copy(last, rest)
+		last[len(rest)] = 0x80
+		for i := range last {
+			last[i] ^= k2[i]
+		}
+	}
+	x := make([]byte, 16)
+	for i := 0; i < n-1; i++ {
+		for j := 0; j < 16; j++ {
+			x[j] ^= msg[i*16+j]
+		}
+		block.Encrypt(x, x)
+	}
+	for j := 0; j < 16; j++ {
+		x[j] ^= last[j]
+	}
+	block.Encrypt(x, x)
+	return x
+}
+
+func (m *TnMac) final() []byte {
+	if m.finalized {
+		panic(TnNodeError("Error", "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"))
+	}
+	m.finalized = true
+	switch {
+	case m.h != nil:
+		return m.h.Sum(nil)
+	case m.kmac != nil:
+		m.kmac.Write(tnRightEncode(uint64(m.outLen) * 8))
+		out := make([]byte, m.outLen)
+		m.kmac.Read(out)
+		return out
+	}
+	return tnCmac(m.cmac, m.data)
+}
+
+func (m *TnMac) finalString(enc string) string {
+	return TnBufferToString(m.final(), enc)
+}`;
 export function registerCrypto(r) {
     defineModule(r, 'crypto');
     r.globals['crypto'] = 'crypto';
@@ -590,6 +796,20 @@ export function registerCrypto(r) {
     fn('getCiphers', '[]string', (_c) => 'TnGetCiphers()');
     fn('randomBytes', '[]byte', (c) => `TnRandomBytes(${c.args[0]})`);
     fn('randomUUID', 'string', (_c) => 'TnRandomUUID()');
+    defineHelper(r, 'nodeCryptoMac', ['crypto/aes', 'crypto/cipher', 'crypto/hmac', 'crypto/sha3', 'encoding/hex', 'hash', 'strings', 'time'], ['nodeCrypto'], cryptoMacHelper);
+    const mac = (name, result, emit) => {
+        r.functions[`crypto.${name}`] = (call) => {
+            r.helper('nodeCryptoMac');
+            return emit(call);
+        };
+        r.results[`crypto.${name}`] = result;
+    };
+    mac('randomUUIDv7', 'string', (_c) => 'TnRandomUUIDv7()');
+    mac('createMac', '*TnMac', (c) => `TnCreateMac(${c.args.join(', ')})`);
+    mac('getMacs', '[]string', (_c) => 'TnGetMacs()');
+    defineClass(r, 'crypto.Mac', '*TnMac', 'class', 'update=*TnMac', '', '', '');
+    r.methods['crypto.Mac#final'] = (c) => (c.args.length > 0 ? `${c.recv}.finalString(${c.args[0]})` : `${c.recv}.final()`);
+    r.typers['crypto.Mac#final'] = (c) => (c.nodes.length > 0 ? 'string' : '[]byte');
     fn('randomInt', 'float64', (c) => `TnRandomInt(${c.args.join(', ')})`);
     fn('getRandomValues', '[]byte', (c) => `TnGetRandomValues(${c.args[0]})`);
     fn('timingSafeEqual', 'bool', (c) => `TnTimingSafeEqual(${c.args[0]}, ${c.args[1]})`);

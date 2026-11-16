@@ -76,6 +76,9 @@ export interface NodeRegistry {
   objects: Record<string, boolean>;
   // for...of / for await over instances: Go type → method returning a slice or channel
   iterators: Record<string, string>;
+  // Accessors whose *TnMap value is a plain object, not a Map ('WebAssembly.Instance#exports'):
+  // .size / .get reads its keys
+  records: Record<string, boolean>;
   // Constructor option methods' parameter types: new Transform({ transform(chunk, enc, cb) {} })
   optionTypers: Record<string, (options: AstNode) => Record<string, string[]>>;
   // Classes whose subclasses may override hook methods (_transform …), by class key
@@ -128,6 +131,7 @@ export function createNodeRegistry(): NodeRegistry {
     namespaces: {},
     objects: {},
     iterators: {},
+    records: {},
     optionTypers: {},
     hookPrefixes: {},
     hookParams: {},

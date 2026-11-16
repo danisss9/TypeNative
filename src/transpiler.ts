@@ -20,7 +20,7 @@ import { registerCrypto } from './node/crypto.js';
 import { registerCryptoKeys } from './node/crypto_keys.js';
 import { registerZlib } from './node/zlib.js';
 import { registerFsWatch } from './node/fs_watch.js';
-import { registerTypedArrays, isTypedArrayGoType } from './node/typed_arrays.js';
+import { registerTypedArrays, isTypedArrayGoType, isBigIntArrayGoType } from './node/typed_arrays.js';
 import { registerTimers } from './node/timers.js';
 import { registerEvents } from './node/events.js';
 import { registerStream } from './node/stream.js';
@@ -31,6 +31,8 @@ import { registerHttp } from './node/http.js';
 import { registerTls } from './node/tls.js';
 import { registerDgram } from './node/dgram.js';
 import { registerSqlite } from './node/sqlite.js';
+import { registerWebAssembly } from './node/webassembly.js';
+import { registerWasi } from './node/wasi.js';
 import { registerWebview } from './node/webview.js';
 import { registerFetch } from './node/fetch.js';
 import { registerStreamWeb } from './node/stream_web.js';
@@ -39,6 +41,7 @@ import { registerTest } from './node/test.js';
 import { registerWorkerThreads } from './node/worker_threads.js';
 import { registerCluster } from './node/cluster.js';
 import { registerHttp2 } from './node/http2.js';
+import { registerWebSocket } from './node/websocket.js';
 import { registerSystemExtra } from './node/system_extra.js';
 import { registerModuleV8 } from './node/module_v8.js';
 import { goStdlib } from './go/stdlib.generated.js';
@@ -1316,12 +1319,36 @@ function lowerModuleForms(node: AstNode): void {
       });
     }
   }
+  // const require = createRequire(import.meta.url): the names a module is
+  // required through (const fs = require('node:fs') is import * as fs)
+  const requireNames = new Set<string>();
+  if (node.kind === 'SourceFile') {
+    for (const st of node.statements) {
+      if (st.kind !== 'VariableStatement') continue;
+      for (const d of st.declarationList?.declarations ?? []) {
+        const callee = d.initializer?.kind === 'CallExpression' ? d.initializer.expression : undefined;
+        const calleeName = isIdentifier(callee) ? callee.text : isPropertyAccessExpression(callee) ? callee.name.text : '';
+        if (isIdentifier(d.name) && calleeName === 'createRequire') requireNames.add(d.name.text);
+      }
+    }
+  }
   node.statements = node.statements.map((statement: AstNode): AstNode => {
     const namespaceImport = (name: AstNode, specifier: AstNode): AstNode => ({
       kind: 'ImportDeclaration',
       moduleSpecifier: specifier,
       importClause: { kind: 'ImportClause', namedBindings: { kind: 'NamespaceImport', name } }
     });
+    // const x = require('spec') (not a JSON file, which is read as a value)
+    if (requireNames.size > 0 && statement.kind === 'VariableStatement' && !hasModifier(statement, 'ExportKeyword')) {
+      const decls: AstNode[] = statement.declarationList?.declarations ?? [];
+      const required = decls.length === 1 ? decls[0].initializer : undefined;
+      if (
+        required?.kind === 'CallExpression' && isIdentifier(required.expression) && requireNames.has(required.expression.text) &&
+        isStringLiteral(required.arguments?.[0]) && !/\.json$/i.test(String(required.arguments[0].text)) && isIdentifier(decls[0].name)
+      ) {
+        return { ...namespaceImport(decls[0].name, required.arguments[0]), line: statement.line, column: statement.column };
+      }
+    }
     if (statement.kind === 'ExportDeclaration' && statement.moduleSpecifier && !statement.isTypeOnly) {
       const clause = statement.exportClause;
       // (reexport: the module linker reads these as exports too)
@@ -2610,16 +2637,58 @@ function lowerExpandoFunctions(sourceFile: AstNode): void {
   sourceFile.statements = sourceFile.statements.map((statement: AstNode) => rewrite(statement));
 }
 
-const DISPOSE_SYMBOLS: Record<string, string> = { dispose: '__dispose', asyncDispose: '__asyncDispose' };
+const DISPOSE_SYMBOLS: Record<string, string> = {
+  dispose: '__dispose', asyncDispose: '__asyncDispose', toPrimitive: '__toPrimitive', toStringTag: '__toStringTag'
+};
 
 function getDisposeSymbolName(expr: AstNode): string | undefined {
   if (!isPropertyAccessExpression(expr) || !isIdentifier(expr.expression) || expr.expression.text !== 'Symbol') return undefined;
   return ownEntry(DISPOSE_SYMBOLS, expr.name.text);
 }
 
+// util.inspect.custom (inspect.custom, util.inspect.custom) or
+// Symbol.for('nodejs.util.inspect.custom') as a member name
+function isInspectCustomSymbol(expr: AstNode | undefined): boolean {
+  if (!expr) return false;
+  if (isPropertyAccessExpression(expr) && expr.name.text === 'custom') {
+    const owner = expr.expression;
+    return (isIdentifier(owner) && owner.text === 'inspect') || (isPropertyAccessExpression(owner) && owner.name.text === 'inspect');
+  }
+  return isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) &&
+    expr.expression.expression.text === 'Symbol' && expr.expression.name.text === 'for' &&
+    isStringLiteral(expr.arguments?.[0]) && expr.arguments[0].text === 'nodejs.util.inspect.custom';
+}
+
+// Symbol.asyncIterator: an async generator method is a channel like
+// Symbol.iterator's (for await reads it the same way)
+function isAsyncIteratorSymbol(expr: AstNode | undefined): boolean {
+  return !!expr && isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && expr.name.text === 'asyncIterator';
+}
+
 // [Symbol.dispose]() { … } → __dispose() { … }; x[Symbol.dispose]() → x.__dispose()
+// (likewise toPrimitive / toStringTag, and a class's static [Symbol.hasInstance])
 function lowerDisposeSymbols(node: AstNode): void {
   for (const child of childNodes(node)) lowerDisposeSymbols(child);
+  if (node.kind === 'ClassDeclaration' || node.kind === 'ClassExpression') {
+    for (const member of node.members ?? []) {
+      if (member.name?.kind === 'ComputedPropertyName' && isAsyncIteratorSymbol(member.name.expression)) {
+        member.name.expression.name = { kind: 'Identifier', text: 'iterator' };
+      }
+    }
+  }
+  if (node.kind === 'ElementAccessExpression' && isAsyncIteratorSymbol(node.argumentExpression)) {
+    node.argumentExpression.name = { kind: 'Identifier', text: 'iterator' };
+  }
+  if (
+    node.name?.kind === 'ComputedPropertyName' && isMethodDeclaration(node) && hasModifier(node, 'StaticKeyword') &&
+    isPropertyAccessExpression(node.name.expression) && isIdentifier(node.name.expression.expression) &&
+    node.name.expression.expression.text === 'Symbol' && node.name.expression.name.text === 'hasInstance'
+  ) {
+    node.name = { kind: 'Identifier', text: '__hasInstance' };
+  }
+  if (node.name?.kind === 'ComputedPropertyName' && isInspectCustomSymbol(node.name.expression)) {
+    node.name = { kind: 'Identifier', text: '__inspectCustom' };
+  }
   if (node.name?.kind === 'ComputedPropertyName') {
     const name = getDisposeSymbolName(node.name.expression);
     if (name) {
@@ -3626,7 +3695,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   // Keep the process alive until detached async work and timers settle
   const drains: string[] = [];
   // The event loop runs until no timers, async work or open handles remain
-  if (usedHelpers.has('eventLoop')) drains.push('TnRunLoop()');
+  if (usedHelpers.has('eventLoop')) drains.push('tnWatchdogInit()\n\tTnRunLoop()');
   // process.exitCode
   if (usedHelpers.has('nodeProcess')) drains.push('TnProcessExit()');
   const drainCode = drains.length > 0 ? `\n${LINE_RESET}\n\t${drains.join('\n\t')}` : '';
@@ -4309,8 +4378,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (isStringLiteral(node.argumentExpression)) {
       return `${visit(node.expression)}[${visit(node.argumentExpression)}]`;
     }
-    // Typed array elements read as numbers (out of range: 0)
-    if (isTypedArrayGoType(targetType) && !isAssignmentTarget(node)) {
+    // Typed array elements read as numbers (out of range: 0); BigInt64Array's as bigints
+    if ((isTypedArrayGoType(targetType) || isBigIntArrayGoType(targetType)) && !isAssignmentTarget(node)) {
       return `${visit(node.expression)}.Get(${visit(node.argumentExpression)})`;
     }
     // Buffer / Uint8Array elements read as numbers
@@ -4572,6 +4641,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('regexMatch');
       return `TnMatchIndex(${leftSide})`;
     }
+    // A DOMException's .code: its legacy number
+    if (rightSide === 'code' && isDOMExceptionValue(node.expression) && !isCallee(node) && !isAssignmentTarget(node)) {
+      return `${leftSide}.Get_domCode()`;
+    }
+    // A /d match array's .indices
+    if (rightSide === 'indices' && leftGoType === '[]string' && !isCallee(node) && !isAssignmentTarget(node)) {
+      useHelper('regexMatch');
+      return `TnMatchIndices(${leftSide})`;
+    }
     if (
       leftGoType?.includes('struct{') &&
       !isCallee(node) &&
@@ -4635,7 +4713,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // Record/Map reads via dot syntax are key lookups; method callees keep their name
     if (
       (objectType === 'Map' || objectType === 'Record') &&
-      rightSide !== 'size' &&
+      // (a plain object's size is a key: wasm exports.size)
+      (rightSide !== 'size' || objectType === 'Record') &&
       rightSide !== 'length' &&
       !isCallee(node) &&
       !isAssignmentTarget(node)
@@ -4984,6 +5063,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
       } else if (node.initializer && isRegularExpressionLiteral(node.initializer)) {
         variableTypes.set(node.name.text, 'RegExp');
+      } else if (node.initializer && isNodeRecordExpression(node.initializer)) {
+        variableTypes.set(node.name.text, 'Record');
       }
       // Array-typed variables hold references (*[]T)
       if (node.type && !isInferredAny) {
@@ -5409,6 +5490,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         : 'nil';
       return `func() []interface{} { ${srcVar} := ${source}; __n := int(${srcVar}.length); __out := make([]interface{}, 0, __n); for ${iVar} := 0; ${iVar} < __n; ${iVar}++ { __out = append(__out, ${itemExpr}) }; return __out }()`;
     }
+    // Array.fromAsync(source, mapFn?): a promise of the source's (awaited) values
+    if (
+      isPropertyAccessExpression(node.expression) &&
+      isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'Array' &&
+      node.expression.name.text === 'fromAsync'
+    ) {
+      return visitArrayFromAsync(node);
+    }
     const arrayHigherOrderCall = visitArrayHigherOrderCall(node);
     if (arrayHigherOrderCall) {
       return arrayHigherOrderCall;
@@ -5558,6 +5648,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         const value = operandType.startsWith('*') ? `TnPtrValue(${visit(node.operand)})` : `interface{}(${visit(node.operand)})`;
         return `${node.operator === 'MinusToken' ? '-' : ''}TnNumber(${value})`;
       }
+      // (+x of a class instance: its [Symbol.toPrimitive]('number') / valueOf)
+      if (operandType.startsWith('*') && classNames.has(operandType.slice(1).replace(/\[.*$/, ''))) {
+        useHelper('dynamic');
+        return `${node.operator === 'MinusToken' ? '-' : ''}TnNumber(interface{}(${visit(node.operand)}))`;
+      }
     }
     // -0: Go constant arithmetic has no negative zero
     if (node.operator === 'MinusToken' && isNumericLiteral(node.operand) && Number(node.operand.text) === 0) {
@@ -5649,6 +5744,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       !classNames.has(node.right.text)
     ) {
       useHelper('error');
+      if (node.right.text === 'QuotaExceededError') return `func() bool { __e, __ok := interface{}(${visit(node.left)}).(*TnError); return __ok && __e.dom && __e.Get_name() == "QuotaExceededError" }()`;
       return `TnIsErrorOf(${visit(node.left)}, ${toGoStringLiteral(node.right.text)})`;
     }
     if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right) && node.right.text === 'Object' && !classNames.has('Object')) {
@@ -5660,10 +5756,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // x instanceof Int32Array / URL / …: a Node global class's Go type
       const nodeClassKey = nodeClassKeyOfName(node.right.text);
       const nodeClass = nodeClassKey ? nodeRegistry.classes[nodeClassKey] : undefined;
-      if (nodeClass) {
-        useNodeHelperDefining(nodeClass.goType);
-        return `func() bool { _, ok := interface{}(${visit(node.left)}).(${nodeClass.goType}); return ok }()`;
-      }
+      if (nodeClass) return nodeClassInstanceOf(node.left, nodeClassKey);
+    }
+    if (node.operatorToken.kind === 'InstanceOfKeyword' && isPropertyAccessExpression(node.right)) {
+      // x instanceof WebAssembly.Memory / WebAssembly.RuntimeError: a Node
+      // class reached through a namespace
+      const nodeClassKey = resolveNodeKey(node.right);
+      if (nodeClassKey && nodeRegistry.classes[nodeClassKey]) return nodeClassInstanceOf(node.left, nodeClassKey);
     }
     if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right) && !classNames.has(node.right.text)) {
       const builtinCheck = builtinInstanceOf(visit(node.left), node.right.text);
@@ -5678,6 +5777,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (node.operatorToken.kind === 'InstanceOfKeyword' && (!isIdentifier(node.right) || (!classNames.has(node.right.text) && isDynamicValue(node.right)))) {
       useHelper('classes');
       return `TnInstanceOf(${visit(node.left)}, ${visit(node.right)})`;
+    }
+    if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right) && classHasStaticHasInstance(node.right.text)) {
+      // (C decides: its static [Symbol.hasInstance](x))
+      const callee: AstNode = { kind: 'PropertyAccessExpression', expression: node.right, name: { kind: 'Identifier', text: '__hasInstance' } };
+      const call: AstNode = { kind: 'CallExpression', expression: callee, arguments: [node.left], parent: node.parent, line: node.line, column: node.column };
+      callee.parent = call;
+      return `TnTruthy(interface{}(${visit(call)}))`;
     }
     if (node.operatorToken.kind === 'InstanceOfKeyword' && isIdentifier(node.right)) {
       // x instanceof C: the runtime type is C's pointer type, or a subclass's
@@ -5998,6 +6104,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (nodeAssignment !== undefined) return nodeAssignment;
     const goFieldAssignment = visitGoFieldAssignment(node, op);
     if (goFieldAssignment !== undefined) return goFieldAssignment;
+    // big[i] = v on a BigInt64Array: Set wraps to 64 bits
+    if (op === '=' && isElementAccessExpression(node.left) && isBigIntArrayGoType(inferExpressionType(node.left.expression))) {
+      return `${visit(node.left.expression)}.Set(${visit(node.left.argumentExpression)}, ${toGoValueOfType(node.right, '*tnbig.Int')})`;
+    }
     // ta[i] = v / ta[i] op= v on a typed array: Set converts to the element type
     if (isElementAccessExpression(node.left) && isTypedArrayGoType(inferExpressionType(node.left.expression))) {
       const typedAssignment = visitTypedArrayAssignment(node.left, op, node.right);
@@ -7550,6 +7660,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const list = errs ? toGoValueOfType(errs, '[]interface{}') : '[]interface{}{}';
       return `func() *TnError { __e := TnNodeError("AggregateError", "", ${msg}); __e.props["errors"] = ${list}; return __e }()`;
     }
+    // new DOMException(message, name | options): a TnError marked as one
+    if ((className === 'DOMException' || className === 'QuotaExceededError') && !classNames.has(className)) {
+      useHelper('domException');
+      const msg = (node.arguments ?? [])[0] ? toGoValueOfType(node.arguments[0], 'string') : '""';
+      const opts = (node.arguments ?? [])[1] ? toGoValueOfType(node.arguments[1], 'interface{}') : 'nil';
+      return `${className === 'DOMException' ? 'TnNewDOMException' : 'TnNewQuotaExceededError'}(${msg}, ${opts})`;
+    }
     // new TypeError(message) & co.: a TnError with that name
     if (BUILTIN_ERROR_NAMES.has(className) && !classNames.has(className)) {
       useHelper('error');
@@ -8399,6 +8516,12 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
         useHelper('slicePtr');
         return `func() ${goType} { if __v, __ok := ${lookup.map}.Lookup(${lookup.key}); __ok { return TnSlicePtr(__v) }; return nil }()`;
       }
+      // (a slice value of the slot's own type: a nil slice is null — a
+      // `??` of exec results —, so it stays nil; anything else is boxed)
+      if (ownSlice === goType.slice(1)) {
+        useHelper('slicePtr');
+        return `TnSlicePtr(${boxedRead()})`;
+      }
       return `func() ${goType} { __v := ${boxedRead()}; return &__v }()`;
     }
   const code = visit(expr);
@@ -8779,7 +8902,7 @@ function getNarrowedNames(condition: AstNode, whenTrue: boolean, seen = new Set<
     const operand = unwrapParentheses(condition.left);
     const className = isIdentifier(condition.right) ? condition.right.text : '';
     if (
-      whenTrue && isIdentifier(operand) && classNames.has(className) && !isPolymorphicClass(className) &&
+      whenTrue && isIdentifier(operand) && classNames.has(className) && !isPolymorphicClass(className) && !classHasStaticHasInstance(className) &&
       untypedVariable(operand.text) && !referenceArrays.has(operand.text)
     ) {
       return [typeofNarrowingKey(operand.text, `*${getSafeName(className)}`)];
@@ -9388,11 +9511,29 @@ function isPlainArrayGoType(goType: string): boolean {
   return goType.startsWith('[]') && goType !== '[]byte';
 }
 
+// A value typed DOMException / QuotaExceededError (a *TnError whose code is a number)
+function isDOMExceptionValue(expr: AstNode): boolean {
+  if (inferExpressionType(expr) !== '*TnError') return false;
+  const isDomName = (name: string | undefined) => name === 'DOMException' || name === 'QuotaExceededError';
+  const u = unwrapParentheses(expr);
+  if ((isAsExpression(u) || isTypeAssertionExpression(u)) && isTypeReferenceNode(u.type) && isIdentifier(u.type.typeName)) return isDomName(u.type.typeName.text);
+  if (isNewExpression(u) && isIdentifier(u.expression)) return isDomName(u.expression.text);
+  if (!isIdentifier(u)) return false;
+  const typeNode = variableTypeNodes.get(u.text);
+  if (typeNode) return isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName) && isDomName(typeNode.typeName.text);
+  // (const e = new DOMException(…) / x as DOMException)
+  const declaration = constDeclarationOf(u);
+  return !!declaration?.initializer && unwrapParentheses(declaration.initializer) !== u && isDOMExceptionValue(declaration.initializer);
+}
+
+// Map methods that read an entry's value (get, and the upserts returning it)
+const MAP_READ_METHODS = new Set<string>(['get', 'getOrInsert', 'getOrInsertComputed']);
+
 // m.get(k) (or m.get(k)!) on a Map holding arrays by reference
 function isMapArrayGet(expr: AstNode): boolean {
   let u = unwrapParentheses(expr);
   while (isNonNullExpression(u)) u = unwrapParentheses(u.expression);
-  if (!isCallExpression(u) || !isPropertyAccessExpression(u.expression) || u.expression.name.text !== 'get' || hasQuestionDot(u.expression)) return false;
+  if (!isCallExpression(u) || !isPropertyAccessExpression(u.expression) || !MAP_READ_METHODS.has(u.expression.name.text) || hasQuestionDot(u.expression)) return false;
   const mapType = inferExpressionType(u.expression.expression) ?? '';
   return mapType.startsWith('*TnMap[') && extractMapValueType(mapType).startsWith('*[]');
 }
@@ -11008,6 +11149,12 @@ function dispatchArgument(goType: string, index: number): string {
   return `TnAs[${goType}](TnArg(__args, ${index}))`;
 }
 
+// Whether a class declares a static [Symbol.hasInstance] (lowered to __hasInstance)
+function classHasStaticHasInstance(className: string): boolean {
+  const declaration = declaredClasses.get(className);
+  return !!declaration && (declaration.members ?? []).some((m: AstNode) => isMethodDeclaration(m) && hasModifier(m, 'StaticKeyword') && isIdentifier(m.name) && m.name.text === '__hasInstance');
+}
+
 // Whether some class declares a method of this name
 function classMethodNamed(method: string): boolean {
   for (const declaration of declaredClasses.values()) {
@@ -11034,12 +11181,33 @@ function emitToJSONWrappers(): string {
           : `return TnJSString(${call})`;
       out.push(`func (self *${getSafeName(className)}) TnToString() string {\n\tvar __args []interface{}\n\t_ = __args\n\t${body}\n}`);
     }
+    // [util.inspect.custom](depth, options, inspect): what console.log / inspect print
+    const inspectCustom = methods.get('__inspectCustom');
+    if (inspectCustom) {
+      const paramTypes = inspectCustom.params ? goFuncParamTypes(`func(${inspectCustom.params})`) : [];
+      const call = `self.${inspectCustom.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
+      out.push(`func (self *${getSafeName(className)}) TnInspectCustom(depth float64, options interface{}) interface{} {\n\t__args := []interface{}{depth, options, nil}\n\t_ = __args\n\t${inspectCustom.result ? `return ${call}` : `${call}\n\treturn nil`}\n}`);
+    }
+    // [Symbol.toPrimitive](hint): what String(x) / +x / x + '' convert through
+    const toPrimitive = methods.get('__toPrimitive');
+    if (toPrimitive) {
+      const paramTypes = toPrimitive.params ? goFuncParamTypes(`func(${toPrimitive.params})`) : [];
+      const call = `self.${toPrimitive.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
+      out.push(`func (self *${getSafeName(className)}) TnToPrimitive(hint string) interface{} {\n\t__args := []interface{}{hint}\n\t_ = __args\n\treturn ${call}\n}`);
+    }
     const sig = methods.get('toJSON');
     if (!sig) continue;
     const paramTypes = sig.params ? goFuncParamTypes(`func(${sig.params})`) : [];
     const callArgs = paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ');
     const call = `self.${sig.goName}(${callArgs})`;
     out.push(`func (self *${getSafeName(className)}) TnToJSON(key string) interface{} {\n\t__args := []interface{}{key}\n\t_ = __args\n\t${sig.result ? `return ${call}` : `${call}\n\treturn nil`}\n}`);
+  }
+  // get [Symbol.toStringTag](): Object.prototype.toString's tag
+  for (const [className, declaration] of declaredClasses) {
+    const tag = (declaration.members ?? []).find((m: AstNode) => isIdentifier(m.name) && m.name.text === '__toStringTag' && !hasModifier(m, 'StaticKeyword'));
+    if (!tag) continue;
+    const read = tag.kind === 'GetAccessor' ? `self.Get___toStringTag()` : `self.__toStringTag`;
+    out.push(`func (self *${getSafeName(className)}) TnToStringTag() string {\n\treturn TnJSString(${read})\n}`);
   }
   if (out.length > 0) useHelper('dynamic');
   return out.join('\n\n');
@@ -11401,7 +11569,7 @@ function isArrayBufferExpression(node: AstNode): boolean {
     return expr.expression.text === 'ArrayBuffer' || expr.expression.text === 'SharedArrayBuffer';
   }
   if (isPropertyAccessExpression(expr)) return expr.name.text === 'buffer';
-  if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && expr.expression.name.text === 'slice') {
+  if (isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && ['slice', 'transfer', 'transferToFixedLength'].includes(expr.expression.name.text)) {
     return isArrayBufferExpression(expr.expression.expression);
   }
   if (isIdentifier(expr)) {
@@ -11455,6 +11623,12 @@ function visitTypedArrayCall(node: AstNode): string | undefined {
     useHelper('typedArrays');
     const args = (node.arguments ?? []).map((a: AstNode) => `, ${visit(a)}`).join('');
     return `TnArrayBufferSlice(${visit(recvNode)}${args})`;
+  }
+  // (transfer: a copy, resized; the original is not detached)
+  if ((method === 'transfer' || method === 'transferToFixedLength') && isArrayBufferExpression(recvNode)) {
+    useHelper('buffer');
+    const args = (node.arguments ?? []).map((a: AstNode) => `, ${toGoValueOfType(a, 'float64')}`).join('');
+    return `TnArrayBufferTransfer(${visit(recvNode)}${args})`;
   }
   const recvType = inferExpressionType(recvNode);
   if (!isTypedArrayGoType(recvType) || !TYPED_ARRAY_CALLBACK_METHODS.includes(method)) return undefined;
@@ -13188,7 +13362,7 @@ function getContextualTypeNode(node: AstNode): AstNode | undefined {
   // map.set(k, v): the Map's value type
   if (
     isCallExpression(parent) && isPropertyAccessExpression(parent.expression) &&
-    parent.expression.name.text === 'set' && (parent.arguments ?? [])[1] === node
+    (parent.expression.name.text === 'set' || parent.expression.name.text === 'getOrInsert') && (parent.arguments ?? [])[1] === node
   ) {
     const mapType = inferExpressionType(parent.expression.expression) ?? '';
     const valueType = mapType.startsWith('*TnMap[') ? extractMapValueType(mapType) : '';
@@ -14290,7 +14464,7 @@ function inferExpressionType(expr: AstNode): string | undefined {
 
 // (isMapArrayGet without the ! / parentheses: the call itself)
 function isMapArrayGetCall(expr: AstNode): boolean {
-  return isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && expr.expression.name.text === 'get' && !hasQuestionDot(expr.expression) &&
+  return isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && MAP_READ_METHODS.has(expr.expression.name.text) && !hasQuestionDot(expr.expression) &&
     (inferRawExpressionType(expr.expression.expression) ?? '').startsWith('*TnMap[') && extractMapValueType(inferRawExpressionType(expr.expression.expression) ?? '').startsWith('*[]');
 }
 
@@ -14515,7 +14689,7 @@ function isBoundAsParameter(expr: AstNode): boolean {
 // Globals of other environments a program probes for (typeof navigator !==
 // 'undefined'; require, in an ES module): absent here, as under Node, unless
 // the program binds the name
-const ABSENT_GLOBALS = new Set(['__DEV__', 'navigator', 'window', 'document', 'location', 'Deno', 'Bun', 'require', 'importScripts']);
+const ABSENT_GLOBALS = new Set(['__DEV__', 'window', 'document', 'location', 'Deno', 'Bun', 'require', 'importScripts']);
 
 function isAbsentGlobal(node: AstNode): boolean {
   if (!isIdentifier(node) || !ABSENT_GLOBALS.has(node.text) || isFieldNameIdentifier(node)) return false;
@@ -14862,6 +15036,18 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
 
   if (isElementAccessExpression(expr)) {
+    // (re.exec(s)?.[i] / a?.[i]: a missed match or an absent array is
+    // undefined, so the element is nullable)
+    const optionalBase = unwrapParentheses(expr.expression);
+    const rawObjectType = inferExpressionType(expr.expression) ?? '';
+    const maybeMissingBase =
+      isCallExpression(optionalBase) &&
+      isPropertyAccessExpression(optionalBase.expression) &&
+      MAYBE_MISSING_METHODS.has(optionalBase.expression.name.text);
+    if (hasQuestionDot(expr) && (maybeMissingBase || rawObjectType.startsWith('*'))) {
+      const baseType = rawObjectType.replace(/^\*/, '');
+      if (baseType.startsWith('[]')) return makeNullableType(baseType.slice(2));
+    }
     const tupleElement = tupleElementGoType(expr);
     if (tupleElement) return tupleElement;
     const objectType = inferExpressionType(expr.expression);
@@ -14872,6 +15058,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
       return objectMemberCommonType(objectType);
     }
     if (isTypedArrayGoType(objectType)) return 'float64';
+    if (isBigIntArrayGoType(objectType)) return '*tnbig.Int';
     if (objectType?.startsWith('*TnMap[')) return extractMapValueType(objectType);
     // (an any object's element is read as any: TnIndex)
     if (objectType === 'interface{}' && !isStringLiteral(expr.argumentExpression)) return 'interface{}';
@@ -14966,6 +15153,11 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
       if (fn) return `chan ${getGeneratorYieldType(fn)}`;
     }
     if (callee === 'Array.of') return arrayOfGoType((expr.arguments ?? []).map((a: AstNode) => inferExpressionType(a)));
+    if (callee === 'Array.fromAsync') return fromAsyncGoType(expr);
+    if (isPropertyAccessExpression(expr.expression) && ['transfer', 'transferToFixedLength'].includes(expr.expression.name.text) && isArrayBufferExpression(expr.expression.expression)) return '[]byte';
+    if (callee === 'Iterator.concat') {
+      return `chan ${iteratorConcatElementType((expr.arguments ?? []).map((a: AstNode) => inferExpressionType(a) ?? ''))}`;
+    }
     if (callee === 'Iterator.from' && expr.arguments?.[0]) {
       const sourceType = (inferExpressionType(expr.arguments[0]) ?? '').replace(/^\*/, '');
       if (sourceType.startsWith('chan ')) return sourceType;
@@ -15161,11 +15353,14 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     const leftType = inferExpressionType(expr.expression);
     if (expr.name.text === 'length') return 'float64';
     // (m.size: the number of entries)
-    if (expr.name.text === 'size' && (leftType ?? '').startsWith('*TnMap[') && !isCallee(expr)) return 'float64';
+    if (expr.name.text === 'size' && (leftType ?? '').startsWith('*TnMap[') && !isCallee(expr) && resolveExpressionType(expr.expression) !== 'Record') return 'float64';
     if (expr.name.text === 'index' && leftType === '[]string') return 'float64';
+    if (expr.name.text === 'indices' && leftType === '[]string') return '[][]float64';
+    if (expr.name.text === 'code' && isDOMExceptionValue(expr.expression)) return 'float64';
     // record.key reads the Record's value type
-    if (leftType?.startsWith('*TnMap[') && expr.name.text !== 'size' && !isCallee(expr)) {
+    if (leftType?.startsWith('*TnMap[') && !isCallee(expr)) {
       const objectType = resolveExpressionType(expr.expression);
+      if (expr.name.text === 'size' && objectType !== 'Record') return undefined;
       if (objectType === 'Record' || objectType === 'Map' || objectType === undefined) {
         const valueType = extractMapValueType(leftType);
         if (valueType !== 'struct{}') return valueType;
@@ -15316,7 +15511,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     if (ownerType && ownerType.startsWith('*TnMap[')) {
       if (['has', 'isSubsetOf', 'isSupersetOf', 'isDisjointFrom'].includes(methodName)) return 'bool';
       if (['union', 'intersection', 'difference', 'symmetricDifference'].includes(methodName)) return ownerType;
-      if (methodName === 'get') {
+      if (methodName === 'get' || methodName === 'getOrInsert' || methodName === 'getOrInsertComputed') {
         const valueType = extractMapValueType(ownerType);
         return isStructGoType(valueType) ? `*${valueType}` : valueType;
       }
@@ -15548,6 +15743,9 @@ const BUILTIN_CALL_TYPES: Record<string, string> = {
   'Math.acosh': 'float64',
   'Math.atanh': 'float64',
   'Math.fround': 'float64',
+  'Math.f16round': 'float64',
+  'RegExp.escape': 'string',
+  'Error.isError': 'bool',
   'Math.imul': 'float64',
   'Math.clz32': 'float64',
   'Math.sumPrecise': 'float64',
@@ -15642,7 +15840,7 @@ function reflectCallName(node: AstNode): string | undefined {
   if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression) || callee.expression.text !== 'Reflect') return undefined;
   if (variableGoTypes.has('Reflect') || classNames.has('Reflect')) return undefined;
   const name: string = callee.name.text;
-  return ['ownKeys', 'apply', 'get', 'set', 'has', 'deleteProperty', 'getOwnPropertyDescriptor', 'defineProperty', 'getPrototypeOf'].includes(name) ? name : undefined;
+  return ['ownKeys', 'apply', 'construct', 'get', 'set', 'has', 'deleteProperty', 'getOwnPropertyDescriptor', 'defineProperty', 'getPrototypeOf'].includes(name) ? name : undefined;
 }
 
 // Reflect's methods, as the Object operations they stand for
@@ -15659,6 +15857,9 @@ function visitReflectCall(node: AstNode): string | undefined {
     case 'apply':
       useHelper('decorators');
       return `TnWithThis(${arg(1)}, func() interface{} { return TnCallValue(${arg(0)}, TnAs[[]interface{}](${arg(2)})...) })`;
+    case 'construct':
+      useHelper('classes');
+      return `TnNew(${arg(0)}, TnAs[[]interface{}](${arg(1)})...)`;
     case 'get':
       return `TnGet(${arg(0)}, TnJSString(${arg(1)}))`;
     case 'set':
@@ -15911,6 +16112,79 @@ function visitPromiseCall(node: AstNode): string | undefined {
 }
 
 // Element type of `await Promise.all([...])` from the first promise channel
+// Array.fromAsync(source): the element type of the values it collects
+function fromAsyncSourceElementType(sourceNode: AstNode | undefined): string {
+  const t = (sourceNode ? inferExpressionType(sourceNode) ?? '' : '').replace(/^\*\[\]/, '[]');
+  if (t.startsWith('chan ')) return t.slice(5) || 'interface{}';
+  if (t.startsWith('[]chan ')) return t.slice(7) || 'interface{}';
+  if (t.startsWith('[]')) return t.slice(2) || 'interface{}';
+  return 'interface{}';
+}
+
+// Array.fromAsync(source, mapFn?): its Go type (chan []T)
+function fromAsyncGoType(expr: AstNode): string {
+  const callback = (expr.arguments ?? [])[1];
+  if (callback) {
+    const result = goFuncReturnType(functionValueGoType(callback) ?? '') ?? '';
+    if (result.startsWith('chan ')) return `chan []${result.slice(5)}`;
+    return result ? `chan []${result}` : 'chan []interface{}';
+  }
+  return `chan []${fromAsyncSourceElementType((expr.arguments ?? [])[0])}`;
+}
+
+function visitArrayFromAsync(node: AstNode): string {
+  useHelper('promiseAll');
+  const sourceNode = (node.arguments ?? [])[0];
+  const callbackNode = (node.arguments ?? [])[1];
+  const sourceType = (sourceNode ? inferExpressionType(sourceNode) ?? '' : '').replace(/^\*\[\]/, '[]');
+  const elem = fromAsyncSourceElementType(sourceNode);
+  const source = sourceNode ? visit(sourceNode) : 'nil';
+  let collected: string;
+  if (sourceType.startsWith('chan ')) collected = `TnFromAsyncChan(${source})`;
+  else if (sourceType.startsWith('[]chan ')) collected = `TnPromiseAll(${source})`;
+  else if (sourceType === '[]interface{}') {
+    useHelper('dynamic');
+    collected = `TnPromiseAllValues(${source})`;
+  } else if (sourceType.startsWith('[]')) collected = `TnFromAsyncValues(${source})`;
+  else {
+    useHelper('dynamic');
+    collected = `TnPromiseAllValues(TnAs[[]interface{}](${source}))`;
+  }
+  if (!callbackNode) return collected;
+  if (isArrowFunction(callbackNode) || isFunctionExpression(callbackNode)) {
+    const paramTypes = [elem, 'float64'];
+    (callbackNode.parameters ?? []).forEach((p: AstNode, index: number) => {
+      if (isIdentifier(p.name) && paramTypes[index] && !p.type) variableGoTypes.set(p.name.text, paramTypes[index]);
+    });
+  }
+  const result = goFuncReturnType(functionValueGoType(callbackNode) ?? '') ?? 'interface{}';
+  const out = result.startsWith('chan ') ? result.slice(5) : result;
+  const arity = (callbackNode.parameters ?? []).length;
+  const cb = visit(callbackNode);
+  // (an untyped source — an async generator's values — as the callback's parameter type)
+  const firstParam = goFuncParamTypes(functionValueGoType(callbackNode) ?? '')[0] ?? elem;
+  let value = '__v';
+  if (elem === 'interface{}' && firstParam !== 'interface{}') {
+    useHelper('dynamic');
+    value = `TnAs[${firstParam}](__v)`;
+  }
+  const call = arity >= 2 ? `__cb(${value}, __i)` : arity === 1 ? `__cb(${value})` : `__cb()`;
+  const mapper = `func(__v ${elem}, __i float64) ${result} { __cb := ${cb}; return ${call} }`;
+  return result.startsWith('chan ') ? `TnFromAsyncMapAwait(${collected}, ${mapper})` : `TnFromAsyncMap[${elem}, ${out}](${collected}, ${mapper})`;
+}
+
+// Iterator.concat(...): the element type its sources share (else interface{})
+function iteratorConcatElementType(types: (string | undefined)[]): string {
+  let elem = '';
+  for (const raw of types) {
+    const t = (raw ?? '').replace(/^\*/, '');
+    const e = t.startsWith('chan ') ? t.slice(5) : t.startsWith('[]') ? t.slice(2) : 'interface{}';
+    if (elem === '') elem = e;
+    else if (elem !== e) return 'interface{}';
+  }
+  return elem || 'interface{}';
+}
+
 function promiseAllElementType(expr: AstNode): string | undefined {
   const arrayNode = (expr.arguments ?? [])[0];
   const first = arrayNode?.elements?.[0];
@@ -16782,7 +17056,15 @@ function flattenNullishChain(node: AstNode): AstNode[] {
 
 // Converts a Go variable between T and *T as the target type requires
 function convertGoValue(variable: string, fromType: string, toType: string): string {
-  if (toType === `*${fromType}`) return `&${variable}`;
+  if (toType === `*${fromType}`) {
+    // (a slice value into a *[]T slot: a nil slice is null, not &slice —
+    // TnSlicePtr only boxes a value, so a ?? b of exec results keeps null)
+    if (fromType.startsWith('[]')) {
+      useHelper('slicePtr');
+      return `TnSlicePtr(${variable})`;
+    }
+    return `&${variable}`;
+  }
   if (fromType === `*${toType}`) return `*${variable}`;
   // dynamic (any) values hold the concrete type at runtime (a primitive may
   // be held as a *T)
@@ -16862,6 +17144,10 @@ function visitOptionalPropertyAccess(node: AstNode): string {
       useHelper('regexMatch');
       return `TnMatchIndex(${baseExpr})`;
     }
+    if (node.name.text === 'indices' && baseType === '[]string') {
+      useHelper('regexMatch');
+      return `TnMatchIndices(${baseExpr})`;
+    }
     return getAcessString(baseExpr, visit(node.name), objectType);
   }
 
@@ -16896,6 +17182,25 @@ function visitOptionalElementAccess(node: AstNode): string {
   const baseExpr = visit(node.expression);
   const baseType = inferExpressionType(node.expression);
   if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
+    // (re.exec(s)?.[i]: a missed match is nil, and its element undefined)
+    const missing = unwrapParentheses(node.expression);
+    if (
+      baseType?.startsWith('[]') &&
+      isCallExpression(missing) &&
+      isPropertyAccessExpression(missing.expression) &&
+      MAYBE_MISSING_METHODS.has(missing.expression.name.text)
+    ) {
+      useHelper('dynamic');
+      const valueType = inferExpectedTypeFromContext(node) ?? baseType.slice(2);
+      const nullableType = makeNullableType(valueType);
+      const tmp = getTempName('opte');
+      const read = `TnAt(${tmp}, ${visit(node.argumentExpression)})`;
+      if (nullableType.startsWith('*') && nullableType.slice(1) === valueType) {
+        const valueTemp = getTempName('optev');
+        return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; ${valueTemp} := ${read}; return &${valueTemp} }()`;
+      }
+      return `func() ${nullableType} { ${tmp} := ${baseExpr}; if ${tmp} == nil { var __zero ${nullableType}; return __zero }; return ${read} }()`;
+    }
     const plainAccess: AstNode = { ...node, questionDotToken: undefined };
     return visit(plainAccess);
   }
@@ -18536,7 +18841,17 @@ function resolveExpressionType(expr: AstNode): string | undefined {
   if (expr.kind === 'ThisKeyword') {
     return 'class';
   }
+  if (isNodeRecordExpression(expr)) return 'Record';
   return goTypeCategory(inferExpressionType(expr));
+}
+
+// A Node accessor whose *TnMap is a plain object (instance.exports): its
+// .size is a key, not a Map's size
+function isNodeRecordExpression(expr: AstNode): boolean {
+  const e = unwrapParentheses(expr);
+  if (!isPropertyAccessExpression(e)) return false;
+  const classKey = nodeClassKeyOfType(inferExpressionType(e.expression));
+  return !!classKey && !!nodeRegistry.records[`${classKey}#${e.name.text}`];
 }
 
 // Method-dispatch category of an inferred Go type (e.g. `const s = new Set<T>()`)
@@ -18718,6 +19033,14 @@ const callHandlers: Record<string, CallHandler> = {
   'Math.acosh': (_caller, args) => mathCall('Acosh', args),
   'Math.atanh': (_caller, args) => mathCall('Atanh', args),
   'Math.fround': (_caller, args) => `float64(float32(${args[0]}))`,
+  'RegExp.escape': (_caller, args) => {
+    useHelper('builtins');
+    return `TnRegExpEscape(${args[0]})`;
+  },
+  'Math.f16round': (_caller, args) => {
+    useHelper('builtins');
+    return `TnF16Round(${args[0]})`;
+  },
   'Math.imul': (_caller, args) => {
     useHelper('dynamic');
     return `float64(TnInt32(${args[0]}) * TnInt32(${args[1]}))`;
@@ -18751,6 +19074,17 @@ const callHandlers: Record<string, CallHandler> = {
   },
   'Object.groupBy': (_caller, args) => visitGroupBy(args, false),
   'Map.groupBy': (_caller, args) => visitGroupBy(args, true),
+  'Iterator.concat': (_caller, args) => {
+    useHelper('iterators');
+    const elem = iteratorConcatElementType(currentCallArgTypes);
+    return `TnIterConcat[${elem}](${args.map((a, i) => {
+      const t = (currentCallArgTypes[i] ?? '').replace(/^\*/, '');
+      if (t.startsWith('chan ')) return a;
+      if (t.startsWith('[]') && t.slice(2) === elem) return `TnIterFrom(${a})`;
+      useHelper('dynamic');
+      return `TnIterFrom(TnAs[[]${elem}](${a}))`;
+    }).join(', ')})`;
+  },
   'Iterator.from': (_caller, args) => {
     useHelper('iterators');
     const sourceType = (currentCallArgTypes[0] ?? '').replace(/^\*/, '');
@@ -18986,6 +19320,10 @@ const callHandlers: Record<string, CallHandler> = {
   // Promise.all: drain every promise channel, collect the results
   // (V8's; there are no V8 stack frames to capture)
   'Error.captureStackTrace': () => 'func() {}()',
+  'Error.isError': (_caller, args) => {
+    useHelper('error');
+    return `TnIsErrorOf(interface{}(${args[0] ?? 'nil'}), "Error")`;
+  },
   'Promise.all': (_caller, args) => {
     useHelper('promiseAll');
     // (values that may or may not be promises, an any[]: each awaited when it is one)
@@ -19103,7 +19441,7 @@ function numberCheckArgument(arg: string): string {
 type MethodHandler = (obj: string, args: string[]) => string;
 
 // Built-in Error subclasses (TnErrors carrying their name)
-const BUILTIN_ERROR_NAMES = new Set(['TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'AggregateError']);
+const BUILTIN_ERROR_NAMES = new Set(['TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'AggregateError', 'DOMException', 'QuotaExceededError']);
 
 // Whether the program uses console.group (then every console line is
 // written through the indentation-aware helper)
@@ -19211,9 +19549,11 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     useHelper('strIndex');
     return `TnCharCodeAt(${obj}, ${args[0] ?? '0'})`;
   },
+  // (the root collation: letters by base letter, then accents, then case)
   localeCompare: (obj, args) => {
-    importedPackages.add('strings');
-    return `float64(strings.Compare(${obj}, ${args[0]}))`;
+    useHelper('builtins');
+    const options = currentCallArgNodes[2] ? toGoValueOfType(currentCallArgNodes[2], 'interface{}') : 'nil';
+    return `TnLocaleCompare(${obj}, ${args[0]}, ${options})`;
   },
   includes: (obj, args) => {
     importedPackages.add('strings');
@@ -19569,14 +19909,38 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   // push / unshift return the new length when their value is used
   push: (obj, args) => {
     const element = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType.slice(2) : undefined;
+    // (an Array subclass's elements (seq.push(…), list.push(…) on T[] & {…}):
+    // the embedded TnArray's reference, so the push reaches the instance)
+    const itemsNode =
+      currentCallNode && isPropertyAccessExpression(currentCallNode.expression) && currentCallNode.expression.expression.kind === 'TnArrayItems'
+        ? currentCallNode.expression.expression
+        : undefined;
+    if (itemsNode) {
+      return `func() float64 { __p := ${visit(itemsNode.expression)}.TnItems(); ${pushStatement('*__p', args, element)}; return float64(len(*__p)) }()`;
+    }
     // (an array a call returns — a getter's — is no Go variable: appended to a copy)
     // (a field through a call's pointer result — getter().items — is addressable)
     const receiver = currentCallNode && isPropertyAccessExpression(currentCallNode.expression) ? currentCallNode.expression.expression : undefined;
-    if (obj.endsWith(')') && !isAddressable(obj) && !/^\(\*.+\)$/.test(obj)) {
+    if (obj.endsWith(')') && !isAddressable(obj)) {
       // (a call returning an array reference — a Map of arrays' value through
-      // getOrInsertWith — appends to the array it refers to)
-      if (receiver && inferRawExpressionType(receiver)?.startsWith('*[]')) {
-        return `func() float64 { __p := ${obj}; ${pushStatement('*__p', args, element)}; return float64(len(*__p)) }()`;
+      // getOrInsertWith, or m.get(k)! — appends to the array it refers to)
+      const receiverType = receiver ? (inferRawExpressionType(receiver) ?? '') : '';
+      const pointer = /^\(\*(.+)\)$/.exec(obj)?.[1];
+      const receiverCall = receiver ? unwrapParentheses(receiver) : undefined;
+      if (
+        receiver &&
+        !isElementAccessExpression(receiver) &&
+        (receiverType.startsWith('*[]') ||
+          (inferExpressionType(receiver) ?? '').startsWith('*[]') ||
+          isMapArrayGet(receiver) ||
+          // (a call's result: the reference, as `return n.sep ?? n.items`
+          // or a generic V bound to an array does)
+          (receiverCall !== undefined && isCallExpression(receiverCall) && !isOptionalChain(receiver)) ||
+          // (obj is a dereference of the receiver: an array reference)
+          (pointer !== undefined && !(isPropertyAccessExpression(receiver) && hasDynamicProperties(receiver.expression))))
+      ) {
+        // (the receiver is the reference: obj is it, or its dereference)
+        return `func() float64 { __p := ${pointer ?? obj}; ${pushStatement('*__p', args, element)}; return float64(len(*__p)) }()`;
       }
       // (a read out of a container — FLIPPED_ALIAS_KEYS[alias], a Map's value
       // —: the array lives in it, so the appended one is stored back, as push
@@ -19839,6 +20203,26 @@ function elementEquals(a: string, b: string): string {
 const mapMethodHandlers: Record<string, MethodHandler> = {
   set: (obj, args) => `${obj}.Set(${args[0]}, ${args[1]})`,
   get: (obj, args) => `${obj}.Get(${args[0]})`,
+  getOrInsert: (obj, args) => `${obj}.GetOrInsert(${args[0]}, ${args[1]})`,
+  // (the callback as a func(K) V, whatever arity it was written with)
+  getOrInsertComputed: (obj, args) => {
+    const keyType = currentReceiverGoType ? extractMapKeyType(currentReceiverGoType) : 'interface{}';
+    const valueType = currentReceiverGoType ? extractMapValueType(currentReceiverGoType) : 'interface{}';
+    const cbNode = currentCallArgNodes[1];
+    const arity = cbNode && (isArrowFunction(cbNode) || isFunctionExpression(cbNode)) ? (cbNode.parameters ?? []).length : 1;
+    const call = `(${args[1]})(${arity === 0 ? '' : '__k'})`;
+    // (the callback's value as the map's: an array stored by reference, a literal converted)
+    const cbResult = cbNode ? goFuncReturnType(functionValueGoType(cbNode) ?? '') ?? '' : '';
+    let value = call;
+    if (valueType.startsWith('*[]') && cbResult !== valueType) {
+      useHelper('dynamic');
+      value = `func() ${valueType} { __r := TnSliceAs[${valueType.slice(3)}](${call}); return &__r }()`;
+    } else if (cbResult !== valueType && valueType !== 'interface{}') {
+      useHelper('dynamic');
+      value = `TnAs[${valueType}](${call})`;
+    }
+    return `${obj}.GetOrInsertComputed(${args[0]}, func(__k ${keyType}) ${valueType} { return ${value} })`;
+  },
   has: (obj, args) => `${obj}.Has(${args[0]})`,
   delete: (obj, args) => `${obj}.Delete(${args[0]})`,
   clear: (obj) => `${obj}.Clear()`,
@@ -19937,6 +20321,14 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
       return (c, args) => {
         importedPackages.add('strconv');
         return `strconv.FormatFloat(${c.substring(0, dotIndex)}, 'g', int(${args[0] ?? '-1'}), 64)`;
+      };
+    }
+    // number.toLocaleString(locales, options): en-US formatting
+    if (methodName === 'toLocaleString' && (currentReceiverGoType === 'float64' || ((objectType === 'number' || objectType === 'float64') && currentReceiverGoType !== 'time.Time'))) {
+      return (c) => {
+        useHelper('builtins');
+        const options = currentCallArgNodes[1] ? toGoValueOfType(currentCallArgNodes[1], 'interface{}') : 'nil';
+        return `TnNumberLocale(${c.substring(0, dotIndex)}, ${options})`;
       };
     }
     // number.toFixed(digits)
@@ -20083,7 +20475,8 @@ const GLOBAL_TYPEOF: Record<string, string> = {
   Buffer: 'function', Uint8Array: 'function', btoa: 'function', atob: 'function', String: 'function',
   Number: 'function', Boolean: 'function', Symbol: 'function', Array: 'function', Object: 'function',
   Map: 'function', Set: 'function', Date: 'function', RegExp: 'function', Promise: 'function', Error: 'function',
-  BigInt: 'function'
+  BigInt: 'function', navigator: 'object', sessionStorage: 'object', Storage: 'function', CustomEvent: 'function',
+  ErrorEvent: 'function', DOMException: 'function'
 };
 
 const CONSOLE_METHODS = new Set(['log', 'info', 'warn', 'error', 'debug', 'trace', 'dir', 'table', 'time', 'timeEnd', 'timeLog', 'group', 'groupEnd', 'groupCollapsed', 'count', 'countReset', 'assert', 'clear']);
@@ -20685,7 +21078,8 @@ function translateJsRegexPattern(pattern: string): string {
 // before testing for lookarounds (?= (?! (?<= (?<!
 function needsStatefulRegex(pattern: string, flags: string): boolean {
   // /g and /y keep lastIndex state; /u keeps its flag for .flags
-  if (flags.includes('g') || flags.includes('y') || flags.includes('u')) return true;
+  // (/d: its matches carry .indices, which only TnRegex records)
+  if (flags.includes('g') || flags.includes('y') || flags.includes('u') || flags.includes('d')) return true;
   const stripped = pattern.replace(/\(\?<[A-Za-z_][A-Za-z0-9_]*>/g, '');
   // (?= (?! and any remaining (?< (lookbehind) need the backtracker, as do
   // backreferences, by number or by name
@@ -20693,7 +21087,7 @@ function needsStatefulRegex(pattern: string, flags: string): boolean {
 }
 
 const REGEX_FLAG_PROPERTIES: Record<string, string> = {
-  global: 'g', ignoreCase: 'i', multiline: 'm', dotAll: 's', unicode: 'u', unicodeSets: 'v', sticky: 'y'
+  global: 'g', ignoreCase: 'i', multiline: 'm', dotAll: 's', unicode: 'u', unicodeSets: 'v', sticky: 'y', hasIndices: 'd'
 };
 
 function inferRegexPropertyType(expr: AstNode): string | undefined {
@@ -22431,7 +22825,8 @@ function getCollectionArgumentTypes(node: AstNode): string[] | undefined {
     const valueType = extractMapValueType(receiverType);
     if (valueType === 'struct{}' && ['add', 'has', 'delete'].includes(method)) return [keyType];
     if (['get', 'has', 'delete'].includes(method)) return [keyType];
-    if (method === 'set') return [keyType, valueType];
+    if (method === 'set' || method === 'getOrInsert') return [keyType, valueType];
+    if (method === 'getOrInsertComputed') return [keyType];
   }
   if (receiverType === '*regexp.Regexp' && (method === 'test' || method === 'exec')) return ['string'];
   if (receiverType?.startsWith('[]') && method === 'push') {
@@ -23420,12 +23815,12 @@ const generatorYieldsInferring = new Set<AstNode>();
 function getGeneratorYieldType(fn: AstNode): string {
   // (a function expression's slot type — let tokenize: (text) => Generator<T> — names it too)
   const contextualReturn = !fn.type && isFunctionExpression(fn) ? resolveTypeNode(getContextualFunctionType(fn)?.type) : undefined;
-  if (contextualReturn && isTypeReferenceNode(contextualReturn) && isIdentifier(contextualReturn.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator'].includes(contextualReturn.typeName.text) && (contextualReturn.typeArguments ?? []).length > 0) {
+  if (contextualReturn && isTypeReferenceNode(contextualReturn) && isIdentifier(contextualReturn.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator', 'AsyncGenerator', 'AsyncIterableIterator', 'AsyncIterable'].includes(contextualReturn.typeName.text) && (contextualReturn.typeArguments ?? []).length > 0) {
     const annotated = getType(contextualReturn.typeArguments[0]);
     if (annotated && annotated !== ':') return annotated;
   }
   // (an annotation Generator<T> / Iterable<T> / Iterator<T> names it)
-  if (fn.type && isTypeReferenceNode(fn.type) && isIdentifier(fn.type.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator'].includes(fn.type.typeName.text) && (fn.type.typeArguments ?? []).length > 0) {
+  if (fn.type && isTypeReferenceNode(fn.type) && isIdentifier(fn.type.typeName) && ['Generator', 'IterableIterator', 'Iterable', 'Iterator', 'AsyncGenerator', 'AsyncIterableIterator', 'AsyncIterable'].includes(fn.type.typeName.text) && (fn.type.typeArguments ?? []).length > 0) {
     const annotated = getType(fn.type.typeArguments[0]);
     if (annotated && annotated !== ':') return annotated;
   }
@@ -25121,6 +25516,7 @@ const helperRequires: Record<string, string[]> = {
   regexMatch: ['strIndex'],
   stringSearch: ['strIndex'],
   classes: ['dynamic', 'error', 'orderedMap', 'decorators'],
+  domException: ['error', 'dynamic'],
   arraySubclass: ['dynamic', 'classes'],
   moduleUrl: ['pathToFileURL'],
   timerWait: ['eventLoop'],
@@ -25824,6 +26220,8 @@ registerTls(nodeRegistry);
 registerHttp(nodeRegistry);
 registerDgram(nodeRegistry);
 registerSqlite(nodeRegistry);
+registerWebAssembly(nodeRegistry);
+registerWasi(nodeRegistry);
 registerWebview(nodeRegistry);
 registerFetch(nodeRegistry);
 registerStreamWeb(nodeRegistry);
@@ -25832,6 +26230,7 @@ registerTest(nodeRegistry);
 registerWorkerThreads(nodeRegistry);
 registerCluster(nodeRegistry);
 registerHttp2(nodeRegistry);
+registerWebSocket(nodeRegistry);
 registerSystemExtra(nodeRegistry);
 registerModuleV8(nodeRegistry);
 
@@ -25850,7 +26249,7 @@ const helperPackages: Record<string, string[]> = {
   isArray: ['reflect'],
   iterators: [],
   weakRefs: ['weak', 'runtime', 'sync'],
-  builtins: ['math', 'strconv', 'strings', 'math/big'],
+  builtins: ['math', 'strconv', 'strings', 'math/big', 'unicode'],
   date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
   dynamic: ['math', 'strings', 'fmt', 'sort', 'reflect', 'strconv', 'regexp', 'unsafe', 'time', 'sync', 'sync/atomic', 'weak', 'runtime'],
   classes: ['reflect'],
@@ -25872,14 +26271,14 @@ const helperPackages: Record<string, string[]> = {
   fancyRegex: ['regexp', 'strings', 'strconv', 'unicode/utf8', 'sync/atomic'],
   regexEngine: ['strings', 'fmt', 'strconv', 'sync', 'sync/atomic', 'unicode', 'unicode/utf8'],
   namedGroups: ['regexp', 'unicode/utf8'],
-  regexMatch: ['regexp', 'math', 'strconv', 'unsafe', 'unicode/utf8'],
+  regexMatch: ['regexp', 'math', 'strconv', 'strings', 'unsafe', 'unicode/utf8'],
   strIndex: ['unicode/utf8', 'sync', 'sync/atomic', 'unsafe', 'math', 'strings', 'sort'],
   jsReplacement: ['strings'],
   moduleUrl: ['os'],
   asyncWait: [],
   timerWait: ['sort', 'sync', 'sync/atomic', 'time'],
   clock: ['time'],
-  eventLoop: ['sync', 'sync/atomic', 'time'],
+  eventLoop: ['os', 'runtime', 'sync', 'sync/atomic', 'time', 'fmt'],
   uri: ['strings', 'fmt', 'net/url'],
   promiseAll: ['reflect'],
   promise: ['sync', 'reflect'],
@@ -26049,6 +26448,20 @@ func TnIterFirst[T any](items []T) *TnIterResult[T] {
 func TnIterNext[T any](ch chan T) *TnIterResult[T] {
 	v, ok := <-ch
 	return &TnIterResult[T]{value: v, done: !ok}
+}
+
+// Iterator.concat(a, b, …): each iterable's values in turn
+func TnIterConcat[T any](chs ...chan T) chan T {
+	ch := make(chan T)
+	go func() {
+		defer close(ch)
+		for _, src := range chs {
+			for v := range src {
+				ch <- v
+			}
+		}
+	}()
+	return ch
 }
 
 // Iterator.from(array)
@@ -26264,6 +26677,310 @@ func TnToExponential(x float64, digits float64, hasDigits bool) string {
 		exponent = "0"
 	}
 	return mantissa + "e" + sign + exponent
+}
+
+// localeCompare / toLocaleString without locale data: the root collation
+// (CLDR) approximated — spaces and punctuation, then digits, then letters;
+// accents and case only break ties — and en-US number formatting
+
+// Latin-1 and Latin Extended-A letters (U+00C0–U+017F) as their base letter ('.': none)
+const tnLatinBase = "AAAAAA.CEEEEIIIIDNOOOOO.OUUUUY..aaaaaa.ceeeeiiiidnooooo.ouuuuy.yAaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIi..JjKkkLlLlLlLlLlNnNnNnn..OoOoOo..RrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs"
+
+type tnCollationUnit struct {
+	class     int    // 1 space / punctuation, 2 digits, 3 letters and the rest
+	primary   rune   // the base letter, lowercased
+	digits    string // a run of digits (numeric collation)
+	secondary rune   // the accented letter (0: none)
+	upper     bool
+}
+
+func tnCollationUnits(s string, numeric bool, ignorePunctuation bool) []tnCollationUnit {
+	units := make([]tnCollationUnit, 0, len(s))
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if numeric && r >= '0' && r <= '9' {
+			j := i
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+			digits := strings.TrimLeft(string(runes[i:j]), "0")
+			units = append(units, tnCollationUnit{class: 2, digits: digits})
+			i = j - 1
+			continue
+		}
+		base, accent := r, rune(0)
+		if r >= 0xc0 && r <= 0x17f {
+			if b := tnLatinBase[r-0xc0]; b != '.' {
+				base, accent = rune(b), r
+			}
+		}
+		unit := tnCollationUnit{class: 3, primary: unicode.ToLower(base), secondary: accent, upper: unicode.IsUpper(base)}
+		switch {
+		case unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r):
+			if ignorePunctuation {
+				continue
+			}
+			unit.class = 1
+		case unicode.IsDigit(r):
+			unit.class = 2
+			unit.digits = string(r)
+		}
+		units = append(units, unit)
+	}
+	return units
+}
+
+func tnCollationSign(n int) float64 {
+	if n < 0 {
+		return -1
+	}
+	if n > 0 {
+		return 1
+	}
+	return 0
+}
+
+// a.localeCompare(b, locales, { sensitivity, numeric, caseFirst, ignorePunctuation })
+func TnLocaleCompare(a string, b string, options interface{}) float64 {
+	sensitivity, caseFirst := "variant", "false"
+	numeric, ignorePunctuation := false, false
+	if options != nil {
+		if v, ok := TnGetValue(options, "sensitivity").(string); ok {
+			sensitivity = v
+		}
+		if v, ok := TnGetValue(options, "caseFirst").(string); ok {
+			caseFirst = v
+		}
+		numeric = TnTruthy(TnGetValue(options, "numeric"))
+		ignorePunctuation = TnTruthy(TnGetValue(options, "ignorePunctuation"))
+	}
+	ua := tnCollationUnits(a, numeric, ignorePunctuation)
+	ub := tnCollationUnits(b, numeric, ignorePunctuation)
+	// primary: base letters, digits, punctuation
+	for i := 0; i < len(ua) && i < len(ub); i++ {
+		x, y := ua[i], ub[i]
+		if x.class != y.class {
+			return tnCollationSign(x.class - y.class)
+		}
+		if x.class == 2 {
+			if len(x.digits) != len(y.digits) && numeric {
+				return tnCollationSign(len(x.digits) - len(y.digits))
+			}
+			if c := strings.Compare(x.digits, y.digits); c != 0 {
+				return float64(c)
+			}
+			continue
+		}
+		if x.primary != y.primary {
+			return tnCollationSign(int(x.primary) - int(y.primary))
+		}
+	}
+	if len(ua) != len(ub) {
+		return tnCollationSign(len(ua) - len(ub))
+	}
+	// secondary: accents (an unaccented letter first)
+	if sensitivity == "accent" || sensitivity == "variant" {
+		for i := range ua {
+			if ua[i].secondary != ub[i].secondary {
+				return tnCollationSign(int(ua[i].secondary) - int(ub[i].secondary))
+			}
+		}
+	}
+	// tertiary: case (lowercase first unless caseFirst is "upper")
+	if sensitivity == "case" || sensitivity == "variant" {
+		for i := range ua {
+			if ua[i].upper != ub[i].upper {
+				if ua[i].upper == (caseFirst == "upper") {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+// n.toLocaleString(locales, options): en-US grouping and digits
+func TnNumberLocale(x float64, options interface{}) string {
+	if math.IsNaN(x) {
+		return "NaN"
+	}
+	if math.IsInf(x, 0) {
+		if x < 0 {
+			return "-∞"
+		}
+		return "∞"
+	}
+	minFD, maxFD := -1, -1
+	grouping := true
+	prefix, suffix := "", ""
+	style := "decimal"
+	if options != nil {
+		if v, ok := TnGetValue(options, "style").(string); ok {
+			style = v
+		}
+		if v, ok := TnGetValue(options, "minimumFractionDigits").(float64); ok {
+			minFD = int(v)
+		}
+		if v, ok := TnGetValue(options, "maximumFractionDigits").(float64); ok {
+			maxFD = int(v)
+		}
+		if v := TnGetValue(options, "useGrouping"); v != nil && !TnTruthy(v) {
+			grouping = false
+		}
+	}
+	defaultMin, defaultMax := 0, 3
+	switch style {
+	case "percent":
+		x *= 100
+		defaultMax = 0
+		suffix = "%"
+	case "currency":
+		code, _ := TnGetValue(options, "currency").(string)
+		code = strings.ToUpper(code)
+		symbols := map[string]string{"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "INR": "₹", "CNY": "CN¥", "CAD": "CA$", "AUD": "A$"}
+		if sym, ok := symbols[code]; ok {
+			prefix = sym
+		} else {
+			prefix = code + " "
+		}
+		defaultMin, defaultMax = 2, 2
+		if code == "JPY" {
+			defaultMin, defaultMax = 0, 0
+		}
+	}
+	if minFD < 0 {
+		minFD = defaultMin
+	}
+	if maxFD < 0 {
+		maxFD = max(defaultMax, minFD)
+	}
+	negative := x < 0 || (x == 0 && math.Signbit(x))
+	digits := TnToFixed(math.Abs(x), float64(maxFD))
+	intPart, frac, _ := strings.Cut(digits, ".")
+	frac = strings.TrimRight(frac, "0")
+	for len(frac) < minFD {
+		frac += "0"
+	}
+	if grouping && len(intPart) > 3 {
+		var b strings.Builder
+		lead := len(intPart) % 3
+		if lead > 0 {
+			b.WriteString(intPart[:lead])
+		}
+		for i := lead; i < len(intPart); i += 3 {
+			if b.Len() > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(intPart[i : i+3])
+		}
+		intPart = b.String()
+	}
+	out := prefix + intPart
+	if frac != "" {
+		out += "." + frac
+	}
+	out += suffix
+	if negative {
+		out = "-" + out
+	}
+	return out
+}
+
+// RegExp.escape(s): s as a pattern matching itself literally
+func TnRegExpEscape(s string) string {
+	var b strings.Builder
+	hex := func(c rune) {
+		h := strconv.FormatInt(int64(c), 16)
+		if c <= 0xff {
+			b.WriteString("\\\\x")
+			if len(h) < 2 {
+				b.WriteByte('0')
+			}
+		} else {
+			b.WriteString("\\\\u")
+			b.WriteString(strings.Repeat("0", max(0, 4-len(h))))
+		}
+		b.WriteString(h)
+	}
+	for i, c := range s {
+		switch {
+		case i == 0 && (c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'):
+			hex(c)
+		case strings.ContainsRune("^$\\\\.*+?()[]{}|/", c):
+			b.WriteByte('\\\\')
+			b.WriteRune(c)
+		case strings.ContainsRune(",-=<>#&!%:;@~'\\x60\\"", c):
+			hex(c)
+		case c == '\\t':
+			b.WriteString("\\\\t")
+		case c == '\\n':
+			b.WriteString("\\\\n")
+		case c == '\\v':
+			b.WriteString("\\\\v")
+		case c == '\\f':
+			b.WriteString("\\\\f")
+		case c == '\\r':
+			b.WriteString("\\\\r")
+		case c == ' ' || c == 0xa0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000 || c == 0xfeff:
+			hex(c)
+		default:
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// Math.f16round / Float16Array: a float64 rounded (to nearest, ties to even)
+// to an IEEE 754 binary16, as its bits
+func TnF64ToF16(x float64) uint16 {
+	sign := uint16(math.Float64bits(x)>>48) & 0x8000
+	if math.IsNaN(x) {
+		return 0x7e00
+	}
+	a := math.Abs(x)
+	if a >= 65520 {
+		return sign | 0x7c00
+	}
+	if a < 1.0/16384 {
+		return sign | uint16(math.RoundToEven(a*16777216))
+	}
+	frac, exp := math.Frexp(a)
+	e := exp - 1
+	m := math.RoundToEven((frac*2 - 1) * 1024)
+	if m == 1024 {
+		m = 0
+		e++
+	}
+	if e > 15 {
+		return sign | 0x7c00
+	}
+	return sign | uint16(e+15)<<10 | uint16(m)
+}
+
+// The float64 value of binary16 bits
+func TnF16ToF64(h uint16) float64 {
+	sign := 1.0
+	if h&0x8000 != 0 {
+		sign = -1
+	}
+	exp := int(h>>10) & 0x1f
+	m := float64(h & 0x3ff)
+	switch exp {
+	case 0:
+		return sign * math.Ldexp(m, -24)
+	case 31:
+		if m == 0 {
+			return math.Inf(int(sign))
+		}
+		return math.NaN()
+	}
+	return sign * math.Ldexp(1024+m, exp-25)
+}
+
+func TnF16Round(x float64) float64 {
+	return TnF16ToF64(TnF64ToF16(x))
 }
 
 // Math.sumPrecise: Neumaier-compensated sum
@@ -27804,6 +28521,13 @@ var tnDynamicPromiseMethod func(p reflect.Value, name string, args []interface{}
 func TnCallMember(obj interface{}, name string, args ...interface{}) interface{} {
 	// a Map / Set's methods (Get, Set, Has … on the ordered map)
 	if kind, ok := obj.(interface{ TnJSKind() uint8 }); ok {
+		// (a plain object's own function property named add / get / set …:
+		// a WebAssembly instance's exports, a record of callbacks)
+		if kind.TnJSKind() == 0 {
+			if fn := TnGet(obj, name); fn != nil && reflect.ValueOf(fn).Kind() == reflect.Func {
+				return TnCallValue(fn, args...)
+			}
+		}
 		if v, handled := tnCallCollection(obj, kind.TnJSKind() == 2, name, args); handled {
 			return v
 		}
@@ -28020,6 +28744,18 @@ func tnCallCollection(obj interface{}, isSet bool, name string, args []interface
 		return call("Get", arg(0)), true
 	case "has":
 		return call("Has", arg(0)), true
+	case "getOrInsert":
+		if call("Has", arg(0)).(bool) {
+			return call("Get", arg(0)), true
+		}
+		call("Set", arg(0), arg(1))
+		return call("Get", arg(0)), true
+	case "getOrInsertComputed":
+		if call("Has", arg(0)).(bool) {
+			return call("Get", arg(0)), true
+		}
+		call("Set", arg(0), TnCallValue(arg(1), arg(0)))
+		return call("Get", arg(0)), true
 	case "delete":
 		return call("Delete", arg(0)), true
 	case "clear":
@@ -28816,6 +29552,8 @@ func TnJSString(v interface{}) string {
 		return "null"
 	}
 	switch x := v.(type) {
+	case interface{ TnToPrimitive(string) interface{} }:
+		return TnJSString(x.TnToPrimitive("string"))
 	case interface{ TnToString() string }:
 		return x.TnToString()
 	case time.Time:
@@ -28950,6 +29688,9 @@ func TnObjectTypeTag(v interface{}) string {
 	if v == nil {
 		return "[object Undefined]"
 	}
+	if t, ok := v.(interface{ TnToStringTag() string }); ok {
+		return "[object " + t.TnToStringTag() + "]"
+	}
 	if v == TnNull {
 		return "[object Null]"
 	}
@@ -28996,6 +29737,8 @@ func TnNumber(v interface{}) float64 {
 	switch t := v.(type) {
 	case float64:
 		return t
+	case interface{ TnToPrimitive(string) interface{} }:
+		return TnNumber(t.TnToPrimitive("number"))
 	case *tnNullValue:
 		return 0
 	case bool:
@@ -29486,6 +30229,16 @@ func TnConcat(v interface{}, others ...interface{}) interface{} {
 	for _, o := range others {
 		if items, ok := o.([]interface{}); ok {
 			result = append(result, items...)
+		} else if p, ok := o.(*[]interface{}); ok && p != nil {
+			result = append(result, (*p)...)
+		} else if rv := reflect.ValueOf(o); o != nil && (rv.Kind() == reflect.Slice || (rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice)) && rv.Type() != reflect.TypeOf([]byte(nil)) {
+			// (a typed array argument — string[], number[] — is spread too)
+			if rv.Kind() == reflect.Pointer {
+				rv = rv.Elem()
+			}
+			for i := 0; i < rv.Len(); i++ {
+				result = append(result, rv.Index(i).Interface())
+			}
 		} else {
 			result = append(result, o)
 		}
@@ -33632,6 +34385,25 @@ func (m *TnMap[K, V]) TnSetProp(key string, value interface{}) bool {
 	return true
 }
 
+// m.getOrInsert(k, v): the entry's value, v stored first when k is missing
+func (m *TnMap[K, V]) GetOrInsert(k K, v V) V {
+	if old, ok := m.read(k); ok {
+		return old
+	}
+	m.Set(k, v)
+	return v
+}
+
+// m.getOrInsertComputed(k, fn): fn(k) runs (and is stored) only when k is missing
+func (m *TnMap[K, V]) GetOrInsertComputed(k K, fn func(K) V) V {
+	if old, ok := m.read(k); ok {
+		return old
+	}
+	v := fn(k)
+	m.Set(k, v)
+	return v
+}
+
 func (m *TnMap[K, V]) Lookup(k K) (V, bool) {
 	if m == nil {
 		var zero V
@@ -33936,6 +34708,59 @@ func tnMatchTag(groups []string, s string, lo int) {
 	hidden[n], hidden[n+1] = tnMatchMark, s[:lo]
 }
 
+// A /d match: its groups copied with two more hidden slots, a mark and each
+// group's code point [start, end] ("-1:-1" for a group that did not take part)
+var tnIndicesMark = "\\x00indices:"
+
+func tnMatchWithIndices(groups []string, s string, caps []int) []string {
+	n := len(groups)
+	out := make([]string, n, n+4)
+	copy(out, groups)
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		a, z := -1, -1
+		if 2*i+1 < len(caps) && caps[2*i] >= 0 && caps[2*i+1] >= caps[2*i] {
+			a, z = tnStrRune(s, caps[2*i]), tnStrRune(s, caps[2*i+1])
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(a))
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(z))
+	}
+	hidden := out[:n+4]
+	hidden[n], hidden[n+1] = tnMatchMark, s[:caps[0]]
+	hidden[n+2], hidden[n+3] = tnIndicesMark, b.String()
+	return out
+}
+
+// m.indices: each group's [start, end] (nil for one that did not take part);
+// nil when m is not a /d match
+func TnMatchIndices(m []string) [][]float64 {
+	n := len(m)
+	if cap(m) < n+4 {
+		return nil
+	}
+	hidden := m[:n+4]
+	if unsafe.StringData(hidden[n+2]) != unsafe.StringData(tnIndicesMark) {
+		return nil
+	}
+	out := make([][]float64, n)
+	for i, pair := range strings.Split(hidden[n+3], ",") {
+		if i >= n {
+			break
+		}
+		a, z, _ := strings.Cut(pair, ":")
+		start, _ := strconv.Atoi(a)
+		end, _ := strconv.Atoi(z)
+		if start >= 0 {
+			out[i] = []float64{float64(start), float64(end)}
+		}
+	}
+	return out
+}
+
 // The groups of the match at loc, with their hidden slots
 func tnMatchGroups(s string, loc []int) []string {
 	n := len(loc) / 2
@@ -34116,13 +34941,15 @@ type TnRegex struct {
 	lastIndex float64
 	global    bool
 	sticky    bool
-	source    string
-	flags     string
-	site      *TnRegexSite
+	// /d: matches record their groups' [start, end] (m.indices)
+	indices bool
+	source  string
+	flags   string
+	site    *TnRegexSite
 }
 
 func TnRegexCompile(pattern string, flags string, source string) *TnRegex {
-	return &TnRegex{vm: true, global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), source: source, flags: flags, pattern: pattern}
+	return &TnRegex{vm: true, global: strings.Contains(flags, "g"), sticky: strings.Contains(flags, "y"), indices: strings.Contains(flags, "d"), source: source, flags: flags, pattern: pattern}
 }
 
 // A regex literal's site. Each evaluation of the literal is a new RegExp
@@ -34531,6 +35358,11 @@ func (r *TnRegex) matchAt(s string, start int, sticky bool, want bool) ([]string
 			var groups []string
 			if want && lo >= 0 {
 				groups = m.groups(p.ncaps/2, lo, hi)
+				if r.indices {
+					caps := append([]int{}, m.caps[:p.ncaps]...)
+					caps[0], caps[1] = lo, hi
+					groups = tnMatchWithIndices(groups, s, caps)
+				}
 			}
 			tnRxRelease(m)
 			return groups, lo, hi
@@ -34558,6 +35390,9 @@ func (r *TnRegex) matchAt(s string, start int, sticky bool, want bool) ([]string
 	}
 	if !want {
 		return nil, loc[0], loc[1]
+	}
+	if r.indices {
+		return tnMatchWithIndices(tnMatchGroups(s, loc), s, loc), loc[0], loc[1]
 	}
 	return tnMatchGroups(s, loc), loc[0], loc[1]
 }
@@ -34603,6 +35438,46 @@ func (r *TnRegex) find(s string, want bool) ([]string, int, int) {
 	return groups, lo, hi
 }`,
   regexEngine: REGEX_ENGINE_HELPER,
+  domException: `// new DOMException(message, name | { name, cause })
+func TnNewDOMException(message string, options interface{}) *TnError {
+	name := "Error"
+	var cause interface{}
+	hasCause := false
+	switch o := options.(type) {
+	case nil:
+	case string:
+		name = o
+	default:
+		if n, ok := TnGetValue(o, "name").(string); ok {
+			name = n
+		}
+		if TnHas(o, "cause") {
+			cause, hasCause = TnGetValue(o, "cause"), true
+		}
+	}
+	e := TnNodeError(name, "", message)
+	e.dom = true
+	e.props["code"] = tnDOMExceptionCodes[name]
+	if hasCause {
+		e.props["cause"] = cause
+	}
+	return e
+}
+
+// new QuotaExceededError(message, { quota, requested })
+func TnNewQuotaExceededError(message string, options interface{}) *TnError {
+	e := TnNewDOMException(message, "QuotaExceededError")
+	e.props["quota"], e.props["requested"] = nil, nil
+	if options != nil {
+		if q, ok := TnGetValue(options, "quota").(float64); ok {
+			e.props["quota"] = q
+		}
+		if r, ok := TnGetValue(options, "requested").(float64); ok {
+			e.props["requested"] = r
+		}
+	}
+	return e
+}`,
   objectAssignTo: `// Object.assign(target, ...sources) on a typed target (a struct or a Map):
 // each source's properties are set on the target's fields / entries, and the
 // target is the result. Unset (nil) fields of a struct source count as absent;
@@ -35200,6 +36075,8 @@ type TnError struct {
 	props   map[string]interface{}
 	goErr   error
 	pcs     []uintptr // where the error was created (err.stack)
+	// a DOMException (instanceof DOMException; its code is the legacy number)
+	dom bool
 }
 
 func (e *TnError) Error() string { return e.message }
@@ -35254,7 +36131,19 @@ func TnIsErrorOf(v interface{}, name string) bool {
 		return ok
 	}
 	e, ok := v.(*TnError)
+	if name == "DOMException" {
+		return ok && e.dom
+	}
 	return ok && e.Get_name() == name
+}
+
+// DOMException's legacy numeric codes, by name
+var tnDOMExceptionCodes = map[string]float64{
+	"IndexSizeError": 1, "HierarchyRequestError": 3, "WrongDocumentError": 4, "InvalidCharacterError": 5,
+	"NoModificationAllowedError": 7, "NotFoundError": 8, "NotSupportedError": 9, "InvalidStateError": 11,
+	"SyntaxError": 12, "InvalidModificationError": 13, "NamespaceError": 14, "InvalidAccessError": 15,
+	"TypeMismatchError": 17, "SecurityError": 18, "NetworkError": 19, "AbortError": 20, "URLMismatchError": 21,
+	"QuotaExceededError": 22, "TimeoutError": 23, "InvalidNodeTypeError": 24, "DataCloneError": 25,
 }
 
 // A Node error: name ('TypeError', 'AssertionError'), code and message
@@ -35360,6 +36249,12 @@ func (e *TnError) Get_errno() float64 {
 }
 
 func (e *TnError) Get_cause() interface{} { return e.prop("cause") }
+
+// A DOMException's legacy numeric code (0 for a name without one)
+func (e *TnError) Get_domCode() float64 {
+	n, _ := e.prop("code").(float64)
+	return n
+}
 
 func (e *TnError) Get_hostname() string {
 	s, _ := e.prop("hostname").(string)
@@ -35873,7 +36768,20 @@ func TnTimeNow() time.Time {
 	}
 	return time.Now()
 }`,
-  eventLoop: `// The event loop. JS runs one thing at a time: whoever holds the
+  eventLoop: `// The event loop.
+var tnIdleDebugCount int32
+
+func tnWatchdogInit() {
+	go func() {
+		time.Sleep(9 * time.Second)
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		fmt.Println("WATCHDOG DUMP")
+		fmt.Println(string(buf[:n]))
+		os.Exit(9)
+	}()
+}
+// JS runs one thing at a time: whoever holds the
 // baton (main, a loop task, a running async function body) runs JS code; the
 // others wait. An await runs pending loop tasks, then hands the baton over
 // while it waits. Callbacks from timers, I/O and other goroutines are posted
@@ -35896,18 +36804,67 @@ type TnAsyncContext map[interface{}]interface{}
 
 var tnAsyncCtx TnAsyncContext
 
-func TnAsyncSnapshot() TnAsyncContext { return tnAsyncCtx }
+// Async ids (node:async_hooks executionAsyncId / createHook): tracked only
+// when a program asks for them; each snapshot is then a new async resource
+// whose id the context carries to the callback that runs in it
+type tnAsyncIDKey struct{}
+
+var tnAsyncHooksOn bool
+var tnAsyncNextID float64 = 1
+var tnAsyncCurID, tnAsyncCurTrigger float64 = 1, 0
+var tnAsyncHookInit func(id float64, trigger float64)
+var tnAsyncHookBefore, tnAsyncHookAfter func(id float64)
+
+func TnAsyncSnapshot() TnAsyncContext {
+	if !tnAsyncHooksOn {
+		return tnAsyncCtx
+	}
+	return tnAsyncSnapshotIDs()
+}
+
+func tnAsyncSnapshotIDs() TnAsyncContext {
+	tnAsyncNextID++
+	id := tnAsyncNextID
+	ctx := TnAsyncContext{}
+	for k, v := range tnAsyncCtx {
+		ctx[k] = v
+	}
+	ctx[tnAsyncIDKey{}] = [2]float64{id, tnAsyncCurID}
+	if tnAsyncHookInit != nil {
+		tnAsyncHookInit(id, tnAsyncCurID)
+	}
+	return ctx
+}
 
 // Runs fn with ctx as the current context, restoring the previous one afterwards
 func TnAsyncRun(ctx TnAsyncContext, fn func()) {
 	saved := tnAsyncCtx
 	tnAsyncCtx = ctx
 	defer func() { tnAsyncCtx = saved }()
+	if tnAsyncHooksOn {
+		if ids, ok := ctx[tnAsyncIDKey{}].([2]float64); ok {
+			prevID, prevTrigger := tnAsyncCurID, tnAsyncCurTrigger
+			tnAsyncCurID, tnAsyncCurTrigger = ids[0], ids[1]
+			if tnAsyncHookBefore != nil {
+				tnAsyncHookBefore(ids[0])
+			}
+			defer func() {
+				if tnAsyncHookAfter != nil {
+					tnAsyncHookAfter(ids[0])
+				}
+				tnAsyncCurID, tnAsyncCurTrigger = prevID, prevTrigger
+			}()
+		}
+	}
 	fn()
 }
 
 // fn bound to the current context (no-op when there is none to keep)
 func TnAsyncWrap(fn func()) func() {
+	if tnAsyncHooksOn {
+		ctx := tnAsyncSnapshotIDs()
+		return func() { TnAsyncRun(ctx, fn) }
+	}
 	ctx := tnAsyncCtx
 	if ctx == nil {
 		return fn
@@ -36079,7 +37036,15 @@ func tnLoopIdle() bool {
 	defer tnLoopMu.Unlock()
 	tnMicrotasksMu.Lock()
 	defer tnMicrotasksMu.Unlock()
-	return len(tnLoopTasks) == 0 && len(tnMicrotasks) == 0 && atomic.LoadInt64(&tnLoopRefs) <= 0
+	refs := atomic.LoadInt64(&tnLoopRefs)
+	tnIdleDebugCount++
+	if len(tnLoopTasks) == 0 && len(tnMicrotasks) == 0 && refs > 0 && tnIdleDebugCount%50 == 40 {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		fmt.Println("IDLEBLOCK refs:", refs)
+		fmt.Println(string(buf[:n]))
+	}
+	return len(tnLoopTasks) == 0 && len(tnMicrotasks) == 0 && refs <= 0
 }
 
 // (loop goroutine, waiting) Tasks or microtasks are queued, or nothing keeps
@@ -36790,10 +37755,16 @@ func TnReject[T any](ch chan T, reason interface{}) {
 // unless process.on('unhandledRejection') takes it
 var tnUnhandledHook func(reason interface{}) bool
 
+// Promises util.markPromiseAsHandled marked: their rejection is not reported
+var tnHandledPromises sync.Map
+
 func TnDetach[T any](ch chan T) {
 	go func() {
 		defer __tnWaitGroup.Done()
 		_, reason, rejected := tnSettle(ch)
+		if _, handled := tnHandledPromises.Load(any(ch)); handled {
+			return
+		}
 		if rejected {
 			TnLoopCall(func() {
 				if tnUnhandledHook != nil && tnUnhandledHook(reason) {
@@ -37031,6 +38002,70 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 	return out
 }
 
+// Array.fromAsync over an async iterable (a channel): its values, in order.
+// It runs as an async function does (TnStartAsync): generator channels are
+// fed by raw sends, received with the baton like for await's
+func TnFromAsyncChan[T any](ch chan T) chan []T {
+	out := make(chan []T, 1)
+	TnStartAsync(func() {
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		results := []T{}
+		for {
+			v, ok := tnRawReceive(ch)
+			if !ok {
+				if reason, rejected := tnRejections.Load(ch); rejected {
+					panic(reason)
+				}
+				break
+			}
+			results = append(results, v)
+		}
+		TnAsyncSend(out, results)
+	})
+	return out
+}
+
+// Array.fromAsync over plain values: resolved with a copy of them
+func TnFromAsyncValues[T any](values []T) chan []T {
+	out := make(chan []T, 1)
+	out <- append([]T{}, values...)
+	close(out)
+	return out
+}
+
+// Array.fromAsync(source, mapFn): the collected values mapped in turn
+func TnFromAsyncMap[T, U any](src chan []T, fn func(T, float64) U) chan []U {
+	out := make(chan []U, 1)
+	TnStartAsync(func() {
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		values := TnAwait(src)
+		results := make([]U, len(values))
+		for i, v := range values {
+			results[i] = fn(v, float64(i))
+		}
+		TnAsyncSend(out, results)
+	})
+	return out
+}
+
+// Array.fromAsync(source, async mapFn): each mapped promise awaited in turn
+func TnFromAsyncMapAwait[T, U any](src chan []T, fn func(T, float64) chan U) chan []U {
+	out := make(chan []U, 1)
+	TnStartAsync(func() {
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		values := TnAwait(src)
+		results := make([]U, len(values))
+		for i, v := range values {
+			results[i] = TnAwait(fn(v, float64(i)))
+		}
+		TnAsyncSend(out, results)
+	})
+	return out
+}
+
 // Promise.all: every channel drained in order, results collected
 func TnPromiseAll[T any](chs []chan T) chan []T {
 	out := make(chan []T, 1)
@@ -37238,6 +38273,18 @@ function resolveNodeKey(expr: AstNode): string {
     return nodeRegistry.namespaces[key] || key;
   }
   return '';
+}
+
+// x instanceof <Node class>: its Go type; error classes sharing *TnError
+// (AssertionError, WebAssembly.RuntimeError …) by name
+function nodeClassInstanceOf(left: AstNode, key: string): string {
+  const nodeClass = nodeRegistry.classes[key];
+  if (nodeClass.goType === '*TnError') {
+    useHelper('error');
+    return `TnIsErrorOf(${visit(left)}, ${toGoStringLiteral(key.slice(key.lastIndexOf('.') + 1))})`;
+  }
+  useNodeHelperDefining(nodeClass.goType);
+  return `func() bool { _, ok := interface{}(${visit(left)}).(${nodeClass.goType}); return ok }()`;
 }
 
 // The promise variant of a Node function, '' when it has none

@@ -183,6 +183,29 @@ func TnReadDirents(dir string, recursive bool) []*TnDirent {
 	return tnReadDirEntries(dir, recursive)
 }
 
+// readFileSync(path, { buffer }): the file read into the given buffer (its
+// leading bytes, a view of the same memory)
+func TnReadFileInto(path string, options interface{}) []byte {
+	buf, _ := TnGetValue(options, "buffer").([]byte)
+	data := TnReadFileBytes(path)
+	if len(buf) < len(data) {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.buffer.byteLength' is smaller than the file size of "+strconv.Itoa(len(data))+" bytes. Received "+strconv.Itoa(len(buf))))
+	}
+	n := copy(buf, data)
+	return buf[:n]
+}
+
+// An options object's AbortSignal, already aborted: its reason is thrown
+func TnFsCheckSignal(options interface{}) {
+	if options == nil {
+		return
+	}
+	signal := TnGetValue(options, "signal")
+	if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+		panic(TnGetValue(signal, "reason"))
+	}
+}
+
 // readdirSync names; recursive names are relative to dir
 func TnReadDirNames(dir string, recursive bool) []string {
 	names := []string{}
@@ -646,6 +669,222 @@ export function readResultType(call, index) {
         return encodingOf(node) ? 'string' : '[]byte';
     return call.types[index] === 'string' ? 'string' : '[]byte';
 }
+const statfsHelper = `// fs.statfs: the file system holding path
+type TnStatFs struct {
+	type_  float64
+	bsize  float64
+	frsize float64
+	blocks float64
+	bfree  float64
+	bavail float64
+	files  float64
+	ffree  float64
+}
+
+func (s *TnStatFs) Get_type_() float64 { return s.type_ }
+
+func TnStatfs(path string) *TnStatFs {
+	s, err := tnStatfsOS(path)
+	tnFsCheck(err, "statfs", path)
+	return s
+}`;
+const statfsOSHelpers = {
+    linux: `func tnStatfsOS(path string) (*TnStatFs, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return nil, err
+	}
+	return &TnStatFs{type_: float64(st.Type), bsize: float64(st.Bsize), frsize: float64(st.Frsize), blocks: float64(st.Blocks), bfree: float64(st.Bfree), bavail: float64(st.Bavail), files: float64(st.Files), ffree: float64(st.Ffree)}, nil
+}`,
+    bsd: `func tnStatfsOS(path string) (*TnStatFs, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return nil, err
+	}
+	return &TnStatFs{type_: float64(st.Type), bsize: float64(st.Bsize), frsize: float64(st.Bsize), blocks: float64(st.Blocks), bfree: float64(st.Bfree), bavail: float64(st.Bavail), files: float64(st.Files), ffree: float64(st.Ffree)}, nil
+}`,
+    windows: `func tnStatfsOS(path string) (*TnStatFs, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return nil, err
+	}
+	root := filepath.VolumeName(abs) + "\\\\"
+	p, err := syscall.UTF16PtrFromString(root)
+	if err != nil {
+		return nil, err
+	}
+	var sectorsPerCluster, bytesPerSector, freeClusters, totalClusters uint32
+	proc := syscall.NewLazyDLL("kernel32.dll").NewProc("GetDiskFreeSpaceW")
+	r, _, callErr := proc.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&sectorsPerCluster)), uintptr(unsafe.Pointer(&bytesPerSector)), uintptr(unsafe.Pointer(&freeClusters)), uintptr(unsafe.Pointer(&totalClusters)))
+	if r == 0 {
+		return nil, callErr
+	}
+	var freeToCaller, total, free uint64
+	procEx := syscall.NewLazyDLL("kernel32.dll").NewProc("GetDiskFreeSpaceExW")
+	procEx.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&freeToCaller)), uintptr(unsafe.Pointer(&total)), uintptr(unsafe.Pointer(&free)))
+	bsize := uint64(sectorsPerCluster) * uint64(bytesPerSector)
+	if bsize == 0 {
+		bsize = 4096
+	}
+	return &TnStatFs{bsize: float64(bsize), frsize: float64(bsize), blocks: float64(totalClusters), bfree: float64(freeClusters), bavail: float64(freeToCaller / bsize)}, nil
+}`,
+    other: `func tnStatfsOS(path string) (*TnStatFs, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return &TnStatFs{}, nil
+}`
+};
+const globHelper = `// fs.glob: the paths under cwd matching any pattern (minimatch syntax, as
+// path.matchesGlob), relative and with the platform's separators
+type tnGlobMatch struct {
+	rel   string
+	entry *TnDirent
+}
+
+func tnGlobPatterns(patterns interface{}) []string {
+	switch p := patterns.(type) {
+	case string:
+		return []string{p}
+	case []string:
+		return p
+	case []interface{}:
+		out := []string{}
+		for _, v := range p {
+			out = append(out, TnJSString(v))
+		}
+		return out
+	}
+	return nil
+}
+
+func tnGlob(patterns interface{}, options interface{}) []tnGlobMatch {
+	cwd := "."
+	maxDepth := -1
+	followSymlinks := false
+	var excludeFn interface{}
+	var excludeGlobs []string
+	if options != nil {
+		if c, ok := TnGetValue(options, "cwd").(string); ok && c != "" {
+			cwd = c
+		}
+		if d, ok := TnGetValue(options, "maxDepth").(float64); ok {
+			maxDepth = int(d)
+		}
+		followSymlinks = TnTruthy(TnGetValue(options, "followSymlinks"))
+		switch ex := TnGetValue(options, "exclude").(type) {
+		case nil:
+		case string, []string, []interface{}:
+			excludeGlobs = tnGlobPatterns(ex)
+		default:
+			excludeFn = ex
+		}
+	}
+	type compiled struct{ alts []*regexp.Regexp }
+	compile := func(globs []string) []compiled {
+		out := []compiled{}
+		for _, g := range globs {
+			g = strings.ReplaceAll(g, "\\\\", "/")
+			c := compiled{}
+			for _, alt := range tnExpandBraces(g) {
+				if re, err := regexp.Compile(tnGlobRegexp(alt, false)); err == nil {
+					c.alts = append(c.alts, re)
+				}
+			}
+			out = append(out, c)
+		}
+		return out
+	}
+	includes := compile(tnGlobPatterns(patterns))
+	excludes := compile(excludeGlobs)
+	matches := func(set []compiled, rel string) bool {
+		for _, c := range set {
+			for _, re := range c.alts {
+				if re.MatchString(rel) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	excluded := func(rel string, name string) bool {
+		if excludeFn != nil && (TnTruthy(TnInvoke(excludeFn, name)) || (rel != name && TnTruthy(TnInvoke(excludeFn, filepath.FromSlash(rel))))) {
+			return true
+		}
+		return matches(excludes, rel)
+	}
+	out := []tnGlobMatch{}
+	root, _ := filepath.Abs(cwd)
+	if matches(includes, ".") || matches(includes, "") {
+		if info, err := os.Stat(cwd); err == nil {
+			out = append(out, tnGlobMatch{rel: ".", entry: &TnDirent{name: filepath.Base(root), parentPath: filepath.Dir(root), path: filepath.Dir(root), mode: info.Mode().Type()}})
+		}
+	}
+	var walk func(dir string, relDir string, depth int)
+	walk = func(dir string, relDir string, depth int) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			rel := e.Name()
+			if relDir != "" {
+				rel = relDir + "/" + e.Name()
+			}
+			if excluded(rel, e.Name()) {
+				continue
+			}
+			mode := e.Type()
+			isDir := e.IsDir()
+			if mode&fs.ModeSymlink != 0 && followSymlinks {
+				if info, err := os.Stat(filepath.Join(dir, e.Name())); err == nil && info.IsDir() {
+					isDir = true
+				}
+			}
+			if (maxDepth < 0 || depth <= maxDepth) && matches(includes, rel) {
+				out = append(out, tnGlobMatch{rel: filepath.FromSlash(rel), entry: &TnDirent{name: e.Name(), parentPath: dir, path: dir, mode: mode}})
+			}
+			if isDir && (maxDepth < 0 || depth < maxDepth) {
+				walk(filepath.Join(dir, e.Name()), rel, depth+1)
+			}
+		}
+	}
+	walk(cwd, "", 1)
+	return out
+}
+
+func TnGlobSync(patterns interface{}, options ...interface{}) []string {
+	var opts interface{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	out := []string{}
+	for _, m := range tnGlob(patterns, opts) {
+		out = append(out, m.rel)
+	}
+	return out
+}
+
+func TnGlobDirentsSync(patterns interface{}, options interface{}) []*TnDirent {
+	out := []*TnDirent{}
+	for _, m := range tnGlob(patterns, options) {
+		out = append(out, m.entry)
+	}
+	return out
+}
+
+// fs/promises glob: an async iterable of the matches
+func TnGlobIter[T any](matches []T) chan T {
+	ch := make(chan T, len(matches))
+	for _, m := range matches {
+		ch <- m
+	}
+	close(ch)
+	return ch
+}`;
 const FS_CONSTANTS = {
     F_OK: 0,
     R_OK: 4,
@@ -671,6 +910,14 @@ export function registerFs(r) {
     defineHelper(r, 'uvErrno', [], ['uvErrnoOS@os'], uvErrnoHelper);
     defineHelper(r, 'fsErrors', ['errors', 'io/fs', 'strings'], ['error', 'uvErrno'], fsErrorsHelper);
     defineHelper(r, 'nodeFs', ['errors', 'fmt', 'io', 'io/fs', 'math', 'os', 'path/filepath', 'runtime', 'strconv', 'strings', 'sync', 'time'], ['fsErrors', 'buffer', 'dynamic'], fsHelper);
+    defineHelper(r, 'nodeFsStatfsOS@linux', ['syscall'], [], statfsOSHelpers.linux);
+    for (const goos of ['darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly'])
+        defineHelper(r, `nodeFsStatfsOS@${goos}`, ['syscall'], [], statfsOSHelpers.bsd);
+    defineHelper(r, 'nodeFsStatfsOS@windows', ['os', 'path/filepath', 'syscall', 'unsafe'], [], statfsOSHelpers.windows);
+    defineHelper(r, 'nodeFsStatfsOS@other', ['os'], [], statfsOSHelpers.other);
+    defineHelper(r, 'nodeFsStatfs', [], ['nodeFs', 'nodeFsStatfsOS@os'], statfsHelper);
+    defineHelper(r, 'nodeFsGlob', ['io/fs', 'os', 'path/filepath', 'regexp', 'strings'], ['nodeFs', 'nodePath', 'nodeInvoke', 'dynamic'], globHelper);
+    defineClass(r, 'fs.StatsFs', '*TnStatFs', 'class', '', 'bsize=float64; frsize=float64; blocks=float64; bfree=float64; bavail=float64; files=float64; ffree=float64', 'type=float64', '');
     defineClass(r, 'fs.Stats', '*TnStats', 'class', 'isFile=bool; isDirectory=bool; isSymbolicLink=bool; isFIFO=bool; isSocket=bool; isBlockDevice=bool; isCharacterDevice=bool', 'dev=float64; ino=float64; mode=float64; nlink=float64; uid=float64; gid=float64; rdev=float64; size=float64; blksize=float64; blocks=float64; atimeMs=float64; mtimeMs=float64; ctimeMs=float64; birthtimeMs=float64; atime=time.Time; mtime=time.Time; ctime=time.Time; birthtime=time.Time', '', '');
     defineClass(r, 'fs.Dirent', '*TnDirent', 'class', 'isFile=bool; isDirectory=bool; isSymbolicLink=bool; isFIFO=bool; isSocket=bool; isBlockDevice=bool; isCharacterDevice=bool', 'name=string; parentPath=string; path=string', '', '');
     const use = () => r.helper('nodeFs');
@@ -683,6 +930,11 @@ export function registerFs(r) {
     };
     fn('readFileSync', '', (c) => {
         const enc = encodingOf(c.nodes[1]);
+        // (options.buffer: read into that buffer, a view of its leading bytes)
+        if (getOption(c.nodes[1], 'buffer')) {
+            const read = `TnReadFileInto(${c.args[0]}, ${c.args[1]})`;
+            return readResultType(c, 1) === 'string' ? `TnBufferToString(${read}, ${JSON.stringify(enc)})` : read;
+        }
         if (readResultType(c, 1) === 'string') {
             const encExpr = enc ? JSON.stringify(enc) : c.types[1] === 'string' ? c.args[1] : '""';
             return `TnReadFileString(${c.args[0]}, ${encExpr})`;
@@ -704,14 +956,36 @@ export function registerFs(r) {
     const stat = (lstat) => (c) => {
         const option = getOption(c.nodes[1], 'throwIfNoEntry');
         const throwIfNoEntry = option && option.kind === 'FalseKeyword' ? 'false' : 'true';
+        // (an aborted options.signal rejects the call)
+        if (getOption(c.nodes[1], 'signal'))
+            return `func() *TnStats { TnFsCheckSignal(${c.args[1]}); return TnStat(${c.args[0]}, ${lstat}, ${throwIfNoEntry}) }()`;
         return `TnStat(${c.args[0]}, ${lstat}, ${throwIfNoEntry})`;
     };
     fn('statSync', '*TnStats', stat(false));
     fn('lstatSync', '*TnStats', stat(true));
-    fn('fstatSync', '*TnStats', (c) => `TnFstat(${c.args[0]})`);
+    fn('fstatSync', '*TnStats', (c) => (getOption(c.nodes[1], 'signal') ? `func() *TnStats { TnFsCheckSignal(${c.args[1]}); return TnFstat(${c.args[0]}) }()` : `TnFstat(${c.args[0]})`));
+    fn('statfsSync', '*TnStatFs', (c) => {
+        r.helper('nodeFsStatfs');
+        return `TnStatfs(${c.args[0]})`;
+    });
+    // openAsBlobSync(path, { type }): the file's bytes as a Blob
+    fn('openAsBlobSync', '*TnBlob', (c) => {
+        r.helper('nodeStreamWeb');
+        const type = getOption(c.nodes[1], 'type');
+        return `&TnBlob{data: TnReadFileBytes(${c.args[0]}), type_: ${type ? `TnJSString(TnGetValue(${c.args[1]}, "type"))` : '""'}}`;
+    });
+    // glob / globSync(pattern | patterns, { cwd, exclude, withFileTypes, followSymlinks, maxDepth })
+    fn('globSync', '', (c) => {
+        r.helper('nodeFsGlob');
+        if (optionIsTrue(c.nodes[1], 'withFileTypes'))
+            return `TnGlobDirentsSync(${c.args[0]}, ${c.args[1]})`;
+        return `TnGlobSync(${c.args.join(', ')})`;
+    });
+    r.typers['fs.globSync'] = (c) => (optionIsTrue(c.nodes[1], 'withFileTypes') ? '[]*TnDirent' : '[]string');
     fn('renameSync', '', (c) => `TnRename(${c.args[0]}, ${c.args[1]})`);
     fn('rmSync', '', (c) => `TnRm(${c.args[0]}, ${optionIsTrue(c.nodes[1], 'recursive')}, ${optionIsTrue(c.nodes[1], 'force')})`);
-    fn('rmdirSync', '', (c) => `TnRmdir(${c.args[0]}, ${optionIsTrue(c.nodes[1], 'recursive')})`);
+    // (rmdir's recursive option is gone in Node 25: rmSync({ recursive }) removes trees)
+    fn('rmdirSync', '', (c) => `TnRmdir(${c.args[0]}, false)`);
     fn('unlinkSync', '', (c) => `TnUnlink(${c.args[0]})`);
     fn('copyFileSync', '', (c) => `TnCopyFile(${c.args[0]}, ${c.args[1]}, ${c.args[2] ?? '0'})`);
     fn('cpSync', '', (c) => {
@@ -741,6 +1015,8 @@ export function registerFs(r) {
         const value = FS_CONSTANTS[name];
         r.values[`fs.constants.${name}`] = (_c) => `float64(${value})`;
         r.valueTypes[`fs.constants.${name}`] = 'float64';
+        if (name.endsWith('_OK'))
+            continue;
         r.values[`fs.${name}`] = r.values[`fs.constants.${name}`];
         r.valueTypes[`fs.${name}`] = 'float64';
     }
@@ -914,7 +1190,10 @@ const FS_ASYNC = [
     'utimes',
     'symlink',
     'readlink',
-    'link'
+    'link',
+    'fstat',
+    'statfs',
+    'glob'
 ];
 // The call without its trailing callback
 function withoutCallback(call) {
@@ -984,6 +1263,17 @@ function registerFsAsync(r) {
             return type ? `chan ${type}` : 'chan struct{}';
         };
     }
+    // fs.openAsBlob(path, options): a promise (no callback form)
+    r.functions['fs.openAsBlob'] = (call) => {
+        r.helper('nodeFsAsync');
+        return `TnFsPromise(func() *TnBlob { return ${r.functions['fs.openAsBlobSync'](call)} })`;
+    };
+    r.results['fs.openAsBlob'] = 'chan *TnBlob';
+    r.functions['fs/promises.glob'] = (call) => {
+        r.helper('nodeFsAsync');
+        return `TnGlobIter(${r.functions['fs.globSync'](call)})`;
+    };
+    r.typers['fs/promises.glob'] = (call) => (optionIsTrue(call.nodes[1], 'withFileTypes') ? 'chan *TnDirent' : 'chan string');
     r.functions['fs.exists'] = (call) => {
         r.helper('nodeFsAsync');
         return `TnFsExists(${call.args[0]}, ${call.args[1]})`;

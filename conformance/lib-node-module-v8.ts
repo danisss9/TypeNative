@@ -5,7 +5,8 @@ import * as v8 from 'node:v8';
 import * as sea from 'node:sea';
 
 assert(builtinModules.includes('fs') && builtinModules.includes('worker_threads'), 'builtinModules lists the core modules');
-assert(!builtinModules.includes('test') && !builtinModules.includes('node:fs'), 'bare names, without node:-only modules');
+assert(!builtinModules.includes('test') && !builtinModules.includes('node:fs'), 'bare names; node:-only modules keep their scheme');
+assert(builtinModules.includes('node:test') && builtinModules.includes('node:sqlite') && !builtinModules.includes('_stream_duplex'), 'Node 26 list');
 assert(isBuiltin('fs') && isBuiltin('node:fs') && isBuiltin('fs/promises'), 'isBuiltin with and without node:');
 assert(isBuiltin('node:test') && !isBuiltin('test'), 'node:test needs the scheme');
 assert(!isBuiltin('left-pad') && !isBuiltin('node:nope'), 'packages are not builtins');

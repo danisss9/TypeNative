@@ -41,6 +41,17 @@ interface Number {
   toFixed(fractionDigits?: number): string;
   toPrecision(precision?: number): string;
   toExponential(fractionDigits?: number): string;
+  /** en-US formatting (grouping, at most 3 fraction digits); other locales are not consulted */
+  toLocaleString(
+    locales?: string | string[],
+    options?: {
+      style?: 'decimal' | 'percent' | 'currency';
+      currency?: string;
+      minimumFractionDigits?: number;
+      maximumFractionDigits?: number;
+      useGrouping?: boolean;
+    }
+  ): string;
 }
 
 type PropertyKey = string | number | symbol;
@@ -100,6 +111,8 @@ interface Generator<T = any, TReturn = any, TNext = any> extends Iterator<T, TRe
 interface IteratorConstructor {
   /** An iterator over an array or generator (with the iterator helpers) */
   from<T>(source: T[] | Generator<T>): Generator<T>;
+  /** The values of each array or generator in turn */
+  concat<T>(...sources: Array<T[] | Generator<T>>): Generator<T>;
 }
 declare var Iterator: IteratorConstructor;
 
@@ -176,6 +189,7 @@ interface RegExp {
   readonly unicode: boolean;
   readonly unicodeSets: boolean;
   readonly sticky: boolean;
+  readonly hasIndices: boolean;
   test(string: string): boolean;
   exec(string: string): RegExpExecArray | null;
 }
@@ -184,17 +198,24 @@ interface RegExp {
 interface RegExpExecArray extends Array<string> {
   index: number;
   readonly groups: Record<string, string> | undefined;
+  /** /d: each group's [start, end] (undefined for a group that did not take part) */
+  readonly indices?: RegExpIndicesArray;
 }
+
+interface RegExpIndicesArray extends Array<[number, number]> {}
 
 // match() result: .index is set unless the regex is /g (that returns every match)
 interface RegExpMatchArray extends Array<string> {
   index?: number;
   readonly groups?: Record<string, string> | undefined;
+  readonly indices?: RegExpIndicesArray;
 }
 
 interface RegExpConstructor {
   new (pattern: string | RegExp, flags?: string): RegExp;
   (pattern: string | RegExp, flags?: string): RegExp;
+  /** s escaped so that it matches itself literally inside a pattern */
+  escape(s: string): string;
 }
 
 declare var RegExp: RegExpConstructor;
@@ -377,6 +398,12 @@ interface ArrayConstructor {
   from<T>(arrayLike: ArrayLike<T> | Iterable<T>): T[];
   from<T, U>(arrayLike: ArrayLike<T> | Iterable<T>, mapFn: (value: T, index: number) => U): U[];
   of<T>(...items: T[]): T[];
+  /** An array of the (awaited) values of an async iterable, an iterable of promises, or an array */
+  fromAsync<T>(source: AsyncIterable<T> | Iterable<T | PromiseLike<T>> | ArrayLike<T | PromiseLike<T>>): Promise<T[]>;
+  fromAsync<T, U>(
+    source: AsyncIterable<T> | Iterable<T> | ArrayLike<T>,
+    mapFn: (value: Awaited<T>, index: number) => U
+  ): Promise<Awaited<U>[]>;
   readonly prototype: any[];
 }
 
@@ -449,7 +476,18 @@ interface String {
   /** Returns the character at the given index (supports negative indices). */
   at(index: number): string | undefined;
   /** Compares two strings (by code unit). */
-  localeCompare(that: string): number;
+  /** The root collation (base letters, then accents, then case); locales are not consulted */
+  localeCompare(
+    that: string,
+    locales?: string | string[],
+    options?: {
+      sensitivity?: 'base' | 'accent' | 'case' | 'variant';
+      numeric?: boolean;
+      caseFirst?: 'upper' | 'lower' | 'false';
+      ignorePunctuation?: boolean;
+      usage?: 'sort' | 'search';
+    }
+  ): number;
   /** Returns the Unicode normalization of the string. */
   normalize(form?: 'NFC' | 'NFD' | 'NFKC' | 'NFKD'): string;
   /** Returns a string representation. */
@@ -549,6 +587,7 @@ interface Math {
   acosh(x: number): number;
   atanh(x: number): number;
   fround(x: number): number;
+  f16round(x: number): number;
   imul(a: number, b: number): number;
   clz32(x: number): number;
   sumPrecise(values: number[]): number;
@@ -680,6 +719,16 @@ interface Process {
   exitCode: number | undefined;
   env: { [key: string]: string | undefined };
   exit(code?: number): never;
+  /** maybeRefable's own ref() / unref() (a timer, a socket, …) */
+  ref(maybeRefable: any): void;
+  unref(maybeRefable: any): void;
+  /** Replaces the process (Unix; Windows throws ERR_FEATURE_UNAVAILABLE_ON_PLATFORM) */
+  execve(file: string, args?: readonly string[], env?: Record<string, string>): never;
+  setUncaughtExceptionCaptureCallback(fn: ((err: Error) => void) | null): void;
+  /** fn takes an uncaught error when it returns true */
+  addUncaughtExceptionCaptureCallback(fn: (err: Error) => boolean | void): void;
+  hasUncaughtExceptionCaptureCallback(): boolean;
+
   cwd(): string;
   chdir(directory: string): void;
   hrtime: { (time?: [number, number]): [number, number]; bigint(): bigint };
@@ -770,6 +819,8 @@ interface ErrorConstructor {
   (message?: string, options?: ErrorOptions): Error;
   // (V8's: accepted, without effect — there are no V8 stack frames)
   captureStackTrace(targetObject: object, constructorOpt?: Function): void;
+  /** Whether value is an Error (of any kind, from any realm) */
+  isError(value: unknown): value is Error;
   stackTraceLimit: number;
   prepareStackTrace?: (err: Error, stackTraces: any[]) => any;
 }
@@ -796,6 +847,30 @@ interface AggregateErrorConstructor {
 }
 
 declare var AggregateError: AggregateErrorConstructor;
+
+interface DOMException extends Error {
+  /** The legacy numeric code of its name (AbortError: 20), else 0 */
+  readonly code: number;
+}
+
+interface DOMExceptionConstructor {
+  new (message?: string, options?: string | { name?: string; cause?: unknown }): DOMException;
+  readonly prototype: DOMException;
+}
+
+declare var DOMException: DOMExceptionConstructor;
+
+interface QuotaExceededError extends DOMException {
+  readonly quota: number | null;
+  readonly requested: number | null;
+}
+
+interface QuotaExceededErrorConstructor {
+  new (message?: string, options?: { quota?: number; requested?: number }): QuotaExceededError;
+  readonly prototype: QuotaExceededError;
+}
+
+declare var QuotaExceededError: QuotaExceededErrorConstructor;
 
 interface Date {
   getTime(): number;
@@ -933,6 +1008,10 @@ interface Map<K, V> {
   set(key: K, value: V): this;
   /** Returns the value for the given key, or undefined if absent. */
   get(key: K): V | undefined;
+  /** The value for key, storing defaultValue first when the key is missing. */
+  getOrInsert(key: K, defaultValue: V): V;
+  /** The value for key, storing callbackfn(key) first when the key is missing. */
+  getOrInsertComputed(key: K, callbackfn: (key: K) => V): V;
   /** Returns true if the key exists in the Map. */
   has(key: K): boolean;
   /** Removes the entry for the given key. Returns true if the entry existed. */
@@ -996,6 +1075,8 @@ declare var Set: SetConstructor;
 interface WeakMap<K extends object, V> {
   set(key: K, value: V): this;
   get(key: K): V | undefined;
+  getOrInsert(key: K, defaultValue: V): V;
+  getOrInsertComputed(key: K, callbackfn: (key: K) => V): V;
   has(key: K): boolean;
   delete(key: K): boolean;
 }
@@ -1027,6 +1108,13 @@ interface SymbolConstructor {
   readonly iterator: unique symbol;
   readonly asyncIterator: unique symbol;
   readonly dispose: unique symbol;
+  readonly asyncDispose: unique symbol;
+  /** A class's [Symbol.toPrimitive](hint) converts its instances (String(x), +x, `${x}`) */
+  readonly toPrimitive: unique symbol;
+  /** A class's [Symbol.toStringTag] getter names it in Object.prototype.toString */
+  readonly toStringTag: unique symbol;
+  /** A class's static [Symbol.hasInstance](x) decides x instanceof C */
+  readonly hasInstance: unique symbol;
   for(key: string): symbol;
   keyFor(sym: symbol): string | undefined;
 }
@@ -1101,7 +1189,16 @@ interface Uint8Array {
   set(array: ArrayLike<number>, offset?: number): void;
   at(index: number): number | undefined;
   /** Base64 of the bytes (ES2026) */
-  toBase64(): string;
+  toBase64(options?: { alphabet?: 'base64' | 'base64url'; omitPadding?: boolean }): string;
+  /** Hex of the bytes (ES2026) */
+  toHex(): string;
+  /** Decodes base64 into this array: the characters read and bytes written */
+  setFromBase64(
+    string: string,
+    options?: { alphabet?: 'base64' | 'base64url'; lastChunkHandling?: 'loose' | 'strict' | 'stop-before-partial' }
+  ): { read: number; written: number };
+  /** Decodes hex into this array: the characters read and bytes written */
+  setFromHex(string: string): { read: number; written: number };
   [Symbol.iterator](): IterableIterator<number>;
 }
 
@@ -1111,8 +1208,13 @@ interface Uint8ArrayConstructor {
   // A view sharing the buffer's memory
   new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
   from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
-  /** The bytes a base64 string encodes (ES2026) */
-  fromBase64(base64: string): Uint8Array;
+  /** The bytes a base64 string encodes (ES2026; a SyntaxError on bad input) */
+  fromBase64(
+    base64: string,
+    options?: { alphabet?: 'base64' | 'base64url'; lastChunkHandling?: 'loose' | 'strict' | 'stop-before-partial' }
+  ): Uint8Array;
+  /** The bytes a hex string encodes (ES2026) */
+  fromHex(hex: string): Uint8Array;
 }
 
 declare var Uint8Array: Uint8ArrayConstructor;
@@ -1122,6 +1224,9 @@ declare var Uint8Array: Uint8ArrayConstructor;
 interface ArrayBuffer {
   readonly byteLength: number;
   slice(begin?: number, end?: number): ArrayBuffer;
+  /** A copy (resized to newLength, zero-filled); the original is not detached */
+  transfer(newLength?: number): ArrayBuffer;
+  transferToFixedLength(newLength?: number): ArrayBuffer;
 }
 
 interface ArrayBufferConstructor {
@@ -1201,6 +1306,46 @@ interface Float32Array extends TypedArray<Float32Array> {}
 declare var Float32Array: TypedArrayConstructor<Float32Array>;
 interface Float64Array extends TypedArray<Float64Array> {}
 declare var Float64Array: TypedArrayConstructor<Float64Array>;
+/** Elements stored as IEEE 754 binary16 (ES2025) */
+interface Float16Array extends TypedArray<Float16Array> {}
+declare var Float16Array: TypedArrayConstructor<Float16Array>;
+
+// 64-bit integer arrays whose elements are bigints (writes wrap modulo 2^64)
+interface BigIntTypedArray<Self> {
+  readonly length: number;
+  readonly byteLength: number;
+  readonly byteOffset: number;
+  readonly BYTES_PER_ELEMENT: number;
+  readonly buffer: ArrayBuffer;
+  [index: number]: bigint;
+  fill(value: bigint, start?: number, end?: number): Self;
+  set(array: ArrayLike<bigint> | Self, offset?: number): void;
+  subarray(begin?: number, end?: number): Self;
+  slice(start?: number, end?: number): Self;
+  at(index: number): bigint | undefined;
+  indexOf(searchElement: bigint, fromIndex?: number): number;
+  includes(searchElement: bigint, fromIndex?: number): boolean;
+  join(separator?: string): string;
+  reverse(): Self;
+  keys(): IterableIterator<number>;
+  values(): IterableIterator<bigint>;
+  toString(): string;
+  [Symbol.iterator](): IterableIterator<bigint>;
+}
+
+interface BigIntTypedArrayConstructor<T> {
+  new (length?: number): T;
+  new (array: ArrayLike<bigint> | Iterable<bigint>): T;
+  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): T;
+  from(arrayLike: ArrayLike<bigint> | Iterable<bigint>): T;
+  of(...items: bigint[]): T;
+  readonly BYTES_PER_ELEMENT: number;
+}
+
+interface BigInt64Array extends BigIntTypedArray<BigInt64Array> {}
+declare var BigInt64Array: BigIntTypedArrayConstructor<BigInt64Array>;
+interface BigUint64Array extends BigIntTypedArray<BigUint64Array> {}
+declare var BigUint64Array: BigIntTypedArrayConstructor<BigUint64Array>;
 
 // Typed reads and writes at byte offsets of an ArrayBuffer (big-endian
 // unless littleEndian is true)
@@ -1214,6 +1359,7 @@ interface DataView {
   getUint16(byteOffset: number, littleEndian?: boolean): number;
   getInt32(byteOffset: number, littleEndian?: boolean): number;
   getUint32(byteOffset: number, littleEndian?: boolean): number;
+  getFloat16(byteOffset: number, littleEndian?: boolean): number;
   getFloat32(byteOffset: number, littleEndian?: boolean): number;
   getFloat64(byteOffset: number, littleEndian?: boolean): number;
   getBigInt64(byteOffset: number, littleEndian?: boolean): bigint;
@@ -1224,6 +1370,7 @@ interface DataView {
   setUint16(byteOffset: number, value: number, littleEndian?: boolean): void;
   setInt32(byteOffset: number, value: number, littleEndian?: boolean): void;
   setUint32(byteOffset: number, value: number, littleEndian?: boolean): void;
+  setFloat16(byteOffset: number, value: number, littleEndian?: boolean): void;
   setFloat32(byteOffset: number, value: number, littleEndian?: boolean): void;
   setFloat64(byteOffset: number, value: number, littleEndian?: boolean): void;
   setBigInt64(byteOffset: number, value: bigint, littleEndian?: boolean): void;
@@ -1242,8 +1389,11 @@ interface Buffer extends Uint8Array {
   subarray(start?: number, end?: number): Buffer;
   slice(start?: number, end?: number): Buffer;
   indexOf(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): number;
+  /** (Node 26: an end bounds the search) */
+  indexOf(value: string | number | Uint8Array, byteOffset: number, end: number, encoding?: BufferEncoding): number;
   lastIndexOf(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): number;
   includes(value: string | number | Uint8Array, byteOffset?: number, encoding?: BufferEncoding): boolean;
+  includes(value: string | number | Uint8Array, byteOffset: number, end: number, encoding?: BufferEncoding): boolean;
   fill(value: string | number | Uint8Array, offset?: number, end?: number): this;
   fill(value: string, encoding: BufferEncoding): this;
   write(string: string, offset?: number, length?: number, encoding?: BufferEncoding): number;
@@ -1310,8 +1460,13 @@ interface BufferConstructor {
   from(data: string, encoding?: BufferEncoding): Buffer;
   from(data: ArrayLike<number> | Uint8Array | ArrayBuffer): Buffer;
   alloc(size: number, fill?: string | number | Uint8Array, encoding?: BufferEncoding): Buffer;
-  allocUnsafe(size: number): Buffer;
-  allocUnsafeSlow(size: number): Buffer;
+  /** (alignment: Node 26; Go allocations are already 8-byte aligned) */
+  allocUnsafe(size: number, alignment?: number): Buffer;
+  allocUnsafeSlow(size: number, alignment?: number): Buffer;
+  /** The length of the string the bytes decode to (Node 26) */
+  stringLength(input: Uint8Array | ArrayBuffer, encoding?: BufferEncoding): number;
+  /** The size of Node's internal pool (64 KiB in Node 26) */
+  readonly poolSize: number;
   concat(list: readonly Uint8Array[], totalLength?: number): Buffer;
   byteLength(string: string | Uint8Array, encoding?: BufferEncoding): number;
   isBuffer(obj: any): obj is Buffer;
@@ -1378,6 +1533,60 @@ declare var URL: {
   parse(input: string, base?: string): URL | null;
 };
 
+type URLPatternInput = string | URLPatternInit;
+
+interface URLPatternComponentResult {
+  input: string;
+  groups: Record<string, string | undefined>;
+}
+
+interface URLPatternInit {
+  protocol?: string;
+  username?: string;
+  password?: string;
+  hostname?: string;
+  port?: string;
+  pathname?: string;
+  search?: string;
+  hash?: string;
+  baseURL?: string;
+}
+
+interface URLPatternOptions {
+  ignoreCase?: boolean;
+}
+
+interface URLPatternResult {
+  inputs: URLPatternInput[];
+  protocol: URLPatternComponentResult;
+  username: URLPatternComponentResult;
+  password: URLPatternComponentResult;
+  hostname: URLPatternComponentResult;
+  port: URLPatternComponentResult;
+  pathname: URLPatternComponentResult;
+  search: URLPatternComponentResult;
+  hash: URLPatternComponentResult;
+}
+
+interface URLPattern {
+  readonly hasRegExpGroups: boolean;
+  readonly protocol: string;
+  readonly username: string;
+  readonly password: string;
+  readonly hostname: string;
+  readonly port: string;
+  readonly pathname: string;
+  readonly search: string;
+  readonly hash: string;
+  exec(input?: URLPatternInput, baseURL?: string | URL): URLPatternResult | null;
+  test(input?: URLPatternInput, baseURL?: string | URL): boolean;
+}
+
+declare var URLPattern: {
+  new (input?: URLPatternInput, baseURL?: string | URL, options?: URLPatternOptions): URLPattern;
+  new (input?: URLPatternInput, options?: URLPatternOptions): URLPattern;
+};
+
 interface Event {
   readonly type: string;
   readonly defaultPrevented: boolean;
@@ -1386,6 +1595,46 @@ interface Event {
   preventDefault(): void;
 }
 declare var Event: { new (type: string, options?: { cancelable?: boolean }): Event };
+
+interface CustomEvent<T = any> extends Event {
+  readonly detail: T;
+}
+declare var CustomEvent: { new <T = any>(type: string, options?: { detail?: T; cancelable?: boolean }): CustomEvent<T> };
+
+interface ErrorEvent extends Event {
+  readonly message: string;
+  readonly filename: string;
+  readonly lineno: number;
+  readonly colno: number;
+  readonly error: any;
+}
+declare var ErrorEvent: {
+  new (type: string, options?: { message?: string; filename?: string; lineno?: number; colno?: number; error?: any; cancelable?: boolean }): ErrorEvent;
+};
+
+interface Navigator {
+  readonly hardwareConcurrency: number;
+  /** The OS locale (LANG / LC_ALL), en-US by default */
+  readonly language: string;
+  readonly languages: readonly string[];
+  readonly platform: string;
+  readonly userAgent: string;
+}
+declare var navigator: Navigator;
+
+interface Storage {
+  readonly length: number;
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+  clear(): void;
+  key(index: number): string | null;
+}
+declare var Storage: { prototype: Storage };
+/** In memory, for the life of the process */
+declare var sessionStorage: Storage;
+/** Persisted to the file TN_LOCALSTORAGE_FILE names (Node: --localstorage-file); undefined without one */
+declare var localStorage: Storage | undefined;
 
 interface EventTarget {
   addEventListener(type: string, listener: (event: Event) => void, options?: { once?: boolean }): void;
@@ -1596,6 +1845,8 @@ interface Blob {
   arrayBuffer(): Promise<Uint8Array>;
   slice(start?: number, end?: number, contentType?: string): Blob;
   stream(): ReadableStream<Uint8Array>;
+  /** The bytes as a stream of UTF-8 text chunks */
+  textStream(): ReadableStream<string>;
 }
 declare var Blob: { new (blobParts?: BlobPart[], options?: { type?: string }): Blob };
 interface File extends Blob {
@@ -1691,6 +1942,81 @@ declare var Response: {
 
 declare function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 
+// --- WebSocket (WHATWG, as in Node) ---
+
+interface MessageEvent extends Event {
+  readonly data: any;
+  readonly origin: string;
+  readonly lastEventId: string;
+}
+declare var MessageEvent: {
+  new (type: string, options?: { data?: any; origin?: string; lastEventId?: string }): MessageEvent;
+};
+
+interface CloseEvent extends Event {
+  readonly code: number;
+  readonly reason: string;
+  readonly wasClean: boolean;
+}
+declare var CloseEvent: {
+  new (type: string, options?: { code?: number; reason?: string; wasClean?: boolean }): CloseEvent;
+};
+
+interface WebSocketEventMap {
+  close: CloseEvent;
+  error: ErrorEvent;
+  message: MessageEvent;
+  open: Event;
+}
+
+type BinaryType = 'blob' | 'arraybuffer';
+
+interface WebSocket extends EventTarget {
+  binaryType: BinaryType;
+  readonly bufferedAmount: number;
+  readonly extensions: string;
+  onclose: ((this: WebSocket, ev: CloseEvent) => any) | null;
+  onerror: ((this: WebSocket, ev: ErrorEvent) => any) | null;
+  onmessage: ((this: WebSocket, ev: MessageEvent) => any) | null;
+  onopen: ((this: WebSocket, ev: Event) => any) | null;
+  readonly protocol: string;
+  readonly readyState: number;
+  readonly url: string;
+  close(code?: number, reason?: string): void;
+  send(data: string | ArrayBuffer | Blob | Uint8Array | TypedArray<any> | DataView): void;
+  readonly CLOSED: number;
+  readonly CLOSING: number;
+  readonly CONNECTING: number;
+  readonly OPEN: number;
+
+  addEventListener<K extends keyof WebSocketEventMap>(
+    type: K,
+    listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+    options?: { once?: boolean }
+  ): void;
+  addEventListener(type: string, listener: (event: Event) => void, options?: { once?: boolean }): void;
+  removeEventListener<K extends keyof WebSocketEventMap>(
+    type: K,
+    listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+    options?: { once?: boolean }
+  ): void;
+  removeEventListener(type: string, listener: (event: Event) => void, options?: { once?: boolean }): void;
+}
+
+interface WebSocketInit {
+  protocols?: string | string[];
+  headers?: HeadersInit;
+}
+
+declare var WebSocket: {
+  prototype: WebSocket;
+  new (url: string | URL, protocols?: string | string[] | WebSocketInit): WebSocket;
+  readonly CLOSED: number;
+  readonly CLOSING: number;
+  readonly CONNECTING: number;
+  readonly OPEN: number;
+};
+
 declare function setImmediate<A extends any[]>(callback: (...args: A) => void, ...args: A): NodeJS.Immediate;
 declare function clearImmediate(immediate?: NodeJS.Immediate | number): void;
 
@@ -1759,6 +2085,7 @@ declare namespace JSX {
 // Reflect: the Object operations as functions
 declare namespace Reflect {
   function apply(target: Function, thisArgument: any, argumentsList: ArrayLike<any>): any;
+  function construct(target: Function, argumentsList: ArrayLike<any>, newTarget?: Function): any;
   function defineProperty(target: object, propertyKey: PropertyKey, attributes: PropertyDescriptor): boolean;
   function deleteProperty(target: object, propertyKey: PropertyKey): boolean;
   function get(target: object, propertyKey: PropertyKey, receiver?: any): any;
@@ -1767,4 +2094,90 @@ declare namespace Reflect {
   function has(target: object, propertyKey: PropertyKey): boolean;
   function ownKeys(target: object): (string | symbol)[];
   function set(target: object, propertyKey: PropertyKey, value: any, receiver?: any): boolean;
+}
+
+// WebAssembly: modules compiled and run by wazero (pure Go). i32 / f32 / f64
+// cross as numbers, i64 as bigints. Tables can be exported and imported again,
+// but not created, read or written (wazero has no table API)
+declare namespace WebAssembly {
+  type ImportExportKind = 'function' | 'table' | 'memory' | 'global' | 'tag';
+  type ValueType = 'i32' | 'i64' | 'f32' | 'f64' | 'externref' | 'anyfunc' | 'v128';
+  type ExportValue = Function | Global | Memory | Table;
+  type Exports = Record<string, ExportValue>;
+  type ImportValue = ExportValue | number | bigint;
+  type ModuleImports = Record<string, ImportValue>;
+  type Imports = Record<string, ModuleImports>;
+  type BufferSource = ArrayBuffer | Uint8Array | Int8Array | Uint16Array | Int16Array | Uint32Array | Int32Array | Float32Array | Float64Array | DataView;
+
+  interface ModuleImportDescriptor {
+    module: string;
+    name: string;
+    kind: ImportExportKind;
+  }
+  interface ModuleExportDescriptor {
+    name: string;
+    kind: ImportExportKind;
+  }
+  interface WebAssemblyInstantiatedSource {
+    module: Module;
+    instance: Instance;
+  }
+  interface MemoryDescriptor {
+    initial: number;
+    maximum?: number;
+    shared?: boolean;
+  }
+  interface GlobalDescriptor {
+    value: ValueType;
+    mutable?: boolean;
+  }
+  interface TableDescriptor {
+    element: 'anyfunc' | 'externref';
+    initial: number;
+    maximum?: number;
+  }
+
+  class Module {
+    constructor(bytes: BufferSource);
+    static imports(moduleObject: Module): ModuleImportDescriptor[];
+    static exports(moduleObject: Module): ModuleExportDescriptor[];
+    static customSections(moduleObject: Module, sectionName: string): ArrayBuffer[];
+  }
+  class Instance {
+    constructor(module: Module, importObject?: Imports);
+    readonly exports: Exports;
+  }
+  // .buffer views the memory's bytes; after grow() read .buffer again
+  class Memory {
+    constructor(descriptor: MemoryDescriptor);
+    readonly buffer: ArrayBuffer;
+    grow(delta: number): number;
+  }
+  class Global {
+    constructor(descriptor: GlobalDescriptor, v?: any);
+    value: any;
+    valueOf(): any;
+  }
+  class Table {
+    constructor(descriptor: TableDescriptor, value?: any);
+    readonly length: number;
+    get(index: number): any;
+    set(index: number, value?: any): void;
+    grow(delta: number, value?: any): number;
+  }
+  class CompileError extends Error {
+    constructor(message?: string);
+  }
+  class LinkError extends Error {
+    constructor(message?: string);
+  }
+  class RuntimeError extends Error {
+    constructor(message?: string);
+  }
+
+  function validate(bytes: BufferSource): boolean;
+  function compile(bytes: BufferSource): Promise<Module>;
+  // (bytes first: a Module has no instance members, so bytes would match it)
+  function instantiate(bytes: BufferSource, importObject?: Imports): Promise<WebAssemblyInstantiatedSource>;
+  function instantiate(moduleObject: Module, importObject?: Imports): Promise<Instance>;
 }

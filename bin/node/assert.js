@@ -6,6 +6,10 @@ func tnAssertionError(message interface{}, generated string, actual interface{},
 	if e, ok := message.(*TnError); ok {
 		panic(e)
 	}
+	// (a message function: called with actual and expected, Node 26)
+	if message != nil && reflect.ValueOf(message).Kind() == reflect.Func {
+		message = TnJSString(TnInvoke(message, actual, expected))
+	}
 	text, isGenerated := generated, true
 	if s, ok := message.(string); ok {
 		text, isGenerated = s, false
@@ -18,11 +22,33 @@ func tnAssertionError(message interface{}, generated string, actual interface{},
 	return err
 }
 
+// The message arguments: a printf-style format and its values (Node 26), or
+// one message (a string, an Error or a function)
 func tnAssertMessage(msg []interface{}) interface{} {
+	if len(msg) > 1 {
+		if _, isString := msg[0].(string); isString {
+			return TnUtilFormat(msg...)
+		}
+	}
 	if len(msg) > 0 {
 		return msg[0]
 	}
 	return nil
+}
+
+// The first message argument as is (fail / throws / rejects don't format, as in Node)
+func tnAssertFirst(msg []interface{}) interface{} {
+	if len(msg) > 0 {
+		return msg[0]
+	}
+	return nil
+}
+
+// assert.partialDeepStrictEqual(actual, expected)
+func TnAssertPartialDeepEqual(actual interface{}, expected interface{}, msg ...interface{}) {
+	if !TnPartialDeepEqual(actual, expected) {
+		panic(tnAssertionError(tnAssertMessage(msg), "Expected values to be partially and strictly deep-equal:\\n"+TnInspect(actual)+"\\n\\nshould contain\\n\\n"+TnInspect(expected), actual, expected, "partialDeepStrictEqual"))
+	}
 }
 
 func TnAssertOk(value interface{}, msg ...interface{}) {
@@ -71,7 +97,15 @@ func tnLooseEqual(a interface{}, b interface{}) bool {
 
 func TnAssertStrictEqual(actual interface{}, expected interface{}, msg ...interface{}) {
 	if !tnObjectIs(actual, expected) {
-		panic(tnAssertionError(tnAssertMessage(msg), "Expected values to be strictly equal:\\n\\n"+TnInspect(actual)+" !== "+TnInspect(expected)+"\\n", actual, expected, "strictEqual"))
+		// (Node 26: a custom message is followed by the comparison)
+		message := tnAssertMessage(msg)
+		if message != nil && reflect.ValueOf(message).Kind() == reflect.Func {
+			message = TnJSString(TnInvoke(message, actual, expected))
+		}
+		if text, ok := message.(string); ok {
+			message = text + "\\n\\n" + TnInspect(actual) + " !== " + TnInspect(expected) + "\\n"
+		}
+		panic(tnAssertionError(message, "Expected values to be strictly equal:\\n\\n"+TnInspect(actual)+" !== "+TnInspect(expected)+"\\n", actual, expected, "strictEqual"))
 	}
 }
 
@@ -166,7 +200,7 @@ func TnAssertThrows(fn func(), check func(interface{}) bool, msg ...interface{})
 	thrown, didThrow := tnAssertRun(fn)
 	if !didThrow {
 		generated := "Missing expected exception."
-		if s, ok := tnAssertMessage(msg).(string); ok {
+		if s, ok := tnAssertFirst(msg).(string); ok {
 			generated = "Missing expected exception: " + s
 		}
 		panic(tnAssertionError(nil, generated, nil, nil, "throws"))
@@ -180,7 +214,7 @@ func TnAssertDoesNotThrow(fn func(), msg ...interface{}) {
 	thrown, didThrow := tnAssertRun(fn)
 	if didThrow {
 		generated := "Got unwanted exception.\\nActual message: \\"" + TnErrorText(thrown) + "\\""
-		panic(tnAssertionError(tnAssertMessage(msg), generated, thrown, nil, "doesNotThrow"))
+		panic(tnAssertionError(tnAssertFirst(msg), generated, thrown, nil, "doesNotThrow"))
 	}
 }
 
@@ -193,7 +227,7 @@ func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...inter
 		_, reason, rejected := tnSettle(p)
 		if !rejected {
 			generated := "Missing expected rejection."
-			if s, ok := tnAssertMessage(msg).(string); ok {
+			if s, ok := tnAssertFirst(msg).(string); ok {
 				generated = "Missing expected rejection: " + s
 			}
 			panic(tnAssertionError(nil, generated, nil, nil, "rejects"))
@@ -213,7 +247,7 @@ func TnAssertDoesNotReject[T any](p chan T, msg ...interface{}) chan struct{} {
 		defer TnRejectOnPanic(out)
 		_, reason, rejected := tnSettle(p)
 		if rejected {
-			panic(tnAssertionError(tnAssertMessage(msg), "Got unwanted rejection.\\nActual message: \\""+TnErrorText(reason)+"\\"", reason, nil, "doesNotReject"))
+			panic(tnAssertionError(tnAssertFirst(msg), "Got unwanted rejection.\\nActual message: \\""+TnErrorText(reason)+"\\"", reason, nil, "doesNotReject"))
 		}
 		TnAsyncSend(out, struct{}{})
 	}()
@@ -233,7 +267,7 @@ func TnAssertMatch(s string, re *regexp.Regexp, negate bool, msg ...interface{})
 }
 
 func TnAssertFail(msg ...interface{}) {
-	panic(tnAssertionError(tnAssertMessage(msg), "Failed", nil, nil, "fail"))
+	panic(tnAssertionError(tnAssertFirst(msg), "Failed", nil, nil, "fail"))
 }
 
 func TnAssertIfError(v interface{}) {
@@ -273,16 +307,16 @@ function errorCheck(r, node, arg, type) {
 function throwsArgs(r, call, from) {
     const node = call.nodes[from];
     if (node && call.types[from] === 'string') {
-        return `nil, ${call.args[from]}`;
+        return `nil, ${call.args.slice(from).join(', ')}`;
     }
     const check = errorCheck(r, node, call.args[from] ?? '', call.types[from]);
-    const message = call.args[from + 1];
-    return message ? `${check}, ${message}` : check;
+    const messages = call.args.slice(from + 1);
+    return messages.length > 0 ? `${check}, ${messages.join(', ')}` : check;
 }
 export function registerAssert(r) {
     defineModule(r, 'assert');
     defineModule(r, 'assert/strict');
-    defineHelper(r, 'nodeAssert', ['fmt', 'math', 'regexp'], ['error', 'dynamic', 'nodeUtil', 'promise'], assertHelper);
+    defineHelper(r, 'nodeAssert', ['fmt', 'math', 'reflect', 'regexp'], ['error', 'dynamic', 'nodeUtil', 'promise', 'nodeInvoke'], assertHelper);
     // AssertionError is a TnError (see NodeJS.ErrnoException); keep that the class of *TnError
     const errnoKey = r.classByGoType['*TnError'];
     defineClass(r, 'assert.AssertionError', '*TnError', 'class', '', 'message=string; code=string', 'name=string; actual=interface{}; expected=interface{}; operator=string; generatedMessage=bool', '');
@@ -320,21 +354,26 @@ export function registerAssert(r) {
         fn('deepStrictEqual', deep(true, false));
         fn('notDeepStrictEqual', deep(true, true));
         fn('throws', (c) => `TnAssertThrows(func() { (${c.args[0]})() }, ${throwsArgs(r, c, 1)})`);
+        const restMessages = (c) => {
+            const from = c.types[1] === 'string' ? 1 : 2;
+            return c.args.length > from ? `, ${c.args.slice(from).join(', ')}` : '';
+        };
         fn('doesNotThrow', (c) => {
-            const message = c.types[1] === 'string' ? `, ${c.args[1]}` : c.args[2] ? `, ${c.args[2]}` : '';
+            const message = restMessages(c);
             return `TnAssertDoesNotThrow(func() { (${c.args[0]})() }${message})`;
         });
         const promiseArg = (c) => (isFunctionNode(c.nodes[0]) || c.types[0].startsWith('func(') ? `(${c.args[0]})()` : c.args[0]);
         fn('rejects', (c) => `TnAssertRejects(${promiseArg(c)}, ${throwsArgs(r, c, 1)})`);
         fn('doesNotReject', (c) => {
-            const message = c.types[1] === 'string' ? `, ${c.args[1]}` : c.args[2] ? `, ${c.args[2]}` : '';
+            const message = restMessages(c);
             return `TnAssertDoesNotReject(${promiseArg(c)}${message})`;
         });
         r.results[`${mod}.rejects`] = 'chan struct{}';
         r.results[`${mod}.doesNotReject`] = 'chan struct{}';
-        fn('match', (c) => `TnAssertMatch(${c.args[0]}, ${c.args[1]}, false${c.args[2] ? `, ${c.args[2]}` : ''})`);
-        fn('doesNotMatch', (c) => `TnAssertMatch(${c.args[0]}, ${c.args[1]}, true${c.args[2] ? `, ${c.args[2]}` : ''})`);
-        fn('fail', (c) => `TnAssertFail(${c.args.slice(0, 1).join(', ')})`);
+        fn('match', (c) => `TnAssertMatch(${[c.args[0], c.args[1], 'false', ...c.args.slice(2)].join(', ')})`);
+        fn('doesNotMatch', (c) => `TnAssertMatch(${[c.args[0], c.args[1], 'true', ...c.args.slice(2)].join(', ')})`);
+        fn('fail', (c) => `TnAssertFail(${c.args.join(', ')})`);
+        fn('partialDeepStrictEqual', (c) => `TnAssertPartialDeepEqual(${c.args.join(', ')})`);
         fn('ifError', (c) => `TnAssertIfError(${c.args[0]})`);
         for (const name of ['throws', 'rejects', 'doesNotThrow', 'doesNotReject']) {
             r.paramTypers[`${mod}.${name}`] = (_n) => ['interface{}'];

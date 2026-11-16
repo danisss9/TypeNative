@@ -850,6 +850,618 @@ func TnDomainToASCII(domain string) string {
 func TnDomainToUnicode(domain string) string {
 	return TnPunycodeToUnicode(strings.ToLower(domain))
 }`;
+const legacyUrlHelper = `// Legacy url.parse / url.resolve (deprecated in Node, kept for old code):
+// a Url object whose missing parts are null
+type TnLegacyUrl struct {
+	protocol interface{}
+	slashes  interface{}
+	auth     interface{}
+	host     interface{}
+	port     interface{}
+	hostname interface{}
+	hash     interface{}
+	search   interface{}
+	query    interface{}
+	pathname interface{}
+	path     interface{}
+	href     string
+}
+
+var tnSlashedProtocols = map[string]bool{"http:": true, "https:": true, "ftp:": true, "gopher:": true, "file:": true, "ws:": true, "wss:": true}
+
+var tnLegacyProtocol = regexp.MustCompile("^([a-zA-Z0-9.+-]+:)")
+
+func TnUrlParse(input string, parseQueryString bool, slashesDenoteHost bool) *TnLegacyUrl {
+	u := &TnLegacyUrl{}
+	rest := strings.TrimSpace(input)
+	if i := strings.Index(rest, "#"); i >= 0 {
+		u.hash = rest[i:]
+		rest = rest[:i]
+	}
+	search := ""
+	if i := strings.Index(rest, "?"); i >= 0 {
+		search = rest[i:]
+		rest = rest[:i]
+		u.search = search
+		if parseQueryString {
+			u.query = TnQueryParse(search[1:])
+		} else {
+			u.query = search[1:]
+		}
+	} else if parseQueryString {
+		u.search = ""
+		u.query = TnQueryParse("")
+	}
+	proto := ""
+	if m := tnLegacyProtocol.FindString(rest); m != "" {
+		proto = strings.ToLower(m)
+		u.protocol = proto
+		rest = rest[len(m):]
+	}
+	slashed := false
+	if strings.HasPrefix(rest, "//") && (proto != "" || slashesDenoteHost) && proto != "javascript:" {
+		slashed = true
+		u.slashes = true
+		rest = rest[2:]
+		end := len(rest)
+		for _, c := range []string{"/", "?", "#"} {
+			if i := strings.Index(rest, c); i >= 0 && i < end {
+				end = i
+			}
+		}
+		hostPart := rest[:end]
+		rest = rest[end:]
+		if i := strings.LastIndex(hostPart, "@"); i >= 0 {
+			auth, _ := tnurl.PathUnescape(hostPart[:i])
+			u.auth = auth
+			hostPart = hostPart[i+1:]
+		}
+		hostPart = strings.ToLower(hostPart)
+		u.host = hostPart
+		hostname := hostPart
+		if i := strings.LastIndex(hostPart, ":"); i >= 0 && !strings.HasSuffix(hostPart, "]") {
+			if port := hostPart[i+1:]; port != "" {
+				u.port = port
+			}
+			hostname = hostPart[:i]
+		}
+		u.hostname = strings.Trim(hostname, "[]")
+	}
+	if rest != "" {
+		u.pathname = rest
+	} else if slashed && tnSlashedProtocols[proto] {
+		u.pathname = "/"
+	}
+	if p, ok := u.pathname.(string); ok {
+		u.path = p + search
+	} else if search != "" {
+		u.path = search
+	}
+	u.href = TnUrlFormatLegacy(u)
+	return u
+}
+
+func TnUrlFormatLegacy(u *TnLegacyUrl) string {
+	var b strings.Builder
+	str := func(v interface{}) string {
+		s, _ := v.(string)
+		return s
+	}
+	b.WriteString(str(u.protocol))
+	if u.slashes == true || (u.host != nil && tnSlashedProtocols[str(u.protocol)]) {
+		b.WriteString("//")
+	}
+	if a := str(u.auth); a != "" {
+		b.WriteString(a + "@")
+	}
+	b.WriteString(str(u.host))
+	b.WriteString(str(u.pathname))
+	b.WriteString(str(u.search))
+	b.WriteString(str(u.hash))
+	return b.String()
+}
+
+func (u *TnLegacyUrl) toString() string { return u.href }
+
+// url.resolve(from, to): to resolved against from, as a browser resolves a link
+func TnUrlResolve(from string, to string) string {
+	base, err := tnurl.Parse(from)
+	if err != nil {
+		return to
+	}
+	ref, err := tnurl.Parse(to)
+	if err != nil {
+		return to
+	}
+	return base.ResolveReference(ref).String()
+}`;
+const urlPatternHelper = `// URLPattern (the URL Pattern Standard): pattern components compiled to
+// anchored Go regexps; exec fills the groups of each component
+type TnURLPatternComponentResult struct {
+	input  string
+	groups *TnMap[string, *string]
+}
+
+type TnURLPatternExecResult struct {
+	inputs   []interface{}
+	protocol *TnURLPatternComponentResult
+	username *TnURLPatternComponentResult
+	password *TnURLPatternComponentResult
+	hostname *TnURLPatternComponentResult
+	port     *TnURLPatternComponentResult
+	pathname *TnURLPatternComponentResult
+	search   *TnURLPatternComponentResult
+	hash     *TnURLPatternComponentResult
+}
+
+type TnURLPattern struct {
+	protocol        string
+	username        string
+	password        string
+	hostname        string
+	port            string
+	pathname        string
+	search          string
+	hash            string
+	hasRegExpGroups bool
+	ignoreCase      bool
+	reProtocol      *regexp.Regexp
+	reUsername      *regexp.Regexp
+	rePassword      *regexp.Regexp
+	reHostname      *regexp.Regexp
+	rePort          *regexp.Regexp
+	rePathname      *regexp.Regexp
+	reSearch        *regexp.Regexp
+	reHash          *regexp.Regexp
+}
+
+func tnURLPatternError(message string) *TnError {
+	return TnNodeError("TypeError", "ERR_INVALID_URL_PATTERN", message)
+}
+
+// The regexp source of a pattern component: :name / :name(regexp) / (regexp)
+// groups, * wildcards, ? + * modifiers, \\-escaped literals
+func tnURLPatternSource(pattern string, component string) (string, bool) {
+	var b strings.Builder
+	hasRegexp := false
+	group := 0
+	parts := []string{}
+	kinds := []byte{}
+	appendLiteral := func(text string) {
+		if text == "" {
+			return
+		}
+		if n := len(parts); n > 0 && kinds[n-1] == 'l' {
+			parts[n-1] += text
+		} else {
+			parts = append(parts, text)
+			kinds = append(kinds, 'l')
+		}
+	}
+	appendGroup := func(name string, source string, custom bool, mod byte) {
+		if custom {
+			hasRegexp = true
+		}
+		prefix := ""
+		// (pathname :x? / :x*: the segment separator is optional with the group)
+		if component == "pathname" && (mod == '?' || mod == '*') && len(parts) > 0 && kinds[len(parts)-1] == 'l' && strings.HasSuffix(parts[len(parts)-1], "/") {
+			parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], "/")
+			if parts[len(parts)-1] == "" {
+				parts = parts[:len(parts)-1]
+				kinds = kinds[:len(kinds)-1]
+			}
+			prefix = "/"
+		}
+		body := source
+		if name != "" {
+			body = "(?P<" + name + ">" + source + ")"
+		} else {
+			body = "(" + source + ")"
+			group++
+		}
+		if prefix != "" {
+			body = "(?:" + prefix + body + ")"
+		}
+		if mod != 0 {
+			body += string(mod)
+		}
+		parts = append(parts, body)
+		kinds = append(kinds, 'g')
+	}
+	balanced := func(i int) (string, int, bool) {
+		depth := 0
+		start := i
+		for i < len(pattern) {
+			switch pattern[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					return pattern[start+1 : i], i + 1, true
+				}
+			case '\\\\':
+				i++
+			}
+			i++
+		}
+		return "", i, false
+	}
+	defaultSource := ".*"
+	if component == "pathname" {
+		defaultSource = "[^/]+?"
+	} else if component == "hostname" {
+		defaultSource = "[^.]+?"
+	} else {
+		defaultSource = ".+?"
+	}
+	modifierAt := func(i int) (byte, int) {
+		if i < len(pattern) && (pattern[i] == '?' || pattern[i] == '+' || pattern[i] == '*') {
+			return pattern[i], i + 1
+		}
+		return 0, i
+	}
+	i := 0
+	for i < len(pattern) {
+		c := pattern[i]
+		if c == '\\\\' && i+1 < len(pattern) {
+			appendLiteral(regexp.QuoteMeta(pattern[i+1 : i+2]))
+			i += 2
+			continue
+		}
+		if c == '*' {
+			mod, next := modifierAt(i + 1)
+			name := strconv.Itoa(group)
+			group++
+			appendGroup(name, ".*", false, mod)
+			i = next
+			continue
+		}
+		if c == ':' {
+			start := i + 1
+			i = start
+			for i < len(pattern) && (pattern[i] == '_' || pattern[i] == '$' || pattern[i] >= 'a' && pattern[i] <= 'z' || pattern[i] >= 'A' && pattern[i] <= 'Z' || pattern[i] >= '0' && pattern[i] <= '9') {
+				i++
+			}
+			if i == start {
+				appendLiteral(regexp.QuoteMeta(":"))
+				continue
+			}
+			name := pattern[start:i]
+			source := defaultSource
+			custom := false
+			if i < len(pattern) && pattern[i] == '(' {
+				if inner, next, ok := balanced(i); ok {
+					source = inner
+					custom = true
+					i = next
+				}
+			}
+			mod, next := modifierAt(i)
+			appendGroup(name, source, custom, mod)
+			i = next
+			continue
+		}
+		if c == '(' {
+			if inner, next, ok := balanced(i); ok {
+				hasRegexp = true
+				mod, after := modifierAt(next)
+				appendGroup("", inner, false, mod)
+				i = after
+				continue
+			}
+		}
+		start := i
+		for i < len(pattern) && pattern[i] != '*' && pattern[i] != ':' && pattern[i] != '(' && pattern[i] != '\\\\' {
+			i++
+		}
+		appendLiteral(regexp.QuoteMeta(pattern[start:i]))
+	}
+	for _, part := range parts {
+		b.WriteString(part)
+	}
+	return b.String(), hasRegexp
+}
+
+func tnURLPatternCompile(pattern string, component string, ignoreCase bool) (*regexp.Regexp, bool) {
+	source, hasRegexp := tnURLPatternSource(pattern, component)
+	if ignoreCase {
+		source = "(?i)" + source
+	}
+	re, err := regexp.Compile("^" + source + "$")
+	if err != nil {
+		panic(tnURLPatternError("Invalid pattern"))
+	}
+	return re, hasRegexp
+}
+
+func tnURLPatternComponent(init interface{}, key string, fallback string) string {
+	value := TnGet(init, key)
+	if value == nil {
+		return fallback
+	}
+	s, ok := value.(string)
+	if !ok {
+		return fallback
+	}
+	return s
+}
+
+func tnURLPatternCanonical(value string, component string) string {
+	switch component {
+	case "protocol":
+		return strings.ToLower(strings.TrimSuffix(value, ":"))
+	case "search":
+		return strings.TrimPrefix(value, "?")
+	case "hash":
+		return strings.TrimPrefix(value, "#")
+	case "hostname":
+		return strings.ToLower(value)
+	}
+	return value
+}
+
+func tnURLPatternSet(p *TnURLPattern, component string, value string) {
+	switch component {
+	case "protocol":
+		p.protocol = value
+	case "username":
+		p.username = value
+	case "password":
+		p.password = value
+	case "hostname":
+		p.hostname = value
+	case "port":
+		p.port = value
+	case "pathname":
+		p.pathname = value
+	case "search":
+		p.search = value
+	case "hash":
+		p.hash = value
+	}
+}
+
+func (p *TnURLPattern) tnCompile() {
+	var hasRegexp bool
+	p.reProtocol, hasRegexp = tnURLPatternCompile(p.protocol, "protocol", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.reUsername, hasRegexp = tnURLPatternCompile(p.username, "username", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.rePassword, hasRegexp = tnURLPatternCompile(p.password, "password", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.reHostname, hasRegexp = tnURLPatternCompile(p.hostname, "hostname", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.rePort, hasRegexp = tnURLPatternCompile(p.port, "port", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.rePathname, hasRegexp = tnURLPatternCompile(p.pathname, "pathname", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.reSearch, hasRegexp = tnURLPatternCompile(p.search, "search", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+	p.reHash, hasRegexp = tnURLPatternCompile(p.hash, "hash", p.ignoreCase)
+	p.hasRegExpGroups = p.hasRegExpGroups || hasRegexp
+}
+
+func TnNewURLPattern(args ...interface{}) *TnURLPattern {
+	p := &TnURLPattern{ignoreCase: false}
+	components := []string{"protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"}
+	for _, component := range components {
+		tnURLPatternSet(p, component, "*")
+	}
+	var input interface{}
+	var base interface{}
+	var options interface{}
+	if len(args) > 0 {
+		input = args[0]
+	}
+	if len(args) > 1 {
+		switch args[1].(type) {
+		case string, *TnURL:
+			base = args[1]
+		default:
+			options = args[1]
+		}
+	}
+	if len(args) > 2 {
+		options = args[2]
+	}
+	if options != nil {
+		if flag, ok := TnGet(options, "ignoreCase").(bool); ok {
+			p.ignoreCase = flag
+		}
+	}
+	// (the init object's baseURL, or the second constructor argument)
+	baseValue := ""
+	if input != nil {
+		if s, ok := TnGet(input, "baseURL").(string); ok {
+			baseValue = s
+		}
+	}
+	var baseURL *TnURL
+	if base != nil {
+		baseURL = TnNewURL(base)
+	}
+	switch value := input.(type) {
+	case nil:
+		// (all components stay wildcards)
+	case string:
+		var parsed *TnURL
+		var ok bool
+		if base != nil {
+			parsed = TnNewURL(value, base)
+			ok = true
+		} else {
+			parsed, ok = tnParseURLString(value, nil)
+		}
+		if !ok || parsed == nil || parsed.protocol == "" {
+			panic(tnURLPatternError("Invalid URL pattern"))
+		}
+		tnURLPatternSet(p, "protocol", strings.TrimSuffix(parsed.protocol, ":"))
+		if parsed.username != "" {
+			tnURLPatternSet(p, "username", parsed.username)
+		}
+		if parsed.password != "" {
+			tnURLPatternSet(p, "password", parsed.password)
+		}
+		tnURLPatternSet(p, "hostname", parsed.hostname)
+		tnURLPatternSet(p, "port", parsed.port)
+		tnURLPatternSet(p, "pathname", parsed.pathname)
+		if parsed.search != "" {
+			tnURLPatternSet(p, "search", strings.TrimPrefix(parsed.search, "?"))
+		}
+		if parsed.hash != "" {
+			tnURLPatternSet(p, "hash", strings.TrimPrefix(parsed.hash, "#"))
+		}
+	case *TnURL:
+		tnURLPatternSet(p, "protocol", strings.TrimSuffix(value.protocol, ":"))
+		if value.username != "" {
+			tnURLPatternSet(p, "username", value.username)
+		}
+		if value.password != "" {
+			tnURLPatternSet(p, "password", value.password)
+		}
+		tnURLPatternSet(p, "hostname", value.hostname)
+		tnURLPatternSet(p, "port", value.port)
+		tnURLPatternSet(p, "pathname", value.pathname)
+		if value.search != "" {
+			tnURLPatternSet(p, "search", strings.TrimPrefix(value.search, "?"))
+		}
+		if value.hash != "" {
+			tnURLPatternSet(p, "hash", strings.TrimPrefix(value.hash, "#"))
+		}
+	default:
+		if baseValue != "" && baseURL == nil {
+			baseURL = TnNewURL(baseValue)
+		}
+		bases := map[string]string{"protocol": "*", "username": "*", "password": "*", "hostname": "*", "port": "*", "pathname": "*", "search": "*", "hash": "*"}
+		if baseURL != nil {
+			bases["protocol"] = strings.TrimSuffix(baseURL.protocol, ":")
+			bases["hostname"] = baseURL.hostname
+			bases["port"] = baseURL.port
+			bases["pathname"] = baseURL.pathname
+		}
+		for _, component := range components {
+			tnURLPatternSet(p, component, tnURLPatternCanonical(tnURLPatternComponent(input, component, bases[component]), component))
+		}
+	}
+	// (canonicalize string and URL inputs too: a pattern's own syntax stays)
+	for _, component := range components {
+		value := ""
+		switch component {
+		case "protocol":
+			value = p.protocol
+		case "username":
+			value = p.username
+		case "password":
+			value = p.password
+		case "hostname":
+			value = p.hostname
+		case "port":
+			value = p.port
+		case "pathname":
+			value = p.pathname
+		case "search":
+			value = p.search
+		case "hash":
+			value = p.hash
+		}
+		if component == "hostname" {
+			tnURLPatternSet(p, component, strings.ToLower(value))
+		}
+	}
+	p.tnCompile()
+	return p
+}
+
+func tnURLPatternGroups(re *regexp.Regexp, input string) *TnMap[string, *string] {
+	groups := TnNewMap[string, *string]()
+	match := re.FindStringSubmatchIndex(input)
+	if match == nil {
+		return groups
+	}
+	names := re.SubexpNames()
+	for i := 1; i < len(names); i++ {
+		name := names[i]
+		if name == "" {
+			name = strconv.Itoa(i - 1)
+		}
+		start, end := match[2*i], match[2*i+1]
+		if start < 0 {
+			groups.Set(name, nil)
+			continue
+		}
+		value := input[start:end]
+		groups.Set(name, &value)
+	}
+	return groups
+}
+
+func (p *TnURLPattern) tnComponent(re *regexp.Regexp, input string) *TnURLPatternComponentResult {
+	return &TnURLPatternComponentResult{input: input, groups: tnURLPatternGroups(re, input)}
+}
+
+func (p *TnURLPattern) exec(args ...interface{}) *TnURLPatternExecResult {
+	if len(args) == 0 || args[0] == nil {
+		return nil
+	}
+	var base interface{}
+	if len(args) > 1 {
+		base = args[1]
+	}
+	protocol, username, password := "", "", ""
+	hostname, port, pathname, search, hash := "", "", "", "", ""
+	switch value := args[0].(type) {
+	case string:
+		var parsed *TnURL
+		if base != nil {
+			parsed = TnNewURL(value, base)
+		} else if u, ok := tnParseURLString(value, nil); ok {
+			parsed = u
+		}
+		if parsed != nil {
+			protocol = strings.TrimSuffix(parsed.protocol, ":")
+			username, password = parsed.username, parsed.password
+			hostname, port, pathname = parsed.hostname, parsed.port, parsed.pathname
+			search, hash = strings.TrimPrefix(parsed.search, "?"), strings.TrimPrefix(parsed.hash, "#")
+		} else {
+			pathname = value
+		}
+	case *TnURL:
+		protocol = strings.TrimSuffix(value.protocol, ":")
+		username, password = value.username, value.password
+		hostname, port, pathname = value.hostname, value.port, value.pathname
+		search, hash = strings.TrimPrefix(value.search, "?"), strings.TrimPrefix(value.hash, "#")
+	default:
+		protocol = tnURLPatternComponent(value, "protocol", "")
+		username = tnURLPatternComponent(value, "username", "")
+		password = tnURLPatternComponent(value, "password", "")
+		hostname = tnURLPatternComponent(value, "hostname", "")
+		port = tnURLPatternComponent(value, "port", "")
+		pathname = tnURLPatternComponent(value, "pathname", "")
+		search = tnURLPatternComponent(value, "search", "")
+		hash = tnURLPatternComponent(value, "hash", "")
+	}
+	if !p.reProtocol.MatchString(protocol) || !p.reUsername.MatchString(username) || !p.rePassword.MatchString(password) ||
+		!p.reHostname.MatchString(hostname) || !p.rePort.MatchString(port) || !p.rePathname.MatchString(pathname) ||
+		!p.reSearch.MatchString(search) || !p.reHash.MatchString(hash) {
+		return nil
+	}
+	return &TnURLPatternExecResult{
+		inputs:   []interface{}{args[0]},
+		protocol: p.tnComponent(p.reProtocol, protocol),
+		username: p.tnComponent(p.reUsername, username),
+		password: p.tnComponent(p.rePassword, password),
+		hostname: p.tnComponent(p.reHostname, hostname),
+		port:     p.tnComponent(p.rePort, port),
+		pathname: p.tnComponent(p.rePathname, pathname),
+		search:   p.tnComponent(p.reSearch, search),
+		hash:     p.tnComponent(p.reHash, hash),
+	}
+}
+
+func (p *TnURLPattern) test(args ...interface{}) bool {
+	return p.exec(args...) != nil
+}`;
 export function registerUrl(r) {
     defineModule(r, 'url');
     defineHelper(r, 'nodeUrl', ['encoding/hex', 'fmt', 'net/url', 'path/filepath', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'sync', 'unicode/utf16', 'unsafe'], ['error', 'dynamic', 'punycode', 'pathToFileURL', 'nodeInvoke'], urlHelper);
@@ -859,6 +1471,38 @@ export function registerUrl(r) {
     r.paramTypers['url.URLSearchParams#forEach'] = (_n) => ['string', 'string', '*TnURLSearchParams'];
     r.globals['URL'] = 'url.URL';
     r.globals['URLSearchParams'] = 'url.URLSearchParams';
+    // URLPattern (a global and a node:url export)
+    defineHelper(r, 'nodeURLPattern', ['regexp', 'strconv', 'strings'], ['nodeUrl', 'error', 'dynamic'], urlPatternHelper);
+    const patternClass = {
+        key: 'url.URLPattern',
+        goType: '*TnURLPattern',
+        category: 'class',
+        methods: { test: 'bool', exec: '*TnURLPatternExecResult' },
+        props: {
+            protocol: 'string',
+            username: 'string',
+            password: 'string',
+            hostname: 'string',
+            port: 'string',
+            pathname: 'string',
+            search: 'string',
+            hash: 'string',
+            hasRegExpGroups: 'bool'
+        },
+        getters: {},
+        setters: {}
+    };
+    r.classes['url.URLPattern'] = patternClass;
+    r.classByGoType['*TnURLPattern'] = 'url.URLPattern';
+    defineClass(r, 'url.URLPatternResult', '*TnURLPatternExecResult', 'class', '', 'inputs=[]interface{}; protocol=*TnURLPatternComponentResult; username=*TnURLPatternComponentResult; password=*TnURLPatternComponentResult; hostname=*TnURLPatternComponentResult; port=*TnURLPatternComponentResult; pathname=*TnURLPatternComponentResult; search=*TnURLPatternComponentResult; hash=*TnURLPatternComponentResult', '', '');
+    defineClass(r, 'url.URLPatternComponentResult', '*TnURLPatternComponentResult', 'class', '', 'input=string; groups=*TnMap[string, *string]', '', '');
+    r.globals['URLPattern'] = 'url.URLPattern';
+    r.globals['URLPatternResult'] = 'url.URLPatternResult';
+    r.globals['URLPatternComponentResult'] = 'url.URLPatternComponentResult';
+    r.constructors['url.URLPattern'] = (call) => {
+        r.helper('nodeURLPattern');
+        return `TnNewURLPattern(${call.args.join(', ')})`;
+    };
     const use = () => r.helper('nodeUrl');
     r.constructors['url.URL'] = (call) => {
         use();
@@ -878,6 +1522,19 @@ export function registerUrl(r) {
     };
     r.results['url.URL.canParse'] = 'bool';
     r.results['url.URL.parse'] = '*TnURL';
+    // legacy url.parse / url.resolve
+    defineHelper(r, 'nodeUrlLegacy', ['net/url', 'regexp', 'strings'], ['nodeQuerystring'], legacyUrlHelper);
+    defineClass(r, 'url.Url', '*TnLegacyUrl', 'class', 'toString=string', 'protocol=interface{}; slashes=interface{}; auth=interface{}; host=interface{}; port=interface{}; hostname=interface{}; hash=interface{}; search=interface{}; query=interface{}; pathname=interface{}; path=interface{}; href=string', '', '');
+    r.functions['url.parse'] = (call) => {
+        r.helper('nodeUrlLegacy');
+        return `TnUrlParse(${call.args[0]}, ${call.args[1] ?? 'false'}, ${call.args[2] ?? 'false'})`;
+    };
+    r.results['url.parse'] = '*TnLegacyUrl';
+    r.functions['url.resolve'] = (call) => {
+        r.helper('nodeUrlLegacy');
+        return `TnUrlResolve(${call.args[0]}, ${call.args[1]})`;
+    };
+    r.results['url.resolve'] = 'string';
     r.functions['url.fileURLToPath'] = (call) => {
         use();
         return `TnFileURLToPath(${call.args[0]})`;

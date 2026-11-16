@@ -681,6 +681,48 @@ func (db *TnSqliteDb) deserialize(data []byte, options ...interface{}) {
 	db.check(db.conn.Restore(schema, path))
 }
 
+// statement.close() / [Symbol.dispose](): finalized now (later calls throw)
+func (st *TnSqliteStmt) close() {
+	if st.s != nil && st.db.live[st.s] {
+		delete(st.db.live, st.s)
+		st.s.Close()
+	}
+}
+
+func (st *TnSqliteStmt) __dispose() { st.close() }
+
+// statement.stat(counter): one of SQLite's statement counters
+var tnSqliteStatCounters = map[string]sqlite3.StmtStatus{
+	"fullscanStep": sqlite3.STMTSTATUS_FULLSCAN_STEP, "sort": sqlite3.STMTSTATUS_SORT,
+	"autoindex": sqlite3.STMTSTATUS_AUTOINDEX, "vmStep": sqlite3.STMTSTATUS_VM_STEP,
+	"reprepare": sqlite3.STMTSTATUS_REPREPARE, "run": sqlite3.STMTSTATUS_RUN,
+	"filterMiss": sqlite3.STMTSTATUS_FILTER_MISS, "filterHit": sqlite3.STMTSTATUS_FILTER_HIT,
+	"memused": sqlite3.STMTSTATUS_MEMUSED,
+}
+
+func (st *TnSqliteStmt) stat(counter interface{}) float64 {
+	st.requireLive()
+	name, isString := counter.(string)
+	if !isString {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"counter\\" argument must be a string."))
+	}
+	op, ok := tnSqliteStatCounters[name]
+	if !ok {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The \\"counter\\" argument is not a valid statistic name."))
+	}
+	return float64(st.s.Status(op, false))
+}
+
+// statement.resetStats(): every counter back to 0
+func (st *TnSqliteStmt) resetStats() {
+	st.requireLive()
+	for _, op := range tnSqliteStatCounters {
+		if op != sqlite3.STMTSTATUS_MEMUSED {
+			st.s.Status(op, true)
+		}
+	}
+}
+
 func (st *TnSqliteStmt) requireLive() {
 	// db.close() (or a reopen) finalized it
 	if st.s == nil || !st.db.live[st.s] {
@@ -1137,7 +1179,7 @@ export function registerSqlite(r: NodeRegistry): void {
     'sqlite.StatementSync',
     '*TnSqliteStmt',
     'class',
-    'run=*TnSqliteRunResult; get=interface{}; all=[]interface{}; iterate=*TnSqliteIterator; columns=[]interface{}; setReadBigInts=; setReturnArrays=; setAllowBareNamedParameters=; setAllowUnknownNamedParameters=',
+    'run=*TnSqliteRunResult; get=interface{}; all=[]interface{}; iterate=*TnSqliteIterator; columns=[]interface{}; setReadBigInts=; setReturnArrays=; setAllowBareNamedParameters=; setAllowUnknownNamedParameters=; close=; __dispose=; stat=float64; resetStats=',
     '',
     'sourceSQL=string; expandedSQL=string',
     ''
@@ -1163,6 +1205,10 @@ export function registerSqlite(r: NodeRegistry): void {
     use();
     return `TnNewSqliteDb(${c.args.join(', ')})`;
   };
+  // Database / Statement: Node 26's names (DatabaseSync / StatementSync stay, deprecated)
+  r.classes['sqlite.Database'] = r.classes['sqlite.DatabaseSync'];
+  r.classes['sqlite.Statement'] = r.classes['sqlite.StatementSync'];
+  r.constructors['sqlite.Database'] = r.constructors['sqlite.DatabaseSync'];
   r.functions['sqlite.backup'] = (c: NodeCall) => {
     use();
     return `TnSqliteBackup(${c.args.join(', ')})`;

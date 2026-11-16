@@ -179,7 +179,7 @@ var tnWarningHinted bool
 
 func TnProcessVersions() *TnMap[string, string] {
 	m := TnNewMap[string, string]()
-	m.Set("node", "24.0.0")
+	m.Set("node", "26.0.0")
 	m.Set("go", strings.TrimPrefix(runtime.Version(), "go"))
 	return m
 }
@@ -396,6 +396,29 @@ func tnUmask(mask int) int {
 	return 0
 }`;
 
+const execveUnixHelper = `// process.execve(file, args, env): the process image replaced
+func TnExecve(file string, args interface{}, env interface{}) {
+	argv := []string{file}
+	if args != nil {
+		argv = TnSliceAs[string](args)
+	}
+	environ := os.Environ()
+	if env != nil {
+		environ = []string{}
+		for _, k := range TnKeys(env) {
+			environ = append(environ, k+"="+TnJSString(TnGetValue(env, k)))
+		}
+	}
+	if err := syscall.Exec(file, argv, environ); err != nil {
+		panic(TnNodeError("Error", "ERR_PROCESS_EXECVE_FAILED", "process.execve failed with error code "+err.Error()))
+	}
+}`;
+
+const execveWindowsHelper = `// process.execve: Windows has no exec
+func TnExecve(file string, args interface{}, env interface{}) {
+	panic(TnNodeError("TypeError", "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM", "The feature process.execve is unavailable on the current platform, which is being used to run Node.js"))
+}`;
+
 export function registerProcess(r: NodeRegistry): void {
   defineModule(r, 'process');
   r.globals['process'] = 'process';
@@ -417,6 +440,9 @@ export function registerProcess(r: NodeRegistry): void {
   for (const goos of ['darwin', 'freebsd']) defineHelper(r, `nodeTtyOS@${goos}`, ['os', 'syscall', 'unsafe'], [], bsdTtyHelper);
   defineHelper(r, 'nodeTtyOS@windows', ['os', 'syscall', 'unsafe'], [], windowsTtyHelper);
   defineHelper(r, 'nodeTtyOS@other', ['os'], [], otherTtyHelper);
+  defineHelper(r, 'nodeExecveOS@windows', [], ['error'], execveWindowsHelper);
+  defineHelper(r, 'nodeExecveOS@other', ['os', 'syscall'], ['error', 'dynamic', 'arraySubclass'], execveUnixHelper);
+  defineHelper(r, 'nodeExecve', [], ['nodeExecveOS@os'], '// process.execve (per OS)');
   defineHelper(r, 'nodeTty', ['os', 'strconv'], ['nodeTtyOS@os', 'nodeProcess', 'error', 'dynamic'], ttyHelper);
   const tty = () => r.helper('nodeTty');
   const value = (name: string, type: string, emit: () => string) => {
@@ -465,7 +491,7 @@ export function registerProcess(r: NodeRegistry): void {
     r.pkg('os');
     return 'float64(os.Getppid())';
   });
-  value('version', 'string', () => '"v24.0.0"');
+  value('version', 'string', () => '"v26.0.0"');
   value('versions', '*TnMap[string, string]', () => {
     use();
     return 'TnProcessVersions()';
@@ -523,6 +549,21 @@ export function registerProcess(r: NodeRegistry): void {
     r.functions[`process.${name}`] = emit;
     r.results[`process.${name}`] = result;
   };
+  // process.ref(x) / unref(x): x's own ref() / unref() (timers, sockets, …)
+  for (const name of ['ref', 'unref']) {
+    fn(name, '', (call: NodeCall) => {
+      const type = call.types[0] ?? '';
+      if (type.startsWith('*Tn') && !type.startsWith('*TnMap[')) return `func() { if __v := ${call.args[0]}; __v != nil { __v.${name}() } }()`;
+      r.helper('dynamic');
+      return `func() { if __v := interface{}(${call.args[0]}); __v != nil { TnCallMember(__v, "${name}") } }()`;
+    });
+  }
+  // process.execve(file, args, env): replaces the process (Unix only)
+  fn('execve', '', (call: NodeCall) => {
+    r.helper('nodeExecve');
+    r.helper('dynamic');
+    return `TnExecve(${call.args[0]}, ${call.args[1] ?? 'nil'}, ${call.args[2] ?? 'nil'})`;
+  });
   fn('exit', '', (call: NodeCall) => {
     use();
     return `TnProcessExitWith(${call.args.slice(0, 1).join(', ')})`;

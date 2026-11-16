@@ -516,7 +516,65 @@ type TnEvent struct {
 	defaultPrevented bool
 	cancelable       bool
 	target           interface{}
+	// CustomEvent's detail; ErrorEvent's message / filename / lineno / colno / error
+	detail   interface{}
+	message  string
+	filename string
+	lineno   float64
+	colno    float64
+	error_   interface{}
+	// MessageEvent's data / origin / lastEventId; CloseEvent's code / reason / wasClean
+	data        interface{}
+	origin      string
+	lastEventId string
+	code        float64
+	reason      string
+	wasClean    bool
 }
+
+// new CustomEvent(type, { detail, cancelable })
+func TnNewCustomEvent(eventType string, options ...interface{}) *TnEvent {
+	ev := TnNewEvent(eventType, options...)
+	if len(options) > 0 && options[0] != nil {
+		ev.detail = TnGetValue(options[0], "detail")
+	}
+	return ev
+}
+
+// new ErrorEvent(type, { message, filename, lineno, colno, error })
+func TnNewErrorEvent(eventType string, options ...interface{}) *TnEvent {
+	ev := TnNewEvent(eventType, options...)
+	if len(options) > 0 && options[0] != nil {
+		o := options[0]
+		if m, ok := TnGetValue(o, "message").(string); ok {
+			ev.message = m
+		}
+		if f, ok := TnGetValue(o, "filename").(string); ok {
+			ev.filename = f
+		}
+		if n, ok := TnGetValue(o, "lineno").(float64); ok {
+			ev.lineno = n
+		}
+		if n, ok := TnGetValue(o, "colno").(float64); ok {
+			ev.colno = n
+		}
+		ev.error_ = TnGetValue(o, "error")
+	}
+	return ev
+}
+
+func (ev *TnEvent) Get_detail() interface{}  { return ev.detail }
+func (ev *TnEvent) Get_data() interface{}    { return ev.data }
+func (ev *TnEvent) Get_origin() string       { return ev.origin }
+func (ev *TnEvent) Get_lastEventId() string  { return ev.lastEventId }
+func (ev *TnEvent) Get_code() float64        { return ev.code }
+func (ev *TnEvent) Get_reason() string       { return ev.reason }
+func (ev *TnEvent) Get_wasClean() bool       { return ev.wasClean }
+func (ev *TnEvent) Get_message() string      { return ev.message }
+func (ev *TnEvent) Get_filename() string     { return ev.filename }
+func (ev *TnEvent) Get_lineno() float64      { return ev.lineno }
+func (ev *TnEvent) Get_colno() float64       { return ev.colno }
+func (ev *TnEvent) Get_error() interface{}   { return ev.error_ }
 
 func TnNewEvent(eventType string, options ...interface{}) *TnEvent {
 	ev := &TnEvent{eventType: eventType, timeStamp: float64(time.Now().UnixNano()) / 1e6}
@@ -532,6 +590,39 @@ func (ev *TnEvent) Get_type_() string           { return ev.eventType }
 func (ev *TnEvent) Get_defaultPrevented() bool  { return ev.defaultPrevented }
 func (ev *TnEvent) Get_target() interface{}     { return ev.target }
 func (ev *TnEvent) Get_timeStamp() float64      { return ev.timeStamp }
+
+// new MessageEvent(type, { data, origin, lastEventId })
+func TnNewMessageEvent(eventType string, options ...interface{}) *TnEvent {
+	ev := TnNewEvent(eventType, options...)
+	if len(options) > 0 && options[0] != nil {
+		ev.data = TnGetValue(options[0], "data")
+		if o, ok := TnGetValue(options[0], "origin").(string); ok {
+			ev.origin = o
+		}
+		if o, ok := TnGetValue(options[0], "lastEventId").(string); ok {
+			ev.lastEventId = o
+		}
+	}
+	return ev
+}
+
+// new CloseEvent(type, { code, reason, wasClean })
+func TnNewCloseEvent(eventType string, options ...interface{}) *TnEvent {
+	ev := TnNewEvent(eventType, options...)
+	if len(options) > 0 && options[0] != nil {
+		if n, ok := TnGetValue(options[0], "code").(float64); ok {
+			ev.code = n
+		}
+		if s, ok := TnGetValue(options[0], "reason").(string); ok {
+			ev.reason = s
+		}
+		if b, ok := TnGetValue(options[0], "wasClean").(bool); ok {
+			ev.wasClean = b
+		}
+	}
+	return ev
+}
+
 func (ev *TnEvent) preventDefault() {
 	if ev.cancelable {
 		ev.defaultPrevented = true
@@ -600,7 +691,8 @@ type TnAbortSignal struct {
 
 func tnAbortError(message string, name string) *TnError {
 	e := TnNodeError(name, "ABORT_ERR", message)
-	e.props["code"] = float64(20)
+	e.props["code"] = tnDOMExceptionCodes[name]
+	e.dom = true
 	return e
 }
 
@@ -731,6 +823,180 @@ func TnProcessEmitExit(code float64) {
 
 func init() { tnBeforeExit = TnProcessEmitExit }`;
 
+const eventsSymbolHelper = `// Symbol event names: each symbol is its own listener key
+func TnEventKey(v interface{}) string {
+	switch k := v.(type) {
+	case string:
+		return k
+	case *TnSymbol:
+		return fmt.Sprintf("Symbol(%s)@%p", k.description, k)
+	}
+	return TnJSString(v)
+}`;
+
+const emitterAsyncResourceHelper = `// events.EventEmitterAsyncResource: an EventEmitter whose listeners run in
+// the async context it was created in
+type TnEventEmitterAsyncResource struct {
+	TnEventEmitter
+	res *TnAsyncResource
+}
+
+func TnNewEventEmitterAsyncResource(options ...interface{}) *TnEventEmitterAsyncResource {
+	name := "EventEmitterAsyncResource"
+	var opts interface{}
+	if len(options) > 0 && options[0] != nil {
+		opts = options[0]
+		if n, ok := TnGetValue(opts, "name").(string); ok {
+			name = n
+		}
+	}
+	e := &TnEventEmitterAsyncResource{res: TnNewAsyncResource(name, opts)}
+	if opts != nil {
+		if b, ok := TnGetValue(opts, "captureRejections").(bool); ok {
+			e.st().captureRejections = b
+		}
+	}
+	return e
+}
+
+func (e *TnEventEmitterAsyncResource) tnEmitter() *TnEventEmitter { return &e.TnEventEmitter }
+
+func (e *TnEventEmitterAsyncResource) emit(event string, args ...interface{}) bool {
+	var out bool
+	TnAsyncRun(e.res.ctx, func() { out = e.TnEventEmitter.emit(event, args...) })
+	return out
+}
+
+func (e *TnEventEmitterAsyncResource) Get_asyncResource() *TnAsyncResource { return e.res }
+func (e *TnEventEmitterAsyncResource) Get_asyncId() float64                { return e.res.id }
+func (e *TnEventEmitterAsyncResource) Get_triggerAsyncId() float64         { return e.res.triggerID }
+func (e *TnEventEmitterAsyncResource) emitDestroy()                        {}`;
+
+const navigatorHelper = `// navigator.language: the OS locale (LANG / LC_ALL), en-US by default
+func TnNavigatorLanguage() string {
+	for _, name := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
+		if v := os.Getenv(name); v != "" && v != "C" && v != "POSIX" {
+			v = strings.SplitN(v, ".", 2)[0]
+			return strings.ReplaceAll(v, "_", "-")
+		}
+	}
+	return "en-US"
+}
+
+type TnNavigator struct{}
+
+var tnNavigator = &TnNavigator{}
+
+func (n *TnNavigator) Get_hardwareConcurrency() float64 { return float64(runtime.NumCPU()) }
+func (n *TnNavigator) Get_language() string            { return TnNavigatorLanguage() }
+func (n *TnNavigator) Get_languages() []string         { return []string{TnNavigatorLanguage()} }
+func (n *TnNavigator) Get_platform() string            { return TnNavigatorPlatform() }
+func (n *TnNavigator) Get_userAgent() string           { return "Node.js/26" }
+
+// navigator.platform as browsers name it
+func TnNavigatorPlatform() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Win32"
+	case "darwin":
+		return "MacIntel"
+	case "linux":
+		if runtime.GOARCH == "arm64" {
+			return "Linux aarch64"
+		}
+		return "Linux x86_64"
+	}
+	return runtime.GOOS
+}`;
+
+const storageHelper = `// Web Storage (sessionStorage / localStorage): string keys and values
+type TnStorage struct {
+	items *TnMap[string, string]
+	file  string
+	mu    sync.Mutex
+}
+
+var tnSessionStorage, tnLocalStorage *TnStorage
+var tnLocalStorageLoaded bool
+
+func TnSessionStorage() *TnStorage {
+	if tnSessionStorage == nil {
+		tnSessionStorage = &TnStorage{items: TnNewMap[string, string]()}
+	}
+	return tnSessionStorage
+}
+
+// localStorage: undefined unless TN_LOCALSTORAGE_FILE names its file
+func TnLocalStorage() *TnStorage {
+	if !tnLocalStorageLoaded {
+		tnLocalStorageLoaded = true
+		if path := os.Getenv("TN_LOCALSTORAGE_FILE"); path != "" {
+			st := &TnStorage{items: TnNewMap[string, string](), file: path}
+			if data, err := os.ReadFile(path); err == nil {
+				var pairs [][2]string
+				if json.Unmarshal(data, &pairs) == nil {
+					for _, p := range pairs {
+						st.items.Set(p[0], p[1])
+					}
+				}
+			}
+			tnLocalStorage = st
+		}
+	}
+	return tnLocalStorage
+}
+
+func (s *TnStorage) save() {
+	if s.file == "" {
+		return
+	}
+	pairs := [][2]string{}
+	for _, k := range s.items.Keys() {
+		pairs = append(pairs, [2]string{k, s.items.Get(k)})
+	}
+	data, _ := json.Marshal(pairs)
+	os.WriteFile(s.file, data, 0o644)
+}
+
+func (s *TnStorage) Get_length() float64 { return float64(s.items.Len()) }
+
+func (s *TnStorage) getItem(key interface{}) *string {
+	if v, ok := s.items.Lookup(TnJSString(key)); ok {
+		return &v
+	}
+	return nil
+}
+
+func (s *TnStorage) setItem(key interface{}, value interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items.Set(TnJSString(key), TnJSString(value))
+	s.save()
+}
+
+func (s *TnStorage) removeItem(key interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items.Delete(TnJSString(key))
+	s.save()
+}
+
+func (s *TnStorage) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items.Clear()
+	s.save()
+}
+
+func (s *TnStorage) key(index float64) *string {
+	keys := s.items.Keys()
+	if index < 0 || int(index) >= len(keys) {
+		return nil
+	}
+	k := keys[int(index)]
+	return &k
+}`;
+
 export function registerEvents(r: NodeRegistry): void {
   defineModule(r, 'events');
   r.namespaces['events.default'] = 'events.EventEmitter';
@@ -740,6 +1006,30 @@ export function registerEvents(r: NodeRegistry): void {
   defineClass(r, 'events.EventEmitter', '*TnEventEmitter', 'class', emitterMethods, '', '', '');
   r.classes['events.default'] = r.classes['events.EventEmitter'];
   const use = () => r.helper('nodeEvents');
+  // (a symbol event name: the listener key TnEventKey gives it)
+  defineHelper(r, 'nodeEventsSymbol', ['fmt'], ['nodeEvents', 'symbol', 'dynamic'], eventsSymbolHelper);
+  for (const name of ['on', 'addListener', 'once', 'prependListener', 'prependOnceListener', 'off', 'removeListener', 'removeAllListeners', 'emit', 'listeners', 'rawListeners', 'listenerCount']) {
+    for (const cls of ['events.EventEmitter', 'events.EventEmitterAsyncResource']) {
+      r.methods[`${cls}#${name}`] = (c: NodeCall) => {
+        use();
+        const args = c.args.slice();
+        if (args.length > 0 && c.types[0] !== 'string') {
+          r.helper('nodeEventsSymbol');
+          args[0] = `TnEventKey(${args[0]})`;
+        }
+        return `${c.recv}.${name}(${args.join(', ')})`;
+      };
+    }
+  }
+  // EventEmitterAsyncResource
+  defineHelper(r, 'nodeEventsAsyncResource', [], ['nodeEvents', 'nodeAsyncHooks'], emitterAsyncResourceHelper);
+  defineClass(r, 'events.EventEmitterAsyncResource', '*TnEventEmitterAsyncResource', 'class', emitterMethods + '; emitDestroy=', '', 'asyncResource=*TnAsyncResource; asyncId=float64; triggerAsyncId=float64', '');
+  r.constructors['events.EventEmitterAsyncResource'] = (call: NodeCall) => {
+    r.helper('nodeEventsAsyncResource');
+    return `TnNewEventEmitterAsyncResource(${call.args.join(', ')})`;
+  };
+  r.classes['events.EventEmitter.EventEmitterAsyncResource'] = r.classes['events.EventEmitterAsyncResource'];
+  r.constructors['events.EventEmitter.EventEmitterAsyncResource'] = r.constructors['events.EventEmitterAsyncResource'];
   r.constructors['events.EventEmitter'] = (call: NodeCall) => {
     use();
     return `TnNewEventEmitter(${call.args.join(', ')})`;
@@ -810,7 +1100,7 @@ export function registerEvents(r: NodeRegistry): void {
   defineClass(r, 'events.Disposable', '*TnDisposable', 'class', '__dispose=', '', '', '');
 
   // EventTarget / Event / AbortController / AbortSignal (globals, also exported by node:events)
-  defineClass(r, 'globals.Event', '*TnEvent', 'class', 'preventDefault=', '', 'type=string; defaultPrevented=bool; target=interface{}; timeStamp=float64', '');
+  defineClass(r, 'globals.Event', '*TnEvent', 'class', 'preventDefault=', '', 'type=string; defaultPrevented=bool; target=interface{}; timeStamp=float64; detail=interface{}; message=string; filename=string; lineno=float64; colno=float64; error=interface{}; data=interface{}; origin=string; lastEventId=string; code=float64; reason=string; wasClean=bool', '');
   defineClass(r, 'globals.EventTarget', '*TnEventTarget', 'class', 'addEventListener=; removeEventListener=; dispatchEvent=bool', '', '', '');
   defineClass(
     r,
@@ -832,6 +1122,49 @@ export function registerEvents(r: NodeRegistry): void {
     use();
     return `TnNewEvent(${call.args.join(', ')})`;
   };
+  // CustomEvent / ErrorEvent / MessageEvent / CloseEvent: Events with their extra fields
+  for (const [name, ctor] of [
+    ['CustomEvent', 'TnNewCustomEvent'],
+    ['ErrorEvent', 'TnNewErrorEvent'],
+    ['MessageEvent', 'TnNewMessageEvent'],
+    ['CloseEvent', 'TnNewCloseEvent']
+  ]) {
+    r.classes[`globals.${name}`] = r.classes['globals.Event'];
+    r.globals[name] = `globals.${name}`;
+    r.constructors[`globals.${name}`] = (call: NodeCall) => {
+      use();
+      return `${ctor}(${call.args.join(', ')})`;
+    };
+  }
+
+  // navigator: the process as a browser would describe it (Node 21+)
+  defineHelper(r, 'nodeNavigator', ['os', 'runtime', 'strings'], [], navigatorHelper);
+  // (a value: navigator?.userAgent and passing it around work)
+  defineClass(r, 'globals.Navigator', '*TnNavigator', 'class', '', '', 'hardwareConcurrency=float64; language=string; languages=[]string; platform=string; userAgent=string', '');
+  r.globals['navigator'] = 'navigator';
+  r.values['navigator'] = (_c: NodeCall) => {
+    r.helper('nodeNavigator');
+    return 'tnNavigator';
+  };
+  r.valueTypes['navigator'] = '*TnNavigator';
+
+  // Web Storage: sessionStorage in memory; localStorage persisted to the file
+  // TN_LOCALSTORAGE_FILE names (Node's --localstorage-file), else undefined
+  defineHelper(r, 'nodeWebStorage', ['encoding/json', 'os', 'sync'], ['orderedMap', 'dynamic', 'error'], storageHelper);
+  defineClass(r, 'globals.Storage', '*TnStorage', 'class', 'getItem=*string; setItem=; removeItem=; clear=; key=*string', '', 'length=float64', '');
+  r.globals['Storage'] = 'globals.Storage';
+  r.globals['sessionStorage'] = 'sessionStorage';
+  r.globals['localStorage'] = 'localStorage';
+  r.values['sessionStorage'] = (_c: NodeCall) => {
+    r.helper('nodeWebStorage');
+    return 'TnSessionStorage()';
+  };
+  r.valueTypes['sessionStorage'] = '*TnStorage';
+  r.values['localStorage'] = (_c: NodeCall) => {
+    r.helper('nodeWebStorage');
+    return 'TnLocalStorage()';
+  };
+  r.valueTypes['localStorage'] = '*TnStorage';
   r.constructors['globals.EventTarget'] = (_c: NodeCall) => {
     use();
     return 'TnNewEventTarget()';

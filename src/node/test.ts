@@ -22,6 +22,7 @@ type TnTestNode struct {
 	todo        bool
 	todoMsg     string
 	only        bool
+	tags        []string
 	timeoutMs   float64
 	parent      *TnTestNode
 	children    []*TnTestNode
@@ -109,6 +110,32 @@ func (t *TnTestContext) diagnostic(msg string) {
 	t.node.diagnostics = append(t.node.diagnostics, msg)
 }
 
+// t.log(...args): a message in the report (formatted like console.log)
+func (t *TnTestContext) log(args ...interface{}) {
+	t.node.diagnostics = append(t.node.diagnostics, TnUtilFormat(args...))
+}
+
+// t.passed: whether the test has finished and passed; t.attempt: 0 (no retries);
+// t.workerId: undefined outside run()'s isolated workers; t.tags: from the options
+func (t *TnTestContext) Get_passed() bool         { return t.node.status == "pass" }
+func (t *TnTestContext) Get_attempt() float64     { return 0 }
+func (t *TnTestContext) Get_workerId() interface{} { return nil }
+func (t *TnTestContext) Get_tags() []string {
+	tags := []string{}
+	for n := t.node; n != nil; n = n.parent {
+		tags = append(tags, n.tags...)
+	}
+	return tags
+}
+
+// test.getTestContext(): the running test's context (undefined outside a test)
+func TnGetTestContext() *TnTestContext {
+	if tnTestRunning != nil {
+		return tnTestRunning.ctx
+	}
+	return nil
+}
+
 func (t *TnTestContext) plan(n float64, options ...interface{}) {
 	t.planned = n
 	t.planSet = true
@@ -170,6 +197,9 @@ func tnTestNew(suite bool, args []interface{}) *TnTestNode {
 			}
 			if only, ok := TnGetValue(a, "only").(bool); ok {
 				n.only = only
+			}
+			if tags := TnGetValue(a, "tags"); tags != nil {
+				n.tags = TnSliceAs[string](tags)
 			}
 		}
 	}
@@ -1097,6 +1127,42 @@ func (a *TnTestAssert) count(run func()) {
 	run()
 }
 
+// t.assert.called / callCount / nthCalledWith / lastCalledWith on a mock function
+func (a *TnTestAssert) called(fn interface{}, msg ...interface{}) {
+	a.ctx.asserts++
+	if len(TnMockOf(fn).calls) == 0 {
+		panic(tnAssertionError(tnAssertMessage(msg), "Expected the mock to have been called", 0.0, nil, "called"))
+	}
+}
+
+func (a *TnTestAssert) callCount(fn interface{}, n float64, msg ...interface{}) {
+	a.ctx.asserts++
+	if got := float64(len(TnMockOf(fn).calls)); got != n {
+		panic(tnAssertionError(tnAssertMessage(msg), "Expected the mock to have been called "+TnNumStr(n)+" times, but it was called "+TnNumStr(got)+" times", got, n, "callCount"))
+	}
+}
+
+func (a *TnTestAssert) nthCalledWith(fn interface{}, n float64, args ...interface{}) {
+	a.ctx.asserts++
+	calls := TnMockOf(fn).calls
+	i := int(n) - 1
+	if i < 0 || i >= len(calls) {
+		panic(tnAssertionError(nil, "Expected the mock to have been called at least "+TnNumStr(n)+" times", float64(len(calls)), n, "nthCalledWith"))
+	}
+	if !TnDeepEqual(calls[i].arguments, args, true) {
+		panic(tnAssertionError(nil, "Expected call "+TnNumStr(n)+" to have been made with "+TnInspect(args)+", got "+TnInspect(calls[i].arguments), calls[i].arguments, args, "nthCalledWith"))
+	}
+}
+
+func (a *TnTestAssert) lastCalledWith(fn interface{}, args ...interface{}) {
+	calls := TnMockOf(fn).calls
+	if len(calls) == 0 {
+		a.ctx.asserts++
+		panic(tnAssertionError(nil, "Expected the mock to have been called", 0.0, args, "lastCalledWith"))
+	}
+	a.nthCalledWith(fn, float64(len(calls)), args...)
+}
+
 func tnTestCounted[T any](a *TnTestAssert, v T) T {
 	a.ctx.asserts++
 	return v
@@ -1537,7 +1603,7 @@ export function registerTest(r: NodeRegistry): void {
     r,
     'nodeTest',
     ['fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'time'],
-    ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'],
+    ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'nodeAssert', 'arraySubclass', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'],
     testHelper
   );
   defineHelper(r, 'nodeTestSnapshot', ['fmt', 'os', 'path/filepath', 'sort', 'strconv', 'strings'], ['nodeTest', 'nodeAssert', 'jsonStringify'], snapshotHelper);
@@ -1555,9 +1621,9 @@ export function registerTest(r: NodeRegistry): void {
     'test.TestContext',
     '*TnTestContext',
     'class',
-    'skip=; todo=; diagnostic=; plan=; runOnly=; test=chan struct{}; before=; after=; beforeEach=; afterEach=',
+    'skip=; todo=; diagnostic=; log=; plan=; runOnly=; test=chan struct{}; before=; after=; beforeEach=; afterEach=',
     '',
-    'name=string; fullName=string; mock=*TnMockTracker; signal=*TnAbortSignal; filePath=string; assert=*TnTestAssert',
+    'name=string; fullName=string; mock=*TnMockTracker; signal=*TnAbortSignal; filePath=string; assert=*TnTestAssert; passed=bool; attempt=float64; workerId=interface{}; tags=[]string',
     ''
   );
   r.methods['test.TestContext#test'] = (c: NodeCall) => {
@@ -1568,14 +1634,19 @@ export function registerTest(r: NodeRegistry): void {
   defineClass(r, 'test.MockTracker', '*TnMockTracker', 'class', 'reset=; restoreAll=', '', 'timers=*TnMockTimers', '');
   defineClass(r, 'test.MockTimers', '*TnMockTimers', 'class', 'enable=; tick=; runAll=; setTime=; reset=', '', '', '');
   // t.assert.x(...): node:assert's x, counted for t.plan()
-  defineClass(r, 'test.TestContextAssert', '*TnTestAssert', 'class', 'snapshot=; fileSnapshot=', '', '', '');
+  defineClass(r, 'test.TestContextAssert', '*TnTestAssert', 'class', 'snapshot=; fileSnapshot=; called=; callCount=; nthCalledWith=; lastCalledWith=', '', '', '');
+  r.functions['test.getTestContext'] = (_c: NodeCall) => {
+    use();
+    return 'TnGetTestContext()';
+  };
+  r.results['test.getTestContext'] = '*TnTestContext';
   for (const name of ['snapshot', 'fileSnapshot']) {
     r.methods[`test.TestContextAssert#${name}`] = (c: NodeCall) => {
       r.helper('nodeTestSnapshot');
       return `${c.recv}.${name}(${c.args.join(', ')})`;
     };
   }
-  const assertNames = ['ok', 'equal', 'notEqual', 'strictEqual', 'notStrictEqual', 'deepEqual', 'notDeepEqual', 'deepStrictEqual', 'notDeepStrictEqual', 'throws', 'doesNotThrow', 'rejects', 'doesNotReject', 'match', 'doesNotMatch', 'fail', 'ifError'];
+  const assertNames = ['ok', 'equal', 'notEqual', 'strictEqual', 'notStrictEqual', 'deepEqual', 'notDeepEqual', 'deepStrictEqual', 'notDeepStrictEqual', 'throws', 'doesNotThrow', 'rejects', 'doesNotReject', 'match', 'doesNotMatch', 'fail', 'ifError', 'partialDeepStrictEqual'];
   for (const name of assertNames) {
     const key = `test.TestContextAssert#${name}`;
     r.methods[key] = (c: NodeCall) => {

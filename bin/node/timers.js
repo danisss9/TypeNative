@@ -1,6 +1,7 @@
 // node:timers (+ globals setImmediate / clearImmediate), node:perf_hooks
 // (+ the global performance), node:tty
 import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { STREAM_METHODS, STREAM_GETTERS } from './stream.js';
 const perfHelper = `// node:perf_hooks — performance.now() is milliseconds since process start
 var tnPerfStart = time.Now()
 
@@ -262,4 +263,126 @@ export function registerTimers(r) {
         return `func() bool { switch int(${call.args[0]}) { case 0: return TnIsTTY(os.Stdin); case 1: return TnIsTTY(os.Stdout); case 2: return TnIsTTY(os.Stderr) }; return false }()`;
     };
     setResults(r, 'tty', 'isatty=bool');
+    // tty.ReadStream / WriteStream: the process's stdio streams with the terminal's size and modes
+    defineHelper(r, 'nodeTtyStreams', ['os'], ['nodeTty', 'nodeStream', 'nodeReadlineCursor', 'nodeProcess'], ttyStreamsHelper);
+    const ttyMethods = STREAM_METHODS;
+    defineClass(r, 'tty.WriteStream', '*TnTtyWriteStream', 'class', ttyMethods + '; getWindowSize=[]float64; hasColors=bool; getColorDepth=float64; clearLine=bool; clearScreenDown=bool; cursorTo=bool; moveCursor=bool', '', STREAM_GETTERS + '; columns=float64; rows=float64; isTTY=bool; fd=float64', '');
+    defineClass(r, 'tty.ReadStream', '*TnTtyReadStream', 'class', ttyMethods + '; setRawMode=*TnTtyReadStream', '', STREAM_GETTERS + '; isRaw=bool; isTTY=bool; fd=float64', '');
+    r.constructors['tty.WriteStream'] = (call) => {
+        r.helper('nodeTtyStreams');
+        return `TnNewTtyWriteStream(${call.args[0]})`;
+    };
+    r.constructors['tty.ReadStream'] = (call) => {
+        r.helper('nodeTtyStreams');
+        return `TnNewTtyReadStream(${call.args[0]})`;
+    };
 }
+const ttyStreamsHelper = `// tty.WriteStream(fd) / ReadStream(fd): process.stdout / stderr / stdin with
+// the terminal's size, colours and raw mode
+type TnTtyWriteStream struct {
+	*TnStream
+	file *os.File
+	fd   float64
+}
+
+// (as in Node, an fd that is not a terminal fails)
+func tnTtyInitCheck(f *os.File) {
+	if !TnIsTTY(f) {
+		e := TnNodeError("SystemError", "ERR_TTY_INIT_FAILED", "TTY initialization failed: uv_tty_init returned EBADF (bad file descriptor)")
+		panic(e)
+	}
+}
+
+func TnNewTtyWriteStream(fd float64) *TnTtyWriteStream {
+	if fd == 2 {
+		tnTtyInitCheck(os.Stderr)
+		return &TnTtyWriteStream{TnStream: TnStderr(), file: os.Stderr, fd: 2}
+	}
+	tnTtyInitCheck(os.Stdout)
+	return &TnTtyWriteStream{TnStream: TnStdout(), file: os.Stdout, fd: fd}
+}
+
+func (w *TnTtyWriteStream) Get_columns() float64    { return TnTtyColumns(w.file) }
+func (w *TnTtyWriteStream) Get_rows() float64       { return TnTtyRows(w.file) }
+func (w *TnTtyWriteStream) Get_isTTY() bool         { return TnIsTTY(w.file) }
+func (w *TnTtyWriteStream) Get_fd() float64         { return w.fd }
+func (w *TnTtyWriteStream) getWindowSize() []float64 { return TnTtyWindowSize(w.file) }
+
+// getColorDepth(): 1 (no colours), 4, 8 or 24 bits, from NO_COLOR / FORCE_COLOR / TERM / COLORTERM
+func (w *TnTtyWriteStream) getColorDepth(env ...interface{}) float64 {
+	if os.Getenv("NO_COLOR") != "" {
+		return 1
+	}
+	switch os.Getenv("FORCE_COLOR") {
+	case "0":
+		return 1
+	case "1":
+		return 4
+	case "2":
+		return 8
+	case "3":
+		return 24
+	}
+	if ct := os.Getenv("COLORTERM"); ct == "truecolor" || ct == "24bit" {
+		return 24
+	}
+	term := os.Getenv("TERM")
+	if term == "dumb" {
+		return 1
+	}
+	if len(term) >= 9 && term[len(term)-9:] == "256color" {
+		return 8
+	}
+	return 4
+}
+
+func (w *TnTtyWriteStream) hasColors(args ...interface{}) bool {
+	count := 16.0
+	for _, a := range args {
+		if n, ok := a.(float64); ok {
+			count = n
+		}
+	}
+	depth := w.getColorDepth()
+	colors := 2.0
+	switch depth {
+	case 4:
+		colors = 16
+	case 8:
+		colors = 256
+	case 24:
+		colors = 16777216
+	}
+	return count <= colors
+}
+
+func (w *TnTtyWriteStream) clearLine(dir float64, rest ...interface{}) bool {
+	return TnClearLine(w.TnStream, dir, rest...)
+}
+func (w *TnTtyWriteStream) clearScreenDown(rest ...interface{}) bool {
+	return TnClearScreenDown(w.TnStream, rest...)
+}
+func (w *TnTtyWriteStream) cursorTo(x float64, rest ...interface{}) bool {
+	return TnCursorTo(w.TnStream, x, rest...)
+}
+func (w *TnTtyWriteStream) moveCursor(dx float64, dy float64, rest ...interface{}) bool {
+	return TnMoveCursor(w.TnStream, dx, dy, rest...)
+}
+
+type TnTtyReadStream struct {
+	*TnStream
+	fd float64
+}
+
+func TnNewTtyReadStream(fd float64) *TnTtyReadStream {
+	tnTtyInitCheck(os.Stdin)
+	return &TnTtyReadStream{TnStream: TnStdin(), fd: fd}
+}
+
+func (r *TnTtyReadStream) Get_isRaw() bool  { return tnStdinRaw }
+func (r *TnTtyReadStream) Get_isTTY() bool  { return TnIsTTY(os.Stdin) }
+func (r *TnTtyReadStream) Get_fd() float64  { return r.fd }
+func (r *TnTtyReadStream) setRawMode(mode bool) *TnTtyReadStream {
+	TnTtySetRawMode(mode)
+	return r
+}`;

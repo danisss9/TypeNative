@@ -9,8 +9,7 @@ import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule } from 
 const moduleHelper = `// node:module
 var tnBuiltinModules = []string{
 	"_http_agent", "_http_client", "_http_common", "_http_incoming", "_http_outgoing", "_http_server",
-	"_stream_duplex", "_stream_passthrough", "_stream_readable", "_stream_transform", "_stream_wrap",
-	"_stream_writable", "_tls_common", "_tls_wrap", "assert", "assert/strict", "async_hooks",
+	"_tls_common", "_tls_wrap", "assert", "assert/strict", "async_hooks",
 	"buffer", "child_process", "cluster", "console", "constants", "crypto", "dgram",
 	"diagnostics_channel", "dns", "dns/promises", "domain", "events", "fs", "fs/promises", "http",
 	"http2", "https", "inspector", "inspector/promises", "module", "net", "os", "path", "path/posix",
@@ -18,13 +17,55 @@ var tnBuiltinModules = []string{
 	"repl", "stream", "stream/consumers", "stream/promises", "stream/web", "string_decoder", "sys",
 	"timers", "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types", "v8",
 	"vm", "wasi", "worker_threads", "zlib",
+	"node:ffi", "node:sea", "node:sqlite", "node:test", "node:test/reporters",
+}
+
+// module.findPackageJSON(specifier, base): the nearest package.json at or
+// above the specifier (relative to base; a bare name looks in node_modules)
+func TnFindPackageJSON(specifier string, base string) interface{} {
+	if strings.HasPrefix(base, "file:") {
+		base = TnFileURLToPath(base)
+	}
+	dir := base
+	if dir == "" {
+		dir, _ = os.Getwd()
+	} else if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		dir = filepath.Dir(dir)
+	}
+	start := ""
+	if strings.HasPrefix(specifier, "file:") {
+		start = TnFileURLToPath(specifier)
+	} else if filepath.IsAbs(specifier) {
+		start = specifier
+	} else if strings.HasPrefix(specifier, ".") {
+		start = filepath.Join(dir, specifier)
+	} else {
+		for d := dir; ; d = filepath.Dir(d) {
+			candidate := filepath.Join(d, "node_modules", specifier, "package.json")
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+			if filepath.Dir(d) == d {
+				return nil
+			}
+		}
+	}
+	for d := filepath.Clean(start); ; d = filepath.Dir(d) {
+		candidate := filepath.Join(d, "package.json")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		if filepath.Dir(d) == d {
+			return nil
+		}
+	}
 }
 
 // isBuiltin('fs') / isBuiltin('node:fs'); node:test, node:sqlite and node:sea
 // exist only with the node: scheme
 func TnIsBuiltin(name string) bool {
 	switch name {
-	case "node:sea", "node:sqlite", "node:test", "node:test/reporters":
+	case "node:ffi", "node:sea", "node:sqlite", "node:test", "node:test/reporters":
 		return true
 	}
 	bare := strings.TrimPrefix(name, "node:")
@@ -61,6 +102,45 @@ func tnHeapLimit() float64 {
 		return float64(limit)
 	}
 	return 4 * 1024 * 1024 * 1024
+}
+
+// v8.getHeapSpaceStatistics(): Go's heap in V8's space names (old_space is
+// the Go heap; the others have no counterpart and are empty)
+type TnHeapSpaceInfo struct {
+	space_name           string
+	space_size           float64
+	space_used_size      float64
+	space_available_size float64
+	physical_space_size  float64
+}
+
+func TnV8HeapSpaceStatistics() []*TnHeapSpaceInfo {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	out := []*TnHeapSpaceInfo{}
+	for _, name := range []string{"read_only_space", "new_space", "old_space", "code_space", "shared_space", "trusted_space", "new_large_object_space", "large_object_space", "code_large_object_space", "shared_large_object_space", "trusted_large_object_space"} {
+		space := &TnHeapSpaceInfo{space_name: name}
+		if name == "old_space" {
+			space.space_size = float64(m.HeapSys)
+			space.space_used_size = float64(m.HeapAlloc)
+			space.space_available_size = float64(m.HeapIdle)
+			space.physical_space_size = float64(m.HeapInuse)
+		}
+		out = append(out, space)
+	}
+	return out
+}
+
+// v8.getHeapCodeStatistics(): no bytecode or script source in a Go binary
+type TnHeapCodeStatistics struct {
+	code_and_metadata_size      float64
+	bytecode_and_metadata_size  float64
+	external_script_source_size float64
+	cpu_profiler_metadata_size  float64
+}
+
+func TnV8HeapCodeStatistics() *TnHeapCodeStatistics {
+	return &TnHeapCodeStatistics{}
 }
 
 func TnV8HeapStatistics() *TnHeapStatistics {
@@ -100,7 +180,13 @@ func TnSeaGetAsset(key string, encoding ...string) interface{} {
 
 export function registerModuleV8(r: NodeRegistry): void {
   defineModule(r, 'module');
-  defineHelper(r, 'nodeModule', ['strings'], [], moduleHelper);
+  defineHelper(r, 'nodeModule', ['os', 'path/filepath', 'strings'], ['nodeUrl'], moduleHelper);
+  r.functions['module.findPackageJSON'] = (c: NodeCall) => {
+    r.helper('nodeModule');
+    const base = c.args[1] === undefined ? '""' : c.types[1] === 'string' ? c.args[1] : `TnJSString(${c.args[1]})`;
+    return `TnFindPackageJSON(${c.types[0] === 'string' ? c.args[0] : `TnJSString(${c.args[0]})`}, ${base})`;
+  };
+  r.results['module.findPackageJSON'] = 'interface{}';
   r.values['module.builtinModules'] = (_c: NodeCall) => {
     r.helper('nodeModule');
     return 'append([]string{}, tnBuiltinModules...)';
@@ -133,6 +219,18 @@ export function registerModuleV8(r: NodeRegistry): void {
     return 'TnV8HeapStatistics()';
   };
   r.results['v8.getHeapStatistics'] = '*TnHeapStatistics';
+  defineClass(r, 'v8.HeapSpaceInfo', '*TnHeapSpaceInfo', 'class', '', 'space_name=string; space_size=float64; space_used_size=float64; space_available_size=float64; physical_space_size=float64', '', '');
+  defineClass(r, 'v8.HeapCodeStatistics', '*TnHeapCodeStatistics', 'class', '', 'code_and_metadata_size=float64; bytecode_and_metadata_size=float64; external_script_source_size=float64; cpu_profiler_metadata_size=float64', '', '');
+  r.functions['v8.getHeapSpaceStatistics'] = (_c: NodeCall) => {
+    r.helper('nodeV8');
+    return 'TnV8HeapSpaceStatistics()';
+  };
+  r.results['v8.getHeapSpaceStatistics'] = '[]*TnHeapSpaceInfo';
+  r.functions['v8.getHeapCodeStatistics'] = (_c: NodeCall) => {
+    r.helper('nodeV8');
+    return 'TnV8HeapCodeStatistics()';
+  };
+  r.results['v8.getHeapCodeStatistics'] = '*TnHeapCodeStatistics';
   r.functions['v8.serialize'] = (c: NodeCall) => {
     r.helper('nodeV8');
     return `TnV8Serialize(${c.args[0]})`;

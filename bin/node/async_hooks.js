@@ -162,19 +162,71 @@ func TnAsyncResourceRunVoid(res *TnAsyncResource, fn func()) {
 
 func TnAsyncResourceBind[F any](res *TnAsyncResource, fn F) F { return tnAsyncBindTo(res.ctx, fn) }
 
-// createHook: accepted, its callbacks are not called
+// createHook({ init, before, after, destroy }): called as the event loop
+// creates async resources (timers, promise continuations, I/O callbacks)
+// and runs them; see tnAsyncSnapshotIDs
 type TnAsyncHook struct {
-	enabled bool
+	enabled   bool
+	callbacks interface{}
 }
 
+var tnAsyncHookList []*TnAsyncHook
+
 func (h *TnAsyncHook) enable() *TnAsyncHook {
-	h.enabled = true
+	if !h.enabled {
+		h.enabled = true
+		tnAsyncHookList = append(tnAsyncHookList, h)
+	}
 	return h
 }
 
 func (h *TnAsyncHook) disable() *TnAsyncHook {
-	h.enabled = false
+	if h.enabled {
+		h.enabled = false
+		for i, x := range tnAsyncHookList {
+			if x == h {
+				tnAsyncHookList = append(tnAsyncHookList[:i], tnAsyncHookList[i+1:]...)
+				break
+			}
+		}
+	}
 	return h
+}`;
+const asyncIdsHelper = `// async ids and hooks: on for programs using executionAsyncId / createHook
+var tnAsyncHookBusy bool
+var tnAsyncDestroyed = map[float64]bool{}
+
+func TnCreateAsyncHook(callbacks interface{}) *TnAsyncHook {
+	return &TnAsyncHook{callbacks: callbacks}
+}
+
+// (a hook callback that schedules work does not re-enter the hooks)
+func tnAsyncHooksCall(name string, args ...interface{}) {
+	if tnAsyncHookBusy || len(tnAsyncHookList) == 0 {
+		return
+	}
+	tnAsyncHookBusy = true
+	defer func() { tnAsyncHookBusy = false }()
+	for _, h := range append([]*TnAsyncHook{}, tnAsyncHookList...) {
+		if fn := TnGetValue(h.callbacks, name); fn != nil {
+			TnInvoke(fn, args...)
+		}
+	}
+}
+
+func init() {
+	tnAsyncHooksOn = true
+	tnAsyncHookInit = func(id float64, trigger float64) {
+		tnAsyncHooksCall("init", id, "Timeout", trigger, TnNewMap[string, interface{}]())
+	}
+	tnAsyncHookBefore = func(id float64) { tnAsyncHooksCall("before", id) }
+	tnAsyncHookAfter = func(id float64) {
+		tnAsyncHooksCall("after", id)
+		if !tnAsyncDestroyed[id] {
+			tnAsyncDestroyed[id] = true
+			tnAsyncHooksCall("destroy", id)
+		}
+	}
 }`;
 // The result type of a Go func type ('func(a string) float64' → 'float64', '' for none)
 export function goFuncResult(goType) {
@@ -204,6 +256,7 @@ export function closure(fn, fnType, extra) {
 export function registerAsyncHooks(r) {
     defineModule(r, 'async_hooks');
     defineHelper(r, 'nodeAsyncHooks', ['reflect'], ['eventLoop', 'dynamic', 'nodeInvoke'], asyncHooksHelper);
+    defineHelper(r, 'nodeAsyncIds', [], ['nodeAsyncHooks', 'orderedMap'], asyncIdsHelper);
     const use = () => r.helper('nodeAsyncHooks');
     defineClass(r, 'async_hooks.AsyncLocalStorage', '*TnAsyncLocalStorage', 'class', 'getStore=interface{}; enterWith=; disable=', '', 'name=string', '');
     defineClass(r, 'async_hooks.AsyncResource', '*TnAsyncResource', 'class', 'asyncId=float64; triggerAsyncId=float64; emitDestroy=*TnAsyncResource', '', '', '');
@@ -261,13 +314,19 @@ export function registerAsyncHooks(r) {
         return 'TnAsyncSnapshotRunner()';
     };
     r.results['async_hooks.AsyncLocalStorage.snapshot'] = 'func(interface{}, ...interface{}) interface{}';
-    // Execution ids are not tracked: the top-level id (1) everywhere
-    r.functions['async_hooks.executionAsyncId'] = (_c) => '1.0';
-    r.functions['async_hooks.triggerAsyncId'] = (_c) => '0.0';
+    // Execution ids: tracked once a program asks for them (nodeAsyncIds)
+    r.functions['async_hooks.executionAsyncId'] = (_c) => {
+        r.helper('nodeAsyncIds');
+        return 'tnAsyncCurID';
+    };
+    r.functions['async_hooks.triggerAsyncId'] = (_c) => {
+        r.helper('nodeAsyncIds');
+        return 'tnAsyncCurTrigger';
+    };
     r.functions['async_hooks.executionAsyncResource'] = (_c) => 'interface{}(map[string]interface{}{})';
-    r.functions['async_hooks.createHook'] = (_c) => {
-        use();
-        return '&TnAsyncHook{}';
+    r.functions['async_hooks.createHook'] = (c) => {
+        r.helper('nodeAsyncIds');
+        return `TnCreateAsyncHook(${c.args[0] ?? 'nil'})`;
     };
     setResults(r, 'async_hooks', 'executionAsyncId=float64; triggerAsyncId=float64; executionAsyncResource=interface{}; createHook=*TnAsyncHook');
 }
