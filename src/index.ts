@@ -279,30 +279,6 @@ interface GoModule {
   dir: string;
 }
 
-// golang.org/x/text's transform and unicode/norm packages (String.normalize),
-// copied from GOROOT/src/vendor
-function vendorXText(outDir: string): GoModule {
-  const goroot = runCommand('go', ['env', 'GOROOT']).stdout.trim();
-  const source = path.join(goroot, 'src', 'vendor', 'golang.org', 'x', 'text');
-  for (const pkg of ['transform', path.join('unicode', 'norm')]) {
-    const target = path.join(outDir, 'tnvendor', 'x-text', pkg);
-    fs.mkdirSync(target, { recursive: true });
-    for (const file of fs.readdirSync(path.join(source, pkg))) {
-      if (file.endsWith('.go') && !file.endsWith('_test.go')) {
-        fs.writeFileSync(
-          path.join(target, file),
-          fs.readFileSync(path.join(source, pkg, file), 'utf-8')
-        );
-      }
-    }
-  }
-  fs.writeFileSync(
-    path.join(outDir, 'tnvendor', 'x-text', 'go.mod'),
-    'module golang.org/x/text\n\ngo 1.23\n'
-  );
-  return { path: 'golang.org/x/text', version: 'v0.0.0', dir: './tnvendor/x-text' };
-}
-
 // golang.org/x/net's dns/dnsmessage (node:dns record queries), copied from
 // GOROOT/src/vendor
 function vendorXNet(outDir: string): GoModule {
@@ -351,7 +327,7 @@ function vendorGoModules(vendorDir: string, outDir: string): { modules: GoModule
 }
 
 // Whether generated Go imports a package of a module in govendor/ (node:sqlite's
-// driver, zlib's Brotli codec, fs.watch's fsnotify)
+// driver, zlib's Brotli codec, fs.watch's fsnotify, Intl's golang.org/x/text)
 function importsVendoredModule(content: string, vendorDir: string): boolean {
   const manifest = fs.readFileSync(path.join(vendorDir, 'manifest.txt'), 'utf-8');
   for (const line of manifest.split('\n')) {
@@ -631,13 +607,11 @@ export function run(opts: RunOptions): void {
   }
   if (sourceDir) copyEmbeds(sourceDir, transpileResult.embeds, outDir);
 
-  // Third-party Go modules the program imports (see vendorXText / vendorGoModules)
+  // Third-party Go modules the program imports (see vendorGoModules)
   const generated: string[] = [transpileResult.main];
   for (const content of transpileResult.files.values()) generated.push(content);
-  const xTextImport = /^import (\w+ )?"golang\.org\/x\/text\//m;
   const modules: GoModule[] = [];
   let goVersion = `${MIN_GO_MAJOR}.${MIN_GO_MINOR}`;
-  if (generated.some((content) => xTextImport.test(content))) modules.push(vendorXText(outDir));
   const xNetImport = /^import (\w+ )?"golang\.org\/x\/net\//m;
   if (generated.some((content) => xNetImport.test(content))) modules.push(vendorXNet(outDir));
   if (generated.some((content) => importsVendoredModule(content, opts.vendorDir))) {

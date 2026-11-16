@@ -24,6 +24,17 @@ const MODULES = [
     'github.com/tetratelabs/wazero',
     'v1.12.0',
     ['api', 'experimental', 'imports/wasi_snapshot_preview1', 'sys'].map((p) => `github.com/tetratelabs/wazero/${p}`)
+  ],
+  // Intl's locale data (and String.normalize's norm, imported on its own):
+  // language tags and matching, plural rules, currency codes, collation,
+  // locale case mapping, display names. The patterns and symbols Node's Intl
+  // formats with come from src/node/intl_data.ts, generated from Node itself
+  [
+    'golang.org/x/text',
+    'v0.44.0',
+    ['language', 'language/display', 'feature/plural', 'currency', 'collate', 'cases', 'transform', 'unicode/norm'].map(
+      (p) => `golang.org/x/text/${p}`
+    )
   ]
 ];
 

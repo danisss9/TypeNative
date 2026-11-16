@@ -949,7 +949,7 @@ export function registerFs(r: NodeRegistry): void {
     'class',
     'isFile=bool; isDirectory=bool; isSymbolicLink=bool; isFIFO=bool; isSocket=bool; isBlockDevice=bool; isCharacterDevice=bool',
     'dev=float64; ino=float64; mode=float64; nlink=float64; uid=float64; gid=float64; rdev=float64; size=float64; blksize=float64; blocks=float64; atimeMs=float64; mtimeMs=float64; ctimeMs=float64; birthtimeMs=float64; atime=time.Time; mtime=time.Time; ctime=time.Time; birthtime=time.Time',
-    '',
+    'atimeInstant=*TnTemporalInstant; mtimeInstant=*TnTemporalInstant; ctimeInstant=*TnTemporalInstant; birthtimeInstant=*TnTemporalInstant',
     ''
   );
   defineClass(

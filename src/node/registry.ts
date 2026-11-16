@@ -90,6 +90,9 @@ export interface NodeRegistry {
   goHelpers: Record<string, string>;
   helperPackages: Record<string, string[]>;
   helperRequires: Record<string, string[]>;
+  // Go packages a helper needs as side-effect blank imports (`import _ "time/tzdata"`),
+  // added when the helper is used
+  helperSideEffects: Record<string, string[]>;
   // Services provided by the transpiler
   pkg: (name: string) => void;
   helper: (id: string) => void;
@@ -139,6 +142,7 @@ export function createNodeRegistry(): NodeRegistry {
     goHelpers: {},
     helperPackages: {},
     helperRequires: {},
+    helperSideEffects: {},
     pkg: (_name: string) => {},
     helper: (_id: string) => {},
     temp: (prefix: string) => prefix,

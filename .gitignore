@@ -88,3 +88,7 @@ native
 .cache/
 # examples: downloaded test corpora (parity.mjs)
 examples/*/.cache
+# a scratch type-check config (the project config without temporal_runtime.ts)
+tsconfig.tmp-intl.json
+# scratch files of in-progress work (spec dumps, build output)
+conformance/_tmp/

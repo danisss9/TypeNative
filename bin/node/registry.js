@@ -35,6 +35,7 @@ export function createNodeRegistry() {
         goHelpers: {},
         helperPackages: {},
         helperRequires: {},
+        helperSideEffects: {},
         pkg: (_name) => { },
         helper: (_id) => { },
         temp: (prefix) => prefix,

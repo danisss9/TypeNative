@@ -674,17 +674,6 @@ func TnUint8SetFromHex(dst []byte, s string) *TnReadWritten {
 	return &TnReadWritten{read: float64(read), written: float64(len(out))}
 }
 
-// arrayBuffer.transfer(newLength): a copy (resized, zero-filled)
-func TnArrayBufferTransfer(b []byte, length ...float64) []byte {
-	n := len(b)
-	if len(length) > 0 && !math.IsNaN(length[0]) {
-		n = int(length[0])
-	}
-	out := make([]byte, n)
-	copy(out, b)
-	return out
-}
-
 func TnIsAscii(b []byte) bool {
 	for _, c := range b {
 		if c > 127 {
@@ -1019,11 +1008,15 @@ export function registerBuffer(r: NodeRegistry): void {
     const type = call.types[0];
     if (call.args.length === 0) return '[]byte{}';
     // new Uint8Array(arrayBuffer, byteOffset?, length?): a view sharing its memory
+    // (a resizable buffer's bytes now — the view doesn't follow later resizes —
+    // and a TypeError for a detached one)
     if (r.isArrayBuffer(call.nodes[0])) {
-      if (call.args.length === 1) return call.args[0];
+      r.helper('typedArrays');
+      const buf = `TnArrayBufferForView(${call.args[0]})`;
+      if (call.args.length === 1) return buf;
       const start = `int(${call.args[1]})`;
-      if (call.args.length === 2) return `${call.args[0]}[${start}:]`;
-      return `${call.args[0]}[${start}:${start}+int(${call.args[2]})]`;
+      if (call.args.length === 2) return `${buf}[${start}:]`;
+      return `${buf}[${start}:${start}+int(${call.args[2]})]`;
     }
     if (type === 'float64') return `make([]byte, int(${call.args[0]}))`;
     use();

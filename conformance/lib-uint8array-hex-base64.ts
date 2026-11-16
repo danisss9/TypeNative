@@ -41,7 +41,8 @@ assert(r1.read === 4 && r1.written === 3 && target[0] === 104 && target[2] === 1
 const r2 = target.setFromHex('0a0b0c0d0e');
 assert(r2.read === 8 && r2.written === 4 && target[3] === 13, 'setFromHex fills the array');
 
-// ArrayBuffer#transfer: a copy, resized
+// ArrayBuffer#transfer: the bytes, resized, in a new buffer; the source is detached
 const buf = new Uint8Array([1, 2, 3]).buffer;
 const moved = buf.transfer(5);
 assert(moved.byteLength === 5 && new Uint8Array(moved)[2] === 3 && new Uint8Array(moved)[4] === 0, 'transfer resizes');
+assert(buf.detached && buf.byteLength === 0, 'transfer detaches the source');

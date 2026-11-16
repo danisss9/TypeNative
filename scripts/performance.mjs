@@ -69,8 +69,10 @@ for (const file of probes) {
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'perf-'));
   const binary = path.join(tmp, exe);
   const [command, ...args] = compiler;
-  const build = spawnSync(command, [...args, '--source', path.join('performance', file), '--output', binary], {
-    cwd: root,
+  // Build in the probe's own temp cwd: the CLI writes dist/ relative to cwd, so
+  // a build in the checkout would clash with a conformance run going at the same time
+  const build = spawnSync(command, [...args, '--source', path.join(dir, file), '--output', binary], {
+    cwd: tmp,
     encoding: 'utf-8',
     timeout: 300000
   });

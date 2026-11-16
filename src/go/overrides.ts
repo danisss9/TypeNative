@@ -52,6 +52,16 @@ export const goPathAliases: Record<string, string> = {
   'math/rand/v2': 'randv2',
   'html/template': 'htmltemplate',
   'golang.org/x/text/unicode/norm': 'tnnorm',
+  // Intl's locale data: short package names that would collide with user
+  // identifiers (language, cases, …)
+  'golang.org/x/text/language': 'xlanguage',
+  'golang.org/x/text/language/display': 'xdisplay',
+  'golang.org/x/text/feature/plural': 'xplural',
+  'golang.org/x/text/message': 'xmessage',
+  'golang.org/x/text/number': 'xnumber',
+  'golang.org/x/text/currency': 'xcurrency',
+  'golang.org/x/text/collate': 'xcollate',
+  'golang.org/x/text/cases': 'xcases',
   // node:sqlite's driver: the package name differs from the last path element
   'github.com/ncruces/go-sqlite3': 'sqlite3',
   // the WebAssembly global / node:wasi's runtime: short package names that

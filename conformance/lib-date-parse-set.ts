@@ -28,4 +28,5 @@ const offset = new Date(0).getTimezoneOffset();
 assert(offset === -new Date(0).getHours() * 60 || Math.abs(offset) > 0, 'getTimezoneOffset');
 assert(/^Thu Jan 01 1970|^Wed Dec 31 1969/.test(new Date(0).toString()), new Date(0).toString());
 assert(`${new Date(0)}` === new Date(0).toString(), 'template literals use toString');
-assert(/^\d+\/\d+\/\d{4}, \d+:\d{2}:\d{2} [AP]M$/.test(new Date(0).toLocaleString()), new Date(0).toLocaleString());
+// (en-US explicitly: without locales, Node formats in the system's locale)
+assert(/^\d+\/\d+\/\d{4}, \d+:\d{2}:\d{2} [AP]M$/.test(new Date(0).toLocaleString('en-US')), new Date(0).toLocaleString('en-US'));

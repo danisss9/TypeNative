@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Intl`:** `NumberFormat` (decimal / percent / currency / unit styles,
+  compact / scientific / engineering notation, significant and fraction
+  digits, rounding modes and increments, `signDisplay`, `formatToParts`,
+  `formatRange`), `DateTimeFormat` (`dateStyle` / `timeStyle`, option bags,
+  IANA and offset time zones with `time/tzdata` embedded, hour cycles, zone
+  names, `formatToParts`, `formatRange`), `Collator`, `PluralRules`,
+  `ListFormat`, `RelativeTimeFormat`, `Segmenter` (UAX #29 graphemes, words
+  and sentences), `DisplayNames`, `Locale`, `getCanonicalLocales` and
+  `supportedValuesOf`. Patterns, symbols and names are captured from Node's
+  own ICU by `npm run gen:intl` for 32 locales (en, en-GB, en-IN, de, fr, es,
+  es-MX, it, pt-BR, pt-PT, nl, sv, da, nb, fi, pl, cs, ru, uk, tr, el, ja,
+  zh, zh-Hant, ko, ar, he, hi, id, th, vi); other regions use their
+  language's data, and unknown languages the default locale's. Language
+  tags, plural rules, collation and locale case mapping run on
+  `golang.org/x/text`, now vendored in `govendor/` (it replaces the copy
+  `String.normalize` took from GOROOT).
+- **Locale-aware `toLocale*`:** `Number` / `BigInt` / `Date` / `Array`
+  `toLocaleString`, `toLocaleDateString` / `toLocaleTimeString` and
+  `localeCompare` with a locale or options go through `Intl`;
+  `toLocaleUpperCase` / `toLocaleLowerCase` apply Turkish, Azeri and
+  Lithuanian casing. Without locales they use the system locale (`LC_ALL` /
+  `LANG`, the Windows user locale), as Node does.
+- **Mixin factories as function declarations:** `function Tagged(superClass:
+  typeof Base) { return class extends superClass {…} }` works like the arrow
+  form, and a function returning a subclass of a known class
+  (`function make() { return class extends Base {…} }`) becomes a class of its
+  own (`syntax-mixins.ts`). A generic constraint or `class extends f()`
+  still isn't lowered.
+
 - **WebAssembly and `node:wasi`:** the `WebAssembly` global (`validate`,
   `compile`, `instantiate`, `Module`, `Instance`, `Memory`, `Global`, the
   `Module` descriptors and `CompileError` / `LinkError` / `RuntimeError`) and
@@ -29,13 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BigInt64Array` / `BigUint64Array`, `DataView` `get` / `setFloat16`,
   `ArrayBuffer` `transfer`, and `Uint8Array` `toHex` / `fromHex` /
   `setFromBase64` / `setFromHex` with the base64 options (strict decoding).
+- **Resizable and detached `ArrayBuffer`s (ES2024):** `new ArrayBuffer(n,
+  { maxByteLength })`, `resize`, `resizable`, `maxByteLength`, `detached`, and
+  growable `SharedArrayBuffer`s (`grow`, `growable`). Typed arrays and
+  DataViews made without a length track the buffer's size, fixed-length ones
+  go out of bounds when it shrinks below them, and `transfer` /
+  `transferToFixedLength` now detach the source (its views read as empty,
+  their methods throw a `TypeError`). A buffer is still a Go `[]byte`: its
+  state lives beside it, so programs that don't resize or transfer don't pay
+  for it. A typed array's `buffer` / `byteOffset` are now the `ArrayBuffer`
+  it views and its offset in it.
 - **Well-known symbols on classes:** `async *[Symbol.asyncIterator]()` for
   `for await`, `[Symbol.toPrimitive](hint)`, a `[Symbol.toStringTag]` getter,
   a static `[Symbol.hasInstance]`, and `[util.inspect.custom]()`.
-- **Locale-aware strings:** `localeCompare` follows the root collation (base
-  letters, then accents, then case) with `sensitivity`, `numeric`,
-  `caseFirst` and `ignorePunctuation`; `Number#toLocaleString` formats in
-  en-US (decimal, percent, currency).
+- **Locale-aware strings:** a bare `a.localeCompare(b)` follows a light
+  approximation of the root collation (base letters, then accents, then
+  case), so programs that only sort don't link the collation tables; with a
+  locale or options it is `Intl.Collator`'s (see `Intl` above).
 - **Node 25 / 26 APIs:** `fs` `glob` / `globSync` / `fs/promises` `glob`,
   `statfs`, `openAsBlob(Sync)`, the `readFile` `buffer` option and `signal`
   on `stat`; `process.ref` / `unref`, `execve` and the uncaught exception
@@ -71,6 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ZIP archives:** `ZipEntry`, `ZipBuffer`, `ZipFile`, `createZipArchive(Sync)`,
   `zipFiles` and `get` / `setMaxZipContentSize`, over Go's `archive/zip`
   (streaming entries and `contentIterator` are not included).
+- **25 more performance probes** in `performance/`: object dictionaries,
+  `Object.keys` / `entries` / `for…in`, spread and destructuring, optional
+  chaining, Map iteration and number keys, array slicing and `for…of`, string
+  methods, string `switch`, non-ASCII strings, `typeof` / `instanceof`
+  narrowing, accessors, rest / spread arguments and `.call` / `.bind`,
+  generator `.next()`, `Promise.all` / `.then`, regex callbacks, `JSON.parse`
+  into `any`, `Math.imul` hashing, `bigint`, `Date`, typed arrays, `Buffer` /
+  base64 / `TextEncoder`, iterator helpers and WebAssembly calls.
+  `scripts/performance.mjs` now builds each probe in its own temp directory,
+  so a perf run no longer clashes with a conformance run over `dist/`.
 
 ### Changed
 
@@ -99,6 +148,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`navigator.language` no longer reports `C`:** a `LANG` / `LC_ALL` of
+  `C.UTF-8` (Git Bash's default) passed the C-locale check before its codeset
+  suffix was stripped, so the language was the one-letter `C`. The codeset is
+  stripped first, and `C` / `POSIX` fall through to `en-US`
+  (`lib-web-globals-node26.ts`).
 - **`??` on an array reference no longer turns null into an empty array:** a
   `RegExp.exec` miss or a `T[] | null` result used to be boxed as `&slice`,
   a non-nil `*[]T`, so `a ?? b` picked the null value. Boxing an array value
@@ -120,6 +174,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when there is no match (the Go value is a nil `[]string`), not `''`, so a
   following `??` applies. It is also typed as nullable, so a variable holds
   the boxed value (`lib-nullish-array-ref.ts`).
+- **Key order of an `any`-typed object literal:** `const o: any = { b: 1, a: 2 }`
+  now keeps the source order in `Object.keys`, `for…in`, `Object.entries`,
+  spread and `JSON.stringify` (it became a Go map, whose keys come out
+  sorted) (`semantics-any-literal-key-order.ts`).
+- **A missing key of a `Record` / `Map` of primitives reads `undefined`:**
+  `rec[k] === undefined` and `map.get(k) === undefined` test key presence,
+  not the value type's zero value (`semantics-record-missing-key.ts`).
+- **`x?.m()` on an `any` value with a primitive result:** a nullish receiver
+  gives `undefined` (so `?? fallback` applies and `=== undefined` holds)
+  instead of the type's zero value (`semantics-optional-any-call.ts`).
+- **`arr?.length` on an absent array is `undefined`:** a nil array is not a
+  zero-length array, so `?? fallback` applies; a set-but-empty array reads
+  `0` (`semantics-optional-array-length.ts`).
+- **An array read from an `any` object and pushed through an alias reaches
+  the object:** `const l = o.list; l.push(x)` and `const l: any = o.list`
+  share the object's array, as JS arrays do (`semantics-any-array-alias.ts`).
+- **Bigint–number loose comparisons:** `5n == 5`, `5n == '5'` and
+  `false == 0n` compare by value through dynamic values; `===` stays false
+  (different types), and the relational operators compare exactly, with NaN
+  never ordered (`semantics-bigint-loose-ops.ts`).
+- **Destructuring past the end of an array is `undefined`** (the binding got
+  the element type's zero value); a default still fills a missing element
+  (`semantics-destructure-past-end.ts`).
 
 ## [0.6.2] - 2026-11-15
 

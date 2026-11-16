@@ -338,14 +338,12 @@ func (s *TnSocket) attach(conn net.Conn) {
 	}
 	s.refd = true
 	TnLoopRef()
-	fmt.Println("SOCKET attach ref", conn.RemoteAddr())
 	s.onClose = func() {
 		s.clearTimer()
 		conn.Close()
 		if s.refd {
 			s.refd = false
 			TnLoopUnref()
-			fmt.Println("SOCKET close unref", conn.RemoteAddr())
 		}
 		if s.server != nil {
 			s.server.forget(s)
@@ -1063,7 +1061,7 @@ export function registerNet(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeNet',
-    ['errors', 'fmt', 'io', 'net', 'strconv', 'strings', 'time'],
+    ['errors', 'io', 'net', 'strconv', 'strings', 'time'],
     ['netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic'],
     netHelper
   );

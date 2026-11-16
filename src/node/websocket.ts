@@ -236,7 +236,6 @@ func TnNewWebSocket(args ...interface{}) *TnWebSocket {
 // The handshake on its own goroutine: dial, request, read the 101
 func (ws *TnWebSocket) dial() {
 	TnLoopRef()
-	fmt.Println("WSREF dial +1", ws.url)
 	go func() {
 		var conn net.Conn
 		var err error
@@ -274,7 +273,6 @@ func (ws *TnWebSocket) dial() {
 		ws.post(func() {
 			if ws.canceled {
 				TnLoopUnref()
-				fmt.Println("WSREF canceled -1")
 				if conn != nil {
 					conn.Close()
 				}
@@ -283,7 +281,6 @@ func (ws *TnWebSocket) dial() {
 			}
 			if err != nil {
 				TnLoopUnref()
-				fmt.Println("WSREF dialerr -1")
 				if conn != nil {
 					conn.Close()
 				}
@@ -295,7 +292,6 @@ func (ws *TnWebSocket) dial() {
 			// open connection keeps it until emitClose
 			if resp.StatusCode != 101 || !tnWsHasToken(resp.Header.Get("Upgrade"), "websocket") || !tnWsHasToken(resp.Header.Get("Connection"), "upgrade") || resp.Header.Get("Sec-WebSocket-Accept") != accept {
 				TnLoopUnref()
-				fmt.Println("WSREF handshake -1")
 				conn.Close()
 				ws.emitError(TnNodeError("TypeError", "", "Unexpected server response: "+strconv.Itoa(resp.StatusCode)))
 				ws.emitClose(1006, "", false)
@@ -322,7 +318,6 @@ func (ws *TnWebSocket) dial() {
 			}
 			if bad {
 				TnLoopUnref()
-				fmt.Println("WSREF proto -1")
 				conn.Close()
 				ws.emitError(TnNodeError("TypeError", "", "Invalid Sec-WebSocket-Protocol header"))
 				ws.emitClose(1006, "", false)
@@ -400,9 +395,7 @@ func (ws *TnWebSocket) emitClose(code float64, reason string, clean bool) {
 	if ws.refHeld {
 		ws.refHeld = false
 		TnLoopUnref()
-		fmt.Println("WSREF emitClose -1", code)
 	} else {
-		fmt.Println("WSREF emitClose (not held)", code)
 	}
 	ws.emitEvent(TnNewCloseEvent("close", map[string]interface{}{"code": code, "reason": reason, "wasClean": clean}))
 }

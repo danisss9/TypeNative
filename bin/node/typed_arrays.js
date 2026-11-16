@@ -54,6 +54,46 @@ type TnTypedArray[T tnTypedElem] struct {
 	clamped bool
 	// Float16Array: the uint16 elements are binary16 bits
 	half bool
+	// A view on an ArrayBuffer: the buffer, the view's byte offset and byte
+	// length (-1: it tracks a resizable buffer's length). data is recomputed
+	// when a buffer was resized or detached since (gen); oob while the view is
+	// out of bounds or its buffer detached.
+	src    []byte
+	offset int
+	fixed  int
+	gen    uint64
+	oob    bool
+}
+
+func (a *TnTypedArray[T]) sync() {
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+}
+
+func (a *TnTypedArray[T]) resync() {
+	a.gen = tnABGen.Load()
+	b, ok := tnABView(a.src, a.offset, a.fixed, tnTypedSize[T]())
+	a.oob = !ok
+	a.data = tnTypedElems[T](b)
+}
+
+// A method of a detached / out-of-bounds view throws
+func (a *TnTypedArray[T]) check(method string) {
+	a.sync()
+	if a.oob {
+		panic(tnABOutOfBounds("%TypedArray%.prototype." + method))
+	}
+}
+
+// Bytes as elements (sharing their memory)
+func tnTypedElems[T tnTypedElem | uint64](b []byte) []T {
+	var zero T
+	size := int(unsafe.Sizeof(zero))
+	if len(b) < size {
+		return []T{}
+	}
+	return unsafe.Slice((*T)(unsafe.Pointer(&b[0])), len(b)/size)
 }
 
 type TnInt8Array = TnTypedArray[int8]
@@ -171,36 +211,13 @@ func TnNewTypedArray[T tnTypedElem](kind string, clamped bool, src ...interface{
 	return tnTypedOf[T](kind, clamped, tnTypedFloats(src[0]))
 }
 
-// new XArray(buffer[, byteOffset[, length]]): a view sharing the buffer's memory
+// new XArray(buffer[, byteOffset[, length]]): a view sharing the buffer's
+// memory (without a length, on a resizable buffer, it tracks its length)
 func TnTypedArrayView[T tnTypedElem](kind string, clamped bool, buf []byte, args ...float64) *TnTypedArray[T] {
-	size := tnTypedSize[T]()
-	offset := 0
-	if len(args) > 0 {
-		offset = int(args[0])
-	}
-	if offset%size != 0 {
-		panic(tnTypedRangeError("start offset of " + kind + " should be a multiple of " + strconv.Itoa(size)))
-	}
-	if offset > len(buf) {
-		panic(tnTypedRangeError("Start offset " + strconv.Itoa(offset) + " is outside the bounds of the buffer"))
-	}
-	length := 0
-	if len(args) > 1 {
-		length = int(args[1])
-		if length < 0 || offset+length*size > len(buf) {
-			panic(tnTypedRangeError("Invalid typed array length: " + strconv.Itoa(length)))
-		}
-	} else {
-		if (len(buf)-offset)%size != 0 {
-			panic(tnTypedRangeError("byte length of " + kind + " should be a multiple of " + strconv.Itoa(size)))
-		}
-		length = (len(buf) - offset) / size
-	}
-	if length == 0 {
-		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped, half: kind == "Float16Array"}
-	}
-	data := unsafe.Slice((*T)(unsafe.Pointer(&buf[offset])), length)
-	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped, half: kind == "Float16Array"}
+	offset, fixed := tnABViewBounds(kind, buf, tnTypedSize[T](), args)
+	a := &TnTypedArray[T]{kind: kind, clamped: clamped, half: kind == "Float16Array", src: buf, offset: offset, fixed: fixed}
+	a.resync()
+	return a
 }
 
 // XArray.from(source[, mapFn]) / XArray.of(...items)
@@ -220,6 +237,7 @@ func TnTypedArrayOf[T tnTypedElem](kind string, clamped bool, items ...float64) 
 
 // Element reads: out-of-range and non-integer indices read 0 (undefined in JS)
 func (a *TnTypedArray[T]) Get(i float64) float64 {
+	a.sync()
 	if !(i >= 0) || i >= float64(len(a.data)) || i != math.Trunc(i) {
 		return 0
 	}
@@ -228,6 +246,7 @@ func (a *TnTypedArray[T]) Get(i float64) float64 {
 
 // Element writes: out-of-range indices are ignored, as in JS
 func (a *TnTypedArray[T]) Set(i float64, v float64) float64 {
+	a.sync()
 	if i >= 0 && i < float64(len(a.data)) && i == math.Trunc(i) {
 		a.data[int(i)] = a.conv(v)
 	}
@@ -235,6 +254,7 @@ func (a *TnTypedArray[T]) Set(i float64, v float64) float64 {
 }
 
 func (a *TnTypedArray[T]) tnFloats() []float64 {
+	a.check("values")
 	out := make([]float64, len(a.data))
 	for i, v := range a.data {
 		out[i] = a.num(v)
@@ -247,13 +267,32 @@ func (a *TnTypedArray[T]) tnLike(values []float64) *TnTypedArray[T] {
 	return tnTypedOf[T](a.kind, a.clamped, values)
 }
 
-func (a *TnTypedArray[T]) Get_length() float64            { return float64(len(a.data)) }
-func (a *TnTypedArray[T]) Get_byteLength() float64        { return float64(len(a.data) * tnTypedSize[T]()) }
-func (a *TnTypedArray[T]) Get_byteOffset() float64        { return 0 }
+func (a *TnTypedArray[T]) Get_length() float64 {
+	a.sync()
+	return float64(len(a.data))
+}
+
+func (a *TnTypedArray[T]) Get_byteLength() float64 {
+	a.sync()
+	return float64(len(a.data) * tnTypedSize[T]())
+}
+
+func (a *TnTypedArray[T]) Get_byteOffset() float64 {
+	a.sync()
+	if a.oob {
+		return 0
+	}
+	return float64(a.offset)
+}
+
 func (a *TnTypedArray[T]) Get_BYTES_PER_ELEMENT() float64 { return float64(tnTypedSize[T]()) }
 
-// The view's bytes (its byteOffset is 0: .buffer starts where the view does)
+// A view's ArrayBuffer; an array that owns its elements gives its own bytes
+// (byteOffset 0)
 func (a *TnTypedArray[T]) Get_buffer() []byte {
+	if a.src != nil {
+		return a.src
+	}
 	if len(a.data) == 0 {
 		return []byte{}
 	}
@@ -285,6 +324,7 @@ func tnTypedBounds(n int, args []float64) (int, int) {
 }
 
 func (a *TnTypedArray[T]) fill(v float64, args ...float64) *TnTypedArray[T] {
+	a.check("fill")
 	start, end := tnTypedBounds(len(a.data), args)
 	value := a.conv(v)
 	for i := start; i < end; i++ {
@@ -295,6 +335,7 @@ func (a *TnTypedArray[T]) fill(v float64, args ...float64) *TnTypedArray[T] {
 
 // set(source[, offset]): copies an array-like in (overlapping views work)
 func (a *TnTypedArray[T]) set(src interface{}, offset ...float64) {
+	a.check("set")
 	at := 0
 	if len(offset) > 0 {
 		at = int(offset[0])
@@ -310,16 +351,32 @@ func (a *TnTypedArray[T]) set(src interface{}, offset ...float64) {
 
 // subarray shares memory; slice copies
 func (a *TnTypedArray[T]) subarray(args ...float64) *TnTypedArray[T] {
+	a.sync()
 	start, end := tnTypedBounds(len(a.data), args)
+	if a.src != nil {
+		// a view on the same buffer (tracking its length when this one does
+		// and no end is given)
+		size := tnTypedSize[T]()
+		fixed := (end - start) * size
+		if a.fixed < 0 && len(args) < 2 {
+			fixed = -1
+		}
+		tnABConstructCheck(a.src)
+		out := &TnTypedArray[T]{kind: a.kind, clamped: a.clamped, half: a.half, src: a.src, offset: a.offset + start*size, fixed: fixed}
+		out.resync()
+		return out
+	}
 	return &TnTypedArray[T]{data: a.data[start:end:end], kind: a.kind, clamped: a.clamped, half: a.half}
 }
 
 func (a *TnTypedArray[T]) slice(args ...float64) *TnTypedArray[T] {
+	a.check("slice")
 	start, end := tnTypedBounds(len(a.data), args)
 	return &TnTypedArray[T]{data: append([]T{}, a.data[start:end]...), kind: a.kind, clamped: a.clamped, half: a.half}
 }
 
 func (a *TnTypedArray[T]) at(i float64) float64 {
+	a.check("at")
 	if i < 0 {
 		i += float64(len(a.data))
 	}
@@ -327,6 +384,7 @@ func (a *TnTypedArray[T]) at(i float64) float64 {
 }
 
 func (a *TnTypedArray[T]) indexOf(v float64, from ...float64) float64 {
+	a.check("indexOf")
 	start, _ := tnTypedBounds(len(a.data), from)
 	for i := start; i < len(a.data); i++ {
 		if a.num(a.data[i]) == v {
@@ -337,6 +395,7 @@ func (a *TnTypedArray[T]) indexOf(v float64, from ...float64) float64 {
 }
 
 func (a *TnTypedArray[T]) lastIndexOf(v float64, from ...float64) float64 {
+	a.check("lastIndexOf")
 	end := len(a.data) - 1
 	if len(from) > 0 {
 		f := math.Trunc(from[0])
@@ -355,6 +414,7 @@ func (a *TnTypedArray[T]) lastIndexOf(v float64, from ...float64) float64 {
 
 // includes uses SameValueZero: NaN finds NaN
 func (a *TnTypedArray[T]) includes(v float64, from ...float64) bool {
+	a.check("includes")
 	start, _ := tnTypedBounds(len(a.data), from)
 	for i := start; i < len(a.data); i++ {
 		x := a.num(a.data[i])
@@ -366,6 +426,7 @@ func (a *TnTypedArray[T]) includes(v float64, from ...float64) bool {
 }
 
 func (a *TnTypedArray[T]) join(sep ...string) string {
+	a.check("join")
 	separator := ","
 	if len(sep) > 0 {
 		separator = sep[0]
@@ -382,6 +443,7 @@ func (a *TnTypedArray[T]) toLocaleString() string { return a.join(",") }
 func (a *TnTypedArray[T]) String() string         { return a.join(",") }
 
 func (a *TnTypedArray[T]) reverse() *TnTypedArray[T] {
+	a.check("reverse")
 	for i, j := 0, len(a.data)-1; i < j; i, j = i+1, j-1 {
 		a.data[i], a.data[j] = a.data[j], a.data[i]
 	}
@@ -389,11 +451,13 @@ func (a *TnTypedArray[T]) reverse() *TnTypedArray[T] {
 }
 
 func (a *TnTypedArray[T]) toReversed() *TnTypedArray[T] {
+	a.check("toReversed")
 	return a.slice().reverse()
 }
 
 // sort([compareFn]): numeric order by default (NaN last)
 func (a *TnTypedArray[T]) sort(compare ...interface{}) *TnTypedArray[T] {
+	a.check("sort")
 	if len(compare) > 0 && compare[0] != nil {
 		cmp := compare[0]
 		sort.SliceStable(a.data, func(i, j int) bool {
@@ -422,10 +486,12 @@ func (a *TnTypedArray[T]) sort(compare ...interface{}) *TnTypedArray[T] {
 }
 
 func (a *TnTypedArray[T]) toSorted(compare ...interface{}) *TnTypedArray[T] {
+	a.check("toSorted")
 	return a.slice().sort(compare...)
 }
 
 func (a *TnTypedArray[T]) with(i float64, v float64) *TnTypedArray[T] {
+	a.check("with")
 	index := math.Trunc(i)
 	if index < 0 {
 		index += float64(len(a.data))
@@ -439,6 +505,7 @@ func (a *TnTypedArray[T]) with(i float64, v float64) *TnTypedArray[T] {
 }
 
 func (a *TnTypedArray[T]) copyWithin(target float64, args ...float64) *TnTypedArray[T] {
+	a.check("copyWithin")
 	n := len(a.data)
 	to, _ := tnTypedBounds(n, []float64{target})
 	start, end := tnTypedBounds(n, args)
@@ -447,6 +514,7 @@ func (a *TnTypedArray[T]) copyWithin(target float64, args ...float64) *TnTypedAr
 }
 
 func (a *TnTypedArray[T]) keys() []float64 {
+	a.check("keys")
 	out := make([]float64, len(a.data))
 	for i := range a.data {
 		out[i] = float64(i)
@@ -458,7 +526,12 @@ func (a *TnTypedArray[T]) values() []float64 { return a.tnFloats() }
 
 // util.inspect / console.log: Int32Array(3) [ 1, 2, 3 ]
 func (a *TnTypedArray[T]) TnTypedInspect() (string, []float64) {
-	return a.kind + "(" + strconv.Itoa(len(a.data)) + ")", a.tnFloats()
+	a.sync()
+	values := make([]float64, len(a.data))
+	for i, v := range a.data {
+		values[i] = a.num(v)
+	}
+	return a.kind + "(" + strconv.Itoa(len(a.data)) + ")", values
 }
 
 // ArrayBuffer.isView: typed arrays, DataViews and Uint8Arrays
@@ -477,37 +550,77 @@ func TnIsView(v interface{}) bool {
 type TnDataView struct {
 	buf    []byte
 	offset int
-	length int
+	// the byte length given (-1: it tracks a resizable buffer's length)
+	fixed int
+	// the view's bytes now (recomputed when a buffer was resized or detached
+	// since gen); oob while out of bounds or detached
+	view []byte
+	gen  uint64
+	oob  bool
 }
 
 func TnNewDataView(buf []byte, args ...float64) *TnDataView {
+	cur, st := tnABCurrent(buf)
+	if st != nil && st.detached {
+		panic(TnNodeError("TypeError", "", "Cannot perform DataView constructor on a detached ArrayBuffer"))
+	}
 	offset := 0
 	if len(args) > 0 {
 		offset = int(args[0])
 	}
-	if offset < 0 || offset > len(buf) {
+	if offset < 0 || offset > len(cur) {
 		panic(tnTypedRangeError("Start offset " + strconv.Itoa(offset) + " is outside the bounds of the buffer"))
 	}
-	length := len(buf) - offset
+	fixed := len(cur) - offset
 	if len(args) > 1 {
-		length = int(args[1])
-		if length < 0 || offset+length > len(buf) {
-			panic(tnTypedRangeError("Invalid DataView length " + strconv.Itoa(length)))
+		fixed = int(args[1])
+		if fixed < 0 || offset+fixed > len(cur) {
+			panic(tnTypedRangeError("Invalid DataView length " + strconv.Itoa(fixed)))
 		}
+	} else if st != nil && st.resizable {
+		fixed = -1
 	}
-	return &TnDataView{buf: buf, offset: offset, length: length}
+	d := &TnDataView{buf: buf, offset: offset, fixed: fixed}
+	d.resync()
+	return d
 }
 
-func (d *TnDataView) Get_buffer() []byte       { return d.buf }
-func (d *TnDataView) Get_byteOffset() float64 { return float64(d.offset) }
-func (d *TnDataView) Get_byteLength() float64 { return float64(d.length) }
+func (d *TnDataView) sync() {
+	if d.gen != tnABGen.Load() {
+		d.resync()
+	}
+}
 
-func (d *TnDataView) at(offset float64, size int) []byte {
-	if !(offset >= 0) || offset != math.Trunc(offset) || int(offset)+size > d.length {
+func (d *TnDataView) resync() {
+	d.gen = tnABGen.Load()
+	view, ok := tnABView(d.buf, d.offset, d.fixed, 1)
+	d.view, d.oob = view, !ok
+}
+
+func (d *TnDataView) check(method string) {
+	d.sync()
+	if d.oob {
+		panic(tnABOutOfBounds(method))
+	}
+}
+
+func (d *TnDataView) Get_buffer() []byte { return d.buf }
+func (d *TnDataView) Get_byteOffset() float64 {
+	d.check("get DataView.prototype.byteOffset")
+	return float64(d.offset)
+}
+func (d *TnDataView) Get_byteLength() float64 {
+	d.check("get DataView.prototype.byteLength")
+	return float64(len(d.view))
+}
+
+func (d *TnDataView) at(method string, offset float64, size int) []byte {
+	d.check("DataView.prototype." + method)
+	if !(offset >= 0) || offset != math.Trunc(offset) || int(offset)+size > len(d.view) {
 		panic(tnTypedRangeError("Offset is outside the bounds of the DataView"))
 	}
-	start := d.offset + int(offset)
-	return d.buf[start : start+size]
+	start := int(offset)
+	return d.view[start : start+size]
 }
 
 func tnDataViewOrder(little []bool) binary.ByteOrder {
@@ -517,58 +630,58 @@ func tnDataViewOrder(little []bool) binary.ByteOrder {
 	return binary.BigEndian
 }
 
-func (d *TnDataView) getInt8(o float64) float64  { return float64(int8(d.at(o, 1)[0])) }
-func (d *TnDataView) getUint8(o float64) float64 { return float64(d.at(o, 1)[0]) }
+func (d *TnDataView) getInt8(o float64) float64  { return float64(int8(d.at("getInt8", o, 1)[0])) }
+func (d *TnDataView) getUint8(o float64) float64 { return float64(d.at("getUint8", o, 1)[0]) }
 func (d *TnDataView) getInt16(o float64, little ...bool) float64 {
-	return float64(int16(tnDataViewOrder(little).Uint16(d.at(o, 2))))
+	return float64(int16(tnDataViewOrder(little).Uint16(d.at("getInt16", o, 2))))
 }
 func (d *TnDataView) getUint16(o float64, little ...bool) float64 {
-	return float64(tnDataViewOrder(little).Uint16(d.at(o, 2)))
+	return float64(tnDataViewOrder(little).Uint16(d.at("getUint16", o, 2)))
 }
 func (d *TnDataView) getInt32(o float64, little ...bool) float64 {
-	return float64(int32(tnDataViewOrder(little).Uint32(d.at(o, 4))))
+	return float64(int32(tnDataViewOrder(little).Uint32(d.at("getInt32", o, 4))))
 }
 func (d *TnDataView) getUint32(o float64, little ...bool) float64 {
-	return float64(tnDataViewOrder(little).Uint32(d.at(o, 4)))
+	return float64(tnDataViewOrder(little).Uint32(d.at("getUint32", o, 4)))
 }
 func (d *TnDataView) getFloat32(o float64, little ...bool) float64 {
-	return float64(math.Float32frombits(tnDataViewOrder(little).Uint32(d.at(o, 4))))
+	return float64(math.Float32frombits(tnDataViewOrder(little).Uint32(d.at("getFloat32", o, 4))))
 }
 func (d *TnDataView) getFloat16(o float64, little ...bool) float64 {
-	return TnF16ToF64(tnDataViewOrder(little).Uint16(d.at(o, 2)))
+	return TnF16ToF64(tnDataViewOrder(little).Uint16(d.at("getFloat16", o, 2)))
 }
 func (d *TnDataView) setFloat16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at(o, 2), TnF64ToF16(v))
+	tnDataViewOrder(little).PutUint16(d.at("setFloat16", o, 2), TnF64ToF16(v))
 }
 func (d *TnDataView) getFloat64(o float64, little ...bool) float64 {
-	return math.Float64frombits(tnDataViewOrder(little).Uint64(d.at(o, 8)))
+	return math.Float64frombits(tnDataViewOrder(little).Uint64(d.at("getFloat64", o, 8)))
 }
 func (d *TnDataView) getBigInt64(o float64, little ...bool) *tnbig.Int {
-	return tnbig.NewInt(int64(tnDataViewOrder(little).Uint64(d.at(o, 8))))
+	return tnbig.NewInt(int64(tnDataViewOrder(little).Uint64(d.at("getBigInt64", o, 8))))
 }
 func (d *TnDataView) getBigUint64(o float64, little ...bool) *tnbig.Int {
-	return new(tnbig.Int).SetUint64(tnDataViewOrder(little).Uint64(d.at(o, 8)))
+	return new(tnbig.Int).SetUint64(tnDataViewOrder(little).Uint64(d.at("getBigUint64", o, 8)))
 }
 
-func (d *TnDataView) setInt8(o float64, v float64)  { d.at(o, 1)[0] = byte(tnTypedConv[uint8](v, false)) }
-func (d *TnDataView) setUint8(o float64, v float64) { d.at(o, 1)[0] = tnTypedConv[uint8](v, false) }
+func (d *TnDataView) setInt8(o float64, v float64)  { d.at("setInt8", o, 1)[0] = byte(tnTypedConv[uint8](v, false)) }
+func (d *TnDataView) setUint8(o float64, v float64) { d.at("setUint8", o, 1)[0] = tnTypedConv[uint8](v, false) }
 func (d *TnDataView) setInt16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at(o, 2), tnTypedConv[uint16](v, false))
+	tnDataViewOrder(little).PutUint16(d.at("setInt16", o, 2), tnTypedConv[uint16](v, false))
 }
 func (d *TnDataView) setUint16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at(o, 2), tnTypedConv[uint16](v, false))
+	tnDataViewOrder(little).PutUint16(d.at("setUint16", o, 2), tnTypedConv[uint16](v, false))
 }
 func (d *TnDataView) setInt32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at(o, 4), tnTypedConv[uint32](v, false))
+	tnDataViewOrder(little).PutUint32(d.at("setInt32", o, 4), tnTypedConv[uint32](v, false))
 }
 func (d *TnDataView) setUint32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at(o, 4), tnTypedConv[uint32](v, false))
+	tnDataViewOrder(little).PutUint32(d.at("setUint32", o, 4), tnTypedConv[uint32](v, false))
 }
 func (d *TnDataView) setFloat32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at(o, 4), math.Float32bits(float32(v)))
+	tnDataViewOrder(little).PutUint32(d.at("setFloat32", o, 4), math.Float32bits(float32(v)))
 }
 func (d *TnDataView) setFloat64(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at(o, 8), math.Float64bits(v))
+	tnDataViewOrder(little).PutUint64(d.at("setFloat64", o, 8), math.Float64bits(v))
 }
 
 // BigInt writes wrap modulo 2^64 (BigInt.asUintN(64, v))
@@ -577,10 +690,10 @@ func tnDataViewUint64(v *tnbig.Int) uint64 {
 	return m.Uint64()
 }
 func (d *TnDataView) setBigInt64(o float64, v *tnbig.Int, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at(o, 8), tnDataViewUint64(v))
+	tnDataViewOrder(little).PutUint64(d.at("setBigInt64", o, 8), tnDataViewUint64(v))
 }
 func (d *TnDataView) setBigUint64(o float64, v *tnbig.Int, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at(o, 8), tnDataViewUint64(v))
+	tnDataViewOrder(little).PutUint64(d.at("setBigUint64", o, 8), tnDataViewUint64(v))
 }
 
 // BigInt64Array / BigUint64Array: 64-bit integers, read and written as
@@ -589,6 +702,32 @@ type TnBigIntArray struct {
 	data     []uint64
 	kind     string
 	unsigned bool
+	// a view on an ArrayBuffer (see TnTypedArray)
+	src    []byte
+	offset int
+	fixed  int
+	gen    uint64
+	oob    bool
+}
+
+func (a *TnBigIntArray) sync() {
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+}
+
+func (a *TnBigIntArray) resync() {
+	a.gen = tnABGen.Load()
+	b, ok := tnABView(a.src, a.offset, a.fixed, 8)
+	a.oob = !ok
+	a.data = tnTypedElems[uint64](b)
+}
+
+func (a *TnBigIntArray) check(method string) {
+	a.sync()
+	if a.oob {
+		panic(tnABOutOfBounds("%TypedArray%.prototype." + method))
+	}
 }
 
 func (a *TnBigIntArray) big(v uint64) *tnbig.Int {
@@ -621,6 +760,7 @@ func TnNewBigIntArray(kind string, src ...interface{}) *TnBigIntArray {
 		}
 		a.data = make([]uint64, int(s))
 	case *TnBigIntArray:
+		s.check("values")
 		a.data = append([]uint64{}, s.data...)
 	case []*tnbig.Int:
 		a.data = make([]uint64, len(s))
@@ -640,26 +780,9 @@ func TnNewBigIntArray(kind string, src ...interface{}) *TnBigIntArray {
 
 // new BigInt64Array(buffer[, byteOffset[, length]]): a view sharing its memory
 func TnBigIntArrayView(kind string, buf []byte, args ...float64) *TnBigIntArray {
-	offset := 0
-	if len(args) > 0 {
-		offset = int(args[0])
-	}
-	if offset%8 != 0 || offset > len(buf) {
-		panic(tnTypedRangeError("start offset of " + kind + " should be a multiple of 8"))
-	}
-	length := (len(buf) - offset) / 8
-	if len(args) > 1 {
-		length = int(args[1])
-		if length < 0 || offset+length*8 > len(buf) {
-			panic(tnTypedRangeError("Invalid typed array length: " + strconv.Itoa(length)))
-		}
-	} else if (len(buf)-offset)%8 != 0 {
-		panic(tnTypedRangeError("byte length of " + kind + " should be a multiple of 8"))
-	}
-	a := &TnBigIntArray{data: []uint64{}, kind: kind, unsigned: kind == "BigUint64Array"}
-	if length > 0 {
-		a.data = unsafe.Slice((*uint64)(unsafe.Pointer(&buf[offset])), length)
-	}
+	offset, fixed := tnABViewBounds(kind, buf, 8, args)
+	a := &TnBigIntArray{kind: kind, unsigned: kind == "BigUint64Array", src: buf, offset: offset, fixed: fixed}
+	a.resync()
 	return a
 }
 
@@ -674,6 +797,7 @@ func TnBigIntArrayOf(kind string, items ...*tnbig.Int) *TnBigIntArray {
 
 // a[i]: undefined (nil) out of range
 func (a *TnBigIntArray) Get(i float64) *tnbig.Int {
+	a.sync()
 	if !(i >= 0) || i >= float64(len(a.data)) || i != math.Trunc(i) {
 		return nil
 	}
@@ -681,18 +805,37 @@ func (a *TnBigIntArray) Get(i float64) *tnbig.Int {
 }
 
 func (a *TnBigIntArray) Set(i float64, v *tnbig.Int) *tnbig.Int {
+	a.sync()
 	if i >= 0 && i < float64(len(a.data)) && i == math.Trunc(i) {
 		a.data[int(i)] = tnDataViewUint64(v)
 	}
 	return v
 }
 
-func (a *TnBigIntArray) Get_length() float64            { return float64(len(a.data)) }
-func (a *TnBigIntArray) Get_byteLength() float64        { return float64(len(a.data) * 8) }
-func (a *TnBigIntArray) Get_byteOffset() float64        { return 0 }
+func (a *TnBigIntArray) Get_length() float64 {
+	a.sync()
+	return float64(len(a.data))
+}
+
+func (a *TnBigIntArray) Get_byteLength() float64 {
+	a.sync()
+	return float64(len(a.data) * 8)
+}
+
+func (a *TnBigIntArray) Get_byteOffset() float64 {
+	a.sync()
+	if a.oob {
+		return 0
+	}
+	return float64(a.offset)
+}
+
 func (a *TnBigIntArray) Get_BYTES_PER_ELEMENT() float64 { return 8 }
 
 func (a *TnBigIntArray) Get_buffer() []byte {
+	if a.src != nil {
+		return a.src
+	}
 	if len(a.data) == 0 {
 		return []byte{}
 	}
@@ -700,6 +843,7 @@ func (a *TnBigIntArray) Get_buffer() []byte {
 }
 
 func (a *TnBigIntArray) values() []*tnbig.Int {
+	a.check("values")
 	out := make([]*tnbig.Int, len(a.data))
 	for i, v := range a.data {
 		out[i] = a.big(v)
@@ -708,6 +852,7 @@ func (a *TnBigIntArray) values() []*tnbig.Int {
 }
 
 func (a *TnBigIntArray) keys() []float64 {
+	a.check("keys")
 	out := make([]float64, len(a.data))
 	for i := range a.data {
 		out[i] = float64(i)
@@ -716,6 +861,7 @@ func (a *TnBigIntArray) keys() []float64 {
 }
 
 func (a *TnBigIntArray) fill(v *tnbig.Int, args ...float64) *TnBigIntArray {
+	a.check("fill")
 	start, end := tnTypedBounds(len(a.data), args)
 	bits := tnDataViewUint64(v)
 	for i := start; i < end; i++ {
@@ -725,6 +871,7 @@ func (a *TnBigIntArray) fill(v *tnbig.Int, args ...float64) *TnBigIntArray {
 }
 
 func (a *TnBigIntArray) set(src interface{}, offset ...float64) {
+	a.check("set")
 	at := 0
 	if len(offset) > 0 {
 		at = int(offset[0])
@@ -737,16 +884,29 @@ func (a *TnBigIntArray) set(src interface{}, offset ...float64) {
 }
 
 func (a *TnBigIntArray) subarray(args ...float64) *TnBigIntArray {
+	a.sync()
 	start, end := tnTypedBounds(len(a.data), args)
+	if a.src != nil {
+		fixed := (end - start) * 8
+		if a.fixed < 0 && len(args) < 2 {
+			fixed = -1
+		}
+		tnABConstructCheck(a.src)
+		out := &TnBigIntArray{kind: a.kind, unsigned: a.unsigned, src: a.src, offset: a.offset + start*8, fixed: fixed}
+		out.resync()
+		return out
+	}
 	return &TnBigIntArray{data: a.data[start:end:end], kind: a.kind, unsigned: a.unsigned}
 }
 
 func (a *TnBigIntArray) slice(args ...float64) *TnBigIntArray {
+	a.check("slice")
 	start, end := tnTypedBounds(len(a.data), args)
 	return &TnBigIntArray{data: append([]uint64{}, a.data[start:end]...), kind: a.kind, unsigned: a.unsigned}
 }
 
 func (a *TnBigIntArray) at(i float64) *tnbig.Int {
+	a.check("at")
 	if i < 0 {
 		i += float64(len(a.data))
 	}
@@ -754,6 +914,7 @@ func (a *TnBigIntArray) at(i float64) *tnbig.Int {
 }
 
 func (a *TnBigIntArray) indexOf(v *tnbig.Int, from ...float64) float64 {
+	a.check("indexOf")
 	start, _ := tnTypedBounds(len(a.data), from)
 	for i := start; i < len(a.data); i++ {
 		if a.big(a.data[i]).Cmp(v) == 0 {
@@ -768,6 +929,7 @@ func (a *TnBigIntArray) includes(v *tnbig.Int, from ...float64) bool {
 }
 
 func (a *TnBigIntArray) join(sep ...string) string {
+	a.check("join")
 	separator := ","
 	if len(sep) > 0 {
 		separator = sep[0]
@@ -783,19 +945,349 @@ func (a *TnBigIntArray) toString() string { return a.join(",") }
 func (a *TnBigIntArray) String() string   { return a.join(",") }
 
 func (a *TnBigIntArray) reverse() *TnBigIntArray {
+	a.check("reverse")
 	for i, j := 0, len(a.data)-1; i < j; i, j = i+1, j-1 {
 		a.data[i], a.data[j] = a.data[j], a.data[i]
 	}
 	return a
 }
 
+// --- ArrayBuffer state ---
+//
+// An ArrayBuffer is a Go []byte value, so a resizable buffer's length and a
+// detached buffer's state live beside it, keyed by the address of its bytes
+// (the slice every holder of the buffer shares). Plain buffers that are
+// never resized or transferred have no entry. A resizable buffer starts with
+// a small capacity; growing past it moves the bytes to a larger allocation
+// (grown), which all ArrayBuffer operations and views then read.
+type tnABState struct {
+	length    int
+	grown     []byte
+	max       int
+	resizable bool
+	detached  bool
+}
+
+type tnABEntry struct {
+	state *tnABState
+	self  weak.Pointer[byte]
+}
+
+var (
+	tnABStates = map[uintptr]tnABEntry{}
+	tnABMu     sync.Mutex
+	tnABCount  atomic.Int64
+	// bumped on every resize and detach: views recompute their elements
+	tnABGen atomic.Uint64
+)
+
+func tnABLookup(b []byte) *tnABState {
+	if tnABCount.Load() == 0 || cap(b) == 0 {
+		return nil
+	}
+	p := unsafe.SliceData(b)
+	tnABMu.Lock()
+	e, ok := tnABStates[uintptr(unsafe.Pointer(p))]
+	tnABMu.Unlock()
+	if !ok || e.self.Value() != p {
+		return nil
+	}
+	return e.state
+}
+
+// Records st for buffer b (false: b has no address of its own to key it by)
+func tnABRegister(b []byte, st *tnABState) (ok bool) {
+	if cap(b) == 0 {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	p := unsafe.SliceData(b)
+	key := uintptr(unsafe.Pointer(p))
+	self := weak.Make(p)
+	tnABMu.Lock()
+	_, had := tnABStates[key]
+	tnABStates[key] = tnABEntry{state: st, self: self}
+	tnABMu.Unlock()
+	if !had {
+		tnABCount.Add(1)
+	}
+	runtime.AddCleanup(p, func(k uintptr) {
+		tnABMu.Lock()
+		if e, has := tnABStates[k]; has && e.self.Value() == nil {
+			delete(tnABStates, k)
+			tnABCount.Add(-1)
+		}
+		tnABMu.Unlock()
+	}, key)
+	return true
+}
+
+// The bytes of buffer b now (nil and its state when detached)
+func tnABCurrent(b []byte) ([]byte, *tnABState) {
+	st := tnABLookup(b)
+	if st == nil {
+		return b, nil
+	}
+	if st.detached {
+		return nil, st
+	}
+	if st.grown != nil {
+		return st.grown[:st.length], st
+	}
+	return b[:min(st.length, cap(b))], st
+}
+
+// The bytes of a view on buffer b at offset: fixed bytes, or (fixed -1) up
+// to the buffer's end in whole elements; false when the buffer is detached or
+// the view out of bounds
+func tnABView(b []byte, offset int, fixed int, size int) ([]byte, bool) {
+	cur, st := tnABCurrent(b)
+	if st != nil && st.detached {
+		return nil, false
+	}
+	if offset > len(cur) {
+		return nil, false
+	}
+	if fixed < 0 {
+		n := (len(cur) - offset) / size * size
+		return cur[offset : offset+n], true
+	}
+	if offset+fixed > len(cur) {
+		return nil, false
+	}
+	return cur[offset : offset+fixed], true
+}
+
+func tnABOutOfBounds(method string) *TnError {
+	return TnNodeError("TypeError", "", "Cannot perform "+method+" on a detached or out-of-bounds ArrayBuffer")
+}
+
+func tnABDetachedError(method string) *TnError {
+	return TnNodeError("TypeError", "", "Cannot perform "+method+" on a detached ArrayBuffer")
+}
+
+func tnABConstructCheck(b []byte) {
+	if st := tnABLookup(b); st != nil && st.detached {
+		panic(tnABDetachedError("Construct"))
+	}
+}
+
+// The byte offset and byte length (-1: tracking) of new XArray(buffer[,
+// byteOffset[, length]]), checked as JS does
+func tnABViewBounds(kind string, buf []byte, size int, args []float64) (int, int) {
+	cur, st := tnABCurrent(buf)
+	if st != nil && st.detached {
+		panic(tnABDetachedError("Construct"))
+	}
+	offset := 0
+	if len(args) > 0 {
+		offset = int(args[0])
+	}
+	if offset%size != 0 {
+		panic(tnTypedRangeError("start offset of " + kind + " should be a multiple of " + strconv.Itoa(size)))
+	}
+	if offset < 0 || offset > len(cur) {
+		panic(tnTypedRangeError("Start offset " + strconv.Itoa(offset) + " is outside the bounds of the buffer"))
+	}
+	if len(args) > 1 {
+		length := int(args[1])
+		if length < 0 || offset+length*size > len(cur) {
+			panic(tnTypedRangeError("Invalid typed array length: " + strconv.Itoa(length)))
+		}
+		return offset, length * size
+	}
+	if st != nil && st.resizable {
+		return offset, -1
+	}
+	if (len(cur)-offset)%size != 0 {
+		panic(tnTypedRangeError("byte length of " + kind + " should be a multiple of " + strconv.Itoa(size)))
+	}
+	return offset, len(cur) - offset
+}
+
+// ToIndex of a byte length
+func tnABIndex(v float64, message string) int {
+	if math.IsNaN(v) {
+		return 0
+	}
+	v = math.Trunc(v)
+	if v < 0 || v > 9007199254740991 {
+		panic(tnTypedRangeError(message))
+	}
+	return int(v)
+}
+
+// A resizable buffer of n bytes, at most max
+func tnABNewResizable(n int, max int) []byte {
+	b := make([]byte, n, tnABMax(n, 16))
+	tnABRegister(b, &tnABState{length: n, max: max, resizable: true})
+	return b
+}
+
+func tnABMax(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// new ArrayBuffer(n, { maxByteLength }) / new SharedArrayBuffer(n, { maxByteLength })
+func TnNewArrayBuffer(n float64, options interface{}) []byte {
+	size := tnABIndex(n, "Invalid array buffer length")
+	max := TnGetValue(options, "maxByteLength")
+	if max == nil {
+		return make([]byte, size)
+	}
+	limit := tnABIndex(TnNumber(max), "Invalid array buffer max length")
+	if size > limit {
+		panic(tnTypedRangeError("Invalid array buffer max length"))
+	}
+	return tnABNewResizable(size, limit)
+}
+
+// The bytes of buffer b now (empty when detached): for APIs taking a buffer
+func TnABBytes(b []byte) []byte {
+	cur, _ := tnABCurrent(b)
+	if cur == nil {
+		return []byte{}
+	}
+	return cur
+}
+
+// new Uint8Array(buffer, …): its bytes now
+func TnArrayBufferForView(b []byte) []byte {
+	cur, st := tnABCurrent(b)
+	if st != nil && st.detached {
+		panic(tnABDetachedError("Construct"))
+	}
+	return cur
+}
+
+func TnABByteLength(b []byte) float64 {
+	cur, _ := tnABCurrent(b)
+	return float64(len(cur))
+}
+
+func TnABMaxByteLength(b []byte) float64 {
+	cur, st := tnABCurrent(b)
+	if st != nil && st.resizable && !st.detached {
+		return float64(st.max)
+	}
+	return float64(len(cur))
+}
+
+func TnABResizable(b []byte) bool {
+	st := tnABLookup(b)
+	return st != nil && st.resizable
+}
+
+func TnABDetached(b []byte) bool {
+	st := tnABLookup(b)
+	return st != nil && st.detached
+}
+
+// The length of a resizable buffer: new bytes read 0; growing past the
+// capacity moves the bytes (views follow)
+func tnABSetLength(b []byte, st *tnABState, n int) {
+	base := st.grown
+	if base == nil {
+		base = b[:cap(b)]
+	}
+	if n > cap(base) {
+		grown := make([]byte, n, min(st.max, tnABMax(n, 2*cap(base))))
+		copy(grown, base[:st.length])
+		st.grown = grown
+	} else if n > st.length {
+		clear(base[st.length:n])
+	}
+	st.length = n
+	tnABGen.Add(1)
+}
+
+// arrayBuffer.resize(n)
+func TnABResize(b []byte, n float64) {
+	st := tnABLookup(b)
+	if st != nil && st.detached && st.resizable {
+		panic(tnABDetachedError("ArrayBuffer.prototype.resize"))
+	}
+	if st == nil || !st.resizable {
+		panic(TnNodeError("TypeError", "", "Method ArrayBuffer.prototype.resize called on incompatible receiver #<ArrayBuffer>"))
+	}
+	size := tnABIndex(n, "ArrayBuffer.prototype.resize: Invalid length parameter")
+	if size > st.max {
+		panic(tnTypedRangeError("ArrayBuffer.prototype.resize: Invalid length parameter"))
+	}
+	tnABSetLength(b, st, size)
+}
+
+// sharedArrayBuffer.grow(n): it can't shrink
+func TnABGrow(b []byte, n float64) {
+	st := tnABLookup(b)
+	if st == nil || !st.resizable {
+		panic(TnNodeError("TypeError", "", "Method SharedArrayBuffer.prototype.grow called on incompatible receiver #<SharedArrayBuffer>"))
+	}
+	size := tnABIndex(n, "SharedArrayBuffer.prototype.grow: Invalid length parameter")
+	if size > st.max || size < st.length {
+		panic(tnTypedRangeError("SharedArrayBuffer.prototype.grow: Invalid length parameter"))
+	}
+	tnABSetLength(b, st, size)
+}
+
 // ArrayBuffer#slice copies (a Uint8Array's subarray / Buffer's slice share)
 func TnArrayBufferSlice(b []byte, args ...float64) []byte {
-	start, end := tnTypedBounds(len(b), args)
-	return append([]byte{}, b[start:end]...)
+	cur, st := tnABCurrent(b)
+	if st != nil && st.detached {
+		panic(tnABDetachedError("ArrayBuffer.prototype.slice"))
+	}
+	start, end := tnTypedBounds(len(cur), args)
+	return append([]byte{}, cur[start:end]...)
+}
+
+// arrayBuffer.transfer(newLength) / transferToFixedLength(newLength): the
+// bytes (resized, zero-filled) move to a new buffer — resizable as the source
+// was, for transfer — and the source is detached. (The bytes are copied:
+// Uint8Arrays made on the source keep the old memory.)
+func TnArrayBufferTransfer(b []byte, toFixed bool, length ...float64) []byte {
+	method := "ArrayBuffer.prototype.transfer"
+	if toFixed {
+		method = "ArrayBuffer.prototype.transferToFixedLength"
+	}
+	cur, st := tnABCurrent(b)
+	if st != nil && st.detached {
+		panic(tnABDetachedError(method))
+	}
+	n := len(cur)
+	if len(length) > 0 && !math.IsNaN(length[0]) {
+		n = tnABIndex(length[0], "Invalid array buffer length")
+	}
+	var out []byte
+	if !toFixed && st != nil && st.resizable {
+		if n > st.max {
+			panic(tnTypedRangeError(method + ": Invalid length parameter"))
+		}
+		out = tnABNewResizable(n, st.max)
+	} else {
+		out = make([]byte, n)
+	}
+	copy(out, cur)
+	if st == nil {
+		st = &tnABState{}
+		if !tnABRegister(b, st) {
+			return out
+		}
+	}
+	st.detached = true
+	st.length = 0
+	st.grown = nil
+	tnABGen.Add(1)
+	return out
 }`;
 export function registerTypedArrays(r) {
-    defineHelper(r, 'typedArrays', ['encoding/binary', 'math', 'math/big', 'sort', 'strconv', 'strings', 'unsafe'], ['error', 'dynamic', 'nodeInvoke', 'builtins'], typedArrayHelper);
+    defineHelper(r, 'typedArrays', ['encoding/binary', 'math', 'math/big', 'runtime', 'sort', 'strconv', 'strings', 'sync', 'sync/atomic', 'unsafe', 'weak'], ['error', 'dynamic', 'nodeInvoke', 'builtins'], typedArrayHelper);
     const use = () => r.helper('typedArrays');
     for (const name of Object.keys(TYPED_ARRAY_KINDS)) {
         const elem = TYPED_ARRAY_KINDS[name];
@@ -866,7 +1358,20 @@ export function registerTypedArrays(r) {
     defineClass(r, 'globals.ArrayBuffer', '[]byte', 'Buffer', '', '', '', '');
     r.classByGoType['[]byte'] = 'buffer.Buffer';
     r.globals['ArrayBuffer'] = 'globals.ArrayBuffer';
-    r.constructors['globals.ArrayBuffer'] = (call) => call.args.length > 0 ? `make([]byte, int(${call.args[0]}))` : '[]byte{}';
+    // new ArrayBuffer(n, { maxByteLength }): resizable (SharedArrayBuffer: growable)
+    const newBuffer = (call) => {
+        if (call.args.length > 1) {
+            use();
+            return `TnNewArrayBuffer(${call.args[0]}, ${call.args[1]})`;
+        }
+        return call.args.length > 0 ? `make([]byte, int(${call.args[0]}))` : '[]byte{}';
+    };
+    r.constructors['globals.ArrayBuffer'] = newBuffer;
+    defineClass(r, 'globals.SharedArrayBuffer', '[]byte', 'Buffer', '', '', '', '');
+    // ([]byte values are Buffers / Uint8Arrays for method calls)
+    r.classByGoType['[]byte'] = 'buffer.Buffer';
+    r.globals['SharedArrayBuffer'] = 'globals.SharedArrayBuffer';
+    r.constructors['globals.SharedArrayBuffer'] = newBuffer;
     r.functions['globals.ArrayBuffer.isView'] = (call) => {
         use();
         if (r.isArrayBuffer(call.nodes[0]))

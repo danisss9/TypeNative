@@ -41,17 +41,8 @@ interface Number {
   toFixed(fractionDigits?: number): string;
   toPrecision(precision?: number): string;
   toExponential(fractionDigits?: number): string;
-  /** en-US formatting (grouping, at most 3 fraction digits); other locales are not consulted */
-  toLocaleString(
-    locales?: string | string[],
-    options?: {
-      style?: 'decimal' | 'percent' | 'currency';
-      currency?: string;
-      minimumFractionDigits?: number;
-      maximumFractionDigits?: number;
-      useGrouping?: boolean;
-    }
-  ): string;
+  /** Formatted as Intl.NumberFormat formats it (the default locale without locales) */
+  toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.NumberFormatOptions): string;
 }
 
 type PropertyKey = string | number | symbol;
@@ -243,6 +234,8 @@ interface Array<T> extends IterableIterator<T> {
    * Adds all the elements of an array into a string, separated by the specified separator string.
    */
   join(separator?: string): string;
+  /** Each element's toLocaleString, joined with commas */
+  toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.NumberFormatOptions & Intl.DateTimeFormatOptions): string;
   /**
    * Returns a copy of a section of an array.
    */
@@ -428,8 +421,9 @@ interface String {
   substr(from: number, length?: number): string;
   trimLeft(): string;
   trimRight(): string;
-  toLocaleUpperCase(locales?: string | string[]): string;
-  toLocaleLowerCase(locales?: string | string[]): string;
+  /** Locale case mapping (tr / az / lt) through golang.org/x/text/cases */
+  toLocaleUpperCase(locales?: Intl.LocalesArgument): string;
+  toLocaleLowerCase(locales?: Intl.LocalesArgument): string;
   isWellFormed(): boolean;
   toWellFormed(): string;
   /** Determines whether a string contains the specified substring. */
@@ -476,18 +470,8 @@ interface String {
   /** Returns the character at the given index (supports negative indices). */
   at(index: number): string | undefined;
   /** Compares two strings (by code unit). */
-  /** The root collation (base letters, then accents, then case); locales are not consulted */
-  localeCompare(
-    that: string,
-    locales?: string | string[],
-    options?: {
-      sensitivity?: 'base' | 'accent' | 'case' | 'variant';
-      numeric?: boolean;
-      caseFirst?: 'upper' | 'lower' | 'false';
-      ignorePunctuation?: boolean;
-      usage?: 'sort' | 'search';
-    }
-  ): number;
+  /** Without locales or options, a light approximation of the root collation; with either, Intl.Collator */
+  localeCompare(that: string, locales?: Intl.LocalesArgument, options?: Intl.CollatorOptions): number;
   /** Returns the Unicode normalization of the string. */
   normalize(form?: 'NFC' | 'NFD' | 'NFKC' | 'NFKD'): string;
   /** Returns a string representation. */
@@ -898,12 +882,10 @@ interface Date {
   toTimeString(): string;
   toUTCString(): string;
   toGMTString(): string;
-  /** en-US format; locales and options are ignored */
-  toLocaleDateString(locales?: string | string[], options?: any): string;
-  /** en-US format; locales and options are ignored */
-  toLocaleTimeString(locales?: string | string[], options?: any): string;
-  /** en-US format; locales and options are ignored */
-  toLocaleString(locales?: string | string[], options?: any): string;
+  /** Formatted as Intl.DateTimeFormat formats it (the default locale and time zone without arguments) */
+  toLocaleDateString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+  toLocaleTimeString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+  toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
   getTimezoneOffset(): number;
   setTime(time: number): number;
   setFullYear(year: number, month?: number, date?: number): number;
@@ -1151,6 +1133,7 @@ interface ClassMethodDecoratorContext<
 // bigint values (*big.Int): toString(radix)
 interface BigInt {
   toString(radix?: number): string;
+  toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.NumberFormatOptions): string;
 }
 
 interface BigIntConstructor {
@@ -1206,7 +1189,7 @@ interface Uint8ArrayConstructor {
   new (length: number): Uint8Array;
   new (array: ArrayLike<number> | Uint8Array): Uint8Array;
   // A view sharing the buffer's memory
-  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array;
+  new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Uint8Array;
   from(arrayLike: ArrayLike<number> | Iterable<number>): Uint8Array;
   /** The bytes a base64 string encodes (ES2026; a SyntaxError on bad input) */
   fromBase64(
@@ -1219,22 +1202,50 @@ interface Uint8ArrayConstructor {
 
 declare var Uint8Array: Uint8ArrayConstructor;
 
-// An ArrayBuffer is Go []byte too; .buffer of a view is its own bytes
-// (byteOffset 0), so new Float32Array(u8.buffer, u8.byteOffset, n) works
+// An ArrayBuffer is Go []byte too; .buffer of a Uint8Array is its own bytes
+// (byteOffset 0), so new Float32Array(u8.buffer, u8.byteOffset, n) works.
+// Resizable and detached buffers keep their state beside the bytes.
 interface ArrayBuffer {
   readonly byteLength: number;
+  /** The most a resizable buffer can grow to (byteLength otherwise; 0 once detached) */
+  readonly maxByteLength: number;
+  readonly resizable: boolean;
+  /** Whether transfer() moved its bytes out */
+  readonly detached: boolean;
   slice(begin?: number, end?: number): ArrayBuffer;
-  /** A copy (resized to newLength, zero-filled); the original is not detached */
+  /** A resizable buffer's new length (new bytes read 0; typed arrays and DataViews follow, Uint8Arrays don't) */
+  resize(newLength: number): void;
+  /** The bytes (resized to newLength, zero-filled) in a new buffer, resizable as this one is; this one is detached */
   transfer(newLength?: number): ArrayBuffer;
+  /** transfer() into a fixed-length buffer */
   transferToFixedLength(newLength?: number): ArrayBuffer;
 }
 
 interface ArrayBufferConstructor {
-  new (byteLength: number): ArrayBuffer;
+  new (byteLength: number, options?: { maxByteLength?: number }): ArrayBuffer;
   isView(arg: any): boolean;
 }
 
 declare var ArrayBuffer: ArrayBufferConstructor;
+
+// A SharedArrayBuffer is an ArrayBuffer here (workers are processes: nothing
+// is shared); { maxByteLength } makes it growable
+interface SharedArrayBuffer {
+  readonly byteLength: number;
+  readonly maxByteLength: number;
+  readonly growable: boolean;
+  slice(begin?: number, end?: number): SharedArrayBuffer;
+  /** A growable buffer's new length (it can't shrink) */
+  grow(newLength: number): void;
+}
+
+interface SharedArrayBufferConstructor {
+  new (byteLength: number, options?: { maxByteLength?: number }): SharedArrayBuffer;
+}
+
+declare var SharedArrayBuffer: SharedArrayBufferConstructor;
+
+type ArrayBufferLike = ArrayBuffer | SharedArrayBuffer;
 
 // Typed arrays other than Uint8Array: Go slices of the element type; views
 // made on an ArrayBuffer share its memory
@@ -1284,7 +1295,7 @@ interface TypedArray<Self> {
 interface TypedArrayConstructor<T> {
   new (length?: number): T;
   new (array: ArrayLike<number> | Iterable<number> | TypedArray<any>): T;
-  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): T;
+  new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): T;
   from(arrayLike: ArrayLike<number> | Iterable<number> | TypedArray<any>, mapfn?: (v: number, k: number) => number): T;
   of(...items: number[]): T;
   readonly BYTES_PER_ELEMENT: number;
@@ -1336,7 +1347,7 @@ interface BigIntTypedArray<Self> {
 interface BigIntTypedArrayConstructor<T> {
   new (length?: number): T;
   new (array: ArrayLike<bigint> | Iterable<bigint>): T;
-  new (buffer: ArrayBuffer, byteOffset?: number, length?: number): T;
+  new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): T;
   from(arrayLike: ArrayLike<bigint> | Iterable<bigint>): T;
   of(...items: bigint[]): T;
   readonly BYTES_PER_ELEMENT: number;
@@ -1378,7 +1389,7 @@ interface DataView {
 }
 
 declare var DataView: {
-  new (buffer: ArrayBuffer, byteOffset?: number, byteLength?: number): DataView;
+  new (buffer: ArrayBufferLike, byteOffset?: number, byteLength?: number): DataView;
 };
 
 interface Buffer extends Uint8Array {
@@ -1487,7 +1498,7 @@ declare var TextEncoder: { new (): TextEncoder };
 
 interface TextDecoder {
   readonly encoding: string;
-  decode(input?: Uint8Array, options?: { stream?: boolean }): string;
+  decode(input?: Uint8Array | ArrayBufferLike, options?: { stream?: boolean }): string;
 }
 declare var TextDecoder: { new (label?: string): TextDecoder };
 
@@ -2180,4 +2191,736 @@ declare namespace WebAssembly {
   // (bytes first: a Module has no instance members, so bytes would match it)
   function instantiate(bytes: BufferSource, importObject?: Imports): Promise<WebAssemblyInstantiatedSource>;
   function instantiate(moduleObject: Module, importObject?: Imports): Promise<Instance>;
+}
+
+// --- Intl ---
+//
+// Formats as Node 26 (ICU 78) does for the locales whose data is generated
+// (scripts/gen-intl-data.mjs: en, en-GB, en-IN, de, fr, es, es-MX, it, pt-BR,
+// pt-PT, nl, sv, da, nb, fi, pl, cs, ru, uk, tr, el, ja, zh, zh-Hant, ko, ar,
+// he, hi, id, th, vi); other locales fall back by language, then to the
+// default locale (LC_ALL / LANG, or the Windows user locale). Language tags,
+// plural rules, collation and locale case mapping run on golang.org/x/text.
+// The gregorian calendar only.
+declare namespace Intl {
+  type LocalesArgument = string | Locale | readonly (string | Locale)[] | undefined;
+  type LocaleMatcher = 'lookup' | 'best fit';
+
+  interface ResolvedOptions {
+    locale: string;
+    [key: string]: any;
+  }
+
+  // --- NumberFormat
+  type NumberFormatPartType =
+    | 'compact' | 'currency' | 'decimal' | 'exponentInteger' | 'exponentMinusSign' | 'exponentSeparator'
+    | 'fraction' | 'group' | 'infinity' | 'integer' | 'literal' | 'minusSign' | 'nan' | 'plusSign'
+    | 'percentSign' | 'unit' | 'unknown' | 'approximatelySign';
+  interface NumberFormatPart {
+    type: NumberFormatPartType;
+    value: string;
+  }
+  interface NumberRangeFormatPart extends NumberFormatPart {
+    source: 'startRange' | 'endRange' | 'shared';
+  }
+  interface NumberFormatOptions {
+    localeMatcher?: LocaleMatcher;
+    numberingSystem?: string;
+    style?: 'decimal' | 'percent' | 'currency' | 'unit';
+    currency?: string;
+    currencyDisplay?: 'symbol' | 'narrowSymbol' | 'code' | 'name';
+    currencySign?: 'standard' | 'accounting';
+    unit?: string;
+    unitDisplay?: 'short' | 'long' | 'narrow';
+    notation?: 'standard' | 'scientific' | 'engineering' | 'compact';
+    compactDisplay?: 'short' | 'long';
+    signDisplay?: 'auto' | 'never' | 'always' | 'exceptZero' | 'negative';
+    useGrouping?: boolean | 'always' | 'auto' | 'min2' | 'true' | 'false';
+    minimumIntegerDigits?: number;
+    minimumFractionDigits?: number;
+    maximumFractionDigits?: number;
+    minimumSignificantDigits?: number;
+    maximumSignificantDigits?: number;
+    roundingMode?: 'ceil' | 'floor' | 'expand' | 'trunc' | 'halfCeil' | 'halfFloor' | 'halfExpand' | 'halfTrunc' | 'halfEven';
+    roundingPriority?: 'auto' | 'morePrecision' | 'lessPrecision';
+    roundingIncrement?: number;
+    trailingZeroDisplay?: 'auto' | 'stripIfInteger';
+  }
+  class NumberFormat {
+    constructor(locales?: LocalesArgument, options?: NumberFormatOptions);
+    /** A bound function (`arr.map(nf.format)` works) */
+    readonly format: (value: number | bigint | string) => string;
+    formatToParts(value: number | bigint | string): NumberFormatPart[];
+    formatRange(start: number | bigint | string, end: number | bigint | string): string;
+    formatRangeToParts(start: number | bigint | string, end: number | bigint | string): NumberRangeFormatPart[];
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- DateTimeFormat
+  type DateTimeFormatPartType =
+    | 'day' | 'dayPeriod' | 'era' | 'hour' | 'literal' | 'minute' | 'month' | 'second' | 'timeZoneName'
+    | 'weekday' | 'year' | 'fractionalSecond' | 'relatedYear' | 'yearName' | 'unknown';
+  interface DateTimeFormatPart {
+    type: DateTimeFormatPartType;
+    value: string;
+  }
+  interface DateTimeRangeFormatPart extends DateTimeFormatPart {
+    source: 'startRange' | 'endRange' | 'shared';
+  }
+  interface DateTimeFormatOptions {
+    localeMatcher?: LocaleMatcher;
+    calendar?: string;
+    numberingSystem?: string;
+    timeZone?: string;
+    hour12?: boolean;
+    hourCycle?: 'h11' | 'h12' | 'h23' | 'h24';
+    formatMatcher?: 'basic' | 'best fit';
+    weekday?: 'long' | 'short' | 'narrow';
+    era?: 'long' | 'short' | 'narrow';
+    year?: 'numeric' | '2-digit';
+    month?: 'numeric' | '2-digit' | 'long' | 'short' | 'narrow';
+    day?: 'numeric' | '2-digit';
+    dayPeriod?: 'narrow' | 'short' | 'long';
+    hour?: 'numeric' | '2-digit';
+    minute?: 'numeric' | '2-digit';
+    second?: 'numeric' | '2-digit';
+    fractionalSecondDigits?: 1 | 2 | 3;
+    timeZoneName?: 'short' | 'long' | 'shortOffset' | 'longOffset' | 'shortGeneric' | 'longGeneric';
+    dateStyle?: 'full' | 'long' | 'medium' | 'short';
+    timeStyle?: 'full' | 'long' | 'medium' | 'short';
+  }
+  class DateTimeFormat {
+    constructor(locales?: LocalesArgument, options?: DateTimeFormatOptions);
+    /** A bound function; without an argument it formats the current time */
+    readonly format: (date?: Date | number) => string;
+    formatToParts(date?: Date | number): DateTimeFormatPart[];
+    formatRange(start: Date | number, end: Date | number): string;
+    formatRangeToParts(start: Date | number, end: Date | number): DateTimeRangeFormatPart[];
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- Collator
+  interface CollatorOptions {
+    localeMatcher?: LocaleMatcher;
+    usage?: 'sort' | 'search';
+    sensitivity?: 'base' | 'accent' | 'case' | 'variant';
+    ignorePunctuation?: boolean;
+    collation?: string;
+    numeric?: boolean;
+    caseFirst?: 'upper' | 'lower' | 'false';
+  }
+  class Collator {
+    constructor(locales?: LocalesArgument, options?: CollatorOptions);
+    /** A bound function (`arr.sort(collator.compare)` works) */
+    readonly compare: (x: string, y: string) => number;
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- PluralRules
+  type LDMLPluralRule = 'zero' | 'one' | 'two' | 'few' | 'many' | 'other';
+  interface PluralRulesOptions {
+    localeMatcher?: LocaleMatcher;
+    type?: 'cardinal' | 'ordinal';
+    minimumIntegerDigits?: number;
+    minimumFractionDigits?: number;
+    maximumFractionDigits?: number;
+    minimumSignificantDigits?: number;
+    maximumSignificantDigits?: number;
+    roundingMode?: NumberFormatOptions['roundingMode'];
+    roundingPriority?: NumberFormatOptions['roundingPriority'];
+    roundingIncrement?: number;
+    trailingZeroDisplay?: NumberFormatOptions['trailingZeroDisplay'];
+  }
+  class PluralRules {
+    constructor(locales?: LocalesArgument, options?: PluralRulesOptions);
+    select(n: number): LDMLPluralRule;
+    selectRange(start: number, end: number): LDMLPluralRule;
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- ListFormat
+  interface ListFormatOptions {
+    localeMatcher?: LocaleMatcher;
+    type?: 'conjunction' | 'disjunction' | 'unit';
+    style?: 'long' | 'short' | 'narrow';
+  }
+  interface ListFormatPart {
+    type: 'element' | 'literal';
+    value: string;
+  }
+  class ListFormat {
+    constructor(locales?: LocalesArgument, options?: ListFormatOptions);
+    format(list: Iterable<string>): string;
+    formatToParts(list: Iterable<string>): ListFormatPart[];
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- RelativeTimeFormat
+  type RelativeTimeFormatUnit =
+    | 'year' | 'years' | 'quarter' | 'quarters' | 'month' | 'months' | 'week' | 'weeks' | 'day' | 'days'
+    | 'hour' | 'hours' | 'minute' | 'minutes' | 'second' | 'seconds';
+  interface RelativeTimeFormatOptions {
+    localeMatcher?: LocaleMatcher;
+    numberingSystem?: string;
+    numeric?: 'always' | 'auto';
+    style?: 'long' | 'short' | 'narrow';
+  }
+  interface RelativeTimeFormatPart {
+    type: string;
+    value: string;
+    unit?: string;
+  }
+  class RelativeTimeFormat {
+    constructor(locales?: LocalesArgument, options?: RelativeTimeFormatOptions);
+    format(value: number, unit: RelativeTimeFormatUnit): string;
+    formatToParts(value: number, unit: RelativeTimeFormatUnit): RelativeTimeFormatPart[];
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- Segmenter
+  interface SegmenterOptions {
+    localeMatcher?: LocaleMatcher;
+    granularity?: 'grapheme' | 'word' | 'sentence';
+  }
+  interface SegmentData {
+    segment: string;
+    index: number;
+    input: string;
+    /** Word granularity only */
+    isWordLike?: boolean;
+  }
+  interface Segments {
+    containing(codeUnitIndex?: number): SegmentData | undefined;
+    [Symbol.iterator](): IterableIterator<SegmentData>;
+  }
+  class Segmenter {
+    constructor(locales?: LocalesArgument, options?: SegmenterOptions);
+    segment(input: string): Segments;
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- DisplayNames
+  interface DisplayNamesOptions {
+    localeMatcher?: LocaleMatcher;
+    type: 'language' | 'region' | 'script' | 'currency' | 'calendar' | 'dateTimeField';
+    style?: 'long' | 'short' | 'narrow';
+    fallback?: 'code' | 'none';
+    languageDisplay?: 'dialect' | 'standard';
+  }
+  class DisplayNames {
+    constructor(locales: LocalesArgument, options: DisplayNamesOptions);
+    of(code: string): string | undefined;
+    resolvedOptions(): ResolvedOptions;
+    static supportedLocalesOf(locales: LocalesArgument, options?: { localeMatcher?: LocaleMatcher }): string[];
+  }
+
+  // --- Locale
+  interface LocaleOptions {
+    baseName?: string;
+    calendar?: string;
+    caseFirst?: 'upper' | 'lower' | 'false';
+    collation?: string;
+    hourCycle?: 'h11' | 'h12' | 'h23' | 'h24';
+    language?: string;
+    numberingSystem?: string;
+    numeric?: boolean;
+    region?: string;
+    script?: string;
+  }
+  class Locale {
+    constructor(tag: string | Locale, options?: LocaleOptions);
+    readonly baseName: string;
+    readonly language: string;
+    readonly script: string | undefined;
+    readonly region: string | undefined;
+    readonly calendar: string | undefined;
+    readonly caseFirst: string | undefined;
+    readonly collation: string | undefined;
+    readonly hourCycle: string | undefined;
+    readonly numberingSystem: string | undefined;
+    readonly numeric: boolean;
+    maximize(): Locale;
+    minimize(): Locale;
+    toString(): string;
+  }
+
+  function getCanonicalLocales(locales?: string | readonly string[]): string[];
+  function supportedValuesOf(key: 'calendar' | 'collation' | 'currency' | 'numberingSystem' | 'timeZone' | 'unit'): string[];
+}
+
+// --- Temporal (Node 26's flagless global) ---
+//
+// The ISO 8601 calendar only: passing a non-ISO calendar id throws a
+// RangeError, like an unknown one. toLocaleString returns the same string as
+// toString (there is no Intl; this follows the fixed en-US convention Date
+// uses).
+
+declare namespace Temporal {
+  type CalendarLike = PlainDate | PlainDateTime | PlainMonthDay | PlainYearMonth | ZonedDateTime | string;
+  type DurationLike = Duration | DurationLikeObject | string;
+  type InstantLike = Instant | string;
+  type PlainDateLike = PlainDate | ZonedDateTime | PlainDateTime | DateLikeObject | string;
+  type PlainDateTimeLike = PlainDateTime | ZonedDateTime | PlainDate | DateTimeLikeObject | string;
+  type PlainMonthDayLike = PlainMonthDay | DateLikeObject | string;
+  type PlainTimeLike = PlainTime | PlainDateTime | ZonedDateTime | TimeLikeObject | string;
+  type PlainYearMonthLike = PlainYearMonth | YearMonthLikeObject | string;
+  type TimeZoneLike = ZonedDateTime | string;
+  type ZonedDateTimeLike = ZonedDateTime | ZonedDateTimeLikeObject | string;
+
+  type PartialTemporalLike<T extends object> = {
+    [P in Exclude<keyof T, "calendar" | "timeZone">]?: T[P] | undefined;
+  };
+
+  interface DateLikeObject {
+    year?: number | undefined;
+    era?: string | undefined;
+    eraYear?: number | undefined;
+    month?: number | undefined;
+    monthCode?: string | undefined;
+    day: number;
+    calendar?: string | undefined;
+  }
+
+  interface DateTimeLikeObject extends DateLikeObject, TimeLikeObject {}
+
+  interface DurationLikeObject {
+    years?: number | undefined;
+    months?: number | undefined;
+    weeks?: number | undefined;
+    days?: number | undefined;
+    hours?: number | undefined;
+    minutes?: number | undefined;
+    seconds?: number | undefined;
+    milliseconds?: number | undefined;
+    microseconds?: number | undefined;
+    nanoseconds?: number | undefined;
+  }
+
+  interface TimeLikeObject {
+    hour?: number | undefined;
+    minute?: number | undefined;
+    second?: number | undefined;
+    millisecond?: number | undefined;
+    microsecond?: number | undefined;
+    nanosecond?: number | undefined;
+  }
+
+  interface YearMonthLikeObject extends Omit<DateLikeObject, "day"> {}
+
+  interface ZonedDateTimeLikeObject extends DateTimeLikeObject {
+    timeZone: TimeZoneLike;
+    offset?: string | undefined;
+  }
+
+  type DateUnit = "year" | "month" | "week" | "day";
+  type TimeUnit = "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond";
+  type PluralizeUnit<T extends DateUnit | TimeUnit> =
+    | T
+    | {
+        year: "years";
+        month: "months";
+        week: "weeks";
+        day: "days";
+        hour: "hours";
+        minute: "minutes";
+        second: "seconds";
+        millisecond: "milliseconds";
+        microsecond: "microseconds";
+        nanosecond: "nanoseconds";
+      }[T];
+
+  interface DisambiguationOptions {
+    disambiguation?: "compatible" | "earlier" | "later" | "reject" | undefined;
+  }
+
+  interface OverflowOptions {
+    overflow?: "constrain" | "reject" | undefined;
+  }
+
+  interface TransitionOptions {
+    direction: "next" | "previous";
+  }
+
+  interface RoundingOptions<Units extends DateUnit | TimeUnit> {
+    smallestUnit?: PluralizeUnit<Units> | undefined;
+    roundingIncrement?: number | undefined;
+    roundingMode?: "ceil" | "floor" | "expand" | "trunc" | "halfCeil" | "halfFloor" | "halfExpand" | "halfTrunc" | "halfEven" | undefined;
+  }
+
+  interface RoundingOptionsWithLargestUnit<Units extends DateUnit | TimeUnit> extends RoundingOptions<Units> {
+    largestUnit?: "auto" | PluralizeUnit<Units> | undefined;
+  }
+
+  interface ToStringRoundingOptions<Units extends DateUnit | TimeUnit> extends Pick<RoundingOptions<Units>, "smallestUnit" | "roundingMode"> {}
+
+  interface ToStringRoundingOptionsWithFractionalSeconds<Units extends DateUnit | TimeUnit> extends ToStringRoundingOptions<Units> {
+    fractionalSecondDigits?: "auto" | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | undefined;
+  }
+
+  namespace Now {
+    function timeZoneId(): string;
+    function instant(): Instant;
+    function plainDateTimeISO(timeZone?: TimeZoneLike): PlainDateTime;
+    function zonedDateTimeISO(timeZone?: TimeZoneLike): ZonedDateTime;
+    function plainDateISO(timeZone?: TimeZoneLike): PlainDate;
+    function plainTimeISO(timeZone?: TimeZoneLike): PlainTime;
+  }
+
+  interface PlainDateToStringOptions {
+    calendarName?: "auto" | "always" | "never" | "critical" | undefined;
+  }
+
+  interface PlainDateToZonedDateTimeOptions {
+    plainTime?: PlainTimeLike | undefined;
+    timeZone: TimeZoneLike;
+  }
+
+  interface PlainDate {
+    readonly calendarId: string;
+    readonly era: string | undefined;
+    readonly eraYear: number | undefined;
+    readonly year: number;
+    readonly month: number;
+    readonly monthCode: string;
+    readonly day: number;
+    readonly dayOfWeek: number;
+    readonly dayOfYear: number;
+    readonly weekOfYear: number | undefined;
+    readonly yearOfWeek: number | undefined;
+    readonly daysInWeek: number;
+    readonly daysInMonth: number;
+    readonly daysInYear: number;
+    readonly monthsInYear: number;
+    readonly inLeapYear: boolean;
+    toPlainYearMonth(): PlainYearMonth;
+    toPlainMonthDay(): PlainMonthDay;
+    add(duration: DurationLike, options?: OverflowOptions): PlainDate;
+    subtract(duration: DurationLike, options?: OverflowOptions): PlainDate;
+    with(dateLike: PartialTemporalLike<DateLikeObject>, options?: OverflowOptions): PlainDate;
+    withCalendar(calendarLike: CalendarLike): PlainDate;
+    until(other: PlainDateLike, options?: RoundingOptionsWithLargestUnit<DateUnit>): Duration;
+    since(other: PlainDateLike, options?: RoundingOptionsWithLargestUnit<DateUnit>): Duration;
+    equals(other: PlainDateLike): boolean;
+    toPlainDateTime(time?: PlainTimeLike): PlainDateTime;
+    toZonedDateTime(timeZone: TimeZoneLike): ZonedDateTime;
+    toZonedDateTime(item: PlainDateToZonedDateTimeOptions): ZonedDateTime;
+    toString(options?: PlainDateToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+  }
+
+  interface PlainDateConstructor {
+    new (isoYear: number, isoMonth: number, isoDay: number, calendar?: string): PlainDate;
+    readonly prototype: PlainDate;
+    from(item: PlainDateLike, options?: OverflowOptions): PlainDate;
+    compare(one: PlainDateLike, two: PlainDateLike): number;
+  }
+  var PlainDate: PlainDateConstructor;
+
+  interface PlainTimeToStringOptions extends ToStringRoundingOptionsWithFractionalSeconds<Exclude<TimeUnit, "hour">> {}
+
+  interface PlainTime {
+    readonly hour: number;
+    readonly minute: number;
+    readonly second: number;
+    readonly millisecond: number;
+    readonly microsecond: number;
+    readonly nanosecond: number;
+    add(duration: DurationLike): PlainTime;
+    subtract(duration: DurationLike): PlainTime;
+    with(timeLike: PartialTemporalLike<TimeLikeObject>, options?: OverflowOptions): PlainTime;
+    until(other: PlainTimeLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+    since(other: PlainTimeLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+    equals(other: PlainTimeLike): boolean;
+    round(roundTo: PluralizeUnit<TimeUnit>): PlainTime;
+    round(roundTo: RoundingOptions<TimeUnit>): PlainTime;
+    toString(options?: PlainTimeToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+  }
+
+  interface PlainTimeConstructor {
+    new (hour?: number, minute?: number, second?: number, millisecond?: number, microsecond?: number, nanosecond?: number): PlainTime;
+    readonly prototype: PlainTime;
+    from(item: PlainTimeLike, options?: OverflowOptions): PlainTime;
+    compare(one: PlainTimeLike, two: PlainTimeLike): number;
+  }
+  var PlainTime: PlainTimeConstructor;
+
+  interface PlainDateTimeToStringOptions extends PlainDateToStringOptions, PlainTimeToStringOptions {}
+
+  interface PlainDateTime {
+    readonly calendarId: string;
+    readonly era: string | undefined;
+    readonly eraYear: number | undefined;
+    readonly year: number;
+    readonly month: number;
+    readonly monthCode: string;
+    readonly day: number;
+    readonly hour: number;
+    readonly minute: number;
+    readonly second: number;
+    readonly millisecond: number;
+    readonly microsecond: number;
+    readonly nanosecond: number;
+    readonly dayOfWeek: number;
+    readonly dayOfYear: number;
+    readonly weekOfYear: number | undefined;
+    readonly yearOfWeek: number | undefined;
+    readonly daysInWeek: number;
+    readonly daysInMonth: number;
+    readonly daysInYear: number;
+    readonly monthsInYear: number;
+    readonly inLeapYear: boolean;
+    with(dateTimeLike: PartialTemporalLike<DateTimeLikeObject>, options?: OverflowOptions): PlainDateTime;
+    withPlainTime(plainTime?: PlainTimeLike): PlainDateTime;
+    withCalendar(calendar: CalendarLike): PlainDateTime;
+    add(duration: DurationLike, options?: OverflowOptions): PlainDateTime;
+    subtract(duration: DurationLike, options?: OverflowOptions): PlainDateTime;
+    until(other: PlainDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+    since(other: PlainDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+    round(roundTo: PluralizeUnit<"day" | TimeUnit>): PlainDateTime;
+    round(roundTo: RoundingOptions<"day" | TimeUnit>): PlainDateTime;
+    equals(other: PlainDateTimeLike): boolean;
+    toString(options?: PlainDateTimeToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+    toZonedDateTime(timeZone: TimeZoneLike, options?: DisambiguationOptions): ZonedDateTime;
+    toPlainDate(): PlainDate;
+    toPlainTime(): PlainTime;
+  }
+
+  interface PlainDateTimeConstructor {
+    new (isoYear: number, isoMonth: number, isoDay: number, hour?: number, minute?: number, second?: number, millisecond?: number, microsecond?: number, nanosecond?: number, calendar?: string): PlainDateTime;
+    readonly prototype: PlainDateTime;
+    from(item: PlainDateTimeLike, options?: OverflowOptions): PlainDateTime;
+    compare(one: PlainDateTimeLike, two: PlainDateTimeLike): number;
+  }
+  var PlainDateTime: PlainDateTimeConstructor;
+
+  interface ZonedDateTimeToStringOptions extends PlainDateTimeToStringOptions {
+    offset?: "auto" | "never" | undefined;
+    timeZoneName?: "auto" | "never" | "critical" | undefined;
+  }
+
+  interface ZonedDateTimeFromOptions extends OverflowOptions, DisambiguationOptions {
+    offset?: "use" | "ignore" | "prefer" | "reject" | undefined;
+  }
+
+  interface ZonedDateTime {
+    readonly calendarId: string;
+    readonly timeZoneId: string;
+    readonly era: string | undefined;
+    readonly eraYear: number | undefined;
+    readonly year: number;
+    readonly month: number;
+    readonly monthCode: string;
+    readonly day: number;
+    readonly hour: number;
+    readonly minute: number;
+    readonly second: number;
+    readonly millisecond: number;
+    readonly microsecond: number;
+    readonly nanosecond: number;
+    readonly epochMilliseconds: number;
+    readonly epochNanoseconds: bigint;
+    readonly dayOfWeek: number;
+    readonly dayOfYear: number;
+    readonly weekOfYear: number | undefined;
+    readonly yearOfWeek: number | undefined;
+    readonly hoursInDay: number;
+    readonly daysInWeek: number;
+    readonly daysInMonth: number;
+    readonly daysInYear: number;
+    readonly monthsInYear: number;
+    readonly inLeapYear: boolean;
+    readonly offsetNanoseconds: number;
+    readonly offset: string;
+    with(zonedDateTimeLike: PartialTemporalLike<ZonedDateTimeLikeObject>, options?: ZonedDateTimeFromOptions): ZonedDateTime;
+    withPlainTime(plainTime?: PlainTimeLike): ZonedDateTime;
+    withTimeZone(timeZone: TimeZoneLike): ZonedDateTime;
+    withCalendar(calendar: CalendarLike): ZonedDateTime;
+    add(duration: DurationLike, options?: OverflowOptions): ZonedDateTime;
+    subtract(duration: DurationLike, options?: OverflowOptions): ZonedDateTime;
+    until(other: ZonedDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+    since(other: ZonedDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+    round(roundTo: PluralizeUnit<"day" | TimeUnit>): ZonedDateTime;
+    round(roundTo: RoundingOptions<"day" | TimeUnit>): ZonedDateTime;
+    equals(other: ZonedDateTimeLike): boolean;
+    toString(options?: ZonedDateTimeToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+    startOfDay(): ZonedDateTime;
+    getTimeZoneTransition(direction: "next" | "previous"): ZonedDateTime | null;
+    getTimeZoneTransition(direction: TransitionOptions): ZonedDateTime | null;
+    toInstant(): Instant;
+    toPlainDate(): PlainDate;
+    toPlainTime(): PlainTime;
+    toPlainDateTime(): PlainDateTime;
+  }
+
+  interface ZonedDateTimeConstructor {
+    new (epochNanoseconds: bigint, timeZone: string, calendar?: string): ZonedDateTime;
+    readonly prototype: ZonedDateTime;
+    from(item: ZonedDateTimeLike, options?: ZonedDateTimeFromOptions): ZonedDateTime;
+    compare(one: ZonedDateTimeLike, two: ZonedDateTimeLike): number;
+  }
+  var ZonedDateTime: ZonedDateTimeConstructor;
+
+  interface DurationRelativeToOptions {
+    relativeTo?: ZonedDateTimeLike | PlainDateLike | undefined;
+  }
+
+  interface DurationRoundingOptions extends DurationRelativeToOptions, RoundingOptionsWithLargestUnit<DateUnit | TimeUnit> {}
+
+  interface DurationToStringOptions extends ToStringRoundingOptionsWithFractionalSeconds<Exclude<TimeUnit, "hour" | "minute">> {}
+
+  interface DurationTotalOptions extends DurationRelativeToOptions {
+    unit: PluralizeUnit<DateUnit | TimeUnit>;
+  }
+
+  interface Duration {
+    readonly years: number;
+    readonly months: number;
+    readonly weeks: number;
+    readonly days: number;
+    readonly hours: number;
+    readonly minutes: number;
+    readonly seconds: number;
+    readonly milliseconds: number;
+    readonly microseconds: number;
+    readonly nanoseconds: number;
+    readonly sign: number;
+    readonly blank: boolean;
+    with(durationLike: PartialTemporalLike<DurationLikeObject>): Duration;
+    negated(): Duration;
+    abs(): Duration;
+    add(other: DurationLike): Duration;
+    subtract(other: DurationLike): Duration;
+    round(roundTo: PluralizeUnit<"day" | TimeUnit>): Duration;
+    round(roundTo: DurationRoundingOptions): Duration;
+    total(totalOf: PluralizeUnit<"day" | TimeUnit>): number;
+    total(totalOf: DurationTotalOptions): number;
+    toString(options?: DurationToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+  }
+
+  interface DurationConstructor {
+    new (years?: number, months?: number, weeks?: number, days?: number, hours?: number, minutes?: number, seconds?: number, milliseconds?: number, microseconds?: number, nanoseconds?: number): Duration;
+    readonly prototype: Duration;
+    from(item: DurationLike): Duration;
+    compare(one: DurationLike, two: DurationLike, options?: DurationRelativeToOptions): number;
+  }
+  var Duration: DurationConstructor;
+
+  interface InstantToStringOptions extends PlainTimeToStringOptions {
+    timeZone?: TimeZoneLike | undefined;
+  }
+
+  interface Instant {
+    readonly epochMilliseconds: number;
+    readonly epochNanoseconds: bigint;
+    add(duration: DurationLike): Instant;
+    subtract(duration: DurationLike): Instant;
+    until(other: InstantLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+    since(other: InstantLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+    round(roundTo: PluralizeUnit<TimeUnit>): Instant;
+    round(roundTo: RoundingOptions<TimeUnit>): Instant;
+    equals(other: InstantLike): boolean;
+    toString(options?: InstantToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+    toZonedDateTimeISO(timeZone: TimeZoneLike): ZonedDateTime;
+  }
+
+  interface InstantConstructor {
+    new (epochNanoseconds: bigint): Instant;
+    readonly prototype: Instant;
+    from(item: InstantLike): Instant;
+    fromEpochMilliseconds(epochMilliseconds: number): Instant;
+    fromEpochNanoseconds(epochNanoseconds: bigint): Instant;
+    compare(one: InstantLike, two: InstantLike): number;
+  }
+  var Instant: InstantConstructor;
+
+  interface PlainYearMonthToPlainDateOptions {
+    day: number;
+  }
+
+  interface PlainYearMonth {
+    readonly calendarId: string;
+    readonly era: string | undefined;
+    readonly eraYear: number | undefined;
+    readonly year: number;
+    readonly month: number;
+    readonly monthCode: string;
+    readonly daysInYear: number;
+    readonly daysInMonth: number;
+    readonly monthsInYear: number;
+    readonly inLeapYear: boolean;
+    with(yearMonthLike: PartialTemporalLike<YearMonthLikeObject>, options?: OverflowOptions): PlainYearMonth;
+    add(duration: DurationLike, options?: OverflowOptions): PlainYearMonth;
+    subtract(duration: DurationLike, options?: OverflowOptions): PlainYearMonth;
+    until(other: PlainYearMonthLike, options?: RoundingOptionsWithLargestUnit<"year" | "month">): Duration;
+    since(other: PlainYearMonthLike, options?: RoundingOptionsWithLargestUnit<"year" | "month">): Duration;
+    equals(other: PlainYearMonthLike): boolean;
+    toString(options?: PlainDateToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+    toPlainDate(item: PlainYearMonthToPlainDateOptions): PlainDate;
+  }
+
+  interface PlainYearMonthConstructor {
+    new (isoYear: number, isoMonth: number, calendar?: string, referenceISODay?: number): PlainYearMonth;
+    readonly prototype: PlainYearMonth;
+    from(item: PlainYearMonthLike, options?: OverflowOptions): PlainYearMonth;
+    compare(one: PlainYearMonthLike, two: PlainYearMonthLike): number;
+  }
+  var PlainYearMonth: PlainYearMonthConstructor;
+
+  interface PlainMonthDayToPlainDateOptions {
+    era?: string | undefined;
+    eraYear?: number | undefined;
+    year?: number | undefined;
+  }
+
+  interface PlainMonthDay {
+    readonly calendarId: string;
+    readonly monthCode: string;
+    readonly day: number;
+    with(monthDayLike: PartialTemporalLike<DateLikeObject>, options?: OverflowOptions): PlainMonthDay;
+    equals(other: PlainMonthDayLike): boolean;
+    toString(options?: PlainDateToStringOptions): string;
+    toLocaleString(locales?: string | string[], options?: any): string;
+    toJSON(): string;
+    valueOf(): never;
+    toPlainDate(item: PlainMonthDayToPlainDateOptions): PlainDate;
+  }
+
+  interface PlainMonthDayConstructor {
+    new (isoMonth: number, isoDay: number, calendar?: string, referenceISOYear?: number): PlainMonthDay;
+    readonly prototype: PlainMonthDay;
+    from(item: PlainMonthDayLike, options?: OverflowOptions): PlainMonthDay;
+  }
+  var PlainMonthDay: PlainMonthDayConstructor;
+}
+
+interface Date {
+  /** An Instant at the same epoch time */
+  toTemporalInstant(): Temporal.Instant;
 }

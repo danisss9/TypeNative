@@ -80,6 +80,8 @@ server.on('upgrade', (req: http.IncomingMessage, socket: Socket, _head: Buffer) 
       code.writeUInt16BE(3001, 0);
       socket.write(serverFrame(8, Buffer.concat([code, Buffer.from('server bye')])));
     }, 30);
+    // Consume the client's close echo (a paused socket would buffer it)
+    socket.on('data', () => {});
     return;
   }
   let buf = Buffer.alloc(0);

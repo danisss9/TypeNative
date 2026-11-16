@@ -875,9 +875,12 @@ func (e *TnEventEmitterAsyncResource) emitDestroy()                        {}`;
 const navigatorHelper = `// navigator.language: the OS locale (LANG / LC_ALL), en-US by default
 func TnNavigatorLanguage() string {
 	for _, name := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
-		if v := os.Getenv(name); v != "" && v != "C" && v != "POSIX" {
+		if v := os.Getenv(name); v != "" {
+			// C and its codeset forms (C.UTF-8) are not a language
 			v = strings.SplitN(v, ".", 2)[0]
-			return strings.ReplaceAll(v, "_", "-")
+			if v != "C" && v != "POSIX" {
+				return strings.ReplaceAll(v, "_", "-")
+			}
 		}
 	}
 	return "en-US"
