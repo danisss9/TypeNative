@@ -57,6 +57,7 @@ import { VERSION } from './version.js';
         gui: args.gui,
         cover: args.cover,
         profile: args.profile,
-        emitGo: args.emitGo
+        emitGo: args.emitGo,
+        seaConfig: args.seaConfig
     });
 })();

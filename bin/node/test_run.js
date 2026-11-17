@@ -159,6 +159,12 @@ func (r *tnTestRun) childOptions() string {
 	if update, _ := TnGetValue(r.options, "updateSnapshots").(bool); update || tnTestFilters().updateSnapshots {
 		words = append(words, "--test-update-snapshots")
 	}
+	if randomize, _ := TnGetValue(r.options, "randomize").(bool); randomize {
+		words = append(words, "--test-randomize")
+	}
+	if seed, ok := TnGetValue(r.options, "randomSeed").(float64); ok {
+		words = append(words, "--test-random-seed="+strconv.FormatFloat(seed, 'f', -1, 64))
+	}
 	return strings.Join(words, " ")
 }
 
@@ -551,7 +557,7 @@ function runFiles(r, options) {
     return out;
 }
 export function registerTestRun(r) {
-    defineHelper(r, 'nodeTestRun', ['bytes', 'encoding/json', 'io', 'math', 'os', 'os/exec', 'path/filepath', 'regexp', 'runtime', 'strings', 'sync', 'time'], ['nodeTest', 'nodeTestReporters', 'nodeClone', 'entryPoints', 'nodeEvents'], runHelper);
+    defineHelper(r, 'nodeTestRun', ['bytes', 'encoding/json', 'io', 'math', 'os', 'os/exec', 'path/filepath', 'regexp', 'runtime', 'strconv', 'strings', 'sync', 'time'], ['nodeTest', 'nodeTestReporters', 'nodeClone', 'entryPoints', 'nodeEvents'], runHelper);
     r.functions['test.run'] = (c) => {
         r.helper('nodeTestRun');
         const files = runFiles(r, c.nodes[0]);

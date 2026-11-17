@@ -75,6 +75,7 @@ Options:
   --profile            Write a CPU profile at exit, to $TYPENATIVE_CPUPROFILE
                        (default cpu.pprof); read it with go tool pprof
   --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
+  --sea-config <file>  Embed node:sea assets (a JSON: { "assets": { "key": "path" } })
   --no-typecheck       Skip type-checking
   -h, --help           Show this help
   -v, --version        Show the TypeNative version
@@ -101,6 +102,7 @@ export function parseCliArgs(argv) {
         output: null,
         target: null,
         emitGo: null,
+        seaConfig: null,
         error: ''
     };
     for (let i = 0; i < argv.length; i++) {
@@ -129,7 +131,7 @@ export function parseCliArgs(argv) {
             args.cover = true;
         else if (arg === '--profile')
             args.profile = true;
-        else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
+        else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go' || arg === '--sea-config') {
             if (value === null) {
                 if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
                     args.error = `${arg} needs a value`;
@@ -144,6 +146,8 @@ export function parseCliArgs(argv) {
                 args.output = value;
             else if (arg === '--target')
                 args.target = value;
+            else if (arg === '--sea-config')
+                args.seaConfig = value;
             else
                 args.emitGo = value;
         }
@@ -486,6 +490,36 @@ export function run(opts) {
             return { content, dir, path: displayPath(resolved.path) };
         };
         transpileOptions.resolveEmbed = (pattern, fromDir) => resolveEmbedPattern(pattern, fromDir ?? sourceDir, sourceDir);
+    }
+    if (opts.seaConfig) {
+        // The config is relative to the working directory, or to the entry file's
+        // (the parallel runner runs probes from their own temp cwd)
+        let configFile = opts.seaConfig;
+        if (!path.isAbsolute(configFile) && !fs.existsSync(configFile) && sourcePath) {
+            const besideEntry = path.resolve(path.dirname(path.resolve(sourcePath)), configFile);
+            if (fs.existsSync(besideEntry))
+                configFile = besideEntry;
+        }
+        const configDir = path.dirname(path.resolve(configFile));
+        let config;
+        try {
+            config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+        }
+        catch (err) {
+            console.error(`error: --sea-config ${configFile} is not readable JSON: ${err.message}`);
+            process.exit(1);
+        }
+        const seaAssets = {};
+        for (const [key, assetPath] of Object.entries(config.assets ?? {})) {
+            try {
+                seaAssets[key] = fs.readFileSync(path.resolve(configDir, assetPath)).toString('base64');
+            }
+            catch (err) {
+                console.error(`error: --sea-config's asset ${key} (${assetPath}) is not readable: ${err.message}`);
+                process.exit(1);
+            }
+        }
+        transpileOptions.seaAssets = seaAssets;
     }
     const transpileResult = transpileToNative(tsCode, transpileOptions);
     if (transpileResult.diagnostics.length > 0) {

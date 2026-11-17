@@ -173,6 +173,64 @@ func tnCoverageCollect(cfg *tnTestConfig) *TnCoverageSummary {
 	t.coveredLinePercent = tnCoveragePct(t.coveredLineCount, t.totalLineCount)
 	t.coveredBranchPercent = tnCoveragePct(t.coveredBranchCount, t.totalBranchCount)
 	t.coveredFunctionPercent = tnCoveragePct(t.coveredFunctionCount, t.totalFunctionCount)
+	// --test-coverage-include-all: the working directory's source files that
+	// never ran report their whole file as uncovered (Node's
+	// **/*.{cjs,cts,js,mjs,mts,ts} walk, without node_modules directories)
+	if cfg.coverageIncludeAll {
+		covered := map[string]bool{}
+		for _, f := range s.files {
+			covered[f.path] = true
+		}
+		paths := []string{}
+		filepath.WalkDir(cwd, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if d.Name() == "node_modules" || strings.HasPrefix(d.Name(), ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasPrefix(d.Name(), ".") {
+				return nil
+			}
+			switch filepath.Ext(p) {
+			case ".cjs", ".cts", ".js", ".mjs", ".mts", ".ts":
+				paths = append(paths, p)
+			}
+			return nil
+		})
+		sort.Strings(paths)
+		for _, p := range paths {
+			if covered[p] {
+				continue
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			last := 0
+			for i, lineText := range strings.Split(string(data), "\\n") {
+				if strings.TrimSpace(lineText) != "" {
+					last = i + 1
+				}
+			}
+			if last == 0 {
+				continue
+			}
+			// (nothing executed: no branches or functions counted, so those
+			// percentages stay 100, as Node's report shows them)
+			file := &TnCoverageFile{path: p, totalLineCount: float64(last), coveredBranchPercent: 100, coveredFunctionPercent: 100}
+			for l := 1; l <= last; l++ {
+				file.lines = append(file.lines, &TnCoverageCount{line: float64(l), count: 0})
+			}
+			s.files = append(s.files, file)
+			t.totalLineCount += float64(last)
+		}
+		sort.SliceStable(s.files, func(i, j int) bool { return s.files[i].path < s.files[j].path })
+		t.coveredLinePercent = tnCoveragePct(t.coveredLineCount, t.totalLineCount)
+	}
 	return s
 }
 

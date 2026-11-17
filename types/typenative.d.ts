@@ -2233,6 +2233,9 @@ declare namespace WebAssembly {
   // (bytes first: a Module has no instance members, so bytes would match it)
   function instantiate(bytes: BufferSource, importObject?: Imports): Promise<WebAssemblyInstantiatedSource>;
   function instantiate(moduleObject: Module, importObject?: Imports): Promise<Instance>;
+  // the Response comes from the fetch globals
+  function compileStreaming(source: Response | Promise<Response>): Promise<Module>;
+  function instantiateStreaming(source: Response | Promise<Response>, importObject?: Imports): Promise<WebAssemblyInstantiatedSource>;
 }
 
 // --- Intl ---

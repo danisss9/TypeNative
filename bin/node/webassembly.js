@@ -909,9 +909,131 @@ func TnWasmInstantiateModule(m *TnWasmModule, importObject ...interface{}) chan 
 	}()
 	return ch
 }`;
+// WebAssembly.compileStreaming / instantiateStreaming — a helper of its own,
+// since it names the fetch classes (a Response is its only source)
+const wasmStreamingHelper = `// The "source" argument's Received description, as Node formats it
+func tnWasmReceived(src interface{}) string {
+	switch s := src.(type) {
+	case string:
+		return "type string (" + strconv.Quote(s) + ")"
+	case bool:
+		if s {
+			return "type boolean (true)"
+		}
+		return "type boolean (false)"
+	case float64:
+		return "type number (" + TnNumStr(s) + ")"
+	}
+	if src == nil {
+		return "type null"
+	}
+	return "an instance of Object"
+}
+
+// A Response — or a promise of one — with the MIME type application/wasm is
+// read, then compiled / instantiated, as the spec runs it
+func tnWasmResponseBytes[T any](r *TnResponse, out chan T, deliver func([]byte)) {
+	TnLoopPost(func() {
+		mime := r.headers.get("content-type")
+		if mime == nil || *mime != "application/wasm" {
+			shown := "null"
+			if mime != nil {
+				shown = *mime
+			}
+			e := TnNodeError("TypeError", "ERR_WEBASSEMBLY_RESPONSE", "WebAssembly response has unsupported MIME type '"+shown+"'")
+			TnReject(out, e)
+			return
+		}
+		body := r.arrayBuffer()
+		TnLoopRef()
+		go func() {
+			defer TnLoopUnref()
+			var data []byte
+			var failure interface{}
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						failure = rec
+					}
+				}()
+				data = <-body
+			}()
+			TnLoopPost(func() {
+				if failure != nil {
+					TnReject(out, failure)
+					return
+				}
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							TnReject(out, rec)
+						}
+					}()
+					deliver(data)
+				}()
+			})
+		}()
+	})
+}
+
+// (a promise's value: still a Response, or a promise of one — Promise.resolve
+// of an any makes an interface{} channel)
+func tnWasmStreamingValue[T any](v interface{}, out chan T, deliver func([]byte)) {
+	switch s := v.(type) {
+	case *TnResponse:
+		tnWasmResponseBytes(s, out, deliver)
+	case chan interface{}:
+		TnLoopRef()
+		go func() {
+			defer TnLoopUnref()
+			tnWasmStreamingValue(<-s, out, deliver)
+		}()
+	default:
+		TnReject(out, tnWasmStreamingTypeError(v))
+	}
+}
+
+func tnWasmStreamingTypeError(src interface{}) *TnError {
+	return TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The "+strconv.Quote("source")+" argument must be an instance of Response or an Promise resolving to Response. Received "+tnWasmReceived(src))
+}
+
+func tnWasmStreamingBytes[T any](src interface{}, out chan T, deliver func([]byte)) {
+	switch s := src.(type) {
+	case *TnResponse:
+		tnWasmResponseBytes(s, out, deliver)
+	case chan *TnResponse:
+		TnLoopRef()
+		go func() {
+			defer TnLoopUnref()
+			tnWasmResponseBytes(<-s, out, deliver)
+		}()
+	case chan interface{}:
+		tnWasmStreamingValue(s, out, deliver)
+	default:
+		TnReject(out, tnWasmStreamingTypeError(src))
+	}
+}
+
+func TnWasmCompileStreaming(src interface{}) chan *TnWasmModule {
+	ch := make(chan *TnWasmModule, 1)
+	tnWasmStreamingBytes(src, ch, func(b []byte) {
+		ch <- TnNewWasmModule(b)
+	})
+	return ch
+}
+
+func TnWasmInstantiateStreaming(src interface{}, importObject ...interface{}) chan *TnWasmInstantiated {
+	ch := make(chan *TnWasmInstantiated, 1)
+	tnWasmStreamingBytes(src, ch, func(b []byte) {
+		m := TnNewWasmModule(b)
+		ch <- &TnWasmInstantiated{module: m, instance: TnNewWasmInstance(m, importObject...)}
+	})
+	return ch
+}`;
 export function registerWebAssembly(r) {
     defineHelper(r, 'nodeWasm', [WAZERO, `${WAZERO}/api`, `${WAZERO}/experimental`, 'context', 'fmt', 'math', 'math/big', 'reflect', 'strconv', 'strings', 'sync'], ['dynamic', 'orderedMap', 'error', 'bigint', 'promise'], wasmHelper);
     const use = () => r.helper('nodeWasm');
+    defineHelper(r, 'nodeWasmStreaming', ['strconv'], ['nodeWasm', 'nodeFetch', 'eventLoop', 'dynamic', 'promise'], wasmStreamingHelper);
     r.globals['WebAssembly'] = 'WebAssembly';
     r.objects['WebAssembly'] = true;
     defineClass(r, 'WebAssembly.Module', '*TnWasmModule', 'class', '', '', '', '');
@@ -972,6 +1094,18 @@ export function registerWebAssembly(r) {
         return `${fn}(${c.args.join(', ')})`;
     };
     r.typers['WebAssembly.instantiate'] = (c) => (c.types[0] === '*TnWasmModule' ? 'chan *TnWasmInstance' : 'chan *TnWasmInstantiated');
+    // compileStreaming / instantiateStreaming(Response | Promise<Response>) —
+    // the fetch classes (TnResponse) come with the streaming helper's requires
+    r.functions['WebAssembly.compileStreaming'] = (c) => {
+        r.helper('nodeWasmStreaming');
+        return `TnWasmCompileStreaming(${c.args.join(', ')})`;
+    };
+    r.results['WebAssembly.compileStreaming'] = 'chan *TnWasmModule';
+    r.functions['WebAssembly.instantiateStreaming'] = (c) => {
+        r.helper('nodeWasmStreaming');
+        return `TnWasmInstantiateStreaming(${c.args.join(', ')})`;
+    };
+    r.results['WebAssembly.instantiateStreaming'] = 'chan *TnWasmInstantiated';
     r.functions['WebAssembly.Module.imports'] = (c) => {
         use();
         return `TnWasmModuleImports(${c.args.join(', ')})`;

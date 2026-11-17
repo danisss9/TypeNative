@@ -416,7 +416,7 @@ func (r *tnTapReporter) report(e *TnTestEvent) string {
 				out += "# " + tnTapEscape(line) + "\\n"
 			}
 		}
-	case "test:diagnostic":
+	case "test:diagnostic", "test:log":
 		out += indent + "# " + tnTapEscape(d.message) + "\\n"
 	case "test:coverage":
 		if d.summary != nil {
@@ -662,7 +662,7 @@ func (r *tnSpecReporter) report(e *TnTestEvent) string {
 		r.stack = append([]*TnTestEventData{d}, r.stack...)
 	case "test:stdout", "test:stderr":
 		return d.message
-	case "test:diagnostic":
+	case "test:diagnostic", "test:log":
 		color := r.p.blue()
 		if d.level == "warn" {
 			color = r.p.yellow()
@@ -956,7 +956,7 @@ func (r *tnJunitReporter) report(e *TnTestEvent) string {
 				test.set("failure", msg)
 			}
 		}
-	case "test:diagnostic":
+	case "test:diagnostic", "test:log":
 		note := &tnJunitNode{nesting: int(d.nesting), isNote: true, comment: d.message}
 		if r.current != nil {
 			r.current.children = append(r.current.children, note)

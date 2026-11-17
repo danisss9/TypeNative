@@ -16,11 +16,13 @@ type TnWasi struct {
 	stderr       float64
 	wasiImport   *TnMap[string, interface{}]
 	started      bool
+	abi          string // the import object's module name (preview1 or the legacy name)
 }
 
 // wasi.wasiImport objects → their WASI (the value identifies it when linked)
 var tnWasiByImport = map[*TnMap[string, interface{}]]*TnWasi{}
 var tnWasiLinked bool
+var tnWasiLegacyLinked bool
 
 func init() {
 	tnWasmWasiLink = func(ns interface{}) (func(wazero.ModuleConfig) wazero.ModuleConfig, interface{}) {
@@ -33,12 +35,21 @@ func init() {
 			return nil, nil
 		}
 		// wazero's WASI functions: one host module, the instances' imports
-		// find by its name (wasi_snapshot_preview1)
+		// find by its name (wasi_snapshot_preview1); version 'unstable' links
+		// the same functions under the legacy module name
 		if !tnWasiLinked {
 			if _, err := wazerowasi.Instantiate(tnWasmCtx, tnWasmRuntime()); err != nil {
 				panic(tnWasmError("LinkError", err.Error()))
 			}
 			tnWasiLinked = true
+		}
+		if w.abi == "wasi_unstable" && !tnWasiLegacyLinked {
+			builder := tnWasmRuntime().NewHostModuleBuilder("wasi_unstable")
+			wazerowasi.NewFunctionExporter().ExportFunctions(builder)
+			if _, err := builder.Instantiate(tnWasmCtx); err != nil {
+				panic(tnWasmError("LinkError", err.Error()))
+			}
+			tnWasiLegacyLinked = true
 		}
 		return w.configure, w
 	}
@@ -71,10 +82,16 @@ func TnNewWasi(options ...interface{}) *TnWasi {
 		}
 		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The "+strconv.Quote("options.version")+" property must be of type string. Received "+received))
 	}
-	if version != "preview1" {
-		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.version' must be 'preview1' (TypeNative's WASI runs preview1 only). Received "+strconv.Quote(version)))
+	if version != "preview1" && version != "unstable" {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.version' unsupported WASI version. Received '"+version+"'"))
 	}
-	w := &TnWasi{returnOnExit: true, stdin: 0, stdout: 1, stderr: 2}
+	// the two ABIs have the same functions here; 'unstable' is the legacy name
+	// guests import under
+	abi := "wasi_snapshot_preview1"
+	if version == "unstable" {
+		abi = "wasi_unstable"
+	}
+	w := &TnWasi{returnOnExit: true, stdin: 0, stdout: 1, stderr: 2, abi: abi}
 	if args := tnWasiOption(o, "args"); args != nil {
 		rv := reflect.ValueOf(args)
 		if rv.Kind() == reflect.Pointer {
@@ -113,7 +130,7 @@ func (w *TnWasi) Get_wasiImport() *TnMap[string, interface{}] { return w.wasiImp
 
 func (w *TnWasi) getImportObject() *TnMap[string, interface{}] {
 	out := TnNewMap[string, interface{}]()
-	out.Set(wazerowasi.ModuleName, w.wasiImport)
+	out.Set(w.abi, w.wasiImport)
 	return out
 }
 

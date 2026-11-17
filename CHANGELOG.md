@@ -197,9 +197,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`util.debounce` / `util.throttle`:** callable functions with `cancel` /
   `flush` / `ref` / `unref` (and `hasImmediateCapacity` on a throttle), over
   the event loop's timers.
-- **ZIP archives:** `ZipEntry`, `ZipBuffer`, `ZipFile`, `createZipArchive(Sync)`,
-  `zipFiles` and `get` / `setMaxZipContentSize`, over Go's `archive/zip`
-  (streaming entries and `contentIterator` are not included).
+- **ZIP archives (Node 26.8):** `ZipEntry` (`create(Sync)` / `createStream` /
+  `createSymlink` / `read`, `content(Sync)` / `contentIterator`),
+  `ZipBuffer`, `ZipFile` (`open(Sync)`, `get` / `add` / `delete` /
+  `compact` / `stream`), `createZipArchive(Sync)`, `zipFiles` and
+  `get` / `setMaxZipContentSize`. Archives are written byte for byte as
+  Node writes them (`lib/internal/zip`'s layout: local headers, Zip64
+  extras for streamed or oversized members, data descriptors), entries take
+  Buffer / TypedArray / ArrayBuffer / DataView (as Node does), and
+  `method: 'zstd'` compresses with the Zstd codecs.
+- **Zstd codecs (Node 26.8):** `zstdCompress(Sync)` / `zstdDecompress(Sync)`
+  (callback and promisified forms), `createZstdCompress` /
+  `createZstdDecompress` and the `ZSTD_*` constants, on the vendored
+  `klauspost/compress` (pure Go, only linked into programs that use it).
+  Frames interoperate with Node's libzstd ones; decoder errors carry libzstd's
+  codes (`ZSTD_error_prefix_unknown`, `ZSTD_error_corruption_detected`, …),
+  and bytes after the last complete frame are ignored as libzstd ignores them.
+- **`node:wasi` version `'unstable'`:** the legacy ABI's import module name
+  (the same WASI functions under `wasi_unstable`, linked by wazero's
+  function exporter), and `WebAssembly.compileStreaming` /
+  `instantiateStreaming`: a `Response` (or a promise of one) whose MIME
+  type is `application/wasm` is read and compiled, with Node's errors for
+  non-`Response` sources and wrong MIME types.
+- **`node:sea` assets:** a `--sea-config <file>` build embeds the config's
+  assets (`{ assets: { key: path } }`, paths relative to the config) into
+  the binary, and `sea.getAsset` / `sea.getRawAsset` / `sea.getAssetAsBlob`
+  read them back; without a config the getters throw
+  `ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND`, as Node's without an
+  asset blob.
+- **The `windowsHandle` stream option** of `fs.createReadStream` /
+  `createWriteStream`: a Windows HANDLE (bigint) the stream reads or writes
+  through, converted into a file at construction as Node's `_open_osfhandle`
+  does; a non-bigint is a `TypeError` and an unusable handle `EBADF`,
+  thrown before the path is opened.
+- **`node:test` randomized runs:** `--test-randomize` /
+  `--test-random-seed` (and run()'s `randomize` / `randomSeed` options)
+  run each parent's siblings in a seeded random order — Node's Mulberry32
+  pick among those still waiting — with the seed reported before the summary;
+  `--test-coverage-include-all` lists the working directory's source files
+  that never ran in the coverage report (their whole file uncovered), and
+  `t.log` emits a `test:log` event on run()'s TestsStream.
 - **IPC handle passing** (`send(msg, socket)`, `serialization: 'advanced'`):
   a `net.Socket` travels with the message to a forked child, a cluster worker
   or the parent and arrives as the second `'message'` argument, live to the
@@ -270,6 +307,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushes into short local and field arrays.
 
 ### Fixed
+
+- **A typed promise awaited through an unknown-typed value settled with the
+  loop stopped:** `await somePromiseAsUnknown` (a `Promise<T>` behind an
+  `unknown` / `any` slot) received from the channel with a raw receive, so
+  a rejection resolved as `undefined` instead of throwing, and an
+  asynchronous settle could deadlock the loop (`Promise.all`'s helper had
+  the same receive). Both now settle with the recorded rejection and keep
+  the loop running while they wait.
+- **A spread array literal used as a statement emitted invalid Go:** a void
+  arrow's body like `use(() => [...arr])` or a bare ``[...arr];``
+  statement became a bare `append(...)`, which Go rejects as unused.
 
 - **The self-hosted compiler's contextual typing is back, so
   `npm run bootstrap:check` holds again.** `Array.prototype.slice` / `indexOf`

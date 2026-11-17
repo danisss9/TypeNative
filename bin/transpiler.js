@@ -3989,6 +3989,30 @@ func main() {
 ${outsideCode.trim()}
 ${LINE_RESET}
 ${helpersCode}`.trimEnd();
+    if (options?.seaAssets && Object.keys(options.seaAssets).length > 0) {
+        const entries = Object.entries(options.seaAssets)
+            .map(([key, data]) => `\t${JSON.stringify(key)}: ${JSON.stringify(data)},`)
+            .join('\n');
+        localImportFiles.set('tn_sea.go', `${GENERATED_HEADER}
+package main
+
+import "encoding/base64"
+
+// node:sea's assets (--sea-config): contents base64-encoded, decoded once
+var tnSeaAssetData = map[string]string{
+${entries}
+}
+
+func init() {
+	tnSeaAssets = make(map[string][]byte, len(tnSeaAssetData))
+	for key, data := range tnSeaAssetData {
+		decoded, err := base64.StdEncoding.DecodeString(data)
+		if err == nil {
+			tnSeaAssets[key] = decoded
+		}
+	}
+}`);
+    }
     return {
         main: applyLineDirectives(finishLiteralSites(main), goFile),
         files: localImportFiles,
@@ -14764,6 +14788,10 @@ function visitSpreadArrayLiteral(node, elemType) {
             result = `append(${result}, ${chunk.items.map((e) => (arrayElementNeedsConversion(e, baseType) ? toGoValueOfType(e, baseType) : visit(e))).join(', ')})`;
         }
     }
+    // (as a statement — a void arrow's body, `[...arr];` — Go rejects a bare
+    // append: its value is discarded)
+    if (isDiscardedValue(node))
+        return `_ = ${result}`;
     return result;
 }
 function visitTemplateExpression(node) {
@@ -39730,8 +39758,27 @@ func TnAwaitValue(v interface{}, inline bool) interface{} {
 		return TnAwait(ch)
 	}
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Chan {
-		received, _ := rv.Recv()
-		return received.Interface()
+		// (a typed promise: forwarded onto an interface{} channel, whose await
+		// keeps the loop running while this goroutine waits)
+		untyped := make(chan interface{}, 1)
+		go func() {
+			received, ok := rv.Recv()
+			if !ok {
+				// (a rejected promise: a closed channel with its reason recorded)
+				if r, rejected := tnRejections.Load(rv.Interface()); rejected {
+					TnReject(untyped, r)
+					return
+				}
+				close(untyped)
+				return
+			}
+			untyped <- received.Interface()
+			close(untyped)
+		}()
+		if inline {
+			return TnAwaitInline(untyped)
+		}
+		return TnAwait(untyped)
 	}
 	return v
 }
@@ -39903,8 +39950,17 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 				}
 				results[i] = r
 			} else if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Chan {
-				r, _ := rv.Recv()
-				results[i] = r.Interface()
+				r, ok := rv.Recv()
+				if !ok {
+					// (a rejected promise: a closed channel with its reason recorded)
+					if reason, rejected := tnRejections.Load(rv.Interface()); rejected {
+						TnReject(out, reason)
+						return
+					}
+					results[i] = nil
+				} else {
+					results[i] = r.Interface()
+				}
 			} else {
 				results[i] = v
 			}

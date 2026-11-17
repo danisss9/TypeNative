@@ -1,0 +1,7 @@
+{
+  "main": "lib-node-sea-assets.ts",
+  "assets": {
+    "text": "assets/sea-note.txt",
+    "binary": "assets/sea-bytes.bin"
+  }
+}
