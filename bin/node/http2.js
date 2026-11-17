@@ -798,6 +798,9 @@ func tnHttp2ConnClosed(conn net.Conn) {
 	if v, ok := tnHttp2Sessions.LoadAndDelete(conn); ok {
 		s := v.(*TnHttp2Session)
 		TnLoopPost(func() {
+			if s.destroyed || s.finished {
+				return
+			}
 			s.closed = true
 			s.destroyed = true
 			s.emit("close")
