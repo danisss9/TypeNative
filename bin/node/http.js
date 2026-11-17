@@ -1280,8 +1280,10 @@ type TnHttpServer struct {
 // Set by node:http2: serves an HTTP/2 request through the 'stream' API (false when not handled)
 var tnHttp2StreamHook func(hs *TnHttpServer, w http.ResponseWriter, r *http.Request) bool
 
-// Set by node:http2: emits its 'session' event for a new HTTP/2 connection
-var tnHttp2SessionHook func(hs *TnHttpServer, r *http.Request)
+// Set by node:http2: serves its servers' connections (a session each, over
+// golang.org/x/net/http2), and closes them all
+var tnHttp2ServeHook func(hs *TnHttpServer, ln net.Listener)
+var tnHttp2CloseAllHook func(hs *TnHttpServer)
 
 func (hs *TnHttpServer) Get_timeout() float64           { return hs.timeout }
 func (hs *TnHttpServer) Set_timeout(v float64)          { hs.timeout = v }
@@ -1838,9 +1840,6 @@ func tnServeOps1(w *tnHttp1ResponseWriter, hc *tnHttpConn, res *TnServerResponse
 }
 
 func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if hs.h2 && tnHttp2SessionHook != nil {
-		tnHttp2SessionHook(hs, r)
-	}
 	if hs.h2 && tnHttp2StreamHook != nil && tnHttp2StreamHook(hs, w, r) {
 		return
 	}
@@ -2112,9 +2111,8 @@ func TnNewHttpServer(secure bool, args ...interface{}) *TnHttpServer {
 		if hs.tlsConfig != nil {
 			ln = tls.NewListener(ln, hs.tlsConfig)
 		}
-		if hs.h2 {
-			hs.httpServer.IdleTimeout = time.Duration(hs.keepAliveTimeout * float64(time.Millisecond))
-			hs.httpServer.Serve(ln)
+		if hs.h2 && tnHttp2ServeHook != nil {
+			tnHttp2ServeHook(hs, ln)
 			return
 		}
 		local := ln.Addr()
@@ -2164,7 +2162,9 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 	TnLoopRef()
 	go func() {
 		if hs.h2 {
+			// GOAWAY on every session; 'close' once their connections are gone
 			hs.httpServer.Shutdown(context.Background())
+			hs.inFlight.Wait()
 		} else {
 			hs.inFlight.Wait()
 			hs.closeAllConnections()
@@ -2182,9 +2182,9 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 }
 
 func (hs *TnHttpServer) closeAllConnections() {
-	if hs.h2 && hs.httpServer != nil {
-		hs.httpServer.Close()
-		return
+	// (an http2 server's sessions; its HTTP/1 fallback connections are below)
+	if hs.h2 && tnHttp2CloseAllHook != nil {
+		tnHttp2CloseAllHook(hs)
 	}
 	hs.connMu.Lock()
 	conns := make([]*tnHttpConn, 0, len(hs.httpConns))
@@ -2198,11 +2198,8 @@ func (hs *TnHttpServer) closeAllConnections() {
 }
 
 func (hs *TnHttpServer) closeIdleConnections() {
-	if hs.h2 && hs.httpServer != nil {
-		hs.httpServer.SetKeepAlivesEnabled(false)
-		hs.httpServer.SetKeepAlivesEnabled(true)
-		return
-	}
+	// (an http2 server's sessions get GOAWAY from close(); this covers its
+	// HTTP/1 fallback connections)
 	hs.connMu.Lock()
 	var idle []*tnHttpConn
 	for hc := range hs.httpConns {
@@ -3251,7 +3248,7 @@ export function registerHttp(r) {
         if (name === 'stream')
             return ['*TnHttp2Stream', '*TnMap[string, interface{}]', 'float64'];
         if (name === 'session')
-            return ['*TnHttp2Session', '*TnSocket'];
+            return ['*TnHttp2Session'];
         if (name === 'connection')
             return ['*TnSocket'];
         if (name === 'upgrade' || name === 'connect')

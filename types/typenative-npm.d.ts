@@ -1622,36 +1622,48 @@ declare module 'node:http2' {
       readonly encrypted: boolean | undefined;
       readonly alpnProtocol: string | undefined;
       readonly socket: net.Socket;
-      readonly type: 'client' | 'server';
+      /** 0 on the server (NGHTTP2_SESSION_SERVER), 1 on the client */
+      readonly type: number;
+      readonly connecting: boolean;
       readonly localSettings: Settings;
       readonly remoteSettings: Settings;
+      /** true while a SETTINGS frame this side sent waits for the peer's ACK */
       readonly pendingSettingsAck: boolean;
       close(callback?: () => void): void;
       destroy(error?: Error, code?: number): void;
       ref(): void;
       unref(): void;
       setTimeout(msecs: number, callback?: () => void): void;
-      /** Sends a PING frame; returns true when it was sent */
+      /** Sends a PING frame; the callback runs on the peer's ACK. Returns true when it was sent */
       ping(callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
       ping(payload: Buffer | Uint8Array, callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
-      settings(settings?: Settings, callback?: (err: Error | null, settings: Settings) => void): void;
+      /** Sends a SETTINGS frame; the callback and 'localSettings' follow the peer's ACK */
+      settings(settings: Settings, callback?: (err: Error | null, settings: Settings, duration: number) => void): void;
       goaway(code?: number, lastStreamID?: number, opaqueData?: Buffer | Uint8Array): void;
+      on(event: 'ping', listener: (payload: Buffer) => void): this;
+      on(event: 'localSettings' | 'remoteSettings', listener: (settings: Settings) => void): this;
+      on(event: 'goaway', listener: (errorCode: number, lastStreamID: number, opaqueData: Buffer) => void): this;
+      on(event: 'close', listener: () => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
     }
     interface ClientHttp2Session extends Http2Session {
       request(headers?: OutgoingHttpHeaders, options?: { endStream?: boolean }): ClientHttp2Stream;
       on(event: 'connect', listener: (session: ClientHttp2Session, socket: net.Socket) => void): this;
+      on(event: 'altsvc', listener: (alt: string, origin: string, streamId: number) => void): this;
       on(event: 'error', listener: (err: Error) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
     interface ServerHttp2Session extends Http2Session {
       altsvc(alt: string, originOrStream: string | URL | number): void;
+      on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
     }
     type Http2ServerRequest = http.IncomingMessage;
     type Http2ServerResponse = http.ServerResponse;
     interface Http2Server extends http.Server {
       on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
       on(event: 'request', listener: (request: Http2ServerRequest, response: Http2ServerResponse) => void): this;
-      on(event: 'session', listener: (session: ServerHttp2Session, socket: net.Socket) => void): this;
+      on(event: 'session', listener: (session: ServerHttp2Session) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
     type Http2SecureServer = Http2Server;

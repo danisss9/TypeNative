@@ -22,14 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   libuv loop).
 - **`node:http`:** connection pooling options on `Agent` (`maxSockets`,
   `maxTotalSockets`, `maxFreeSockets`, `keepAlive`, `keepAliveMsecs`,
-  `scheduling`), request trailers (`req.addTrailers` with a declared
-  `Trailer` header), `res.statusMessage` and `'checkContinue'` /
+  `scheduling`), request trailers (`req.addTrailers` after a streamed
+  body, declared or not), `res.statusMessage` and `'checkContinue'` /
   `'checkExpectation'`, and the Node 26.3 `httpValidation` option
   (`'strict'` / `'relaxed'` / `'insecure'`, also `insecureHTTPParser`).
 - **`node:http2`:** frame-level session APIs on the vendored
   `golang.org/x/net/http2` — `ping`, `settings`, `goaway`, `altsvc`, the
-  server's `'session'` event, `localSettings` / `remoteSettings`, and
-  `getPackedSettings` / `getUnpackedSettings`. Cleartext still uses prior
+  server's `'session'` event, `type`, `localSettings` / `remoteSettings` /
+  `pendingSettingsAck`, the peer's `'ping'` / `'localSettings'` /
+  `'remoteSettings'` / `'goaway'` / `'altsvc'` events, and
+  `getPackedSettings` / `getUnpackedSettings`. Sessions run x/net's
+  `ServeConn` / `NewClientConn` over a connection split into frames, so the
+  session's own frames never land inside one of the library's. Cleartext still uses prior
   knowledge (no HTTP/1.1 `Upgrade: h2c` handshake), as in Node.
 - **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
   `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
