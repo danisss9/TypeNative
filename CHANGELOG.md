@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`node:crypto` keys beyond Go's standard library:** encrypted private
+  keys (PKCS#8 PBES2 with PBKDF2 + AES-CBC / 3DES, the legacy `DEK-Info`
+  PEM headers) and encrypted export (`cipher` / `passphrase`, PEM or DER);
+  `rsa-pss` (with its hash, MGF1 hash and salt length), `dsa` and `dh`
+  key types in PKCS#8 / SPKI, `ed448` / `x448` (signing, ECDH, JWK) and
+  `secp256k1` (`createECDH`, ECDSA, JWK). Ed448 / X448 come from the
+  vendored `cloudflare/circl`, secp256k1 from `decred/dcrd` (both pure Go).
+  `crypto.Certificate` (`verifySpkac` / `exportChallenge` /
+  `exportPublicKey`) and `crypto.parsePKCS12(bundle, { passphrase })` —
+  Node 26's `{ privateKey, certificate, additionalCertificates }` — on the
+  vendored `go-pkcs12`.
+- **`node:crypto` MACs and ciphers:** `createMac` gains `gmac`,
+  `poly1305`, `siphash` (64- / 128-bit), `blake2bmac` and `blake2smac`
+  (output length, salt, personalization), and `getCiphers` gains AES-SIV
+  and AES-GCM-SIV (`aes-128/192/256-siv`, `aes-128/192/256-gcm-siv`), all
+  in pure Go (S2V / CMAC, POLYVAL over GHASH's field).
+- **`node:tls` PFX, passphrases and sessions:** `pfx` (a Buffer or
+  `{ buf, passphrase }` entries) and `passphrase`-protected keys for
+  servers, clients and secure contexts; session resumption through the
+  `session` option, `'newSession'` / `'resumeSession'` events,
+  `getSession()` and `isSessionReused()`; and `tls.rootCertificates`,
+  Node's 118-certificate Mozilla bundle (linked only when read).
 - **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
   `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
   `PlainMonthDay`, `Duration` and `Now` — on Go's `time` and embedded

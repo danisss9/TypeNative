@@ -1,10 +1,15 @@
 // node:crypto keys and the rest of crypto: scrypt, callback forms, KeyObject
 // (createPrivateKey / createPublicKey / createSecretKey, generateKeyPair,
 // PEM / DER / JWK export), sign / verify, RSA encryption, ECDH and classic
-// Diffie-Hellman, X509Certificate, primes, and webcrypto's subtle. Backed by
-// Go's crypto packages (RSA, ECDSA P-256/384/521, Ed25519, X25519).
+// Diffie-Hellman, X509Certificate, SPKAC Certificates, PKCS#12, primes, and
+// webcrypto's subtle. Backed by Go's crypto packages (RSA, ECDSA, Ed25519,
+// X25519), the vendored circl curves (Ed448 / X448), decred's secp256k1, and
+// go-pkcs12; encrypted keys are PBES2 / the legacy PEM headers.
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, getOption, isStringNode, isObjectLiteral, optionIsTrue } from './registry.js';
+import { CRYPTO_CURVES_HELPER } from './crypto_curves.js';
+import { CRYPTO_PEM_HELPER } from './crypto_pem.js';
+import { CRYPTO_PKCS12_HELPER } from './crypto_pkcs12.js';
 
 const cryptoKeysHelper = `// node:crypto keys
 func tnCryptoArg(args []interface{}) interface{} {
@@ -235,6 +240,18 @@ func tnPublicOf(priv tncrypto.PrivateKey) tncrypto.PublicKey {
 		return k.Public()
 	case *ecdh.PrivateKey:
 		return k.PublicKey()
+	case *TnRSAPSSKey:
+		return &TnRSAPSSPublicKey{key: &k.key.PublicKey, hash: k.hash, mgfHash: k.mgfHash, saltLength: k.saltLength, trailer: k.trailer}
+	case *TnDSAKey:
+		return &TnDSAKey{p: k.p, q: k.q, g: k.g, y: k.y}
+	case *TnDHKey:
+		return &TnDHKey{p: k.p, g: k.g, y: k.y}
+	case *TnEd448Key:
+		return &TnEd448Key{pub: k.pub}
+	case *TnX448Key:
+		return &TnX448Key{pub: k.pub}
+	case *TnSecp256k1Key:
+		return &TnSecp256k1Key{pub: k.pub, curve: true}
 	}
 	return nil
 }
@@ -243,13 +260,175 @@ func tnPrivateKeyObject(priv tncrypto.PrivateKey) *TnKeyObject {
 	return &TnKeyObject{type_: "private", priv: priv, pub: tnPublicOf(priv)}
 }
 
-// A key argument: PEM / DER bytes, a KeyObject / CryptoKey, or { key, format, type, encoding }
+// --- key types Go's crypto/x509 does not know ---
+
+// PKCS#8 / SPKI ASN.1
+var (
+	tnOIDRSA            = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
+	tnOIDRSAPSS         = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 10}
+	tnOIDMGF1           = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
+	tnOIDDSA            = asn1.ObjectIdentifier{1, 2, 840, 10040, 4, 1}
+	tnOIDDH             = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 3, 1}
+	tnOIDEd448          = asn1.ObjectIdentifier{1, 3, 101, 113}
+	tnOIDX448           = asn1.ObjectIdentifier{1, 3, 101, 111}
+	tnOIDECPublicKey    = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+	tnOIDSecp256k1      = asn1.ObjectIdentifier{1, 3, 132, 0, 10}
+	tnOIDPSSHashSHA1    = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
+	tnOIDPSSHashSHA224  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 4}
+	tnOIDPSSHashSHA256  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
+	tnOIDPSSHashSHA384  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
+	tnOIDPSSHashSHA512  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
+)
+
+type tnPSSParams struct {
+	Hash         asn1.RawValue ` + "`asn1:\"optional\"`" + `
+	MGF          asn1.RawValue ` + "`asn1:\"optional\"`" + `
+	SaltLength   int           ` + "`asn1:\"optional,explicit,tag:2,default:20\"`" + `
+	TrailerField int           ` + "`asn1:\"optional,explicit,tag:3,default:1\"`" + `
+}
+
+// An explicitly tagged field ([n] { ... })
+func tnPSSWrap(tag byte, der []byte) asn1.RawValue {
+	b := []byte{0xa0 | tag}
+	n := len(der)
+	switch {
+	case n < 0x80:
+		b = append(b, byte(n))
+	case n < 0x100:
+		b = append(b, 0x81, byte(n))
+	default:
+		b = append(b, 0x82, byte(n>>8), byte(n))
+	}
+	return asn1.RawValue{FullBytes: append(b, der...)}
+}
+
+type tnPKCS8Info struct {
+	Version    int
+	Algo       pkix.AlgorithmIdentifier
+	PrivateKey []byte
+}
+
+type tnSPKIInfo struct {
+	Algo pkix.AlgorithmIdentifier
+	Bits asn1.BitString
+}
+
+type tnECPrivateKeyInfo struct {
+	Version    int
+	PrivateKey []byte
+	NamedCurve asn1.ObjectIdentifier ` + "`asn1:\"optional,explicit,tag:0\"`" + `
+	PublicKey  asn1.BitString        ` + "`asn1:\"optional,explicit,tag:1\"`" + `
+}
+
+// RSA-PSS: an RSA key with the parameters its PKCS#8 / SPKI encodes
+type TnRSAPSSKey struct {
+	key        *rsa.PrivateKey
+	hash       tncrypto.Hash
+	mgfHash    tncrypto.Hash
+	saltLength int
+	trailer    int
+}
+
+type TnRSAPSSPublicKey struct {
+	key        *rsa.PublicKey
+	hash       tncrypto.Hash
+	mgfHash    tncrypto.Hash
+	saltLength int
+	trailer    int
+}
+
+// DSA / DH keys (OpenSSL's PKCS#8 and SPKI encodings)
+type TnDSAKey struct {
+	p, q, g, y, x *tnbig.Int
+	private       bool
+}
+
+type TnDHKey struct {
+	p, g, y, x *tnbig.Int
+	private    bool
+}
+
+func tnPSSHash(oid asn1.ObjectIdentifier) tncrypto.Hash {
+	switch oid.String() {
+	case tnOIDPSSHashSHA1.String():
+		return tncrypto.SHA1
+	case tnOIDPSSHashSHA224.String():
+		return tncrypto.SHA224
+	case tnOIDPSSHashSHA256.String():
+		return tncrypto.SHA256
+	case tnOIDPSSHashSHA384.String():
+		return tncrypto.SHA384
+	case tnOIDPSSHashSHA512.String():
+		return tncrypto.SHA512
+	}
+	return 0
+}
+
+func tnPSSOID(h tncrypto.Hash) asn1.ObjectIdentifier {
+	switch h {
+	case tncrypto.SHA224:
+		return tnOIDPSSHashSHA224
+	case tncrypto.SHA256:
+		return tnOIDPSSHashSHA256
+	case tncrypto.SHA384:
+		return tnOIDPSSHashSHA384
+	case tncrypto.SHA512:
+		return tnOIDPSSHashSHA512
+	}
+	return tnOIDPSSHashSHA1
+}
+
+func tnReadPSSParams(params asn1.RawValue) *tnPSSParams {
+	p := &tnPSSParams{Hash: asn1.RawValue{}, MGF: asn1.RawValue{}, SaltLength: 20, TrailerField: 1}
+	if len(params.FullBytes) > 0 {
+		asn1.Unmarshal(params.FullBytes, p)
+	}
+	if p.SaltLength == 0 && p.TrailerField == 0 {
+		p.SaltLength, p.TrailerField = 20, 1
+	}
+	return p
+}
+
+func tnPSSParamsOf(hash, mgf tncrypto.Hash, saltLength, trailer int) tnPSSParams {
+	hashAlg, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: tnPSSOID(hash), Parameters: asn1.RawValue{Tag: 5}})
+	mgfHash, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: tnPSSOID(mgf), Parameters: asn1.RawValue{Tag: 5}})
+	mgfAlg, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: tnOIDMGF1, Parameters: asn1.RawValue{FullBytes: mgfHash}})
+	return tnPSSParams{
+		Hash:         tnPSSWrap(0, hashAlg),
+		MGF:          tnPSSWrap(1, mgfAlg),
+		SaltLength:   saltLength,
+		TrailerField: trailer,
+	}
+}
+
+func tnPKCS8Algo(oid asn1.ObjectIdentifier, params interface{}) pkix.AlgorithmIdentifier {
+	alg := pkix.AlgorithmIdentifier{Algorithm: oid}
+	if params != nil {
+		der, _ := asn1.Marshal(params)
+		alg.Parameters = asn1.RawValue{FullBytes: der}
+	}
+	return alg
+}
+
+func tnMarshalPKCS8(algo pkix.AlgorithmIdentifier, key []byte) []byte {
+	der, _ := asn1.Marshal(tnPKCS8Info{Algo: algo, PrivateKey: key})
+	return der
+}
+
+func tnMarshalSPKI(algo pkix.AlgorithmIdentifier, key []byte) []byte {
+	der, _ := asn1.Marshal(tnSPKIInfo{Algo: algo, Bits: asn1.BitString{Bytes: key, BitLength: len(key) * 8}})
+	return der
+}
+
+// A key argument: PEM / DER bytes, a KeyObject / CryptoKey, or { key, format, type, encoding, passphrase }
 type tnKeyInput struct {
-	data   []byte
-	format string
-	typ    string
-	jwk    interface{}
-	object *TnKeyObject
+	data      []byte
+	format    string
+	typ       string
+	jwk       interface{}
+	object    *TnKeyObject
+	pass      []byte
+	havePass  bool
 }
 
 func tnReadKeyInput(v interface{}) tnKeyInput {
@@ -280,6 +459,12 @@ func tnReadKeyInput(v interface{}) tnKeyInput {
 	if t, ok := TnGetValue(v, "type").(string); ok {
 		in.typ = t
 	}
+	switch p := TnGetValue(v, "passphrase").(type) {
+	case string:
+		in.pass, in.havePass = []byte(p), true
+	case []byte:
+		in.pass, in.havePass = p, true
+	}
 	switch k := TnGetValue(v, "key").(type) {
 	case *TnKeyObject:
 		in.object = k
@@ -304,7 +489,227 @@ func tnReadKeyInput(v interface{}) tnKeyInput {
 	return in
 }
 
+// Unsigned big-endian INTEGER bytes for a BIT STRING
+func tnIntDER(v *tnbig.Int) []byte {
+	b := v.Bytes()
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		return append([]byte{0}, b...)
+	}
+	return b
+}
+
+// A public key's DER: the standard types through x509, the rest by hand
+func tnMarshalPublic(pub tncrypto.PublicKey) ([]byte, error) {
+	switch k := pub.(type) {
+	case *TnRSAPSSPublicKey:
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDRSAPSS, tnPSSParamsOf(k.hash, k.mgfHash, k.saltLength, k.trailer)), x509.MarshalPKCS1PublicKey(k.key)), nil
+	case *TnDSAKey:
+		params := struct{ P, Q, G *tnbig.Int }{k.p, k.q, k.g}
+		y, _ := asn1.Marshal(k.y)
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDDSA, params), y), nil
+	case *TnDHKey:
+		params := struct{ P, G *tnbig.Int }{k.p, k.g}
+		y, _ := asn1.Marshal(k.y)
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDDH, params), y), nil
+	case *TnEd448Key:
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDEd448, nil), k.pub), nil
+	case *TnX448Key:
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDX448, nil), k.pub), nil
+	case *TnSecp256k1Key:
+		return tnMarshalSPKI(tnPKCS8Algo(tnOIDECPublicKey, tnOIDSecp256k1), k.pub), nil
+	}
+	return x509.MarshalPKIXPublicKey(pub)
+}
+
+// A private key's PKCS#8 DER: the standard types through x509, the rest by hand
+func tnMarshalPrivate(priv tncrypto.PrivateKey) ([]byte, error) {
+	switch k := priv.(type) {
+	case *TnRSAPSSKey:
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDRSAPSS, tnPSSParamsOf(k.hash, k.mgfHash, k.saltLength, k.trailer)), x509.MarshalPKCS1PrivateKey(k.key)), nil
+	case *TnDSAKey:
+		params := struct{ P, Q, G *tnbig.Int }{k.p, k.q, k.g}
+		x, _ := asn1.Marshal(k.x)
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDDSA, params), x), nil
+	case *TnDHKey:
+		params := struct{ P, G *tnbig.Int }{k.p, k.g}
+		x, _ := asn1.Marshal(k.x)
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDDH, params), x), nil
+	case *TnEd448Key:
+		inner, _ := asn1.Marshal(k.seed)
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDEd448, nil), inner), nil
+	case *TnX448Key:
+		inner, _ := asn1.Marshal(k.secret)
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDX448, nil), inner), nil
+	case *TnSecp256k1Key:
+		inner, _ := asn1.Marshal(tnECPrivateKeyInfo{Version: 1, PrivateKey: k.priv, PublicKey: asn1.BitString{Bytes: k.pub, BitLength: len(k.pub) * 8}})
+		return tnMarshalPKCS8(tnPKCS8Algo(tnOIDECPublicKey, tnOIDSecp256k1), inner), nil
+	}
+	return x509.MarshalPKCS8PrivateKey(priv)
+}
+
+// The contents of an explicitly tagged field
+func tnASN1Explicit(raw asn1.RawValue) []byte {
+	if len(raw.FullBytes) >= 2 && raw.FullBytes[0]&0xe0 == 0xa0 {
+		b := raw.FullBytes
+		l, off := int(b[1]), 2
+		if l&0x80 != 0 {
+			n := l & 0x7f
+			l = 0
+			for i := 0; i < n; i++ {
+				l = l<<8 | int(b[2+i])
+			}
+			off = 2 + n
+		}
+		if off+l <= len(b) {
+			return b[off : off+l]
+		}
+	}
+	return raw.FullBytes
+}
+
+func tnPSSParamsFromAlgo(alg pkix.AlgorithmIdentifier) (tncrypto.Hash, tncrypto.Hash, int, int) {
+	p := tnReadPSSParams(alg.Parameters)
+	hash, mgf := tncrypto.SHA1, tncrypto.SHA1
+	if inner := tnASN1Explicit(p.Hash); len(inner) > 0 {
+		var a pkix.AlgorithmIdentifier
+		if _, err := asn1.Unmarshal(inner, &a); err == nil {
+			if h := tnPSSHash(a.Algorithm); h != 0 {
+				hash, mgf = h, h
+			}
+		}
+	}
+	if inner := tnASN1Explicit(p.MGF); len(inner) > 0 {
+		var a pkix.AlgorithmIdentifier
+		if _, err := asn1.Unmarshal(inner, &a); err == nil && a.Algorithm.Equal(tnOIDMGF1) && len(a.Parameters.FullBytes) > 0 {
+			var h pkix.AlgorithmIdentifier
+			if _, err := asn1.Unmarshal(a.Parameters.FullBytes, &h); err == nil {
+				if x := tnPSSHash(h.Algorithm); x != 0 {
+					mgf = x
+				}
+			}
+		}
+	}
+	return hash, mgf, p.SaltLength, p.TrailerField
+}
+
+// RFC 8410 keys nest their raw key in a second OCTET STRING inside PKCS#8
+func tnCurvePrivateKey(b []byte, size int) []byte {
+	if len(b) == size {
+		return b
+	}
+	var inner []byte
+	if _, err := asn1.Unmarshal(b, &inner); err == nil && len(inner) == size {
+		return inner
+	}
+	return b
+}
+
+func tnParsePKCS8Extra(der []byte) (tncrypto.PrivateKey, bool) {
+	var info tnPKCS8Info
+	if _, err := asn1.Unmarshal(der, &info); err != nil {
+		return nil, false
+	}
+	switch info.Algo.Algorithm.String() {
+	case tnOIDRSAPSS.String():
+		key, err := x509.ParsePKCS1PrivateKey(info.PrivateKey)
+		if err != nil {
+			return nil, false
+		}
+		hash, mgf, salt, trailer := tnPSSParamsFromAlgo(info.Algo)
+		return &TnRSAPSSKey{key: key, hash: hash, mgfHash: mgf, saltLength: salt, trailer: trailer}, true
+	case tnOIDDSA.String():
+		var params struct{ P, Q, G *tnbig.Int }
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &params); err != nil || params.P == nil {
+			return nil, false
+		}
+		var x *tnbig.Int
+		if _, err := asn1.Unmarshal(info.PrivateKey, &x); err != nil || x == nil {
+			return nil, false
+		}
+		y := new(tnbig.Int).Exp(params.G, x, params.P)
+		return &TnDSAKey{p: params.P, q: params.Q, g: params.G, y: y, x: x, private: true}, true
+	case "1.2.840.113549.1.3.1":
+		var params struct{ P, G *tnbig.Int }
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &params); err != nil || params.P == nil {
+			return nil, false
+		}
+		var x *tnbig.Int
+		if _, err := asn1.Unmarshal(info.PrivateKey, &x); err != nil || x == nil {
+			return nil, false
+		}
+		y := new(tnbig.Int).Exp(params.G, x, params.P)
+		return &TnDHKey{p: params.P, g: params.G, y: y, x: x, private: true}, true
+	case tnOIDEd448.String():
+		return tnEd448FromSeed(tnCurvePrivateKey(info.PrivateKey, 57)), true
+	case tnOIDX448.String():
+		return tnX448FromSecret(tnCurvePrivateKey(info.PrivateKey, 56)), true
+	case tnOIDECPublicKey.String():
+		var curve asn1.ObjectIdentifier
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &curve); err != nil || !curve.Equal(tnOIDSecp256k1) {
+			return nil, false
+		}
+		var inner tnECPrivateKeyInfo
+		if _, err := asn1.Unmarshal(info.PrivateKey, &inner); err != nil {
+			return nil, false
+		}
+		return tnSecp256k1FromPrivate(inner.PrivateKey), true
+	}
+	return nil, false
+}
+
+func tnParseSPKIExtra(der []byte) (tncrypto.PublicKey, bool) {
+	var info tnSPKIInfo
+	if _, err := asn1.Unmarshal(der, &info); err != nil {
+		return nil, false
+	}
+	switch info.Algo.Algorithm.String() {
+	case tnOIDRSAPSS.String():
+		key, err := x509.ParsePKCS1PublicKey(info.Bits.Bytes)
+		if err != nil {
+			return nil, false
+		}
+		hash, mgf, salt, trailer := tnPSSParamsFromAlgo(info.Algo)
+		return &TnRSAPSSPublicKey{key: key, hash: hash, mgfHash: mgf, saltLength: salt, trailer: trailer}, true
+	case tnOIDDSA.String():
+		var params struct{ P, Q, G *tnbig.Int }
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &params); err != nil {
+			return nil, false
+		}
+		var y tnbig.Int
+		if _, err := asn1.Unmarshal(info.Bits.Bytes, &y); err != nil {
+			return nil, false
+		}
+		return &TnDSAKey{p: params.P, q: params.Q, g: params.G, y: &y}, true
+	case "1.2.840.113549.1.3.1":
+		var params struct{ P, G *tnbig.Int }
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &params); err != nil {
+			return nil, false
+		}
+		var y tnbig.Int
+		if _, err := asn1.Unmarshal(info.Bits.Bytes, &y); err != nil {
+			return nil, false
+		}
+		return &TnDHKey{p: params.P, g: params.G, y: &y}, true
+	case tnOIDEd448.String():
+		return &TnEd448Key{pub: info.Bits.Bytes}, true
+	case tnOIDX448.String():
+		return &TnX448Key{pub: info.Bits.Bytes}, true
+	case tnOIDECPublicKey.String():
+		var curve asn1.ObjectIdentifier
+		if _, err := asn1.Unmarshal(info.Algo.Parameters.FullBytes, &curve); err != nil || !curve.Equal(tnOIDSecp256k1) {
+			return nil, false
+		}
+		return tnSecp256k1FromPublic(info.Bits.Bytes), true
+	}
+	return nil, false
+}
+
 func tnParsePrivateDER(der []byte, typ string) (tncrypto.PrivateKey, error) {
+	if typ == "" || typ == "pkcs8" {
+		if k, ok := tnParsePKCS8Extra(der); ok {
+			return k, nil
+		}
+	}
 	switch typ {
 	case "pkcs1":
 		return x509.ParsePKCS1PrivateKey(der)
@@ -327,6 +732,9 @@ func tnParsePublicDER(der []byte, typ string) (tncrypto.PublicKey, error) {
 		return x509.ParsePKCS1PublicKey(der)
 	}
 	if k, err := x509.ParsePKIXPublicKey(der); err == nil {
+		return k, nil
+	}
+	if k, ok := tnParseSPKIExtra(der); ok {
 		return k, nil
 	}
 	if typ == "" {
@@ -363,6 +771,9 @@ func tnParsePrivateKey(in tnKeyInput) tncrypto.PrivateKey {
 				break
 			}
 			rest = r
+			if tnPEMEncrypted(block) {
+				block = tnPEMDecryptBlock(block, in.pass, in.havePass)
+			}
 			switch block.Type {
 			case "PRIVATE KEY":
 				der, typ, found = block.Bytes, "pkcs8", true
@@ -370,13 +781,25 @@ func tnParsePrivateKey(in tnKeyInput) tncrypto.PrivateKey {
 				der, typ, found = block.Bytes, "pkcs1", true
 			case "EC PRIVATE KEY":
 				der, typ, found = block.Bytes, "sec1", true
-			case "ENCRYPTED PRIVATE KEY":
-				panic(TnNodeError("Error", "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Encrypted private keys are not supported"))
+			case "DSA PRIVATE KEY":
+				der, typ, found = block.Bytes, "dsa", true
 			}
 		}
 		if !found {
 			panic(tnUnsupportedKey())
 		}
+	} else if in.havePass && tnPEMIsEncryptedPKCS8(der) {
+		der, typ = tnPEMDecryptPKCS8(der, in.pass, true), "pkcs8"
+	}
+	if typ == "dsa" {
+		var k struct {
+			Version int
+			P, Q, G, Y, X *tnbig.Int
+		}
+		if _, err := asn1.Unmarshal(der, &k); err != nil {
+			panic(tnUnsupportedKey())
+		}
+		return &TnDSAKey{p: k.P, q: k.Q, g: k.G, y: k.Y, x: k.X, private: true}
 	}
 	key, err := tnParsePrivateDER(der, typ)
 	if err != nil {
@@ -409,6 +832,11 @@ func tnParsePublicKey(in tnKeyInput) tncrypto.PublicKey {
 		switch block.Type {
 		case "PUBLIC KEY":
 			key, err = x509.ParsePKIXPublicKey(block.Bytes)
+			if err != nil {
+				if k, ok := tnParseSPKIExtra(block.Bytes); ok {
+					key, err = k, nil
+				}
+			}
 		case "RSA PUBLIC KEY":
 			key, err = x509.ParsePKCS1PublicKey(block.Bytes)
 		case "CERTIFICATE":
@@ -417,8 +845,8 @@ func tnParsePublicKey(in tnKeyInput) tncrypto.PublicKey {
 			if err == nil {
 				key = c.PublicKey
 			}
-		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY":
-			key = tnPublicOf(tnParsePrivateKey(tnKeyInput{data: pem.EncodeToMemory(block), format: "pem"}))
+		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "DSA PRIVATE KEY":
+			key = tnPublicOf(tnParsePrivateKey(tnKeyInput{data: pem.EncodeToMemory(block), format: "pem", pass: in.pass, havePass: in.havePass}))
 		default:
 			continue
 		}
@@ -481,6 +909,18 @@ func tnAsymmetricType(pub tncrypto.PublicKey) string {
 			return "x25519"
 		}
 		return "ec"
+	case *TnRSAPSSKey, *TnRSAPSSPublicKey:
+		return "rsa-pss"
+	case *TnDSAKey:
+		return "dsa"
+	case *TnDHKey:
+		return "dh"
+	case *TnEd448Key:
+		return "ed448"
+	case *TnX448Key:
+		return "x448"
+	case *TnSecp256k1Key:
+		return "ec"
 	}
 	return ""
 }
@@ -514,9 +954,43 @@ func tnOpenSSLCurve(name string) string {
 }
 
 type TnKeyDetails struct {
-	modulusLength  float64
-	publicExponent *tnbig.Int
-	namedCurve     string
+	modulusLength    float64
+	publicExponent   *tnbig.Int
+	namedCurve       *string
+	hashAlgorithm    *string
+	mgf1HashAlgorithm *string
+	saltLength       *float64
+	trailerField     *float64
+	divisorLength    *float64
+}
+
+func tnHashNameOf(h tncrypto.Hash) *string {
+	name := ""
+	switch h {
+	case tncrypto.SHA1:
+		name = "sha1"
+	case tncrypto.SHA224:
+		name = "sha224"
+	case tncrypto.SHA256:
+		name = "sha256"
+	case tncrypto.SHA384:
+		name = "sha384"
+	case tncrypto.SHA512:
+		name = "sha512"
+	}
+	return &name
+}
+
+func tnPSSDetails(hash, mgf tncrypto.Hash, salt, trailer int) *TnKeyDetails {
+	h, m := tnHashNameOf(hash), tnHashNameOf(mgf)
+	s := float64(salt)
+	// Node's asymmetricKeyDetails omits trailerField unless it is not 1
+	d := &TnKeyDetails{hashAlgorithm: h, mgf1HashAlgorithm: m, saltLength: &s}
+	if trailer != 1 {
+		t := float64(trailer)
+		d.trailerField = &t
+	}
+	return d
 }
 
 func (k *TnKeyObject) Get_asymmetricKeyDetails() *TnKeyDetails {
@@ -524,7 +998,19 @@ func (k *TnKeyObject) Get_asymmetricKeyDetails() *TnKeyDetails {
 	case *rsa.PublicKey:
 		return &TnKeyDetails{modulusLength: float64(p.N.BitLen()), publicExponent: tnbig.NewInt(int64(p.E))}
 	case *ecdsa.PublicKey:
-		return &TnKeyDetails{namedCurve: tnOpenSSLCurve(p.Curve.Params().Name)}
+		name := tnOpenSSLCurve(p.Curve.Params().Name)
+		return &TnKeyDetails{namedCurve: &name}
+	case *TnRSAPSSPublicKey:
+		d := tnPSSDetails(p.hash, p.mgfHash, p.saltLength, p.trailer)
+		d.modulusLength = float64(p.key.N.BitLen())
+		d.publicExponent = tnbig.NewInt(int64(p.key.E))
+		return d
+	case *TnDSAKey:
+		n := float64(p.q.BitLen())
+		return &TnKeyDetails{modulusLength: float64(p.p.BitLen()), divisorLength: &n}
+	case *TnSecp256k1Key:
+		name := "secp256k1"
+		return &TnKeyDetails{namedCurve: &name}
 	case nil:
 		return nil
 	}
@@ -532,6 +1018,14 @@ func (k *TnKeyObject) Get_asymmetricKeyDetails() *TnKeyDetails {
 }
 
 func tnB64u(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+// Key types with no JWK representation (Node throws for these)
+func tnJWKCheck(pub tncrypto.PublicKey) {
+	switch pub.(type) {
+	case *TnRSAPSSPublicKey, *TnDSAKey, *TnDHKey:
+		panic(TnNodeError("Error", "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE", "Unsupported JWK Key Type."))
+	}
+}
 
 func tnJWK(pub tncrypto.PublicKey, priv tncrypto.PrivateKey) map[string]interface{} {
 	m := map[string]interface{}{}
@@ -574,8 +1068,39 @@ func tnJWK(pub tncrypto.PublicKey, priv tncrypto.PrivateKey) map[string]interfac
 		if k, ok := priv.(*ecdh.PrivateKey); ok {
 			m["d"] = tnB64u(k.Bytes())
 		}
+	case *TnSecp256k1Key:
+		x, y := tnSecp256k1XY(p.pub)
+		m["kty"] = "EC"
+		m["crv"] = "secp256k1"
+		m["x"] = tnB64u(x)
+		m["y"] = tnB64u(y)
+		if k, ok := priv.(*TnSecp256k1Key); ok && k.priv != nil {
+			m["d"] = tnB64u(k.priv)
+		}
+	case *TnEd448Key:
+		m["kty"] = "OKP"
+		m["crv"] = "Ed448"
+		m["x"] = tnB64u(p.pub)
+		if k, ok := priv.(*TnEd448Key); ok && k.seed != nil {
+			m["d"] = tnB64u(k.seed)
+		}
+	case *TnX448Key:
+		m["kty"] = "OKP"
+		m["crv"] = "X448"
+		m["x"] = tnB64u(p.pub)
+		if k, ok := priv.(*TnX448Key); ok && k.secret != nil {
+			m["d"] = tnB64u(k.secret)
+		}
 	}
 	return m
+}
+
+// The X / Y halves of a secp256k1 uncompressed point
+func tnSecp256k1XY(pub []byte) ([]byte, []byte) {
+	if len(pub) == 65 && pub[0] == 4 {
+		return pub[1:33], pub[33:65]
+	}
+	return pub, pub
 }
 
 func tnJWKBytes(jwk interface{}, key string) []byte {
@@ -619,8 +1144,16 @@ func tnKeyFromJWK(jwk interface{}) (tncrypto.PublicKey, tncrypto.PrivateKey) {
 		return &priv.PublicKey, priv
 	case "EC":
 		crv, _ := TnGetValue(jwk, "crv").(string)
-		pub := &ecdsa.PublicKey{Curve: tnNamedCurve(crv), X: tnBigFrom(tnJWKBytes(jwk, "x")), Y: tnBigFrom(tnJWKBytes(jwk, "y"))}
-		d := tnJWKBytes(jwk, "d")
+		x, y, d := tnJWKBytes(jwk, "x"), tnJWKBytes(jwk, "y"), tnJWKBytes(jwk, "d")
+		if strings.EqualFold(crv, "secp256k1") {
+			point := append([]byte{4}, append(x, y...)...)
+			if d != nil {
+				k := tnSecp256k1FromPrivate(d)
+				return &TnSecp256k1Key{pub: k.pub, curve: true}, k
+			}
+			return tnSecp256k1FromPublic(point), nil
+		}
+		pub := &ecdsa.PublicKey{Curve: tnNamedCurve(crv), X: tnBigFrom(x), Y: tnBigFrom(y)}
 		if d == nil {
 			return pub, nil
 		}
@@ -645,6 +1178,18 @@ func tnKeyFromJWK(jwk interface{}) (tncrypto.PublicKey, tncrypto.PrivateKey) {
 			} else if pub, err := ecdh.X25519().NewPublicKey(x); err == nil {
 				return pub, nil
 			}
+		case "Ed448":
+			if d != nil {
+				k := tnEd448FromSeed(d)
+				return &TnEd448Key{pub: k.pub}, k
+			}
+			return &TnEd448Key{pub: x}, nil
+		case "X448":
+			if d != nil {
+				k := tnX448FromSecret(d)
+				return &TnX448Key{pub: k.pub}, k
+			}
+			return &TnX448Key{pub: x}, nil
 		}
 	}
 	panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_JWK", "Invalid JWK data"))
@@ -674,35 +1219,43 @@ func (k *TnKeyObject) export(options ...interface{}) interface{} {
 		return append([]byte{}, k.secret...)
 	case "public":
 		if format == "jwk" {
+			tnJWKCheck(k.pub)
 			return tnJWK(k.pub, nil)
 		}
 		if typ == "pkcs1" {
-			pub, ok := k.pub.(*rsa.PublicKey)
-			if !ok {
+			var pub *rsa.PublicKey
+			switch p := k.pub.(type) {
+			case *rsa.PublicKey:
+				pub = p
+			case *TnRSAPSSPublicKey:
+				pub = p.key
+			default:
 				panic(tnKeyEncodingError(typ))
 			}
 			return tnPEMOrDER(x509.MarshalPKCS1PublicKey(pub), "RSA PUBLIC KEY", format)
 		}
-		der, err := x509.MarshalPKIXPublicKey(k.pub)
+		der, err := tnMarshalPublic(k.pub)
 		if err != nil {
 			panic(tnCryptoErr(err))
 		}
 		return tnPEMOrDER(der, "PUBLIC KEY", format)
 	}
-	if c := TnGet(opts, "cipher"); c != nil && !TnIsNil(c) {
-		panic(TnNodeError("Error", "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Encrypted private key export is not supported"))
-	}
 	if format == "jwk" {
+		tnJWKCheck(k.pub)
 		return tnJWK(k.pub, k.priv)
 	}
-	switch typ {
-	case "pkcs1":
+	if typ == "pkcs1" {
 		priv, ok := k.priv.(*rsa.PrivateKey)
 		if !ok {
-			panic(tnKeyEncodingError(typ))
+			if p, pss := k.priv.(*TnRSAPSSKey); pss {
+				priv = p.key
+			} else {
+				panic(tnKeyEncodingError(typ))
+			}
 		}
 		return tnPEMOrDER(x509.MarshalPKCS1PrivateKey(priv), "RSA PRIVATE KEY", format)
-	case "sec1":
+	}
+	if typ == "sec1" {
 		priv, ok := k.priv.(*ecdsa.PrivateKey)
 		if !ok {
 			panic(tnKeyEncodingError(typ))
@@ -713,9 +1266,27 @@ func (k *TnKeyObject) export(options ...interface{}) interface{} {
 		}
 		return tnPEMOrDER(der, "EC PRIVATE KEY", format)
 	}
-	der, err := x509.MarshalPKCS8PrivateKey(k.priv)
+	der, err := tnMarshalPrivate(k.priv)
 	if err != nil {
 		panic(tnCryptoErr(err))
+	}
+	// cipher / passphrase: PBES2 (an ENCRYPTED PRIVATE KEY)
+	cipherName, _ := TnGet(opts, "cipher").(string)
+	if cipherName != "" {
+		pass := ""
+		switch p := TnGetValue(opts, "passphrase").(type) {
+		case string:
+			pass = p
+		case []byte:
+			pass = string(p)
+		default:
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.passphrase\\" property must be of type string or an instance of Buffer"))
+		}
+		encrypted := tnPEMEncryptPKCS8(der, cipherName, []byte(pass))
+		if format == "der" {
+			return encrypted
+		}
+		return string(pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: encrypted}))
 	}
 	return tnPEMOrDER(der, "PRIVATE KEY", format)
 }
@@ -728,12 +1299,12 @@ func (k *TnKeyObject) equals(other *TnKeyObject) bool {
 	case "secret":
 		return len(k.secret) == len(other.secret) && subtle.ConstantTimeCompare(k.secret, other.secret) == 1
 	case "public":
-		a, _ := x509.MarshalPKIXPublicKey(k.pub)
-		b, _ := x509.MarshalPKIXPublicKey(other.pub)
+		a, _ := tnMarshalPublic(k.pub)
+		b, _ := tnMarshalPublic(other.pub)
 		return bytes.Equal(a, b)
 	}
-	a, _ := x509.MarshalPKCS8PrivateKey(k.priv)
-	b, _ := x509.MarshalPKCS8PrivateKey(other.priv)
+	a, _ := tnMarshalPrivate(k.priv)
+	b, _ := tnMarshalPrivate(other.priv)
 	return bytes.Equal(a, b)
 }
 
@@ -757,8 +1328,33 @@ func tnGenerateAsymmetric(kind string, options interface{}) tncrypto.PrivateKey 
 			panic(tnCryptoErr(err))
 		}
 		return k
+	case "rsa-pss":
+		bitsN, ok := tnCryptoNumber(TnGet(options, "modulusLength"))
+		if !ok {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.modulusLength\\" property must be of type number. Received undefined"))
+		}
+		k, err := rsa.GenerateKey(cryptorand.Reader, int(bitsN))
+		if err != nil {
+			panic(tnCryptoErr(err))
+		}
+		hash, mgf := tncrypto.SHA1, tncrypto.SHA1
+		if h, ok := TnGetValue(options, "hashAlgorithm").(string); ok && h != "" {
+			hash = tnCryptoHash(h)
+		}
+		mgf = hash
+		if h, ok := TnGetValue(options, "mgf1HashAlgorithm").(string); ok && h != "" {
+			mgf = tnCryptoHash(h)
+		}
+		salt := 20
+		if n, ok := tnCryptoNumber(TnGet(options, "saltLength")); ok {
+			salt = int(n)
+		}
+		return &TnRSAPSSKey{key: k, hash: hash, mgfHash: mgf, saltLength: salt, trailer: 1}
 	case "ec":
 		name, _ := TnGetValue(options, "namedCurve").(string)
+		if strings.EqualFold(name, "secp256k1") {
+			return tnSecp256k1Generate()
+		}
 		k, err := ecdsa.GenerateKey(tnNamedCurve(name), cryptorand.Reader)
 		if err != nil {
 			panic(tnCryptoErr(err))
@@ -770,6 +1366,10 @@ func tnGenerateAsymmetric(kind string, options interface{}) tncrypto.PrivateKey 
 	case "x25519":
 		k, _ := ecdh.X25519().GenerateKey(cryptorand.Reader)
 		return k
+	case "ed448":
+		return tnEd448Generate()
+	case "x448":
+		return tnX448Generate()
 	}
 	panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'type' must be a supported key type. Received '"+kind+"'"))
 }
@@ -988,6 +1588,70 @@ func tnHashName(alg interface{}) string {
 	return ""
 }
 
+// DSA (FIPS 186): a random k, r = (g^k mod p) mod q, s = k⁻¹ (z + x·r) mod q
+func tnDSASign(k *TnDSAKey, digest []byte) []byte {
+	q := k.q
+	z := new(tnbig.Int).SetBytes(digest)
+	if z.BitLen() > q.BitLen() {
+		z.Rsh(z, uint(z.BitLen()-q.BitLen()))
+	}
+	one := tnbig.NewInt(1)
+	qMinus1 := new(tnbig.Int).Sub(q, one)
+	for {
+		candidate, err := cryptorand.Int(cryptorand.Reader, qMinus1)
+		if err != nil {
+			panic(tnCryptoErr(err))
+		}
+		kk := new(tnbig.Int).Add(candidate, one)
+		r := new(tnbig.Int).Exp(k.g, kk, k.p)
+		r.Mod(r, q)
+		if r.Sign() == 0 {
+			continue
+		}
+		kinv := new(tnbig.Int).ModInverse(kk, q)
+		if kinv == nil {
+			continue
+		}
+		s := new(tnbig.Int).Mul(k.x, r)
+		s.Add(s, z)
+		s.Mul(s, kinv)
+		s.Mod(s, q)
+		if s.Sign() == 0 {
+			continue
+		}
+		der, _ := asn1.Marshal(tnECSig{R: r, S: s})
+		return der
+	}
+}
+
+func tnDSAVerify(k *TnDSAKey, digest, der []byte) bool {
+	var sig tnECSig
+	if _, err := asn1.Unmarshal(der, &sig); err != nil || sig.R == nil || sig.S == nil {
+		return false
+	}
+	q := k.q
+	if sig.R.Sign() <= 0 || sig.S.Sign() <= 0 || sig.R.Cmp(q) >= 0 || sig.S.Cmp(q) >= 0 {
+		return false
+	}
+	z := new(tnbig.Int).SetBytes(digest)
+	if z.BitLen() > q.BitLen() {
+		z.Rsh(z, uint(z.BitLen()-q.BitLen()))
+	}
+	w := new(tnbig.Int).ModInverse(sig.S, q)
+	if w == nil {
+		return false
+	}
+	u1 := new(tnbig.Int).Mul(z, w)
+	u1.Mod(u1, q)
+	u2 := new(tnbig.Int).Mul(sig.R, w)
+	u2.Mod(u2, q)
+	v := new(tnbig.Int).Exp(k.g, u1, k.p)
+	v.Mul(v, new(tnbig.Int).Exp(k.y, u2, k.p))
+	v.Mod(v, k.p)
+	v.Mod(v, q)
+	return v.Cmp(sig.R) == 0
+}
+
 // sign(algorithm, data, key)
 func TnSign(alg interface{}, data interface{}, key interface{}) []byte {
 	k := TnCreatePrivateKey(key)
@@ -1024,6 +1688,39 @@ func TnSign(alg interface{}, data interface{}, key interface{}) []byte {
 		return sig
 	case ed25519.PrivateKey:
 		return ed25519.Sign(p, msg)
+	case *TnRSAPSSKey:
+		h := p.hash
+		opts := &rsa.PSSOptions{SaltLength: p.saltLength, Hash: h}
+		if o.hasSalt {
+			opts = o.pss(h)
+		}
+		sig, err := rsa.SignPSS(cryptorand.Reader, p.key, h, tnDigest(h, msg), opts)
+		if err != nil {
+			panic(tnCryptoErr(err))
+		}
+		return sig
+	case *TnEd448Key:
+		if p.seed == nil {
+			panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key type for signing: ed448"))
+		}
+		return tnEd448Sign(p, msg)
+	case *TnSecp256k1Key:
+		if p.priv == nil {
+			panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key type for signing: ec"))
+		}
+		sig := tnSecp256k1Sign(p, tnDigest(tnCryptoHash(name), msg))
+		if o.dsaEncoding == "ieee-p1363" {
+			return tnDERToP1363(sig, 32)
+		}
+		return sig
+	case *TnDSAKey:
+		if p.private {
+			sig := tnDSASign(p, tnDigest(tnCryptoHash(name), msg))
+			if o.dsaEncoding == "ieee-p1363" {
+				return tnDERToP1363(sig, (p.q.BitLen()+7)/8)
+			}
+			return sig
+		}
 	}
 	panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key type for signing: "+tnAsymmetricType(k.pub)))
 }
@@ -1053,6 +1750,25 @@ func TnVerify(alg interface{}, data interface{}, key interface{}, signature inte
 		return ecdsa.VerifyASN1(p, tnDigest(tnCryptoHash(name), msg), sig)
 	case ed25519.PublicKey:
 		return ed25519.Verify(p, msg, sig)
+	case *TnRSAPSSPublicKey:
+		h := p.hash
+		opts := &rsa.PSSOptions{SaltLength: p.saltLength, Hash: h}
+		if o.hasSalt {
+			opts = o.pss(h)
+		}
+		return rsa.VerifyPSS(p.key, h, tnDigest(h, msg), sig, opts) == nil
+	case *TnEd448Key:
+		return tnEd448Verify(p.pub, msg, sig)
+	case *TnSecp256k1Key:
+		if o.dsaEncoding == "ieee-p1363" {
+			sig = tnP1363ToDER(sig)
+		}
+		return tnSecp256k1Verify(p.pub, tnDigest(tnCryptoHash(name), msg), sig)
+	case *TnDSAKey:
+		if o.dsaEncoding == "ieee-p1363" {
+			sig = tnP1363ToDER(sig)
+		}
+		return tnDSAVerify(p, tnDigest(tnCryptoHash(name), msg), sig)
 	}
 	panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key type for verification: "+tnAsymmetricType(k.pub)))
 }
@@ -1223,9 +1939,10 @@ type TnECDH struct {
 	curve ecdh.Curve
 	ec    elliptic.Curve
 	priv  *ecdh.PrivateKey
+	k1    *TnSecp256k1Key
 }
 
-func TnGetCurves() []string { return []string{"prime256v1", "secp384r1", "secp521r1"} }
+func TnGetCurves() []string { return []string{"prime256v1", "secp384r1", "secp521r1", "secp256k1"} }
 
 func TnCreateECDH(name string) *TnECDH {
 	switch strings.ToLower(name) {
@@ -1235,6 +1952,8 @@ func TnCreateECDH(name string) *TnECDH {
 		return &TnECDH{name: name, curve: ecdh.P384(), ec: elliptic.P384()}
 	case "secp521r1", "p-521":
 		return &TnECDH{name: name, curve: ecdh.P521(), ec: elliptic.P521()}
+	case "secp256k1":
+		return &TnECDH{name: name}
 	}
 	panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_CURVE", "Invalid EC curve name"))
 }
@@ -1258,6 +1977,17 @@ func tnEncodeOut(b []byte, enc []string) interface{} {
 }
 
 func (e *TnECDH) publicBytes(format string) []byte {
+	if e.k1 != nil {
+		raw := e.k1.pub
+		if format == "compressed" && len(raw) == 65 {
+			prefix := byte(2)
+			if raw[64]&1 == 1 {
+				prefix = 3
+			}
+			return append([]byte{prefix}, raw[1:33]...)
+		}
+		return raw
+	}
 	if e.priv == nil {
 		panic(TnNodeError("Error", "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY", "Failed to get ECDH public key"))
 	}
@@ -1270,6 +2000,10 @@ func (e *TnECDH) publicBytes(format string) []byte {
 }
 
 func (e *TnECDH) generateKeys(args ...string) interface{} {
+	if e.name == "secp256k1" {
+		e.k1 = tnSecp256k1Generate()
+		return e.getPublicKey(args...)
+	}
 	k, err := e.curve.GenerateKey(cryptorand.Reader)
 	if err != nil {
 		panic(tnCryptoErr(err))
@@ -1287,6 +2021,9 @@ func (e *TnECDH) getPublicKey(args ...string) interface{} {
 }
 
 func (e *TnECDH) getPrivateKey(args ...string) interface{} {
+	if e.k1 != nil {
+		return tnEncodeOut(e.k1.priv, args)
+	}
 	if e.priv == nil {
 		panic(TnNodeError("Error", "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY", "Failed to get ECDH private key"))
 	}
@@ -1298,7 +2035,12 @@ func (e *TnECDH) setPrivateKey(key interface{}, enc ...string) {
 	if len(enc) > 0 {
 		ee = enc[0]
 	}
-	k, err := e.curve.NewPrivateKey(tnCryptoBytes(key, ee))
+	raw := tnCryptoBytes(key, ee)
+	if e.name == "secp256k1" {
+		e.k1 = tnSecp256k1FromPrivate(raw)
+		return
+	}
+	k, err := e.curve.NewPrivateKey(raw)
 	if err != nil {
 		panic(TnNodeError("Error", "ERR_CRYPTO_INVALID_KEYTYPE", "Private key is not valid for specified curve."))
 	}
@@ -1311,6 +2053,16 @@ func (e *TnECDH) computeSecret(other interface{}, args ...string) interface{} {
 		inEnc = args[0]
 	}
 	raw := tnCryptoBytes(other, inEnc)
+	if e.k1 != nil {
+		if e.k1.priv == nil {
+			panic(TnNodeError("Error", "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY", "Public key is not valid for specified curve"))
+		}
+		secret := tnSecp256k1Shared(e.k1.priv, raw)
+		if len(args) > 1 {
+			return tnEncodeOut(secret, args[1:])
+		}
+		return secret
+	}
 	if len(raw) > 0 && (raw[0] == 2 || raw[0] == 3) {
 		x, y := elliptic.UnmarshalCompressed(e.ec, raw)
 		if x == nil {
@@ -1343,6 +2095,20 @@ func TnDiffieHellman(options interface{}) []byte {
 }
 
 func tnECDHSecret(privKey tncrypto.PrivateKey, pubKey tncrypto.PublicKey) []byte {
+	if a, ok := privKey.(*TnX448Key); ok {
+		b, ok := pubKey.(*TnX448Key)
+		if !ok || a.secret == nil {
+			panic(TnNodeError("Error", "ERR_CRYPTO_INCOMPATIBLE_KEY", "Incompatible key types for Diffie-Hellman"))
+		}
+		return tnX448Shared(a.secret, b.pub)
+	}
+	if a, ok := privKey.(*TnSecp256k1Key); ok {
+		b, ok := pubKey.(*TnSecp256k1Key)
+		if !ok || a.priv == nil {
+			panic(TnNodeError("Error", "ERR_CRYPTO_INCOMPATIBLE_KEY", "Incompatible key types for Diffie-Hellman"))
+		}
+		return tnSecp256k1Shared(a.priv, b.pub)
+	}
 	var a *ecdh.PrivateKey
 	var b *ecdh.PublicKey
 	var err error
@@ -1569,6 +2335,10 @@ type TnX509Certificate struct {
 	cert *x509.Certificate
 }
 
+func tnX509Of(c *x509.Certificate) *TnX509Certificate {
+	return &TnX509Certificate{cert: c}
+}
+
 func TnNewX509Certificate(data interface{}) *TnX509Certificate {
 	raw := tnCryptoBytes(data, "")
 	if block, _ := pem.Decode(raw); block != nil {
@@ -1578,7 +2348,184 @@ func TnNewX509Certificate(data interface{}) *TnX509Certificate {
 	if err != nil {
 		panic(TnNodeError("Error", "ERR_OSSL_PEM_NO_START_LINE", "error:0480006C:PEM routines::no start line"))
 	}
-	return &TnX509Certificate{cert: c}
+	return tnX509Of(c)
+}
+
+// crypto.parsePKCS12(bundle, { passphrase }) (Node 26's KeyObject / X509Certificate result)
+type TnPKCS12 struct {
+	privateKey             *TnKeyObject
+	certificate            *TnX509Certificate
+	additionalCertificates []*TnX509Certificate
+}
+
+func TnParsePKCS12(bundle interface{}, options ...interface{}) *TnPKCS12 {
+	raw, ok := bundle.([]byte)
+	if !ok {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"bundle\\" argument must be of type ArrayBuffer, Buffer, TypedArray, or DataView"))
+	}
+	pass := ""
+	if len(options) > 0 && options[0] != nil && !TnIsNil(options[0]) {
+		opts := options[0]
+		if _, isObj := opts.(*TnMap[interface{}, interface{}]); !isObj {
+			switch opts.(type) {
+			case string, []byte:
+				panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options\\" argument must be of type object"))
+			}
+		}
+		switch p := TnGetValue(opts, "passphrase").(type) {
+		case string:
+			pass = p
+		case []byte:
+			pass = string(p)
+		case nil:
+		default:
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.passphrase\\" property must be of type string or an instance of Buffer"))
+		}
+		if strings.ContainsRune(pass, 0) {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The argument 'options.passphrase' must not contain null bytes"))
+		}
+	}
+	key, cert, cas, err := tnPkcs12Decode(raw, pass)
+	if err != nil {
+		panic(TnNodeError("Error", "ERR_OSSL_PKCS12_MAC_VERIFY_FAILURE", "error:11800071:PKCS12 routines::mac verify failure"))
+	}
+	out := &TnPKCS12{}
+	if key != nil {
+		out.privateKey = tnPrivateKeyObject(key)
+	}
+	if cert != nil {
+		out.certificate = tnX509Of(cert)
+	}
+	for _, ca := range cas {
+		out.additionalCertificates = append(out.additionalCertificates, tnX509Of(ca))
+	}
+	if out.additionalCertificates == nil {
+		out.additionalCertificates = []*TnX509Certificate{}
+	}
+	return out
+}
+
+// --- crypto.Certificate (SPKAC, Netscape's signed public key and challenge) ---
+
+type TnCertificate struct{}
+
+type tnSpkacInfo struct {
+	Inner tnSpkacInner
+	Algo  pkix.AlgorithmIdentifier
+	Sig   asn1.BitString
+}
+
+type tnSpkacInner struct {
+	Spki      tnSPKIInfo
+	Challenge string ` + "`asn1:\"ia5\"`" + `
+}
+
+func tnSpkacBytes(v interface{}) []byte {
+	var text string
+	switch x := v.(type) {
+	case string:
+		text = x
+	case []byte:
+		text = string(x)
+	default:
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "SPKAC=") {
+		text = strings.TrimPrefix(text, "SPKAC=")
+		if decoded, err := tnurl.QueryUnescape(text); err == nil {
+			text = decoded
+		}
+	}
+	text = strings.Join(strings.Fields(text), "")
+	raw, err := base64.StdEncoding.DecodeString(text)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func tnSpkacParse(v interface{}) *tnSpkacInfo {
+	raw := tnSpkacBytes(v)
+	if raw == nil {
+		return nil
+	}
+	var info tnSpkacInfo
+	if _, err := asn1.Unmarshal(raw, &info); err != nil {
+		return nil
+	}
+	return &info
+}
+
+func tnSpkacVerify(info *tnSpkacInfo) bool {
+	der, err := asn1.Marshal(info.Inner)
+	if err != nil {
+		return false
+	}
+	spki, err := asn1.Marshal(info.Inner.Spki)
+	if err != nil {
+		return false
+	}
+	pub, err := x509.ParsePKIXPublicKey(spki)
+	if err != nil {
+		return false
+	}
+	oid, hash := info.Algo.Algorithm.String(), tncrypto.SHA1
+	switch oid {
+	case "1.2.840.113549.1.1.4":
+		hash = tncrypto.MD5
+	case "1.2.840.113549.1.1.5":
+		hash = tncrypto.SHA1
+	case "1.2.840.113549.1.1.11":
+		hash = tncrypto.SHA256
+	case "1.2.840.113549.1.1.12":
+		hash = tncrypto.SHA384
+	case "1.2.840.113549.1.1.13":
+		hash = tncrypto.SHA512
+	case "1.2.840.10045.4.1":
+		hash = tncrypto.SHA1
+	case "1.2.840.10045.4.3.2":
+		hash = tncrypto.SHA256
+	case "1.2.840.10045.4.3.3":
+		hash = tncrypto.SHA384
+	case "1.2.840.10045.4.3.4":
+		hash = tncrypto.SHA512
+	default:
+		return false
+	}
+	digest := tnDigest(hash, der)
+	switch key := pub.(type) {
+	case *rsa.PublicKey:
+		return rsa.VerifyPKCS1v15(key, hash, digest, info.Sig.Bytes) == nil
+	case *ecdsa.PublicKey:
+		return ecdsa.VerifyASN1(key, digest, info.Sig.Bytes)
+	}
+	return false
+}
+
+func TnCertificateVerifySpkac(v interface{}) bool {
+	info := tnSpkacParse(v)
+	return info != nil && tnSpkacVerify(info)
+}
+
+func TnCertificateExportChallenge(v interface{}) []byte {
+	info := tnSpkacParse(v)
+	if info == nil || !tnSpkacVerify(info) {
+		return nil
+	}
+	return []byte(info.Inner.Challenge)
+}
+
+func TnCertificateExportPublicKey(v interface{}) []byte {
+	info := tnSpkacParse(v)
+	if info == nil || !tnSpkacVerify(info) {
+		return nil
+	}
+	der, err := asn1.Marshal(info.Inner.Spki)
+	if err != nil {
+		return nil
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 }
 
 var tnX509Names = map[string]string{
@@ -2459,6 +3406,52 @@ const SECRET_ALGORITHMS: Record<string, boolean> = { HMAC: true, 'AES-GCM': true
 export function registerCryptoKeys(r: NodeRegistry): void {
   defineHelper(
     r,
+    'nodePem',
+    [
+      'bytes',
+      'crypto/aes',
+      'crypto/cipher',
+      'crypto/des',
+      'crypto/md5',
+      'crypto/pbkdf2',
+      'crypto/rand',
+      'crypto/sha1',
+      'crypto/sha256',
+      'crypto/sha512',
+      'crypto/x509/pkix',
+      'encoding/asn1',
+      'encoding/hex',
+      'encoding/pem',
+      'hash',
+      'strings'
+    ],
+    ['error'],
+    CRYPTO_PEM_HELPER
+  );
+  defineHelper(
+    r,
+    'nodePkcs12',
+    ['crypto/x509', 'encoding/pem', 'errors', 'strings', 'software.sslmate.com/src/go-pkcs12'],
+    [],
+    CRYPTO_PKCS12_HELPER
+  );
+  defineHelper(
+    r,
+    'nodeCryptoCurves',
+    [
+      'crypto/rand',
+      'encoding/asn1',
+      'math/big',
+      'github.com/cloudflare/circl/dh/x448',
+      'github.com/cloudflare/circl/sign/ed448',
+      'github.com/decred/dcrd/dcrec/secp256k1/v4',
+      'github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa'
+    ],
+    ['error'],
+    CRYPTO_CURVES_HELPER
+  );
+  defineHelper(
+    r,
     'nodeCryptoKeys',
     [
       'bytes',
@@ -2489,11 +3482,24 @@ export function registerCryptoKeys(r: NodeRegistry): void {
       'math/big',
       'math/bits',
       'net',
+      'net/url',
       'reflect',
       'strings',
       'time'
     ],
-    ['nodeCrypto', 'error', 'buffer', 'dynamic', 'eventLoop', 'promise', 'nodeInvoke', 'jsonStringify'],
+    [
+      'nodeCrypto',
+      'nodeCryptoCurves',
+      'nodePem',
+      'nodePkcs12',
+      'error',
+      'buffer',
+      'dynamic',
+      'eventLoop',
+      'promise',
+      'nodeInvoke',
+      'jsonStringify'
+    ],
     cryptoKeysHelper
   );
   const use = () => r.helper('nodeCryptoKeys');
@@ -2533,7 +3539,16 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     'type=string; asymmetricKeyType=*string; symmetricKeySize=*float64; asymmetricKeyDetails=*TnKeyDetails',
     ''
   );
-  defineClass(r, 'crypto.AsymmetricKeyDetails', '*TnKeyDetails', 'class', '', 'modulusLength=float64; publicExponent=*tnbig.Int; namedCurve=string', '', '');
+  defineClass(
+    r,
+    'crypto.AsymmetricKeyDetails',
+    '*TnKeyDetails',
+    'class',
+    '',
+    'modulusLength=float64; publicExponent=*tnbig.Int; namedCurve=*string; hashAlgorithm=*string; mgf1HashAlgorithm=*string; saltLength=*float64; trailerField=*float64; divisorLength=*float64',
+    '',
+    ''
+  );
   r.typers['crypto.KeyObject#export'] = (c: NodeCall) => {
     const options = c.nodes[0];
     if (!options) return '[]byte';
@@ -2556,6 +3571,24 @@ export function registerCryptoKeys(r: NodeRegistry): void {
   fn('createPublicKey', '*TnKeyObject', (c: NodeCall) => `TnCreatePublicKey(${c.args[0]})`);
   fn('createSecretKey', '*TnKeyObject', (c: NodeCall) => `TnCreateSecretKey(${c.args.join(', ')})`);
   fn('KeyObject.from', '*TnKeyObject', (c: NodeCall) => `TnKeyObjectFrom(${c.args[0]})`);
+
+  // PKCS#12 (PFX) bundles
+  defineClass(
+    r,
+    'crypto.PKCS12',
+    '*TnPKCS12',
+    'class',
+    '',
+    'privateKey=*TnKeyObject; certificate=*TnX509Certificate; additionalCertificates=[]*TnX509Certificate',
+    '',
+    ''
+  );
+  fn('parsePKCS12', '*TnPKCS12', (c: NodeCall) => `TnParsePKCS12(${c.args.join(', ')})`);
+  // crypto.Certificate (SPKAC)
+  defineClass(r, 'crypto.Certificate', '*TnCertificate', 'class', '', '', '', '');
+  fn('Certificate.verifySpkac', 'bool', (c: NodeCall) => `TnCertificateVerifySpkac(${c.args[0]})`);
+  fn('Certificate.exportChallenge', '[]byte', (c: NodeCall) => `TnCertificateExportChallenge(${c.args[0]})`);
+  fn('Certificate.exportPublicKey', '[]byte', (c: NodeCall) => `TnCertificateExportPublicKey(${c.args[0]})`);
 
   // generateKeyPair(Sync) / generateKey(Sync)
   for (const kind of Object.keys(KEY_PAIRS)) {

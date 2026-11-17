@@ -1,6 +1,7 @@
 // node:crypto (+ the global crypto): hashes / HMAC (md5, sha1, sha2, sha3),
 // random bytes / UUIDs / ints, timingSafeEqual, PBKDF2 / HKDF, AES ciphers
-// (cbc / ctr / gcm). Backed by Go's crypto packages.
+// (cbc / ctr / gcm, SIV / GCM-SIV) and MACs (hmac, KMAC, CMAC, GMAC,
+// Poly1305, SipHash, BLAKE2). Backed by Go's crypto packages.
 import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
 import { streamListenerTypes } from './stream.js';
 const cryptoHelper = `// node:crypto
@@ -198,10 +199,15 @@ type TnCipher struct {
 	autoPadding bool
 	finalized   bool
 	wrapped     bool
+	// SIV / GCM-SIV: AAD components, one update() only
+	aads       [][]byte
+	updated    bool
+	authFailed bool
 }
 
 func TnGetCiphers() []string {
-	return []string{"aes-128-cbc", "aes-128-ctr", "aes-128-gcm", "aes-192-cbc", "aes-192-ctr", "aes-192-gcm", "aes-256-cbc", "aes-256-ctr", "aes-256-gcm",
+	return []string{"aes-128-cbc", "aes-128-ctr", "aes-128-gcm", "aes-128-gcm-siv", "aes-128-siv", "aes-192-cbc", "aes-192-ctr", "aes-192-gcm", "aes-192-gcm-siv", "aes-192-siv",
+		"aes-256-cbc", "aes-256-ctr", "aes-256-gcm", "aes-256-gcm-siv", "aes-256-siv",
 		"aes128-wrap", "aes128-wrap-pad", "aes192-wrap", "aes192-wrap-pad", "aes256-wrap", "aes256-wrap-pad",
 		"id-aes128-wrap", "id-aes128-wrap-pad", "id-aes192-wrap", "id-aes192-wrap-pad", "id-aes256-wrap", "id-aes256-wrap-pad"}
 }
@@ -350,18 +356,40 @@ func TnCreateCipher(alg string, key interface{}, iv interface{}, decrypt bool, o
 		return tnCreateWrapCipher(alg, key, iv, decrypt)
 	}
 	parts := strings.Split(strings.ToLower(alg), "-")
-	if len(parts) != 3 || parts[0] != "aes" {
+	if len(parts) < 3 || parts[0] != "aes" {
 		panic(TnNodeError("Error", "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher"))
 	}
+	mode := strings.Join(parts[2:], "-")
 	k := tnCryptoBytes(key, "")
-	if strconv.Itoa(len(k)*8) != parts[1] {
+	keyBits := len(k) * 8
+	// AES-SIV takes two AES keys: one for S2V (CMAC), one for CTR
+	if mode == "siv" {
+		keyBits /= 2
+	}
+	if strconv.Itoa(keyBits) != parts[1] || mode == "siv" && len(k)%2 != 0 {
 		panic(TnNodeError("RangeError", "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length"))
+	}
+	var ivBytes []byte
+	if iv != nil && !TnIsNil(iv) {
+		ivBytes = tnCryptoBytes(iv, "")
+	}
+	switch mode {
+	case "siv":
+		if len(ivBytes) != 0 {
+			panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"))
+		}
+		return &TnCipher{decrypt: decrypt, mode: mode, pending: k}
+	case "gcm-siv":
+		if len(ivBytes) != 12 {
+			panic(TnNodeError("TypeError", "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"))
+		}
+		return &TnCipher{decrypt: decrypt, mode: mode, pending: k, iv: ivBytes}
 	}
 	block, err := aes.NewCipher(k)
 	if err != nil {
 		panic(TnNodeError("RangeError", "ERR_CRYPTO_INVALID_KEYLEN", "Invalid key length"))
 	}
-	c := &TnCipher{decrypt: decrypt, mode: parts[2], block: block, iv: tnCryptoBytes(iv, ""), autoPadding: true}
+	c := &TnCipher{decrypt: decrypt, mode: mode, block: block, iv: ivBytes, autoPadding: true}
 	switch c.mode {
 	case "cbc":
 		if len(c.iv) != aes.BlockSize {
@@ -393,6 +421,8 @@ func (c *TnCipher) process(data []byte) []byte {
 	switch c.mode {
 	case "wrap", "wrap-pad":
 		return c.keyWrap(data)
+	case "siv", "gcm-siv":
+		return c.sivUpdate(data)
 	case "ctr":
 		out := make([]byte, len(data))
 		c.stream.XORKeyStream(out, data)
@@ -421,6 +451,8 @@ func (c *TnCipher) finish() []byte {
 	switch c.mode {
 	case "ctr", "wrap", "wrap-pad":
 		return []byte{}
+	case "siv", "gcm-siv":
+		return c.sivFinal()
 	case "gcm":
 		if c.decrypt {
 			out, err := c.aead.Open(nil, c.iv, append(append([]byte{}, c.pending...), c.authTag...), c.aad)
@@ -467,6 +499,266 @@ func (c *TnCipher) finish() []byte {
 	return out
 }
 
+// AES-CMAC (RFC 4493)
+func tnCmac(block cipher.Block, msg []byte) []byte {
+	shift := func(in []byte) []byte {
+		out := make([]byte, 16)
+		carry := byte(0)
+		for i := 15; i >= 0; i-- {
+			out[i] = in[i]<<1 | carry
+			carry = in[i] >> 7
+		}
+		if in[0]&0x80 != 0 {
+			out[15] ^= 0x87
+		}
+		return out
+	}
+	l := make([]byte, 16)
+	block.Encrypt(l, l)
+	k1 := shift(l)
+	k2 := shift(k1)
+	n := (len(msg) + 15) / 16
+	complete := n > 0 && len(msg)%16 == 0
+	if n == 0 {
+		n = 1
+	}
+	last := make([]byte, 16)
+	if complete {
+		copy(last, msg[(n-1)*16:])
+		for i := range last {
+			last[i] ^= k1[i]
+		}
+	} else {
+		rest := msg[(n-1)*16:]
+		copy(last, rest)
+		last[len(rest)] = 0x80
+		for i := range last {
+			last[i] ^= k2[i]
+		}
+	}
+	x := make([]byte, 16)
+	for i := 0; i < n-1; i++ {
+		for j := 0; j < 16; j++ {
+			x[j] ^= msg[i*16+j]
+		}
+		block.Encrypt(x, x)
+	}
+	for j := 0; j < 16; j++ {
+		x[j] ^= last[j]
+	}
+	block.Encrypt(x, x)
+	return x
+}
+
+// AES-SIV (RFC 5297): S2V over AES-CMAC, then CTR
+func tnDbl(d []byte) []byte {
+	out := make([]byte, 16)
+	carry := byte(0)
+	for i := 15; i >= 0; i-- {
+		out[i] = d[i]<<1 | carry
+		carry = d[i] >> 7
+	}
+	if d[0]&0x80 != 0 {
+		out[15] ^= 0x87
+	}
+	return out
+}
+
+func tnS2V(block cipher.Block, aads [][]byte, plain []byte) []byte {
+	d := tnCmac(block, make([]byte, 16))
+	for _, a := range aads {
+		c := tnCmac(block, a)
+		d = tnDbl(d)
+		subtle.XORBytes(d, d, c)
+	}
+	var t []byte
+	if len(plain) >= 16 {
+		t = append([]byte{}, plain...)
+		subtle.XORBytes(t[len(t)-16:], t[len(t)-16:], d)
+	} else {
+		t = make([]byte, 16)
+		copy(t, plain)
+		t[len(plain)] = 0x80
+		subtle.XORBytes(t, t, tnDbl(d))
+	}
+	return tnCmac(block, t)
+}
+
+func tnSIVCtr(block cipher.Block, v []byte, data []byte) []byte {
+	q := append([]byte{}, v...)
+	q[8] &= 0x7f
+	q[12] &= 0x7f
+	out := make([]byte, len(data))
+	cipher.NewCTR(block, q).XORKeyStream(out, data)
+	return out
+}
+
+func tnReverse(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i := range b {
+		out[len(b)-1-i] = b[i]
+	}
+	return out
+}
+
+// AES-GCM-SIV (RFC 8452): POLYVAL, computed through GHASH's bit-reflected field
+func tnGFMul(x, y [2]uint64) [2]uint64 {
+	var z [2]uint64
+	v := y
+	for i := 0; i < 128; i++ {
+		word := x[i/64]
+		if word>>(63-uint(i%64))&1 == 1 {
+			z[0] ^= v[0]
+			z[1] ^= v[1]
+		}
+		lsb := v[1] & 1
+		v[1] = v[1]>>1 | v[0]<<63
+		v[0] >>= 1
+		if lsb == 1 {
+			v[0] ^= 0xe1 << 56
+		}
+	}
+	return z
+}
+
+func tnBE128(b []byte) [2]uint64 {
+	return [2]uint64{binary.BigEndian.Uint64(b), binary.BigEndian.Uint64(b[8:])}
+}
+
+func tnPolyval(h []byte, data []byte) []byte {
+	hr := tnBE128(tnReverse(h))
+	// mulX in GHASH's field
+	lsb := hr[1] & 1
+	hr[1] = hr[1]>>1 | hr[0]<<63
+	hr[0] >>= 1
+	if lsb == 1 {
+		hr[0] ^= 0xe1 << 56
+	}
+	var s [2]uint64
+	for i := 0; i < len(data); i += 16 {
+		x := tnBE128(tnReverse(data[i : i+16]))
+		s[0] ^= x[0]
+		s[1] ^= x[1]
+		s = tnGFMul(s, hr)
+	}
+	out := make([]byte, 16)
+	binary.BigEndian.PutUint64(out, s[0])
+	binary.BigEndian.PutUint64(out[8:], s[1])
+	return tnReverse(out)
+}
+
+func tnPad16(b []byte) []byte {
+	out := append([]byte{}, b...)
+	for len(out)%16 != 0 {
+		out = append(out, 0)
+	}
+	return out
+}
+
+func tnGCMSIVKeys(key, nonce []byte) ([]byte, cipher.Block) {
+	kb, _ := aes.NewCipher(key)
+	derive := func(i uint32) []byte {
+		in := make([]byte, 16)
+		binary.LittleEndian.PutUint32(in, i)
+		copy(in[4:], nonce)
+		out := make([]byte, 16)
+		kb.Encrypt(out, in)
+		return out[:8]
+	}
+	auth := append(derive(0), derive(1)...)
+	enc := []byte{}
+	for i := uint32(2); len(enc) < len(key); i++ {
+		enc = append(enc, derive(i)...)
+	}
+	eb, _ := aes.NewCipher(enc)
+	return auth, eb
+}
+
+func tnGCMSIVTag(auth []byte, eb cipher.Block, nonce, aad, plain []byte) []byte {
+	lengths := make([]byte, 16)
+	binary.LittleEndian.PutUint64(lengths, uint64(len(aad))*8)
+	binary.LittleEndian.PutUint64(lengths[8:], uint64(len(plain))*8)
+	input := append(append(tnPad16(aad), tnPad16(plain)...), lengths...)
+	s := tnPolyval(auth, input)
+	for i := 0; i < 12; i++ {
+		s[i] ^= nonce[i]
+	}
+	s[15] &= 0x7f
+	tag := make([]byte, 16)
+	eb.Encrypt(tag, s)
+	return tag
+}
+
+func tnGCMSIVCtr(eb cipher.Block, tag, data []byte) []byte {
+	ctr := append([]byte{}, tag...)
+	ctr[15] |= 0x80
+	out := make([]byte, len(data))
+	ks := make([]byte, 16)
+	for i := 0; i < len(data); i += 16 {
+		eb.Encrypt(ks, ctr)
+		end := i + 16
+		if end > len(data) {
+			end = len(data)
+		}
+		subtle.XORBytes(out[i:end], data[i:end], ks)
+		binary.LittleEndian.PutUint32(ctr, binary.LittleEndian.Uint32(ctr)+1)
+	}
+	return out
+}
+
+// AES-SIV / AES-GCM-SIV take the whole message in one update(), as with
+// OpenSSL; decryption reports a bad tag from final()
+func (c *TnCipher) sivUpdate(data []byte) []byte {
+	if c.updated {
+		panic(TnNodeError("Error", "", "Trying to add data in unsupported state"))
+	}
+	c.updated = true
+	key := c.pending
+	if c.mode == "siv" {
+		half := len(key) / 2
+		mac, _ := aes.NewCipher(key[:half])
+		ctr, _ := aes.NewCipher(key[half:])
+		if !c.decrypt {
+			c.authTag = tnS2V(mac, c.aads, data)
+			return tnSIVCtr(ctr, c.authTag, data)
+		}
+		plain := []byte{}
+		if len(c.authTag) == 16 {
+			plain = tnSIVCtr(ctr, c.authTag, data)
+		}
+		if len(c.authTag) != 16 || subtle.ConstantTimeCompare(tnS2V(mac, c.aads, plain), c.authTag) != 1 {
+			c.authFailed = true
+			return []byte{}
+		}
+		return plain
+	}
+	auth, enc := tnGCMSIVKeys(key, c.iv)
+	if !c.decrypt {
+		c.authTag = tnGCMSIVTag(auth, enc, c.iv, c.aad, data)
+		return tnGCMSIVCtr(enc, c.authTag, data)
+	}
+	if len(c.authTag) != 16 {
+		c.authFailed = true
+		return []byte{}
+	}
+	plain := tnGCMSIVCtr(enc, c.authTag, data)
+	c.authFailed = subtle.ConstantTimeCompare(tnGCMSIVTag(auth, enc, c.iv, c.aad, plain), c.authTag) != 1
+	return plain
+}
+
+func (c *TnCipher) sivFinal() []byte {
+	if !c.updated {
+		if c.mode == "siv" {
+			panic(TnNodeError("Error", "", "Unsupported state or unable to authenticate data"))
+		}
+		c.sivUpdate([]byte{})
+	}
+	if c.authFailed {
+		panic(TnNodeError("Error", "", "Unsupported state or unable to authenticate data"))
+	}
+	return []byte{}
+}
+
 func (c *TnCipher) update(data interface{}, inputEncoding ...string) []byte {
 	enc := ""
 	if len(inputEncoding) > 0 {
@@ -484,6 +776,12 @@ func (c *TnCipher) final() []byte { return c.finish() }
 func (c *TnCipher) finalString(enc string) string { return TnBufferToString(c.finish(), enc) }
 
 func (c *TnCipher) setAAD(aad []byte, options ...interface{}) *TnCipher {
+	// SIV authenticates each setAAD() as its own component; GCM-SIV concatenates them
+	c.aads = append(c.aads, append([]byte{}, aad...))
+	if c.mode == "gcm-siv" {
+		c.aad = append(c.aad, aad...)
+		return c
+	}
 	c.aad = aad
 	return c
 }
@@ -545,20 +843,289 @@ func TnRandomUUIDv7() string {
 }
 
 // crypto.createMac(algorithm, key, options): HMAC (options.digest), KMAC128 /
-// KMAC256 (options.outputLength / customization) and AES-CMAC (options.cipher)
+// KMAC256 (options.outputLength / customization), AES-CMAC (options.cipher),
+// GMAC (options.cipher / iv), Poly1305, SipHash-2-4 (outputLength 8 / 16),
+// BLAKE2b / BLAKE2s (outputLength, salt, customization: the personalization)
 type TnMac struct {
 	alg       string
 	h         hash.Hash
 	kmac      *sha3.SHAKE
 	outLen    int
 	cmac      cipher.Block
+	gmac      cipher.AEAD
+	key       []byte
+	iv        []byte
+	salt      []byte
+	personal  []byte
 	data      []byte
 	finalized bool
 }
 
 func TnGetMacs() []string {
-	return []string{"cmac", "hmac", "kmac-128", "kmac-256", "kmac128", "kmac256"}
+	return []string{"blake2bmac", "blake2smac", "cmac", "gmac", "hmac", "kmac-128", "kmac-256", "kmac128", "kmac256", "poly1305", "siphash"}
 }
+
+var tnBlake2Sigma = [10][16]byte{
+	{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+	{14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+	{11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+	{7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+	{9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+	{2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+	{12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+	{13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+	{6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+	{10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0},
+}
+
+var tnBlake2bIV = [8]uint64{0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1, 0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179}
+var tnBlake2sIV = [8]uint32{0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19}
+
+func tnMacKeyLengthError() *TnError {
+	return TnNodeError("Error", "ERR_OSSL_INVALID_KEY_LENGTH", "error:1C800069:Provider routines::invalid key length")
+}
+
+func tnBlake2b(key, salt, personal, msg []byte, outLen int) []byte {
+	var h [8]uint64
+	h = tnBlake2bIV
+	h[0] ^= 0x01010000 ^ uint64(len(key))<<8 ^ uint64(outLen)
+	var s, p [16]byte
+	copy(s[:], salt)
+	copy(p[:], personal)
+	h[4] ^= binary.LittleEndian.Uint64(s[0:])
+	h[5] ^= binary.LittleEndian.Uint64(s[8:])
+	h[6] ^= binary.LittleEndian.Uint64(p[0:])
+	h[7] ^= binary.LittleEndian.Uint64(p[8:])
+	data := msg
+	if len(key) > 0 {
+		block := make([]byte, 128)
+		copy(block, key)
+		data = append(block, msg...)
+	}
+	var t uint64
+	compress := func(block []byte, last bool) {
+		var m [16]uint64
+		for i := range m {
+			m[i] = binary.LittleEndian.Uint64(block[i*8:])
+		}
+		var v [16]uint64
+		copy(v[:8], h[:])
+		copy(v[8:], tnBlake2bIV[:])
+		v[12] ^= t
+		if last {
+			v[14] = ^v[14]
+		}
+		g := func(a, b, c, d int, x, y uint64) {
+			v[a] = v[a] + v[b] + x
+			v[d] = bits.RotateLeft64(v[d]^v[a], -32)
+			v[c] = v[c] + v[d]
+			v[b] = bits.RotateLeft64(v[b]^v[c], -24)
+			v[a] = v[a] + v[b] + y
+			v[d] = bits.RotateLeft64(v[d]^v[a], -16)
+			v[c] = v[c] + v[d]
+			v[b] = bits.RotateLeft64(v[b]^v[c], -63)
+		}
+		for r := 0; r < 12; r++ {
+			s := tnBlake2Sigma[r%10]
+			g(0, 4, 8, 12, m[s[0]], m[s[1]])
+			g(1, 5, 9, 13, m[s[2]], m[s[3]])
+			g(2, 6, 10, 14, m[s[4]], m[s[5]])
+			g(3, 7, 11, 15, m[s[6]], m[s[7]])
+			g(0, 5, 10, 15, m[s[8]], m[s[9]])
+			g(1, 6, 11, 12, m[s[10]], m[s[11]])
+			g(2, 7, 8, 13, m[s[12]], m[s[13]])
+			g(3, 4, 9, 14, m[s[14]], m[s[15]])
+		}
+		for i := 0; i < 8; i++ {
+			h[i] ^= v[i] ^ v[i+8]
+		}
+	}
+	for len(data) > 128 {
+		t += 128
+		compress(data[:128], false)
+		data = data[128:]
+	}
+	last := make([]byte, 128)
+	copy(last, data)
+	t += uint64(len(data))
+	compress(last, true)
+	out := make([]byte, 64)
+	for i, w := range h {
+		binary.LittleEndian.PutUint64(out[i*8:], w)
+	}
+	return out[:outLen]
+}
+
+func tnBlake2s(key, salt, personal, msg []byte, outLen int) []byte {
+	var h [8]uint32
+	h = tnBlake2sIV
+	h[0] ^= 0x01010000 ^ uint32(len(key))<<8 ^ uint32(outLen)
+	var s, p [8]byte
+	copy(s[:], salt)
+	copy(p[:], personal)
+	h[4] ^= binary.LittleEndian.Uint32(s[0:])
+	h[5] ^= binary.LittleEndian.Uint32(s[4:])
+	h[6] ^= binary.LittleEndian.Uint32(p[0:])
+	h[7] ^= binary.LittleEndian.Uint32(p[4:])
+	data := msg
+	if len(key) > 0 {
+		block := make([]byte, 64)
+		copy(block, key)
+		data = append(block, msg...)
+	}
+	var t uint64
+	compress := func(block []byte, last bool) {
+		var m [16]uint32
+		for i := range m {
+			m[i] = binary.LittleEndian.Uint32(block[i*4:])
+		}
+		var v [16]uint32
+		copy(v[:8], h[:])
+		copy(v[8:], tnBlake2sIV[:])
+		v[12] ^= uint32(t)
+		v[13] ^= uint32(t >> 32)
+		if last {
+			v[14] = ^v[14]
+		}
+		g := func(a, b, c, d int, x, y uint32) {
+			v[a] = v[a] + v[b] + x
+			v[d] = bits.RotateLeft32(v[d]^v[a], -16)
+			v[c] = v[c] + v[d]
+			v[b] = bits.RotateLeft32(v[b]^v[c], -12)
+			v[a] = v[a] + v[b] + y
+			v[d] = bits.RotateLeft32(v[d]^v[a], -8)
+			v[c] = v[c] + v[d]
+			v[b] = bits.RotateLeft32(v[b]^v[c], -7)
+		}
+		for r := 0; r < 10; r++ {
+			s := tnBlake2Sigma[r]
+			g(0, 4, 8, 12, m[s[0]], m[s[1]])
+			g(1, 5, 9, 13, m[s[2]], m[s[3]])
+			g(2, 6, 10, 14, m[s[4]], m[s[5]])
+			g(3, 7, 11, 15, m[s[6]], m[s[7]])
+			g(0, 5, 10, 15, m[s[8]], m[s[9]])
+			g(1, 6, 11, 12, m[s[10]], m[s[11]])
+			g(2, 7, 8, 13, m[s[12]], m[s[13]])
+			g(3, 4, 9, 14, m[s[14]], m[s[15]])
+		}
+		for i := 0; i < 8; i++ {
+			h[i] ^= v[i] ^ v[i+8]
+		}
+	}
+	for len(data) > 64 {
+		t += 64
+		compress(data[:64], false)
+		data = data[64:]
+	}
+	last := make([]byte, 64)
+	copy(last, data)
+	t += uint64(len(data))
+	compress(last, true)
+	out := make([]byte, 32)
+	for i, w := range h {
+		binary.LittleEndian.PutUint32(out[i*4:], w)
+	}
+	return out[:outLen]
+}
+
+// SipHash-2-4 with a 64- or 128-bit output
+func tnSipHash(key, msg []byte, outLen int) []byte {
+	k0 := binary.LittleEndian.Uint64(key[0:])
+	k1 := binary.LittleEndian.Uint64(key[8:])
+	v0 := k0 ^ 0x736f6d6570736575
+	v1 := k1 ^ 0x646f72616e646f6d
+	v2 := k0 ^ 0x6c7967656e657261
+	v3 := k1 ^ 0x7465646279746573
+	if outLen == 16 {
+		v1 ^= 0xee
+	}
+	round := func() {
+		v0 += v1
+		v1 = bits.RotateLeft64(v1, 13)
+		v1 ^= v0
+		v0 = bits.RotateLeft64(v0, 32)
+		v2 += v3
+		v3 = bits.RotateLeft64(v3, 16)
+		v3 ^= v2
+		v0 += v3
+		v3 = bits.RotateLeft64(v3, 21)
+		v3 ^= v0
+		v2 += v1
+		v1 = bits.RotateLeft64(v1, 17)
+		v1 ^= v2
+		v2 = bits.RotateLeft64(v2, 32)
+	}
+	n := len(msg)
+	for len(msg) >= 8 {
+		m := binary.LittleEndian.Uint64(msg)
+		v3 ^= m
+		round()
+		round()
+		v0 ^= m
+		msg = msg[8:]
+	}
+	var lastBlock [8]byte
+	copy(lastBlock[:], msg)
+	lastBlock[7] = byte(n)
+	m := binary.LittleEndian.Uint64(lastBlock[:])
+	v3 ^= m
+	round()
+	round()
+	v0 ^= m
+	if outLen == 16 {
+		v2 ^= 0xee
+	} else {
+		v2 ^= 0xff
+	}
+	for i := 0; i < 4; i++ {
+		round()
+	}
+	out := binary.LittleEndian.AppendUint64(nil, v0^v1^v2^v3)
+	if outLen == 16 {
+		v1 ^= 0xdd
+		for i := 0; i < 4; i++ {
+			round()
+		}
+		out = binary.LittleEndian.AppendUint64(out, v0^v1^v2^v3)
+	}
+	return out
+}
+
+// Poly1305 (RFC 8439) over math/big
+func tnPoly1305(key, msg []byte) []byte {
+	clamp := make([]byte, 16)
+	copy(clamp, key[:16])
+	clamp[3] &= 15
+	clamp[7] &= 15
+	clamp[11] &= 15
+	clamp[15] &= 15
+	clamp[4] &= 252
+	clamp[8] &= 252
+	clamp[12] &= 252
+	r := new(tnbig.Int).SetBytes(tnReverse(clamp))
+	s := new(tnbig.Int).SetBytes(tnReverse(key[16:32]))
+	p := new(tnbig.Int).Sub(new(tnbig.Int).Lsh(tnbig.NewInt(1), 130), tnbig.NewInt(5))
+	acc := new(tnbig.Int)
+	for len(msg) > 0 {
+		n := 16
+		if len(msg) < n {
+			n = len(msg)
+		}
+		block := append(append([]byte{}, msg[:n]...), 1)
+		acc.Add(acc, new(tnbig.Int).SetBytes(tnReverse(block)))
+		acc.Mul(acc, r)
+		acc.Mod(acc, p)
+		msg = msg[n:]
+	}
+	acc.Add(acc, s)
+	out := make([]byte, 16)
+	b := acc.Bytes()
+	for i := 0; i < 16 && i < len(b); i++ {
+		out[i] = b[len(b)-1-i]
+	}
+	return out
+}
+
 
 func tnLeftEncode(x uint64) []byte {
 	n := 1
@@ -640,6 +1207,66 @@ func TnCreateMac(alg string, key interface{}, options ...interface{}) *TnMac {
 			panic(TnNodeError("Error", "ERR_OSSL_INVALID_KEY_LENGTH", "error:1C800069:Provider routines::invalid key length"))
 		}
 		m.cmac = block
+	case "gmac":
+		name, _ := option("cipher").(string)
+		if name == "" {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.cipher' is required for GMAC"))
+		}
+		iv := option("iv")
+		if iv == nil || TnIsNil(iv) || len(tnCryptoBytes(iv, "")) == 0 {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.iv' must be non-empty for GMAC"))
+		}
+		parts := strings.Split(strings.ToLower(name), "-")
+		if len(parts) != 3 || parts[0] != "aes" || parts[2] != "gcm" {
+			panic(TnNodeError("Error", "ERR_CRYPTO_INVALID_CIPHER", "Invalid cipher: "+name))
+		}
+		if strconv.Itoa(len(k)*8) != parts[1] {
+			panic(tnMacKeyLengthError())
+		}
+		block, _ := aes.NewCipher(k)
+		m.iv = tnCryptoBytes(iv, "")
+		aead, err := cipher.NewGCMWithNonceSize(block, len(m.iv))
+		if err != nil {
+			panic(TnNodeError("Error", "ERR_CRYPTO_OPERATION_FAILED", "Failed to initialize MAC"))
+		}
+		m.gmac = aead
+	case "poly1305":
+		if len(k) != 32 {
+			panic(tnMacKeyLengthError())
+		}
+		m.key = k
+	case "siphash":
+		m.outLen = 16
+		if n, ok := option("outputLength").(float64); ok {
+			m.outLen = int(n)
+		}
+		if len(k) != 16 || m.outLen != 8 && m.outLen != 16 {
+			panic(TnNodeError("Error", "ERR_CRYPTO_OPERATION_FAILED", "Failed to initialize MAC"))
+		}
+		m.key = k
+	case "blake2bmac", "blake2smac":
+		max := 64
+		if m.alg == "blake2smac" {
+			max = 32
+		}
+		m.outLen = max
+		if n, ok := option("outputLength").(float64); ok {
+			m.outLen = int(n)
+		}
+		if len(k) == 0 || len(k) > max {
+			panic(tnMacKeyLengthError())
+		}
+		// salt and personalization are zero-padded to their full size
+		if v := option("salt"); v != nil && !TnIsNil(v) {
+			m.salt = tnCryptoBytes(v, "")
+		}
+		if v := option("customization"); v != nil && !TnIsNil(v) {
+			m.personal = tnCryptoBytes(v, "")
+		}
+		if m.outLen < 1 || m.outLen > max || len(m.salt) > max/4 || len(m.personal) > max/4 {
+			panic(TnNodeError("Error", "ERR_CRYPTO_OPERATION_FAILED", "Failed to initialize MAC"))
+		}
+		m.key = k
 	default:
 		panic(TnNodeError("Error", "ERR_CRYPTO_INVALID_DIGEST", "Invalid MAC algorithm: "+alg))
 	}
@@ -666,57 +1293,6 @@ func (m *TnMac) update(data interface{}, enc ...string) *TnMac {
 	return m
 }
 
-// AES-CMAC (RFC 4493)
-func tnCmac(block cipher.Block, msg []byte) []byte {
-	shift := func(in []byte) []byte {
-		out := make([]byte, 16)
-		carry := byte(0)
-		for i := 15; i >= 0; i-- {
-			out[i] = in[i]<<1 | carry
-			carry = in[i] >> 7
-		}
-		if in[0]&0x80 != 0 {
-			out[15] ^= 0x87
-		}
-		return out
-	}
-	l := make([]byte, 16)
-	block.Encrypt(l, l)
-	k1 := shift(l)
-	k2 := shift(k1)
-	n := (len(msg) + 15) / 16
-	complete := n > 0 && len(msg)%16 == 0
-	if n == 0 {
-		n = 1
-	}
-	last := make([]byte, 16)
-	if complete {
-		copy(last, msg[(n-1)*16:])
-		for i := range last {
-			last[i] ^= k1[i]
-		}
-	} else {
-		rest := msg[(n-1)*16:]
-		copy(last, rest)
-		last[len(rest)] = 0x80
-		for i := range last {
-			last[i] ^= k2[i]
-		}
-	}
-	x := make([]byte, 16)
-	for i := 0; i < n-1; i++ {
-		for j := 0; j < 16; j++ {
-			x[j] ^= msg[i*16+j]
-		}
-		block.Encrypt(x, x)
-	}
-	for j := 0; j < 16; j++ {
-		x[j] ^= last[j]
-	}
-	block.Encrypt(x, x)
-	return x
-}
-
 func (m *TnMac) final() []byte {
 	if m.finalized {
 		panic(TnNodeError("Error", "ERR_CRYPTO_HASH_FINALIZED", "Digest already called"))
@@ -730,6 +1306,18 @@ func (m *TnMac) final() []byte {
 		out := make([]byte, m.outLen)
 		m.kmac.Read(out)
 		return out
+	case m.gmac != nil:
+		return m.gmac.Seal(nil, m.iv, nil, m.data)
+	}
+	switch m.alg {
+	case "poly1305":
+		return tnPoly1305(m.key, m.data)
+	case "siphash":
+		return tnSipHash(m.key, m.data, m.outLen)
+	case "blake2bmac":
+		return tnBlake2b(m.key, m.salt, m.personal, m.data, m.outLen)
+	case "blake2smac":
+		return tnBlake2s(m.key, m.salt, m.personal, m.data, m.outLen)
 	}
 	return tnCmac(m.cmac, m.data)
 }
@@ -755,6 +1343,7 @@ export function registerCrypto(r) {
         'crypto/sha512',
         'crypto/subtle',
         'encoding',
+        'encoding/binary',
         'encoding/hex',
         'hash',
         'math/big',
@@ -796,7 +1385,7 @@ export function registerCrypto(r) {
     fn('getCiphers', '[]string', (_c) => 'TnGetCiphers()');
     fn('randomBytes', '[]byte', (c) => `TnRandomBytes(${c.args[0]})`);
     fn('randomUUID', 'string', (_c) => 'TnRandomUUID()');
-    defineHelper(r, 'nodeCryptoMac', ['crypto/aes', 'crypto/cipher', 'crypto/hmac', 'crypto/sha3', 'encoding/hex', 'hash', 'strings', 'time'], ['nodeCrypto'], cryptoMacHelper);
+    defineHelper(r, 'nodeCryptoMac', ['crypto/aes', 'crypto/cipher', 'crypto/hmac', 'crypto/sha3', 'encoding/binary', 'encoding/hex', 'hash', 'math/big', 'math/bits', 'strconv', 'strings', 'time'], ['nodeCrypto'], cryptoMacHelper);
     const mac = (name, result, emit) => {
         r.functions[`crypto.${name}`] = (call) => {
             r.helper('nodeCryptoMac');
