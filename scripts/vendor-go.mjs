@@ -15,6 +15,9 @@ import path from 'node:path';
 const MODULES = [
   ['github.com/ncruces/go-sqlite3', 'v0.35.6'],
   ['github.com/andybalholm/brotli', 'v1.2.6'],
+  // node:zlib's Zstd codecs (pure Go; decodes libzstd's frames). `go mod
+  // vendor` only copies imported packages, so the zstd subpackage is listed too
+  ['github.com/klauspost/compress', 'v1.20.4', ['zstd'].map((p) => `github.com/klauspost/compress/${p}`)],
   ['github.com/fsnotify/fsnotify', 'v1.10.1'],
   ['github.com/jchv/go-webview2', 'v0.0.0-20260205173254-56598839c808'],
   // the WebAssembly global and node:wasi's runtime (pure Go, no cgo); `go mod

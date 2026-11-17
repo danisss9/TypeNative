@@ -267,8 +267,8 @@ declare module 'node:fs' {
     function exists(path: PathLike, callback: (exists: boolean) => void): void;
 
     // --- streams ---
-    function createReadStream(path: PathLike, options?: BufferEncoding | { encoding?: BufferEncoding; start?: number; end?: number; highWaterMark?: number }): ReadStream;
-    function createWriteStream(path: PathLike, options?: BufferEncoding | { flags?: string; encoding?: BufferEncoding }): WriteStream;
+    function createReadStream(path: PathLike, options?: BufferEncoding | { encoding?: BufferEncoding; start?: number; end?: number; highWaterMark?: number; windowsHandle?: bigint }): ReadStream;
+    function createWriteStream(path: PathLike, options?: BufferEncoding | { flags?: string; encoding?: BufferEncoding; windowsHandle?: bigint }): WriteStream;
 
     // --- watching: fs.watch on the OS's notifications (fsnotify), watchFile polls stat() ---
     type WatchEventType = 'rename' | 'change';
@@ -1125,6 +1125,21 @@ declare module 'node:zlib' {
     namespace brotliDecompress { function __promisify__(buf: InputType, options?: BrotliOptions): Promise<Buffer>; }
     function createBrotliCompress(options?: BrotliOptions): import('node:stream').Transform;
     function createBrotliDecompress(options?: BrotliOptions): import('node:stream').Transform;
+    // Zstd: `level` (libzstd's 1-22) and `params` keyed by constants.ZSTD_c_*
+    interface ZstdOptions {
+      level?: number;
+      params?: { [key: number]: number };
+    }
+    function zstdCompressSync(buf: InputType, options?: ZstdOptions): Buffer;
+    function zstdDecompressSync(buf: InputType, options?: ZstdOptions): Buffer;
+    function zstdCompress(buf: InputType, callback: CompressCallback): void;
+    function zstdCompress(buf: InputType, options: ZstdOptions, callback: CompressCallback): void;
+    function zstdDecompress(buf: InputType, callback: CompressCallback): void;
+    function zstdDecompress(buf: InputType, options: ZstdOptions, callback: CompressCallback): void;
+    namespace zstdCompress { function __promisify__(buf: InputType, options?: ZstdOptions): Promise<Buffer>; }
+    namespace zstdDecompress { function __promisify__(buf: InputType, options?: ZstdOptions): Promise<Buffer>; }
+    function createZstdCompress(options?: ZstdOptions): import('node:stream').Transform;
+    function createZstdDecompress(options?: ZstdOptions): import('node:stream').Transform;
     const constants: {
       readonly Z_NO_FLUSH: number;
       readonly Z_SYNC_FLUSH: number;
@@ -1161,6 +1176,69 @@ declare module 'node:zlib' {
       readonly BROTLI_PARAM_SIZE_HINT: number;
       readonly BROTLI_DECODER_RESULT_ERROR: number;
       readonly BROTLI_DECODER_RESULT_SUCCESS: number;
+      readonly ZSTD_COMPRESS: number;
+      readonly ZSTD_DECOMPRESS: number;
+      readonly ZSTD_e_continue: number;
+      readonly ZSTD_e_flush: number;
+      readonly ZSTD_e_end: number;
+      readonly ZSTD_fast: number;
+      readonly ZSTD_dfast: number;
+      readonly ZSTD_greedy: number;
+      readonly ZSTD_lazy: number;
+      readonly ZSTD_lazy2: number;
+      readonly ZSTD_btlazy2: number;
+      readonly ZSTD_btopt: number;
+      readonly ZSTD_btultra: number;
+      readonly ZSTD_btultra2: number;
+      readonly ZSTD_c_compressionLevel: number;
+      readonly ZSTD_c_windowLog: number;
+      readonly ZSTD_c_hashLog: number;
+      readonly ZSTD_c_chainLog: number;
+      readonly ZSTD_c_searchLog: number;
+      readonly ZSTD_c_minMatch: number;
+      readonly ZSTD_c_targetLength: number;
+      readonly ZSTD_c_strategy: number;
+      readonly ZSTD_c_enableLongDistanceMatching: number;
+      readonly ZSTD_c_ldmHashLog: number;
+      readonly ZSTD_c_ldmMinMatch: number;
+      readonly ZSTD_c_ldmBucketSizeLog: number;
+      readonly ZSTD_c_ldmHashRateLog: number;
+      readonly ZSTD_c_contentSizeFlag: number;
+      readonly ZSTD_c_checksumFlag: number;
+      readonly ZSTD_c_dictIDFlag: number;
+      readonly ZSTD_c_nbWorkers: number;
+      readonly ZSTD_c_jobSize: number;
+      readonly ZSTD_c_overlapLog: number;
+      readonly ZSTD_d_windowLogMax: number;
+      readonly ZSTD_CLEVEL_DEFAULT: number;
+      readonly ZSTD_error_no_error: number;
+      readonly ZSTD_error_GENERIC: number;
+      readonly ZSTD_error_prefix_unknown: number;
+      readonly ZSTD_error_version_unsupported: number;
+      readonly ZSTD_error_frameParameter_unsupported: number;
+      readonly ZSTD_error_frameParameter_windowTooLarge: number;
+      readonly ZSTD_error_corruption_detected: number;
+      readonly ZSTD_error_checksum_wrong: number;
+      readonly ZSTD_error_literals_headerWrong: number;
+      readonly ZSTD_error_dictionary_corrupted: number;
+      readonly ZSTD_error_dictionary_wrong: number;
+      readonly ZSTD_error_dictionaryCreation_failed: number;
+      readonly ZSTD_error_parameter_unsupported: number;
+      readonly ZSTD_error_parameter_combination_unsupported: number;
+      readonly ZSTD_error_parameter_outOfBound: number;
+      readonly ZSTD_error_tableLog_tooLarge: number;
+      readonly ZSTD_error_maxSymbolValue_tooLarge: number;
+      readonly ZSTD_error_maxSymbolValue_tooSmall: number;
+      readonly ZSTD_error_stabilityCondition_notRespected: number;
+      readonly ZSTD_error_stage_wrong: number;
+      readonly ZSTD_error_init_missing: number;
+      readonly ZSTD_error_memory_allocation: number;
+      readonly ZSTD_error_workSpace_tooSmall: number;
+      readonly ZSTD_error_dstSize_tooSmall: number;
+      readonly ZSTD_error_srcSize_wrong: number;
+      readonly ZSTD_error_dstBuffer_null: number;
+      readonly ZSTD_error_noForwardProgress_destFull: number;
+      readonly ZSTD_error_noForwardProgress_inputEmpty: number;
     };
     interface ZipEntryCreateOptionsBase {
       comment?: string;
@@ -1170,15 +1248,25 @@ declare module 'node:zlib' {
     interface ZipEntryCreateOptions extends ZipEntryCreateOptionsBase {
       method?: 'deflate' | 'store' | 'zstd';
     }
+    interface ZipContentOptions {
+      verify?: boolean;
+      maxSize?: number;
+    }
     interface CreateZipArchiveOptions {
       comment?: string;
       baseOffset?: number;
     }
-    type ZipInputType = string | Uint8Array;
+    interface ZipFilesOptions extends CreateZipArchiveOptions {
+      followSymlinks?: boolean;
+    }
+    type ZipInputType = Uint8Array | ArrayBuffer | DataView;
     class ZipEntry {
+      private constructor();
       static createSync(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): ZipEntry;
       static create(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): Promise<ZipEntry>;
+      static createStream(filename: string, source: AsyncIterable<Uint8Array>, options?: ZipEntryCreateOptions): ZipEntry;
       static createSymlink(filename: string, target: string, options?: ZipEntryCreateOptionsBase): ZipEntry;
+      static read(buffer: ZipInputType): IterableIterator<ZipEntry>;
       readonly name: string;
       readonly nameBuffer: Buffer;
       readonly comment: string;
@@ -1194,9 +1282,10 @@ declare module 'node:zlib' {
       readonly isFile: boolean;
       readonly isSymlink: boolean;
       readonly rawContent: Buffer | null;
-      contentSync(options?: { maxSize?: number }): Buffer;
-      content(options?: { maxSize?: number }): Promise<Buffer>;
-      dispose(): void;
+      contentSync(options?: ZipContentOptions): Buffer;
+      content(options?: ZipContentOptions): Promise<Buffer>;
+      contentIterator(options?: ZipContentOptions): AsyncIterableIterator<Buffer>;
+      [Symbol.dispose](): void;
     }
     class ZipBuffer {
       constructor(buffer: ZipInputType);
@@ -1205,18 +1294,22 @@ declare module 'node:zlib' {
       addEntry(entry: ZipEntry): ZipEntry;
       clear(): void;
       delete(name: string): boolean;
-      entries(): [string, ZipEntry][];
+      entries(): IterableIterator<[string, ZipEntry]>;
+      forEach(callback: (entry: ZipEntry, name: string, buffer: ZipBuffer) => void): void;
       get(name: string): ZipEntry;
       has(name: string): boolean;
-      keys(): string[];
-      values(): ZipEntry[];
+      keys(): IterableIterator<string>;
+      values(): IterableIterator<ZipEntry>;
       toBufferSync(options?: string | CreateZipArchiveOptions): Buffer;
       toBuffer(options?: string | CreateZipArchiveOptions): Promise<Buffer>;
+      [Symbol.iterator](): IterableIterator<[string, ZipEntry]>;
+      [Symbol.dispose](): void;
       readonly comment: string;
       readonly size: number;
       readonly writable: boolean;
     }
     class ZipFile {
+      private constructor();
       static openSync(filename: string, options?: { writable?: boolean }): ZipFile;
       static open(filename: string, options?: { writable?: boolean }): Promise<ZipFile>;
       addSync(filename: string, data: ZipInputType, options?: ZipEntryCreateOptions): ZipEntry;
@@ -1228,20 +1321,30 @@ declare module 'node:zlib' {
       getSync(name: string): ZipEntry;
       get(name: string): Promise<ZipEntry>;
       has(name: string): boolean;
+      stream(name: string, options?: ZipContentOptions): Promise<import('node:stream').Readable>;
       compactSync(comment?: string): Buffer;
-      compact(comment?: string): Promise<Buffer>;
+      compact(comment?: string): import('node:stream').Readable;
       closeSync(): void;
       close(): Promise<void>;
-      entriesSync(): [string, ZipEntry][];
-      keys(): string[];
-      valuesSync(): ZipEntry[];
+      entries(): IterableIterator<[string, Promise<ZipEntry>]>;
+      entriesSync(): IterableIterator<[string, ZipEntry]>;
+      forEach(callback: (entry: Promise<ZipEntry>, name: string, file: ZipFile) => void): void;
+      forEachSync(callback: (entry: ZipEntry, name: string, file: ZipFile) => void): void;
+      keys(): IterableIterator<string>;
+      values(): IterableIterator<Promise<ZipEntry>>;
+      valuesSync(): IterableIterator<ZipEntry>;
+      [Symbol.iterator](): IterableIterator<[string, Promise<ZipEntry>]>;
+      [Symbol.dispose](): void;
       readonly comment: string;
       readonly size: number;
       readonly writable: boolean;
     }
-    function createZipArchiveSync(entries: ZipEntry[], options?: string | CreateZipArchiveOptions): Buffer[];
-    function createZipArchive(entries: ZipEntry[], options?: string | CreateZipArchiveOptions): Promise<Buffer[]>;
-    function zipFiles(files: [string, string][], options?: string | CreateZipArchiveOptions): Buffer;
+    function createZipArchiveSync(entries: Iterable<ZipEntry>, options?: string | CreateZipArchiveOptions): Generator<Buffer, void>;
+    function createZipArchive(
+      entries: Iterable<ZipEntry> | AsyncIterable<ZipEntry>,
+      options?: string | CreateZipArchiveOptions
+    ): import('node:stream').Readable;
+    function zipFiles(files: Iterable<[string, string]>, options?: ZipFilesOptions): import('node:stream').Readable;
     function getMaxZipContentSize(): number;
     function setMaxZipContentSize(size: number): void;
   }
@@ -2014,10 +2117,12 @@ declare module 'node:v8' {
 declare module 'node:sea' {
   /** Always true: a TypeNative program is a single executable */
   export function isSea(): boolean;
-  /** TypeNative binaries carry no assets yet: throws ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND */
+  /** The asset embedded by --sea-config ({ assets: { key: path } }): a copy (throws ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND for a key the config doesn't name) */
   export function getAsset(key: string): ArrayBuffer;
   export function getAsset(key: string, encoding: string): string;
+  /** The asset's bytes as stored, without a copy */
   export function getRawAsset(key: string): ArrayBuffer;
+  export function getAssetAsBlob(key: string): import('node:buffer').Blob;
 }
 
 declare module 'node:diagnostics_channel' {
@@ -2929,11 +3034,16 @@ declare module 'node:test' {
       cwd?: string;
       argv?: readonly string[];
       setup?: (reporter: TestsStream) => void | Promise<void>;
+      /** Siblings run in a seeded random order */
+      randomize?: boolean;
+      /** The seed for randomize; giving it turns randomize on */
+      randomSeed?: number | undefined;
     }
     export interface TestsStream extends Readable {
       on(event: 'test:pass' | 'test:fail' | 'test:start' | 'test:complete' | 'test:enqueue' | 'test:dequeue', listener: (data: EventData.Test) => void): this;
       on(event: 'test:plan', listener: (data: EventData.TestPlan) => void): this;
       on(event: 'test:diagnostic' | 'test:stdout' | 'test:stderr', listener: (data: EventData.TestMessage) => void): this;
+      on(event: 'test:log', listener: (data: EventData.TestMessage) => void): this;
       on(event: 'test:summary', listener: (data: EventData.TestSummary) => void): this;
       on(event: 'test:coverage', listener: (data: EventData.TestCoverage) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;

@@ -97,11 +97,11 @@ async function main(): Promise<void> {
 
   let badVersion = '';
   try {
-    new WASI({ version: 'unstable' });
+    new WASI({ version: 'bogus' as any });
   } catch (e) {
     badVersion = (e as NodeJS.ErrnoException).code ?? '';
   }
-  assert(badVersion === 'ERR_INVALID_ARG_VALUE', 'only preview1');
+  assert(badVersion === 'ERR_INVALID_ARG_VALUE', "other versions than 'preview1' and 'unstable' rejected");
   fs.rmSync(dir, { recursive: true, force: true });
   console.log('ok');
 }

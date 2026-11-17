@@ -50,6 +50,9 @@ export interface RunOptions {
   profile: boolean;
   // --emit-go <dir>: write the Go sources and go.mod there instead of building
   emitGo: string | null;
+  // --sea-config <file>: node:sea's assets ({ assets: { key: path } }) to
+  // embed in the binary (node:sea getAsset / getRawAsset / getAssetAsBlob)
+  seaConfig: string | null;
 }
 
 // --profile: starts a CPU profile before any module initializes and stops
@@ -115,6 +118,8 @@ export interface CliArgs {
   output: string | null;
   target: string | null;
   emitGo: string | null;
+  // --sea-config <file>: node:sea assets to embed
+  seaConfig: string | null;
   // '' when the command line is valid
   error: string;
 }
@@ -138,6 +143,7 @@ Options:
   --profile            Write a CPU profile at exit, to $TYPENATIVE_CPUPROFILE
                        (default cpu.pprof); read it with go tool pprof
   --emit-go <dir>      Write the generated Go (and go.mod) to <dir> instead of building
+  --sea-config <file>  Embed node:sea assets (a JSON: { "assets": { "key": "path" } })
   --no-typecheck       Skip type-checking
   -h, --help           Show this help
   -v, --version        Show the TypeNative version
@@ -165,6 +171,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
     output: null,
     target: null,
     emitGo: null,
+    seaConfig: null,
     error: ''
   };
   for (let i = 0; i < argv.length; i++) {
@@ -184,7 +191,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
     else if (arg === '--gui') args.gui = true;
     else if (arg === '--cover') args.cover = true;
     else if (arg === '--profile') args.profile = true;
-    else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go') {
+    else if (arg === '--source' || arg === '--output' || arg === '--target' || arg === '--emit-go' || arg === '--sea-config') {
       if (value === null) {
         if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
           args.error = `${arg} needs a value`;
@@ -196,6 +203,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
       if (arg === '--source') args.source = value;
       else if (arg === '--output') args.output = value;
       else if (arg === '--target') args.target = value;
+      else if (arg === '--sea-config') args.seaConfig = value;
       else args.emitGo = value;
     } else if (arg.startsWith('-')) {
       args.error = `Unknown option: ${arg}`;
@@ -559,6 +567,33 @@ export function run(opts: RunOptions): void {
     };
     transpileOptions.resolveEmbed = (pattern: string, fromDir: string | null) =>
       resolveEmbedPattern(pattern, fromDir ?? sourceDir, sourceDir);
+  }
+  if (opts.seaConfig) {
+    // The config is relative to the working directory, or to the entry file's
+    // (the parallel runner runs probes from their own temp cwd)
+    let configFile = opts.seaConfig;
+    if (!path.isAbsolute(configFile) && !fs.existsSync(configFile) && sourcePath) {
+      const besideEntry = path.resolve(path.dirname(path.resolve(sourcePath)), configFile);
+      if (fs.existsSync(besideEntry)) configFile = besideEntry;
+    }
+    const configDir = path.dirname(path.resolve(configFile));
+    let config: { assets?: Record<string, string> };
+    try {
+      config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    } catch (err) {
+      console.error(`error: --sea-config ${configFile} is not readable JSON: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const seaAssets: Record<string, string> = {};
+    for (const [key, assetPath] of Object.entries(config.assets ?? {})) {
+      try {
+        seaAssets[key] = fs.readFileSync(path.resolve(configDir, assetPath)).toString('base64');
+      } catch (err) {
+        console.error(`error: --sea-config's asset ${key} (${assetPath}) is not readable: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }
+    transpileOptions.seaAssets = seaAssets;
   }
   const transpileResult = transpileToNative(tsCode, transpileOptions);
   if (transpileResult.diagnostics.length > 0) {

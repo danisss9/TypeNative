@@ -169,9 +169,41 @@ func TnV8Deserialize(buf []byte) interface{} {
 	}
 	return tnCloneDecode(v)
 }`;
-const seaHelper = `// node:sea: a TypeNative binary is a single executable without assets
-func TnSeaGetAsset(key string, encoding ...string) interface{} {
+const seaHelper = `// node:sea — every TypeNative binary is a single executable. Assets come from
+// --sea-config (the generated tn_sea.go fills the map), so a program built
+// without it has none, as Node's without an asset blob
+var tnSeaAssets map[string][]byte
+
+func tnSeaAsset(key string) []byte {
+	if data, ok := tnSeaAssets[key]; ok {
+		return data
+	}
 	panic(TnNodeError("Error", "ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND", "Cannot find asset "+key+" for the single executable application"))
+}
+
+// sea.getAsset(key[, encoding]): a copy of the asset (a Buffer, or a string
+// with an encoding)
+func TnSeaAssetGet(key string, encoding ...interface{}) interface{} {
+	data := tnSeaAsset(key)
+	if len(encoding) > 0 && encoding[0] != nil {
+		if enc, ok := encoding[0].(string); ok && enc != "" && enc != "buffer" {
+			return TnBufferToString(data, enc)
+		}
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out
+}
+
+// sea.getRawAsset(key): the bytes as stored (an ArrayBuffer, not a copy)
+func TnSeaGetRawAsset(key string) []byte {
+	return tnSeaAsset(key)
+}`;
+// sea.getAssetAsBlob — a helper of its own: the Blob type comes with the
+// web-streams helper
+const seaBlobHelper = `// sea.getAssetAsBlob(key)
+func TnSeaGetAssetBlob(key string) *TnBlob {
+	return TnNewBlob([]interface{}{tnSeaAsset(key)})
 }`;
 export function registerModuleV8(r) {
     defineModule(r, 'module');
@@ -229,12 +261,21 @@ export function registerModuleV8(r) {
     defineModule(r, 'sea');
     r.functions['sea.isSea'] = (_c) => 'true';
     r.results['sea.isSea'] = 'bool';
-    defineHelper(r, 'nodeSea', [], ['error'], seaHelper);
-    for (const name of ['getAsset', 'getRawAsset', 'getAssetAsBlob']) {
-        r.functions[`sea.${name}`] = (c) => {
-            r.helper('nodeSea');
-            return `TnSeaGetAsset(${c.args.join(', ')})`;
-        };
-        r.results[`sea.${name}`] = 'interface{}';
-    }
+    defineHelper(r, 'nodeSea', ['strings'], ['error', 'buffer'], seaHelper);
+    defineHelper(r, 'nodeSeaBlob', [], ['nodeSea', 'nodeStreamWeb'], seaBlobHelper);
+    r.functions['sea.getAsset'] = (c) => {
+        r.helper('nodeSea');
+        return `TnSeaAssetGet(${c.args.join(', ')})`;
+    };
+    r.results['sea.getAsset'] = 'interface{}';
+    r.functions['sea.getRawAsset'] = (c) => {
+        r.helper('nodeSea');
+        return `TnSeaGetRawAsset(${c.args[0]})`;
+    };
+    r.results['sea.getRawAsset'] = '[]byte';
+    r.functions['sea.getAssetAsBlob'] = (c) => {
+        r.helper('nodeSeaBlob');
+        return `TnSeaGetAssetBlob(${c.args[0]})`;
+    };
+    r.results['sea.getAssetAsBlob'] = '*TnBlob';
 }

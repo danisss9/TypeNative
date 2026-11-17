@@ -1,8 +1,11 @@
 // node:zlib — gzip / deflate (zlib format) / raw deflate, unzip (auto-detect),
-// crc32 on Go's compress/*, and Brotli on the vendored
-// github.com/andybalholm/brotli (pure Go; linked only into programs that use it).
+// crc32 on Go's compress/*, Brotli on the vendored
+// github.com/andybalholm/brotli and Zstd on the vendored
+// github.com/klauspost/compress (both pure Go; linked only into programs that
+// use them).
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { zipHelper, zipContainersHelper, zipStreamHelper } from './zlib_zip.js';
 
 const zlibHelper = `// node:zlib
 func tnZlibInput(v interface{}) []byte {
@@ -48,9 +51,19 @@ func tnZlibError(err error) *TnError {
 var tnBrotliEncode func(data []byte, options []interface{}) []byte
 var tnBrotliDecode func(data []byte) []byte
 
+// Set by the nodeZstd helper, so the Zstd codec (a vendored module) is
+// linked only into programs that use it
+var tnZstdEncode func(data []byte, options []interface{}) []byte
+// The ZIP archive writer's Zstd method (nil unless the codec is linked)
+var tnZipZstdEncode func(data []byte) []byte
+var tnZstdDecode func(data []byte) []byte
+
 func tnCompress(format string, data []byte, options []interface{}) []byte {
 	if format == "brotli" {
 		return tnBrotliEncode(data, options)
+	}
+	if format == "zstd" {
+		return tnZstdEncode(data, options)
 	}
 	level := tnZlibLevel(options)
 	var buf bytes.Buffer
@@ -75,6 +88,9 @@ func tnCompress(format string, data []byte, options []interface{}) []byte {
 func tnDecompress(format string, data []byte) []byte {
 	if format == "brotli" {
 		return tnBrotliDecode(data)
+	}
+	if format == "zstd" {
+		return tnZstdDecode(data)
 	}
 	var r io.Reader
 	var err error
@@ -259,6 +275,202 @@ func tnBrotliDecompress(data []byte) []byte {
 	panic(e)
 }`;
 
+// Zstd's frames are located by hand before decoding: libzstd ignores bytes
+// after the last complete frame (whatever they are) and reports a frame that
+// ends mid-way as "unexpected end of file", while the decoder's DecodeAll
+// reports both the same way
+const zstdHelper = `// node:zlib Zstd (github.com/klauspost/compress, pure Go; linked only into
+// programs that use it)
+func init() {
+	tnZstdEncode = tnZstdCompress
+	tnZstdDecode = tnZstdDecompress
+	// (the ZIP archive writer's method: 'zstd' entries use it when the codec
+	// is linked)
+	tnZipZstdEncode = func(data []byte) []byte { return tnZstdCompress(data, nil) }
+}
+
+// The \`level\` option (default 3) or \`params[ZSTD_c_compressionLevel]\`;
+// klauspost's encoder covers libzstd's levels with its four speeds and
+// ZSTD_c_windowLog with the window size (its other params have no equivalent
+// here, so they are accepted and ignored)
+func tnZstdLevel(options []interface{}) int {
+	level := 3
+	if len(options) > 0 && options[0] != nil {
+		if l, ok := TnGetValue(options[0], "level").(float64); ok {
+			level = int(l)
+		}
+		if params := TnGet(options[0], "params"); params != nil {
+			if l, ok := TnGetValue(params, "100").(float64); ok {
+				level = int(l)
+			}
+		}
+	}
+	return level
+}
+
+func tnZstdCompress(data []byte, options []interface{}) []byte {
+	if len(data) == 0 {
+		// libzstd's frame for empty input: magic, single-segment header with a
+		// zero content size, one empty last block
+		return []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}
+	}
+	opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(tnZstdLevel(options)))}
+	if len(options) > 0 && options[0] != nil {
+		if params := TnGet(options[0], "params"); params != nil {
+			if w, ok := TnGetValue(params, "101").(float64); ok && w >= 10 && w <= 31 {
+				opts = append(opts, zstd.WithWindowSize(1<<uint(w)))
+			}
+		}
+	}
+	var buf bytes.Buffer
+	w, err := zstd.NewWriter(&buf, opts...)
+	if err != nil {
+		panic(TnNodeError("Error", "ZSTD_error_GENERIC", "zstd compression failed"))
+	}
+	w.Write(data)
+	w.Close()
+	return buf.Bytes()
+}
+
+// End offset of the zstd frame starting at start (at least 4 bytes are left):
+// -1 when it ends mid-way, -2 when those bytes are not a frame
+func tnZstdFrameEnd(data []byte, start int) int {
+	i := start
+	magic := uint32(data[i]) | uint32(data[i+1])<<8 | uint32(data[i+2])<<16 | uint32(data[i+3])<<24
+	if magic >= 0x184D2A50 && magic <= 0x184D2A5F { // a skippable frame
+		if len(data)-i < 8 {
+			return -1
+		}
+		size := int(uint32(data[i+4]) | uint32(data[i+5])<<8 | uint32(data[i+6])<<16 | uint32(data[i+7])<<24)
+		if len(data)-i < 8+size {
+			return -1
+		}
+		return i + 8 + size
+	}
+	if magic != 0xFD2FB528 { // another format's magic
+		return -2
+	}
+	if len(data)-i < 5 {
+		return -1
+	}
+	if data[i+4]&0x08 != 0 { // the reserved bit
+		return -2
+	}
+	fhd := data[i+4]
+	checksum := fhd&0x04 != 0 // a four-byte checksum follows the last block
+	i += 5
+	if fhd&0x20 == 0 { // not single-segment: a window descriptor follows
+		i++
+	}
+	switch fhd & 3 { // the dictionary-ID field
+	case 1:
+		i++
+	case 2:
+		i += 2
+	case 3:
+		i += 4
+	}
+	switch (fhd >> 6) & 3 { // the content-size field (1 byte with single-segment and no flag)
+	case 1:
+		i += 2
+	case 2:
+		i += 4
+	case 3:
+		i += 8
+	case 0:
+		if fhd&0x20 != 0 {
+			i++
+		}
+	}
+	for { // the blocks, until one says it is the last
+		if len(data)-i < 3 {
+			return -1
+		}
+		header := uint32(data[i]) | uint32(data[i+1])<<8 | uint32(data[i+2])<<16
+		kind := (header >> 1) & 3
+		size := int(header >> 3)
+		i += 3
+		switch kind {
+		case 0, 2: // raw or compressed
+			if len(data)-i < size {
+				return -1
+			}
+			i += size
+		case 1: // one byte repeated
+			i++
+		default: // reserved
+			return -2
+		}
+		if header&1 == 1 {
+			if checksum {
+				i += 4
+			}
+			return i
+		}
+	}
+}
+
+// End of the last complete frame, and 0, or -1 / -2 when the scan stopped on
+// a frame that ends mid-way / on bytes that are not a frame
+func tnZstdScan(data []byte) (int, int) {
+	i := 0
+	for i < len(data) {
+		if len(data)-i < 4 {
+			if i == 0 {
+				return 0, -1
+			}
+			return i, 0 // a byte or three after the last frame: ignored
+		}
+		end := tnZstdFrameEnd(data, i)
+		if end == -1 { // ends mid-way
+			return i, -1
+		}
+		if end == -2 { // not a frame: an error at the start, ignored later
+			if i == 0 {
+				return 0, -2
+			}
+			return i, 0
+		}
+		i = end
+	}
+	return i, 0
+}
+
+func tnZstdDecompress(data []byte) []byte {
+	if len(data) == 0 {
+		e := TnNodeError("Error", "Z_BUF_ERROR", "unexpected end of file")
+		e.props["errno"] = float64(-5)
+		panic(e)
+	}
+	valid, status := tnZstdScan(data)
+	switch {
+	case status == -1:
+		e := TnNodeError("Error", "Z_BUF_ERROR", "unexpected end of file")
+		e.props["errno"] = float64(-5)
+		panic(e)
+	case status == -2:
+		e := TnNodeError("Error", "ZSTD_error_prefix_unknown", "Unknown frame descriptor")
+		e.props["errno"] = float64(10)
+		panic(e)
+	}
+	d, err := zstd.NewReader(bytes.NewReader(nil))
+	if err != nil {
+		panic(TnNodeError("Error", "ZSTD_error_GENERIC", "zstd decompression failed"))
+	}
+	out, err := d.DecodeAll(data[:valid], nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "checksum") || strings.Contains(err.Error(), "CRC") {
+			e := TnNodeError("Error", "ZSTD_error_checksum_wrong", "Restored data doesn't match checksum")
+			e.props["errno"] = float64(22)
+			panic(e)
+		}
+		e := TnNodeError("Error", "ZSTD_error_corruption_detected", "Data corruption detected")
+		e.props["errno"] = float64(20)
+		panic(e)
+	}
+	return out
+}`;
+
 const ZLIB_CONSTANTS: Record<string, number> = {
   Z_NO_FLUSH: 0,
   Z_SYNC_FLUSH: 2,
@@ -301,487 +513,87 @@ const BROTLI_CONSTANTS: Record<string, number> = {
   BROTLI_DECODER_RESULT_SUCCESS: 1
 };
 
-const zipHelper = `// node:zlib ZIP archives (ZipEntry / ZipBuffer / ZipFile), over archive/zip
-var tnMaxZipContentSize float64 = 268435456
+// Zstd (libzstd's ZSTD_ErrorCode values, reported positive in errno)
+const ZSTD_CONSTANTS: Record<string, number> = {
+  ZSTD_COMPRESS: 10,
+  ZSTD_DECOMPRESS: 11,
+  ZSTD_e_continue: 0,
+  ZSTD_e_flush: 1,
+  ZSTD_e_end: 2,
+  ZSTD_fast: 1,
+  ZSTD_dfast: 2,
+  ZSTD_greedy: 3,
+  ZSTD_lazy: 4,
+  ZSTD_lazy2: 5,
+  ZSTD_btlazy2: 6,
+  ZSTD_btopt: 7,
+  ZSTD_btultra: 8,
+  ZSTD_btultra2: 9,
+  ZSTD_c_compressionLevel: 100,
+  ZSTD_c_windowLog: 101,
+  ZSTD_c_hashLog: 102,
+  ZSTD_c_chainLog: 103,
+  ZSTD_c_searchLog: 104,
+  ZSTD_c_minMatch: 105,
+  ZSTD_c_targetLength: 106,
+  ZSTD_c_strategy: 107,
+  ZSTD_c_enableLongDistanceMatching: 160,
+  ZSTD_c_ldmHashLog: 161,
+  ZSTD_c_ldmMinMatch: 162,
+  ZSTD_c_ldmBucketSizeLog: 163,
+  ZSTD_c_ldmHashRateLog: 164,
+  ZSTD_c_contentSizeFlag: 200,
+  ZSTD_c_checksumFlag: 201,
+  ZSTD_c_dictIDFlag: 202,
+  ZSTD_c_nbWorkers: 400,
+  ZSTD_c_jobSize: 401,
+  ZSTD_c_overlapLog: 402,
+  ZSTD_d_windowLogMax: 100,
+  ZSTD_CLEVEL_DEFAULT: 3,
+  ZSTD_error_no_error: 0,
+  ZSTD_error_GENERIC: 1,
+  ZSTD_error_prefix_unknown: 10,
+  ZSTD_error_version_unsupported: 12,
+  ZSTD_error_frameParameter_unsupported: 14,
+  ZSTD_error_frameParameter_windowTooLarge: 16,
+  ZSTD_error_corruption_detected: 20,
+  ZSTD_error_checksum_wrong: 22,
+  ZSTD_error_literals_headerWrong: 24,
+  ZSTD_error_dictionary_corrupted: 30,
+  ZSTD_error_dictionary_wrong: 32,
+  ZSTD_error_dictionaryCreation_failed: 34,
+  ZSTD_error_parameter_unsupported: 40,
+  ZSTD_error_parameter_combination_unsupported: 41,
+  ZSTD_error_parameter_outOfBound: 42,
+  ZSTD_error_tableLog_tooLarge: 44,
+  ZSTD_error_maxSymbolValue_tooLarge: 46,
+  ZSTD_error_maxSymbolValue_tooSmall: 48,
+  ZSTD_error_stabilityCondition_notRespected: 50,
+  ZSTD_error_stage_wrong: 60,
+  ZSTD_error_init_missing: 62,
+  ZSTD_error_memory_allocation: 64,
+  ZSTD_error_workSpace_tooSmall: 66,
+  ZSTD_error_dstSize_tooSmall: 70,
+  ZSTD_error_srcSize_wrong: 72,
+  ZSTD_error_dstBuffer_null: 74,
+  ZSTD_error_noForwardProgress_destFull: 80,
+  ZSTD_error_noForwardProgress_inputEmpty: 82
+};
 
-func TnGetMaxZipContentSize() float64 { return tnMaxZipContentSize }
-
-func TnSetMaxZipContentSize(size float64) { tnMaxZipContentSize = size }
-
-func tnZipError(code string, message string) *TnError {
-	return TnNodeError("Error", code, message)
-}
-
-type TnZipEntry struct {
-	name           string
-	data           []byte
-	compressedData []byte
-	comment        string
-	modified       time.Time
-	method         uint16
-	crc            uint32
-	mode           uint32
-	symlink        bool
-	dir            bool
-	streaming      bool
-}
-
-func (e *TnZipEntry) Get_name() string         { return e.name }
-func (e *TnZipEntry) Get_nameBuffer() []byte   { return []byte(e.name) }
-func (e *TnZipEntry) Get_comment() string      { return e.comment }
-func (e *TnZipEntry) Get_modified() time.Time  { return e.modified }
-func (e *TnZipEntry) Get_method() float64      { return float64(e.method) }
-func (e *TnZipEntry) Get_crc32() float64       { return float64(e.crc) }
-func (e *TnZipEntry) Get_mode() float64        { return float64(e.mode) }
-func (e *TnZipEntry) Get_flags() float64       { return 0 }
-func (e *TnZipEntry) Get_size() float64        { return float64(len(e.data)) }
-func (e *TnZipEntry) Get_compressedSize() float64 { return float64(len(e.compressedData)) }
-func (e *TnZipEntry) Get_compressed() bool     { return e.method != 0 }
-func (e *TnZipEntry) Get_isDirectory() bool    { return e.dir }
-func (e *TnZipEntry) Get_isFile() bool         { return !e.dir && !e.symlink }
-func (e *TnZipEntry) Get_isSymlink() bool      { return e.symlink }
-func (e *TnZipEntry) Get_rawContent() []byte {
-	if e.method == 0 {
-		return e.data
-	}
-	return nil
-}
-
-func (e *TnZipEntry) tnEncode() {
-	e.crc = crc32.ChecksumIEEE(e.data)
-	if e.method == 8 {
-		var b bytes.Buffer
-		w, _ := flate.NewWriter(&b, flate.DefaultCompression)
-		w.Write(e.data)
-		w.Close()
-		if b.Len() >= len(e.data) {
-			e.method = 0
-			e.compressedData = e.data
-		} else {
-			e.compressedData = b.Bytes()
-		}
-	} else {
-		e.method = 0
-		e.compressedData = e.data
-	}
-}
-
-func (e *TnZipEntry) tnContent(options ...interface{}) []byte {
-	if e.streaming {
-		panic(tnZipError("ERR_INVALID_STATE", "The entry's content is not available"))
-	}
-	max := tnMaxZipContentSize
-	if len(options) > 0 && options[0] != nil {
-		if m, ok := TnGetValue(options[0], "maxSize").(float64); ok {
-			max = m
-		}
-	}
-	if max > 0 && float64(len(e.data)) > max {
-		panic(tnZipError("ERR_ZIP_ENTRY_TOO_LARGE", "The entry is larger than the maximum allowed size"))
-	}
-	return append([]byte{}, e.data...)
-}
-
-func (e *TnZipEntry) contentSync(options ...interface{}) []byte { return e.tnContent(options...) }
-
-func (e *TnZipEntry) content(options ...interface{}) chan []byte {
-	ch := make(chan []byte, 1)
-	ch <- e.tnContent(options...)
-	return ch
-}
-
-func (e *TnZipEntry) dispose() {}
-
-func TnZipEntryCreateSync(name string, data interface{}, options ...interface{}) *TnZipEntry {
-	e := &TnZipEntry{name: name, data: tnZlibInput(data), modified: time.Now(), method: 8}
-	if strings.HasSuffix(name, "/") {
-		e.dir = true
-		e.method = 0
-	}
-	if len(options) > 0 && options[0] != nil {
-		if method, ok := TnGetValue(options[0], "method").(string); ok && method == "store" {
-			e.method = 0
-		}
-		if comment, ok := TnGetValue(options[0], "comment").(string); ok {
-			e.comment = comment
-		}
-		if modified, ok := TnGetValue(options[0], "modified").(time.Time); ok {
-			e.modified = modified
-		}
-		if mode, ok := TnGetValue(options[0], "mode").(float64); ok {
-			e.mode = uint32(mode)
-		}
-	}
-	e.tnEncode()
-	return e
-}
-
-func TnZipEntryCreate(name string, data interface{}, options ...interface{}) chan *TnZipEntry {
-	ch := make(chan *TnZipEntry, 1)
-	ch <- TnZipEntryCreateSync(name, data, options...)
-	return ch
-}
-
-func TnZipEntrySymlink(name string, target string, options ...interface{}) *TnZipEntry {
-	e := TnZipEntryCreateSync(name, target, options...)
-	e.method = 0
-	e.symlink = true
-	e.mode = 0777
-	e.tnEncode()
-	return e
-}
-
-func tnZipReadEntry(f *zip.File) (*TnZipEntry, error) {
-	r, err := f.Open()
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-	mode := uint32(f.Mode())
-	return &TnZipEntry{
-		name: f.Name, data: data, comment: f.Comment, modified: f.Modified,
-		method: f.Method, crc: f.CRC32, mode: mode,
-		symlink: f.Mode()&os.ModeSymlink != 0,
-		dir:     strings.HasSuffix(f.Name, "/"),
-	}, nil
-}
-
-type TnZipBuffer struct {
-	order   []string
-	byName  map[string]*TnZipEntry
-	comment string
-}
-
-func tnZipBufferEntries(v interface{}) []*TnZipEntry {
-	if b, ok := v.(*TnZipBuffer); ok {
-		return b.tnValues()
-	}
-	var out []*TnZipEntry
-	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
-		for i := 0; i < rv.Len(); i++ {
-			if e, ok := rv.Index(i).Interface().(*TnZipEntry); ok {
-				out = append(out, e)
-			}
-		}
-	}
-	return out
-}
-
-func TnNewZipBuffer(data interface{}) *TnZipBuffer {
-	raw := tnZlibInput(data)
-	reader, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
-	if err != nil {
-		panic(tnZipError("ERR_ZIP_INVALID_ARCHIVE", "Invalid ZIP archive"))
-	}
-	b := &TnZipBuffer{byName: map[string]*TnZipEntry{}, comment: reader.Comment}
-	for _, f := range reader.File {
-		entry, err := tnZipReadEntry(f)
-		if err != nil {
-			panic(tnZipError("ERR_ZIP_ENTRY_CORRUPT", "Could not read a ZIP entry"))
-		}
-		b.addEntry(entry)
-	}
-	return b
-}
-
-func (b *TnZipBuffer) addEntry(entry *TnZipEntry) *TnZipEntry {
-	if _, found := b.byName[entry.name]; !found {
-		b.order = append(b.order, entry.name)
-	}
-	b.byName[entry.name] = entry
-	return entry
-}
-
-func (b *TnZipBuffer) get(name string) *TnZipEntry {
-	entry, found := b.byName[name]
-	if !found {
-		panic(tnZipError("ERR_ZIP_ENTRY_NOT_FOUND", "No ZIP entry named "+name))
-	}
-	return entry
-}
-
-func (b *TnZipBuffer) has(name string) bool {
-	_, found := b.byName[name]
-	return found
-}
-
-func (b *TnZipBuffer) delete(name string) bool {
-	if _, found := b.byName[name]; !found {
-		return false
-	}
-	delete(b.byName, name)
-	for i, n := range b.order {
-		if n == name {
-			b.order = append(b.order[:i], b.order[i+1:]...)
-			break
-		}
-	}
-	return true
-}
-
-func (b *TnZipBuffer) clear() {
-	b.order = nil
-	b.byName = map[string]*TnZipEntry{}
-}
-
-func (b *TnZipBuffer) tnValues() []*TnZipEntry {
-	out := make([]*TnZipEntry, 0, len(b.order))
-	for _, name := range b.order {
-		out = append(out, b.byName[name])
-	}
-	return out
-}
-
-func (b *TnZipBuffer) Get_size() float64  { return float64(len(b.order)) }
-func (b *TnZipBuffer) Get_comment() string { return b.comment }
-
-func (b *TnZipBuffer) Get_writable() bool { return true }
-
-func (b *TnZipBuffer) addSync(name string, data interface{}, options ...interface{}) *TnZipEntry {
-	return b.addEntry(TnZipEntryCreateSync(name, data, options...))
-}
-
-func (b *TnZipBuffer) add(name string, data interface{}, options ...interface{}) chan *TnZipEntry {
-	ch := make(chan *TnZipEntry, 1)
-	ch <- b.addSync(name, data, options...)
-	return ch
-}
-
-func (b *TnZipBuffer) entries() [][]interface{} {
-	out := make([][]interface{}, 0, len(b.order))
-	for _, name := range b.order {
-		out = append(out, []interface{}{name, b.byName[name]})
-	}
-	return out
-}
-
-func (b *TnZipBuffer) keys() []string {
-	return append([]string{}, b.order...)
-}
-
-func (b *TnZipBuffer) values() []*TnZipEntry { return b.tnValues() }
-
-func tnZipComment(options []interface{}, fallback string) string {
-	if len(options) == 0 || options[0] == nil {
-		return fallback
-	}
-	if text, ok := options[0].(string); ok {
-		return text
-	}
-	if text, ok := TnGetValue(options[0], "comment").(string); ok {
-		return text
-	}
-	return fallback
-}
-
-func (b *TnZipBuffer) toBytes(options ...interface{}) []byte {
-	comment := tnZipComment(options, b.comment)
-	var buf bytes.Buffer
-	writer := zip.NewWriter(&buf)
-	for _, name := range b.order {
-		entry := b.byName[name]
-		header := &zip.FileHeader{Name: entry.name, Method: entry.method, Comment: entry.comment}
-		header.Modified = entry.modified
-		if entry.mode != 0 {
-			header.SetMode(os.FileMode(entry.mode))
-		}
-		if entry.symlink {
-			header.SetMode(header.Mode() | os.ModeSymlink)
-		}
-		w, err := writer.CreateHeader(header)
-		if err != nil {
-			panic(tnZipError("ERR_ZIP_INVALID_ARCHIVE", "Could not write a ZIP entry"))
-		}
-		w.Write(entry.data)
-	}
-	writer.SetComment(comment)
-	writer.Close()
-	return buf.Bytes()
-}
-
-func (b *TnZipBuffer) toBufferSync(options ...interface{}) []byte { return b.toBytes(options...) }
-
-func (b *TnZipBuffer) toBuffer(options ...interface{}) chan []byte {
-	ch := make(chan []byte, 1)
-	ch <- b.toBytes(options...)
-	return ch
-}
-
-func TnCreateZipArchiveSync(entries interface{}, options ...interface{}) [][]byte {
-	b := &TnZipBuffer{byName: map[string]*TnZipEntry{}}
-	for _, entry := range tnZipBufferEntries(entries) {
-		b.addEntry(entry)
-	}
-	return [][]byte{b.toBytes(options...)}
-}
-
-func TnCreateZipArchive(entries interface{}, options ...interface{}) chan [][]byte {
-	ch := make(chan [][]byte, 1)
-	ch <- TnCreateZipArchiveSync(entries, options...)
-	return ch
-}
-
-func TnZipFiles(files interface{}, options ...interface{}) []byte {
-	b := &TnZipBuffer{byName: map[string]*TnZipEntry{}}
-	rv := reflect.ValueOf(files)
-	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
-		for i := 0; i < rv.Len(); i++ {
-			pair := rv.Index(i)
-			if pair.Kind() != reflect.Slice || pair.Len() < 2 {
-				continue
-			}
-			source, _ := pair.Index(0).Interface().(string)
-			name, _ := pair.Index(1).Interface().(string)
-			data, err := os.ReadFile(source)
-			if err != nil {
-				panic(TnNodeError("Error", "ENOENT", "no such file or directory: "+source))
-			}
-			info, _ := os.Stat(source)
-			entry := TnZipEntryCreateSync(name, data)
-			if info != nil {
-				entry.modified = info.ModTime()
-				entry.mode = uint32(info.Mode())
-				if info.IsDir() {
-					entry.dir = true
-				}
-			}
-			entry.tnEncode()
-			b.addEntry(entry)
-		}
-	}
-	return b.toBytes(options...)
-}
-
-type TnZipFile struct {
-	path     string
-	buffer   *TnZipBuffer
-	writable bool
-}
-
-func TnZipFileOpenSync(path string, options ...interface{}) *TnZipFile {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		panic(TnNodeError("Error", "ENOENT", "no such file or directory: "+path))
-	}
-	f := &TnZipFile{path: path, buffer: TnNewZipBuffer(data)}
-	if len(options) > 0 && options[0] != nil {
-		if flag, ok := TnGetValue(options[0], "writable").(bool); ok {
-			f.writable = flag
-		}
-	}
-	return f
-}
-
-func TnZipFileOpen(path string, options ...interface{}) chan *TnZipFile {
-	ch := make(chan *TnZipFile, 1)
-	ch <- TnZipFileOpenSync(path, options...)
-	return ch
-}
-
-func (f *TnZipFile) tnCheckWritable() {
-	if !f.writable {
-		panic(tnZipError("ERR_ZIP_NOT_WRITABLE", "The ZIP file was not opened as writable"))
-	}
-}
-
-func (f *TnZipFile) tnFlush() {
-	if f.writable {
-		if err := os.WriteFile(f.path, f.buffer.toBytes(), 0o644); err != nil {
-			panic(TnNodeError("Error", "EIO", err.Error()))
-		}
-	}
-}
-
-func (f *TnZipFile) Get_comment() string  { return f.buffer.comment }
-func (f *TnZipFile) Get_size() float64    { return f.buffer.Get_size() }
-func (f *TnZipFile) Get_writable() bool   { return f.writable }
-
-func (f *TnZipFile) getSync(name string) *TnZipEntry { return f.buffer.get(name) }
-func (f *TnZipFile) has(name string) bool           { return f.buffer.has(name) }
-
-func (f *TnZipFile) get(name string) chan *TnZipEntry {
-	ch := make(chan *TnZipEntry, 1)
-	ch <- f.buffer.get(name)
-	return ch
-}
-
-func (f *TnZipFile) addSync(name string, data interface{}, options ...interface{}) *TnZipEntry {
-	f.tnCheckWritable()
-	entry := f.buffer.addSync(name, data, options...)
-	f.tnFlush()
-	return entry
-}
-
-func (f *TnZipFile) add(name string, data interface{}, options ...interface{}) chan *TnZipEntry {
-	ch := make(chan *TnZipEntry, 1)
-	ch <- f.addSync(name, data, options...)
-	return ch
-}
-
-func (f *TnZipFile) addEntrySync(entry *TnZipEntry) *TnZipEntry {
-	f.tnCheckWritable()
-	f.buffer.addEntry(entry)
-	f.tnFlush()
-	return entry
-}
-
-func (f *TnZipFile) addEntry(entry *TnZipEntry) chan *TnZipEntry {
-	ch := make(chan *TnZipEntry, 1)
-	ch <- f.addEntrySync(entry)
-	return ch
-}
-
-func (f *TnZipFile) deleteSync(name string) bool {
-	f.tnCheckWritable()
-	deleted := f.buffer.delete(name)
-	f.tnFlush()
-	return deleted
-}
-
-func (f *TnZipFile) delete(name string) chan bool {
-	ch := make(chan bool, 1)
-	ch <- f.deleteSync(name)
-	return ch
-}
-
-func (f *TnZipFile) compactSync(comment ...interface{}) []byte {
-	return f.buffer.toBytes(comment...)
-}
-
-func (f *TnZipFile) compact(comment ...interface{}) chan []byte {
-	ch := make(chan []byte, 1)
-	ch <- f.compactSync(comment...)
-	return ch
-}
-
-func (f *TnZipFile) closeSync() {}
-func (f *TnZipFile) close() chan struct{} {
-	ch := make(chan struct{}, 1)
-	ch <- struct{}{}
-	return ch
-}
-
-func (f *TnZipFile) entriesSync() [][]interface{} { return f.buffer.entries() }
-func (f *TnZipFile) keys() []string               { return f.buffer.keys() }
-func (f *TnZipFile) valuesSync() []*TnZipEntry    { return f.buffer.values() }
-`;
 
 export function registerZlib(r: NodeRegistry): void {
   defineModule(r, 'zlib');
   defineHelper(r, 'nodeZlib', ['bytes', 'compress/flate', 'compress/gzip', 'compress/zlib', 'hash/crc32', 'io', 'strings'], ['error', 'buffer', 'dynamic', 'eventLoop', 'promise', 'nodeInvoke'], zlibHelper);
   defineHelper(r, 'nodeBrotli', ['bytes', 'github.com/andybalholm/brotli', 'io', 'strings'], ['nodeZlib'], brotliHelper);
-  // Brotli entries pull in the codec helper too
-  const use = (format: string) => r.helper(format === 'brotli' ? 'nodeBrotli' : 'nodeZlib');
+  defineHelper(r, 'nodeZstd', ['bytes', 'github.com/klauspost/compress/zstd', 'strings'], ['nodeZlib'], zstdHelper);
+  // Codec entries pull in the codec's helper too
+  const use = (format: string) => r.helper(format === 'brotli' ? 'nodeBrotli' : format === 'zstd' ? 'nodeZstd' : 'nodeZlib');
   const formats: Record<string, string> = {
     gzipSync: 'gzip',
     deflateSync: 'deflate',
     deflateRawSync: 'deflateRaw',
-    brotliCompressSync: 'brotli'
+    brotliCompressSync: 'brotli',
+    zstdCompressSync: 'zstd'
   };
   for (const name of Object.keys(formats)) {
     const format = formats[name];
@@ -796,7 +608,8 @@ export function registerZlib(r: NodeRegistry): void {
     inflateSync: 'inflate',
     inflateRawSync: 'inflateRaw',
     unzipSync: 'unzip',
-    brotliDecompressSync: 'brotli'
+    brotliDecompressSync: 'brotli',
+    zstdDecompressSync: 'zstd'
   };
   for (const name of Object.keys(decoders)) {
     const format = decoders[name];
@@ -816,12 +629,16 @@ export function registerZlib(r: NodeRegistry): void {
     inflateRaw: 'inflateRaw',
     unzip: 'unzip',
     brotliCompress: 'brotli',
-    brotliDecompress: 'brotli'
+    brotliDecompress: 'brotli',
+    zstdCompress: 'zstd',
+    zstdDecompress: 'zstd'
   };
   for (const name of Object.keys(asyncForms)) {
     const format = asyncForms[name];
     const compress =
-      name === 'gzip' || name === 'deflate' || name === 'deflateRaw' || name === 'brotliCompress' ? 'true' : 'false';
+      name === 'gzip' || name === 'deflate' || name === 'deflateRaw' || name === 'brotliCompress' || name === 'zstdCompress'
+        ? 'true'
+        : 'false';
     r.functions[`zlib.${name}`] = (call: NodeCall) => {
       use(format);
       return `TnZlibAsync(${compress}, ${JSON.stringify(format)}, ${call.args.join(', ')})`;
@@ -839,20 +656,22 @@ export function registerZlib(r: NodeRegistry): void {
     return `TnCrc32(${call.args.join(', ')})`;
   };
   setResults(r, 'zlib', 'crc32=float64');
-  // ZIP archives (Node 26): ZipEntry / ZipBuffer / ZipFile
+  // ZIP archives (Node 26.8): ZipEntry / ZipBuffer / ZipFile, createZipArchive(Sync), zipFiles
   defineHelper(
     r,
     'nodeZip',
-    ['archive/zip', 'bytes', 'compress/flate', 'hash/crc32', 'io', 'os', 'reflect', 'strings', 'time'],
-    ['error', 'nodeZlib'],
+    ['bytes', 'compress/flate', 'encoding/binary', 'encoding/json', 'hash/crc32', 'io', 'math', 'os', 'reflect', 'sort', 'strconv', 'strings', 'time', 'unicode/utf8'],
+    ['error', 'buffer', 'date', 'dynamic', 'eventLoop', 'promise', 'nodeZlib', 'nodeStream'],
     zipHelper
   );
+  defineHelper(r, 'nodeZipContainers', ['bytes', 'os', 'sync', 'sync/atomic'], ['nodeZip', 'fsErrors', 'nodeInvoke', 'nodeStream'], zipContainersHelper);
+  defineHelper(r, 'nodeZipStream', ['os', 'reflect', 'runtime', 'strings'], ['nodeZipContainers', 'nodeStream'], zipStreamHelper);
   defineClass(
     r,
     'zlib.ZipEntry',
     '*TnZipEntry',
     'class',
-    'contentSync=[]byte; content=chan []byte; dispose=',
+    'contentSync=[]byte; content=chan []byte; contentIterator=chan []byte; dispose=',
     '',
     'name=string; nameBuffer=[]byte; comment=string; modified=time.Time; method=float64; crc32=float64; mode=float64; flags=float64; size=float64; compressedSize=float64; compressed=bool; isDirectory=bool; isFile=bool; isSymlink=bool; rawContent=[]byte',
     ''
@@ -862,7 +681,7 @@ export function registerZlib(r: NodeRegistry): void {
     'zlib.ZipBuffer',
     '*TnZipBuffer',
     'class',
-    'addSync=*TnZipEntry; add=chan *TnZipEntry; addEntry=*TnZipEntry; clear=; delete=bool; entries=[][]interface{}; get=*TnZipEntry; has=bool; keys=[]string; values=[]*TnZipEntry; toBufferSync=[]byte; toBuffer=chan []byte',
+    'addSync=*TnZipEntry; add=chan *TnZipEntry; addEntry=*TnZipEntry; clear=; delete=bool; entries=[][]interface{}; forEach=; get=*TnZipEntry; has=bool; keys=[]string; values=[]*TnZipEntry; toBufferSync=[]byte; toBuffer=chan []byte; dispose=',
     '',
     'comment=string; size=float64; writable=bool',
     ''
@@ -872,36 +691,42 @@ export function registerZlib(r: NodeRegistry): void {
     'zlib.ZipFile',
     '*TnZipFile',
     'class',
-    'addSync=*TnZipEntry; add=chan *TnZipEntry; addEntrySync=*TnZipEntry; addEntry=chan *TnZipEntry; deleteSync=bool; delete=chan bool; getSync=*TnZipEntry; get=chan *TnZipEntry; has=bool; compactSync=[]byte; compact=chan []byte; closeSync=; close=chan struct{}; entriesSync=[][]interface{}; keys=[]string; valuesSync=[]*TnZipEntry',
+    'addSync=*TnZipEntry; add=chan *TnZipEntry; addEntrySync=*TnZipEntry; addEntry=chan *TnZipEntry; deleteSync=bool; delete=chan bool; getSync=*TnZipEntry; get=chan *TnZipEntry; has=bool; stream=chan *TnStream; compactSync=[]byte; compact=*TnStream; closeSync=; close=chan struct{}; entries=[][]interface{}; entriesSync=[][]interface{}; forEach=; forEachSync=; keys=[]string; values=[]chan *TnZipEntry; valuesSync=[]*TnZipEntry; dispose=',
     '',
     'comment=string; size=float64; writable=bool',
     ''
   );
   r.iterators['*TnZipBuffer'] = 'entries';
+  r.iterators['*TnZipFile'] = 'entries';
+  for (const method of ['compact', 'stream']) {
+    r.methods[`zlib.ZipFile#${method}`] = (call: NodeCall) => {
+      r.helper('nodeZipStream');
+      return `${call.recv}.${method}(${call.args.join(', ')})`;
+    };
+  }
   r.constructors['zlib.ZipBuffer'] = (call: NodeCall) => {
-    r.helper('nodeZip');
+    r.helper('nodeZipContainers');
     return `TnNewZipBuffer(${call.args[0]})`;
   };
-  const zipStatic = (name: string, target: string, result: string, args: (call: NodeCall) => string) => {
+  const zipStatic = (name: string, target: string, result: string, helper: string) => {
     r.functions[`zlib.${name}`] = (call: NodeCall) => {
-      r.helper('nodeZip');
-      return `${target}(${args(call)})`;
+      r.helper(helper);
+      return `${target}(${call.args.join(', ')})`;
     };
     r.results[`zlib.${name}`] = result;
   };
-  zipStatic('ZipEntry.createSync', 'TnZipEntryCreateSync', '*TnZipEntry', (c: NodeCall) => c.args.join(', '));
-  zipStatic('ZipEntry.create', 'TnZipEntryCreate', 'chan *TnZipEntry', (c: NodeCall) => c.args.join(', '));
-  zipStatic('ZipEntry.createSymlink', 'TnZipEntrySymlink', '*TnZipEntry', (c: NodeCall) => c.args.join(', '));
-  zipStatic('ZipFile.openSync', 'TnZipFileOpenSync', '*TnZipFile', (c: NodeCall) => c.args.join(', '));
-  zipStatic('ZipFile.open', 'TnZipFileOpen', 'chan *TnZipFile', (c: NodeCall) => c.args.join(', '));
-  zipStatic('createZipArchiveSync', 'TnCreateZipArchiveSync', '[][]byte', (c: NodeCall) => c.args.join(', '));
-  zipStatic('createZipArchive', 'TnCreateZipArchive', 'chan [][]byte', (c: NodeCall) => c.args.join(', '));
-  zipStatic('zipFiles', 'TnZipFiles', '[]byte', (c: NodeCall) => c.args.join(', '));
-  zipStatic('getMaxZipContentSize', 'TnGetMaxZipContentSize', 'float64', () => '');
-  r.functions['zlib.setMaxZipContentSize'] = (call: NodeCall) => {
-    r.helper('nodeZip');
-    return `TnSetMaxZipContentSize(${call.args[0]})`;
-  };
+  zipStatic('ZipEntry.createSync', 'TnZipEntryCreateSync', '*TnZipEntry', 'nodeZip');
+  zipStatic('ZipEntry.create', 'TnZipEntryCreate', 'chan *TnZipEntry', 'nodeZip');
+  zipStatic('ZipEntry.createStream', 'TnZipEntryCreateStream', '*TnZipEntry', 'nodeZip');
+  zipStatic('ZipEntry.createSymlink', 'TnZipEntrySymlink', '*TnZipEntry', 'nodeZip');
+  zipStatic('ZipEntry.read', 'TnZipEntryRead', '[]*TnZipEntry', 'nodeZip');
+  zipStatic('ZipFile.openSync', 'TnZipFileOpenSync', '*TnZipFile', 'nodeZipContainers');
+  zipStatic('ZipFile.open', 'TnZipFileOpen', 'chan *TnZipFile', 'nodeZipContainers');
+  zipStatic('createZipArchiveSync', 'TnCreateZipArchiveSync', '[][]byte', 'nodeZipContainers');
+  zipStatic('createZipArchive', 'TnCreateZipArchive', '*TnStream', 'nodeZipStream');
+  zipStatic('zipFiles', 'TnZipFiles', '*TnStream', 'nodeZipStream');
+  zipStatic('getMaxZipContentSize', 'TnGetMaxZipContentSize', 'float64', 'nodeZip');
+  zipStatic('setMaxZipContentSize', 'TnSetMaxZipContentSize', '', 'nodeZip');
   r.objects['zlib.constants'] = true;
   for (const name of Object.keys(ZLIB_CONSTANTS)) {
     const value = ZLIB_CONSTANTS[name];
@@ -914,5 +739,12 @@ export function registerZlib(r: NodeRegistry): void {
     const value = BROTLI_CONSTANTS[name];
     r.values[`zlib.constants.${name}`] = (_c: NodeCall) => `float64(${value})`;
     r.valueTypes[`zlib.constants.${name}`] = 'float64';
+  }
+  for (const name of Object.keys(ZSTD_CONSTANTS)) {
+    const value = ZSTD_CONSTANTS[name];
+    r.values[`zlib.constants.${name}`] = (_c: NodeCall) => `float64(${value})`;
+    r.valueTypes[`zlib.constants.${name}`] = 'float64';
+    r.values[`zlib.${name}`] = r.values[`zlib.constants.${name}`];
+    r.valueTypes[`zlib.${name}`] = 'float64';
   }
 }

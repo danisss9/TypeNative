@@ -1126,11 +1126,48 @@ func TnStdin() *TnStream {
 	return s
 }`;
 const fileStreamHelper = `// fs.createReadStream / createWriteStream
+// The windowsHandle stream option: a Windows HANDLE (bigint) the stream reads
+// or writes through, converted into a file at construction as Node's
+// _open_osfhandle conversion does. A real HANDLE cannot be obtained from pure
+// JS, so what probes see are the errors: a non-bigint is a TypeError and an
+// unusable handle is EBADF
+func tnWindowsHandle(value interface{}, path string) *os.File {
+	h, ok := value.(*tnbig.Int)
+	if !ok {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The "+strconv.Quote("options.windowsHandle")+" property must be of type bigint. Received "+tnReceivedKind(value)))
+	}
+	handle, _ := strconv.ParseUint(h.String(), 10, 64)
+	f := os.NewFile(uintptr(handle), path)
+	if _, err := f.Stat(); err != nil {
+		panic(TnNodeError("Error", "EBADF", "EBADF, Bad file descriptor"))
+	}
+	return f
+}
+
+// The Received description of an argument, as Node formats it
+func tnReceivedKind(v interface{}) string {
+	switch s := v.(type) {
+	case nil:
+		return "type null"
+	case bool:
+		if s {
+			return "type boolean (true)"
+		}
+		return "type boolean (false)"
+	case string:
+		return "type string (" + strconv.Quote(s) + ")"
+	case float64:
+		return "type number (" + TnNumStr(s) + ")"
+	}
+	return "an instance of Object"
+}
+
 func TnCreateReadStream(path string, options ...interface{}) *TnStream {
 	s := TnNewReadable()
 	s.path = path
 	start, end := int64(0), int64(-1)
 	chunkSize := 65536
+	var handleFile *os.File
 	if len(options) > 0 && options[0] != nil {
 		opts := options[0]
 		if enc, ok := opts.(string); ok {
@@ -1148,19 +1185,26 @@ func TnCreateReadStream(path string, options ...interface{}) *TnStream {
 			if v, ok := TnGetValue(opts, "highWaterMark").(float64); ok && v > 0 {
 				chunkSize = int(v)
 			}
+			if h := TnGetValue(opts, "windowsHandle"); h != nil {
+				handleFile = tnWindowsHandle(h, path)
+			}
 		}
 	}
 	s.source = func(st *TnStream) {
 		TnLoopRef()
 		go func() {
-			f, err := os.Open(path)
-			if err != nil {
-				sysErr := TnSysError(err, "open", path)
-				TnLoopPost(func() {
-					defer TnLoopUnref()
-					st.destroy(sysErr)
-				})
-				return
+			f := handleFile
+			if f == nil {
+				opened, err := os.Open(path)
+				if err != nil {
+					sysErr := TnSysError(err, "open", path)
+					TnLoopPost(func() {
+						defer TnLoopUnref()
+						st.destroy(sysErr)
+					})
+					return
+				}
+				f = opened
 			}
 			defer f.Close()
 			TnLoopPost(func() {
@@ -1205,6 +1249,7 @@ func TnCreateWriteStream(path string, options ...interface{}) *TnStream {
 	s := TnNewWritable()
 	s.path = path
 	flags := "w"
+	var handleFile *os.File
 	if len(options) > 0 && options[0] != nil {
 		if f, ok := TnGetValue(options[0], "flags").(string); ok && f != "" {
 			flags = f
@@ -1212,11 +1257,18 @@ func TnCreateWriteStream(path string, options ...interface{}) *TnStream {
 		if enc, ok := TnGetValue(options[0], "encoding").(string); ok && enc != "" {
 			s.decodeStrings = true
 		}
+		if h := TnGetValue(options[0], "windowsHandle"); h != nil {
+			handleFile = tnWindowsHandle(h, path)
+		}
 	}
-	f, err := os.OpenFile(path, tnOpenFlags(flags), 0o666)
-	if err != nil {
-		s.errorLater(TnSysError(err, "open", path))
-		return s
+	f := handleFile
+	if f == nil {
+		var err error
+		f, err = os.OpenFile(path, tnOpenFlags(flags), 0o666)
+		if err != nil {
+			s.errorLater(TnSysError(err, "open", path))
+			return s
+		}
 	}
 	TnLoopRef()
 	TnLoopPost(func() {
@@ -1280,7 +1332,7 @@ export function registerStream(r) {
         defineModule(r, mod);
     r.namespaces['stream.promises'] = 'stream/promises';
     r.namespaces['stream.default'] = 'stream.Stream';
-    defineHelper(r, 'nodeStream', ['encoding/json', 'os', 'reflect', 'unicode/utf8'], ['nodeEvents', 'buffer', 'stringDecoder', 'eventLoop', 'promise', 'dynamic', 'nodeInvoke', 'stdinReader'], streamHelper);
+    defineHelper(r, 'nodeStream', ['encoding/json', 'math/big', 'os', 'reflect', 'strconv', 'unicode/utf8'], ['nodeEvents', 'buffer', 'stringDecoder', 'eventLoop', 'promise', 'dynamic', 'nodeInvoke', 'stdinReader'], streamHelper);
     defineHelper(r, 'stdinReader', ['bufio', 'os'], [], `// One buffered reader shared by process.stdin, readline and question()
 var tnStdinBuffered *bufio.Reader
 
@@ -1424,7 +1476,9 @@ func tnStdin() *bufio.Reader {
         createInflateRaw: 'inflateRaw:true',
         createUnzip: 'unzip:true',
         createBrotliCompress: 'brotli:false',
-        createBrotliDecompress: 'brotli:true'
+        createBrotliDecompress: 'brotli:true',
+        createZstdCompress: 'zstd:false',
+        createZstdDecompress: 'zstd:true'
     };
     for (const name of Object.keys(zlibStreams)) {
         const parts = zlibStreams[name].split(':');
@@ -1432,6 +1486,8 @@ func tnStdin() *bufio.Reader {
             r.helper('zlibStreams');
             if (parts[0] === 'brotli')
                 r.helper('nodeBrotli');
+            if (parts[0] === 'zstd')
+                r.helper('nodeZstd');
             const options = call.args.length > 0 ? `, ${call.args[0]}` : '';
             return `TnZlibStream(${JSON.stringify(parts[0])}, ${parts[1]}${options})`;
         };

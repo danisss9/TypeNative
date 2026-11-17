@@ -33,7 +33,7 @@ type TnTestNode struct {
 	failureType string
 	failure     *TnError
 	duration    float64
-	diagnostics []string
+	diagnostics []tnTestNoteEntry
 	started     bool
 	ctx         *TnTestContext
 	done        chan struct{}
@@ -104,13 +104,19 @@ func (t *TnTestContext) todo(msg ...interface{}) {
 	}
 }
 
-func (t *TnTestContext) diagnostic(msg string) {
-	t.node.diagnostics = append(t.node.diagnostics, msg)
+type tnTestNoteEntry struct {
+	message string
+	log     bool
 }
 
-// t.log(...args): a message in the report (formatted like console.log)
+func (t *TnTestContext) diagnostic(msg string) {
+	t.node.diagnostics = append(t.node.diagnostics, tnTestNoteEntry{message: msg})
+}
+
+// t.log(...args): a message in the report (formatted like console.log); its
+// event on the run stream is test:log, unlike t.diagnostic's
 func (t *TnTestContext) log(args ...interface{}) {
-	t.node.diagnostics = append(t.node.diagnostics, TnUtilFormat(args...))
+	t.node.diagnostics = append(t.node.diagnostics, tnTestNoteEntry{message: TnUtilFormat(args...), log: true})
 }
 
 // t.passed: whether the test has finished and passed; t.attempt: 0 (no retries);
@@ -432,6 +438,12 @@ type tnTestConfig struct {
 	coverageExclude []string
 	// --test-coverage-lines / -branches / -functions (0: no threshold)
 	thresholds map[string]float64
+	// --test-randomize / --test-random-seed: siblings run in a seeded random
+	// order (Node's Mulberry32 pick among the pending ones)
+	randomize  bool
+	randomSeed uint32
+	// --test-coverage-include-all: files that never ran, in the report
+	coverageIncludeAll bool
 }
 
 func (c *tnTestConfig) active() bool { return len(c.names) > 0 || len(c.skips) > 0 || c.only }
@@ -488,6 +500,7 @@ var tnTestValueFlags = map[string]bool{
 	"--test-name-pattern": true, "--test-skip-pattern": true, "--test-reporter": true, "--test-reporter-destination": true,
 	"--test-coverage-include": true, "--test-coverage-exclude": true,
 	"--test-coverage-lines": true, "--test-coverage-branches": true, "--test-coverage-functions": true,
+	"--test-random-seed": true,
 }
 
 func tnTestFilters() *tnTestConfig {
@@ -525,10 +538,54 @@ func tnTestFilters() *tnTestConfig {
 			if n, err := strconv.ParseFloat(value, 64); err == nil {
 				c.thresholds[strings.TrimPrefix(name, "--test-coverage-")] = n
 			}
+		case "--test-randomize":
+			c.randomize = true
+		case "--test-random-seed":
+			if n, err := strconv.ParseUint(value, 10, 32); err == nil {
+				c.randomSeed = uint32(n)
+			}
+		case "--test-coverage-include-all":
+			c.coverageIncludeAll = true
+		}
+	}
+	if c.randomSeed != 0 {
+		c.randomize = true
+	}
+	if c.randomize && c.randomSeed == 0 {
+		// Node's seed: floor(Math.random() * 2**32) — any source of 32 random bits
+		var b [4]byte
+		if _, err := cryptorand.Read(b[:]); err == nil {
+			c.randomSeed = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 		}
 	}
 	tnTestCfg = c
 	return c
+}
+
+// Node's Mulberry32: the seeded generator its randomized dequeue picks with
+func tnTestRandomPick(state *uint32) float64 {
+	*state += 0x6D2B79F5
+	v := *state ^ (*state >> 15)
+	v = uint32(v) * uint32(1|*state)
+	v ^= v + uint32(v^(v>>7))*uint32(61|v)
+	return float64(v ^ (v >> 14)) / 4294967296.0
+}
+
+// A parent's siblings in a seeded random order: Node picks uniformly among
+// those still waiting (floor(rng() * n), spliced out) until one is left
+func tnTestShuffle(children []*TnTestNode, seed uint32) []*TnTestNode {
+	state := seed
+	pending := append([]*TnTestNode{}, children...)
+	out := make([]*TnTestNode, 0, len(pending))
+	for len(pending) > 0 {
+		i := 0
+		if len(pending) > 1 {
+			i = int(tnTestRandomPick(&state) * float64(len(pending)))
+		}
+		out = append(out, pending[i])
+		pending = append(pending[:i], pending[i+1:]...)
+	}
+	return out
 }
 
 // A pattern matches a test's name, an ancestor's, or the names joined with spaces
@@ -725,6 +782,9 @@ func tnRunRoot() {
 	}
 	ctx := &TnTestContext{node: root}
 	failedHook := tnRunHooks(root.before, ctx)
+	if cfg.randomize {
+		root.children = tnTestShuffle(root.children, cfg.randomSeed)
+	}
 	for i := 0; i < len(root.children); i++ {
 		child := root.children[i]
 		if failedHook != nil {
@@ -741,7 +801,7 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 	tnTestEmit(tnTestEventFor("test:start", n, depth))
 	// .only without --test-only: Node's notice, as the test's diagnostic
 	if n.only && !tnTestFilters().only {
-		n.diagnostics = append(n.diagnostics, "'only' and 'runOnly' require the --test-only command-line option.")
+		n.diagnostics = append(n.diagnostics, tnTestNoteEntry{message: "'only' and 'runOnly' require the --test-only command-line option."})
 	}
 	start := tnTestNow()
 	ctx := &TnTestContext{node: n, mock: TnNewMockTracker(), signal: TnNewAbortSignal()}
@@ -755,6 +815,9 @@ func tnRunTestNode(n *TnTestNode, depth int) {
 			if o := tnRunHooks(n.before, ctx); o != nil {
 				n.err, n.failureType = o.err, "hookFailure"
 			}
+		}
+		if tnTestFilters().randomize {
+			n.children = tnTestShuffle(n.children, tnTestFilters().randomSeed)
 		}
 		for _, child := range n.children {
 			if n.skip {
@@ -870,7 +933,13 @@ func tnTestReport(n *TnTestNode, depth int) {
 	}
 	tnTestEmit(tnTestEventFor(kind, n, depth))
 	for _, d := range n.diagnostics {
-		tnTestEmit(tnTestNote(depth, d, "info", n))
+		note := tnTestNote(depth, d.message, "info", n)
+		if d.log {
+			// (Node's test:log names the test; the message stays the report's text)
+			note.type_ = "test:log"
+			note.data.name = n.name
+		}
+		tnTestEmit(note)
 	}
 }
 
@@ -884,6 +953,11 @@ func tnTestFinish() {
 	duration := tnTestNow() - tnTestStart
 	stats := []string{"tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"}
 	if tnTestChildSink == nil {
+		if cfg.randomize {
+			// Node reports the seed even when it generated it (a diagnostic the
+			// tap and spec reporters show before their summary)
+			tnTestEmit(tnTestNote(0, "Randomized test order seed: "+strconv.FormatUint(uint64(cfg.randomSeed), 10), "info", nil))
+		}
 		tnTestEmit(&TnTestEvent{type_: "test:plan", data: &TnTestEventData{count: float64(len(tnTestRoot.children))}})
 		for _, key := range stats {
 			tnTestEmit(tnTestNote(0, key+" "+strconv.Itoa(tnTestCounts[key]), "info", nil))
@@ -1594,7 +1668,7 @@ function eventFn(nodes) {
 }
 export function registerTest(r) {
     defineModule(r, 'test');
-    defineHelper(r, 'nodeTest', ['fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'time'], ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'nodeAssert', 'arraySubclass', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'], testHelper);
+    defineHelper(r, 'nodeTest', ['crypto/rand', 'fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'time'], ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'nodeAssert', 'arraySubclass', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'], testHelper);
     defineHelper(r, 'nodeTestSnapshot', ['fmt', 'os', 'path/filepath', 'sort', 'strconv', 'strings'], ['nodeTest', 'nodeAssert', 'jsonStringify'], snapshotHelper);
     registerTestReporters(r);
     registerTestRun(r);
