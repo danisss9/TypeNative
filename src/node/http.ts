@@ -2502,6 +2502,9 @@ type TnClientRequest struct {
 	validation  string
 	trailers    http.Header
 	trailerMu   sync.Mutex
+	// A streamed body's trailer map: empty when the request goes out (so Go
+	// declares no Trailer header), filled from addTrailers before the body ends
+	lateTrailers http.Header
 }
 
 func (cr *TnClientRequest) Get_headersSent() bool { return cr.started }
@@ -2573,8 +2576,9 @@ func (cr *TnClientRequest) flushHeaders()             {}
 func (cr *TnClientRequest) setNoDelay(args ...interface{}) {}
 func (cr *TnClientRequest) setSocketKeepAlive(args ...interface{}) {}
 
-// addTrailers(headers): sent with a chunked body whose Trailer header names
-// them, as in Node (end(data) gets a Content-Length, which has no trailers)
+// addTrailers(headers): sent after a chunked body, as in Node. A streamed body
+// (write() before end()) carries them whether or not a Trailer header names
+// them; end(data) alone carries only declared ones (otherwise a Content-Length)
 func (cr *TnClientRequest) addTrailers(headers interface{}) {
 	cr.trailerMu.Lock()
 	defer cr.trailerMu.Unlock()
@@ -2617,6 +2621,17 @@ func (cr *TnClientRequest) requestTrailers() http.Header {
 	}
 	// The same map addTrailers fills in before the body ends
 	return cr.trailers
+}
+
+func (cr *TnClientRequest) fillLateTrailers() {
+	if cr.lateTrailers == nil {
+		return
+	}
+	cr.trailerMu.Lock()
+	defer cr.trailerMu.Unlock()
+	for k, v := range cr.trailers {
+		cr.lateTrailers[k] = v
+	}
 }
 
 func (cr *TnClientRequest) setTimeout(ms float64, cb ...interface{}) *TnClientRequest {
@@ -2864,12 +2879,18 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 	// when end(data) carries the whole body, as Node does)
 	if tr := cr.requestTrailers(); tr != nil {
 		req.Trailer = tr
+		// Go writes the Trailer line from the map's keys
+		req.Header.Del("Trailer")
 		if complete {
 			if req.Body == nil {
 				req.Body = io.NopCloser(strings.NewReader(""))
 			}
 			req.ContentLength = -1
 		}
+	}
+	if req.Trailer == nil && !complete {
+		cr.lateTrailers = http.Header{}
+		req.Trailer = cr.lateTrailers
 	}
 	if cr.auth != "" {
 		parts := strings.SplitN(cr.auth, ":", 2)
@@ -3135,6 +3156,8 @@ func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
 	cr.sinkFinal = func(done func(err interface{})) {
 		cr.start(nil, true)
 		if cr.bodyWriter != nil {
+			// The transport reads the trailers once the body's EOF arrives
+			cr.fillLateTrailers()
 			cr.bodyWriter.Close()
 		}
 		done(nil)
