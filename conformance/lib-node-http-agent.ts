@@ -33,13 +33,20 @@ assert(
 configured.destroy();
 assert(http.globalAgent.keepAlive, 'globalAgent keeps connections alive');
 
+let active = 0;
+let maxActive = 0;
 const server = http.createServer((req, res) => {
   ports.add(req.socket.remotePort ?? 0);
+  active++;
+  if (active > maxActive) maxActive = active;
   const chunks: Buffer[] = [];
   req.on('data', (chunk: Buffer) => chunks.push(chunk));
   req.on('end', () => {
     res.setHeader('x-trailer', req.trailers['x-sum'] ?? 'none');
-    setTimeout(() => res.end(Buffer.concat(chunks).toString()), 30);
+    setTimeout(() => {
+      active--;
+      res.end(Buffer.concat(chunks).toString());
+    }, 30);
   });
 });
 let connections = 0;
@@ -101,6 +108,46 @@ connections = ports.size;
 console.log('maxSockets connections', connections);
 assert(connections === 1, 'maxSockets 1 keeps one socket (' + connections + ')');
 agent.destroy();
+
+// A second origin: maxSockets is per host, maxTotalSockets is process-wide
+const second = http.createServer((req, res) => {
+  ports.add(req.socket.remotePort ?? 0);
+  active++;
+  if (active > maxActive) maxActive = active;
+  setTimeout(() => {
+    active--;
+    res.end('second');
+  }, 30);
+});
+await new Promise<void>((resolve) => second.listen(0, '127.0.0.1', () => resolve()));
+const secondPort = (second.address() as AddressInfo).port;
+const getFrom = (targetPort: number, agent: http.Agent): Promise<string> =>
+  new Promise<string>((resolve, reject) => {
+    const req = http.get({ port: targetPort, host: '127.0.0.1', agent }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    });
+    req.on('error', reject);
+  });
+
+ports.clear();
+maxActive = 0;
+agent = new http.Agent({ maxSockets: 1, keepAlive: true });
+const twoOrigins = await Promise.all([get(agent), getFrom(secondPort, agent)]);
+connections = ports.size;
+console.log('per-origin', connections, maxActive, twoOrigins.join(','));
+assert(connections === 2 && maxActive === 2, 'maxSockets is per origin');
+agent.destroy();
+
+ports.clear();
+maxActive = 0;
+agent = new http.Agent({ maxSockets: 1, maxTotalSockets: 1, keepAlive: true });
+const limited = await Promise.all([get(agent), getFrom(secondPort, agent)]);
+console.log('maxTotalSockets', ports.size, maxActive, limited.join(','));
+assert(maxActive === 1, 'maxTotalSockets serializes across origins');
+agent.destroy();
+second.close();
 
 // A chunked request whose Trailer header declares the trailer
 const withTrailer = await post({ Trailer: 'x-sum' }, 'abc', { 'x-sum': '42' });

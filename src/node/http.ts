@@ -2226,8 +2226,9 @@ func (hs *TnHttpServer) listen(args ...interface{}) *TnHttpServer {
 // --- client ---
 
 // http.Agent: connection pooling mapped onto Go's transport (maxSockets is
-// MaxConnsPerHost, maxTotalSockets a process-wide dial limit, keepAlive decides
-// whether idle connections are kept, maxFreeSockets the idle pool size)
+// MaxConnsPerHost plus a per-origin request limit, maxTotalSockets a
+// process-wide one, keepAlive decides whether idle connections are kept,
+// maxFreeSockets the idle pool size)
 type TnHttpAgent struct {
 	mu              sync.Mutex
 	keepAlive       bool
@@ -2239,6 +2240,7 @@ type TnHttpAgent struct {
 	timeout         interface{}
 	options         interface{}
 	transports      map[string]*http.Transport
+	origins         map[string]*tnAgentOrigin
 	total           chan struct{}
 }
 
@@ -2277,7 +2279,8 @@ func TnNewHttpAgent(options ...interface{}) *TnHttpAgent {
 	return a
 }
 
-// maxTotalSockets: a channel of tokens, one per open connection
+// maxTotalSockets: a channel of tokens, one per in-flight request (a free
+// keep-alive connection doesn't hold one, so another origin can use the slot)
 func (a *TnHttpAgent) resetLimit() {
 	a.total = nil
 	if !math.IsInf(a.maxTotalSockets, 1) && a.maxTotalSockets > 0 {
@@ -2289,25 +2292,85 @@ func (a *TnHttpAgent) resetLimit() {
 	}
 }
 
-// An extra token would overrun maxTotalSockets: the dial waits for a close
-type tnAgentConn struct {
-	net.Conn
-	sem     chan struct{}
-	hostSem chan struct{}
+// A response body holds the agent's slots until it is closed: idle keep-alive
+// connections do not count against maxSockets / maxTotalSockets, so waiting
+// requests can reuse them instead of deadlocking on a dial limit
+type tnAgentBody struct {
+	io.ReadCloser
+	release func()
 	once    sync.Once
 }
 
-func (c *tnAgentConn) Close() error {
-	err := c.Conn.Close()
-	c.once.Do(func() {
-		if c.sem != nil {
-			<-c.sem
-		}
-		if c.hostSem != nil {
-			<-c.hostSem
-		}
-	})
+func (b *tnAgentBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
 	return err
+}
+
+// An upgraded (101) body is a ReadWriteCloser: keep its Write
+type tnAgentRWBody struct {
+	io.ReadWriteCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *tnAgentRWBody) Close() error {
+	err := b.ReadWriteCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+type tnAgentOrigin struct {
+	transport *http.Transport
+	rt        *tnAgentRoundTripper
+}
+
+// Gates each request on the per-origin and process-wide socket limits
+type tnAgentRoundTripper struct {
+	agent     *TnHttpAgent
+	transport *http.Transport
+	origin    chan struct{}
+}
+
+func (rt *tnAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	slots := []chan struct{}{}
+	rt.agent.mu.Lock()
+	total := rt.agent.total
+	rt.agent.mu.Unlock()
+	if rt.origin != nil {
+		slots = append(slots, rt.origin)
+	}
+	if total != nil {
+		slots = append(slots, total)
+	}
+	acquired := []chan struct{}{}
+	for _, sem := range slots {
+		select {
+		case sem <- struct{}{}:
+			acquired = append(acquired, sem)
+		case <-req.Context().Done():
+			for _, held := range acquired {
+				<-held
+			}
+			return nil, req.Context().Err()
+		}
+	}
+	release := func() {
+		for _, sem := range acquired {
+			<-sem
+		}
+	}
+	resp, err := rt.transport.RoundTrip(req)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok {
+		resp.Body = &tnAgentRWBody{ReadWriteCloser: rwc, release: release}
+	} else {
+		resp.Body = &tnAgentBody{ReadCloser: resp.Body, release: release}
+	}
+	return resp, nil
 }
 
 func (a *TnHttpAgent) Get_keepAlive() bool           { return a.keepAlive }
@@ -2327,14 +2390,17 @@ func (a *TnHttpAgent) Set_timeout(v interface{})     { a.timeout = v }
 func (a *TnHttpAgent) Get_options() interface{}      { return a.options }
 
 // The transport of one origin (the TLS configuration is part of the key)
-func (a *TnHttpAgent) transport(cfg *tls.Config, key string) *http.Transport {
+func (a *TnHttpAgent) transport(cfg *tls.Config, key string) *tnAgentOrigin {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	if o, ok := a.origins[key]; ok {
+		return o
+	}
 	if a.transports == nil {
 		a.transports = map[string]*http.Transport{}
-	}
-	if t, ok := a.transports[key]; ok {
-		return t
 	}
 	t := &http.Transport{
 		Proxy:               nil,
@@ -2351,58 +2417,56 @@ func (a *TnHttpAgent) transport(cfg *tls.Config, key string) *http.Transport {
 	if !math.IsInf(a.maxFreeSockets, 1) && a.maxFreeSockets >= 0 {
 		t.MaxIdleConnsPerHost = int(a.maxFreeSockets)
 	}
-	// DisableKeepAlives also turns off Go's MaxConnsPerHost accounting, so a
-	// per-origin dial limit of our own keeps maxSockets honest without it
-	var hostSem chan struct{}
-	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
-		hostSem = make(chan struct{}, int(a.maxSockets))
-	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	if a.keepAlive {
 		dialer.KeepAlive = time.Duration(a.keepAliveMsecs * float64(time.Millisecond))
 	}
-	sem := a.total
-	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if hostSem != nil {
-			select {
-			case hostSem <- struct{}{}:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		if sem != nil {
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				if hostSem != nil {
-					<-hostSem
-				}
-				return nil, ctx.Err()
-			}
-		}
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			if sem != nil {
-				<-sem
-			}
-			if hostSem != nil {
-				<-hostSem
-			}
-			return nil, err
-		}
-		return &tnAgentConn{Conn: conn, sem: sem, hostSem: hostSem}, nil
+	t.DialContext = dialer.DialContext
+	var origin chan struct{}
+	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
+		origin = make(chan struct{}, int(a.maxSockets))
 	}
 	a.transports[key] = t
-	return t
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	o := &tnAgentOrigin{transport: t, rt: &tnAgentRoundTripper{agent: a, transport: t, origin: origin}}
+	a.origins[key] = o
+	return o
+}
+
+// A dedicated transport for a Unix socket (one origin)
+func (a *TnHttpAgent) unixOrigin(path string) *tnAgentOrigin {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	key := "unix://" + path
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	if o, ok := a.origins[key]; ok {
+		return o
+	}
+	t := &http.Transport{DisableCompression: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", path)
+	}}
+	var origin chan struct{}
+	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
+		origin = make(chan struct{}, int(a.maxSockets))
+	}
+	o := &tnAgentOrigin{transport: t, rt: &tnAgentRoundTripper{agent: a, transport: t, origin: origin}}
+	a.origins[key] = o
+	return o
 }
 
 func (a *TnHttpAgent) destroy() {
 	a.mu.Lock()
-	transports := a.transports
+	origins := a.origins
+	a.origins = nil
 	a.transports = nil
 	a.mu.Unlock()
-	for _, t := range transports {
-		t.CloseIdleConnections()
+	for _, o := range origins {
+		o.transport.CloseIdleConnections()
 	}
 }
 
@@ -2818,15 +2882,14 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 	if _, ok := req.Header["User-Agent"]; !ok {
 		req.Header["User-Agent"] = nil
 	}
-	transport := cr.agent.transport(cr.tlsConfig, cr.tlsKey)
+	// One transport per origin (and TLS configuration): maxSockets is per
+	// origin, while the agent's total-sockets limit is shared by all of them
+	agentKey := fmt.Sprint(cr.protocol, "//", net.JoinHostPort(cr.host, cr.port), "|", cr.tlsKey)
+	origin := cr.agent.transport(cr.tlsConfig, agentKey)
 	if cr.socketPath != "" {
-		path := cr.socketPath
-		transport = &http.Transport{DisableCompression: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", path)
-		}}
+		origin = cr.agent.unixOrigin(cr.socketPath)
 	}
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: origin.rt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	TnLoopRef()
 	cr.armTimer()
 	host, port := cr.host, cr.port
