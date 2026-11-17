@@ -1202,8 +1202,9 @@ export function registerEvents(r) {
         const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
         if (name === 'exit')
             return ['float64'];
+        // 'message' also passes the handle sent with it (send(msg, socket))
         if (name === 'message')
-            return ['interface{}'];
+            return ['interface{}', 'interface{}'];
         if (name === 'disconnect')
             return [];
         return ['string'];

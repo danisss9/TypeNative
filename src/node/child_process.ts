@@ -5,12 +5,53 @@
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, encodingOf, getOption, isStringNode } from './registry.js';
 
 const childHelper = `// node:child_process
+// Inherited extra stdio fds (a spawn stdio array past stderr): the parent
+// says how many with TN_EXTRA_FDS. On Unix they are fds 3, 4, … (ExtraFiles).
+// Windows has no ExtraFiles: the child opens the parent's named pipes
+func init() {
+	n, err := strconv.Atoi(os.Getenv("TN_EXTRA_FDS"))
+	if err != nil || n <= 0 {
+		return
+	}
+	os.Unsetenv("TN_EXTRA_FDS")
+	if names := os.Getenv("TN_EXTRA_PIPES"); names != "" {
+		os.Unsetenv("TN_EXTRA_PIPES")
+		for i, name := range strings.Split(names, ",") {
+			if i >= n {
+				break
+			}
+			f, oerr := tnOpenExtraPipe(name)
+			if oerr != nil {
+				break
+			}
+			fd := 3 + i
+			tnFdsMu.Lock()
+			tnFds[fd] = f
+			if fd >= tnNextFd {
+				tnNextFd = fd + 1
+			}
+			tnFdsMu.Unlock()
+		}
+		return
+	}
+	tnFdsMu.Lock()
+	for i := 0; i < n; i++ {
+		fd := 3 + i
+		tnFds[fd] = os.NewFile(uintptr(fd), "")
+		if fd >= tnNextFd {
+			tnNextFd = fd + 1
+		}
+	}
+	tnFdsMu.Unlock()
+}
+
 type tnSpawnOptions struct {
 	cwd      string
 	env      []string
 	shell    bool
 	input    []byte
 	stdio    string
+	stdioExtra []interface{}
 	encoding string
 	detached bool
 }
@@ -78,9 +119,18 @@ func tnSpawnOpts(options []interface{}) tnSpawnOptions {
 				o.stdio = s
 			}
 		}
+		// entries past stderr: 'pipe' becomes an ExtraFile (fd 3, 4, …)
+		if len(st) > 3 {
+			o.stdioExtra = append(o.stdioExtra, st[3:]...)
+		}
 	case []string:
 		if len(st) > 1 {
 			o.stdio = st[1]
+		}
+		if len(st) > 3 {
+			for _, e := range st[3:] {
+				o.stdioExtra = append(o.stdioExtra, e)
+			}
 		}
 	}
 	if e, ok := TnGetValue(opts, "encoding").(string); ok {
@@ -142,6 +192,7 @@ type tnSyncRun struct {
 }
 
 func tnRunSync(file string, args []string, o tnSpawnOptions, inheritStderr bool) tnSyncRun {
+	tnPermRequire("child")
 	cmd := tnCommand(file, args, o)
 	var stdout, stderr bytes.Buffer
 	if o.input != nil {
@@ -247,9 +298,11 @@ func TnSpawnSyncString(file string, args []string, enc string, options ...interf
 // ChildProcess (spawn / exec / execFile)
 type TnChildProcess struct {
 	TnEventEmitter
-	stdin      *TnStream
-	stdout     *TnStream
-	stderr     *TnStream
+	stdin  *TnStream
+	stdout *TnStream
+	stderr *TnStream
+	// entries past stderr (a stdio array): a readable pipe end per 'pipe'
+	stdioExtra []*TnStream
 	pid        float64
 	exitCode   interface{}
 	signalCode interface{}
@@ -265,6 +318,12 @@ type TnChildProcess struct {
 func (cp *TnChildProcess) Get_stdin() *TnStream       { return cp.stdin }
 func (cp *TnChildProcess) Get_stdout() *TnStream      { return cp.stdout }
 func (cp *TnChildProcess) Get_stderr() *TnStream      { return cp.stderr }
+
+// child.stdio: [stdin, stdout, stderr, ...the extra stdio entries]
+func (cp *TnChildProcess) Get_stdio() []*TnStream {
+	out := []*TnStream{cp.stdin, cp.stdout, cp.stderr}
+	return append(out, cp.stdioExtra...)
+}
 func (cp *TnChildProcess) Get_pid() float64           { return cp.pid }
 func (cp *TnChildProcess) Get_exitCode() interface{}  { return cp.exitCode }
 func (cp *TnChildProcess) Get_signalCode() interface{} { return cp.signalCode }
@@ -319,6 +378,7 @@ func tnPipeSource(r io.Reader, s *TnStream, done *sync.WaitGroup) {
 }
 
 func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess {
+	tnPermRequire("child")
 	o := tnSpawnOpts(options)
 	cp := &TnChildProcess{spawnfile: file}
 	cmd := tnCommand(file, args, o)
@@ -349,6 +409,52 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 		streams.Add(2)
 		tnPipeSource(stdoutPipe, cp.stdout, &streams)
 		tnPipeSource(stderrPipe, cp.stderr, &streams)
+	}
+	// stdio entries past stderr: each 'pipe' is one end of an os.Pipe — the
+	// child writes (or reads) fd 3, 4, …, the parent reads child.stdio[3+n].
+	// Unix passes the write end as an ExtraFile; Windows has no ExtraFiles, so
+	// each entry is a named pipe the child opens as a real file
+	var tnExtraPipeNames []string
+	if len(o.stdioExtra) > 0 {
+		for _, e := range o.stdioExtra {
+			if s, ok := e.(string); !ok || s != "pipe" {
+				cp.stdioExtra = append(cp.stdioExtra, nil)
+				continue
+			}
+			st := TnNewReadable()
+			cp.stdioExtra = append(cp.stdioExtra, st)
+			if runtime.GOOS == "windows" {
+				name := fmt.Sprintf("\\\\\\\\.\\\\pipe\\\\tn-extra-%d-%d", os.Getpid(), len(tnExtraPipeNames))
+				server := tnCreateExtraPipeServer(name)
+				if server == nil {
+					cp.stdioExtra[len(cp.stdioExtra)-1] = nil
+					continue
+				}
+				tnExtraPipeNames = append(tnExtraPipeNames, name)
+				streams.Add(1)
+				go func() {
+					tnConnectExtraPipe(server)
+					tnPipeSource(server, st, &streams)
+				}()
+				continue
+			}
+			r, w, perr := os.Pipe()
+			if perr != nil {
+				continue
+			}
+			cmd.ExtraFiles = append(cmd.ExtraFiles, w)
+			streams.Add(1)
+			tnPipeSource(r, st, &streams)
+		}
+		if len(cmd.ExtraFiles) > 0 || len(tnExtraPipeNames) > 0 {
+			if cmd.Env == nil {
+				cmd.Env = os.Environ()
+			}
+			cmd.Env = append(cmd.Env, "TN_EXTRA_FDS="+strconv.Itoa(len(cmd.ExtraFiles)+len(tnExtraPipeNames)))
+			if len(tnExtraPipeNames) > 0 {
+				cmd.Env = append(cmd.Env, "TN_EXTRA_PIPES="+strings.Join(tnExtraPipeNames, ","))
+			}
+		}
 	}
 	if err := cmd.Start(); err != nil {
 		spawnErr := tnSpawnError(err, file)
@@ -384,7 +490,8 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 				}
 			}
 			pending++
-			for _, st := range []*TnStream{cp.stdout, cp.stderr} {
+			streamsToWait := append([]*TnStream{cp.stdout, cp.stderr}, cp.stdioExtra...)
+			for _, st := range streamsToWait {
 				if st != nil && st.flowing == 1 && !st.endEmitted {
 					pending++
 					TnLoopRef()
@@ -532,6 +639,39 @@ const windowsDetachHelper = `func tnDetach(cmd *exec.Cmd) {
 	cmd.SysProcAttr.CreationFlags |= 0x8 | 0x200
 }`;
 
+// Extra stdio on Windows: os/exec's ExtraFiles are not supported there, so
+// each extra 'pipe' entry is a named pipe — the parent serves it, the child
+// opens the client as a real os.File and fs.writeSync(fd) reaches the parent
+// synchronously, as it would with a pipe fd
+const windowsExtraPipesHelper = `var tnKernel32 = syscall.NewLazyDLL("kernel32.dll")
+var tnCreateNamedPipeProc = tnKernel32.NewProc("CreateNamedPipeW")
+var tnConnectNamedPipeProc = tnKernel32.NewProc("ConnectNamedPipe")
+
+func tnCreateExtraPipeServer(name string) *os.File {
+	p16, _ := syscall.UTF16PtrFromString(name)
+	// PIPE_ACCESS_INBOUND (the child writes), byte mode, blocking, 1 instance
+	h, _, callErr := tnCreateNamedPipeProc.Call(
+		uintptr(unsafe.Pointer(p16)), 0x1, 0x0, 1, 0, 4096, 0, 0)
+	if callErr != syscall.Errno(0) {
+		return nil
+	}
+	return os.NewFile(h, name)
+}
+
+// Blocks until the child's end connects (ERROR_PIPE_CONNECTED is fine: it is
+// already connected)
+func tnConnectExtraPipe(f *os.File) {
+	tnConnectNamedPipeProc.Call(f.Fd(), 0)
+}
+
+func tnOpenExtraPipe(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_WRONLY, 0)
+}`;
+
+const otherExtraPipesHelper = `func tnCreateExtraPipeServer(name string) *os.File { return nil }
+func tnConnectExtraPipe(f *os.File) {}
+func tnOpenExtraPipe(name string) (*os.File, error) { return nil, os.ErrNotExist }`;
+
 export function registerChildProcess(r: NodeRegistry): void {
   defineModule(r, 'child_process');
   for (const goos of ['linux', 'darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly', 'solaris', 'illumos', 'aix']) {
@@ -539,11 +679,13 @@ export function registerChildProcess(r: NodeRegistry): void {
   }
   defineHelper(r, 'nodeChildOS@windows', ['os/exec', 'syscall'], [], windowsDetachHelper);
   defineHelper(r, 'nodeChildOS@other', ['os/exec'], [], 'func tnDetach(cmd *exec.Cmd) {}');
+  defineHelper(r, 'nodeChildPipes@windows', ['os', 'syscall', 'unsafe'], [], windowsExtraPipesHelper);
+  defineHelper(r, 'nodeChildPipes@other', ['os'], [], otherExtraPipesHelper);
   defineHelper(
     r,
     'nodeChild',
-    ['bytes', 'errors', 'fmt', 'io', 'io/fs', 'os', 'os/exec', 'reflect', 'runtime', 'strings', 'sync', 'unsafe'],
-    ['nodeStream', 'fsErrors', 'buffer', 'dynamic', 'nodeInvoke', 'eventLoop', 'promise', 'nodeChildOS@os'],
+    ['bytes', 'errors', 'fmt', 'io', 'io/fs', 'os', 'os/exec', 'reflect', 'runtime', 'strconv', 'strings', 'sync', 'unsafe'],
+    ['nodeStream', 'fsErrors', 'nodeFs', 'buffer', 'dynamic', 'nodeInvoke', 'eventLoop', 'promise', 'nodeChildOS@os', 'nodeChildPipes@os'],
     childHelper
   );
   defineClass(
@@ -553,7 +695,7 @@ export function registerChildProcess(r: NodeRegistry): void {
     'class',
     'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; emit=bool; kill=bool; ref=; unref=',
     '',
-    'stdin=*TnStream; stdout=*TnStream; stderr=*TnStream; pid=float64; exitCode=interface{}; signalCode=interface{}; killed=bool; spawnfile=string',
+    'stdin=*TnStream; stdout=*TnStream; stderr=*TnStream; stdio=[]*TnStream; pid=float64; exitCode=interface{}; signalCode=interface{}; killed=bool; spawnfile=string',
     ''
   );
   defineClass(r, 'child_process.SpawnSyncReturns', '*TnSpawnSyncResult', 'class', '', 'pid=float64; stdout=string; stderr=string; status=float64; signal=*string; output=[]interface{}; error=*TnError', '', '');
@@ -563,7 +705,7 @@ export function registerChildProcess(r: NodeRegistry): void {
     const event = nodes[0];
     const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
     if (name === 'exit' || name === 'close') return ['interface{}', 'interface{}'];
-    return name === 'error' || name === 'message' ? ['interface{}'] : [];
+    return name === 'error' ? ['interface{}'] : name === 'message' ? ['interface{}', 'interface{}'] : [];
   };
   r.paramTypers['child_process.ChildProcess#once'] = r.paramTypers['child_process.ChildProcess#on'];
   const use = () => r.helper('nodeChild');

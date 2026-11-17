@@ -17,7 +17,24 @@ func tnCloneObject(keys []string, values []interface{}) map[string]interface{} {
 	return map[string]interface{}{"$tn": "Object", "k": k, "v": values}
 }
 
-func tnCloneEncode(v interface{}) interface{} {
+// Transferables (MessagePorts in a transferList) go through a hook of the
+// sending link; without one they can't be cloned, as in Node
+type tnCloneHooks struct {
+	transfer func(v interface{}) (interface{}, bool)
+	receive  func(tag map[string]interface{}) interface{}
+}
+
+func tnCloneEncode(v interface{}) interface{} { return tnCloneEncodeIn(v, nil) }
+
+func tnCloneEncodeIn(v interface{}, h *tnCloneHooks) interface{} {
+	if t, ok := v.(interface{ tnTransferable() }); ok && !TnIsNil(v) {
+		if h != nil && h.transfer != nil {
+			if out, ok := h.transfer(t); ok {
+				return out
+			}
+		}
+		panic(TnNodeError("DataCloneError", "", "Object that needs transfer was found in message but not listed in transferList"))
+	}
 	switch x := v.(type) {
 	case nil:
 		return nil
@@ -49,7 +66,7 @@ func tnCloneEncode(v interface{}) interface{} {
 	case *TnError:
 		props := map[string]interface{}{}
 		for k, val := range x.props {
-			props[k] = tnCloneEncode(val)
+			props[k] = tnCloneEncodeIn(val, h)
 		}
 		return map[string]interface{}{"$tn": "Error", "message": x.message, "code": x.code, "props": props}
 	case map[string]interface{}:
@@ -60,13 +77,13 @@ func tnCloneEncode(v interface{}) interface{} {
 		sort.Strings(keys)
 		values := make([]interface{}, len(keys))
 		for i, k := range keys {
-			values[i] = tnCloneEncode(x[k])
+			values[i] = tnCloneEncodeIn(x[k], h)
 		}
 		return tnCloneObject(keys, values)
 	case []interface{}:
 		out := make([]interface{}, len(x))
 		for i, val := range x {
-			out[i] = tnCloneEncode(val)
+			out[i] = tnCloneEncodeIn(val, h)
 		}
 		return out
 	}
@@ -88,7 +105,7 @@ func tnCloneEncode(v interface{}) interface{} {
 					break
 				}
 				keys = append(keys, k)
-				values = append(values, tnCloneEncode(e[1]))
+				values = append(values, tnCloneEncodeIn(e[1], h))
 			}
 			if plain {
 				return tnCloneObject(keys, values)
@@ -97,13 +114,13 @@ func tnCloneEncode(v interface{}) interface{} {
 		if kind == 2 {
 			values := []interface{}{}
 			for _, e := range withEntries.Entries() {
-				values = append(values, tnCloneEncode(e[0]))
+				values = append(values, tnCloneEncodeIn(e[0], h))
 			}
 			return map[string]interface{}{"$tn": "Set", "v": values}
 		}
 		pairs := []interface{}{}
 		for _, e := range withEntries.Entries() {
-			pairs = append(pairs, []interface{}{tnCloneEncode(e[0]), tnCloneEncode(e[1])})
+			pairs = append(pairs, []interface{}{tnCloneEncodeIn(e[0], h), tnCloneEncodeIn(e[1], h)})
 		}
 		return map[string]interface{}{"$tn": "Map", "v": pairs}
 	}
@@ -114,13 +131,13 @@ func tnCloneEncode(v interface{}) interface{} {
 	case reflect.Slice, reflect.Array:
 		out := make([]interface{}, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
-			out[i] = tnCloneEncode(rv.Index(i).Interface())
+			out[i] = tnCloneEncodeIn(rv.Index(i).Interface(), h)
 		}
 		return out
 	case reflect.Map:
 		out := map[string]interface{}{}
 		for _, key := range rv.MapKeys() {
-			out[fmt.Sprint(key.Interface())] = tnCloneEncode(rv.MapIndex(key).Interface())
+			out[fmt.Sprint(key.Interface())] = tnCloneEncodeIn(rv.MapIndex(key).Interface(), h)
 		}
 		return out
 	case reflect.Pointer:
@@ -138,27 +155,34 @@ func tnCloneEncode(v interface{}) interface{} {
 				}
 				value := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
 				keys = append(keys, strings.TrimSuffix(sv.Type().Field(i).Name, "_"))
-				values = append(values, tnCloneEncode(value))
+				values = append(values, tnCloneEncodeIn(value, h))
 			}
 			return tnCloneObject(keys, values)
 		}
-		return tnCloneEncode(rv.Elem().Interface())
+		return tnCloneEncodeIn(rv.Elem().Interface(), h)
 	case reflect.Float32, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return rv.Convert(reflect.TypeOf(float64(0))).Interface()
 	}
 	return TnJSString(v)
 }
 
-func tnCloneDecode(v interface{}) interface{} {
+func tnCloneDecode(v interface{}) interface{} { return tnCloneDecodeIn(v, nil) }
+
+func tnCloneDecodeIn(v interface{}, h *tnCloneHooks) interface{} {
 	switch x := v.(type) {
 	case []interface{}:
 		for i, val := range x {
-			x[i] = tnCloneDecode(val)
+			x[i] = tnCloneDecodeIn(val, h)
 		}
 		return x
 	case map[string]interface{}:
 		if tag, ok := x["$tn"].(string); ok {
 			switch tag {
+			case "Port":
+				if h != nil && h.receive != nil {
+					return h.receive(x)
+				}
+				return x
 			case "Buffer":
 				b, _ := base64.StdEncoding.DecodeString(TnJSString(x["v"]))
 				return b
@@ -175,7 +199,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				}
 				if props, ok := x["props"].(map[string]interface{}); ok {
 					for k, val := range props {
-						e.props[k] = tnCloneDecode(val)
+						e.props[k] = tnCloneDecodeIn(val, h)
 					}
 				}
 				return e
@@ -184,7 +208,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				if pairs, ok := x["v"].([]interface{}); ok {
 					for _, p := range pairs {
 						if pair, ok := p.([]interface{}); ok && len(pair) == 2 {
-							m.Set(tnCloneDecode(pair[0]), tnCloneDecode(pair[1]))
+							m.Set(tnCloneDecodeIn(pair[0], h), tnCloneDecodeIn(pair[1], h))
 						}
 					}
 				}
@@ -196,7 +220,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				values, _ := x["v"].([]interface{})
 				for i, k := range keys {
 					if i < len(values) {
-						m.Set(TnJSString(k), tnCloneDecode(values[i]))
+						m.Set(TnJSString(k), tnCloneDecodeIn(values[i], h))
 					}
 				}
 				return m
@@ -204,7 +228,7 @@ func tnCloneDecode(v interface{}) interface{} {
 				m := TnJSCollection(TnNewMap[interface{}, interface{}](), 2)
 				if values, ok := x["v"].([]interface{}); ok {
 					for _, val := range values {
-						d := tnCloneDecode(val)
+						d := tnCloneDecodeIn(val, h)
 						m.Set(d, d)
 					}
 				}
@@ -212,7 +236,7 @@ func tnCloneDecode(v interface{}) interface{} {
 			}
 		}
 		for k, val := range x {
-			x[k] = tnCloneDecode(val)
+			x[k] = tnCloneDecodeIn(val, h)
 		}
 		return x
 	}
@@ -224,6 +248,12 @@ type TnMessagePort struct {
 	TnEventEmitter
 	other     *TnMessagePort
 	transport func(data []byte)
+	// the link a received port talks over (decodes ports it carries)
+	link *tnPortLink
+	// a transferred port: deliveries go over the link to its new owner
+	forward   func(data []byte)
+	detached  bool
+	linkClose func()
 	queue     []interface{}
 	started   bool
 	closed    bool
@@ -234,6 +264,8 @@ type TnMessagePort struct {
 }
 
 func tnNewPort() *TnMessagePort { return &TnMessagePort{} }
+
+func (p *TnMessagePort) tnTransferable() {}
 
 func (p *TnMessagePort) Get_onmessage() interface{} { return p.onmessage }
 func (p *TnMessagePort) Set_onmessage(fn interface{}) {
@@ -323,29 +355,215 @@ func (p *TnMessagePort) deliver(msg interface{}) {
 }
 
 func (p *TnMessagePort) postMessage(value interface{}, transfer ...interface{}) {
-	if p.closed {
+	if p.closed || p.detached {
 		return
 	}
-	data := tnEncodeMessage(value)
+	link := p.link
+	if p.transport == nil {
+		link = nil
+	}
+	p.postRaw(tnEncodeTransfer(value, transfer, link))
+}
+
+// An encoded message posted on this port: to its peer, or over its link
+func (p *TnMessagePort) postRaw(data []byte) {
 	if p.transport != nil {
 		p.transport(data)
 		return
 	}
 	if p.other != nil {
-		p.other.deliver(tnDecodeMessage(data))
+		p.other.deliverData(data, nil)
 	}
 }
 
-func (p *TnMessagePort) close() {
+// An encoded message arriving at this port (from link, nil when in-process)
+func (p *TnMessagePort) deliverData(data []byte, link *tnPortLink) {
+	if p.forward != nil {
+		p.forward(data)
+		return
+	}
+	p.deliver(tnDecodeTransfer(data, link))
+}
+
+func (p *TnMessagePort) close() { p.closeFrom(false) }
+
+// remote: the other process closed it (nothing to tell the link)
+func (p *TnMessagePort) closeFrom(remote bool) {
 	if p.closed {
 		return
 	}
 	p.closed = true
 	p.unref()
-	TnLoopPost(func() { p.emit("close") })
+	if !remote && p.linkClose != nil {
+		p.linkClose()
+	}
+	if !p.detached {
+		TnLoopPost(func() { p.emit("close") })
+	}
 	if other := p.other; other != nil && !other.closed {
 		other.close()
 	}
+}
+
+// --- transferring ports ---
+// A MessagePort in a transferList travels as {"$tn": "Port", "id": n}. The
+// sender keeps the entangled peer and relays over the worker link: 'p'
+// frames (id + message) both ways, 'q' when either side closes. Ids count up
+// in the parent and down in a worker, so they never collide.
+type tnPortEnd struct {
+	onData  func(data []byte)
+	onClose func()
+}
+
+type tnPortLink struct {
+	send  func(kind byte, payload []byte)
+	ports map[float64]*tnPortEnd
+	next  float64
+	step  float64
+}
+
+func tnNewPortLink(step float64, send func(kind byte, payload []byte)) *tnPortLink {
+	return &tnPortLink{send: send, ports: map[float64]*tnPortEnd{}, step: step}
+}
+
+func tnPortFrame(id float64, data []byte) []byte {
+	b := make([]byte, 8, 8+len(data))
+	binary.BigEndian.PutUint64(b, math.Float64bits(id))
+	return append(b, data...)
+}
+
+// A 'p' / 'q' frame from the link (on the loop); false for other kinds
+func (l *tnPortLink) handle(kind byte, payload []byte) bool {
+	if (kind != 'p' && kind != 'q') || len(payload) < 8 {
+		return false
+	}
+	id := math.Float64frombits(binary.BigEndian.Uint64(payload))
+	end := l.ports[id]
+	if end == nil {
+		return true
+	}
+	if kind == 'p' {
+		end.onData(payload[8:])
+	} else {
+		delete(l.ports, id)
+		end.onClose()
+	}
+	return true
+}
+
+// The link is gone: every port relayed over it closes
+func (l *tnPortLink) closeAll() {
+	ends := l.ports
+	l.ports = map[float64]*tnPortEnd{}
+	for _, end := range ends {
+		end.onClose()
+	}
+}
+
+// A port leaving this process: what reaches it goes over the link, what the
+// other side posts on it goes where it would have
+func (l *tnPortLink) export(p *TnMessagePort) map[string]interface{} {
+	l.next += l.step
+	id := l.next
+	p.detached = true
+	p.queue = nil
+	p.unref()
+	p.forward = func(data []byte) { l.send('p', tnPortFrame(id, data)) }
+	p.linkClose = func() {
+		delete(l.ports, id)
+		l.send('q', tnPortFrame(id, nil))
+	}
+	l.ports[id] = &tnPortEnd{onData: p.postRaw, onClose: func() { p.closeFrom(true) }}
+	return map[string]interface{}{"$tn": "Port", "id": id}
+}
+
+// A port arriving over the link
+func (l *tnPortLink) receive(id float64) *TnMessagePort {
+	r := tnNewPort()
+	r.link = l
+	r.transport = func(data []byte) { l.send('p', tnPortFrame(id, data)) }
+	r.linkClose = func() {
+		delete(l.ports, id)
+		l.send('q', tnPortFrame(id, nil))
+	}
+	l.ports[id] = &tnPortEnd{onData: func(data []byte) { r.deliverData(data, l) }, onClose: func() { r.closeFrom(true) }}
+	return r
+}
+
+// In-process transfers hand over the port itself
+var tnLocalPorts = map[float64]*TnMessagePort{}
+var tnLocalPortNext float64
+
+func tnTransferListed(list []interface{}, p *TnMessagePort) bool {
+	for _, t := range list {
+		if t == interface{}(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// The elements of a transferList argument (an array, or { transfer: [...] })
+func tnTransferItems(transfer []interface{}) []interface{} {
+	if len(transfer) == 0 || transfer[0] == nil || TnIsNil(transfer[0]) {
+		return nil
+	}
+	v := transfer[0]
+	if t := TnGet(v, "transfer"); t != nil && reflect.ValueOf(v).Kind() != reflect.Slice {
+		v = t
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer && rv.Elem().Kind() == reflect.Slice {
+		rv = rv.Elem()
+	}
+	out := []interface{}{}
+	if rv.Kind() == reflect.Slice {
+		for i := 0; i < rv.Len(); i++ {
+			out = append(out, rv.Index(i).Interface())
+		}
+	}
+	return out
+}
+
+func tnEncodeTransfer(value interface{}, transfer []interface{}, link *tnPortLink) []byte {
+	list := tnTransferItems(transfer)
+	hooks := &tnCloneHooks{transfer: func(v interface{}) (interface{}, bool) {
+		p, ok := v.(*TnMessagePort)
+		if !ok || !tnTransferListed(list, p) {
+			return nil, false
+		}
+		if p.closed || p.detached {
+			panic(TnNodeError("DataCloneError", "", "MessagePort in transfer list is already detached"))
+		}
+		if link != nil {
+			return link.export(p), true
+		}
+		tnLocalPortNext++
+		tnLocalPorts[tnLocalPortNext] = p
+		return map[string]interface{}{"$tn": "Port", "local": tnLocalPortNext}, true
+	}}
+	data, err := json.Marshal(tnCloneEncodeIn(value, hooks))
+	if err != nil {
+		panic(TnNodeError("DataCloneError", "", err.Error()))
+	}
+	return data
+}
+
+func tnDecodeTransfer(data []byte, link *tnPortLink) interface{} {
+	var v interface{}
+	json.Unmarshal(data, &v)
+	return tnCloneDecodeIn(v, &tnCloneHooks{receive: func(tag map[string]interface{}) interface{} {
+		if n, ok := tag["local"].(float64); ok {
+			p := tnLocalPorts[n]
+			delete(tnLocalPorts, n)
+			return p
+		}
+		id, _ := tag["id"].(float64)
+		if link == nil {
+			return nil
+		}
+		return link.receive(id)
+	}})
 }
 
 type TnMessageEvent struct {
@@ -466,24 +684,78 @@ func init() {
 		}
 	}
 	TnThreadID, _ = setup["threadId"].(float64)
+	tnApplyResourceLimits(setup["resourceLimits"])
 	port := tnNewPort()
 	var writeMu sync.Mutex
-	port.transport = func(data []byte) {
+	link := tnNewPortLink(-1, func(kind byte, data []byte) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		tnWriteFrame(conn, 'm', data)
-	}
+		tnWriteFrame(conn, kind, data)
+	})
+	port.link = link
+	port.transport = func(data []byte) { link.send('m', data) }
 	TnParentPort = port
 	go func() {
 		for {
 			kind, payload, err := tnReadFrame(conn)
 			if err != nil {
-				TnLoopPost(func() { port.close() })
+				TnLoopPost(func() {
+					link.closeAll()
+					port.close()
+				})
 				return
 			}
-			if kind == 'm' {
-				msg := tnDecodeMessage(payload)
-				TnLoopPost(func() { port.deliver(msg) })
+			TnLoopPost(func() {
+				if kind == 'm' {
+					port.deliverData(payload, link)
+				} else {
+					link.handle(kind, payload)
+				}
+			})
+		}
+	}()
+}
+
+// resourceLimits: the heap limits are Go's soft memory limit, and a live heap
+// past them ends the worker with ERR_WORKER_OUT_OF_MEMORY (reported by the
+// parent from a marker line on stderr); stackSizeMb caps goroutine stacks
+var TnResourceLimits = TnNewMap[string, float64]()
+
+const tnWorkerOOMMarker = "\\x00tn:worker-out-of-memory"
+
+func tnApplyResourceLimits(raw interface{}) {
+	limits, ok := raw.(map[string]interface{})
+	if !ok {
+		return
+	}
+	num := func(key string, def float64) float64 {
+		if n, ok := limits[key].(float64); ok && n > 0 {
+			return n
+		}
+		return def
+	}
+	young, old := num("maxYoungGenerationSizeMb", 0), num("maxOldGenerationSizeMb", 0)
+	stack := num("stackSizeMb", 4)
+	TnResourceLimits.Set("maxYoungGenerationSizeMb", young)
+	TnResourceLimits.Set("maxOldGenerationSizeMb", old)
+	TnResourceLimits.Set("codeRangeSizeMb", num("codeRangeSizeMb", 0))
+	TnResourceLimits.Set("stackSizeMb", stack)
+	if _, set := limits["stackSizeMb"].(float64); set {
+		tndebug.SetMaxStack(int(stack * 1024 * 1024))
+	}
+	if young+old <= 0 {
+		return
+	}
+	limit := int64((young + old) * 1024 * 1024)
+	tndebug.SetMemoryLimit(limit)
+	go func() {
+		sample := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+		for {
+			time.Sleep(5 * time.Millisecond)
+			metrics.Read(sample)
+			if sample[0].Value.Kind() == metrics.KindUint64 && int64(sample[0].Value.Uint64()) > limit {
+				fmt.Fprintln(os.Stderr, tnWorkerOOMMarker)
+				os.Exit(1)
 			}
 		}
 	}()
@@ -506,14 +778,46 @@ type TnWorker struct {
 	threadId float64
 	cmd      *exec.Cmd
 	conn     net.Conn
+	writeMu  sync.Mutex
+	link     *tnPortLink
 	pending  [][]byte
 	refd     bool
 	exited   bool
 	killed   bool
 	exitWait []chan float64
+	stdin    *TnStream
+	stdout   *TnStream
+	stderr   *TnStream
+	limits   *TnMap[string, float64]
 }
 
 func (w *TnWorker) Get_threadId() float64 { return w.threadId }
+func (w *TnWorker) Get_stdin() *TnStream  { return w.stdin }
+func (w *TnWorker) Get_stdout() *TnStream { return w.stdout }
+func (w *TnWorker) Get_stderr() *TnStream { return w.stderr }
+
+// worker.resourceLimits: the limits given (codeRangeSizeMb -1 when unset, as
+// in Node) while the worker runs, {} once it has exited
+func (w *TnWorker) Get_resourceLimits() *TnMap[string, float64] {
+	if w.exited || w.limits == nil {
+		return TnNewMap[string, float64]()
+	}
+	return w.limits
+}
+
+// A frame to the worker (pending until it connects)
+func (w *TnWorker) sendFrame(kind byte, data []byte) {
+	if w.exited {
+		return
+	}
+	if w.conn == nil {
+		w.pending = append(w.pending, append([]byte{kind}, data...))
+		return
+	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	tnWriteFrame(w.conn, kind, data)
+}
 
 // new Worker('./w.ts'): runs the entry point compiled from that file
 func TnNewWorkerAt(entry string, filename interface{}, options ...interface{}) *TnWorker {
@@ -523,6 +827,7 @@ func TnNewWorkerAt(entry string, filename interface{}, options ...interface{}) *
 }
 
 func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
+	tnPermRequire("worker")
 	tnNextThreadID++
 	w := &TnWorker{threadId: tnNextThreadID}
 	var opts interface{}
@@ -548,7 +853,27 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 	args := []string{}
 	env := os.Environ()
 	var workerData interface{}
+	var limits map[string]interface{}
+	pipeStdout, pipeStderr, pipeStdin := false, false, false
 	if opts != nil {
+		pipeStdout, _ = TnGetValue(opts, "stdout").(bool)
+		pipeStderr, _ = TnGetValue(opts, "stderr").(bool)
+		pipeStdin, _ = TnGetValue(opts, "stdin").(bool)
+		if rl := TnGet(opts, "resourceLimits"); rl != nil && !TnIsNil(rl) {
+			limits = map[string]interface{}{}
+			w.limits = TnNewMap[string, float64]()
+			for _, key := range []string{"maxYoungGenerationSizeMb", "maxOldGenerationSizeMb", "codeRangeSizeMb", "stackSizeMb"} {
+				n, ok := tnNetNumber(TnGet(rl, key))
+				if ok {
+					limits[key] = n
+				} else if key == "stackSizeMb" {
+					n = 4
+				} else {
+					n = -1
+				}
+				w.limits.Set(key, n)
+			}
+		}
 		workerData = TnGet(opts, "workerData")
 		if argv := TnGet(opts, "argv"); argv != nil {
 			rv := reflect.ValueOf(argv)
@@ -570,6 +895,7 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 		"workerData":      tnCloneEncode(workerData),
 		"environmentData": tnCloneEncode(tnEnvironmentData),
 		"threadId":        w.threadId,
+		"resourceLimits":  limits,
 	})
 	if err != nil {
 		panic(TnNodeError("DataCloneError", "", err.Error()))
@@ -577,7 +903,28 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 	cmd := exec.Command(exe, args...)
 	cmd.Env = env
 	cmd.Stdin = nil
-	cmd.Stdout = os.Stdout
+	if !pipeStdout {
+		cmd.Stdout = os.Stdout
+	}
+	// worker.stdout / stderr are readable streams: with stdout: true /
+	// stderr: true the output goes only there, else to the parent's own
+	w.stdout, w.stderr = TnNewReadable(), TnNewReadable()
+	var stdoutPipe io.ReadCloser
+	if pipeStdout {
+		stdoutPipe, _ = cmd.StdoutPipe()
+	}
+	if pipeStdin {
+		stdinPipe, _ := cmd.StdinPipe()
+		w.stdin = TnNewWritable()
+		w.stdin.sink = func(chunk interface{}, done func(err interface{})) {
+			stdinPipe.Write(tnChunksBytes([]interface{}{chunk}))
+			done(nil)
+		}
+		w.stdin.sinkFinal = func(done func(err interface{})) {
+			stdinPipe.Close()
+			done(nil)
+		}
+	}
 	stderr, _ := cmd.StderrPipe()
 	w.cmd = cmd
 	if err := cmd.Start(); err != nil {
@@ -590,6 +937,7 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 	TnLoopRef()
 	// stderr passes through; a Go panic (an uncaught exception) becomes 'error'
 	var panicMsg string
+	outOfMemory := false
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
@@ -598,16 +946,45 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 		inPanic := false
 		for scanner.Scan() {
 			line := scanner.Text()
+			if line == tnWorkerOOMMarker {
+				outOfMemory = true
+				continue
+			}
 			if !inPanic && strings.HasPrefix(line, "panic: ") {
 				inPanic = true
 				panicMsg = strings.TrimPrefix(line, "panic: ")
 				continue
 			}
 			if !inPanic {
-				fmt.Fprintln(os.Stderr, line)
+				if pipeStderr {
+					chunk := []byte(line + "\\n")
+					TnLoopPost(func() { w.stderr.push(chunk) })
+				} else {
+					fmt.Fprintln(os.Stderr, line)
+				}
 			}
 		}
 	}()
+	stdoutDone := make(chan struct{})
+	if stdoutPipe != nil {
+		go func() {
+			defer close(stdoutDone)
+			buf := make([]byte, 32768)
+			for {
+				n, err := stdoutPipe.Read(buf)
+				if n > 0 {
+					chunk := append([]byte{}, buf[:n]...)
+					TnLoopPost(func() { w.stdout.push(chunk) })
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	} else {
+		close(stdoutDone)
+	}
+	w.link = tnNewPortLink(1, w.sendFrame)
 	go func() {
 		deadline := time.Now().Add(30 * time.Second)
 		ln.(*net.TCPListener).SetDeadline(deadline)
@@ -626,8 +1003,8 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 			tnWriteFrame(conn, 'd', setup)
 			TnLoopPost(func() {
 				w.conn = conn
-				for _, data := range w.pending {
-					tnWriteFrame(conn, 'm', data)
+				for _, frame := range w.pending {
+					tnWriteFrame(conn, frame[0], frame[1:])
 				}
 				w.pending = nil
 				w.emit("online")
@@ -637,27 +1014,37 @@ func TnNewWorker(filename interface{}, options ...interface{}) *TnWorker {
 				if err != nil {
 					return
 				}
-				if kind == 'm' {
-					msg := tnDecodeMessage(payload)
-					TnLoopPost(func() { w.emit("message", msg) })
-				}
+				TnLoopPost(func() {
+					if kind == 'm' {
+						w.emit("message", tnDecodeTransfer(payload, w.link))
+					} else {
+						w.link.handle(kind, payload)
+					}
+				})
 			}
 		}
 	}()
 	go func() {
 		<-stderrDone
-		err := cmd.Wait()
-		code := float64(0)
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			code = float64(exitErr.ExitCode())
-		}
+		<-stdoutDone
+	err := cmd.Wait()
+	code := float64(0)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code = float64(exitErr.ExitCode())
+	}
 		TnLoopPost(func() {
 			w.exited = true
 			if w.conn != nil {
 				w.conn.Close()
 			}
+			w.link.closeAll()
+			w.stdout.push(nil)
+			w.stderr.push(nil)
 			if w.killed {
 				code = 1
+			} else if outOfMemory {
+				code = 1
+				w.emit("error", TnNodeError("Error", "ERR_WORKER_OUT_OF_MEMORY", "Worker terminated due to reaching memory limit: JS heap out of memory"))
 			} else if panicMsg != "" {
 				code = 1
 				w.emit("error", TnNodeError("Error", "", panicMsg))
@@ -679,12 +1066,7 @@ func (w *TnWorker) postMessage(value interface{}, transfer ...interface{}) {
 	if w.exited {
 		return
 	}
-	data := tnEncodeMessage(value)
-	if w.conn == nil {
-		w.pending = append(w.pending, data)
-		return
-	}
-	tnWriteFrame(w.conn, 'm', data)
+	w.sendFrame('m', tnEncodeTransfer(value, transfer, w.link))
 }
 
 // terminate(): stops the worker; resolves with its exit code
@@ -719,9 +1101,9 @@ const EMITTER = 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventE
 export function registerWorkerThreads(r) {
     defineModule(r, 'worker_threads');
     defineHelper(r, 'nodeClone', ['encoding/base64', 'encoding/json', 'fmt', 'math/big', 'reflect', 'sort', 'strings', 'time', 'unsafe'], ['dynamic', 'orderedMap', 'error'], cloneHelper);
-    defineHelper(r, 'nodeWorker', ['bufio', 'crypto/rand', 'encoding/hex', 'encoding/json', 'fmt', 'net', 'os', 'os/exec', 'reflect', 'strings', 'sync', 'time'], ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild', 'entryPoints'], workerHelper);
+    defineHelper(r, 'nodeWorker', ['bufio', 'crypto/rand', 'encoding/binary', 'encoding/hex', 'encoding/json', 'fmt', 'io', 'math', 'net', 'os', 'os/exec', 'reflect', 'runtime/debug', 'runtime/metrics', 'strings', 'sync', 'time'], ['nodeClone', 'nodeIpc', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeChild', 'entryPoints', 'nodeStream', 'netErrors', 'orderedMap'], workerHelper);
     const use = () => r.helper('nodeWorker');
-    defineClass(r, 'worker_threads.Worker', '*TnWorker', 'class', `${EMITTER}; postMessage=; terminate=chan float64; ref=*TnWorker; unref=*TnWorker`, '', 'threadId=float64', '');
+    defineClass(r, 'worker_threads.Worker', '*TnWorker', 'class', `${EMITTER}; postMessage=; terminate=chan float64; ref=*TnWorker; unref=*TnWorker`, '', 'threadId=float64; stdin=*TnStream; stdout=*TnStream; stderr=*TnStream; resourceLimits=*TnMap[string, float64]', '');
     defineClass(r, 'worker_threads.MessagePort', '*TnMessagePort', 'class', `${EMITTER}; postMessage=; start=; close=; ref=*TnMessagePort; unref=*TnMessagePort; hasRef=bool`, '', 'onmessage=interface{}', 'onmessage');
     defineClass(r, 'worker_threads.MessageChannel', '*TnMessageChannel', 'class', '', 'port1=*TnMessagePort; port2=*TnMessagePort', '', '');
     defineClass(r, 'worker_threads.BroadcastChannel', '*TnBroadcastChannel', 'class', 'postMessage=; close=; addEventListener=; ref=*TnBroadcastChannel; unref=*TnBroadcastChannel', '', 'name=string; onmessage=interface{}', 'onmessage');
@@ -772,7 +1154,7 @@ export function registerWorkerThreads(r) {
     value('workerData', 'interface{}', 'TnWorkerData');
     value('threadId', 'float64', 'TnThreadID');
     value('SHARE_ENV', 'string', '"TnShareEnv"');
-    value('resourceLimits', 'map[string]interface{}', 'map[string]interface{}{}');
+    value('resourceLimits', '*TnMap[string, float64]', 'TnResourceLimits');
     r.functions['worker_threads.receiveMessageOnPort'] = (c) => {
         use();
         return `TnReceiveMessageOnPort(${c.args[0]})`;

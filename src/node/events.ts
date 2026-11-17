@@ -1221,7 +1221,8 @@ export function registerEvents(r: NodeRegistry): void {
     const event = nodes[0];
     const name = event && event.kind === 'StringLiteral' ? String(event.text) : '';
     if (name === 'exit') return ['float64'];
-    if (name === 'message') return ['interface{}'];
+    // 'message' also passes the handle sent with it (send(msg, socket))
+    if (name === 'message') return ['interface{}', 'interface{}'];
     if (name === 'disconnect') return [];
     return ['string'];
   };

@@ -125,6 +125,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ZIP archives:** `ZipEntry`, `ZipBuffer`, `ZipFile`, `createZipArchive(Sync)`,
   `zipFiles` and `get` / `setMaxZipContentSize`, over Go's `archive/zip`
   (streaming entries and `contentIterator` are not included).
+- **IPC handle passing** (`send(msg, socket)`, `serialization: 'advanced'`):
+  a `net.Socket` travels with the message to a forked child, a cluster worker
+  or the parent and arrives as the second `'message'` argument, live to the
+  real peer with its addresses; the sender keeps the connection and relays
+  its bytes over the IPC link (fd-passing-like), and its own copy goes silent
+  as in Node. Half-closes, destroys and the socket's addresses propagate.
+- **`cluster` `SCHED_NONE`:** with `cluster.schedulingPolicy = cluster.SCHED_NONE`
+  (writable now) a worker binds the port itself — `SO_REUSEPORT` on Unix,
+  `SO_REUSEADDR` on Windows — and the OS balances the connections; the
+  primary still hears `'listening'` with the port. `exclusive: true`
+  listeners bind directly, and dgram sockets with `reuseAddr` share a port.
+- **`child_process` `stdio` arrays:** entries past stderr are `ExtraFiles`
+  (fds 3, 4, …), readable as `child.stdio[3+n]`; Windows, where `os/exec`
+  has no `ExtraFiles`, serves each entry a named pipe the child opens as a
+  real file, so `fs.writeSync(3, …)` reaches the parent synchronously.
+- **`process.permission`:** `has` / `drop` under `--permission` (from
+  `NODE_OPTIONS`): fs read / write path prefixes, child process, worker and
+  addon grants, enforced by the fs, child_process and worker helpers with
+  Node's `ERR_ACCESS_DENIED` messages; `process.permission` is `undefined`
+  without the flag, as in Node.
+- **`worker_threads` port transfer, `resourceLimits` and `stdout` /
+  `stderr: true`:** transferred `MessagePort`s relay over the worker link
+  (both ways, close propagates), a worker's heap limit ends it with
+  `ERR_WORKER_OUT_OF_MEMORY` and `stackSizeMb` caps goroutine stacks, and a
+  worker's output is readable on `worker.stdout` / `worker.stderr`.
+- **`dgram` source-specific membership:** `addSourceSpecificMembership` /
+  `dropSourceSpecificMembership` on Linux, macOS, the BSDs and Windows
+  (`IP_ADD_SOURCE_MEMBERSHIP` / `MCAST_JOIN_SOURCE_GROUP`), with Node's
+  errors and the unbound-socket bind.
 - **25 more performance probes** in `performance/`: object dictionaries,
   `Object.keys` / `entries` / `for…in`, spread and destructuring, optional
   chaining, Map iteration and number keys, array slicing and `for…of`, string

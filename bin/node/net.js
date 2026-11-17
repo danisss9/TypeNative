@@ -193,10 +193,20 @@ func tnAddrInfo(addr net.Addr) *TnAddressInfo {
 	return &TnAddressInfo{address: addr.String(), family: "", port: -1}
 }
 
+// A socket sent over an IPC link (child_process send(msg, socket)): the
+// sender keeps the real connection and relays its bytes — data read off it
+// goes to the receiving side ('w'), the receiver's writes come back as 'd',
+// its end is 'x', a destroy 'z'
+type tnSocketRelay struct {
+	id   float64
+	send func(kind byte, data []byte) bool
+}
+
 // net.Socket: a duplex stream over a net.Conn
 type TnSocket struct {
 	TnStream
 	conn          net.Conn
+	relay         *tnSocketRelay
 	connecting    bool
 	pendingWrites []func()
 	allowHalfOpen bool
@@ -271,10 +281,6 @@ func TnNewSocket(options ...interface{}) *TnSocket {
 	}
 	s.sink = func(chunk interface{}, done func(err interface{})) {
 		write := func() {
-			if s.conn == nil {
-				done(TnNodeError("Error", "EPIPE", "This socket has been ended by the other party"))
-				return
-			}
 			var data []byte
 			switch c := chunk.(type) {
 			case []byte:
@@ -283,6 +289,18 @@ func TnNewSocket(options ...interface{}) *TnSocket {
 				data = []byte(c)
 			default:
 				data = []byte(TnJSString(c))
+			}
+			if s.relay != nil {
+				if !s.relay.send('d', data) {
+					done(TnNodeError("Error", "EPIPE", "This socket has been ended by the other party"))
+				} else {
+					done(nil)
+				}
+				return
+			}
+			if s.conn == nil {
+				done(TnNodeError("Error", "EPIPE", "This socket has been ended by the other party"))
+				return
 			}
 			_, err := s.conn.Write(data)
 			s.touch()
@@ -300,6 +318,11 @@ func TnNewSocket(options ...interface{}) *TnSocket {
 	}
 	s.sinkFinal = func(done func(err interface{})) {
 		finish := func() {
+			if s.relay != nil {
+				s.relay.send('x', nil)
+				done(nil)
+				return
+			}
 			if cw, ok := s.conn.(interface{ CloseWrite() error }); ok {
 				cw.CloseWrite()
 			}
@@ -336,6 +359,9 @@ func (s *TnSocket) attach(conn net.Conn) {
 	s.refd = true
 	TnLoopRef()
 	s.onClose = func() {
+		if s.relay != nil {
+			s.relay.send('z', nil)
+		}
 		s.clearTimer()
 		conn.Close()
 		if s.refd {
@@ -353,14 +379,23 @@ func (s *TnSocket) attach(conn net.Conn) {
 			if n > 0 {
 				chunk := append([]byte{}, buf[:n]...)
 				s.post(func() {
-					if !s.destroyed {
-						s.touch()
-						s.push(chunk)
+					if s.destroyed {
+						return
 					}
+					if s.relay != nil {
+						s.relay.send('w', chunk)
+						return
+					}
+					s.touch()
+					s.push(chunk)
 				})
 			}
 			if err != nil {
 				s.post(func() {
+					if s.relay != nil {
+						s.relay.send('x', nil)
+						return
+					}
 					if s.destroyed || s.readEnded {
 						return
 					}
@@ -594,13 +629,14 @@ func (s *TnSocket) destroySoon() {
 }
 
 // Cluster workers listen through the primary (set by node:cluster)
-var tnListenHook func(srv *TnNetServer, network string, address string) (net.Listener, error)
+var tnListenHook func(srv *TnNetServer, network string, address string, exclusive bool) (net.Listener, error)
 
 // net.Server
 type TnNetServer struct {
 	TnEventEmitter
 	ln            net.Listener
 	listening     bool
+	exclusive     bool
 	conns         map[*TnSocket]bool
 	refd          bool
 	closing       bool
@@ -669,6 +705,9 @@ func (srv *TnNetServer) listen(args ...interface{}) *TnNetServer {
 			if p := tnNetString(TnGet(a, "path")); p != "" {
 				path, network = p, "unix"
 			}
+			if b, ok := TnGetValue(a, "exclusive").(bool); ok {
+				srv.exclusive = b
+			}
 		}
 	}
 	srv.asyncCtx = TnAsyncSnapshot()
@@ -679,7 +718,7 @@ func (srv *TnNetServer) listen(args ...interface{}) *TnNetServer {
 	var ln net.Listener
 	var err error
 	if tnListenHook != nil && network != "unix" {
-		ln, err = tnListenHook(srv, network, address)
+		ln, err = tnListenHook(srv, network, address, srv.exclusive)
 	} else {
 		ln, err = net.Listen(network, address)
 	}

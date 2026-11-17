@@ -4,9 +4,207 @@
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
 
+// process.permission under --permission: the grants come from NODE_OPTIONS
+// (--permission, --allow-fs-read[=path], --allow-fs-write[=path],
+// --allow-child-process, --allow-worker, --allow-addons) and are enforced by
+// the fs / child_process / worker_threads helpers
+const permHelper = `// process.permission
+var tnPermEnabled bool
+var tnPermReadAll bool
+var tnPermWriteAll bool
+var tnPermReadGrants []string
+var tnPermWriteGrants []string
+var tnPermReadDropped []string
+var tnPermWriteDropped []string
+var tnPermChild bool
+var tnPermWorker bool
+var tnPermAddon bool
+var tnPermDroppedRead bool
+var tnPermDroppedWrite bool
+var tnPermDroppedChild bool
+var tnPermDroppedWorker bool
+var tnPermDroppedAddon bool
+var tnPermMu sync.Mutex
+
+func init() {
+	opts := os.Getenv("NODE_OPTIONS")
+	if opts == "" {
+		return
+	}
+	enabled := false
+	for _, f := range strings.Fields(opts) {
+		f = strings.Trim(f, "\\"'")
+		switch {
+		case f == "--permission":
+			enabled = true
+		case f == "--no-permission":
+			enabled = false
+		case f == "--allow-fs-read":
+			tnPermReadAll = true
+		case f == "--allow-fs-write":
+			tnPermWriteAll = true
+		case strings.HasPrefix(f, "--allow-fs-read="):
+			if v := strings.TrimPrefix(f, "--allow-fs-read="); v == "*" {
+				tnPermReadAll = true
+			} else {
+				tnPermReadGrants = append(tnPermReadGrants, v)
+			}
+		case strings.HasPrefix(f, "--allow-fs-write="):
+			if v := strings.TrimPrefix(f, "--allow-fs-write="); v == "*" {
+				tnPermWriteAll = true
+			} else {
+				tnPermWriteGrants = append(tnPermWriteGrants, v)
+			}
+		case f == "--allow-child-process":
+			tnPermChild = true
+		case f == "--allow-worker":
+			tnPermWorker = true
+		case f == "--allow-addons":
+			tnPermAddon = true
+		}
+	}
+	tnPermEnabled = enabled
+}
+
+func tnPermHas(kind string, path string) bool {
+	if !tnPermEnabled {
+		return false
+	}
+	tnPermMu.Lock()
+	defer tnPermMu.Unlock()
+	switch kind {
+	case "fs.read":
+		if tnPermDroppedRead {
+			return false
+		}
+		if path == "" {
+			return tnPermReadAll
+		}
+		for _, d := range tnPermReadDropped {
+			if strings.HasPrefix(path, d) {
+				return false
+			}
+		}
+		for _, g := range tnPermReadGrants {
+			if strings.HasPrefix(path, g) {
+				return true
+			}
+		}
+		return tnPermReadAll
+	case "fs.write":
+		if tnPermDroppedWrite {
+			return false
+		}
+		if path == "" {
+			return tnPermWriteAll
+		}
+		for _, d := range tnPermWriteDropped {
+			if strings.HasPrefix(path, d) {
+				return false
+			}
+		}
+		for _, g := range tnPermWriteGrants {
+			if strings.HasPrefix(path, g) {
+				return true
+			}
+		}
+		return tnPermWriteAll
+	case "child":
+		return tnPermChild && !tnPermDroppedChild
+	case "worker":
+		return tnPermWorker && !tnPermDroppedWorker
+	case "addon":
+		return tnPermAddon && !tnPermDroppedAddon
+	}
+	return false
+}
+
+func tnPermDrop(kind string, path string) {
+	if !tnPermEnabled {
+		return
+	}
+	tnPermMu.Lock()
+	defer tnPermMu.Unlock()
+	switch kind {
+	case "fs.read":
+		if path == "" {
+			tnPermDroppedRead = true
+			tnPermReadAll = false
+			tnPermReadGrants = nil
+			return
+		}
+		// dropping one path denies it while other grants stay
+		tnPermReadDropped = append(tnPermReadDropped, path)
+	case "fs.write":
+		if path == "" {
+			tnPermDroppedWrite = true
+			tnPermWriteAll = false
+			tnPermWriteGrants = nil
+			return
+		}
+		tnPermWriteDropped = append(tnPermWriteDropped, path)
+	case "child":
+		tnPermDroppedChild = true
+	case "worker":
+		tnPermDroppedWorker = true
+	case "addon":
+		tnPermDroppedAddon = true
+	}
+}
+
+func tnPermRequire(kind string, path ...string) {
+	p := ""
+	if len(path) > 0 {
+		p = path[0]
+	}
+	if tnPermEnabled && !tnPermHas(kind, p) {
+		flag := "fs-read"
+		switch kind {
+		case "fs.write":
+			flag = "fs-write"
+		case "child":
+			flag = "child-process"
+		case "worker":
+			flag = "worker"
+		case "addon":
+			flag = "addons"
+		}
+		panic(TnNodeError("Error", "ERR_ACCESS_DENIED", "Access to this API has been restricted. Use --allow-"+flag+" to manage permissions."))
+	}
+}`;
+
 const processHelper = `// node:process
 var tnProcessStart = time.Now()
 var tnExitCode float64
+
+// process.permission: undefined unless --permission is in effect; an object
+// of closures (dynamic calls find it like the process value's members)
+var tnPermissionValue *TnMap[string, interface{}]
+
+func TnProcessPermissionValue() interface{} {
+	if !tnPermEnabled {
+		return nil
+	}
+	if tnPermissionValue == nil {
+		p := TnNewMap[string, interface{}]()
+		p.Set("has", func(permission interface{}, arg interface{}) bool {
+			path := ""
+			if arg != nil {
+				path = TnJSString(arg)
+			}
+			return tnPermHas(TnJSString(permission), path)
+		})
+		p.Set("drop", func(permission interface{}, arg interface{}) {
+			path := ""
+			if arg != nil {
+				path = TnJSString(arg)
+			}
+			tnPermDrop(TnJSString(permission), path)
+		})
+		tnPermissionValue = p
+	}
+	return tnPermissionValue
+}
 
 // Node's argv shape: [execPath, script, ...args] (the binary is the script)
 func TnProcessArgv() []string {
@@ -429,9 +627,16 @@ export function registerProcess(r: NodeRegistry): void {
   r.objects['process.memoryUsage'] = true;
   defineHelper(
     r,
+    'nodePerm',
+    ['os', 'strings', 'sync'],
+    ['error', 'dynamic'],
+    permHelper
+  );
+  defineHelper(
+    r,
     'nodeProcess',
     ['fmt', 'math/big', 'os', 'runtime', 'strings', 'syscall', 'time'],
-    ['error', 'orderedMap'],
+    ['error', 'orderedMap', 'dynamic', 'nodePerm'],
     processHelper
   );
   defineClass(r, 'process.MemoryUsage', '*TnMemoryUsage', 'class', '', 'rss=float64; heapTotal=float64; heapUsed=float64; external=float64; arrayBuffers=float64', '', '');
@@ -497,6 +702,10 @@ export function registerProcess(r: NodeRegistry): void {
     return 'TnProcessVersions()';
   });
   value('title', 'string', () => '"node"');
+  value('permission', 'interface{}', () => {
+    use();
+    return 'TnProcessPermissionValue()';
+  });
   value('exitCode', 'float64', () => {
     use();
     return 'tnExitCode';

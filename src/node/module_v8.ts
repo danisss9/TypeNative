@@ -95,10 +95,10 @@ type TnHeapStatistics struct {
 	external_memory             float64
 }
 
-// The heap limit: GOMEMLIMIT / debug.SetMemoryLimit when set, else 4 GiB
+// The heap limit: GOMEMLIMIT / tndebug.SetMemoryLimit when set, else 4 GiB
 // (V8's default on 64-bit systems)
 func tnHeapLimit() float64 {
-	if limit := debug.SetMemoryLimit(-1); limit < math.MaxInt64 {
+	if limit := tndebug.SetMemoryLimit(-1); limit < math.MaxInt64 {
 		return float64(limit)
 	}
 	return 4 * 1024 * 1024 * 1024

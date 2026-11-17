@@ -48,17 +48,167 @@ func tnDecodeMessage(data []byte) interface{} {
 	return tnCloneDecode(v)
 }
 
+// --- handle passing (send(msg, socket)) ---
+// A transferred net.Socket travels as a descriptor inside an 'h' frame: the
+// sender keeps the real connection and relays its bytes over tunnel frames —
+// 'w' carries data read off the real connection to the receiving side, 'd'
+// carries its writes back, 'x' is a half-close either way, 'z' a destroy. Ids
+// count up in the parent and down in a child, so they never collide.
+
+func tnHandleFrame(id float64, data []byte) []byte {
+	b := make([]byte, 8, 8+len(data))
+	binary.BigEndian.PutUint64(b, math.Float64bits(id))
+	return append(b, data...)
+}
+
+// The receiving side's end of a transferred socket: a net.Conn whose reads
+// drain 'w' frames and whose writes leave as 'd' frames
+type tnHandleConn struct {
+	link  *tnIpcLink
+	id    float64
+	mu    sync.Mutex
+	inbox [][]byte
+	wake  chan struct{}
+	eof   bool
+	done  bool
+	wend  bool
+	raddr *net.TCPAddr
+	laddr *net.TCPAddr
+}
+
+func tnHandleConnAddr(desc map[string]interface{}, host string, port string) *net.TCPAddr {
+	h, _ := desc[host].(string)
+	p, _ := desc[port].(float64)
+	return &net.TCPAddr{IP: net.ParseIP(h), Port: int(p)}
+}
+
+func tnNewHandleConn(l *tnIpcLink, id float64, desc map[string]interface{}) *tnHandleConn {
+	return &tnHandleConn{
+		link: l, id: id, wake: make(chan struct{}, 1),
+		raddr: tnHandleConnAddr(desc, "ra", "rp"),
+		laddr: tnHandleConnAddr(desc, "la", "lp"),
+	}
+}
+
+// A tunnel frame for a socket this side owns
+func (c *tnHandleConn) tnFrame(kind byte, data []byte) {
+	c.mu.Lock()
+	switch kind {
+	case 'w':
+		if !c.eof && !c.done {
+			c.inbox = append(c.inbox, data)
+		}
+	case 'x':
+		c.eof = true
+	case 'z':
+		c.done = true
+		c.eof = true
+		c.inbox = nil
+	}
+	c.mu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *tnHandleConn) Read(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		if len(c.inbox) > 0 {
+			data := c.inbox[0]
+			n := copy(b, data)
+			if n < len(data) {
+				c.inbox[0] = data[n:]
+			} else {
+				c.inbox = c.inbox[1:]
+			}
+			c.mu.Unlock()
+			return n, nil
+		}
+		eof, done := c.eof, c.done
+		c.mu.Unlock()
+		if done || eof {
+			return 0, io.EOF
+		}
+		<-c.wake
+	}
+}
+
+func (c *tnHandleConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	dead := c.done || c.wend
+	c.mu.Unlock()
+	if dead {
+		return 0, net.ErrClosed
+	}
+	if !c.link.write('d', tnHandleFrame(c.id, b)) {
+		return 0, net.ErrClosed
+	}
+	return len(b), nil
+}
+
+func (c *tnHandleConn) Close() error {
+	c.mu.Lock()
+	was := c.done
+	c.done = true
+	c.eof = true
+	c.mu.Unlock()
+	if !was {
+		c.link.write('z', tnHandleFrame(c.id, nil))
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *tnHandleConn) CloseWrite() error {
+	c.mu.Lock()
+	c.wend = true
+	c.mu.Unlock()
+	c.link.write('x', tnHandleFrame(c.id, nil))
+	return nil
+}
+
+func (c *tnHandleConn) LocalAddr() net.Addr  { return c.laddr }
+func (c *tnHandleConn) RemoteAddr() net.Addr { return c.raddr }
+func (c *tnHandleConn) SetDeadline(t time.Time) error {
+	return nil
+}
+func (c *tnHandleConn) SetReadDeadline(t time.Time) error   { return nil }
+func (c *tnHandleConn) SetWriteDeadline(t time.Time) error  { return nil }
+
+// The sender's record of a socket it transferred
+type tnRelayEnd struct {
+	conn   net.Conn
+	socket *TnSocket
+}
+
+// A queued frame: an 'm' / 'h' message or a tunnel frame for a socket
+type tnTunnelFrame struct {
+	kind byte
+	data []byte
+}
+
 // One end of an IPC link. Handlers run on the loop; direct control handlers
 // run on the reading goroutine (replies a blocked caller waits for)
 type tnIpcLink struct {
 	conn          net.Conn
 	mu            sync.Mutex
 	closed        bool
-	onMessage     func(msg interface{})
+	onMessage     func(msg interface{}, handle interface{})
 	onControl     func(ctl map[string]interface{})
 	directControl func(ctl map[string]interface{}) bool
 	onClose       func()
 	done          chan struct{}
+	hnext         float64
+	hstep         float64
+	hmu           sync.Mutex
+	handles       map[float64]*tnHandleConn
+	relays        map[float64]*tnRelayEnd
+	pendingH      map[float64][]tnTunnelFrame
 }
 
 func (l *tnIpcLink) write(kind byte, data []byte) bool {
@@ -106,9 +256,26 @@ func (l *tnIpcLink) start() {
 				msg := tnDecodeMessage(payload)
 				TnLoopPost(func() {
 					if l.onMessage != nil {
-						l.onMessage(msg)
+						l.onMessage(msg, nil)
 					}
 				})
+			case 'h':
+				var wrap map[string]json.RawMessage
+				json.Unmarshal(payload, &wrap)
+				msg := tnDecodeMessage(wrap["msg"])
+				var desc map[string]interface{}
+				json.Unmarshal(wrap["handle"], &desc)
+				TnLoopPost(func() {
+					var handle interface{}
+					if len(desc) > 0 {
+						handle = l.resolveHandle(desc)
+					}
+					if l.onMessage != nil {
+						l.onMessage(msg, handle)
+					}
+				})
+			case 'w', 'd', 'x', 'z':
+				l.handleTunnel(kind, payload)
 			case 'c':
 				var ctl map[string]interface{}
 				json.Unmarshal(payload, &ctl)
@@ -134,15 +301,128 @@ func tnIpcCallback(args []interface{}) interface{} {
 	return nil
 }
 
+// The handle argument of send(message, handle?, ..., callback?): the first
+// net.Socket among the extra arguments
+func tnIpcHandle(args []interface{}) *TnSocket {
+	for _, a := range args {
+		if s, ok := a.(*TnSocket); ok {
+			return s
+		}
+	}
+	return nil
+}
+
+// Transfers a connected socket over this link: the socket's connection is
+// relayed from now on; the descriptor travels in the message
+func (l *tnIpcLink) exportSocket(s *TnSocket) map[string]interface{} {
+	if s.relay != nil {
+		panic(TnNodeError("DataCloneError", "", "This socket has already been sent"))
+	}
+	if s.conn == nil {
+		panic(TnNodeError("DataCloneError", "", "The socket must be connected to send it"))
+	}
+	l.hmu.Lock()
+	l.hnext += l.hstep
+	id := l.hnext
+	l.relays[id] = &tnRelayEnd{conn: s.conn, socket: s}
+	l.hmu.Unlock()
+	s.relay = &tnSocketRelay{id: id, send: func(kind byte, data []byte) bool {
+		return l.write(kind, tnHandleFrame(id, data))
+	}}
+	// the sender's copy is no longer used: like Node after send(handle), it
+	// does not keep the process alive
+	if s.refd {
+		s.refd = false
+		TnLoopUnref()
+	}
+	return map[string]interface{}{
+		"$tn": "Handle", "kind": "socket", "id": id,
+		"ra": s.remoteAddress, "rp": s.remotePort,
+		"la": s.localAddress, "lp": s.localPort,
+	}
+}
+
+// A socket arriving: its end lives here from now on, fed by tunnel frames
+func (l *tnIpcLink) resolveHandle(desc map[string]interface{}) *TnSocket {
+	id, _ := desc["id"].(float64)
+	c := tnNewHandleConn(l, id, desc)
+	l.hmu.Lock()
+	pend := l.pendingH[id]
+	delete(l.pendingH, id)
+	l.handles[id] = c
+	l.hmu.Unlock()
+	for _, f := range pend {
+		c.tnFrame(f.kind, f.data)
+	}
+	s := TnNewSocket()
+	s.attach(c)
+	return s
+}
+
+// A tunnel frame ('w'/'d'/'x'/'z') for a transferred socket: to the end this
+// side owns, to the connection this side relays, or in flight (the message
+// carrying the descriptor is still on the loop)
+func (l *tnIpcLink) handleTunnel(kind byte, payload []byte) {
+	if len(payload) < 8 {
+		return
+	}
+	id := math.Float64frombits(binary.BigEndian.Uint64(payload))
+	data := payload[8:]
+	l.hmu.Lock()
+	if c := l.handles[id]; c != nil {
+		l.hmu.Unlock()
+		c.tnFrame(kind, data)
+		return
+	}
+	if r := l.relays[id]; r != nil {
+		l.hmu.Unlock()
+		l.relayFrame(r, kind, data)
+		return
+	}
+	l.pendingH[id] = append(l.pendingH[id], tnTunnelFrame{kind: kind, data: data})
+	l.hmu.Unlock()
+}
+
+func (l *tnIpcLink) relayFrame(r *tnRelayEnd, kind byte, data []byte) {
+	switch kind {
+	case 'd':
+		r.conn.Write(data)
+	case 'x':
+		if cw, ok := r.conn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+	case 'z':
+		r.conn.Close()
+	}
+}
+
+// Registers a relay before the link exists (a send on a not-yet-connected
+// child); merged into the link when it connects
+func (l *tnIpcLink) adoptRelays(relays map[float64]*tnRelayEnd, pendingH map[float64][]tnTunnelFrame, hnext float64) {
+	l.hmu.Lock()
+	for id, r := range relays {
+		l.relays[id] = r
+	}
+	for id, frames := range pendingH {
+		l.pendingH[id] = append(l.pendingH[id], frames...)
+	}
+	if l.hnext == 0 && hnext != 0 {
+		l.hnext = hnext
+	}
+	l.hmu.Unlock()
+}
+
 // --- the parent side: child_process.fork ---
 
 type tnChildIpc struct {
-	link      *tnIpcLink
-	pending   [][]byte
-	connected bool
-	onConnect func()
-	onControl func(ctl map[string]interface{})
-	drained   chan struct{}
+	link          *tnIpcLink
+	pending       []tnTunnelFrame
+	pendingRelays map[float64]*tnRelayEnd
+	hnext         float64
+	connected     bool
+	onConnect     func()
+	onControl     func(ctl map[string]interface{})
+	drained       chan struct{}
 }
 
 // Holds the child's 'exit' until everything it sent (and the channel's close)
@@ -163,10 +443,57 @@ func tnIpcClosedError() *TnError {
 	return TnNodeError("Error", "ERR_IPC_CHANNEL_CLOSED", "Channel closed")
 }
 
-// child.send(message, callback?)
+// A frame to the child, held until the link connects
+func (st *tnChildIpc) writeFrame(kind byte, data []byte) bool {
+	if st.link == nil {
+		st.pending = append(st.pending, tnTunnelFrame{kind: kind, data: data})
+		return true
+	}
+	return st.link.write(kind, data)
+}
+
+// Transfers a socket to the child (may run before the link connects)
+func (st *tnChildIpc) exportSocket(s *TnSocket) map[string]interface{} {
+	if s.relay != nil {
+		panic(TnNodeError("DataCloneError", "", "This socket has already been sent"))
+	}
+	if s.conn == nil {
+		panic(TnNodeError("DataCloneError", "", "The socket must be connected to send it"))
+	}
+	st.hnext++
+	id := st.hnext
+	end := &tnRelayEnd{conn: s.conn, socket: s}
+	if st.link == nil {
+		if st.pendingRelays == nil {
+			st.pendingRelays = map[float64]*tnRelayEnd{}
+		}
+		st.pendingRelays[id] = end
+	} else {
+		st.link.hmu.Lock()
+		st.link.relays[id] = end
+		st.link.hmu.Unlock()
+	}
+	s.relay = &tnSocketRelay{id: id, send: func(kind byte, data []byte) bool {
+		return st.writeFrame(kind, tnHandleFrame(id, data))
+	}}
+	// the sender's copy is no longer used: like Node after send(handle), it
+	// does not keep the process alive
+	if s.refd {
+		s.refd = false
+		TnLoopUnref()
+	}
+	return map[string]interface{}{
+		"$tn": "Handle", "kind": "socket", "id": id,
+		"ra": s.remoteAddress, "rp": s.remotePort,
+		"la": s.localAddress, "lp": s.localPort,
+	}
+}
+
+// child.send(message, handle?, callback?)
 func (cp *TnChildProcess) send(message interface{}, args ...interface{}) bool {
 	st := tnCPIpc(cp)
 	cb := tnIpcCallback(args)
+	handle := tnIpcHandle(args)
 	if st == nil || !st.connected {
 		err := tnIpcClosedError()
 		if cb != nil {
@@ -176,11 +503,15 @@ func (cp *TnChildProcess) send(message interface{}, args ...interface{}) bool {
 		}
 		return false
 	}
-	data := tnEncodeMessage(message)
-	if st.link == nil {
-		st.pending = append(st.pending, data)
+	if handle != nil {
+		desc := st.exportSocket(handle)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"msg":    json.RawMessage(tnEncodeMessage(message)),
+			"handle": desc,
+		})
+		st.writeFrame('h', payload)
 	} else {
-		st.link.write('m', data)
+		st.writeFrame('m', tnEncodeMessage(message))
 	}
 	if cb != nil {
 		TnLoopPost(func() { TnInvoke(cb, nil) })
@@ -257,7 +588,9 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 				continue
 			}
 			ln.Close()
-			link := &tnIpcLink{conn: conn, done: st.drained}
+			link := &tnIpcLink{conn: conn, done: st.drained, hstep: 1, handles: map[float64]*tnHandleConn{}, relays: map[float64]*tnRelayEnd{}, pendingH: map[float64][]tnTunnelFrame{}}
+			link.adoptRelays(st.pendingRelays, nil, st.hnext)
+			st.pendingRelays = nil
 			TnLoopPost(func() {
 				st.link = link
 				if !st.connected {
@@ -265,11 +598,11 @@ func tnForkWith(argv []string, opts interface{}, extraEnv []string) *TnChildProc
 					close(st.drained)
 					return
 				}
-				for _, data := range st.pending {
-					link.write('m', data)
+				for _, f := range st.pending {
+					link.write(f.kind, f.data)
 				}
 				st.pending = nil
-				link.onMessage = func(msg interface{}) { cp.emit("message", msg) }
+				link.onMessage = func(msg interface{}, handle interface{}) { cp.emit("message", msg, handle) }
 				link.onControl = func(ctl map[string]interface{}) {
 					if st.onControl != nil {
 						st.onControl(ctl)
@@ -345,10 +678,10 @@ func init() {
 		conn.Close()
 		return
 	}
-	link := &tnIpcLink{conn: conn}
+	link := &tnIpcLink{conn: conn, hstep: -1, handles: map[float64]*tnHandleConn{}, relays: map[float64]*tnRelayEnd{}, pendingH: map[float64][]tnTunnelFrame{}}
 	tnIpcParent = link
 	tnIpcConnected = true
-	link.onMessage = func(msg interface{}) { tnProcessEmitter.emit("message", msg) }
+	link.onMessage = func(msg interface{}, handle interface{}) { tnProcessEmitter.emit("message", msg, handle) }
 	link.onClose = func() {
 		if tnIpcConnected {
 			tnIpcConnected = false
@@ -386,11 +719,20 @@ func TnProcessSend(message interface{}, args ...interface{}) bool {
 		}
 		panic(err)
 	}
-	ok := tnIpcParent.write('m', tnEncodeMessage(message))
+	if handle := tnIpcHandle(args); handle != nil {
+		desc := tnIpcParent.exportSocket(handle)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"msg":    json.RawMessage(tnEncodeMessage(message)),
+			"handle": desc,
+		})
+		tnIpcParent.write('h', payload)
+	} else {
+		tnIpcParent.write('m', tnEncodeMessage(message))
+	}
 	if cb != nil {
 		TnLoopPost(func() { TnInvoke(cb, nil) })
 	}
-	return ok
+	return true
 }
 
 func TnProcessDisconnect() {
@@ -405,6 +747,16 @@ func TnProcessDisconnect() {
 
 func TnProcessConnected() bool { return tnIpcConnected }`;
 const clusterHelper = `// node:cluster
+// SCHED_RR (2): the primary owns the listeners and relays. SCHED_NONE (1):
+// each worker binds the port itself and the OS balances the connections
+var tnSchedulingPolicy float64 = 2
+
+func tnSetSchedulingPolicy(v interface{}) {
+	if n, ok := tnNetNumber(v); ok {
+		tnSchedulingPolicy = n
+	}
+}
+
 type TnClusterAddress struct {
 	address     string
 	port        float64
@@ -566,9 +918,9 @@ func (c *TnCluster) fork(env ...interface{}) *TnClusterWorker {
 		c.emit("online", w)
 	}
 	st.onControl = func(ctl map[string]interface{}) { c.control(w, st.link, ctl) }
-	cp.TnEventEmitter.on("message", func(msg interface{}) {
-		w.emit("message", msg)
-		c.emit("message", w, msg)
+	cp.TnEventEmitter.on("message", func(msg interface{}, handle interface{}) {
+		w.emit("message", msg, handle)
+		c.emit("message", w, msg, handle)
 	})
 	cp.TnEventEmitter.on("disconnect", func() {
 		if w.state != "dead" {
@@ -879,9 +1231,31 @@ func tnClusterWorkerDisconnect() {
 	}
 }
 
-func tnClusterListen(srv *TnNetServer, network string, address string) (net.Listener, error) {
-	if tnIpcParent == nil || !tnIpcConnected {
-		return net.Listen(network, address)
+func tnClusterListen(srv *TnNetServer, network string, address string, exclusive bool) (net.Listener, error) {
+	if tnIpcParent == nil || !tnIpcConnected || exclusive || tnSchedulingPolicy == float64(1) {
+		// the primary binds directly; so does a worker with an exclusive
+		// listener, or one whose cluster runs SCHED_NONE (each worker owns the
+		// port and the OS balances — the socket options let several bind).
+		// The worker's servers close on disconnect either way
+		if tnIpcParent == nil || !tnIpcConnected {
+			return net.Listen(network, address)
+		}
+		tnClusterControlHandlers()
+		tnClusterServers = append(tnClusterServers, srv)
+		var ln net.Listener
+		var err error
+		if exclusive {
+			ln, err = net.Listen(network, address)
+		} else {
+			var lc net.ListenConfig
+			lc.Control = tnReuseSockControl
+			ln, err = lc.Listen(context.Background(), network, address)
+		}
+		if err == nil {
+			// the primary hears 'listening' (and the port) as with a relay
+			tnIpcParent.control(map[string]interface{}{"act": "listening", "address": ln.Addr().String()})
+		}
+		return ln, err
 	}
 	tnClusterControlHandlers()
 	private, err := net.Listen("tcp", "127.0.0.1:0")
@@ -921,8 +1295,24 @@ func tnClusterListen(srv *TnNetServer, network string, address string) (net.List
 	return &tnClusterListener{private: private, addr: shared, key: network + "|" + address}, nil
 }`;
 const CLUSTER_EMITTER = 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64';
+// Sockets that several processes may bind (SCHED_NONE workers, reuseAddr
+// dgram sockets): SO_REUSEPORT where the OS balances, SO_REUSEADDR on Windows
+const reuseSockHelper = (fd, opt) => `func tnReuseSockControl(network string, address string, c syscall.RawConn) error {
+	var serr error
+	if ctlErr := c.Control(func(fd uintptr) {
+		serr = syscall.SetsockoptInt(${fd}(fd), syscall.SOL_SOCKET, syscall.${opt}, 1)
+	}); ctlErr != nil {
+		return ctlErr
+	}
+	return serr
+}`;
 export function registerCluster(r) {
-    defineHelper(r, 'nodeIpc', ['crypto/rand', 'encoding/binary', 'encoding/hex', 'encoding/json', 'io', 'net', 'os', 'reflect', 'strings', 'sync', 'time'], ['nodeClone', 'nodeChild', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'entryPoints'], ipcHelper);
+    defineHelper(r, 'nodeReuseSock@windows', ['syscall'], [], reuseSockHelper('syscall.Handle', 'SO_REUSEADDR'));
+    for (const goos of ['linux', 'darwin', 'freebsd', 'netbsd', 'openbsd', 'dragonfly']) {
+        defineHelper(r, `nodeReuseSock@${goos}`, ['syscall'], [], reuseSockHelper('int', 'SO_REUSEPORT'));
+    }
+    defineHelper(r, 'nodeReuseSock@other', ['syscall'], [], 'func tnReuseSockControl(network string, address string, c syscall.RawConn) error { return nil }');
+    defineHelper(r, 'nodeIpc', ['crypto/rand', 'encoding/binary', 'encoding/hex', 'encoding/json', 'io', 'math', 'net', 'os', 'reflect', 'strconv', 'strings', 'sync', 'time'], ['nodeClone', 'nodeChild', 'nodeEvents', 'nodeNet', 'eventLoop', 'nodeInvoke', 'dynamic', 'entryPoints'], ipcHelper);
     const useIpc = () => r.helper('nodeIpc');
     // child_process.fork and the child's process.send / connected / disconnect
     r.functions['child_process.fork'] = (c) => {
@@ -973,7 +1363,7 @@ export function registerCluster(r) {
     // node:cluster
     defineModule(r, 'cluster');
     r.namespaces['cluster.default'] = 'cluster';
-    defineHelper(r, 'nodeCluster', ['bufio', 'errors', 'io', 'net', 'os', 'reflect', 'strconv', 'strings', 'sync', 'syscall', 'time'], ['nodeIpc', 'nodeNet', 'orderedMap'], clusterHelper);
+    defineHelper(r, 'nodeCluster', ['bufio', 'context', 'errors', 'io', 'net', 'os', 'reflect', 'strconv', 'strings', 'sync', 'syscall', 'time'], ['nodeIpc', 'nodeNet', 'nodeReuseSock@os', 'orderedMap'], clusterHelper);
     const use = () => r.helper('nodeCluster');
     defineClass(r, 'cluster.Worker', '*TnClusterWorker', 'class', `${CLUSTER_EMITTER}; send=bool; kill=; destroy=; disconnect=*TnClusterWorker; isDead=bool; isConnected=bool`, '', 'id=float64; process=*TnChildProcess; exitedAfterDisconnect=bool', '');
     defineClass(r, 'cluster.Address', '*TnClusterAddress', 'class', '', 'address=string; port=float64; addressType=float64', '', '');
@@ -992,7 +1382,11 @@ export function registerCluster(r) {
     value('settings', 'map[string]interface{}', 'tnCluster.settings');
     value('SCHED_NONE', 'float64', 'float64(1)');
     value('SCHED_RR', 'float64', 'float64(2)');
-    value('schedulingPolicy', 'float64', 'float64(2)');
+    value('schedulingPolicy', 'float64', 'tnSchedulingPolicy');
+    r.functions['cluster.schedulingPolicy='] = (c) => {
+        use();
+        return `tnSetSchedulingPolicy(${c.args.join(', ')})`;
+    };
     const method = (name, goName, result) => {
         r.functions[`cluster.${name}`] = (c) => {
             use();
@@ -1017,7 +1411,7 @@ export function registerCluster(r) {
         if (name === 'listening')
             return ['*TnClusterWorker', '*TnClusterAddress'];
         if (name === 'message')
-            return ['*TnClusterWorker', 'interface{}'];
+            return ['*TnClusterWorker', 'interface{}', 'interface{}'];
         if (name === 'exit')
             return ['*TnClusterWorker', 'interface{}', 'interface{}'];
         return ['*TnClusterWorker'];
@@ -1030,7 +1424,7 @@ export function registerCluster(r) {
         if (name === 'listening')
             return ['*TnClusterAddress'];
         if (name === 'message' || name === 'error')
-            return ['interface{}'];
+            return ['interface{}', 'interface{}'];
         if (name === 'exit')
             return ['interface{}', 'interface{}'];
         return [];

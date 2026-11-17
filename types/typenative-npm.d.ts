@@ -1727,12 +1727,13 @@ declare module 'node:cluster' {
       readonly process: ChildProcess;
       exitedAfterDisconnect: boolean;
       send(message: any, callback?: (error: Error | null) => void): boolean;
+      send(message: any, handle?: any, options?: any, callback?: (error: Error | null) => void): boolean;
       kill(signal?: string): void;
       destroy(signal?: string): void;
       disconnect(): this;
       isConnected(): boolean;
       isDead(): boolean;
-      on(event: 'message', listener: (message: any) => void): this;
+      on(event: 'message', listener: (message: any, sendHandle: any) => void): this;
       on(event: 'exit', listener: (code: number, signal: string) => void): this;
       on(event: 'listening', listener: (address: Address) => void): this;
       on(event: 'online' | 'disconnect', listener: () => void): this;
@@ -1746,7 +1747,7 @@ declare module 'node:cluster' {
     const workers: Record<string, Worker> | undefined;
     const worker: Worker | undefined;
     const settings: ClusterSettings;
-    const schedulingPolicy: number;
+    var schedulingPolicy: number;
     const SCHED_NONE: number;
     const SCHED_RR: number;
     function fork(env?: Record<string, string | undefined>): Worker;
@@ -1756,11 +1757,11 @@ declare module 'node:cluster' {
     function disconnect(callback?: () => void): void;
     function on(event: 'fork' | 'online' | 'disconnect', listener: (worker: Worker) => void): EventEmitter;
     function on(event: 'listening', listener: (worker: Worker, address: Address) => void): EventEmitter;
-    function on(event: 'message', listener: (worker: Worker, message: any) => void): EventEmitter;
+    function on(event: 'message', listener: (worker: Worker, message: any, sendHandle: any) => void): EventEmitter;
     function on(event: 'exit', listener: (worker: Worker, code: number, signal: string) => void): EventEmitter;
     function once(event: 'fork' | 'online' | 'disconnect', listener: (worker: Worker) => void): EventEmitter;
     function once(event: 'listening', listener: (worker: Worker, address: Address) => void): EventEmitter;
-    function once(event: 'message', listener: (worker: Worker, message: any) => void): EventEmitter;
+    function once(event: 'message', listener: (worker: Worker, message: any, sendHandle: any) => void): EventEmitter;
     function once(event: 'exit', listener: (worker: Worker, code: number, signal: string) => void): EventEmitter;
     function off(event: string, listener: (...args: any[]) => void): EventEmitter;
     function removeAllListeners(event?: string): EventEmitter;
@@ -1839,6 +1840,8 @@ declare module 'node:child_process' {
       readonly stdin: Writable;
       readonly stdout: Readable;
       readonly stderr: Readable;
+      /** [stdin, stdout, stderr, …the extra stdio entries] */
+      readonly stdio: any[];
       readonly pid: number | undefined;
       readonly exitCode: number | null;
       readonly signalCode: string | null;
@@ -1850,6 +1853,7 @@ declare module 'node:child_process' {
       unref(): void;
       ref(): void;
       send(message: any, callback?: (error: Error | null) => void): boolean;
+      send(message: any, handle?: any, options?: any, callback?: (error: Error | null) => void): boolean;
       disconnect(): void;
     }
     interface ForkOptions {
@@ -1857,6 +1861,7 @@ declare module 'node:child_process' {
       env?: Record<string, string | undefined>;
       execArgv?: string[];
       silent?: boolean;
+      serialization?: 'json' | 'advanced';
     }
     // Runs this program again (a native binary holds one program) with an IPC channel
     function fork(modulePath: string | URL, options?: ForkOptions): ChildProcess;
@@ -2136,6 +2141,8 @@ declare module 'node:net' {
       host?: string;
       path?: string;
       backlog?: number;
+      /** bind directly, not through the cluster primary */
+      exclusive?: boolean;
     }
     class Server extends EventEmitter {
       constructor(connectionListener?: (socket: Socket) => void);
@@ -2687,6 +2694,8 @@ declare module 'node:dgram' {
       /** Joins a multicast group (an unbound socket binds first) */
       addMembership(multicastAddress: string, multicastInterface?: string): void;
       dropMembership(multicastAddress: string, multicastInterface?: string): void;
+      addSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void;
+      dropSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void;
       setRecvBufferSize(size: number): void;
       setSendBufferSize(size: number): void;
     }
@@ -3027,14 +3036,29 @@ declare module 'node:worker_threads' {
       argv?: any[];
       env?: Record<string, string> | typeof SHARE_ENV;
       eval?: false;
+      stdin?: boolean;
       stdout?: boolean;
       stderr?: boolean;
       name?: string;
+      resourceLimits?: ResourceLimits;
+      transferList?: readonly any[];
+    }
+    interface ResourceLimits {
+      maxYoungGenerationSizeMb?: number;
+      maxOldGenerationSizeMb?: number;
+      codeRangeSizeMb?: number;
+      stackSizeMb?: number;
     }
     // Runs this program again (pass __filename or new URL(import.meta.url))
     class Worker extends EventEmitter {
       constructor(filename: string | URL, options?: WorkerOptions);
       readonly threadId: number;
+      // stdin with { stdin: true }; stdout / stderr carry the worker's output
+      // only with { stdout: true } / { stderr: true }
+      readonly stdin: import('node:stream').Writable | null;
+      readonly stdout: import('node:stream').Readable;
+      readonly stderr: import('node:stream').Readable;
+      readonly resourceLimits: Record<string, number>;
       postMessage(value: any, transferList?: readonly any[]): void;
       terminate(): Promise<number>;
       ref(): this;

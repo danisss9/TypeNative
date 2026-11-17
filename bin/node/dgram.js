@@ -91,10 +91,16 @@ func (s *TnDgramSocket) listen(address string, port float64) *TnError {
 	if err != nil {
 		return TnNetError(err, "bind", address, port)
 	}
-	conn, err := net.ListenUDP(s.network, addr)
+	var lc net.ListenConfig
+	if s.reuseAddr {
+		// several processes may bind the same port (cluster workers)
+		lc.Control = tnReuseSockControl
+	}
+	pc, err := lc.ListenPacket(context.Background(), s.network, addr.String())
 	if err != nil {
 		return TnNetError(err, "bind", address, port)
 	}
+	conn := pc.(*net.UDPConn)
 	s.conn = conn
 	s.bound = true
 	s.refd = true
@@ -478,6 +484,37 @@ func (s *TnDgramSocket) dropMembership(group string, iface ...string) {
 	s.membership("dropMembership", false, group, iface)
 }
 
+// addSourceSpecificMembership(source, group, iface?) / drop…: IP_ADD_SOURCE_MEMBERSHIP
+// (IPv4) or MCAST_JOIN_SOURCE_GROUP (IPv6); an unbound socket binds first
+func (s *TnDgramSocket) sourceMembership(name string, join bool, source string, group string, iface []string) {
+	if s.closed {
+		panic(TnNodeError("Error", "ERR_SOCKET_DGRAM_NOT_RUNNING", "Not running"))
+	}
+	src, grp := net.ParseIP(source), net.ParseIP(group)
+	v6 := s.network == "udp6"
+	if src == nil || grp == nil || (src.To4() != nil) == v6 || (grp.To4() != nil) == v6 {
+		panic(tnDgramOptError(name, syscall.EINVAL))
+	}
+	if s.conn == nil {
+		if err := s.listen("", 0); err != nil {
+			panic(err)
+		}
+		TnLoopPost(func() { s.emit("listening") })
+	}
+	ifaceIP, index := s.multicastIface(strings.Join(iface, ""))
+	if err := tnDgramSourceMembership(s.conn, join, v6, src, grp, ifaceIP, index); err != nil {
+		panic(tnDgramOptError(name, err))
+	}
+}
+
+func (s *TnDgramSocket) addSourceSpecificMembership(source string, group string, iface ...string) {
+	s.sourceMembership("addSourceSpecificMembership", true, source, group, iface)
+}
+
+func (s *TnDgramSocket) dropSourceSpecificMembership(source string, group string, iface ...string) {
+	s.sourceMembership("dropSourceSpecificMembership", false, source, group, iface)
+}
+
 func (s *TnDgramSocket) setRecvBufferSize(size float64) {
 	if s.conn != nil {
 		s.conn.SetReadBuffer(int(size))
@@ -491,8 +528,10 @@ func (s *TnDgramSocket) setSendBufferSize(size float64) {
 }`;
 // Socket options through the raw descriptor, one variant per target OS
 // (nodeDgramOS@os); BSDs take a byte for the IPv4 multicast TTL / loopback
-function dgramOSHelper(fd, mcast4) {
-    return `func tnDgramSockopt(conn *net.UDPConn, set func(fd ${fd}) error) error {
+function dgramOSHelper(fd, mcast4, ssm) {
+    return `${ssm}
+
+func tnDgramSockopt(conn *net.UDPConn, set func(fd ${fd}) error) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err
@@ -576,20 +615,125 @@ func tnDgramMulticastIF(conn *net.UDPConn, v6 bool, ip net.IP, index int) error 
 
 func tnDgramMembership(conn *net.UDPConn, join bool, group net.IP, iface net.IP, index int) error {
 	return errors.ErrUnsupported
+}
+
+func tnDgramSourceMembership(conn *net.UDPConn, join bool, v6 bool, source net.IP, group net.IP, iface net.IP, index int) error {
+	return syscall.ENOSYS
+}`;
+function ssmHelper(l) {
+    const family = l.sinLen ? `b[0], b[1] = 28, ${l.af6}` : `binary.NativeEndian.PutUint16(b[0:2], ${l.af6})`;
+    const [first, second] = l.ifaceFirst ? ['ifc', 'src'] : ['src', 'ifc'];
+    return `// A sockaddr_in6 in a sockaddr_storage
+func tnDgramSockaddr6(ip net.IP) []byte {
+	b := make([]byte, 128)
+	${family}
+	copy(b[8:24], ip.To16())
+	return b
+}
+
+func tnDgramSourceMembership(conn *net.UDPConn, join bool, v6 bool, source net.IP, group net.IP, iface net.IP, index int) error {
+	var level, opt int
+	var req []byte
+	if !v6 {
+		level, opt = syscall.IPPROTO_IP, ${l.add4}
+		if !join {
+			opt = ${l.drop4}
+		}
+		ifc := make([]byte, 4)
+		if i4 := iface.To4(); i4 != nil {
+			copy(ifc, i4)
+		}
+		src := []byte(source.To4())
+		req = append(append(append([]byte{}, group.To4()...), ${first}...), ${second}...)
+	} else {
+		level, opt = syscall.IPPROTO_IPV6, ${l.join6}
+		if !join {
+			opt = ${l.leave6}
+		}
+		req = make([]byte, 4, 264)
+		binary.NativeEndian.PutUint32(req, uint32(index))
+		${l.pad}
+		req = append(append(req, tnDgramSockaddr6(group)...), tnDgramSockaddr6(source)...)
+	}
+	return tnDgramSockopt(conn, func(fd ${l.fd}) error {
+		return ${l.set}
+	})
+}`;
+}
+const pad8 = 'req = append(req, 0, 0, 0, 0)';
+const unixSet = 'syscall.SetsockoptString(fd, level, opt, string(req))';
+const linuxSsm = {
+    add4: 39,
+    drop4: 40,
+    join6: 46,
+    leave6: 47,
+    ifaceFirst: true,
+    sinLen: false,
+    af6: 10,
+    pad: `if bits.UintSize == 64 {\n\t\t\t${pad8}\n\t\t}`,
+    fd: 'int',
+    set: unixSet
+};
+const bsdSsm = (af6) => ({
+    add4: 70,
+    drop4: 71,
+    join6: 82,
+    leave6: 83,
+    ifaceFirst: false,
+    sinLen: true,
+    af6,
+    pad: pad8,
+    fd: 'int',
+    set: unixSet
+});
+const windowsSsm = {
+    add4: 15,
+    drop4: 16,
+    join6: 45,
+    leave6: 46,
+    ifaceFirst: false,
+    sinLen: false,
+    af6: 23,
+    pad: pad8,
+    fd: 'syscall.Handle',
+    set: 'tnDgramWSAErr(syscall.Setsockopt(fd, int32(level), int32(opt), &req[0], int32(len(req))))'
+};
+// Winsock errors come back as WSA numbers: map the ones setsockopt returns
+const wsaErrHelper = `func tnDgramWSAErr(err error) error {
+	if e, ok := err.(syscall.Errno); ok {
+		switch e {
+		case 10022:
+			return syscall.EINVAL
+		case 10042:
+			return syscall.ENOPROTOOPT
+		case 10048:
+			return syscall.EADDRINUSE
+		case 10049:
+			return syscall.EADDRNOTAVAIL
+		}
+	}
+	return err
+}`;
+const noSsm = `func tnDgramSourceMembership(conn *net.UDPConn, join bool, v6 bool, source net.IP, group net.IP, iface net.IP, index int) error {
+	return syscall.ENOSYS
 }`;
 export function registerDgram(r) {
     defineModule(r, 'dgram');
     const intOpt = 'syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, OPT, value)';
     const byteOpt = 'syscall.SetsockoptByte(fd, syscall.IPPROTO_IP, OPT, byte(value))';
-    defineHelper(r, 'nodeDgramOS@linux', ['net', 'syscall'], [], dgramOSHelper('int', intOpt));
-    for (const goos of ['darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly']) {
-        defineHelper(r, `nodeDgramOS@${goos}`, ['net', 'syscall'], [], dgramOSHelper('int', byteOpt));
+    const ssmImports = ['encoding/binary', 'net', 'syscall'];
+    defineHelper(r, 'nodeDgramOS@linux', [...ssmImports, 'math/bits'], [], dgramOSHelper('int', intOpt, ssmHelper(linuxSsm)));
+    // AF_INET6 is 30 on macOS, 28 on FreeBSD; OpenBSD, NetBSD and DragonFly have no SSM (ENOSYS, as in libuv)
+    defineHelper(r, 'nodeDgramOS@darwin', ssmImports, [], dgramOSHelper('int', byteOpt, ssmHelper(bsdSsm(30))));
+    defineHelper(r, 'nodeDgramOS@freebsd', ssmImports, [], dgramOSHelper('int', byteOpt, ssmHelper(bsdSsm(28))));
+    for (const goos of ['openbsd', 'netbsd', 'dragonfly']) {
+        defineHelper(r, `nodeDgramOS@${goos}`, ['net', 'syscall'], [], dgramOSHelper('int', byteOpt, noSsm));
     }
-    defineHelper(r, 'nodeDgramOS@windows', ['net', 'syscall'], [], dgramOSHelper('syscall.Handle', intOpt));
-    defineHelper(r, 'nodeDgramOS@other', ['errors', 'net'], [], otherDgramOSHelper);
-    defineHelper(r, 'nodeDgram', ['errors', 'math', 'net', 'strconv', 'strings', 'syscall'], ['nodeNet', 'netErrors', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeDgramOS@os'], dgramHelper);
+    defineHelper(r, 'nodeDgramOS@windows', ssmImports, [], dgramOSHelper('syscall.Handle', intOpt, ssmHelper(windowsSsm) + '\n\n' + wsaErrHelper));
+    defineHelper(r, 'nodeDgramOS@other', ['errors', 'net', 'syscall'], [], otherDgramOSHelper);
+    defineHelper(r, 'nodeDgram', ['context', 'errors', 'math', 'net', 'strconv', 'strings', 'syscall'], ['nodeNet', 'netErrors', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodeDgramOS@os', 'nodeReuseSock@os'], dgramHelper);
     const use = () => r.helper('nodeDgram');
-    defineClass(r, 'dgram.Socket', '*TnDgramSocket', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; bind=*TnDgramSocket; send=; connect=; disconnect=; remoteAddress=*TnAddressInfo; address=*TnAddressInfo; close=*TnDgramSocket; ref=*TnDgramSocket; unref=*TnDgramSocket; setBroadcast=; setTTL=float64; setMulticastTTL=float64; setMulticastLoopback=bool; setMulticastInterface=; addMembership=; dropMembership=; setRecvBufferSize=; setSendBufferSize=', '', '', '');
+    defineClass(r, 'dgram.Socket', '*TnDgramSocket', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; bind=*TnDgramSocket; send=; connect=; disconnect=; remoteAddress=*TnAddressInfo; address=*TnAddressInfo; close=*TnDgramSocket; ref=*TnDgramSocket; unref=*TnDgramSocket; setBroadcast=; setTTL=float64; setMulticastTTL=float64; setMulticastLoopback=bool; setMulticastInterface=; addMembership=; dropMembership=; addSourceSpecificMembership=; dropSourceSpecificMembership=; setRecvBufferSize=; setSendBufferSize=', '', '', '');
     defineClass(r, 'dgram.RemoteInfo', '*TnRemoteInfo', 'class', '', 'address=string; family=string; port=float64; size=float64', '', '');
     const listeners = (nodes) => {
         const event = nodes[0];

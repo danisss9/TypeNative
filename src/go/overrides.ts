@@ -51,6 +51,8 @@ export const goPathAliases: Record<string, string> = {
   'crypto/rand': 'cryptorand',
   'math/rand/v2': 'randv2',
   'html/template': 'htmltemplate',
+  // the worker heap-limit monitor: a program's own `debug` would collide
+  'runtime/debug': 'tndebug',
   'golang.org/x/text/unicode/norm': 'tnnorm',
   // Intl's locale data: short package names that would collide with user
   // identifiers (language, cases, …)

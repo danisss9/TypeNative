@@ -769,7 +769,16 @@ interface Process {
   };
   /** The file mode creation mask; with an argument sets it and returns the previous one (0 on Windows) */
   umask(mask?: number | string): number;
+  /** undefined unless the program runs under --permission (NODE_OPTIONS) */
+  readonly permission:
+    | {
+        has(permission: string, path?: string): boolean;
+        drop(permission: string, path?: string): void;
+      }
+    | undefined;
   on(event: 'exit', listener: (code: number) => void): this;
+  /** 'message' also receives the handle sent with it (send(msg, socket)) */
+  on(event: 'message', listener: (message: any, sendHandle: any) => void): this;
   on(event: string, listener: (...args: any[]) => void): this;
   once(event: 'exit', listener: (code: number) => void): this;
   once(event: string, listener: (...args: any[]) => void): this;
@@ -778,8 +787,10 @@ interface Process {
   removeListener(event: string, listener: (...args: any[]) => void): this;
   emit(event: string, ...args: any[]): boolean;
   listenerCount(event: string): number;
-  // IPC of forked children (child_process.fork, cluster workers)
+  // IPC of forked children (child_process.fork, cluster workers); a connected
+  // net.Socket can be transferred with it (serialization: 'advanced')
   send?(message: any, callback?: (error: Error | null) => void): boolean;
+  send?(message: any, handle?: any, options?: any, callback?: (error: Error | null) => void): boolean;
   readonly connected: boolean;
   disconnect(): void;
 }

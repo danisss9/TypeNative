@@ -78,6 +78,7 @@ func tnFsCheck(err error, syscall string, path string, dest ...string) {
 }`;
 const fsHelper = `// node:fs (sync)
 func TnReadFileBytes(path string) []byte {
+	tnPermRequire("fs.read", path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if tnErrnoCode(err) == "EISDIR" {
@@ -128,6 +129,7 @@ func tnOpenFlags(flag string) int {
 }
 
 func TnWriteFile(path string, data []byte, flag string) {
+	tnPermRequire("fs.write", path)
 	if flag == "" {
 		flag = "w"
 	}
@@ -139,6 +141,7 @@ func TnWriteFile(path string, data []byte, flag string) {
 }
 
 func TnMkdir(path string, recursive bool) {
+	tnPermRequire("fs.write", path)
 	if recursive {
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			panic(TnSysError(fs.ErrExist, "mkdir", path))
@@ -318,6 +321,8 @@ func TnExists(path string) bool {
 }
 
 func TnRename(from string, to string) {
+	tnPermRequire("fs.write", from)
+	tnPermRequire("fs.write", to)
 	tnFsCheck(os.Rename(from, to), "rename", from, to)
 }
 
@@ -341,6 +346,7 @@ func TnRm(path string, recursive bool, force bool) {
 }
 
 func TnRmdir(path string, recursive bool) {
+	tnPermRequire("fs.write", path)
 	if recursive {
 		tnFsCheck(os.RemoveAll(path), "rmdir", path)
 		return
@@ -354,6 +360,7 @@ func TnRmdir(path string, recursive bool) {
 }
 
 func TnUnlink(path string) {
+	tnPermRequire("fs.write", path)
 	info, err := os.Lstat(path)
 	tnFsCheck(err, "unlink", path)
 	if info.IsDir() {
@@ -519,6 +526,15 @@ func TnOpen(path string, flags interface{}, mode ...interface{}) float64 {
 	flag := "r"
 	if s, ok := flags.(string); ok && s != "" {
 		flag = s
+	}
+	// --permission: reads and writes through open() are gated separately
+	if flag == "r" || flag == "rs" {
+		tnPermRequire("fs.read", path)
+	} else {
+		tnPermRequire("fs.write", path)
+		if strings.Contains(flag, "+") {
+			tnPermRequire("fs.read", path)
+		}
 	}
 	perm := fs.FileMode(0o666)
 	if len(mode) > 0 && mode[0] != nil {
@@ -909,7 +925,7 @@ export function registerFs(r) {
     defineHelper(r, 'uvErrnoOS@other', [], [], uvErrnoTable(''));
     defineHelper(r, 'uvErrno', [], ['uvErrnoOS@os'], uvErrnoHelper);
     defineHelper(r, 'fsErrors', ['errors', 'io/fs', 'strings'], ['error', 'uvErrno'], fsErrorsHelper);
-    defineHelper(r, 'nodeFs', ['errors', 'fmt', 'io', 'io/fs', 'math', 'os', 'path/filepath', 'runtime', 'strconv', 'strings', 'sync', 'time'], ['fsErrors', 'buffer', 'dynamic'], fsHelper);
+    defineHelper(r, 'nodeFs', ['errors', 'fmt', 'io', 'io/fs', 'math', 'os', 'path/filepath', 'runtime', 'strconv', 'strings', 'sync', 'time'], ['fsErrors', 'buffer', 'dynamic', 'nodePerm'], fsHelper);
     defineHelper(r, 'nodeFsStatfsOS@linux', ['syscall'], [], statfsOSHelpers.linux);
     for (const goos of ['darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly'])
         defineHelper(r, `nodeFsStatfsOS@${goos}`, ['syscall'], [], statfsOSHelpers.bsd);
