@@ -86,33 +86,55 @@ function runOne({ name, args: jobArgs }) {
     // An example's build is its own program's: the vendored-package ones
     // transpile tens of thousands of lines and go build the result (the same
     // budget the sequential runner gives them); probes get 90s
-    const t = setTimeout(() => killTree(p), name.startsWith('example-') ? 600000 : 90000);
+    const budget = name.startsWith('example-') ? 600000 : 90000;
+    const started = Date.now();
+    let timedOut = false;
+    let reason = null;
+    const t = setTimeout(() => {
+      timedOut = true;
+      killTree(p);
+    }, budget);
     p.on('close', (code) => {
       clearTimeout(t);
       // Anything the probe left running in its group goes too
       if (process.platform !== 'win32') killTree(p);
-      if (code !== 0) {
+      if (code !== 0 || timedOut) {
+        const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
+        // The first recognizable error, else the last thing the probe printed
+        // (a `go build failed:` toolchain error, a log line): a bare exit code
+        // says nothing about where it stopped
+        const at = lines.findIndex((l) => /\.go:\d+|panic:|Unsupported syntax|Error|error TS\d+|assert|go build failed/.test(l));
         const line =
-          out
-            .split('\n')
-            .find((l) => /\.go:\d+|panic:|Unsupported syntax|Error|error TS\d+|assert/.test(l))
-            ?.trim() ?? `exit ${code}`;
-        failures.push({ name, reason: line.slice(0, 160) });
+          at < 0
+            ? lines.slice(-2).join(' | ')
+            : lines[at] === 'go build failed:'
+              ? lines.slice(at, at + 2).join(' ')
+              : lines[at];
+        // taskkill /f exits the tree with 1, so a timeout on Windows otherwise
+        // reads as a plain failure
+        const status = timedOut ? `timed out after ${budget / 1000}s` : `exit ${code} after ${Math.round((Date.now() - started) / 1000)}s`;
+        reason = `${status}${line ? `: ${line}` : ''}`.slice(0, 240);
       }
       try {
         rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
       } catch { /* Windows may briefly lock native.exe; leave tmp dir */ }
-      done++;
-      if (done % 10 === 0 || done === jobs.length) process.stdout.write(`\r${done}/${jobs.length}`);
-      resolve();
+      resolve(reason);
     });
   });
+}
+
+// A probe run in the pack; its failure (a reason) or null
+async function runCounted(job) {
+  const reason = await runOne(job);
+  if (reason !== null) failures.push({ name: job.name, reason });
+  done++;
+  if (done % 10 === 0 || done === jobs.length) process.stdout.write(`\r${done}/${jobs.length}`);
 }
 
 async function worker() {
   while (idx < jobs.length) {
     const job = jobs[idx++];
-    await runOne(job);
+    await runCounted(job);
   }
 }
 
@@ -124,7 +146,7 @@ if (warm) {
   jobs.splice(jobs.indexOf(warm), 1);
   jobs.unshift(warm);
   idx = 1;
-  await runOne(warm);
+  await runCounted(warm);
 }
 // The largest example (the React Compiler: ~450 transpiled modules) also runs
 // alone before the pack, so its build gets full cores instead of contending
@@ -133,13 +155,36 @@ const heavy = jobs.find((j) => j.name === 'example-react-compiler');
 if (heavy) {
   jobs.splice(jobs.indexOf(heavy), 1);
   jobs.splice(idx, 0, heavy);
-  await runOne(heavy);
+  await runCounted(heavy);
   idx++;
 }
 await Promise.all(Array.from({ length: N }, worker));
 console.log('');
+// A failure in the pack runs once more, alone: on a small CI runner N
+// concurrent go builds can push a probe past its budget, or the toolchain
+// can trip over a file another build holds, which says nothing about the
+// probe. One that passes alone is reported as flaky with its first failure,
+// so a real intermittent bug stays visible; one that fails again counts
+const flaky = [];
+for (const f of [...failures]) {
+  const retry = await runOne(jobs.find((j) => j.name === f.name));
+  if (retry === null) {
+    flaky.push(f);
+    failures.splice(failures.indexOf(f), 1);
+  } else {
+    f.reason = `${f.reason}; alone: ${retry}`.slice(0, 400);
+  }
+}
 failures.sort((a, b) => (a.name < b.name ? -1 : 1));
+flaky.sort((a, b) => (a.name < b.name ? -1 : 1));
+for (const f of flaky) console.log(`  ⚠ ${f.name} passed alone after failing in the pack: ${f.reason}`);
 for (const f of failures) console.log(`  ✘ ${f.name}: ${f.reason}`);
+// GitHub shows annotations on the run page without opening the step's log
+if (process.env.GITHUB_ACTIONS) {
+  const esc = (s) => s.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  for (const f of flaky) console.log(`::warning title=Flaky probe ${f.name}::${esc(f.reason)}`);
+  for (const f of failures) console.log(`::error title=Probe ${f.name}::${esc(f.reason)}`);
+}
 const failed = new Set(failures.map((f) => f.name));
 const cats = new Map();
 for (const { name } of jobs) {
