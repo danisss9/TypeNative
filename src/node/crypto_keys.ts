@@ -12,6 +12,46 @@ import { CRYPTO_PEM_HELPER } from './crypto_pem.js';
 import { CRYPTO_PKCS12_HELPER } from './crypto_pkcs12.js';
 
 const cryptoKeysHelper = `// node:crypto keys
+// Ed448 / X448 / secp256k1 keys. Their operations come from the nodeCryptoCurves
+// helper (vendored circl / decred code), which sets these variables; programs
+// that never read, generate or agree on asymmetric keys do not link it
+type TnEd448Key struct {
+	seed []byte
+	pub  []byte
+}
+
+type TnX448Key struct {
+	secret []byte
+	pub    []byte
+}
+
+// secp256k1 is an EC key to Node (asymmetricKeyType 'ec', namedCurve secp256k1)
+type TnSecp256k1Key struct {
+	priv  []byte
+	pub   []byte
+	curve bool
+}
+
+func tnCurvesMissing() *TnError {
+	return TnNodeError("Error", "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Ed448, X448 and secp256k1 keys are not linked into this program")
+}
+
+var (
+	tnEd448FromSeed = func(seed []byte) *TnEd448Key { panic(tnCurvesMissing()) }
+	tnEd448Generate = func() *TnEd448Key { panic(tnCurvesMissing()) }
+	tnEd448Sign = func(k *TnEd448Key, msg []byte) []byte { panic(tnCurvesMissing()) }
+	tnEd448Verify = func(pub []byte, msg, sig []byte) bool { panic(tnCurvesMissing()) }
+	tnX448FromSecret = func(secret []byte) *TnX448Key { panic(tnCurvesMissing()) }
+	tnX448Generate = func() *TnX448Key { panic(tnCurvesMissing()) }
+	tnX448Shared = func(secret, public []byte) []byte { panic(tnCurvesMissing()) }
+	tnSecp256k1FromPrivate = func(priv []byte) *TnSecp256k1Key { panic(tnCurvesMissing()) }
+	tnSecp256k1FromPublic = func(pub []byte) *TnSecp256k1Key { panic(tnCurvesMissing()) }
+	tnSecp256k1Generate = func() *TnSecp256k1Key { panic(tnCurvesMissing()) }
+	tnSecp256k1Sign = func(k *TnSecp256k1Key, digest []byte) []byte { panic(tnCurvesMissing()) }
+	tnSecp256k1Verify = func(pub []byte, digest, der []byte) bool { panic(tnCurvesMissing()) }
+	tnSecp256k1Shared = func(priv, public []byte) []byte { panic(tnCurvesMissing()) }
+)
+
 func tnCryptoArg(args []interface{}) interface{} {
 	if len(args) > 0 {
 		return args[0]
@@ -3403,6 +3443,22 @@ function algorithmName(node: any): string {
 
 const SECRET_ALGORITHMS: Record<string, boolean> = { HMAC: true, 'AES-GCM': true, 'AES-CBC': true, 'AES-CTR': true };
 
+const NIST_CURVES: Record<string, boolean> = { prime256v1: true, secp256r1: true, 'p-256': true, secp384r1: true, 'p-384': true, secp521r1: true, 'p-521': true };
+
+// Whether generateKeyPair(Sync)(type, options) may make an Ed448 / X448 /
+// secp256k1 key: a non-literal type or curve, or one of those
+function generatesCurveKey(c: NodeCall): boolean {
+  const type = c.nodes[0];
+  if (!type || !isStringNode(type)) return true;
+  const kind = String(type.text);
+  if (kind === 'ed448' || kind === 'x448') return true;
+  if (kind !== 'ec') return false;
+  const options = c.nodes[1];
+  if (!options || !isObjectLiteral(options)) return true;
+  const curve = getOption(options, 'namedCurve');
+  return !curve || !isStringNode(curve) || !NIST_CURVES[String(curve.text).toLowerCase()];
+}
+
 export function registerCryptoKeys(r: NodeRegistry): void {
   defineHelper(
     r,
@@ -3418,10 +3474,12 @@ export function registerCryptoKeys(r: NodeRegistry): void {
       'crypto/sha1',
       'crypto/sha256',
       'crypto/sha512',
+      'crypto/x509',
       'crypto/x509/pkix',
       'encoding/asn1',
       'encoding/hex',
       'encoding/pem',
+      'errors',
       'hash',
       'strings'
     ],
@@ -3431,8 +3489,8 @@ export function registerCryptoKeys(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodePkcs12',
-    ['crypto/x509', 'encoding/pem', 'errors', 'strings', 'software.sslmate.com/src/go-pkcs12'],
-    [],
+    ['crypto/x509', 'strings', 'software.sslmate.com/src/go-pkcs12'],
+    ['nodePem'],
     CRYPTO_PKCS12_HELPER
   );
   defineHelper(
@@ -3447,7 +3505,7 @@ export function registerCryptoKeys(r: NodeRegistry): void {
       'github.com/decred/dcrd/dcrec/secp256k1/v4',
       'github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa'
     ],
-    ['error'],
+    ['error', 'nodeCryptoKeys'],
     CRYPTO_CURVES_HELPER
   );
   defineHelper(
@@ -3489,9 +3547,7 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     ],
     [
       'nodeCrypto',
-      'nodeCryptoCurves',
       'nodePem',
-      'nodePkcs12',
       'error',
       'buffer',
       'dynamic',
@@ -3503,6 +3559,24 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     cryptoKeysHelper
   );
   const use = () => r.helper('nodeCryptoKeys');
+  // The vendored Ed448 / X448 / secp256k1 code, for calls that read key data
+  // (or generate / agree on keys that may be on those curves)
+  const useCurves = () => {
+    use();
+    r.helper('nodeCryptoCurves');
+  };
+  const parsing = (name: string, result: string, emit: (call: NodeCall) => string) => {
+    r.functions[`crypto.${name}`] = (call: NodeCall) => {
+      useCurves();
+      return emit(call);
+    };
+    r.results[`crypto.${name}`] = result;
+  };
+  // sign / verify with a KeyObject reuse a key some other call parsed or generated
+  const keyArg = (c: NodeCall, i: number) => {
+    if (c.types[i] === '*TnKeyObject') use();
+    else useCurves();
+  };
   const fn = (name: string, result: string, emit: (call: NodeCall) => string) => {
     r.functions[`crypto.${name}`] = (call: NodeCall) => {
       use();
@@ -3567,8 +3641,8 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     if (type === '[]byte') return `tnAsBytes(${call})`;
     return call;
   };
-  fn('createPrivateKey', '*TnKeyObject', (c: NodeCall) => `TnCreatePrivateKey(${c.args[0]})`);
-  fn('createPublicKey', '*TnKeyObject', (c: NodeCall) => `TnCreatePublicKey(${c.args[0]})`);
+  parsing('createPrivateKey', '*TnKeyObject', (c: NodeCall) => `TnCreatePrivateKey(${c.args[0]})`);
+  parsing('createPublicKey', '*TnKeyObject', (c: NodeCall) => `TnCreatePublicKey(${c.args[0]})`);
   fn('createSecretKey', '*TnKeyObject', (c: NodeCall) => `TnCreateSecretKey(${c.args.join(', ')})`);
   fn('KeyObject.from', '*TnKeyObject', (c: NodeCall) => `TnKeyObjectFrom(${c.args[0]})`);
 
@@ -3583,12 +3657,15 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     '',
     ''
   );
-  fn('parsePKCS12', '*TnPKCS12', (c: NodeCall) => `TnParsePKCS12(${c.args.join(', ')})`);
+  parsing('parsePKCS12', '*TnPKCS12', (c: NodeCall) => {
+    r.helper('nodePkcs12');
+    return `TnParsePKCS12(${c.args.join(', ')})`;
+  });
   // crypto.Certificate (SPKAC)
   defineClass(r, 'crypto.Certificate', '*TnCertificate', 'class', '', '', '', '');
-  fn('Certificate.verifySpkac', 'bool', (c: NodeCall) => `TnCertificateVerifySpkac(${c.args[0]})`);
+  parsing('Certificate.verifySpkac', 'bool', (c: NodeCall) => `TnCertificateVerifySpkac(${c.args[0]})`);
   fn('Certificate.exportChallenge', '[]byte', (c: NodeCall) => `TnCertificateExportChallenge(${c.args[0]})`);
-  fn('Certificate.exportPublicKey', '[]byte', (c: NodeCall) => `TnCertificateExportPublicKey(${c.args[0]})`);
+  parsing('Certificate.exportPublicKey', '[]byte', (c: NodeCall) => `TnCertificateExportPublicKey(${c.args[0]})`);
 
   // generateKeyPair(Sync) / generateKey(Sync)
   for (const kind of Object.keys(KEY_PAIRS)) {
@@ -3596,13 +3673,15 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     defineClass(r, `crypto.KeyPair_${kind}`, goType, 'class', '', `publicKey=${member}; privateKey=${member}`, '', '');
   }
   r.functions['crypto.generateKeyPairSync'] = (c: NodeCall) => {
-    use();
+    if (generatesCurveKey(c)) useCurves();
+    else use();
     const [ctor] = KEY_PAIRS[keyPairKind(c.nodes[1])];
     return `${ctor}(TnGenerateKeyPairSync(${c.args.join(', ')}))`;
   };
   r.typers['crypto.generateKeyPairSync'] = (c: NodeCall) => KEY_PAIRS[keyPairKind(c.nodes[1])][1];
   r.functions['crypto.generateKeyPair'] = (c: NodeCall) => {
-    use();
+    if (generatesCurveKey(c)) useCurves();
+    else use();
     const cb = c.args[c.args.length - 1];
     const options = c.args.length > 2 ? c.args[1] : 'nil';
     return `TnGenerateKeyPair(${c.args[0]}, ${options}, ${cb})`;
@@ -3615,12 +3694,20 @@ export function registerCryptoKeys(r: NodeRegistry): void {
   asyncCall(r, 'crypto.generateKey', 'TnGenerateKeySync', '*TnKeyObject');
 
   // sign / verify
-  fn('sign', '[]byte', (c: NodeCall) => `TnSign(${c.args[0]}, ${c.args[1]}, ${c.args[2]})`);
-  fn('verify', 'bool', (c: NodeCall) => `TnVerify(${c.args[0]}, ${c.args[1]}, ${c.args[2]}, ${c.args[3]})`);
+  r.functions['crypto.sign'] = (c: NodeCall) => {
+    keyArg(c, 2);
+    return `TnSign(${c.args[0]}, ${c.args[1]}, ${c.args[2]})`;
+  };
+  r.results['crypto.sign'] = '[]byte';
+  r.functions['crypto.verify'] = (c: NodeCall) => {
+    keyArg(c, 2);
+    return `TnVerify(${c.args[0]}, ${c.args[1]}, ${c.args[2]}, ${c.args[3]})`;
+  };
+  r.results['crypto.verify'] = 'bool';
   defineClass(r, 'crypto.Sign', '*TnSigner', 'class', 'update=*TnSigner; verify=bool', '', '', '');
   r.classes['crypto.Verify'] = r.classes['crypto.Sign'];
-  fn('createSign', '*TnSigner', (c: NodeCall) => `TnCreateSign(${c.args.join(', ')})`);
-  fn('createVerify', '*TnSigner', (c: NodeCall) => `TnCreateSign(${c.args.join(', ')})`);
+  parsing('createSign', '*TnSigner', (c: NodeCall) => `TnCreateSign(${c.args.join(', ')})`);
+  parsing('createVerify', '*TnSigner', (c: NodeCall) => `TnCreateSign(${c.args.join(', ')})`);
   r.methods['crypto.Sign#sign'] = (c: NodeCall) =>
     c.args.length > 1 ? `${c.recv}.signString(${c.args[0]}, ${c.args[1]})` : `${c.recv}.sign(${c.args[0]})`;
   r.typers['crypto.Sign#sign'] = (c: NodeCall) => (c.nodes.length > 1 ? 'string' : '[]byte');
@@ -3658,7 +3745,13 @@ export function registerCryptoKeys(r: NodeRegistry): void {
   defineClass(r, 'crypto.ECDH', '*TnECDH', 'class', 'setPrivateKey=', '', '', '');
   for (const m of ['generateKeys', 'getPublicKey', 'getPrivateKey']) encoded('crypto.ECDH', m, 0);
   encoded('crypto.ECDH', 'computeSecret', 2);
-  fn('createECDH', '*TnECDH', (c: NodeCall) => `TnCreateECDH(${c.args[0]})`);
+  r.functions['crypto.createECDH'] = (c: NodeCall) => {
+    const name = c.nodes[0];
+    if (name && isStringNode(name) && NIST_CURVES[String(name.text).toLowerCase()]) use();
+    else useCurves();
+    return `TnCreateECDH(${c.args[0]})`;
+  };
+  r.results['crypto.createECDH'] = '*TnECDH';
   fn('getCurves', '[]string', (_c: NodeCall) => 'TnGetCurves()');
   fn('diffieHellman', '[]byte', (c: NodeCall) => `TnDiffieHellman(${c.args[0]})`);
   defineClass(r, 'crypto.DiffieHellman', '*TnDiffieHellmanGroup', 'class', 'setPublicKey=; setPrivateKey=', '', 'verifyError=float64', '');
@@ -3699,7 +3792,7 @@ export function registerCryptoKeys(r: NodeRegistry): void {
     ''
   );
   r.constructors['crypto.X509Certificate'] = (c: NodeCall) => {
-    use();
+    useCurves();
     return `TnNewX509Certificate(${c.args[0]})`;
   };
 

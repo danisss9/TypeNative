@@ -15,11 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rsa-pss` (with its hash, MGF1 hash and salt length), `dsa` and `dh`
   key types in PKCS#8 / SPKI, `ed448` / `x448` (signing, ECDH, JWK) and
   `secp256k1` (`createECDH`, ECDSA, JWK). Ed448 / X448 come from the
-  vendored `cloudflare/circl`, secp256k1 from `decred/dcrd` (both pure Go).
+  vendored `cloudflare/circl`, secp256k1 from `decred/dcrd` (both pure Go),
+  linked only into programs that read key data or may generate such keys.
   `crypto.Certificate` (`verifySpkac` / `exportChallenge` /
   `exportPublicKey`) and `crypto.parsePKCS12(bundle, { passphrase })` —
   Node 26's `{ privateKey, certificate, additionalCertificates }` — on the
-  vendored `go-pkcs12`.
+  vendored `go-pkcs12`, linked only by `parsePKCS12` and `pfx` options.
 - **`node:crypto` MACs and ciphers:** `createMac` gains `gmac`,
   `poly1305`, `siphash` (64- / 128-bit), `blake2bmac` and `blake2smac`
   (output length, salt, personalization), and `getCiphers` gains AES-SIV

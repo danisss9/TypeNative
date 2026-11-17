@@ -5,7 +5,7 @@
 // the same code node:crypto uses; session tickets map to Node's 'newSession' /
 // 'resumeSession' / 'session' API. Also used by https.
 
-import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
+import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, getOption, isObjectLiteral, isStringNode, setResults } from './registry.js';
 import { SOCKET_METHODS, SOCKET_GETTERS, SERVER_METHODS, socketListenerTypes } from './net.js';
 import { ROOT_CERTIFICATES } from './tls_roots.js';
 
@@ -134,6 +134,9 @@ func tnKeyPair(options interface{}) ([]tls.Certificate, error) {
 		pairs := []tls.Certificate{}
 		for _, entry := range tnPFXEntries(pfx, pass, havePass) {
 			keyDER, certPEM, err := tnPkcs12KeyPair(entry.data, entry.pass)
+			if te, ok := err.(*TnError); ok {
+				return nil, te
+			}
 			if err != nil {
 				if len(pairs) > 0 {
 					continue
@@ -956,6 +959,23 @@ func TnTLSGetCiphers() []string {
 	return out
 }`;
 
+// Whether a tls call's options may hold `pfx`: an options literal naming it,
+// or an options argument that is not written out as a literal
+function mayUsePfx(c: NodeCall): boolean {
+  for (let i = 0; i < c.nodes.length; i++) {
+    const node = c.nodes[i];
+    const type = c.types[i] || '';
+    if (isObjectLiteral(node)) {
+      if (getOption(node, 'pfx')) return true;
+      continue;
+    }
+    if (type === 'string' || type === 'float64' || type.startsWith('func')) continue;
+    if (node && (node.kind === 'ArrowFunction' || node.kind === 'FunctionExpression' || isStringNode(node))) continue;
+    return true;
+  }
+  return false;
+}
+
 export function registerTls(r: NodeRegistry): void {
   defineModule(r, 'tls');
   defineHelper(
@@ -977,7 +997,7 @@ export function registerTls(r: NodeRegistry): void {
       'strings',
       'time'
     ],
-    ['dynamic', 'nodeNet', 'netErrors', 'orderedMap', 'eventLoop', 'nodeInvoke', 'nodePem', 'nodePkcs12'],
+    ['dynamic', 'nodeNet', 'netErrors', 'orderedMap', 'eventLoop', 'nodeInvoke', 'nodePem'],
     tlsConfigHelper
   );
   defineHelper(
@@ -990,6 +1010,11 @@ export function registerTls(r: NodeRegistry): void {
   // Mozilla's bundle, as Node embeds it (linked only when tls.rootCertificates is read)
   defineHelper(r, 'nodeTlsRoots', [], [], ROOTS_HELPER);
   const use = () => r.helper('nodeTls');
+  // The vendored PKCS#12 decoder, for calls whose options may carry `pfx`
+  const useWithPfx = (c: NodeCall) => {
+    use();
+    if (mayUsePfx(c)) r.helper('nodePkcs12');
+  };
   defineClass(
     r,
     'tls.TLSSocket',
@@ -1026,17 +1051,17 @@ export function registerTls(r: NodeRegistry): void {
   r.paramTypers['tls.Server#once'] = r.paramTypers['net.Server#once'];
 
   r.functions['tls.connect'] = (c: NodeCall) => {
-    use();
+    useWithPfx(c);
     return `TnTLSConnect(${c.args.join(', ')})`;
   };
   r.paramTypers['tls.connect'] = (_n: any[]) => [];
   r.functions['tls.createServer'] = (c: NodeCall) => {
-    use();
+    useWithPfx(c);
     return `TnTLSCreateServer(${c.args.join(', ')})`;
   };
   r.paramTypers['tls.createServer'] = (_n: any[]) => ['*TnSocket'];
   r.functions['tls.createSecureContext'] = (c: NodeCall) => {
-    use();
+    useWithPfx(c);
     return `TnCreateSecureContext(${c.args.join(', ')})`;
   };
   r.functions['tls.checkServerIdentity'] = (c: NodeCall) => {

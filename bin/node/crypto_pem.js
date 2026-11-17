@@ -2,6 +2,30 @@
 // legacy PEM DEK-Info headers (EVP_BytesToKey with MD5). Used by node:crypto's
 // createPrivateKey / export and by node:tls's passphrase option.
 export const CRYPTO_PEM_HELPER = `// node:crypto / node:tls: encrypted private keys
+// PKCS#12 decoding, set by the nodePkcs12 helper (the vendored go-pkcs12)
+var tnPkcs12Decode = func(data []byte, password string) (interface{}, *x509.Certificate, []*x509.Certificate, error) {
+	return nil, nil, nil, TnNodeError("Error", "ERR_CRYPTO_UNSUPPORTED_OPERATION", "PKCS#12 support is not linked into this program")
+}
+
+// The PEM a PFX's key and certificate chain make, for crypto/tls
+func tnPkcs12KeyPair(data []byte, password string) ([]byte, []byte, error) {
+	key, cert, cas, err := tnPkcs12Decode(data, password)
+	if err != nil {
+		return nil, nil, err
+	}
+	if key == nil || cert == nil {
+		return nil, nil, errors.New("pkcs12: no private key")
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	for _, ca := range cas {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw})...)
+	}
+	return der, certPEM, nil
+}
 var (
 	tnOIDPBES2     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 13}
 	tnOIDPBKDF2    = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
