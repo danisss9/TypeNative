@@ -95,67 +95,67 @@ console.log(`elapsed: ${elapsed.toFixed(2)} ms`);
 
 <!-- perf-results:start -->
 
-Last run 2026-11-16: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, Node v26.13.0, go1.27.4 windows/amd64, TypeNative 0.6.2, 15 interleaved runs per probe.
+Last run 2026-11-17: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, Node v26.13.0, go1.27.4 windows/amd64, TypeNative 0.7.0, 15 interleaved runs per probe.
 
 | Probe | Measures | Node ms (min / median) | TypeNative ms (min / median) | TypeNative vs Node (median) |
 | ----- | -------- | ---------------------: | ---------------------------: | :-------------------------- |
-| [any-dynamic](any-dynamic.ts) | property reads and writes on `any` objects (nested objects, arrays) | 73.1 / 78.4 | 4010 / 4217 (4 runs) | 53.8x slower |
-| [any-record-view](any-record-view.ts) | viewing an `any` object as `Record<string, any>` and reading keys through it | 6.4 / 7.1 | 127 / 167 | 23.7x slower |
-| [arr-for-of](arr-for-of.ts) | `for…of`, `forEach`, `find` / `findIndex` and `entries()` over arrays of objects | 77.8 / 84.2 | 411 / 452 | 5.4x slower |
-| [arr-hof](arr-hof.ts) | `map` / `filter` / `reduce` / `some` chains with closure callbacks | 113 / 146 | 35.8 / 44.8 | **3.3x faster** |
-| [arr-push-index](arr-push-index.ts) | `push`, indexed reads/writes and `length` on number arrays | 61.0 / 73.2 | 52.2 / 55.9 | **1.3x faster** |
-| [arr-push-local](arr-push-local.ts) | building many short arrays with `push` inside functions (locals and fields of new objects) | 168 / 215 | 418 / 498 | 2.3x slower |
-| [arr-slice-concat](arr-slice-concat.ts) | `slice`, `splice`, `concat`, `[...a, ...b]`, `includes` and `indexOf` on arrays | 149 / 181 | 170 / 204 | 1.1x slower |
-| [arr-sort](arr-sort.ts) | `sort` of numbers with a comparator and of strings in default order | 173 / 209 | 445 / 487 | 2.3x slower |
-| [async-await](async-await.ts) | `await` chains of async functions that resolve immediately | 122 / 140 | 276 / 321 | 2.3x slower |
-| [async-promise-all](async-promise-all.ts) | `Promise.all` fan-out, `new Promise` + `.then` chains and `queueMicrotask` (the general async path) | 77.9 / 96.9 | 1035 / 1123 (14 runs) | 11.6x slower |
-| [bigint-arith](bigint-arith.ts) | `bigint` `+`, `*`, `%` and shifts (Fibonacci mod a prime, modular exponentiation) | 90.8 / 110 | 1107 / 1171 (13 runs) | 10.7x slower |
-| [buf-encode](buf-encode.ts) | `Buffer` integer reads and writes, `hex` / `base64` / `utf8` conversion, `Buffer.concat`, `Uint8Array` `toHex` / `fromBase64` and `TextEncoder` / `TextDecoder` | 106 / 136 | 142 / 160 | 1.2x slower |
-| [class-accessors](class-accessors.ts) | getters and setters, static fields and `super.m()` calls on class instances | 13.7 / 14.4 | 4056 / 4293 (4 runs) | 299.1x slower |
-| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 84.9 / 103 | 147 / 154 | 1.5x slower |
-| [date-format](date-format.ts) | `new Date(ms)`, UTC getters, `toISOString` and `Date.parse` (timestamps in log lines) | 101 / 113 | 33.7 / 42.0 | **2.7x faster** |
-| [events-emit](events-emit.ts) | `EventEmitter` `emit` to listeners taking 0, 1 and 2 arguments | 91.3 / 109 | 834 / 978 | 9.0x slower |
-| [exc-throw-rare](exc-throw-rare.ts) | `try`/`catch`/`finally` in a hot loop where nothing throws | 216 / 225 | 290 / 316 | 1.4x slower |
-| [exc-try-catch](exc-try-catch.ts) | `try`/`catch`/`finally` in a hot loop where one call in 1,024 throws | 28.3 / 34.5 | 72.5 / 80.6 | 2.3x slower |
-| [fn-closures](fn-closures.ts) | creating closures over mutable state and calling them indirectly | 186 / 229 | 37.7 / 39.0 | **5.9x faster** |
-| [fn-recursion-tree](fn-recursion-tree.ts) | building and walking binary trees (recursion plus allocation) | 141 / 175 | 211 / 249 | 1.4x slower |
-| [fn-rest-spread](fn-rest-spread.ts) | rest parameters, spread arguments `f(...args)`, default parameters and `.call` / `.apply` / `.bind` | 91.6 / 112 | 605 / 707 | 6.3x slower |
-| [gen-for-of](gen-for-of.ts) | sync generators (a method, `*[Symbol.iterator]()`, `yield*`) consumed by `for…of` | 56.8 / 66.5 | 12.3 / 14.8 | **4.5x faster** |
-| [gen-next](gen-next.ts) | generators driven by hand (`.next()`), spread `[...gen()]` and stored in a variable before `for…of` | 48.8 / 72.5 | 542 / 687 | 9.5x slower |
-| [iter-helpers](iter-helpers.ts) | ES2025 iterator helpers (`filter` / `map` / `take` / `drop` / `reduce` / `toArray`) on generators and `Iterator.from(array)` | 71.8 / 103 | 1388 / 1496 (11 runs) | 14.5x slower |
-| [json-any](json-any.ts) | `JSON.parse` into `any` and walking the result, `JSON.stringify` of objects built as `any` | 88.0 / 104 | 406 / 436 | 4.2x slower |
-| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 43.0 / 54.8 | 110 / 123 | 2.3x slower |
-| [map-delete](map-delete.ts) | `Map<string, number>` insert/delete churn (an LRU-style sliding window) | 34.6 / 46.9 | 199 / 215 | 4.6x slower |
-| [map-iterate](map-iterate.ts) | iterating a `Map` (`for…of` entries, `forEach`, `[...values()]`), also after deletes | 95.9 / 116 | 250 / 288 | 2.5x slower |
-| [map-number-keys](map-number-keys.ts) | `Map<number, T>` lookups by integer id and memoization | 132 / 169 | 220 / 247 | 1.5x slower |
-| [map-string-keys](map-string-keys.ts) | `Map<string, number>` `set` / `get` / `has` word counting | 107 / 139 | 159 / 186 | 1.3x slower |
-| [num-arith-loop](num-arith-loop.ts) | tight float64 loop with `%`, `*` and `Math.floor` | 79.5 / 88.7 | 176 / 201 | 2.3x slower |
-| [num-bitwise](num-bitwise.ts) | bitwise and, or, xor and shifts (`<<`, `>>`, `>>>`) on integers, and flag tests | 23.9 / 35.0 | 121 / 128 | 3.7x slower |
-| [num-hash-imul](num-hash-imul.ts) | FNV-1a and murmur-style string hashing with `Math.imul`, `>>> 0` and `charCodeAt` | 81.9 / 113 | 900 / 1018 | 9.0x slower |
-| [num-mod-int](num-mod-int.ts) | `%` on integer operands (hash buckets, cycling indexes) | 67.6 / 71.9 | 196 / 204 | 2.8x slower |
-| [num-to-string](num-to-string.ts) | number/string conversion: `String(n)`, `toFixed`, `Number(str)`, `parseInt` | 114 / 160 | 639 / 766 | 4.8x slower |
-| [obj-alloc](obj-alloc.ts) | allocating many short-lived object literals and class instances | 65.6 / 69.7 | 215 / 250 | 3.6x slower |
-| [obj-keys-entries](obj-keys-entries.ts) | `Object.keys` / `values` / `entries` and `for…in` over typed objects and class instances | 92.6 / 118 | 1209 / 1672 (10 runs) | 14.2x slower |
-| [obj-optional-chain](obj-optional-chain.ts) | `?.` and `??` walking nullable links and optional fields | 57.6 / 67.8 | 191 / 215 | 3.2x slower |
-| [obj-record-dict](obj-record-dict.ts) | a `Record<string, number>` object literal used as a dictionary (`rec[k] ?? 0`, `k in rec`, `Object.keys`) | 93.8 / 107 | 125 / 143 | 1.3x slower |
-| [obj-spread-destructure](obj-spread-destructure.ts) | object spread `{ ...p, x }`, destructuring with defaults, and array-destructuring swaps | 66.8 / 83.2 | 2306 / 2585 (6 runs) | 31.1x slower |
-| [regex-exec](regex-exec.ts) | regex `test`, `exec` with groups and global `replace` over log lines | 94.8 / 108 | 138 / 170 | 1.6x slower |
-| [regex-replace-fn](regex-replace-fn.ts) | `replace` with a callback, `matchAll` with groups and `split` on a regex | 88.1 / 110 | 102 / 116 | 1.1x slower |
-| [regex-site](regex-site.ts) | `/g` regex literals evaluated inside a hot function, and `.index` on long input | 82.5 / 106 | 234 / 257 | 2.4x slower |
-| [set-ops](set-ops.ts) | `Set<number>` `add` / `has` / `delete` on a 16,384-entry set | 41.4 / 47.0 | 106 / 117 | 2.5x slower |
-| [str-char-scan](str-char-scan.ts) | lexer-style scan of a large string with `charCodeAt` and `str[i]` | 90.3 / 128 | 392 / 492 | 3.8x slower |
-| [str-concat](str-concat.ts) | growing ~20 KB strings with `s += x` and `s = s + …` (each pass starts empty) | 11.2 / 14.9 | 27.6 / 33.2 | 2.2x slower |
-| [str-concat-plus](str-concat-plus.ts) | growing strings with `s = s + x` (not `+=`), each pass starting empty | 32.4 / 42.0 | 114 / 133 | 3.2x slower |
-| [str-methods](str-methods.ts) | `startsWith` / `endsWith` / `includes`, case conversion, `padStart`, `repeat` and `replaceAll` with a string | 79.7 / 107 | 148 / 171 | 1.6x slower |
-| [str-short-scan](str-short-scan.ts) | `charCodeAt(i)` / `s[i]` scans of many short (< 512 byte) lines | 33.6 / 48.5 | 242 / 282 | 5.8x slower |
-| [str-split-join](str-split-join.ts) | `split`, `join`, `indexOf`, `slice` and `trim` on CSV-like lines | 61.4 / 75.1 | 42.5 / 49.0 | **1.5x faster** |
-| [str-switch-compare](str-switch-compare.ts) | `switch` over string values and `===` / `<` string comparisons (keyword lookup) | 105 / 124 | 106 / 125 | 1.0x slower |
-| [str-template](str-template.ts) | template literals mixing strings, integers, floats and booleans | 60.0 / 73.8 | 112 / 125 | 1.7x slower |
-| [str-unicode](str-unicode.ts) | `length`, `charCodeAt`, `codePointAt` and `slice` on non-ASCII text (UTF-16 indexes) | 102 / 115 | 1961 / 2141 (8 runs) | 18.6x slower |
-| [typed-array](typed-array.ts) | `Float64Array` / `Int32Array` / `Uint8Array` indexed loops, `subarray`, `set` and `fill` | 69.1 / 85.7 | 538 / 594 | 6.9x slower |
-| [union-switch](union-switch.ts) | evaluating an expression tree of a discriminated union with `switch (e.kind)` | 155 / 202 | 587 / 643 | 3.2x slower |
-| [union-typeof](union-typeof.ts) | `typeof`, `instanceof` and `Array.isArray` narrowing of a five-way union (string, number, boolean, class, array) | 52.2 / 64.0 | 478 / 548 | 8.6x slower |
-| [wasm-call](wasm-call.ts) | calls from TypeScript into WebAssembly exports (i32 / f64 arithmetic, memory loads) and reads of the exported memory | 47.7 / 50.9 | 2469 / 2743 (6 runs) | 53.9x slower |
+| [any-dynamic](any-dynamic.ts) | property reads and writes on `any` objects (nested objects, arrays) | 50.3 / 51.0 | 5924 / 5956 (3 runs) | 116.8x slower |
+| [any-record-view](any-record-view.ts) | viewing an `any` object as `Record<string, any>` and reading keys through it | 5.3 / 6.1 | 50.9 / 51.9 | 8.5x slower |
+| [arr-for-of](arr-for-of.ts) | `for…of`, `forEach`, `find` / `findIndex` and `entries()` over arrays of objects | 53.8 / 54.7 | 270 / 275 | 5.0x slower |
+| [arr-hof](arr-hof.ts) | `map` / `filter` / `reduce` / `some` chains with closure callbacks | 86.9 / 87.7 | 27.1 / 28.2 | **3.1x faster** |
+| [arr-push-index](arr-push-index.ts) | `push`, indexed reads/writes and `length` on number arrays | 50.8 / 52.8 | 47.8 / 49.4 | **1.1x faster** |
+| [arr-push-local](arr-push-local.ts) | building many short arrays with `push` inside functions (locals and fields of new objects) | 138 / 139 | 310 / 317 | 2.3x slower |
+| [arr-slice-concat](arr-slice-concat.ts) | `slice`, `splice`, `concat`, `[...a, ...b]`, `includes` and `indexOf` on arrays | 109 / 110 | 117 / 119 | 1.1x slower |
+| [arr-sort](arr-sort.ts) | `sort` of numbers with a comparator and of strings in default order | 105 / 116 | 308 / 314 | 2.7x slower |
+| [async-await](async-await.ts) | `await` chains of async functions that resolve immediately | 97.6 / 99.4 | 200 / 202 | 2.0x slower |
+| [async-promise-all](async-promise-all.ts) | `Promise.all` fan-out, `new Promise` + `.then` chains and `queueMicrotask` (the general async path) | 61.7 / 63.3 | 689 / 696 | 11.0x slower |
+| [bigint-arith](bigint-arith.ts) | `bigint` `+`, `*`, `%` and shifts (Fibonacci mod a prime, modular exponentiation) | 70.4 / 72.1 | 686 / 698 | 9.7x slower |
+| [buf-encode](buf-encode.ts) | `Buffer` integer reads and writes, `hex` / `base64` / `utf8` conversion, `Buffer.concat`, `Uint8Array` `toHex` / `fromBase64` and `TextEncoder` / `TextDecoder` | 78.6 / 81.0 | 94.2 / 97.5 | 1.2x slower |
+| [class-accessors](class-accessors.ts) | getters and setters, static fields and `super.m()` calls on class instances | 9.6 / 9.7 | 2836 / 2859 (6 runs) | 294.9x slower |
+| [class-dispatch](class-dispatch.ts) | virtual method calls through an abstract base class and an interface | 67.0 / 69.3 | 121 / 122 | 1.8x slower |
+| [date-format](date-format.ts) | `new Date(ms)`, UTC getters, `toISOString` and `Date.parse` (timestamps in log lines) | 82.5 / 83.5 | 30.5 / 31.6 | **2.6x faster** |
+| [events-emit](events-emit.ts) | `EventEmitter` `emit` to listeners taking 0, 1 and 2 arguments | 69.2 / 70.7 | 621 / 627 | 8.9x slower |
+| [exc-throw-rare](exc-throw-rare.ts) | `try`/`catch`/`finally` in a hot loop where nothing throws | 191 / 193 | 243 / 245 | 1.3x slower |
+| [exc-try-catch](exc-try-catch.ts) | `try`/`catch`/`finally` in a hot loop where one call in 1,024 throws | 23.3 / 23.9 | 62.1 / 63.3 | 2.6x slower |
+| [fn-closures](fn-closures.ts) | creating closures over mutable state and calling them indirectly | 140 / 141 | 34.9 / 36.5 | **3.9x faster** |
+| [fn-recursion-tree](fn-recursion-tree.ts) | building and walking binary trees (recursion plus allocation) | 99.2 / 100 | 148 / 150 | 1.5x slower |
+| [fn-rest-spread](fn-rest-spread.ts) | rest parameters, spread arguments `f(...args)`, default parameters and `.call` / `.apply` / `.bind` | 72.1 / 72.7 | 444 / 449 | 6.2x slower |
+| [gen-for-of](gen-for-of.ts) | sync generators (a method, `*[Symbol.iterator]()`, `yield*`) consumed by `for…of` | 51.4 / 51.8 | 11.8 / 12.2 | **4.2x faster** |
+| [gen-next](gen-next.ts) | generators driven by hand (`.next()`), spread `[...gen()]` and stored in a variable before `for…of` | 44.0 / 44.8 | 449 / 454 | 10.1x slower |
+| [iter-helpers](iter-helpers.ts) | ES2025 iterator helpers (`filter` / `map` / `take` / `drop` / `reduce` / `toArray`) on generators and `Iterator.from(array)` | 65.9 / 67.0 | 1042 / 1061 | 15.8x slower |
+| [json-any](json-any.ts) | `JSON.parse` into `any` and walking the result, `JSON.stringify` of objects built as `any` | 66.0 / 67.4 | 276 / 280 | 4.2x slower |
+| [json-roundtrip](json-roundtrip.ts) | `JSON.stringify` and `JSON.parse` of an array of nested objects | 37.5 / 38.4 | 76.7 / 78.4 | 2.0x slower |
+| [map-delete](map-delete.ts) | `Map<string, number>` insert/delete churn (an LRU-style sliding window) | 29.9 / 35.3 | 167 / 170 | 4.8x slower |
+| [map-iterate](map-iterate.ts) | iterating a `Map` (`for…of` entries, `forEach`, `[...values()]`), also after deletes | 85.7 / 87.1 | 229 / 231 | 2.7x slower |
+| [map-number-keys](map-number-keys.ts) | `Map<number, T>` lookups by integer id and memoization | 107 / 108 | 165 / 169 | 1.6x slower |
+| [map-string-keys](map-string-keys.ts) | `Map<string, number>` `set` / `get` / `has` word counting | 90.2 / 91.8 | 118 / 119 | 1.3x slower |
+| [num-arith-loop](num-arith-loop.ts) | tight float64 loop with `%`, `*` and `Math.floor` | 73.1 / 73.7 | 155 / 157 | 2.1x slower |
+| [num-bitwise](num-bitwise.ts) | bitwise and, or, xor and shifts (`<<`, `>>`, `>>>`) on integers, and flag tests | 20.8 / 21.8 | 108 / 109 | 5.0x slower |
+| [num-hash-imul](num-hash-imul.ts) | FNV-1a and murmur-style string hashing with `Math.imul`, `>>> 0` and `charCodeAt` | 69.2 / 71.1 | 787 / 791 | 11.1x slower |
+| [num-mod-int](num-mod-int.ts) | `%` on integer operands (hash buckets, cycling indexes) | 60.0 / 60.5 | 175 / 180 | 3.0x slower |
+| [num-to-string](num-to-string.ts) | number/string conversion: `String(n)`, `toFixed`, `Number(str)`, `parseInt` | 97.8 / 101 | 390 / 404 | 4.0x slower |
+| [obj-alloc](obj-alloc.ts) | allocating many short-lived object literals and class instances | 61.9 / 63.5 | 182 / 183 | 2.9x slower |
+| [obj-keys-entries](obj-keys-entries.ts) | `Object.keys` / `values` / `entries` and `for…in` over typed objects and class instances | 74.2 / 75.2 | 1041 / 1053 | 14.0x slower |
+| [obj-optional-chain](obj-optional-chain.ts) | `?.` and `??` walking nullable links and optional fields | 47.0 / 48.7 | 169 / 171 | 3.5x slower |
+| [obj-record-dict](obj-record-dict.ts) | a `Record<string, number>` object literal used as a dictionary (`rec[k] ?? 0`, `k in rec`, `Object.keys`) | 79.3 / 84.6 | 108 / 111 | 1.3x slower |
+| [obj-spread-destructure](obj-spread-destructure.ts) | object spread `{ ...p, x }`, destructuring with defaults, and array-destructuring swaps | 50.6 / 51.5 | 1547 / 1555 (10 runs) | 30.2x slower |
+| [regex-exec](regex-exec.ts) | regex `test`, `exec` with groups and global `replace` over log lines | 63.9 / 65.8 | 100 / 102 | 1.6x slower |
+| [regex-replace-fn](regex-replace-fn.ts) | `replace` with a callback, `matchAll` with groups and `split` on a regex | 69.9 / 70.4 | 77.2 / 79.1 | 1.1x slower |
+| [regex-site](regex-site.ts) | `/g` regex literals evaluated inside a hot function, and `.index` on long input | 67.7 / 69.5 | 155 / 158 | 2.3x slower |
+| [set-ops](set-ops.ts) | `Set<number>` `add` / `has` / `delete` on a 16,384-entry set | 36.5 / 37.3 | 86.8 / 89.4 | 2.4x slower |
+| [str-char-scan](str-char-scan.ts) | lexer-style scan of a large string with `charCodeAt` and `str[i]` | 76.8 / 77.5 | 320 / 324 | 4.2x slower |
+| [str-concat](str-concat.ts) | growing ~20 KB strings with `s += x` and `s = s + …` (each pass starts empty) | 9.8 / 10.2 | 22.5 / 24.0 | 2.4x slower |
+| [str-concat-plus](str-concat-plus.ts) | growing strings with `s = s + x` (not `+=`), each pass starting empty | 28.1 / 29.4 | 92.1 / 95.4 | 3.2x slower |
+| [str-methods](str-methods.ts) | `startsWith` / `endsWith` / `includes`, case conversion, `padStart`, `repeat` and `replaceAll` with a string | 66.3 / 67.0 | 110 / 113 | 1.7x slower |
+| [str-short-scan](str-short-scan.ts) | `charCodeAt(i)` / `s[i]` scans of many short (< 512 byte) lines | 29.9 / 30.7 | 199 / 201 | 6.5x slower |
+| [str-split-join](str-split-join.ts) | `split`, `join`, `indexOf`, `slice` and `trim` on CSV-like lines | 55.3 / 56.6 | 36.6 / 38.5 | **1.5x faster** |
+| [str-switch-compare](str-switch-compare.ts) | `switch` over string values and `===` / `<` string comparisons (keyword lookup) | 88.6 / 90.7 | 92.4 / 93.8 | 1.0x slower |
+| [str-template](str-template.ts) | template literals mixing strings, integers, floats and booleans | 51.0 / 51.5 | 81.0 / 82.2 | 1.6x slower |
+| [str-unicode](str-unicode.ts) | `length`, `charCodeAt`, `codePointAt` and `slice` on non-ASCII text (UTF-16 indexes) | 68.0 / 71.0 | 1280 / 1302 (12 runs) | 18.3x slower |
+| [typed-array](typed-array.ts) | `Float64Array` / `Int32Array` / `Uint8Array` indexed loops, `subarray`, `set` and `fill` | 58.7 / 60.2 | 463 / 466 | 7.7x slower |
+| [union-switch](union-switch.ts) | evaluating an expression tree of a discriminated union with `switch (e.kind)` | 90.7 / 95.1 | 309 / 339 | 3.6x slower |
+| [union-typeof](union-typeof.ts) | `typeof`, `instanceof` and `Array.isArray` narrowing of a five-way union (string, number, boolean, class, array) | 49.0 / 49.4 | 415 / 421 | 8.5x slower |
+| [wasm-call](wasm-call.ts) | calls from TypeScript into WebAssembly exports (i32 / f64 arithmetic, memory loads) and reads of the exported memory | 38.9 / 39.2 | 1579 / 1589 (10 runs) | 40.5x slower |
 
 <!-- perf-results:end -->
 
