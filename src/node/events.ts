@@ -32,6 +32,14 @@ type TnEventEmitter struct {
 	fn0   interface{}
 	ev1   string
 	fn1   interface{}
+	// A subclass instance (class X extends EventEmitter): its own
+	// [Symbol.for('nodejs.rejection')] method handles captured rejections
+	tnSelf interface{}
+}
+
+// A subclass's [Symbol.for('nodejs.rejection')](err, event, ...args) (lowered by the transpiler)
+type tnRejectionHandler interface {
+	TnNodejsRejection(err interface{}, event string, args []interface{})
 }
 
 // Anything that embeds an EventEmitter (events.once(emitter, …) accepts subclasses)
@@ -314,13 +322,13 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 		result := TnInvoke(l.fn, args...)
 		// captureRejections: an async listener's rejection becomes an 'error' event
 		if capture && event != "error" {
-			tnCaptureRejection(e, result)
+			tnCaptureRejection(e, result, event, args)
 		}
 	}
 	return true
 }
 
-func tnCaptureRejection(e *TnEventEmitter, result interface{}) {
+func tnCaptureRejection(e *TnEventEmitter, result interface{}, event string, args []interface{}) {
 	rv := reflect.ValueOf(result)
 	if !rv.IsValid() || rv.Kind() != reflect.Chan || rv.IsNil() {
 		return
@@ -335,9 +343,14 @@ func tnCaptureRejection(e *TnEventEmitter, result interface{}) {
 		}
 		TnLoopPost(func() {
 			defer TnLoopUnref()
-			if rejected {
-				e.emit("error", reason)
+			if !rejected {
+				return
 			}
+			if h, ok := e.tnSelf.(tnRejectionHandler); ok {
+				h.TnNodejsRejection(reason, event, args)
+				return
+			}
+			e.emit("error", reason)
 		})
 	}()
 }
@@ -1006,7 +1019,7 @@ export function registerEvents(r: NodeRegistry): void {
   defineHelper(r, 'nodeEvents', ['fmt', 'os', 'os/signal', 'reflect', 'sync', 'syscall', 'time', 'unsafe'], ['error', 'dynamic', 'nodeInvoke', 'promise', 'eventLoop', 'nodeProcess'], eventsHelper);
   const emitterMethods =
     'on=*TnEventEmitter; addListener=*TnEventEmitter; once=*TnEventEmitter; prependListener=*TnEventEmitter; prependOnceListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listeners=[]interface{}; rawListeners=[]interface{}; listenerCount=float64; eventNames=[]string; setMaxListeners=*TnEventEmitter; getMaxListeners=float64';
-  defineClass(r, 'events.EventEmitter', '*TnEventEmitter', 'class', emitterMethods, '', '', '');
+  defineClass(r, 'events.EventEmitter', '*TnEventEmitter', 'class', emitterMethods, 'tnSelf=interface{}', '', '');
   r.classes['events.default'] = r.classes['events.EventEmitter'];
   const use = () => r.helper('nodeEvents');
   // (a symbol event name: the listener key TnEventKey gives it)
@@ -1081,6 +1094,12 @@ export function registerEvents(r: NodeRegistry): void {
       return 'TnCaptureRejections';
     };
     r.valueTypes[`${prefix}.captureRejections`] = 'bool';
+    // (the same symbol as Symbol.for('nodejs.rejection'))
+    r.values[`${prefix}.captureRejectionSymbol`] = (_c: NodeCall) => {
+      r.helper('symbol');
+      return 'TnSymbolFor("nodejs.rejection")';
+    };
+    r.valueTypes[`${prefix}.captureRejectionSymbol`] = '*TnSymbol';
     r.functions[`${prefix}.captureRejections=`] = (call: NodeCall) => {
       use();
       return `TnCaptureRejections = ${call.args[0]}`;

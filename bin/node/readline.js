@@ -1,5 +1,8 @@
 // node:readline (+ node:readline/promises): createInterface over any readable
-// stream ('line' / 'close' events, question, prompt, for await). The
+// stream ('line' / 'close' events, question, prompt, for await). In terminal
+// mode (terminal: true, or stdin and stdout both terminals) keypresses drive a
+// line editor: cursor keys, Emacs-style ctrl / meta keys, history (up / down,
+// prefix search, 'history' events) and a completer on Tab. The
 // module-level `question(prompt)` is a TypeNative extension: synchronous,
 // used by the self-hosted compiler's prompts.
 import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
@@ -13,21 +16,76 @@ type TnReadline struct {
 	closed          bool
 	pendingQuestion interface{}
 	lines           chan string
+	// terminal mode: the line being edited and the cursor in it (characters)
+	terminal     bool
+	line         []rune
+	cursor       int
+	history      []string
+	historySize  int
+	historyIndex int
+	// (the text up to the cursor when history browsing began: a prefix search)
+	search       *string
+	removeDups   bool
+	completer    interface{}
+	lastTab      bool
+	sawReturn    bool
+	rawMode      bool
+	oldPrompt    *string
+}
+
+// rl.getCursorPos(): where the cursor is, counting the prompt
+type TnCursorPos struct {
+	rows float64
+	cols float64
 }
 
 func TnCreateInterface(options interface{}, rest ...interface{}) *TnReadline {
-	rl := &TnReadline{promptText: "> "}
+	rl := &TnReadline{promptText: "> ", historySize: 30, historyIndex: -1}
 	var input, output interface{}
+	terminal, terminalSet := false, false
 	if s, ok := options.(tnStreamLike); ok {
 		input = s
 		if len(rest) > 0 {
 			output = rest[0]
+		}
+		if len(rest) > 1 && tnRlIsFunc(rest[1]) {
+			rl.completer = rest[1]
+		}
+		if len(rest) > 2 {
+			if b, ok := rest[2].(bool); ok {
+				terminal, terminalSet = b, true
+			}
 		}
 	} else if options != nil {
 		input = TnGet(options, "input")
 		output = TnGet(options, "output")
 		if p, ok := TnGetValue(options, "prompt").(string); ok {
 			rl.promptText = p
+		}
+		if b, ok := TnGetValue(options, "terminal").(bool); ok {
+			terminal, terminalSet = b, true
+		}
+		if fn := TnGet(options, "completer"); tnRlIsFunc(fn) {
+			rl.completer = fn
+		}
+		if n, ok := TnGetValue(options, "historySize").(float64); ok {
+			if n < 0 {
+				panic(TnNodeError("RangeError", "ERR_INVALID_ARG_VALUE", "The argument 'historySize' must be a non-negative number"))
+			}
+			rl.historySize = int(n)
+		}
+		if b, ok := TnGetValue(options, "removeHistoryDuplicates").(bool); ok {
+			rl.removeDups = b
+		}
+		if h := reflect.ValueOf(TnGetValue(options, "history")); h.IsValid() {
+			if h.Kind() == reflect.Pointer && !h.IsNil() {
+				h = h.Elem()
+			}
+			if h.Kind() == reflect.Slice {
+				for i := 0; i < h.Len(); i++ {
+					rl.history = append(rl.history, TnJSString(h.Index(i).Interface()))
+				}
+			}
 		}
 	}
 	if s, ok := output.(tnStreamLike); ok && !TnIsNil(output) {
@@ -38,6 +96,14 @@ func TnCreateInterface(options interface{}, rest ...interface{}) *TnReadline {
 		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"input\\" argument must be a readable stream"))
 	}
 	rl.input = s.tnStream()
+	// (Node's default: a terminal when the output is one; here stdin and stdout)
+	if !terminalSet {
+		terminal = rl.input == tnStdinStream && rl.output == tnStdoutStream && TnIsTTY(os.Stdin) && TnIsTTY(os.Stdout)
+	}
+	if terminal {
+		rl.startTerminal()
+		return rl
+	}
 	rl.input.on("data", func(chunk interface{}) { rl.feed(TnJSString(chunk)) })
 	rl.input.TnEventEmitter.once("end", func() {
 		if rl.partial != "" {
@@ -51,6 +117,438 @@ func TnCreateInterface(options interface{}, rest ...interface{}) *TnReadline {
 		rl.input.stdinRef(true)
 	}
 	return rl
+}
+
+func tnRlIsFunc(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Func && !rv.IsNil()
+}
+
+// --- terminal mode: a line editor over 'keypress' events ---
+
+func (rl *TnReadline) startTerminal() {
+	rl.terminal = true
+	if len(rl.history) > rl.historySize {
+		rl.history = rl.history[:rl.historySize]
+	}
+	rl.input.TnEventEmitter.on("keypress", func(str string, key *TnKey) {
+		if !rl.closed {
+			rl.ttyWrite(str, key)
+		}
+	})
+	TnEmitKeypressEvents(rl.input)
+	rl.input.TnEventEmitter.once("end", func() { rl.close() })
+	if rl.input == tnStdinStream {
+		if TnIsTTY(os.Stdin) && tnSetRawMode(os.Stdin, true) {
+			rl.rawMode = true
+			tnStdinRaw = true
+			tnResetStdio = func() { tnSetRawMode(os.Stdin, false) }
+		}
+		rl.input.stdinRef(true)
+	}
+}
+
+func (rl *TnReadline) Get_line() string     { return string(rl.line) }
+func (rl *TnReadline) Get_cursor() float64  { return float64(rl.cursor) }
+func (rl *TnReadline) Get_terminal() bool   { return rl.terminal }
+func (rl *TnReadline) Get_history() []string {
+	if rl.history == nil {
+		return []string{}
+	}
+	return rl.history
+}
+
+func (rl *TnReadline) getCursorPos() *TnCursorPos {
+	return &TnCursorPos{rows: 0, cols: float64(utf8.RuneCountInString(rl.promptText) + rl.cursor)}
+}
+
+// Redraws the prompt and the line, then puts the cursor back
+func (rl *TnReadline) refreshLine() {
+	col := utf8.RuneCountInString(rl.promptText) + rl.cursor
+	rl.writeOut("\\x1b[1G\\x1b[0J" + rl.promptText + string(rl.line) + "\\x1b[" + strconv.Itoa(col+1) + "G")
+}
+
+func (rl *TnReadline) moveCursor(dx int) {
+	to := rl.cursor + dx
+	if to < 0 {
+		to = 0
+	}
+	if to > len(rl.line) {
+		to = len(rl.line)
+	}
+	d := to - rl.cursor
+	rl.cursor = to
+	if d < 0 {
+		rl.writeOut("\\x1b[" + strconv.Itoa(-d) + "D")
+	} else if d > 0 {
+		rl.writeOut("\\x1b[" + strconv.Itoa(d) + "C")
+	}
+}
+
+func (rl *TnReadline) insertString(text string) {
+	if text == "" {
+		return
+	}
+	r := []rune(text)
+	if rl.cursor < len(rl.line) {
+		rl.line = append(rl.line[:rl.cursor], append(r, rl.line[rl.cursor:]...)...)
+		rl.cursor += len(r)
+		rl.refreshLine()
+		return
+	}
+	rl.line = append(rl.line, r...)
+	rl.cursor += len(r)
+	rl.writeOut(text)
+}
+
+func (rl *TnReadline) setLine(text []rune, cursor int) {
+	rl.line = text
+	rl.cursor = cursor
+	rl.refreshLine()
+}
+
+func (rl *TnReadline) deleteLeft() {
+	if rl.cursor > 0 {
+		rl.setLine(append(append([]rune{}, rl.line[:rl.cursor-1]...), rl.line[rl.cursor:]...), rl.cursor-1)
+	}
+}
+
+func (rl *TnReadline) deleteRight() {
+	if rl.cursor < len(rl.line) {
+		rl.setLine(append(append([]rune{}, rl.line[:rl.cursor]...), rl.line[rl.cursor+1:]...), rl.cursor)
+	}
+}
+
+func tnRlWordChar(r rune) bool { return !unicode.IsSpace(r) && !unicode.IsPunct(r) }
+
+// The start of the word before the cursor, and the end of the one after it
+func (rl *TnReadline) wordLeft() int {
+	i := rl.cursor
+	for i > 0 && !tnRlWordChar(rl.line[i-1]) {
+		i--
+	}
+	for i > 0 && tnRlWordChar(rl.line[i-1]) {
+		i--
+	}
+	return i
+}
+
+func (rl *TnReadline) wordRight() int {
+	i := rl.cursor
+	for i < len(rl.line) && !tnRlWordChar(rl.line[i]) {
+		i++
+	}
+	for i < len(rl.line) && tnRlWordChar(rl.line[i]) {
+		i++
+	}
+	return i
+}
+
+func (rl *TnReadline) deleteRange(from, to int) {
+	if from < to {
+		rl.setLine(append(append([]rune{}, rl.line[:from]...), rl.line[to:]...), from)
+	}
+}
+
+// Up / down: older and newer entries that start with what was typed
+func (rl *TnReadline) historyStep(older bool) {
+	if rl.search == nil {
+		prefix := string(rl.line[:rl.cursor])
+		rl.search = &prefix
+	}
+	search := *rl.search
+	current := string(rl.line)
+	if older {
+		if len(rl.history) == 0 || rl.historyIndex >= len(rl.history) {
+			return
+		}
+		i := rl.historyIndex + 1
+		for i < len(rl.history) && (!strings.HasPrefix(rl.history[i], search) || rl.history[i] == current) {
+			i++
+		}
+		rl.historyIndex = i
+		if i == len(rl.history) {
+			rl.setLine([]rune(search), utf8.RuneCountInString(search))
+			return
+		}
+		rl.setLine([]rune(rl.history[i]), utf8.RuneCountInString(rl.history[i]))
+		return
+	}
+	if rl.historyIndex < 0 {
+		return
+	}
+	i := rl.historyIndex - 1
+	for i >= 0 && (!strings.HasPrefix(rl.history[i], search) || rl.history[i] == current) {
+		i--
+	}
+	rl.historyIndex = i
+	if i < 0 {
+		rl.setLine([]rune(search), utf8.RuneCountInString(search))
+		return
+	}
+	rl.setLine([]rune(rl.history[i]), utf8.RuneCountInString(rl.history[i]))
+}
+
+func (rl *TnReadline) addHistory(text string) {
+	if text == "" || rl.historySize == 0 {
+		return
+	}
+	if len(rl.history) == 0 || rl.history[0] != text {
+		if rl.removeDups {
+			kept := rl.history[:0:0]
+			for _, h := range rl.history {
+				if h != text {
+					kept = append(kept, h)
+				}
+			}
+			rl.history = kept
+		}
+		rl.history = append([]string{text}, rl.history...)
+		if len(rl.history) > rl.historySize {
+			rl.history = rl.history[:rl.historySize]
+		}
+	}
+	rl.emit("history", rl.history)
+}
+
+// Return: the line is done
+func (rl *TnReadline) ttyLine() {
+	text := string(rl.line)
+	rl.addHistory(text)
+	rl.historyIndex = -1
+	rl.search = nil
+	rl.line = nil
+	rl.cursor = 0
+	rl.writeOut("\\r\\n")
+	if rl.oldPrompt != nil {
+		rl.promptText = *rl.oldPrompt
+		rl.oldPrompt = nil
+	}
+	rl.onLine(text)
+}
+
+// Tab: the completer's [completions, substring]; a common prefix is applied,
+// a second Tab lists the completions
+func (rl *TnReadline) tabComplete(lastWasTab bool) {
+	text := string(rl.line[:rl.cursor])
+	apply := func(result interface{}) {
+		rv := reflect.ValueOf(result)
+		if rv.IsValid() && rv.Kind() == reflect.Pointer && !rv.IsNil() {
+			rv = rv.Elem()
+		}
+		if !rv.IsValid() || (rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array) || rv.Len() < 2 {
+			return
+		}
+		hitsV := reflect.ValueOf(rv.Index(0).Interface())
+		if hitsV.IsValid() && hitsV.Kind() == reflect.Pointer && !hitsV.IsNil() {
+			hitsV = hitsV.Elem()
+		}
+		completeOn := TnJSString(rv.Index(1).Interface())
+		hits := []string{}
+		if hitsV.IsValid() && hitsV.Kind() == reflect.Slice {
+			for i := 0; i < hitsV.Len(); i++ {
+				hits = append(hits, TnJSString(hitsV.Index(i).Interface()))
+			}
+		}
+		if len(hits) == 0 {
+			return
+		}
+		prefix := ""
+		first := true
+		for _, h := range hits {
+			if h == "" {
+				continue
+			}
+			if first {
+				prefix, first = h, false
+				continue
+			}
+			for !strings.HasPrefix(h, prefix) {
+				_, size := utf8.DecodeLastRuneInString(prefix)
+				prefix = prefix[:len(prefix)-size]
+			}
+		}
+		onLen := utf8.RuneCountInString(completeOn)
+		if strings.HasPrefix(prefix, completeOn) && len(prefix) > len(completeOn) {
+			rl.insertString(prefix[len(completeOn):])
+			return
+		}
+		if !strings.HasPrefix(completeOn, prefix) && onLen <= rl.cursor {
+			start := rl.cursor - onLen
+			p := []rune(prefix)
+			rl.setLine(append(append(append([]rune{}, rl.line[:start]...), p...), rl.line[rl.cursor:]...), start+len(p))
+			return
+		}
+		if !lastWasTab || len(hits) < 2 {
+			return
+		}
+		rl.writeOut("\\r\\n" + strings.Join(hits, "  ") + "\\r\\n")
+		rl.refreshLine()
+	}
+	fv := reflect.ValueOf(rl.completer)
+	if fv.Type().NumIn() >= 2 {
+		// completer(line, callback(err, result))
+		TnInvoke(rl.completer, text, func(err interface{}, result interface{}) {
+			if err == nil || TnIsNil(err) {
+				apply(result)
+			}
+		})
+		return
+	}
+	result := TnInvoke(rl.completer, text)
+	if rv := reflect.ValueOf(result); rv.IsValid() && rv.Kind() == reflect.Chan {
+		// (an async completer: its promise)
+		go func() {
+			v, ok := rv.Recv()
+			if !ok {
+				return
+			}
+			TnLoopPost(func() { apply(v.Interface()) })
+		}()
+		return
+	}
+	apply(result)
+}
+
+// One keypress
+func (rl *TnReadline) ttyWrite(str string, key *TnKey) {
+	if key == nil {
+		key = &TnKey{}
+	}
+	lastWasTab := rl.lastTab
+	rl.lastTab = false
+	if key.name != "up" && key.name != "down" {
+		rl.search = nil
+	}
+	if key.name != "enter" {
+		defer func() { rl.sawReturn = key.name == "return" }()
+	}
+	if key.ctrl && key.shift {
+		switch key.name {
+		case "backspace":
+			rl.deleteRange(0, rl.cursor)
+		case "delete":
+			rl.deleteRange(rl.cursor, len(rl.line))
+		}
+		return
+	}
+	if key.ctrl {
+		switch key.name {
+		case "c":
+			if rl.listenerCount("SIGINT") > 0 {
+				rl.emit("SIGINT")
+			} else {
+				rl.close()
+			}
+		case "h":
+			rl.deleteLeft()
+		case "d":
+			if rl.cursor == 0 && len(rl.line) == 0 {
+				rl.close()
+			} else {
+				rl.deleteRight()
+			}
+		case "u":
+			rl.deleteRange(0, rl.cursor)
+		case "k":
+			rl.deleteRange(rl.cursor, len(rl.line))
+		case "a":
+			rl.moveCursor(-rl.cursor)
+		case "e":
+			rl.moveCursor(len(rl.line) - rl.cursor)
+		case "b":
+			rl.moveCursor(-1)
+		case "f":
+			rl.moveCursor(1)
+		case "l":
+			rl.writeOut("\\x1b[1;1H\\x1b[0J")
+			rl.refreshLine()
+		case "n":
+			rl.historyStep(false)
+		case "p":
+			rl.historyStep(true)
+		case "w", "backspace":
+			rl.deleteRange(rl.wordLeft(), rl.cursor)
+		case "delete":
+			rl.deleteRange(rl.cursor, rl.wordRight())
+		case "left":
+			rl.moveCursor(rl.wordLeft() - rl.cursor)
+		case "right":
+			rl.moveCursor(rl.wordRight() - rl.cursor)
+		}
+		return
+	}
+	if key.meta {
+		switch key.name {
+		case "b":
+			rl.moveCursor(rl.wordLeft() - rl.cursor)
+		case "f":
+			rl.moveCursor(rl.wordRight() - rl.cursor)
+		case "d", "delete":
+			rl.deleteRange(rl.cursor, rl.wordRight())
+		case "backspace":
+			rl.deleteRange(rl.wordLeft(), rl.cursor)
+		}
+		return
+	}
+	switch key.name {
+	case "return":
+		rl.ttyLine()
+		return
+	case "enter":
+		// (\\r\\n: the \\n after a return is part of it)
+		if rl.sawReturn {
+			rl.sawReturn = false
+			return
+		}
+		rl.ttyLine()
+		return
+	case "backspace":
+		rl.deleteLeft()
+		return
+	case "delete":
+		rl.deleteRight()
+		return
+	case "left":
+		rl.moveCursor(-1)
+		return
+	case "right":
+		rl.moveCursor(1)
+		return
+	case "home":
+		rl.moveCursor(-rl.cursor)
+		return
+	case "end":
+		rl.moveCursor(len(rl.line) - rl.cursor)
+		return
+	case "up":
+		rl.historyStep(true)
+		return
+	case "down":
+		rl.historyStep(false)
+		return
+	case "tab":
+		if rl.completer != nil {
+			rl.lastTab = true
+			rl.tabComplete(lastWasTab)
+			return
+		}
+	}
+	// text (rl.write('a\\nb') splits into lines)
+	if str == "" {
+		return
+	}
+	text := strings.ReplaceAll(strings.ReplaceAll(str, "\\r\\n", "\\n"), "\\r", "\\n")
+	pieces := strings.Split(text, "\\n")
+	for i, piece := range pieces {
+		if i > 0 {
+			rl.ttyLine()
+		}
+		rl.insertString(piece)
+	}
 }
 
 func (rl *TnReadline) feed(text string) {
@@ -87,10 +585,25 @@ func (rl *TnReadline) question(query string, args ...interface{}) {
 	if rl.closed {
 		panic(TnNodeError("Error", "ERR_USE_AFTER_CLOSE", "readline was closed"))
 	}
-	rl.writeOut(query)
+	rl.askQuestion(query)
 	if len(args) > 0 {
 		rl.pendingQuestion = args[len(args)-1]
 	}
+}
+
+// A question is the prompt until it's answered (terminal mode)
+func (rl *TnReadline) askQuestion(query string) {
+	if !rl.terminal {
+		rl.writeOut(query)
+		return
+	}
+	if rl.oldPrompt == nil {
+		old := rl.promptText
+		rl.oldPrompt = &old
+	}
+	rl.promptText = query
+	rl.cursor = len(rl.line)
+	rl.refreshLine()
 }
 
 // readline/promises: question(query) resolves with the answer
@@ -101,7 +614,7 @@ func (rl *TnReadline) questionAsync(query string, options ...interface{}) chan s
 		return ch
 	}
 	TnLoopRef()
-	rl.writeOut(query)
+	rl.askQuestion(query)
 	rl.pendingQuestion = func(answer string) {
 		TnLoopUnref()
 		TnAsyncSend(ch, answer)
@@ -109,11 +622,40 @@ func (rl *TnReadline) questionAsync(query string, options ...interface{}) chan s
 	return ch
 }
 
-func (rl *TnReadline) prompt(preserveCursor ...bool) { rl.writeOut(rl.promptText) }
+func (rl *TnReadline) prompt(preserveCursor ...bool) {
+	if !rl.terminal {
+		rl.writeOut(rl.promptText)
+		return
+	}
+	if len(preserveCursor) == 0 || !preserveCursor[0] {
+		rl.cursor = 0
+	}
+	rl.refreshLine()
+}
 func (rl *TnReadline) setPrompt(p string)             { rl.promptText = p }
 func (rl *TnReadline) getPrompt() string              { return rl.promptText }
 func (rl *TnReadline) write(data interface{}, key ...interface{}) {
-	rl.feed(TnJSString(data))
+	if !rl.terminal {
+		rl.feed(TnJSString(data))
+		return
+	}
+	// rl.write(text) types it; rl.write(null, { ctrl: true, name: 'u' }) presses a key
+	k := &TnKey{}
+	if len(key) > 0 && key[0] != nil && !TnIsNil(key[0]) {
+		if tk, ok := key[0].(*TnKey); ok {
+			k = tk
+		} else {
+			k.name, _ = TnGetValue(key[0], "name").(string)
+			k.ctrl, _ = TnGetValue(key[0], "ctrl").(bool)
+			k.meta, _ = TnGetValue(key[0], "meta").(bool)
+			k.shift, _ = TnGetValue(key[0], "shift").(bool)
+		}
+	}
+	text := ""
+	if data != nil && !TnIsNil(data) {
+		text = TnJSString(data)
+	}
+	rl.ttyWrite(text, k)
 }
 
 func (rl *TnReadline) pause() *TnReadline {
@@ -139,6 +681,11 @@ func (rl *TnReadline) close() {
 		return
 	}
 	rl.closed = true
+	if rl.rawMode {
+		rl.rawMode = false
+		tnSetRawMode(os.Stdin, false)
+		tnStdinRaw = false
+	}
 	if rl.input == tnStdinStream {
 		rl.input.pause()
 		rl.input.stdinRef(false)
@@ -513,8 +1060,9 @@ export function registerReadline(r) {
         return `TnQuestion(${call.args[0] ?? '""'})`;
     };
     setResults(r, 'readline', 'question=string');
-    defineHelper(r, 'nodeReadline', ['strings'], ['nodeStream', 'nodeEvents', 'nodeInvoke', 'promise', 'eventLoop'], readlineHelper);
-    const cls = defineClass(r, 'readline.Interface', '*TnReadline', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; emit=bool; prompt=; setPrompt=; getPrompt=string; write=; pause=*TnReadline; resume=*TnReadline; close=; tnIterator=chan string', '', 'closed=bool', '');
+    defineHelper(r, 'nodeReadline', ['os', 'reflect', 'strconv', 'strings', 'unicode', 'unicode/utf8'], ['nodeStream', 'nodeEvents', 'nodeInvoke', 'promise', 'eventLoop', 'nodeKeypress', 'nodeTty'], readlineHelper);
+    const cls = defineClass(r, 'readline.Interface', '*TnReadline', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; emit=bool; prompt=; setPrompt=; getPrompt=string; write=; pause=*TnReadline; resume=*TnReadline; close=; tnIterator=chan string; getCursorPos=*TnCursorPos', '', 'closed=bool; line=string; cursor=float64; terminal=bool; history=[]string', '');
+    defineClass(r, 'readline.CursorPos', '*TnCursorPos', 'class', '', 'rows=float64; cols=float64', '', '');
     r.classes['readline/promises.Interface'] = cls;
     r.iterators['*TnReadline'] = 'tnIterator';
     for (const mod of ['readline', 'readline/promises']) {
@@ -541,6 +1089,8 @@ export function registerReadline(r) {
     r.paramTypers['readline.Interface#question'] = (_n) => ['string'];
     r.paramTypers['readline.Interface#on'] = (nodes) => {
         const event = nodes[0];
+        if (event && event.kind === 'StringLiteral' && event.text === 'history')
+            return ['[]string'];
         return event && event.kind === 'StringLiteral' && event.text === 'line' ? ['string'] : [];
     };
     r.paramTypers['readline.Interface#once'] = r.paramTypers['readline.Interface#on'];

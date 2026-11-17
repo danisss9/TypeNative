@@ -33,6 +33,7 @@ import { registerDgram } from './node/dgram.js';
 import { registerSqlite } from './node/sqlite.js';
 import { registerWebAssembly } from './node/webassembly.js';
 import { registerWasi } from './node/wasi.js';
+import { registerFfi } from './node/ffi.js';
 import { registerTemporal } from './node/temporal.js';
 import { registerIntl } from './node/intl.js';
 import { registerWebview } from './node/webview.js';
@@ -2713,6 +2714,22 @@ function isInspectCustomSymbol(expr: AstNode | undefined): boolean {
     isStringLiteral(expr.arguments?.[0]) && expr.arguments[0].text === 'nodejs.util.inspect.custom';
 }
 
+// Symbol.for(key) with this key
+function isRegisteredSymbol(expr: AstNode | undefined, key: string): boolean {
+  return !!expr && isCallExpression(expr) && isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) &&
+    expr.expression.expression.text === 'Symbol' && expr.expression.name.text === 'for' &&
+    isStringLiteral(expr.arguments?.[0]) && expr.arguments[0].text === key;
+}
+
+// Symbol.for('nodejs.rejection') / (EventEmitter.)captureRejectionSymbol as
+// a member name: an EventEmitter subclass's captured-rejection handler
+function isRejectionSymbol(expr: AstNode | undefined): boolean {
+  if (!expr) return false;
+  if (isIdentifier(expr) && expr.text === 'captureRejectionSymbol') return true;
+  if (isPropertyAccessExpression(expr) && expr.name.text === 'captureRejectionSymbol') return true;
+  return isRegisteredSymbol(expr, 'nodejs.rejection');
+}
+
 // Symbol.asyncIterator: an async generator method is a channel like
 // Symbol.iterator's (for await reads it the same way)
 function isAsyncIteratorSymbol(expr: AstNode | undefined): boolean {
@@ -2742,6 +2759,15 @@ function lowerDisposeSymbols(node: AstNode): void {
   }
   if (node.name?.kind === 'ComputedPropertyName' && isInspectCustomSymbol(node.name.expression)) {
     node.name = { kind: 'Identifier', text: '__inspectCustom' };
+  }
+  if (node.name?.kind === 'ComputedPropertyName' && isMethodDeclaration(node) && isRejectionSymbol(node.name.expression)) {
+    node.name = { kind: 'Identifier', text: '__nodejsRejection' };
+  }
+  // readable[Symbol.for('Stream.toAsyncStreamable')]() → readable.__toAsyncStreamable()
+  if (node.kind === 'ElementAccessExpression' && isRegisteredSymbol(node.argumentExpression, 'Stream.toAsyncStreamable')) {
+    node.kind = 'PropertyAccessExpression';
+    node.name = { kind: 'Identifier', text: '__toAsyncStreamable' };
+    delete node.argumentExpression;
   }
   if (node.name?.kind === 'ComputedPropertyName') {
     const name = getDisposeSymbolName(node.name.expression);
@@ -10345,9 +10371,17 @@ function constructorParameterNodes(className: string): AstNode[] {
 // The parameters of the nearest user-class ancestor with a constructor, as a
 // Go signature and the argument list forwarding them (null when none, or when
 // they need destructuring)
+const VARIADIC_NODE_PARENTS = new Set([
+  'events.EventEmitter', 'events.default', 'stream.Readable', 'stream.Writable', 'stream.Duplex', 'stream.Transform', 'stream.PassThrough'
+]);
+
 function inheritedConstructorParameters(parentClass: string): { signature: string; forward: string[] } | null {
   let current = parentClass;
   for (let depth = 0; depth < 50 && current; depth++) {
+    // (EventEmitter and the stream classes: Go constructors over ...options)
+    if (VARIADIC_NODE_PARENTS.has(nodeParentClassKeys.get(current) ?? '')) {
+      return { signature: '__options ...interface{}', forward: ['__options...'] };
+    }
     const classNode = declaredClasses.get(current);
     if (!classNode) return null;
     const ctor = (classNode.members ?? []).find((m: AstNode) => isConstructorDeclaration(m) && !!m.body);
@@ -11350,6 +11384,17 @@ function emitToJSONWrappers(): string {
       const paramTypes = inspectCustom.params ? goFuncParamTypes(`func(${inspectCustom.params})`) : [];
       const call = `self.${inspectCustom.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
       out.push(`func (self *${getSafeName(className)}) TnInspectCustom(depth float64, options interface{}) interface{} {\n\t__args := []interface{}{depth, options, nil}\n\t_ = __args\n\t${inspectCustom.result ? `return ${call}` : `${call}\n\treturn nil`}\n}`);
+    }
+    // [Symbol.for('nodejs.rejection')](err, event, ...args): node:events calls it for captured rejections
+    const rejection = methods.get('__nodejsRejection');
+    if (rejection) {
+      const paramTypes = rejection.params ? goFuncParamTypes(`func(${rejection.params})`) : [];
+      const call = `self.${rejection.goName}(${paramTypes.map((t, i) => dispatchArgument(t, i)).join(', ')})`;
+      out.push(`func (self *${getSafeName(className)}) TnNodejsRejection(err interface{}, event string, args []interface{}) {
+	__args := append([]interface{}{err, event}, args...)
+	_ = __args
+	${call}
+}`);
     }
     // [Symbol.toPrimitive](hint): what String(x) / +x / x + '' convert through
     const toPrimitive = methods.get('__toPrimitive');
@@ -19427,6 +19472,11 @@ const callHandlers: Record<string, CallHandler> = {
   },
   structuredClone: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('structuredClone');
+    // (structuredClone(v, { transfer }): listed web streams move instead)
+    if (args.length > 1) {
+      useHelper('structuredCloneTransfer');
+      return `TnStructuredCloneTransfer(${args[0]}, ${args[1]})`;
+    }
     return `TnStructuredClone(${args[0]})`;
   },
   setInterval: (_caller: string, args: string[], _typeArgs: string) => {
@@ -25810,7 +25860,8 @@ const helperRequires: Record<string, string[]> = {
   functionThis: [],
   jsx: [],
   objectIntegrity: [],
-  structuredClone: [],
+  structuredClone: ['domException'],
+  structuredCloneTransfer: ['structuredClone', 'dynamic'],
   globalThis: ['dynamic'],
   namedGroups: ['orderedMap', 'regexMatch'],
   fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
@@ -26529,6 +26580,7 @@ registerDgram(nodeRegistry);
 registerSqlite(nodeRegistry);
 registerWebAssembly(nodeRegistry);
 registerWasi(nodeRegistry);
+registerFfi(nodeRegistry);
 registerTemporal(nodeRegistry);
 registerIntl(nodeRegistry);
 registerWebview(nodeRegistry);
@@ -26602,6 +26654,7 @@ const helperPackages: Record<string, string[]> = {
   jsx: ['strings', 'html', 'reflect', 'strconv', 'fmt'],
   objectIntegrity: ['sync', 'reflect'],
   structuredClone: ['reflect', 'unsafe'],
+  structuredCloneTransfer: ['reflect'],
   globalThis: [],
   getenv: ['os'],
   strAppend: ['sync', 'unsafe'],
@@ -28269,6 +28322,8 @@ func TnSwitchString(v interface{}) string {
 	return s
 }
 
+var tnFuncPropHooks []func(interface{}, string) (interface{}, bool)
+
 func TnGet(obj interface{}, key string) interface{} {
 	if obj != nil && key != "length" && key != "size" {
 		if origin, ok := tnViewOrigin(obj); ok {
@@ -28307,6 +28362,14 @@ func TnGet(obj interface{}, key string) interface{} {
 			return o.Get_stack()
 		}
 		return o.prop(key)
+	}
+	// (properties a module hangs on Go funcs: node:ffi wrappers' .pointer)
+	if len(tnFuncPropHooks) > 0 && obj != nil && reflect.ValueOf(obj).Kind() == reflect.Func {
+		for _, hook := range tnFuncPropHooks {
+			if v, ok := hook(obj, key); ok {
+				return v
+			}
+		}
 	}
 	// (an accessor shadows the property: its getter runs on reads — Babel's
 	// ParseError defines a 'message' getter that computes and self-assigns)
@@ -37824,11 +37887,36 @@ func TnStructuredClone[T any](v T) T {
 	return tnCloneValue(reflect.ValueOf(&v).Elem()).Interface().(T)
 }
 
+// Transferable objects (web streams) are never copied: structuredClone(v, {
+// transfer }) moves the listed ones (tnCloneTransfers), others throw
+type tnTransferable interface {
+	tnTransfer() interface{}
+}
+
+var tnCloneTransfers map[interface{}]interface{}
+
+func tnCloneTransferable(t tnTransferable) interface{} {
+	moved, listed := tnCloneTransfers[t]
+	if !listed {
+		panic(TnNewDOMException("Object that needs transfer was found in message but not listed in transferList", "DataCloneError"))
+	}
+	if moved == nil {
+		moved = t.tnTransfer()
+		tnCloneTransfers[t] = moved
+	}
+	return moved
+}
+
 func tnCloneValue(v reflect.Value) reflect.Value {
 	switch v.Kind() {
 	case reflect.Pointer:
 		if v.IsNil() {
 			return v
+		}
+		if v.CanInterface() {
+			if t, ok := v.Interface().(tnTransferable); ok {
+				return reflect.ValueOf(tnCloneTransferable(t))
+			}
 		}
 		c := reflect.New(v.Elem().Type())
 		c.Elem().Set(tnCloneValue(v.Elem()))
@@ -37875,6 +37963,26 @@ func tnCloneValue(v reflect.Value) reflect.Value {
 		return c
 	}
 	return v
+}`,
+  structuredCloneTransfer: `// structuredClone(value, { transfer }): the listed transferables move
+func TnStructuredCloneTransfer[T any](v T, options interface{}) T {
+	saved := tnCloneTransfers
+	tnCloneTransfers = map[interface{}]interface{}{}
+	defer func() { tnCloneTransfers = saved }()
+	if options != nil && !TnIsNil(options) {
+		list := reflect.ValueOf(TnGetValue(options, "transfer"))
+		if list.IsValid() && list.Kind() == reflect.Pointer && !list.IsNil() {
+			list = list.Elem()
+		}
+		if list.IsValid() && (list.Kind() == reflect.Slice || list.Kind() == reflect.Array) {
+			for i := 0; i < list.Len(); i++ {
+				if t, ok := list.Index(i).Interface().(tnTransferable); ok {
+					tnCloneTransfers[t] = nil
+				}
+			}
+		}
+	}
+	return TnStructuredClone(v)
 }`,
   globalThis: `// (globalThis as any).x: properties set on the global object at runtime
 var TnGlobalThis = map[string]interface{}{}`,

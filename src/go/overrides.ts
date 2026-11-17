@@ -71,7 +71,9 @@ export const goPathAliases: Record<string, string> = {
   'github.com/tetratelabs/wazero/api': 'wazeroapi',
   'github.com/tetratelabs/wazero/sys': 'wazerosys',
   'github.com/tetratelabs/wazero/experimental': 'wazeroexp',
-  'github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1': 'wazerowasi'
+  'github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1': 'wazerowasi',
+  // node:crypto's secp256k1 keys (the package name would clash with crypto/ecdsa)
+  'github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa': 'decredecdsa'
 };
 
 export const goExcluded: Record<string, string> = {
