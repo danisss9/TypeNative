@@ -8,168 +8,242 @@ import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setRes
 // (--permission, --allow-fs-read[=path], --allow-fs-write[=path],
 // --allow-child-process, --allow-worker, --allow-addons) and are enforced by
 // the fs / child_process / worker_threads helpers
-const permHelper = `// process.permission
-var tnPermEnabled bool
-var tnPermReadAll bool
-var tnPermWriteAll bool
-var tnPermReadGrants []string
-var tnPermWriteGrants []string
-var tnPermReadDropped []string
-var tnPermWriteDropped []string
-var tnPermChild bool
-var tnPermWorker bool
-var tnPermAddon bool
-var tnPermDroppedRead bool
-var tnPermDroppedWrite bool
-var tnPermDroppedChild bool
-var tnPermDroppedWorker bool
-var tnPermDroppedAddon bool
-var tnPermMu sync.Mutex
-
-func init() {
-	opts := os.Getenv("NODE_OPTIONS")
-	if opts == "" {
-		return
-	}
-	enabled := false
-	for _, f := range strings.Fields(opts) {
-		f = strings.Trim(f, "\\"'")
-		switch {
-		case f == "--permission":
-			enabled = true
-		case f == "--no-permission":
-			enabled = false
-		case f == "--allow-fs-read":
-			tnPermReadAll = true
-		case f == "--allow-fs-write":
-			tnPermWriteAll = true
-		case strings.HasPrefix(f, "--allow-fs-read="):
-			if v := strings.TrimPrefix(f, "--allow-fs-read="); v == "*" {
-				tnPermReadAll = true
-			} else {
-				tnPermReadGrants = append(tnPermReadGrants, v)
-			}
-		case strings.HasPrefix(f, "--allow-fs-write="):
-			if v := strings.TrimPrefix(f, "--allow-fs-write="); v == "*" {
-				tnPermWriteAll = true
-			} else {
-				tnPermWriteGrants = append(tnPermWriteGrants, v)
-			}
-		case f == "--allow-child-process":
-			tnPermChild = true
-		case f == "--allow-worker":
-			tnPermWorker = true
-		case f == "--allow-addons":
-			tnPermAddon = true
-		}
-	}
-	tnPermEnabled = enabled
+const permHelper = `// process.permission: Node's permission model, switched on by --permission
+// in NODE_OPTIONS (a compiled program has no node flags of its own). Paths
+// are resolved (absolute, cleaned; case-folded on Windows) before matching:
+// a grant covers itself and what is under it at a separator boundary, and a
+// trailing '*' grants every path with that prefix, as in Node
+type tnPermScope struct {
+	all    bool
+	grants []string
 }
 
-func tnPermHas(kind string, path string) bool {
-	if !tnPermEnabled {
-		return false
+var tnPermEnabled bool
+var tnPermRead, tnPermWrite tnPermScope
+var tnPermFlags = map[string]bool{}
+var tnPermMu sync.Mutex
+
+// NODE_OPTIONS words: double quotes group, and a backslash escapes inside them
+func tnPermOptionWords(s string) []string {
+	words := []string{}
+	var cur strings.Builder
+	inWord, quoted := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quoted && c == '\\\\' && i+1 < len(s):
+			i++
+			cur.WriteByte(s[i])
+		case c == '"':
+			quoted = !quoted
+			inWord = true
+		case !quoted && (c == ' ' || c == '\\t' || c == '\\n'):
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		default:
+			cur.WriteByte(c)
+			inWord = true
+		}
 	}
-	tnPermMu.Lock()
-	defer tnPermMu.Unlock()
-	switch kind {
-	case "fs.read":
-		if tnPermDroppedRead {
-			return false
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
+}
+
+func tnPermPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	p = filepath.Clean(p)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(strings.TrimPrefix(p, "\\\\\\\\?\\\\"))
+	}
+	return p
+}
+
+// A grant as matched: the resolved path, or the resolved prefix + "*"
+func tnPermGrant(g string) string {
+	if strings.HasSuffix(g, "*") {
+		base := strings.TrimSuffix(g, "*")
+		if base == "" {
+			return "*"
 		}
-		if path == "" {
-			return tnPermReadAll
+		trailing := strings.HasSuffix(base, "/") || strings.HasSuffix(base, string(filepath.Separator))
+		norm := tnPermPath(base)
+		if trailing && !strings.HasSuffix(norm, string(filepath.Separator)) {
+			norm += string(filepath.Separator)
 		}
-		for _, d := range tnPermReadDropped {
-			if strings.HasPrefix(path, d) {
-				return false
-			}
+		return norm + "*"
+	}
+	return tnPermPath(g)
+}
+
+func tnPermMatch(path string, grant string) bool {
+	if strings.HasSuffix(grant, "*") {
+		return strings.HasPrefix(path, strings.TrimSuffix(grant, "*"))
+	}
+	sep := string(filepath.Separator)
+	return path == grant || strings.HasPrefix(path, strings.TrimSuffix(grant, sep)+sep)
+}
+
+func (s *tnPermScope) grant(v string) {
+	if v == "" || v == "*" {
+		s.all = true
+		return
+	}
+	s.grants = append(s.grants, tnPermGrant(v))
+}
+
+// drop(scope, path): the grants at or under path go (a path inside a wider
+// grant stays covered by it, as in Node)
+func (s *tnPermScope) drop(path string) {
+	p := tnPermGrant(path)
+	kept := []string{}
+	for _, g := range s.grants {
+		if !tnPermMatch(strings.TrimSuffix(g, "*"), strings.TrimSuffix(p, "*")) {
+			kept = append(kept, g)
 		}
-		for _, g := range tnPermReadGrants {
-			if strings.HasPrefix(path, g) {
-				return true
-			}
+	}
+	s.grants = kept
+}
+
+func (s *tnPermScope) has(path string) bool {
+	if path == "" {
+		return s.all
+	}
+	p := tnPermPath(path)
+	if s.all {
+		return true
+	}
+	for _, g := range s.grants {
+		if tnPermMatch(p, g) {
+			return true
 		}
-		return tnPermReadAll
-	case "fs.write":
-		if tnPermDroppedWrite {
-			return false
-		}
-		if path == "" {
-			return tnPermWriteAll
-		}
-		for _, d := range tnPermWriteDropped {
-			if strings.HasPrefix(path, d) {
-				return false
-			}
-		}
-		for _, g := range tnPermWriteGrants {
-			if strings.HasPrefix(path, g) {
-				return true
-			}
-		}
-		return tnPermWriteAll
-	case "child":
-		return tnPermChild && !tnPermDroppedChild
-	case "worker":
-		return tnPermWorker && !tnPermDroppedWorker
-	case "addon":
-		return tnPermAddon && !tnPermDroppedAddon
 	}
 	return false
 }
 
+func init() {
+	for _, f := range tnPermOptionWords(os.Getenv("NODE_OPTIONS")) {
+		name, value, hasValue := strings.Cut(f, "=")
+		switch name {
+		case "--permission", "--experimental-permission":
+			tnPermEnabled = true
+		case "--no-permission":
+			tnPermEnabled = false
+		case "--allow-fs-read":
+			if !hasValue || value != "" {
+				tnPermRead.grant(value)
+			}
+		case "--allow-fs-write":
+			if !hasValue || value != "" {
+				tnPermWrite.grant(value)
+			}
+		case "--allow-child-process":
+			tnPermFlags["child"] = true
+		case "--allow-worker":
+			tnPermFlags["worker"] = true
+		case "--allow-addons":
+			tnPermFlags["addon"] = true
+		case "--allow-net":
+			tnPermFlags["net"] = true
+		case "--allow-wasi":
+			tnPermFlags["wasi"] = true
+		}
+	}
+}
+
+// process.permission.has(scope, reference?)
+func tnPermHas(kind string, path string) bool {
+	if !tnPermEnabled {
+		return true
+	}
+	tnPermMu.Lock()
+	defer tnPermMu.Unlock()
+	switch kind {
+	case "fs":
+		return tnPermRead.has(path) && tnPermWrite.has(path)
+	case "fs.read":
+		return tnPermRead.has(path)
+	case "fs.write":
+		return tnPermWrite.has(path)
+	}
+	return tnPermFlags[kind]
+}
+
+// process.permission.drop(scope, reference?): permanent for this process
 func tnPermDrop(kind string, path string) {
 	if !tnPermEnabled {
 		return
 	}
 	tnPermMu.Lock()
 	defer tnPermMu.Unlock()
-	switch kind {
-	case "fs.read":
-		if path == "" {
-			tnPermDroppedRead = true
-			tnPermReadAll = false
-			tnPermReadGrants = nil
-			return
+	scopes := map[string][]*tnPermScope{"fs": {&tnPermRead, &tnPermWrite}, "fs.read": {&tnPermRead}, "fs.write": {&tnPermWrite}}
+	if list, ok := scopes[kind]; ok {
+		for _, s := range list {
+			if path == "" {
+				*s = tnPermScope{}
+			} else {
+				s.drop(path)
+			}
 		}
-		// dropping one path denies it while other grants stay
-		tnPermReadDropped = append(tnPermReadDropped, path)
-	case "fs.write":
-		if path == "" {
-			tnPermDroppedWrite = true
-			tnPermWriteAll = false
-			tnPermWriteGrants = nil
-			return
-		}
-		tnPermWriteDropped = append(tnPermWriteDropped, path)
-	case "child":
-		tnPermDroppedChild = true
-	case "worker":
-		tnPermDroppedWorker = true
-	case "addon":
-		tnPermDroppedAddon = true
+		return
 	}
+	delete(tnPermFlags, kind)
 }
 
-func tnPermRequire(kind string, path ...string) {
+// Node's ERR_ACCESS_DENIED for a scope (and the resource it was asked for)
+func tnPermError(kind string, path string, prefix string) *TnError {
+	flag, permission := "fs-read", "FileSystemRead"
+	switch kind {
+	case "fs.write":
+		flag, permission = "fs-write", "FileSystemWrite"
+	case "child":
+		flag, permission = "child-process", "ChildProcess"
+	case "worker":
+		flag, permission = "worker", "WorkerThreads"
+	case "addon":
+		flag, permission = "addons", "Addon"
+	case "net":
+		flag, permission = "net", "Net"
+	case "wasi":
+		flag, permission = "wasi", "WASI"
+	}
+	e := TnNodeError("Error", "ERR_ACCESS_DENIED", prefix+"Access to this API has been restricted. Use --allow-"+flag+" to manage permissions.")
+	e.props["permission"] = permission
+	if path != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		e.props["resource"] = path
+	}
+	return e
+}
+
+func tnPermDenied(kind string, path ...string) bool {
+	if !tnPermEnabled {
+		return false
+	}
 	p := ""
 	if len(path) > 0 {
 		p = path[0]
 	}
-	if tnPermEnabled && !tnPermHas(kind, p) {
-		flag := "fs-read"
-		switch kind {
-		case "fs.write":
-			flag = "fs-write"
-		case "child":
-			flag = "child-process"
-		case "worker":
-			flag = "worker"
-		case "addon":
-			flag = "addons"
+	// (an fs scope with no path asks for access to everything)
+	return !tnPermHas(kind, p)
+}
+
+// Throws ERR_ACCESS_DENIED unless the scope (and path) is granted
+func tnPermRequire(kind string, path ...string) {
+	if tnPermDenied(kind, path...) {
+		p := ""
+		if len(path) > 0 {
+			p = path[0]
 		}
-		panic(TnNodeError("Error", "ERR_ACCESS_DENIED", "Access to this API has been restricted. Use --allow-"+flag+" to manage permissions."))
+		panic(tnPermError(kind, p, ""))
 	}
 }`;
 
@@ -259,6 +333,8 @@ func TnProcessExitWith(code ...float64) {
 }
 
 func TnProcessChdir(dir string) {
+	// --permission: the new directory must be readable, as in Node
+	tnPermRequire("fs.read", dir)
 	if err := os.Chdir(dir); err != nil {
 		panic(TnNodeError("Error", "ENOENT", "ENOENT: no such file or directory, chdir "+tnQuote(dir)))
 	}
@@ -628,7 +704,7 @@ export function registerProcess(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodePerm',
-    ['os', 'strings', 'sync'],
+    ['os', 'path/filepath', 'runtime', 'strings', 'sync'],
     ['error', 'dynamic'],
     permHelper
   );

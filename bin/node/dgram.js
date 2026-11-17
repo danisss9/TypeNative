@@ -77,6 +77,13 @@ func (s *TnDgramSocket) bind(args ...interface{}) *TnDgramSocket {
 }
 
 func (s *TnDgramSocket) listen(address string, port float64) *TnError {
+	// --permission without --allow-net: bind fails with an 'error', as in Node
+	if tnPermDenied("net") {
+		e := tnPermError("net", "", "bind ERR_ACCESS_DENIED ")
+		delete(e.props, "permission")
+		e.props["syscall"] = "bind"
+		return e
+	}
 	if s.bound {
 		return TnNodeError("Error", "ERR_SOCKET_ALREADY_BOUND", "Socket is already bound")
 	}

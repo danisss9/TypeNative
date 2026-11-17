@@ -203,23 +203,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **IPC handle passing** (`send(msg, socket)`, `serialization: 'advanced'`):
   a `net.Socket` travels with the message to a forked child, a cluster worker
   or the parent and arrives as the second `'message'` argument, live to the
-  real peer with its addresses; the sender keeps the connection and relays
-  its bytes over the IPC link (fd-passing-like), and its own copy goes silent
-  as in Node. Half-closes, destroys and the socket's addresses propagate.
+  real peer with its addresses, and the sender's own copy goes silent as in
+  Node. It is a relay, not descriptor passing: the sender keeps the
+  connection and relays its bytes over the IPC link, so it must stay alive.
+  Half-closes, destroys and the socket's addresses propagate.
 - **`cluster` `SCHED_NONE`:** with `cluster.schedulingPolicy = cluster.SCHED_NONE`
-  (writable now) a worker binds the port itself — `SO_REUSEPORT` on Unix,
-  `SO_REUSEADDR` on Windows — and the OS balances the connections; the
-  primary still hears `'listening'` with the port. `exclusive: true`
+  (writable now) a worker binds the port itself with `SO_REUSEPORT` on Unix,
+  where the kernel balances the connections (on Windows `SO_REUSEADDR` lets
+  the workers bind, without balancing); the primary still hears
+  `'listening'` with the port. `exclusive: true`
   listeners bind directly, and dgram sockets with `reuseAddr` share a port.
 - **`child_process` `stdio` arrays:** entries past stderr are `ExtraFiles`
   (fds 3, 4, …), readable as `child.stdio[3+n]`; Windows, where `os/exec`
   has no `ExtraFiles`, serves each entry a named pipe the child opens as a
   real file, so `fs.writeSync(3, …)` reaches the parent synchronously.
 - **`process.permission`:** `has` / `drop` under `--permission` (from
-  `NODE_OPTIONS`): fs read / write path prefixes, child process, worker and
-  addon grants, enforced by the fs, child_process and worker helpers with
-  Node's `ERR_ACCESS_DENIED` messages; `process.permission` is `undefined`
-  without the flag, as in Node.
+  `NODE_OPTIONS`, with Node's quoting): fs read / write grants matched on
+  resolved paths at directory boundaries (`..` can't escape a grant),
+  child process, worker, net, addon and WASI grants. Enforced with Node's
+  `ERR_ACCESS_DENIED` (`permission`, `resource`) by the fs calls,
+  `process.chdir`, child_process, workers, `net` and `dgram`;
+  `process.permission` is `undefined` without the flag, as in Node.
 - **`worker_threads` port transfer, `resourceLimits` and `stdout` /
   `stderr: true`:** transferred `MessagePort`s relay over the worker link
   (both ways, close propagates), a worker's heap limit ends it with

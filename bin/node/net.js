@@ -471,6 +471,14 @@ func (s *TnSocket) connect(args ...interface{}) *TnSocket {
 	if timeoutMs > 0 {
 		s.setTimeout(timeoutMs)
 	}
+	// --permission without --allow-net: an 'error', as in Node
+	if tnPermDenied("net") {
+		e := tnPermError("net", "", "connect ERR_ACCESS_DENIED ")
+		delete(e.props, "permission")
+		e.props["syscall"] = "connect"
+		TnLoopPost(func() { s.destroy(e) })
+		return s
+	}
 	s.connecting = true
 	TnLoopRef()
 	address := path
@@ -710,6 +718,8 @@ func (srv *TnNetServer) listen(args ...interface{}) *TnNetServer {
 			}
 		}
 	}
+	// --permission without --allow-net: listen() throws, as in Node
+	tnPermRequire("net")
 	srv.asyncCtx = TnAsyncSnapshot()
 	address := path
 	if network != "unix" {
@@ -1089,7 +1099,7 @@ func (b *TnBlockList) Get_rules() []string {
 export function registerNet(r) {
     defineModule(r, 'net');
     defineHelper(r, 'netErrors', ['errors', 'net', 'os', 'reflect', 'strconv', 'strings', 'syscall'], ['error', 'dynamic', 'uvErrno'], netErrorsHelper);
-    defineHelper(r, 'nodeNet', ['errors', 'io', 'net', 'strconv', 'strings', 'time'], ['netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic'], netHelper);
+    defineHelper(r, 'nodeNet', ['errors', 'io', 'net', 'strconv', 'strings', 'time'], ['netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'nodePerm'], netHelper);
     const use = () => r.helper('nodeNet');
     defineClass(r, 'net.AddressInfo', '*TnAddressInfo', 'class', '', 'address=string; family=string; port=float64', '', '');
     defineClass(r, 'net.Socket', '*TnSocket', 'class', SOCKET_METHODS, '', SOCKET_GETTERS, '');

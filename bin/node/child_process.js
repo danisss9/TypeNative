@@ -190,7 +190,7 @@ type tnSyncRun struct {
 }
 
 func tnRunSync(file string, args []string, o tnSpawnOptions, inheritStderr bool) tnSyncRun {
-	tnPermRequire("child")
+	tnPermRequire("child", file)
 	cmd := tnCommand(file, args, o)
 	var stdout, stderr bytes.Buffer
 	if o.input != nil {
@@ -376,7 +376,7 @@ func tnPipeSource(r io.Reader, s *TnStream, done *sync.WaitGroup) {
 }
 
 func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess {
-	tnPermRequire("child")
+	tnPermRequire("child", file)
 	o := tnSpawnOpts(options)
 	cp := &TnChildProcess{spawnfile: file}
 	cmd := tnCommand(file, args, o)

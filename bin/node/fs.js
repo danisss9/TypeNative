@@ -168,6 +168,7 @@ func (d *TnDirent) isBlockDevice() bool   { return d.mode&fs.ModeDevice != 0 && 
 func (d *TnDirent) isCharacterDevice() bool { return d.mode&fs.ModeCharDevice != 0 }
 
 func tnReadDirEntries(dir string, recursive bool) []*TnDirent {
+	tnPermRequire("fs.read", dir)
 	entries, err := os.ReadDir(dir)
 	tnFsCheck(err, "scandir", dir)
 	out := []*TnDirent{}
@@ -297,6 +298,7 @@ func tnStatsOf(info fs.FileInfo) *TnStats {
 }
 
 func TnStat(path string, lstat bool, throwIfNoEntry bool) *TnStats {
+	tnPermRequire("fs.read", path)
 	var info fs.FileInfo
 	var err error
 	syscall := "stat"
@@ -316,6 +318,7 @@ func TnStat(path string, lstat bool, throwIfNoEntry bool) *TnStats {
 }
 
 func TnExists(path string) bool {
+	tnPermRequire("fs.read", path)
 	_, err := os.Stat(path)
 	return err == nil
 }
@@ -328,6 +331,7 @@ func TnRename(from string, to string) {
 
 // rmSync(path, { recursive, force })
 func TnRm(path string, recursive bool, force bool) {
+	tnPermRequire("fs.write", path)
 	info, err := os.Lstat(path)
 	if err != nil {
 		if force && tnErrnoCode(err) == "ENOENT" {
@@ -371,6 +375,8 @@ func TnUnlink(path string) {
 
 // copyFileSync(src, dest, mode): mode 1 (COPYFILE_EXCL) fails if dest exists
 func TnCopyFile(src string, dst string, mode float64) {
+	tnPermRequire("fs.read", src)
+	tnPermRequire("fs.write", dst)
 	in, err := os.Open(src)
 	tnFsCheck(err, "copyfile", src, dst)
 	defer in.Close()
@@ -392,6 +398,8 @@ func TnCopyFile(src string, dst string, mode float64) {
 
 // cpSync(src, dest, { recursive, force, errorOnExist })
 func TnCp(src string, dst string, recursive bool, force bool) {
+	tnPermRequire("fs.read", src)
+	tnPermRequire("fs.write", dst)
 	info, err := os.Stat(src)
 	tnFsCheck(err, "cp", src)
 	if info.IsDir() {
@@ -415,6 +423,7 @@ func TnCp(src string, dst string, recursive bool, force bool) {
 }
 
 func TnRealpath(path string) string {
+	tnPermRequire("fs.read", path)
 	abs, err := filepath.Abs(path)
 	tnFsCheck(err, "realpath", path)
 	real, err := filepath.EvalSymlinks(abs)
@@ -423,6 +432,7 @@ func TnRealpath(path string) string {
 }
 
 func TnMkdtemp(prefix string) string {
+	tnPermRequire("fs.write", prefix)
 	dir, base := filepath.Split(prefix)
 	if dir == "" {
 		dir = "."
@@ -433,6 +443,7 @@ func TnMkdtemp(prefix string) string {
 }
 
 func TnTruncate(path string, length float64) {
+	tnPermRequire("fs.write", path)
 	tnFsCheck(os.Truncate(path, int64(length)), "open", path)
 }
 
@@ -448,6 +459,7 @@ func tnFileMode(mode interface{}) fs.FileMode {
 }
 
 func TnChmod(path string, mode interface{}) {
+	tnPermRequire("fs.write", path)
 	tnFsCheck(os.Chmod(path, tnFileMode(mode)), "chmod", path)
 }
 
@@ -465,25 +477,33 @@ func tnTimeArg(v interface{}) time.Time {
 }
 
 func TnUtimes(path string, atime interface{}, mtime interface{}) {
+	tnPermRequire("fs.write", path)
 	tnFsCheck(os.Chtimes(path, tnTimeArg(atime), tnTimeArg(mtime)), "utime", path)
 }
 
 func TnSymlink(target string, path string) {
+	// (Node needs full read and write access for symlinks)
+	tnPermRequire("fs.read", "")
+	tnPermRequire("fs.write", "")
 	tnFsCheck(os.Symlink(target, path), "symlink", target, path)
 }
 
 func TnReadlink(path string) string {
+	tnPermRequire("fs.read", path)
 	target, err := os.Readlink(path)
 	tnFsCheck(err, "readlink", path)
 	return target
 }
 
 func TnLink(existing string, path string) {
+	tnPermRequire("fs.read", existing)
+	tnPermRequire("fs.write", path)
 	tnFsCheck(os.Link(existing, path), "link", existing, path)
 }
 
 // accessSync(path, mode): F_OK 0, R_OK 4, W_OK 2, X_OK 1
 func TnAccess(path string, mode float64) {
+	tnPermRequire("fs.read", path)
 	info, err := os.Stat(path)
 	tnFsCheck(err, "access", path)
 	perm := info.Mode().Perm()
@@ -700,6 +720,7 @@ type TnStatFs struct {
 func (s *TnStatFs) Get_type_() float64 { return s.type_ }
 
 func TnStatfs(path string) *TnStatFs {
+	tnPermRequire("fs.read", path)
 	s, err := tnStatfsOS(path)
 	tnFsCheck(err, "statfs", path)
 	return s
@@ -1100,7 +1121,8 @@ func TnFsExists(path string, cb interface{}) {
 	TnLoopRef()
 	ctx := TnAsyncSnapshot()
 	go func() {
-		exists := TnExists(path)
+		// (a path the permission model denies doesn't exist for the callback)
+		exists := !tnPermDenied("fs.read", path) && TnExists(path)
 		TnLoopPost(func() {
 			defer TnLoopUnref()
 			TnAsyncRun(ctx, func() { TnInvoke(cb, exists) })
