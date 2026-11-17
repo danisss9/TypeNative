@@ -29209,7 +29209,12 @@ func tnGetRefSlow(obj interface{}, key string) interface{} {
 			}
 			return v
 		}
-		return nil
+		// (a missing data key is undefined — except the collection
+		// pseudo-properties, which TnGet answers; a Set's .size read as a
+		// reference, as in an interpolated set.size, must not read as undefined)
+		if key != "length" && key != "size" {
+			return nil
+		}
 	}
 	return TnGet(obj, key)
 }

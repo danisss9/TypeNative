@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`size` / `length` on a `Set` or `Map` read as a reference:** `undefined`.
+  The dynamic-record fast path in reference reads answered a missing data key
+  before the collection properties were consulted, so any read whose value
+  escapes the expression — a template interpolation, an argument, a field
+  chain such as `block.preds.size` — read as undefined while a plain
+  comparison still worked. The React Compiler example's build failed its
+  `EnterSSA` entry-block invariant on most fixtures because of it. Such reads
+  now fall through to `TnGet`, which answers the collection properties.
+
 ## [0.7.0] - 2026-11-17
 
 ### Added
