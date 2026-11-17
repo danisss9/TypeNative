@@ -43,7 +43,11 @@ const MODULES = [
     ['language', 'language/display', 'feature/plural', 'currency', 'collate', 'cases', 'transform', 'unicode/norm'].map(
       (p) => `golang.org/x/text/${p}`
     )
-  ]
+  ],
+  // node:crypto / node:tls: PKCS#12 (PFX) bundles, secp256k1, Ed448 / X448
+  ['software.sslmate.com/src/go-pkcs12', 'v0.7.4'],
+  ['github.com/decred/dcrd/dcrec/secp256k1/v4', 'v4.4.1', ['github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa']],
+  ['github.com/cloudflare/circl', 'v1.6.5', ['sign/ed448', 'dh/x448'].map((p) => `github.com/cloudflare/circl/${p}`)]
 ];
 
 const root = path.resolve(import.meta.dirname, '..');
