@@ -1622,11 +1622,20 @@ declare module 'node:http2' {
       readonly encrypted: boolean | undefined;
       readonly alpnProtocol: string | undefined;
       readonly socket: net.Socket;
+      readonly type: 'client' | 'server';
+      readonly localSettings: Settings;
+      readonly remoteSettings: Settings;
+      readonly pendingSettingsAck: boolean;
       close(callback?: () => void): void;
       destroy(error?: Error, code?: number): void;
       ref(): void;
       unref(): void;
       setTimeout(msecs: number, callback?: () => void): void;
+      /** Sends a PING frame; returns true when it was sent */
+      ping(callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
+      ping(payload: Buffer | Uint8Array, callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
+      settings(settings?: Settings, callback?: (err: Error | null, settings: Settings) => void): void;
+      goaway(code?: number, lastStreamID?: number, opaqueData?: Buffer | Uint8Array): void;
     }
     interface ClientHttp2Session extends Http2Session {
       request(headers?: OutgoingHttpHeaders, options?: { endStream?: boolean }): ClientHttp2Stream;
@@ -1634,12 +1643,15 @@ declare module 'node:http2' {
       on(event: 'error', listener: (err: Error) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
-    interface ServerHttp2Session extends Http2Session {}
+    interface ServerHttp2Session extends Http2Session {
+      altsvc(alt: string, originOrStream: string | URL | number): void;
+    }
     type Http2ServerRequest = http.IncomingMessage;
     type Http2ServerResponse = http.ServerResponse;
     interface Http2Server extends http.Server {
       on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
       on(event: 'request', listener: (request: Http2ServerRequest, response: Http2ServerResponse) => void): this;
+      on(event: 'session', listener: (session: ServerHttp2Session, socket: net.Socket) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
     type Http2SecureServer = Http2Server;
@@ -1655,6 +1667,7 @@ declare module 'node:http2' {
       initialWindowSize?: number;
       maxFrameSize?: number;
       maxConcurrentStreams?: number;
+      maxHeaderSize?: number;
       maxHeaderListSize?: number;
       enableConnectProtocol?: boolean;
     }
@@ -1664,6 +1677,8 @@ declare module 'node:http2' {
     function connect(authority: string | URL, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
     function connect(authority: string | URL, options?: { ca?: string | Buffer | (string | Buffer)[]; rejectUnauthorized?: boolean; servername?: string }, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
     function getDefaultSettings(): Settings;
+    function getPackedSettings(settings?: Settings): Buffer;
+    function getUnpackedSettings(buf: Buffer | Uint8Array): Settings & { customSettings?: Record<string, number> };
     const constants: {
       readonly HTTP2_HEADER_STATUS: ':status';
       readonly HTTP2_HEADER_METHOD: ':method';
@@ -2470,6 +2485,8 @@ declare module 'node:http' {
       setTimeout(timeout: number, callback?: () => void): this;
       setNoDelay(noDelay?: boolean): void;
       setSocketKeepAlive(enable?: boolean, initialDelay?: number): void;
+      /** Trailers, sent with a chunked body whose Trailer header names them */
+      addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void;
       abort(): void;
     }
     interface ServerOptions {
@@ -2477,6 +2494,9 @@ declare module 'node:http' {
       keepAliveTimeout?: number;
       requestTimeout?: number;
       headersTimeout?: number;
+      /** How outgoing header values are validated (Node 26.3) */
+      httpValidation?: 'strict' | 'relaxed' | 'insecure';
+      insecureHTTPParser?: boolean;
     }
     type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
     class Server extends net.Server {
@@ -2495,13 +2515,21 @@ declare module 'node:http' {
       keepAlive?: boolean;
       keepAliveMsecs?: number;
       maxSockets?: number;
+      maxTotalSockets?: number;
       maxFreeSockets?: number;
+      scheduling?: 'fifo' | 'lifo';
       timeout?: number;
     }
     class Agent {
       constructor(options?: AgentOptions);
-      readonly keepAlive: boolean;
+      keepAlive: boolean;
+      keepAliveMsecs: number;
       maxSockets: number;
+      maxTotalSockets: number;
+      maxFreeSockets: number;
+      scheduling: 'fifo' | 'lifo';
+      timeout?: number;
+      readonly options: AgentOptions;
       destroy(): void;
     }
     interface RequestOptions {
@@ -2519,6 +2547,9 @@ declare module 'node:http' {
       agent?: Agent | boolean;
       setHost?: boolean;
       family?: number;
+      /** How outgoing header values are validated (Node 26.3) */
+      httpValidation?: 'strict' | 'relaxed' | 'insecure';
+      insecureHTTPParser?: boolean;
       // https
       ca?: string | Buffer | Array<string | Buffer>;
       cert?: string | Buffer;
@@ -3299,6 +3330,185 @@ declare module 'node:sqlite' {
     }
   }
   export = sqlite;
+}
+
+// node:ffi (Node 26): getCurrentEventLoop is left out, as a compiled program
+// has no libuv loop to hand out
+declare module 'node:ffi' {
+  namespace ffi {
+    type ArrayBufferView =
+      | Int8Array
+      | Uint8Array
+      | Uint8ClampedArray
+      | Int16Array
+      | Uint16Array
+      | Int32Array
+      | Uint32Array
+      | Float32Array
+      | Float64Array
+      | BigInt64Array
+      | BigUint64Array
+      | DataView;
+    interface DataTypeMap {
+      void: 'void';
+      char: 'number';
+      bool: 'number';
+      i8: 'number';
+      int8: 'number';
+      u8: 'number';
+      uint8: 'number';
+      i16: 'number';
+      int16: 'number';
+      u16: 'number';
+      uint16: 'number';
+      i32: 'number';
+      int32: 'number';
+      u32: 'number';
+      uint32: 'number';
+      i64: 'bigint';
+      int64: 'bigint';
+      u64: 'bigint';
+      uint64: 'bigint';
+      float: 'number';
+      f32: 'number';
+      float32: 'number';
+      double: 'number';
+      f64: 'number';
+      float64: 'number';
+      pointer: 'pointer';
+      ptr: 'pointer';
+      function: 'pointer';
+      buffer: 'pointer';
+      arraybuffer: 'pointer';
+      string: 'pointer';
+      str: 'pointer';
+    }
+    type ReturnType = keyof DataTypeMap;
+    type ArgumentType = Exclude<ReturnType, 'void'>;
+    interface ArgumentTypeMap {
+      number: number;
+      bigint: bigint;
+      pointer: bigint | string | ArrayBuffer | ArrayBufferView | null;
+    }
+    interface ReturnTypeMap {
+      void: void;
+      number: number;
+      bigint: bigint;
+      pointer: bigint;
+    }
+    interface FunctionSignature {
+      return?: ReturnType;
+      arguments?: readonly ArgumentType[];
+    }
+    interface FunctionDefinitions {
+      [symbol: string]: FunctionSignature;
+    }
+    type CallbackFunction<R extends ReturnType = any, P extends readonly ArgumentType[] = any[]> = (
+      ...args: { [K in keyof P]: ArgumentTypeMap[DataTypeMap[P[K]]] }
+    ) => ReturnTypeMap[DataTypeMap[R]];
+    interface WrappedFunction<R extends ReturnType = any, P extends readonly ArgumentType[] = any[]> extends CallbackFunction<R, P> {
+      readonly pointer: bigint;
+    }
+    type ReturnTypeFromFunctionSignature<T extends FunctionSignature> = 'return' extends keyof T
+      ? T extends { return: infer R extends ReturnType }
+        ? R
+        : any
+      : 'void';
+    type ArgumentTypesFromFunctionSignature<T extends FunctionSignature> = 'arguments' extends keyof T
+      ? T extends { arguments: infer P extends readonly ArgumentType[] }
+        ? P
+        : any[]
+      : [];
+    type CallbackFunctionFromSignature<T extends FunctionSignature> = CallbackFunction<
+      ReturnTypeFromFunctionSignature<T>,
+      ArgumentTypesFromFunctionSignature<T>
+    >;
+    type WrappedFunctionFromSignature<T extends FunctionSignature> = WrappedFunction<
+      ReturnTypeFromFunctionSignature<T>,
+      ArgumentTypesFromFunctionSignature<T>
+    >;
+    type WrappedFunctionsFromDefinitions<T extends FunctionDefinitions> = {
+      [K in keyof T]: WrappedFunctionFromSignature<T[K]>;
+    };
+    interface DynamicLibraryResult<T extends FunctionDefinitions> extends Disposable {
+      lib: DynamicLibrary;
+      functions: WrappedFunctionsFromDefinitions<T>;
+    }
+    /** 'dll' on Windows, 'dylib' on macOS, 'so' elsewhere */
+    const suffix: string;
+    function dlopen<const T extends FunctionDefinitions = {}>(path: string | null, definitions?: T): DynamicLibraryResult<T>;
+    function dlclose(handle: DynamicLibrary): void;
+    function dlsym(handle: DynamicLibrary, symbol: string): bigint;
+    class DynamicLibrary {
+      constructor(path: string | null);
+      readonly path: string;
+      readonly symbols: { [symbol: string]: bigint };
+      close(): void;
+      [Symbol.dispose](): void;
+      getFunction<const T extends FunctionSignature>(name: string, signature: T): WrappedFunctionFromSignature<T>;
+      getFunctions(): { [symbol: string]: WrappedFunction };
+      getFunctions<const T extends FunctionDefinitions>(definitions: T): WrappedFunctionsFromDefinitions<T>;
+      getSymbol(name: string): bigint;
+      getSymbols(): Record<string, bigint>;
+      /** Callbacks are trampolines that can't be freed; on Windows they take integer / pointer arguments only */
+      registerCallback(callback: () => void): bigint;
+      registerCallback<const T extends FunctionSignature>(signature: T, callback: CallbackFunctionFromSignature<T>): bigint;
+      unregisterCallback(pointer: bigint): void;
+      refCallback(pointer: bigint): void;
+      unrefCallback(pointer: bigint): void;
+    }
+    function getInt8(pointer: bigint, offset?: number): number;
+    function getUint8(pointer: bigint, offset?: number): number;
+    function getInt16(pointer: bigint, offset?: number): number;
+    function getUint16(pointer: bigint, offset?: number): number;
+    function getInt32(pointer: bigint, offset?: number): number;
+    function getUint32(pointer: bigint, offset?: number): number;
+    function getInt64(pointer: bigint, offset?: number): bigint;
+    function getUint64(pointer: bigint, offset?: number): bigint;
+    function getFloat32(pointer: bigint, offset?: number): number;
+    function getFloat64(pointer: bigint, offset?: number): number;
+    function setInt8(pointer: bigint, offset: number, value: number): void;
+    function setUint8(pointer: bigint, offset: number, value: number): void;
+    function setInt16(pointer: bigint, offset: number, value: number): void;
+    function setUint16(pointer: bigint, offset: number, value: number): void;
+    function setInt32(pointer: bigint, offset: number, value: number): void;
+    function setUint32(pointer: bigint, offset: number, value: number): void;
+    function setInt64(pointer: bigint, offset: number, value: number | bigint): void;
+    function setUint64(pointer: bigint, offset: number, value: number | bigint): void;
+    function setFloat32(pointer: bigint, offset: number, value: number): void;
+    function setFloat64(pointer: bigint, offset: number, value: number): void;
+    function toString(pointer: bigint): string | null;
+    function toBuffer(pointer: bigint, length: number, copy?: boolean): Buffer;
+    function toArrayBuffer(pointer: bigint, length: number, copy?: boolean): ArrayBuffer;
+    function exportString(string: string, pointer: bigint, length: number, encoding?: BufferEncoding): void;
+    function exportBuffer(buffer: Buffer, pointer: bigint, length: number): void;
+    function exportArrayBuffer(arrayBuffer: ArrayBuffer, pointer: bigint, length: number): void;
+    function exportArrayBufferView(arrayBufferView: ArrayBufferView, pointer: bigint, length: number): void;
+    function getRawPointer(source: ArrayBuffer | ArrayBufferView): bigint;
+    const types: {
+      readonly VOID: 'void';
+      readonly POINTER: 'pointer';
+      readonly BUFFER: 'buffer';
+      readonly ARRAY_BUFFER: 'arraybuffer';
+      readonly FUNCTION: 'function';
+      readonly BOOL: 'bool';
+      readonly CHAR: 'char';
+      readonly STRING: 'string';
+      readonly FLOAT: 'float';
+      readonly DOUBLE: 'double';
+      readonly INT_8: 'int8';
+      readonly UINT_8: 'uint8';
+      readonly INT_16: 'int16';
+      readonly UINT_16: 'uint16';
+      readonly INT_32: 'int32';
+      readonly UINT_32: 'uint32';
+      readonly INT_64: 'int64';
+      readonly UINT_64: 'uint64';
+      readonly FLOAT_32: 'float32';
+      readonly FLOAT_64: 'float64';
+    };
+  }
+  export = ffi;
 }
 
 declare module 'path' { import m = require('node:path'); export = m; }

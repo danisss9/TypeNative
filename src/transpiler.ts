@@ -33,6 +33,7 @@ import { registerDgram } from './node/dgram.js';
 import { registerSqlite } from './node/sqlite.js';
 import { registerWebAssembly } from './node/webassembly.js';
 import { registerWasi } from './node/wasi.js';
+import { registerFfi } from './node/ffi.js';
 import { registerTemporal } from './node/temporal.js';
 import { registerIntl } from './node/intl.js';
 import { registerWebview } from './node/webview.js';
@@ -26529,6 +26530,7 @@ registerDgram(nodeRegistry);
 registerSqlite(nodeRegistry);
 registerWebAssembly(nodeRegistry);
 registerWasi(nodeRegistry);
+registerFfi(nodeRegistry);
 registerTemporal(nodeRegistry);
 registerIntl(nodeRegistry);
 registerWebview(nodeRegistry);
@@ -28269,6 +28271,8 @@ func TnSwitchString(v interface{}) string {
 	return s
 }
 
+var tnFuncPropHooks []func(interface{}, string) (interface{}, bool)
+
 func TnGet(obj interface{}, key string) interface{} {
 	if obj != nil && key != "length" && key != "size" {
 		if origin, ok := tnViewOrigin(obj); ok {
@@ -28307,6 +28311,14 @@ func TnGet(obj interface{}, key string) interface{} {
 			return o.Get_stack()
 		}
 		return o.prop(key)
+	}
+	// (properties a module hangs on Go funcs: node:ffi wrappers' .pointer)
+	if len(tnFuncPropHooks) > 0 && obj != nil && reflect.ValueOf(obj).Kind() == reflect.Func {
+		for _, hook := range tnFuncPropHooks {
+			if v, ok := hook(obj, key); ok {
+				return v
+			}
+		}
 	}
 	// (an accessor shadows the property: its getter runs on reads — Babel's
 	// ParseError defines a 'message' getter that computes and self-assigns)

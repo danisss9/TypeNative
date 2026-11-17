@@ -1,11 +1,13 @@
 // node:http2 on Go's net/http (HTTP/2 over TLS, and cleartext h2c with prior
-// knowledge). Servers are http.Servers speaking HTTP/2: the 'stream' event
-// hands out ServerHttp2Streams (respond / write / end, request headers with
-// :method / :path / :scheme / :authority); without 'stream' listeners the
-// compatibility 'request' API serves Http2ServerRequest / Response (the
-// node:http objects). connect() returns a ClientHttp2Session whose request()
-// streams are Duplexes emitting 'response' with :status. Frame-level features
-// (push, ping, settings, goaway) are not exposed by Go's standard library.
+// knowledge) plus golang.org/x/net/http2 for the frames net/http keeps private.
+// Servers are http.Servers speaking HTTP/2: the 'stream' event hands out
+// ServerHttp2Streams (respond / write / end, request headers with :method /
+// :path / :scheme / :authority); a 'session' event fires per connection.
+// Without 'stream' listeners the compatibility 'request' API serves
+// Http2ServerRequest / Response (the node:http objects). connect() returns a
+// ClientHttp2Session whose request() streams are Duplexes emitting 'response'
+// with :status. ping / settings / goaway / altsvc write real frames through a
+// Framer on the session's connection; getPackedSettings serializes settings.
 import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
 import { STREAM_METHODS, STREAM_GETTERS, streamListenerTypes } from './stream.js';
 const http2Helper = `// node:http2
@@ -14,8 +16,12 @@ var tnHttp2NextID float64 = -1
 type TnHttp2Session struct {
 	TnEventEmitter
 	origin       string
-	transport    *http.Transport
-	client       *http.Client
+	transport    *http2.Transport
+	cc           *http2.ClientConn
+	conn         net.Conn
+	framer       *http2.Framer
+	writeMu      sync.Mutex
+	serverSide   bool
 	encrypted    bool
 	alpnProtocol string
 	closed       bool
@@ -26,7 +32,11 @@ type TnHttp2Session struct {
 	nextID       float64
 	socket       *TnSocket
 
+	localSettings  map[string]interface{}
+	remoteSettings map[string]interface{}
+	pending        []*TnHttp2Stream
 	connectEmitted bool
+	emitOnce       sync.Once
 }
 
 func (s *TnHttp2Session) Get_closed() bool        { return s.closed }
@@ -34,6 +44,25 @@ func (s *TnHttp2Session) Get_destroyed() bool     { return s.destroyed }
 func (s *TnHttp2Session) Get_encrypted() bool     { return s.encrypted }
 func (s *TnHttp2Session) Get_alpnProtocol() string { return s.alpnProtocol }
 func (s *TnHttp2Session) Get_socket() *TnSocket   { return s.socket }
+func (s *TnHttp2Session) Get_type_() string {
+	if s.serverSide {
+		return "server"
+	}
+	return "client"
+}
+func (s *TnHttp2Session) Get_localSettings() interface{} {
+	if s.localSettings == nil {
+		s.localSettings = TnHttp2DefaultSettings()
+	}
+	return s.localSettings
+}
+func (s *TnHttp2Session) Get_remoteSettings() interface{} {
+	if s.remoteSettings == nil {
+		s.remoteSettings = TnHttp2DefaultSettings()
+	}
+	return s.remoteSettings
+}
+func (s *TnHttp2Session) Get_pendingSettingsAck() bool { return false }
 
 func (s *TnHttp2Session) ref() *TnHttp2Session {
 	if !s.refd && !s.finished {
@@ -53,18 +82,226 @@ func (s *TnHttp2Session) unref() *TnHttp2Session {
 
 func (s *TnHttp2Session) setTimeout(ms float64, cb ...interface{}) *TnHttp2Session { return s }
 
-// 'connect' fires once, when the session's first connection is up; guarded on
-// the loop so the eager probe dial and the transport's own dials can both call
-// it without racing
-func (s *TnHttp2Session) emitConnect(conn net.Conn) {
-	TnLoopPost(func() {
-		if s.connectEmitted || s.destroyed {
-			return
+// Writes one frame through the session's Framer. net.Conn serializes each
+// Write, and Framer writes a whole frame in one call, so these interleave with
+// net/http's own frames without corrupting them.
+func (s *TnHttp2Session) frame(fn func(*http2.Framer) error) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.framer == nil {
+		return TnNodeError("Error", "ERR_HTTP2_INVALID_SESSION", "The session has been destroyed")
+	}
+	return fn(s.framer)
+}
+
+func tnHttp2SettingID(name string) (http2.SettingID, bool) {
+	switch name {
+	case "headerTableSize":
+		return http2.SettingHeaderTableSize, true
+	case "enablePush":
+		return http2.SettingEnablePush, true
+	case "maxConcurrentStreams":
+		return http2.SettingMaxConcurrentStreams, true
+	case "initialWindowSize":
+		return http2.SettingInitialWindowSize, true
+	case "maxFrameSize":
+		return http2.SettingMaxFrameSize, true
+	case "maxHeaderListSize", "maxHeaderSize":
+		return http2.SettingMaxHeaderListSize, true
+	case "enableConnectProtocol":
+		return http2.SettingEnableConnectProtocol, true
+	}
+	return 0, false
+}
+
+// The settings object as SETTINGS frame entries, with Node's range checks
+func tnHttp2Settings(settings interface{}) ([]http2.Setting, map[string]interface{}, error) {
+	out := []http2.Setting{}
+	local := map[string]interface{}{}
+	for _, e := range tnEntries(settings) {
+		name := fmt.Sprint(e[0])
+		id, ok := tnHttp2SettingID(name)
+		if !ok {
+			continue
 		}
-		s.connectEmitted = true
-		s.socket = tnInfoSocket(conn.LocalAddr(), conn.RemoteAddr().String())
-		s.socket.encrypted = s.encrypted
-		s.emit("connect", s, s.socket)
+		var value float64
+		switch v := e[1].(type) {
+		case bool:
+			if v {
+				value = 1
+			}
+		default:
+			n, ok := tnNetNumber(v)
+			if !ok || n != math.Trunc(n) {
+				return nil, nil, tnHttp2SettingError(name, e[1])
+			}
+			value = n
+		}
+		valid := value >= 0 && value <= 4294967295
+		switch id {
+		case http2.SettingEnablePush, http2.SettingEnableConnectProtocol:
+			valid = value == 0 || value == 1
+		case http2.SettingInitialWindowSize:
+			valid = value >= 0 && value <= 2147483647
+		case http2.SettingMaxFrameSize:
+			valid = value >= 16384 && value <= 16777215
+		}
+		if !valid {
+			return nil, nil, tnHttp2SettingError(name, e[1])
+		}
+		out = append(out, http2.Setting{ID: id, Val: uint32(value)})
+		if id == http2.SettingEnablePush || id == http2.SettingEnableConnectProtocol {
+			local[name] = value == 1
+		} else {
+			local[name] = value
+		}
+	}
+	return out, local, nil
+}
+
+func tnHttp2SettingError(name string, value interface{}) *TnError {
+	return TnNodeError("RangeError", "ERR_HTTP2_INVALID_SETTING_VALUE", "Invalid value for setting \\""+name+"\\": "+TnJSString(value))
+}
+
+// session.settings(settings, callback?): validated and recorded; net/http owns
+// the connection's SETTINGS exchange, so no second SETTINGS frame is sent (the
+// peer would ack it, and the transport that owns the connection treats an
+// unsolicited ack as a protocol error)
+func (s *TnHttp2Session) settings(settings interface{}, cb ...interface{}) {
+	_, local, err := tnHttp2Settings(settings)
+	var callback interface{}
+	if len(cb) > 0 && tnIsFunc(cb[0]) {
+		callback = cb[0]
+	}
+	if err == nil && s.framer == nil {
+		err = TnNodeError("Error", "ERR_HTTP2_INVALID_SESSION", "The session has been destroyed")
+	}
+	if err != nil {
+		TnLoopPost(func() {
+			if callback != nil {
+				TnInvoke(callback, err, nil)
+			} else {
+				s.emit("error", err)
+			}
+		})
+		return
+	}
+	if s.localSettings == nil {
+		s.localSettings = TnHttp2DefaultSettings()
+	}
+	for k, v := range local {
+		s.localSettings[k] = v
+	}
+	if callback != nil {
+		next := s.localSettings
+		TnLoopPost(func() { TnInvoke(callback, nil, next) })
+	}
+}
+
+// session.ping([payload], callback): true when sent, like Node
+func (s *TnHttp2Session) ping(args ...interface{}) bool {
+	var payload []byte
+	var callback interface{}
+	for _, a := range args {
+		if tnIsFunc(a) {
+			callback = a
+		} else if a != nil {
+			payload = TnBufferFrom(a, "")
+		}
+	}
+	if callback == nil {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"callback\\" argument must be of type function"))
+	}
+	if len(payload) > 0 && len(payload) != 8 {
+		panic(TnNodeError("RangeError", "ERR_HTTP2_PING_LENGTH", "HTTP2 ping payload must be 8 bytes"))
+	}
+	data := [8]byte{}
+	if len(payload) == 8 {
+		copy(data[:], payload)
+	} else {
+		cryptorand.Read(data[:])
+	}
+	start := time.Now()
+	if s.cc != nil && !s.serverSide {
+		go func() {
+			err := s.cc.Ping(context.Background())
+			duration := float64(time.Since(start)) / float64(time.Millisecond)
+			TnLoopPost(func() {
+				if err != nil {
+					TnInvoke(callback, TnNodeError("Error", tnNetCode(err), err.Error()), duration, data[:])
+				} else {
+					TnInvoke(callback, nil, duration, data[:])
+				}
+			})
+		}()
+		return true
+	}
+	if s.framer == nil {
+		return false
+	}
+	go func() {
+		err := s.frame(func(f *http2.Framer) error { return f.WritePing(false, data) })
+		duration := float64(time.Since(start)) / float64(time.Millisecond)
+		TnLoopPost(func() {
+			if err != nil {
+				TnInvoke(callback, TnNodeError("Error", tnNetCode(err), err.Error()), duration, data[:])
+			} else {
+				TnInvoke(callback, nil, duration, data[:])
+			}
+		})
+	}()
+	return true
+}
+
+// session.goaway([code[, lastStreamID[, opaqueData]]])
+func (s *TnHttp2Session) goaway(args ...interface{}) {
+	code := uint32(0)
+	lastStream := uint32(0)
+	var opaque []byte
+	if len(args) > 0 && args[0] != nil {
+		if n, ok := tnNetNumber(args[0]); ok {
+			code = uint32(n)
+		}
+	}
+	if len(args) > 1 && args[1] != nil {
+		if n, ok := tnNetNumber(args[1]); ok {
+			lastStream = uint32(n)
+		}
+	}
+	if len(args) > 2 && args[2] != nil {
+		opaque = TnBufferFrom(args[2], "")
+	}
+	if s.framer == nil {
+		return
+	}
+	go s.frame(func(f *http2.Framer) error {
+		return f.WriteGoAway(lastStream, http2.ErrCode(code), opaque)
+	})
+}
+
+// ServerHttp2Session.altsvc(alt, originOrStream)
+func (s *TnHttp2Session) altsvc(alt string, originOrStream interface{}) {
+	origin := ""
+	streamID := uint32(0)
+	switch v := originOrStream.(type) {
+	case string:
+		origin = v
+	case interface{ Get_href() string }:
+		origin = v.Get_href()
+	default:
+		if n, ok := tnNetNumber(v); ok {
+			streamID = uint32(n)
+		}
+	}
+	if s.framer == nil {
+		return
+	}
+	payload := make([]byte, 2, 2+len(origin)+len(alt))
+	binary.BigEndian.PutUint16(payload, uint16(len(origin)))
+	payload = append(payload, origin...)
+	payload = append(payload, alt...)
+	go s.frame(func(f *http2.Framer) error {
+		return f.WriteRawFrame(http2.FrameType(0x0a), 0, streamID, payload)
 	})
 }
 
@@ -73,8 +310,11 @@ func (s *TnHttp2Session) maybeFinish() {
 		return
 	}
 	s.finished = true
-	if s.transport != nil {
-		s.transport.CloseIdleConnections()
+	if s.cc != nil {
+		s.cc.Close()
+	}
+	if s.conn != nil && s.serverSide {
+		s.conn.Close()
 	}
 	s.unref()
 	TnLoopPost(func() { s.emit("close") })
@@ -100,6 +340,12 @@ func (s *TnHttp2Session) destroy(err ...interface{}) {
 		TnLoopPost(func() { s.emit("error", e) })
 	}
 	s.active = 0
+	if s.cc != nil {
+		s.cc.Close()
+	}
+	if s.conn != nil {
+		s.conn.Close()
+	}
 	s.maybeFinish()
 }
 
@@ -131,65 +377,100 @@ func TnHttp2Connect(authority interface{}, args ...interface{}) *TnHttp2Session 
 	if err != nil || u.Host == "" {
 		panic(TnNodeError("TypeError", "ERR_INVALID_URL", "Invalid URL"))
 	}
-	s := &TnHttp2Session{origin: u.Scheme + "://" + u.Host}
-	protocols := new(http.Protocols)
-	t := &http.Transport{Proxy: nil, DisableCompression: true, IdleConnTimeout: 30 * time.Second}
+	s := &TnHttp2Session{origin: u.Scheme + "://" + u.Host, alpnProtocol: "h2c", localSettings: TnHttp2DefaultSettings(), remoteSettings: TnHttp2DefaultSettings()}
 	port := u.Port()
+	host := u.Hostname()
+	var cfg *tls.Config
 	if u.Scheme == "https" {
-		cfg, err := tnTLSClientConfig(opts, u.Hostname(), nil)
+		cfg, err = tnTLSClientConfig(opts, host, nil)
 		if err != nil {
 			panic(err)
 		}
-		t.TLSClientConfig = cfg
-		protocols.SetHTTP2(true)
+		cfg = cfg.Clone()
+		cfg.NextProtos = []string{"h2"}
 		s.encrypted = true
 		s.alpnProtocol = "h2"
 		if port == "" {
 			port = "443"
 		}
-	} else {
-		protocols.SetUnencryptedHTTP2(true)
-		s.alpnProtocol = "h2c"
-		if port == "" {
-			port = "80"
-		}
-	}
-	t.Protocols = protocols
-	s.transport = t
-	s.client = &http.Client{Transport: t, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	// The transport dials through here (https too, there is no custom DialTLS),
-	// so 'connect' is posted before that request's response can be
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		s.emitConnect(conn)
-		return conn, nil
+	} else if port == "" {
+		port = "80"
 	}
 	if listener != nil {
 		s.TnEventEmitter.once("connect", listener)
 	}
 	s.ref()
-	host := u.Hostname()
+	// Dial once, then hand the connection to x/net/http2: its ClientConn keeps
+	// the frames (PING, SETTINGS, GOAWAY) available to the session methods
+	TnLoopRef()
 	go func() {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		addr := net.JoinHostPort(host, port)
+		var conn net.Conn
+		var dialErr error
+		if cfg != nil {
+			conn, dialErr = tls.DialWithDialer(dialer, "tcp", addr, cfg)
+			if dialErr == nil {
+				if tc, ok := conn.(*tls.Conn); !ok || tc.ConnectionState().NegotiatedProtocol != "h2" {
+					conn.Close()
+					conn = nil
+					dialErr = fmt.Errorf("http2: the server did not negotiate h2")
+				}
+			}
+		} else {
+			conn, dialErr = dialer.Dial("tcp", addr)
+		}
+		var cc *http2.ClientConn
+		var transport *http2.Transport
+		if dialErr == nil {
+			transport = &http2.Transport{AllowHTTP: cfg == nil, TLSClientConfig: cfg, DisableCompression: true, IdleConnTimeout: 30 * time.Second}
+			cc, dialErr = transport.NewClientConn(conn)
+			if dialErr != nil {
+				conn.Close()
+				conn = nil
+			}
+		}
 		TnLoopPost(func() {
-			if err != nil {
-				if s.connectEmitted || s.destroyed {
+			defer TnLoopUnref()
+			if dialErr != nil {
+				if s.destroyed {
 					return
 				}
-				p, _ := strconv.ParseFloat(port, 64)
-				target := host
-				if ip := tnDialedIP(err); ip != "" {
-					target = ip
+				// A verification failure is already a Node error (its code is
+				// DEPTH_ZERO_SELF_SIGNED_CERT & co.)
+				var e *TnError
+				if te := tnUnwrapTnError(dialErr); te != nil {
+					e = te
+				} else {
+					p, _ := strconv.ParseFloat(port, 64)
+					target := host
+					if ip := tnDialedIP(dialErr); ip != "" {
+						target = ip
+					}
+					e = TnNetError(dialErr, "connect", target, p)
 				}
-				s.destroy(TnNetError(err, "connect", target, p))
+				cancel := TnNodeError("Error", "ERR_HTTP2_STREAM_CANCEL", "The pending stream has been canceled (caused by: "+e.message+")")
+				cancel.props["cause"] = e
+				for _, st := range s.pending {
+					st.destroy(cancel)
+				}
+				s.pending = nil
+				s.destroy(e)
 				return
 			}
-			s.emitConnect(conn)
-			conn.Close()
+			s.cc = cc
+			s.transport = transport
+			s.conn = conn
+			s.framer = http2.NewFramer(conn, conn)
+			s.connectEmitted = true
+			s.socket = tnInfoSocket(conn.LocalAddr(), conn.RemoteAddr().String())
+			s.socket.encrypted = s.encrypted
+			s.emit("connect", s, s.socket)
+			pending := s.pending
+			s.pending = nil
+			for _, st := range pending {
+				st.start()
+			}
 		})
 	}()
 	return s
@@ -400,7 +681,10 @@ func tnHttp2ServeStream(hs *TnHttpServer, w http.ResponseWriter, r *http.Request
 			st.res = tnNewServerResponse(req)
 			tnHttp2NextID += 2
 			st.id = tnHttp2NextID
-			st.session = &TnHttp2Session{socket: req.socket, encrypted: r.TLS != nil, alpnProtocol: "h2c"}
+			st.session = tnHttp2SessionFor(hs, r)
+			if st.session == nil {
+				st.session = &TnHttp2Session{socket: req.socket, encrypted: r.TLS != nil, alpnProtocol: "h2c"}
+			}
 			if r.TLS != nil {
 				st.session.alpnProtocol = "h2"
 				req.socket.encrypted = true
@@ -451,7 +735,75 @@ func tnHttp2ServeStream(hs *TnHttpServer, w http.ResponseWriter, r *http.Request
 	return true
 }
 
-func init() { tnHttp2StreamHook = tnHttp2ServeStream }
+func init() { tnHttp2StreamHook = tnHttp2ServeStream; tnHttp2SessionHook = tnHttp2MaybeSession }
+
+// A server session per HTTP/2 connection: the same object the 'session' event
+// hands out is reused by its streams (stream.session.ping / altsvc)
+type tnHttp2ConnKey struct{}
+
+var tnHttp2Sessions sync.Map
+
+func tnHttp2SessionFor(hs *TnHttpServer, r *http.Request) *TnHttp2Session {
+	conn, _ := r.Context().Value(tnHttp2ConnKey{}).(net.Conn)
+	if conn == nil {
+		return nil
+	}
+	if v, ok := tnHttp2Sessions.Load(conn); ok {
+		return v.(*TnHttp2Session)
+	}
+	s := &TnHttp2Session{
+		serverSide:     true,
+		conn:           conn,
+		encrypted:      r.TLS != nil,
+		alpnProtocol:   "h2c",
+		localSettings:  TnHttp2DefaultSettings(),
+		remoteSettings: TnHttp2DefaultSettings(),
+	}
+	if r.TLS != nil {
+		s.alpnProtocol = "h2"
+	}
+	s.framer = http2.NewFramer(conn, conn)
+	if conn.LocalAddr() != nil {
+		s.socket = tnInfoSocket(conn.LocalAddr(), conn.RemoteAddr().String())
+		s.socket.encrypted = s.encrypted
+	}
+	actual, loaded := tnHttp2Sessions.LoadOrStore(conn, s)
+	if loaded {
+		return actual.(*TnHttp2Session)
+	}
+	return s
+}
+
+func tnHttp2MaybeSession(hs *TnHttpServer, r *http.Request) {
+	if r.ProtoMajor != 2 {
+		return
+	}
+	s := tnHttp2SessionFor(hs, r)
+	if s == nil {
+		return
+	}
+	s.emitOnce.Do(func() {
+		if hs.listenerCount("session") == 0 {
+			return
+		}
+		TnLoopPost(func() {
+			if !s.destroyed {
+				hs.emit("session", s, s.socket)
+			}
+		})
+	})
+}
+
+func tnHttp2ConnClosed(conn net.Conn) {
+	if v, ok := tnHttp2Sessions.LoadAndDelete(conn); ok {
+		s := v.(*TnHttp2Session)
+		TnLoopPost(func() {
+			s.closed = true
+			s.destroyed = true
+			s.emit("close")
+		})
+	}
+}
 
 // createServer(options?, onRequest?) / createSecureServer({ key, cert, allowHTTP1 }, onRequest?)
 func TnHttp2CreateServer(secure bool, args ...interface{}) *TnHttpServer {
@@ -478,6 +830,14 @@ func TnHttp2CreateServer(secure bool, args ...interface{}) *TnHttpServer {
 		protocols.SetUnencryptedHTTP2(true)
 	}
 	hs.httpServer.Protocols = protocols
+	hs.httpServer.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		return context.WithValue(ctx, tnHttp2ConnKey{}, c)
+	}
+	hs.httpServer.ConnState = func(c net.Conn, state http.ConnState) {
+		if state == http.StateClosed || state == http.StateHijacked {
+			tnHttp2ConnClosed(c)
+		}
+	}
 	return hs
 }
 
@@ -537,8 +897,13 @@ func (st *TnHttp2Stream) start() {
 	if st.started {
 		return
 	}
-	st.started = true
 	s := st.session
+	if s.cc == nil {
+		// the session is still dialing: start once 'connect' fires
+		s.pending = append(s.pending, st)
+		return
+	}
+	st.started = true
 	var body io.Reader
 	if len(st.body) > 0 {
 		body = bytes.NewReader(st.body)
@@ -557,7 +922,7 @@ func (st *TnHttp2Stream) start() {
 	}
 	TnLoopRef()
 	go func() {
-		resp, err := s.client.Do(req)
+		resp, err := s.cc.RoundTrip(req)
 		TnLoopPost(func() {
 			defer TnLoopUnref()
 			if err != nil {
@@ -601,9 +966,64 @@ func TnHttp2DefaultSettings() map[string]interface{} {
 		"initialWindowSize":     float64(65535),
 		"maxFrameSize":          float64(16384),
 		"maxConcurrentStreams":  float64(4294967295),
+		"maxHeaderSize":         float64(65535),
 		"maxHeaderListSize":     float64(65535),
 		"enableConnectProtocol": false,
 	}
+}
+
+// http2.getPackedSettings(settings?): the SETTINGS payload, six bytes each,
+// ordered by setting id as Node does
+func TnHttp2GetPackedSettings(settings interface{}) []byte {
+	entries, _, err := tnHttp2Settings(settings)
+	if err != nil {
+		panic(err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	buf := make([]byte, 0, len(entries)*6)
+	for _, e := range entries {
+		var b [6]byte
+		binary.BigEndian.PutUint16(b[0:2], uint16(e.ID))
+		binary.BigEndian.PutUint32(b[2:6], e.Val)
+		buf = append(buf, b[:]...)
+	}
+	return buf
+}
+
+// http2.getUnpackedSettings(buf): unknown ids land in customSettings
+func TnHttp2GetUnpackedSettings(b []byte) map[string]interface{} {
+	if len(b)%6 != 0 {
+		panic(TnNodeError("RangeError", "ERR_HTTP2_INVALID_PACKED_SETTINGS_LENGTH", "Packed settings length must be a multiple of six"))
+	}
+	out := map[string]interface{}{}
+	custom := map[string]interface{}{}
+	for i := 0; i+6 <= len(b); i += 6 {
+		id := http2.SettingID(binary.BigEndian.Uint16(b[i : i+2]))
+		val := binary.BigEndian.Uint32(b[i+2 : i+6])
+		switch id {
+		case http2.SettingHeaderTableSize:
+			out["headerTableSize"] = float64(val)
+		case http2.SettingEnablePush:
+			out["enablePush"] = val == 1
+		case http2.SettingMaxConcurrentStreams:
+			out["maxConcurrentStreams"] = float64(val)
+		case http2.SettingInitialWindowSize:
+			out["initialWindowSize"] = float64(val)
+		case http2.SettingMaxFrameSize:
+			out["maxFrameSize"] = float64(val)
+		case http2.SettingMaxHeaderListSize:
+			out["maxHeaderSize"] = float64(val)
+			out["maxHeaderListSize"] = float64(val)
+		case http2.SettingEnableConnectProtocol:
+			out["enableConnectProtocol"] = val == 1
+		default:
+			custom[strconv.Itoa(int(id))] = float64(val)
+		}
+	}
+	if len(custom) > 0 {
+		out["customSettings"] = custom
+	}
+	return out
 }`;
 const HTTP2_CONSTANTS = {
     HTTP2_HEADER_STATUS: ':status',
@@ -647,12 +1067,12 @@ const HTTP2_NUMBERS = {
 };
 export function registerHttp2(r) {
     defineModule(r, 'http2');
-    defineHelper(r, 'nodeHttp2', ['bytes', 'context', 'crypto/tls', 'fmt', 'io', 'net', 'net/http', 'net/url', 'os', 'sort', 'strconv', 'strings', 'time'], ['nodeHttp', 'nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'tlsConfig', 'fsErrors'], http2Helper);
+    defineHelper(r, 'nodeHttp2', ['bytes', 'context', 'crypto/rand', 'crypto/tls', 'encoding/binary', 'fmt', 'golang.org/x/net/http2', 'io', 'math', 'net', 'net/http', 'net/url', 'os', 'sort', 'strconv', 'strings', 'sync', 'time'], ['nodeHttp', 'nodeNet', 'netErrors', 'nodeStream', 'nodeEvents', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap', 'tlsConfig', 'fsErrors', 'buffer'], http2Helper);
     const use = () => r.helper('nodeHttp2');
     defineClass(r, 'http2.Http2Stream', '*TnHttp2Stream', 'class', STREAM_METHODS + '; respond=; respondWithFile=; close=; pushStream=; additionalHeaders=', '', STREAM_GETTERS + '; id=float64; session=*TnHttp2Session; sentHeaders=*TnMap[string, interface{}]; headersSent=bool; pushAllowed=bool; endAfterHeaders=bool; rstCode=float64; aborted=bool', '');
     for (const name of ['ServerHttp2Stream', 'ClientHttp2Stream'])
         r.classes[`http2.${name}`] = r.classes['http2.Http2Stream'];
-    defineClass(r, 'http2.Http2Session', '*TnHttp2Session', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; emit=bool; request=*TnHttp2Stream; close=; destroy=; ref=*TnHttp2Session; unref=*TnHttp2Session; setTimeout=*TnHttp2Session', '', 'closed=bool; destroyed=bool; encrypted=bool; alpnProtocol=string; socket=*TnSocket', '');
+    defineClass(r, 'http2.Http2Session', '*TnHttp2Session', 'class', 'on=*TnEventEmitter; once=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; emit=bool; request=*TnHttp2Stream; close=; destroy=; ref=*TnHttp2Session; unref=*TnHttp2Session; setTimeout=*TnHttp2Session; ping=bool; settings=; goaway=; altsvc=', '', 'closed=bool; destroyed=bool; encrypted=bool; alpnProtocol=string; socket=*TnSocket; type=string; localSettings=interface{}; remoteSettings=interface{}; pendingSettingsAck=bool', '');
     for (const name of ['ServerHttp2Session', 'ClientHttp2Session'])
         r.classes[`http2.${name}`] = r.classes['http2.Http2Session'];
     for (const name of ['Http2Server', 'Http2SecureServer'])
@@ -684,6 +1104,8 @@ export function registerHttp2(r) {
     };
     r.paramTypers['http2.Http2Session#on'] = sessionListeners;
     r.paramTypers['http2.Http2Session#once'] = sessionListeners;
+    r.paramTypers['http2.Http2Session#ping'] = (_n) => ['interface{}', 'float64', '[]byte'];
+    r.paramTypers['http2.Http2Session#settings'] = (_n) => ['interface{}', 'interface{}'];
     r.functions['http2.createServer'] = (c) => {
         use();
         return `TnHttp2CreateServer(false${c.args.length > 0 ? ', ' : ''}${c.args.join(', ')})`;
@@ -703,7 +1125,15 @@ export function registerHttp2(r) {
         use();
         return 'TnHttp2DefaultSettings()';
     };
-    setResults(r, 'http2', 'createServer=*TnHttpServer; createSecureServer=*TnHttpServer; connect=*TnHttp2Session; getDefaultSettings=map[string]interface{}');
+    r.functions['http2.getPackedSettings'] = (c) => {
+        use();
+        return `TnHttp2GetPackedSettings(${c.args.join(', ')})`;
+    };
+    r.functions['http2.getUnpackedSettings'] = (c) => {
+        use();
+        return `TnHttp2GetUnpackedSettings(${c.args.join(', ')})`;
+    };
+    setResults(r, 'http2', 'createServer=*TnHttpServer; createSecureServer=*TnHttpServer; connect=*TnHttp2Session; getDefaultSettings=interface{}; getPackedSettings=[]byte; getUnpackedSettings=interface{}');
     r.objects['http2.constants'] = true;
     for (const name of Object.keys(HTTP2_CONSTANTS)) {
         const text = HTTP2_CONSTANTS[name];

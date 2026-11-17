@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`node:ffi`:** the Node 26 module — `dlopen` / `dlclose` / `dlsym`,
+  `DynamicLibrary` (`getFunction(s)`, `getSymbol(s)`, `symbols`, `close`,
+  `using`), wrappers' `.pointer`, `registerCallback` and friends, the
+  `get*` / `set*` memory accessors, `toString` / `toBuffer` /
+  `toArrayBuffer`, `export*`, `getRawPointer`, `suffix` and `types`, with
+  Node's argument checks and error codes. No cgo: `LoadLibrary` on
+  Windows, the vendored `github.com/ebitengine/purego` on Linux / macOS
+  (linked only into programs that import `node:ffi`). A JS throw in a
+  callback is rethrown once the native call returns; Windows callbacks
+  take integer / pointer arguments only. `getCurrentEventLoop` is 🚫 (no
+  libuv loop).
+- **`node:http`:** connection pooling options on `Agent` (`maxSockets`,
+  `maxTotalSockets`, `maxFreeSockets`, `keepAlive`, `keepAliveMsecs`,
+  `scheduling`), request trailers (`req.addTrailers` with a declared
+  `Trailer` header), `res.statusMessage` and `'checkContinue'` /
+  `'checkExpectation'`, and the Node 26.3 `httpValidation` option
+  (`'strict'` / `'relaxed'` / `'insecure'`, also `insecureHTTPParser`).
+- **`node:http2`:** frame-level session APIs on the vendored
+  `golang.org/x/net/http2` — `ping`, `settings`, `goaway`, `altsvc`, the
+  server's `'session'` event, `localSettings` / `remoteSettings`, and
+  `getPackedSettings` / `getUnpackedSettings`. Cleartext still uses prior
+  knowledge (no HTTP/1.1 `Upgrade: h2c` handshake), as in Node.
 - **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
   `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
   `PlainMonthDay`, `Duration` and `Now` — on Go's `time` and embedded
