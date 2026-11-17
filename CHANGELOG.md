@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Streams, events and readline (closing the remaining ❌ rows):**
+  `node:stream` backpressure — `highWaterMark` / `readableHighWaterMark` /
+  `writableHighWaterMark` (16 KiB or 16 objects by default,
+  `get/setDefaultHighWaterMark`), `write()` / `push()` returning `false`
+  at the mark, `'drain'` only after a `false` write, `writableNeedDrain`,
+  byte-counted `readableLength` / `writableLength`, read-ahead up to the
+  mark, and transforms holding their writer while their output is unread,
+  so `pipe` / `pipeline` pause a fast source; `compose` with async
+  generator functions, source generators and async sink functions;
+  `duplexPair` (Node 26.1 semantics); `Readable.toWeb` `type: 'bytes'` /
+  `Duplex.toWeb` `readableType`; and
+  `readable[Symbol.for('Stream.toAsyncStreamable')]()` (stream/iter
+  batches). `node:stream/web`: BYOB readers (`getReader({ mode: 'byob' })`,
+  `ReadableStreamBYOBReader`, `read(view, { min })` filling the caller's
+  view), byte-stream controllers' `byobRequest` (`view`, `respond`,
+  `respondWithNewView`) and `autoAllocateChunkSize`, and transferring
+  streams with `structuredClone(stream, { transfer: [stream] })` (others
+  throw a `DataCloneError`). `node:events`: an EventEmitter subclass's
+  `[Symbol.for('nodejs.rejection')]` / `[captureRejectionSymbol]` method
+  handles captured rejections (`captureRejectionSymbol` is exported), and
+  a subclass without a constructor passes its options on.
+  `node:readline`: terminal-mode line editing (`terminal: true`, or stdin
+  and stdout both terminals, in raw mode) — cursor keys, Emacs-style ctrl /
+  meta keys, `history` / `historySize` / `removeHistoryDuplicates` with
+  prefix search and `'history'` events, a sync or callback `completer` on
+  Tab, `line` / `cursor` / `getCursorPos()`, and `write(data, key)`.
 - **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
   `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
   `PlainMonthDay`, `Duration` and `Now` — on Go's `time` and embedded

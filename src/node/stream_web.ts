@@ -226,6 +226,27 @@ type TnReadableStream struct {
 	controller     *TnReadableStreamDefaultController
 	pullFn         func() interface{}
 	cancelFn       func(reason interface{}) interface{}
+	// a byte stream (type: 'bytes'): BYOB reads wait in pullIntos
+	byteStream     bool
+	autoAllocate   int
+	pullIntos      []*tnPullInto
+	byobReq        *TnReadableStreamBYOBRequest
+}
+
+// A BYOB read (or a default read over an autoAllocateChunkSize buffer)
+// waiting for bytes: they are copied into the caller's view
+type tnPullInto struct {
+	buf    []byte
+	filled int
+	min    int
+	rd     tnWebRead
+	auto   bool
+}
+
+// controller.byobRequest: the view the source can fill, then respond(n)
+type TnReadableStreamBYOBRequest struct {
+	stream *TnReadableStream
+	into   *tnPullInto
 }
 
 type TnReadableStreamDefaultController struct {
@@ -234,6 +255,7 @@ type TnReadableStreamDefaultController struct {
 
 type TnReadableStreamDefaultReader struct {
 	stream        *TnReadableStream
+	byob          bool
 	reads         []tnWebRead
 	closed        chan struct{}
 	closedSettled bool
@@ -259,8 +281,15 @@ func TnNewReadableStream(args ...interface{}) *TnReadableStream {
 	}
 	if t, _ := TnGetValue(source, "type").(string); t == "bytes" {
 		s.strategy.bytes = true
+		s.byteStream = true
 		if len(rest) == 0 {
 			s.strategy.hwm = 0
+		}
+		if n, ok := tnWebNumber(TnGetValue(source, "autoAllocateChunkSize")); ok {
+			if n <= 0 {
+				panic(tnWebTypeError("ERR_INVALID_ARG_VALUE", "The property 'autoAllocateChunkSize' must be a positive integer"))
+			}
+			s.autoAllocate = int(n)
 		}
 	}
 	if pull := TnGet(source, "pull"); tnWebIsFunc(pull) {
@@ -297,7 +326,127 @@ func (s *TnReadableStream) startWith(start func() interface{}) {
 func (s *TnReadableStream) desiredSize() float64 { return s.strategy.hwm - s.queueTotal }
 
 func (s *TnReadableStream) hasPendingReads() bool {
-	return s.reader != nil && len(s.reader.reads) > 0
+	return (s.reader != nil && len(s.reader.reads) > 0) || len(s.pullIntos) > 0
+}
+
+// The bytes of a byte stream's queue fill the waiting BYOB reads, in order
+func (s *TnReadableStream) fillPullIntos() {
+	for len(s.pullIntos) > 0 && !s.pullIntos[0].auto && len(s.queue) > 0 {
+		into := s.pullIntos[0]
+		for len(s.queue) > 0 && into.filled < len(into.buf) {
+			chunk, _ := s.queue[0].value.([]byte)
+			n := copy(into.buf[into.filled:], chunk)
+			into.filled += n
+			s.queueTotal -= float64(n)
+			if n < len(chunk) {
+				s.queue[0] = tnWebChunk{value: chunk[n:], size: float64(len(chunk) - n)}
+			} else {
+				s.queue = s.queue[1:]
+			}
+		}
+		if s.queueTotal < 0 || len(s.queue) == 0 {
+			s.queueTotal = 0
+		}
+		if into.filled < into.min {
+			return
+		}
+		s.commitPullInto(false)
+	}
+	if s.closeRequested && len(s.queue) == 0 && s.state == "readable" {
+		s.finishClose()
+	}
+}
+
+// Settles the first waiting BYOB read with the bytes it got
+func (s *TnReadableStream) commitPullInto(done bool) {
+	into := s.pullIntos[0]
+	s.pullIntos = s.pullIntos[1:]
+	s.byobReq = nil
+	if into.auto {
+		if s.reader != nil && len(s.reader.reads) > 0 {
+			rd := s.reader.reads[0]
+			s.reader.reads = s.reader.reads[1:]
+			if into.filled == 0 {
+				rd.settle(&TnReadResult{done: true}, nil, false)
+			} else {
+				rd.settle(&TnReadResult{value: into.buf[:into.filled]}, nil, false)
+			}
+		}
+		return
+	}
+	into.rd.settle(&TnReadResult{value: into.buf[:into.filled], done: done}, nil, false)
+}
+
+// reader.read(view, { min }) on a BYOB reader
+func (s *TnReadableStream) readBYOB(view []byte, min int, rd tnWebRead) {
+	s.disturbed = true
+	switch s.state {
+	case "closed":
+		rd.settle(&TnReadResult{value: view[:0], done: true}, nil, false)
+		return
+	case "errored":
+		rd.settle(nil, s.storedError, true)
+		return
+	}
+	s.pullIntos = append(s.pullIntos, &tnPullInto{buf: view, min: min, rd: rd})
+	s.fillPullIntos()
+	s.pullIfNeeded()
+}
+
+func (c *TnReadableStreamDefaultController) Get_byobRequest() *TnReadableStreamBYOBRequest {
+	s := c.stream
+	if !s.byteStream || len(s.pullIntos) == 0 || s.state == "errored" {
+		return nil
+	}
+	if s.byobReq == nil || s.byobReq.into != s.pullIntos[0] {
+		s.byobReq = &TnReadableStreamBYOBRequest{stream: s, into: s.pullIntos[0]}
+	}
+	return s.byobReq
+}
+
+// byobRequest.view: the unfilled part of the reader's view (shared memory)
+func (q *TnReadableStreamBYOBRequest) Get_view() []byte {
+	if q.into == nil || q.stream.byobReq != q {
+		return nil
+	}
+	return q.into.buf[q.into.filled:]
+}
+
+// byobRequest.respond(bytesWritten): that many bytes of the view were filled
+func (q *TnReadableStreamBYOBRequest) respond(bytesWritten float64) {
+	s := q.stream
+	if q.into == nil || s.byobReq != q || len(s.pullIntos) == 0 || s.pullIntos[0] != q.into {
+		panic(tnWebTypeError("ERR_INVALID_STATE", "Invalid state: This BYOB request has been invalidated"))
+	}
+	n := int(bytesWritten)
+	if s.state == "closed" {
+		if n != 0 {
+			panic(TnNodeError("RangeError", "ERR_INVALID_ARG_VALUE", "bytesWritten must be 0 when calling respond() on a closed stream"))
+		}
+		// (the waiting reads end: done, with what they hold)
+		for len(s.pullIntos) > 0 {
+			s.commitPullInto(true)
+		}
+		return
+	}
+	if n < 0 || n > len(q.into.buf)-q.into.filled {
+		panic(TnNodeError("RangeError", "ERR_INVALID_ARG_VALUE", "bytesWritten out of range"))
+	}
+	q.into.filled += n
+	s.byobReq = nil
+	if q.into.filled >= q.into.min && (n > 0 || q.into.auto) {
+		s.commitPullInto(false)
+		s.fillPullIntos()
+	}
+	s.pullIfNeeded()
+}
+
+// byobRequest.respondWithNewView(view): the filled bytes, as a view of their own
+func (q *TnReadableStreamBYOBRequest) respondWithNewView(view []byte) {
+	if q.into != nil && len(view) > 0 && q.into.filled+len(view) <= len(q.into.buf) {
+		copy(q.into.buf[q.into.filled:], view)
+	}
+	q.respond(float64(len(view)))
 }
 
 // No reader is waiting and the queue is full
@@ -339,7 +488,21 @@ func (s *TnReadableStream) pullIfNeeded() {
 }
 
 func (s *TnReadableStream) enqueue(v interface{}) {
-	if s.hasPendingReads() {
+	if s.byteStream {
+		s.byobReq = nil
+		if len(s.pullIntos) > 0 && s.pullIntos[0].auto {
+			// (a default read takes the chunk itself, not the auto-allocated buffer)
+			s.pullIntos = s.pullIntos[1:]
+		} else if len(s.pullIntos) > 0 {
+			b, _ := v.([]byte)
+			s.queue = append(s.queue, tnWebChunk{value: b, size: float64(len(b))})
+			s.queueTotal += float64(len(b))
+			s.fillPullIntos()
+			s.pullIfNeeded()
+			return
+		}
+	}
+	if s.reader != nil && len(s.reader.reads) > 0 {
 		rd := s.reader.reads[0]
 		s.reader.reads = s.reader.reads[1:]
 		rd.settle(&TnReadResult{value: v}, nil, false)
@@ -353,6 +516,11 @@ func (s *TnReadableStream) enqueue(v interface{}) {
 
 func (s *TnReadableStream) finishClose() {
 	s.state = "closed"
+	// (a waiting BYOB read stays until byobRequest.respond(0), as in Node)
+	if len(s.pullIntos) > 0 && s.pullIntos[0].auto {
+		s.pullIntos = nil
+		s.byobReq = nil
+	}
 	if r := s.reader; r != nil {
 		reads := r.reads
 		r.reads = nil
@@ -371,6 +539,14 @@ func (s *TnReadableStream) fail(reason interface{}) {
 	s.storedError = reason
 	s.queue = nil
 	s.queueTotal = 0
+	s.byobReq = nil
+	pullIntos := s.pullIntos
+	s.pullIntos = nil
+	for _, into := range pullIntos {
+		if !into.auto {
+			into.rd.settle(nil, reason, true)
+		}
+	}
 	if r := s.reader; r != nil {
 		reads := r.reads
 		r.reads = nil
@@ -385,7 +561,13 @@ func (c *TnReadableStreamDefaultController) enqueue(chunk ...interface{}) {
 	if !c.stream.open() {
 		panic(tnWebTypeError("ERR_INVALID_STATE", "Invalid state: Controller is already closed"))
 	}
-	c.stream.enqueue(tnWebArg(chunk))
+	v := tnWebArg(chunk)
+	if c.stream.byteStream {
+		if _, ok := v.([]byte); !ok {
+			panic(tnWebTypeError("ERR_INVALID_ARG_TYPE", "The \\"buffer\\" argument must be an instance of Buffer, TypedArray, or DataView. Received "+TnJSString(v)))
+		}
+	}
+	c.stream.enqueue(v)
 }
 
 func (c *TnReadableStreamDefaultController) close() {
@@ -417,7 +599,18 @@ func (s *TnReadableStream) getReader(options ...interface{}) *TnReadableStreamDe
 	if s.reader != nil {
 		panic(tnWebTypeError("ERR_INVALID_STATE", "Invalid state: ReadableStream is locked"))
 	}
-	r := &TnReadableStreamDefaultReader{stream: s, closed: make(chan struct{})}
+	byob := false
+	if len(options) > 0 && options[0] != nil && !TnIsNil(options[0]) {
+		if mode, _ := TnGetValue(options[0], "mode").(string); mode == "byob" {
+			if !s.byteStream {
+				panic(tnWebTypeError("ERR_INVALID_ARG_VALUE", "The argument 'stream' must be a byte stream. Received ReadableStream { locked: false, state: '"+s.state+"', supportsBYOB: false }"))
+			}
+			byob = true
+		} else if mode != "" {
+			panic(tnWebTypeError("ERR_INVALID_ARG_VALUE", "The argument 'options.mode' is invalid. Received '"+mode+"'"))
+		}
+	}
+	r := &TnReadableStreamDefaultReader{stream: s, closed: make(chan struct{}), byob: byob}
 	s.reader = r
 	switch s.state {
 	case "closed":
@@ -448,7 +641,35 @@ func (r *TnReadableStreamDefaultReader) Get_closed() chan struct{} { return r.cl
 // read(): { value, done } — the next chunk, or done once the stream closed
 func (r *TnReadableStreamDefaultReader) read(view ...interface{}) chan *TnReadResult {
 	ch := make(chan *TnReadResult, 1)
-	r.readInto(tnWebRead{ch: ch})
+	if !r.byob {
+		r.readInto(tnWebRead{ch: ch})
+		return ch
+	}
+	// a BYOB reader: read(view, { min }) fills the caller's view
+	buf, ok := tnWebArg(view).([]byte)
+	if !ok || buf == nil {
+		TnReject(ch, tnWebTypeError("ERR_INVALID_ARG_TYPE", "The \\"view\\" argument must be an instance of Buffer, TypedArray, or DataView. Received "+TnJSString(tnWebArg(view))))
+		return ch
+	}
+	min := 1
+	if len(view) > 1 && view[1] != nil {
+		if n, ok := tnWebNumber(TnGetValue(view[1], "min")); ok {
+			min = int(n)
+			if min <= 0 || min > len(buf) {
+				TnReject(ch, TnNodeError("RangeError", "ERR_OUT_OF_RANGE", "options.min is out of range"))
+				return ch
+			}
+		}
+	}
+	if len(buf) == 0 {
+		TnReject(ch, tnWebTypeError("ERR_INVALID_STATE", "Invalid state: View or buffer must have a non-zero byteLength"))
+		return ch
+	}
+	if r.stream == nil {
+		TnReject(ch, tnWebTypeError("ERR_INVALID_STATE", "Invalid state: The reader is not attached to a stream"))
+		return ch
+	}
+	r.stream.readBYOB(buf, min, tnWebRead{ch: ch})
 	return ch
 }
 
@@ -483,6 +704,9 @@ func (r *TnReadableStreamDefaultReader) readInto(rd tnWebRead) {
 		return
 	}
 	r.reads = append(r.reads, rd)
+	if s.byteStream && s.autoAllocate > 0 && len(s.pullIntos) == 0 {
+		s.pullIntos = append(s.pullIntos, &tnPullInto{buf: make([]byte, s.autoAllocate), min: 1, auto: true})
+	}
 	s.pullIfNeeded()
 }
 
@@ -492,6 +716,14 @@ func (r *TnReadableStreamDefaultReader) releaseLock() {
 		return
 	}
 	err := tnWebTypeError("ERR_INVALID_STATE", "Invalid state: Releasing reader")
+	if r.byob {
+		pullIntos := s.pullIntos
+		s.pullIntos = nil
+		s.byobReq = nil
+		for _, into := range pullIntos {
+			into.rd.settle(nil, err, true)
+		}
+	}
 	reads := r.reads
 	r.reads = nil
 	for _, rd := range reads {
@@ -527,6 +759,13 @@ func (s *TnReadableStream) cancelWith(reason interface{}) chan struct{} {
 	s.queue = nil
 	s.queueTotal = 0
 	s.finishClose()
+	pullIntos := s.pullIntos
+	s.pullIntos = nil
+	for _, into := range pullIntos {
+		if !into.auto {
+			into.rd.settle(&TnReadResult{done: true}, nil, false)
+		}
+	}
 	if s.cancelFn == nil {
 		return tnWebResolved()
 	}
@@ -1611,18 +1850,80 @@ func TnNewDecompressionStream(format string) *TnTransformStream {
 	return ts
 }
 
+// --- transferring (structuredClone(stream, { transfer: [stream] })) ---
+
+// A new stream reading the (now locked) original, chunk by chunk
+func (s *TnReadableStream) tnTransfer() interface{} {
+	reader := s.getReader()
+	out := tnNewWebReadable(tnWebStrategy{hwm: 1})
+	reading := false
+	out.pullFn = func() interface{} {
+		if reading {
+			return nil
+		}
+		reading = true
+		reader.readInto(tnWebRead{cb: func(res *TnReadResult, reason interface{}, failed bool) {
+			reading = false
+			switch {
+			case failed:
+				out.fail(reason)
+			case res.done:
+				if out.open() {
+					out.controller.close()
+				}
+			default:
+				if out.open() {
+					out.enqueue(TnStructuredClone(res.value))
+				}
+			}
+		}})
+		return nil
+	}
+	out.cancelFn = func(reason interface{}) interface{} { return reader.cancel(reason) }
+	out.startWith(nil)
+	return out
+}
+
+// A new stream writing into the (now locked) original
+func (s *TnWritableStream) tnTransfer() interface{} {
+	writer := s.getWriter()
+	out := tnNewWebWritable(tnWebStrategy{hwm: 1})
+	out.writeFn = func(chunk interface{}) interface{} { return writer.write(TnStructuredClone(chunk)) }
+	out.closeFn = func() interface{} { return writer.close() }
+	out.abortFn = func(reason interface{}) interface{} { return writer.abort(reason) }
+	out.startWith(nil)
+	return out
+}
+
+// Both sides move
+func (t *TnTransformStream) tnTransfer() interface{} {
+	return &TnTransformStream{readable: t.readable.tnTransfer().(*TnReadableStream), writable: t.writable.tnTransfer().(*TnWritableStream)}
+}
+
 // --- Node stream bridges ---
 
-// Readable.toWeb(readable, { strategy }): paused while the web queue is full
+// Readable.toWeb(readable, { strategy, type }): paused while the web queue is
+// full; type 'bytes' makes a byte stream (BYOB readers)
 func TnReadableToWeb(src tnStreamLike, options ...interface{}) *TnReadableStream {
 	n := src.tnStream()
 	var strategy []interface{}
-	if len(options) > 0 && options[0] != nil {
+	bytesType := false
+	if len(options) > 0 && options[0] != nil && !TnIsNil(options[0]) {
 		if st := TnGet(options[0], "strategy"); st != nil {
 			strategy = []interface{}{st}
 		}
+		if t, _ := TnGetValue(options[0], "type").(string); t == "bytes" {
+			bytesType = true
+		}
 	}
 	ws := tnNewWebReadable(tnWebStrategyOf(strategy, 1))
+	if bytesType {
+		ws.byteStream = true
+		ws.strategy.bytes = true
+		if len(strategy) == 0 {
+			ws.strategy.hwm = 0
+		}
+	}
 	ws.pullFn = func() interface{} {
 		if n.isPaused() {
 			n.resume()
@@ -1637,6 +1938,9 @@ func TnReadableToWeb(src tnStreamLike, options ...interface{}) *TnReadableStream
 		if !ws.open() {
 			return
 		}
+		if str, ok := chunk.(string); ok && ws.byteStream {
+			chunk = []byte(str)
+		}
 		ws.enqueue(chunk)
 		if ws.backpressured() {
 			n.pause()
@@ -1645,6 +1949,12 @@ func TnReadableToWeb(src tnStreamLike, options ...interface{}) *TnReadableStream
 	n.TnEventEmitter.once("end", func() {
 		if ws.open() {
 			ws.controller.close()
+			// (waiting BYOB reads end: done)
+			if ws.state == "closed" {
+				for len(ws.pullIntos) > 0 {
+					ws.commitPullInto(true)
+				}
+			}
 		}
 	})
 	n.TnEventEmitter.once("error", func(err interface{}) { ws.fail(err) })
@@ -1737,9 +2047,15 @@ func TnWritableFromWeb(ws *TnWritableStream, options ...interface{}) *TnStream {
 	return n
 }
 
-// Duplex.toWeb(duplex): { readable, writable }
-func TnDuplexToWeb(d tnStreamLike) *TnTransformStream {
-	return &TnTransformStream{readable: TnReadableToWeb(d), writable: TnWritableToWeb(d)}
+// Duplex.toWeb(duplex, { readableType }): { readable, writable }
+func TnDuplexToWeb(d tnStreamLike, options ...interface{}) *TnTransformStream {
+	var readOptions []interface{}
+	if len(options) > 0 && options[0] != nil && !TnIsNil(options[0]) {
+		if t, ok := TnGetValue(options[0], "readableType").(string); ok {
+			readOptions = []interface{}{map[string]interface{}{"type": t}}
+		}
+	}
+	return &TnTransformStream{readable: TnReadableToWeb(d, readOptions...), writable: TnWritableToWeb(d)}
 }
 
 // Duplex.fromWeb({ readable, writable }, options?)
@@ -1764,11 +2080,95 @@ func TnDuplexFromWeb(pair interface{}, options ...interface{}) *TnStream {
 	return d
 }
 
+// A function stage of compose(): an async generator over the chunks written
+// (a Duplex), a source generator without parameters (a Readable), or an async
+// function consuming the chunks (a Writable, finished once it returns)
+func tnComposeFunc(fv reflect.Value) *TnStream {
+	objectMode := map[string]interface{}{"objectMode": true}
+	ft := fv.Type()
+	if ft.NumIn() == 0 {
+		out := fv.Call(nil)
+		if len(out) == 0 {
+			panic(tnWebTypeError("ERR_INVALID_RETURN_VALUE", "Expected an AsyncIterable to be returned from the \\"source\\" function"))
+		}
+		return TnReadableFrom(out[0].Interface(), objectMode)
+	}
+	in := ft.In(0)
+	elem := reflect.TypeOf((*interface{})(nil)).Elem()
+	if in.Kind() == reflect.Chan {
+		elem = in.Elem()
+	}
+	feed := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, elem), 65536)
+	arg := feed
+	if in.Kind() != reflect.Chan {
+		arg = tnInvokeArg(feed.Interface(), in)
+	}
+	d := TnNewDuplex(objectMode)
+	d.sink = func(chunk interface{}, done func(err interface{})) {
+		feed.Send(tnInvokeArg(chunk, elem))
+		done(nil)
+	}
+	// (an async function, not a generator: nothing, or a promise of nothing, comes back)
+	sinkOnly := ft.NumOut() == 0 || (ft.Out(0).Kind() == reflect.Chan && ft.Out(0).Elem() == reflect.TypeOf(struct{}{}))
+	if !sinkOnly {
+		out := fv.Call([]reflect.Value{arg})
+		r := TnReadableFrom(out[0].Interface(), objectMode)
+		d.sinkFinal = func(done func(err interface{})) {
+			feed.Close()
+			done(nil)
+		}
+		d.setHook("_read", func(size float64) {})
+		r.on("data", func(chunk interface{}) { d.push(chunk) })
+		r.TnEventEmitter.once("end", func() { d.push(nil) })
+		r.TnEventEmitter.once("error", func(err interface{}) { d.destroy(err) })
+		return d
+	}
+	d.readableSide = false
+	returned := false
+	var returnErr interface{}
+	var finalDone func(err interface{})
+	settle := func(err interface{}) {
+		returned, returnErr = true, err
+		if finalDone != nil {
+			finalDone(err)
+		}
+	}
+	d.sinkFinal = func(done func(err interface{})) {
+		feed.Close()
+		if returned {
+			done(returnErr)
+			return
+		}
+		finalDone = done
+	}
+	// (the function parks at its first await; the writes go on meanwhile)
+	TnStartAsync(func() {
+		out := fv.Call([]reflect.Value{arg})
+		if len(out) == 0 {
+			settle(nil)
+			return
+		}
+		tnWebWhen(out[0].Interface(), func(_ interface{}, reason interface{}, failed bool) {
+			if failed {
+				settle(reason)
+				return
+			}
+			settle(nil)
+		})
+	})
+	return d
+}
+
 // stream.compose(...streams): one Duplex writing into the first stream and
-// reading from the last (web streams convert to Node streams)
+// reading from the last (web streams convert to Node streams, functions to
+// the streams they stand for)
 func TnCompose(streams ...interface{}) *TnStream {
 	nodes := []*TnStream{}
 	for _, st := range streams {
+		if fv := reflect.ValueOf(st); st != nil && fv.Kind() == reflect.Func && !fv.IsNil() {
+			nodes = append(nodes, tnComposeFunc(fv))
+			continue
+		}
 		switch x := st.(type) {
 		case tnStreamLike:
 			nodes = append(nodes, x.tnStream())
@@ -2154,7 +2554,7 @@ export function registerStreamWeb(r: NodeRegistry): void {
     r,
     'nodeStreamWeb',
     ['bytes', 'compress/flate', 'compress/gzip', 'compress/zlib', 'fmt', 'io', 'mime', 'mime/multipart', 'net/textproto', 'reflect', 'strings', 'time', 'net/url'],
-    ['nodeStream', 'nodeEvents', 'promise', 'eventLoop', 'dynamic', 'error', 'nodeInvoke', 'buffer', 'stringDecoder'],
+    ['nodeStream', 'nodeEvents', 'promise', 'eventLoop', 'dynamic', 'error', 'nodeInvoke', 'buffer', 'stringDecoder', 'structuredClone'],
     streamWebHelper
   );
   const use = () => r.helper('nodeStreamWeb');
@@ -2184,7 +2584,8 @@ export function registerStreamWeb(r: NodeRegistry): void {
     ''
   );
   r.classes[web('ReadableStreamBYOBReader')] = r.classes[web('ReadableStreamDefaultReader')];
-  defineClass(r, web('ReadableStreamDefaultController'), '*TnReadableStreamDefaultController', 'class', 'enqueue=; close=; error=', '', 'desiredSize=float64', '');
+  defineClass(r, web('ReadableStreamDefaultController'), '*TnReadableStreamDefaultController', 'class', 'enqueue=; close=; error=', '', 'desiredSize=float64; byobRequest=*TnReadableStreamBYOBRequest', '');
+  defineClass(r, web('ReadableStreamBYOBRequest'), '*TnReadableStreamBYOBRequest', 'class', 'respond=; respondWithNewView=', '', 'view=[]byte', '');
   r.classes[web('ReadableByteStreamController')] = r.classes[web('ReadableStreamDefaultController')];
   defineClass(r, web('WritableStream'), '*TnWritableStream', 'class', 'getWriter=*TnWritableStreamDefaultWriter; close=chan struct{}; abort=chan struct{}', '', 'locked=bool', '');
   defineClass(
@@ -2220,6 +2621,7 @@ export function registerStreamWeb(r: NodeRegistry): void {
     'ReadableStreamBYOBReader',
     'ReadableStreamDefaultController',
     'ReadableByteStreamController',
+    'ReadableStreamBYOBRequest',
     'WritableStream',
     'WritableStreamDefaultWriter',
     'WritableStreamDefaultController',
@@ -2250,7 +2652,7 @@ export function registerStreamWeb(r: NodeRegistry): void {
   ctor('CountQueuingStrategy', (c: NodeCall) => `TnNewQueuingStrategy(false, ${c.args[0] ?? 'nil'})`);
   ctor('ByteLengthQueuingStrategy', (c: NodeCall) => `TnNewQueuingStrategy(true, ${c.args[0] ?? 'nil'})`);
   ctor('ReadableStreamDefaultReader', (c: NodeCall) => `${c.args[0]}.getReader()`);
-  ctor('ReadableStreamBYOBReader', (c: NodeCall) => `${c.args[0]}.getReader()`);
+  ctor('ReadableStreamBYOBReader', (c: NodeCall) => `${c.args[0]}.getReader(map[string]interface{}{"mode": "byob"})`);
   ctor('WritableStreamDefaultWriter', (c: NodeCall) => `${c.args[0]}.getWriter()`);
   r.optionTypers[web('ReadableStream')] = (_n: any) => sourceTypes('*TnReadableStreamDefaultController');
   r.optionTypers[web('WritableStream')] = (_n: any) => ({

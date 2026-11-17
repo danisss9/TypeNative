@@ -1414,6 +1414,8 @@ declare module 'node:events' {
     static getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     static listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
     static readonly errorMonitor: unique symbol;
+    /** Symbol.for('nodejs.rejection'): a subclass method of this name handles captured rejections */
+    static readonly captureRejectionSymbol: unique symbol;
     static captureRejections: boolean;
     static getMaxListeners(emitter: EventEmitter | EventTarget): number;
     static setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
@@ -1435,6 +1437,7 @@ declare module 'node:events' {
     function getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     function listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
     const errorMonitor: typeof EventEmitter.errorMonitor;
+    const captureRejectionSymbol: typeof EventEmitter.captureRejectionSymbol;
     let captureRejections: boolean;
     function getMaxListeners(emitter: EventEmitter | EventTarget): number;
     function setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
@@ -1479,6 +1482,7 @@ declare module 'node:stream' {
       readonly readableEnded: boolean;
       readonly readableFlowing: boolean | null;
       readonly readableLength: number;
+      readonly readableHighWaterMark: number;
       readonly readableObjectMode: boolean;
       readonly destroyed: boolean;
       readonly closed: boolean;
@@ -1497,7 +1501,9 @@ declare module 'node:stream' {
       compose(stream: Duplex | ((source: any) => any)): Duplex;
       destroy(error?: Error): this;
       [Symbol.asyncIterator](): AsyncIterator<any>;
-      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
+      /** readable[Symbol.for('Stream.toAsyncStreamable')](): the chunks as batches of Uint8Arrays (stream/iter) */
+      [key: symbol]: any;
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy; type?: 'bytes' }): ReadableStream;
       static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
     }
     class Writable extends Stream {
@@ -1508,6 +1514,8 @@ declare module 'node:stream' {
       readonly writableEnded: boolean;
       readonly writableFinished: boolean;
       readonly writableLength: number;
+      readonly writableHighWaterMark: number;
+      readonly writableNeedDrain: boolean;
       readonly writableObjectMode: boolean;
       readonly destroyed: boolean;
       readonly closed: boolean;
@@ -1526,8 +1534,8 @@ declare module 'node:stream' {
       destroy(error?: Error): this;
     }
     class Duplex extends Readable implements Writable {
-      static toWeb(streamDuplex: Duplex): { readable: ReadableStream; writable: WritableStream };
-      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
+      static toWeb(streamDuplex: Duplex, options?: { readableType?: 'bytes' }): { readable: ReadableStream; writable: WritableStream };
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy; type?: 'bytes' }): ReadableStream;
       static fromWeb(pair: { readable: ReadableStream; writable: WritableStream }, options?: DuplexOptions): Duplex;
       static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
       constructor(options?: DuplexOptions);
@@ -1535,6 +1543,8 @@ declare module 'node:stream' {
       readonly writableEnded: boolean;
       readonly writableFinished: boolean;
       readonly writableLength: number;
+      readonly writableHighWaterMark: number;
+      readonly writableNeedDrain: boolean;
       readonly writableObjectMode: boolean;
       _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
       _final(callback: (error?: Error | null) => void): void;
@@ -1555,7 +1565,12 @@ declare module 'node:stream' {
     class PassThrough extends Transform {}
     function pipeline<T extends Writable | Duplex>(...args: [...streams: (Readable | Writable | Duplex)[], callback: (err: NodeJS.ErrnoException | null) => void]): T;
     function finished(stream: Readable | Writable, callback: (err?: NodeJS.ErrnoException | null) => void): void;
-    function compose(...streams: (Readable | Writable | Duplex | ReadableStream | WritableStream | TransformStream)[]): Duplex;
+    /** Streams, web streams, or functions: an async generator over the chunks, a source generator, an async sink */
+    function compose(...streams: (Readable | Writable | Duplex | ReadableStream | WritableStream | TransformStream | ((source: AsyncIterable<any>) => any))[]): Duplex;
+    function getDefaultHighWaterMark(objectMode: boolean): number;
+    /** Two connected Duplexes: what one writes, the other reads */
+    function duplexPair(options?: DuplexOptions): [Duplex, Duplex];
+    function setDefaultHighWaterMark(objectMode: boolean, value: number): void;
     const promises: typeof import('node:stream/promises');
     const web: typeof import('node:stream/web');
   }
@@ -1776,6 +1791,11 @@ declare module 'node:stream/web' {
   const ReadableStreamDefaultReader: typeof globalThis.ReadableStreamDefaultReader;
   type ReadableStreamDefaultReader<R = any> = globalThis.ReadableStreamDefaultReader<R>;
   type ReadableStreamDefaultController<R = any> = globalThis.ReadableStreamDefaultController<R>;
+  const ReadableStreamBYOBReader: typeof globalThis.ReadableStreamBYOBReader;
+  type ReadableStreamBYOBReader = globalThis.ReadableStreamBYOBReader;
+  type ReadableByteStreamController = globalThis.ReadableByteStreamController;
+  type ReadableStreamBYOBRequest = globalThis.ReadableStreamBYOBRequest;
+  type UnderlyingByteSource = globalThis.UnderlyingByteSource;
   type ReadableStreamReadResult<R> = globalThis.ReadableStreamReadResult<R>;
   const WritableStream: typeof globalThis.WritableStream;
   type WritableStream<W = any> = globalThis.WritableStream<W>;
@@ -1887,22 +1907,43 @@ declare module 'node:readline' {
       input: Readable;
       output?: Writable;
       prompt?: string;
+      /** Line editing over keypresses (default: when stdin and stdout are terminals) */
       terminal?: boolean;
+      /** Tab completion: [completions, the substring they complete] (or through a callback) */
+      completer?: Completer | AsyncCompleter;
+      /** Initial history, most recent first */
+      history?: string[];
+      historySize?: number;
+      removeHistoryDuplicates?: boolean;
+    }
+    type CompleterResult = [string[], string];
+    type Completer = (line: string) => CompleterResult;
+    type AsyncCompleter = (line: string, callback: (err?: null | Error, result?: CompleterResult) => void) => void;
+    interface CursorPos {
+      rows: number;
+      cols: number;
     }
     class Interface extends EventEmitter implements AsyncIterable<string> {
       readonly closed: boolean;
+      readonly terminal: boolean;
+      /** The line being edited (terminal mode) */
+      readonly line: string;
+      readonly cursor: number;
+      /** Entered lines, most recent first (terminal mode) */
+      readonly history: string[];
+      getCursorPos(): CursorPos;
       question(query: string, callback: (answer: string) => void): void;
       prompt(preserveCursor?: boolean): void;
       setPrompt(prompt: string): void;
       getPrompt(): string;
-      write(data: string): void;
+      write(data: string | null, key?: Key): void;
       pause(): this;
       resume(): this;
       close(): void;
       [Symbol.asyncIterator](): AsyncIterator<string>;
     }
     function createInterface(options: ReadLineOptions): Interface;
-    function createInterface(input: Readable, output?: Writable): Interface;
+    function createInterface(input: Readable, output?: Writable, completer?: Completer | AsyncCompleter, terminal?: boolean): Interface;
     /** TypeNative extension: prints the prompt and reads one line from stdin, synchronously */
     function question(prompt: string): string;
     type Direction = -1 | 0 | 1;
@@ -1933,6 +1974,11 @@ declare module 'node:readline/promises' {
   namespace promises {
     class Interface extends EventEmitter implements AsyncIterable<string> {
       readonly closed: boolean;
+      readonly terminal: boolean;
+      readonly line: string;
+      readonly cursor: number;
+      readonly history: string[];
+      getCursorPos(): import('node:readline').CursorPos;
       question(query: string, options?: { signal?: AbortSignal }): Promise<string>;
       prompt(preserveCursor?: boolean): void;
       setPrompt(prompt: string): void;
@@ -1942,7 +1988,7 @@ declare module 'node:readline/promises' {
       close(): void;
       [Symbol.asyncIterator](): AsyncIterator<string>;
     }
-    function createInterface(options: { input: Readable; output?: Writable; prompt?: string; terminal?: boolean }): Interface;
+    function createInterface(options: import('node:readline').ReadLineOptions): Interface;
     function createInterface(input: Readable, output?: Writable): Interface;
   }
   export = promises;
