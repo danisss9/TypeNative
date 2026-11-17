@@ -591,7 +591,7 @@ declare function encodeURIComponent(uriComponent: string): string;
 declare function decodeURIComponent(uriComponent: string): string;
 declare function encodeURI(uri: string): string;
 declare function decodeURI(encodedURI: string): string;
-declare function structuredClone<T>(value: T): T;
+declare function structuredClone<T>(value: T, options?: { transfer?: any[] }): T;
 
 // The running program (a native binary has no separate script file)
 declare var __filename: string;
@@ -1734,6 +1734,34 @@ interface UnderlyingSource<R = any> {
   pull?(controller: ReadableStreamDefaultController<R>): void | PromiseLike<void>;
   cancel?(reason?: any): void | PromiseLike<void>;
 }
+/** A byte stream's controller: enqueue bytes, or fill the waiting BYOB read's view */
+interface ReadableByteStreamController {
+  readonly byobRequest: ReadableStreamBYOBRequest | null;
+  readonly desiredSize: number | null;
+  enqueue(chunk: Uint8Array): void;
+  close(): void;
+  error(e?: any): void;
+}
+interface ReadableStreamBYOBRequest {
+  /** The unfilled part of the reader's view */
+  readonly view: Uint8Array | null;
+  respond(bytesWritten: number): void;
+  respondWithNewView(view: Uint8Array): void;
+}
+interface UnderlyingByteSource {
+  type: 'bytes';
+  autoAllocateChunkSize?: number;
+  start?(controller: ReadableByteStreamController): any;
+  pull?(controller: ReadableByteStreamController): void | PromiseLike<void>;
+  cancel?(reason?: any): void | PromiseLike<void>;
+}
+/** getReader({ mode: 'byob' }): reads fill the caller's view */
+interface ReadableStreamBYOBReader {
+  readonly closed: Promise<void>;
+  read<T extends Uint8Array>(view: T, options?: { min?: number }): Promise<ReadableStreamReadResult<T>>;
+  releaseLock(): void;
+  cancel(reason?: any): Promise<void>;
+}
 interface QueuingStrategy<T = any> {
   highWaterMark?: number;
   size?(chunk: T): number;
@@ -1756,6 +1784,7 @@ interface ReadableWritablePair<R = any, W = any> {
 }
 interface ReadableStream<R = any> extends AsyncIterable<R> {
   readonly locked: boolean;
+  getReader(options: { mode: 'byob' }): ReadableStreamBYOBReader;
   getReader(options?: { mode?: undefined }): ReadableStreamDefaultReader<R>;
   cancel(reason?: any): Promise<void>;
   tee(): [ReadableStream<R>, ReadableStream<R>];
@@ -1765,10 +1794,12 @@ interface ReadableStream<R = any> extends AsyncIterable<R> {
   [Symbol.asyncIterator](): AsyncIterableIterator<R>;
 }
 declare var ReadableStream: {
+  new (underlyingSource: UnderlyingByteSource, strategy?: { highWaterMark?: number }): ReadableStream<Uint8Array>;
   new <R = any>(underlyingSource?: UnderlyingSource<R>, strategy?: QueuingStrategy<R>): ReadableStream<R>;
   from<T>(iterable: Iterable<T> | AsyncIterable<T>): ReadableStream<T>;
 };
 declare var ReadableStreamDefaultReader: { new <R = any>(stream: ReadableStream<R>): ReadableStreamDefaultReader<R> };
+declare var ReadableStreamBYOBReader: { new (stream: ReadableStream<Uint8Array>): ReadableStreamBYOBReader };
 
 interface WritableStreamDefaultController {
   readonly signal: AbortSignal;

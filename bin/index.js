@@ -574,13 +574,16 @@ export function run(opts) {
     const modules = [];
     let goVersion = `${MIN_GO_MAJOR}.${MIN_GO_MINOR}`;
     const xNetImport = /^import (\w+ )?"golang\.org\/x\/net\//m;
-    if (generated.some((content) => xNetImport.test(content)))
-        modules.push(vendorXNet(outDir));
     if (generated.some((content) => importsVendoredModule(content, opts.vendorDir))) {
         const vendored = vendorGoModules(opts.vendorDir, outDir);
         for (const mod of vendored.modules)
             modules.push(mod);
         goVersion = vendored.goVersion;
+    }
+    // The GOROOT copy of dns/dnsmessage is the fallback for a manifest that
+    // doesn't vendor golang.org/x/net itself
+    if (generated.some((content) => xNetImport.test(content)) && !modules.some((mod) => mod.path === 'golang.org/x/net')) {
+        modules.push(vendorXNet(outDir));
     }
     writeGoMod(modules, goVersion, outDir);
     if (opts.emitGo) {

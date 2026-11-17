@@ -1,9 +1,17 @@
 // node:tls — TLS servers and clients: net sockets over crypto/tls. Handshakes
 // run on the dial / accept goroutines; certificates are verified like Node
 // (rejectUnauthorized, ca, Node's error codes: DEPTH_ZERO_SELF_SIGNED_CERT,
-// ERR_TLS_CERT_ALTNAME_INVALID …). Also used by https.
-import { defineClass, defineHelper, defineModule, setResults } from './registry.js';
+// ERR_TLS_CERT_ALTNAME_INVALID …). PFX bundles and passphrases decrypt through
+// the same code node:crypto uses; session tickets map to Node's 'newSession' /
+// 'resumeSession' / 'session' API. Also used by https.
+import { defineClass, defineHelper, defineModule, getOption, isObjectLiteral, isStringNode, setResults } from './registry.js';
 import { SOCKET_METHODS, SOCKET_GETTERS, SERVER_METHODS, socketListenerTypes } from './net.js';
+import { ROOT_CERTIFICATES } from './tls_roots.js';
+// tls.rootCertificates: the Mozilla bundle as a Go slice
+const ROOTS_HELPER = `// tls.rootCertificates
+var tnRootCertificates = []string{
+${ROOT_CERTIFICATES.map((pem) => JSON.stringify(pem)).join(',\n')},
+}`;
 const tlsConfigHelper = `// TLS configuration from Node options (key / cert / ca as PEM strings or Buffers)
 func tnPemValue(v interface{}) interface{} {
 	switch x := v.(type) {
@@ -57,11 +65,97 @@ func tnCertPool(pems []string) *x509.CertPool {
 	return pool
 }
 
+// An encrypted PEM private key with options.passphrase
+func tnTLSDecryptKey(key string, pass string, havePass bool) string {
+	rest := []byte(key)
+	block, _ := pem.Decode(rest)
+	if block == nil || !tnPEMEncrypted(block) {
+		return key
+	}
+	return string(pem.EncodeToMemory(tnPEMDecryptBlock(block, []byte(pass), havePass)))
+}
+
+type tnPFXEntry struct {
+	data []byte
+	pass string
+}
+
+// options.pfx: a Buffer / string, or an array of those and { buf, passphrase }
+func tnPFXEntries(v interface{}, pass string, havePass bool) []tnPFXEntry {
+	entries := []tnPFXEntry{}
+	add := func(item interface{}) {
+		switch x := item.(type) {
+		case []byte:
+			entries = append(entries, tnPFXEntry{data: x, pass: pass})
+		case string:
+			entries = append(entries, tnPFXEntry{data: []byte(x), pass: pass})
+		case nil:
+		default:
+			buf, _ := TnGetValue(item, "buf").([]byte)
+			if buf == nil {
+				if s, ok := TnGetValue(item, "buf").(string); ok {
+					buf = []byte(s)
+				}
+			}
+			p := pass
+			if s, ok := TnGetValue(item, "passphrase").(string); ok {
+				p = s
+			}
+			if len(buf) > 0 {
+				entries = append(entries, tnPFXEntry{data: buf, pass: p})
+			}
+		}
+	}
+	// an array of entries (of any element type the transpiler inferred)
+	rv := reflect.ValueOf(v)
+	if rv.IsValid() && rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() != reflect.Uint8 {
+		for i := 0; i < rv.Len(); i++ {
+			add(rv.Index(i).Interface())
+		}
+		return entries
+	}
+	add(v)
+	return entries
+}
+
 func tnKeyPair(options interface{}) ([]tls.Certificate, error) {
+	pass := ""
+	havePass := false
+	switch s := TnGetValue(options, "passphrase").(type) {
+	case string:
+		pass, havePass = s, true
+	case []byte:
+		pass, havePass = string(s), true
+	}
+	if pfx := TnGetValue(options, "pfx"); pfx != nil && !TnIsNil(pfx) {
+		pairs := []tls.Certificate{}
+		for _, entry := range tnPFXEntries(pfx, pass, havePass) {
+			keyDER, certPEM, err := tnPkcs12KeyPair(entry.data, entry.pass)
+			if te, ok := err.(*TnError); ok {
+				return nil, te
+			}
+			if err != nil {
+				if len(pairs) > 0 {
+					continue
+				}
+				return nil, TnNodeError("Error", "ERR_OSSL_PKCS12_MAC_VERIFY_FAILURE", "error:11800071:PKCS12 routines::mac verify failure")
+			}
+			keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+			pair, err := tls.X509KeyPair(certPEM, keyPEM)
+			if err != nil {
+				return nil, TnNodeError("Error", "ERR_OSSL_PEM_NO_START_LINE", err.Error())
+			}
+			pairs = append(pairs, pair)
+		}
+		if len(pairs) > 0 {
+			return pairs, nil
+		}
+	}
 	key, cert := tnPemString(TnGet(options, "key")), tnPemString(TnGet(options, "cert"))
 	if key == "" && cert == "" {
 		return nil, nil
 	}
+	key = tnTLSDecryptKey(key, pass, havePass)
 	pair, err := tls.X509KeyPair([]byte(cert), []byte(key))
 	if err != nil {
 		return nil, TnNodeError("Error", "ERR_OSSL_PEM_NO_START_LINE", err.Error())
@@ -405,6 +499,76 @@ func TnCheckServerIdentity(hostname string, cert interface{}) *TnError {
 	return e
 }
 
+func tnTLSSessionKey(cfg *tls.Config, conn net.Conn) string {
+	if cfg != nil && cfg.ServerName != "" {
+		return cfg.ServerName
+	}
+	if conn != nil && conn.RemoteAddr() != nil {
+		return conn.RemoteAddr().String()
+	}
+	return ""
+}
+
+// A session as Node hands it around: an opaque Buffer
+func tnEncodeClientSession(s *tls.ClientSessionState) []byte {
+	if s == nil {
+		return nil
+	}
+	ticket, state, err := s.ResumptionState()
+	if err != nil || state == nil {
+		return nil
+	}
+	st, err := state.Bytes()
+	if err != nil {
+		return nil
+	}
+	out := []byte{byte(len(ticket) >> 8), byte(len(ticket))}
+	out = append(out, ticket...)
+	out = append(out, byte(len(st)>>8), byte(len(st)))
+	return append(out, st...)
+}
+
+func tnDecodeClientSession(b []byte) *tls.ClientSessionState {
+	if len(b) < 4 {
+		return nil
+	}
+	n := int(b[0])<<8 | int(b[1])
+	if len(b) < 2+n+2 {
+		return nil
+	}
+	ticket, rest := b[2:2+n], b[2+n:]
+	m := int(rest[0])<<8 | int(rest[1])
+	if len(rest) < 2+m {
+		return nil
+	}
+	state, err := tls.ParseSessionState(rest[2 : 2+m])
+	if err != nil {
+		return nil
+	}
+	s, err := tls.NewResumptionState(ticket, state)
+	if err != nil {
+		return nil
+	}
+	return s
+}
+
+// options.session: resume a session from a previous connection
+type tnSeedSessionCache struct {
+	inner tls.ClientSessionCache
+	seed  *tls.ClientSessionState
+	used  bool
+}
+
+func (c *tnSeedSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	if !c.used && c.seed != nil {
+		c.used = true
+		return c.seed, true
+	}
+	return c.inner.Get(key)
+}
+
+func (c *tnSeedSessionCache) Put(key string, state *tls.ClientSessionState) { c.inner.Put(key, state) }
+
 // Client options: servername / rejectUnauthorized / ca / key / cert / ALPNProtocols / min/maxVersion.
 // verified receives the result of Node's verification ('' when authorized)
 func tnTLSClientConfig(options interface{}, host string, verified func(err *TnError)) (*tls.Config, error) {
@@ -436,6 +600,14 @@ func tnTLSClientConfig(options interface{}, host string, verified func(err *TnEr
 	if net.ParseIP(servername) == nil {
 		cfg.ServerName = servername
 	}
+	// options.session resumes a previous connection's ticket
+	var cache tls.ClientSessionCache = tls.NewLRUClientSessionCache(16)
+	if s, ok := TnGetValue(options, "session").([]byte); ok && len(s) > 0 {
+		if state := tnDecodeClientSession(s); state != nil {
+			cache = &tnSeedSessionCache{inner: cache, seed: state}
+		}
+	}
+	cfg.ClientSessionCache = cache
 	// options.checkServerIdentity(servername, cert) replaces the hostname check; it runs on the loop
 	check := TnGet(options, "checkServerIdentity")
 	cfg.VerifyConnection = func(state tls.ConnectionState) error {
@@ -476,6 +648,53 @@ type TnCipherInfo struct {
 	version      string
 }
 
+// Session tickets and the socket's TLS configuration (getSession / isSessionReused)
+type TnTLSSocketState struct {
+	cert    *x509.Certificate
+	cfg     *tls.Config
+	cache   tls.ClientSessionCache
+	server  bool
+	tried   bool
+}
+
+// Checks for a post-handshake session ticket while the socket is read
+type tnSessionWatchConn struct {
+	net.Conn
+	check func()
+}
+
+func (w *tnSessionWatchConn) Read(p []byte) (int, error) {
+	n, err := w.Conn.Read(p)
+	if w.check != nil {
+		w.check()
+	}
+	return n, err
+}
+
+func (s *TnSocket) tlsSessionState() *TnTLSSocketState {
+	st, _ := s.tlsState.(*TnTLSSocketState)
+	return st
+}
+
+func (s *TnSocket) getSession() []byte {
+	st := s.tlsSessionState()
+	if st == nil || st.cache == nil {
+		return nil
+	}
+	state, ok := st.cache.Get(tnTLSSessionKey(st.cfg, s.conn))
+	if !ok {
+		return nil
+	}
+	return tnEncodeClientSession(state)
+}
+
+func (s *TnSocket) isSessionReused() bool {
+	if state := s.tlsConnState(); state != nil {
+		return state.DidResume
+	}
+	return false
+}
+
 func (s *TnSocket) tlsConnState() *tls.ConnectionState {
 	if tc, ok := s.conn.(*tls.Conn); ok {
 		state := tc.ConnectionState()
@@ -493,9 +712,8 @@ func (s *TnSocket) getPeerCertificate(detailed ...bool) *TnPeerCertificate {
 }
 
 func (s *TnSocket) getCertificate() *TnPeerCertificate {
-	state := s.tlsConnState()
-	if tc, ok := s.conn.(*tls.Conn); ok && state != nil {
-		_ = tc
+	if st := s.tlsSessionState(); st != nil && st.cert != nil {
+		return tnPeerCertificate(st.cert)
 	}
 	if s.tlsState != nil {
 		if cert, ok := s.tlsState.(*x509.Certificate); ok {
@@ -575,8 +793,23 @@ func TnTLSConnect(args ...interface{}) *TnSocket {
 		TnLoopPost(func() { s.destroy(e) })
 		return s
 	}
+	state := &TnTLSSocketState{cfg: cfg, cache: cfg.ClientSessionCache}
+	s.tlsState = state
+	checkSession := func(conn net.Conn) {
+		if state.tried {
+			return
+		}
+		cs, ok := cfg.ClientSessionCache.Get(tnTLSSessionKey(cfg, conn))
+		if !ok {
+			return
+		}
+		state.tried = true
+		if buf := tnEncodeClientSession(cs); buf != nil {
+			s.post(func() { s.emit("session", buf) })
+		}
+	}
 	s.dialWrap = func(conn net.Conn) (net.Conn, error) {
-		tc := tls.Client(conn, cfg)
+		tc := tls.Client(&tnSessionWatchConn{Conn: conn, check: func() { checkSession(conn) }}, cfg)
 		if err := tc.HandshakeContext(context.Background()); err != nil {
 			if te := tnUnwrapTnError(err); te != nil {
 				return nil, te
@@ -591,6 +824,7 @@ func TnTLSConnect(args ...interface{}) *TnSocket {
 		if verifyErr != nil {
 			s.authorizationError = verifyErr.code
 		}
+		checkSession(s.conn)
 		s.emit("secureConnect")
 	}
 	if cb != nil {
@@ -619,6 +853,52 @@ func TnTLSCreateServer(args ...interface{}) *TnNetServer {
 	if options != nil {
 		requestCert, _ = TnGetValue(options, "requestCert").(bool)
 	}
+	// Session tickets: Node's 'newSession' / 'resumeSession' events
+	var mu sync.Mutex
+	sessions := map[string]*tls.SessionState{}
+	cfg.WrapSession = func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+		id := make([]byte, 32)
+		cryptorand.Read(id)
+		data, _ := ss.Bytes()
+		if srv.listenerCount("newSession") > 0 {
+			done := make(chan interface{}, 1)
+			TnLoopCall(func() {
+				srv.emit("newSession", id, data, func(err interface{}) { done <- err })
+			})
+			if err := <-done; err != nil && !TnIsNil(err) {
+				// the ticket is discarded, but the connection stays up
+				return id, nil
+			}
+		}
+		mu.Lock()
+		sessions[string(id)] = ss
+		mu.Unlock()
+		return id, nil
+	}
+	cfg.UnwrapSession = func(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
+		mu.Lock()
+		ss := sessions[string(identity)]
+		mu.Unlock()
+		if srv.listenerCount("resumeSession") > 0 {
+			done := make(chan interface{}, 2)
+			TnLoopCall(func() {
+				srv.emit("resumeSession", identity, func(err interface{}, data interface{}) {
+					done <- err
+					done <- data
+				})
+			})
+			err, data := <-done, <-done
+			if err != nil && !TnIsNil(err) {
+				return nil, nil
+			}
+			if b, ok := data.([]byte); ok && len(b) > 0 {
+				if parsed, err := tls.ParseSessionState(b); err == nil {
+					return parsed, nil
+				}
+			}
+		}
+		return ss, nil
+	}
 	srv.wrapConn = func(conn net.Conn) (net.Conn, error) {
 		tc := tls.Server(conn, cfg)
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -630,6 +910,13 @@ func TnTLSCreateServer(args ...interface{}) *TnNetServer {
 	}
 	srv.onSocket = func(s *TnSocket) {
 		tnTLSAfterHandshake(s)
+		session := &TnTLSSocketState{cfg: cfg, server: true}
+		if len(cfg.Certificates) > 0 && len(cfg.Certificates[0].Certificate) > 0 {
+			if leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0]); err == nil {
+				session.cert = leaf
+			}
+		}
+		s.tlsState = session
 		if state := s.tlsConnState(); state != nil && requestCert {
 			if len(state.PeerCertificates) > 0 {
 				err := tnVerifyPeer(state.PeerCertificates, cfg.ClientCAs, "")
@@ -667,12 +954,54 @@ func TnTLSGetCiphers() []string {
 	}
 	return out
 }`;
+// Whether a tls call's options may hold `pfx`: an options literal naming it,
+// or an options argument that is not written out as a literal
+function mayUsePfx(c) {
+    for (let i = 0; i < c.nodes.length; i++) {
+        const node = c.nodes[i];
+        const type = c.types[i] || '';
+        if (isObjectLiteral(node)) {
+            if (getOption(node, 'pfx'))
+                return true;
+            continue;
+        }
+        if (type === 'string' || type === 'float64' || type.startsWith('func'))
+            continue;
+        if (node && (node.kind === 'ArrowFunction' || node.kind === 'FunctionExpression' || isStringNode(node)))
+            continue;
+        return true;
+    }
+    return false;
+}
 export function registerTls(r) {
     defineModule(r, 'tls');
-    defineHelper(r, 'tlsConfig', ['bytes', 'crypto/sha1', 'crypto/sha256', 'crypto/sha512', 'crypto/tls', 'crypto/x509', 'crypto/x509/pkix', 'errors', 'fmt', 'net', 'strings', 'time'], ['dynamic', 'nodeNet', 'netErrors', 'orderedMap', 'eventLoop', 'nodeInvoke'], tlsConfigHelper);
-    defineHelper(r, 'nodeTls', ['context', 'crypto/tls', 'crypto/x509', 'net', 'strings', 'time'], ['tlsConfig', 'nodeNet', 'orderedMap'], tlsHelper);
+    defineHelper(r, 'tlsConfig', [
+        'bytes',
+        'crypto/sha1',
+        'crypto/sha256',
+        'crypto/sha512',
+        'crypto/tls',
+        'crypto/x509',
+        'crypto/x509/pkix',
+        'encoding/pem',
+        'errors',
+        'fmt',
+        'net',
+        'reflect',
+        'strings',
+        'time'
+    ], ['dynamic', 'nodeNet', 'netErrors', 'orderedMap', 'eventLoop', 'nodeInvoke', 'nodePem'], tlsConfigHelper);
+    defineHelper(r, 'nodeTls', ['context', 'crypto/rand', 'crypto/tls', 'crypto/x509', 'net', 'strings', 'sync', 'time'], ['tlsConfig', 'nodeNet', 'orderedMap'], tlsHelper);
+    // Mozilla's bundle, as Node embeds it (linked only when tls.rootCertificates is read)
+    defineHelper(r, 'nodeTlsRoots', [], [], ROOTS_HELPER);
     const use = () => r.helper('nodeTls');
-    defineClass(r, 'tls.TLSSocket', '*TnSocket', 'class', SOCKET_METHODS + '; getPeerCertificate=*TnPeerCertificate; getCertificate=*TnPeerCertificate; getProtocol=interface{}; getCipher=*TnCipherInfo', '', SOCKET_GETTERS + '; alpnProtocol=interface{}; servername=interface{}', '');
+    // The vendored PKCS#12 decoder, for calls whose options may carry `pfx`
+    const useWithPfx = (c) => {
+        use();
+        if (mayUsePfx(c))
+            r.helper('nodePkcs12');
+    };
+    defineClass(r, 'tls.TLSSocket', '*TnSocket', 'class', SOCKET_METHODS + '; getPeerCertificate=*TnPeerCertificate; getCertificate=*TnPeerCertificate; getProtocol=interface{}; getCipher=*TnCipherInfo; getSession=[]byte; isSessionReused=bool', '', SOCKET_GETTERS + '; alpnProtocol=interface{}; servername=interface{}', '');
     // net.Socket instances share the Go type; TLS methods are available on both
     const netSocket = r.classes['net.Socket'];
     if (netSocket) {
@@ -689,17 +1018,17 @@ export function registerTls(r) {
     r.paramTypers['tls.Server#on'] = r.paramTypers['net.Server#on'];
     r.paramTypers['tls.Server#once'] = r.paramTypers['net.Server#once'];
     r.functions['tls.connect'] = (c) => {
-        use();
+        useWithPfx(c);
         return `TnTLSConnect(${c.args.join(', ')})`;
     };
     r.paramTypers['tls.connect'] = (_n) => [];
     r.functions['tls.createServer'] = (c) => {
-        use();
+        useWithPfx(c);
         return `TnTLSCreateServer(${c.args.join(', ')})`;
     };
     r.paramTypers['tls.createServer'] = (_n) => ['*TnSocket'];
     r.functions['tls.createSecureContext'] = (c) => {
-        use();
+        useWithPfx(c);
         return `TnCreateSecureContext(${c.args.join(', ')})`;
     };
     r.functions['tls.checkServerIdentity'] = (c) => {
@@ -715,7 +1044,12 @@ export function registerTls(r) {
     r.values['tls.DEFAULT_MIN_VERSION'] = (_c) => '"TLSv1.2"';
     r.values['tls.DEFAULT_MAX_VERSION'] = (_c) => '"TLSv1.3"';
     r.values['tls.DEFAULT_ECDH_CURVE'] = (_c) => '"auto"';
+    r.values['tls.rootCertificates'] = (_c) => {
+        r.helper('nodeTlsRoots');
+        return 'tnRootCertificates';
+    };
     r.valueTypes['tls.DEFAULT_MIN_VERSION'] = 'string';
     r.valueTypes['tls.DEFAULT_MAX_VERSION'] = 'string';
     r.valueTypes['tls.DEFAULT_ECDH_CURVE'] = 'string';
+    r.valueTypes['tls.rootCertificates'] = '[]string';
 }

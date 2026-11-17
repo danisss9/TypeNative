@@ -752,11 +752,15 @@ declare module 'node:crypto' {
       final(): Buffer;
       final(outputEncoding: BufferEncoding): string;
     }
-    /** 'hmac' (options.digest), 'kmac128' / 'kmac256' (outputLength, customization), 'cmac' (options.cipher: an AES-CBC name) */
+    /**
+     * 'hmac' (options.digest), 'kmac128' / 'kmac256' (outputLength, customization), 'cmac' (options.cipher: an AES-CBC name),
+     * 'gmac' (cipher: an AES-GCM name, iv), 'poly1305', 'siphash' (outputLength 8 / 16), 'blake2bmac' / 'blake2smac'
+     * (outputLength, salt, customization)
+     */
     function createMac(
       algorithm: string,
       key: BinaryLike,
-      options?: { digest?: string; outputLength?: number; customization?: BinaryLike; cipher?: string }
+      options?: { digest?: string; outputLength?: number; customization?: BinaryLike; cipher?: string; iv?: BinaryLike; salt?: BinaryLike }
     ): Mac;
     function getMacs(): string[];
     function randomInt(max: number): number;
@@ -765,8 +769,9 @@ declare module 'node:crypto' {
     function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean;
     function pbkdf2Sync(password: BinaryLike, salt: BinaryLike, iterations: number, keylen: number, digest: string): Buffer;
     function hkdfSync(digest: string, ikm: BinaryLike, salt: BinaryLike, info: BinaryLike, keylen: number): ArrayBuffer;
-    function createCipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Cipheriv;
-    function createDecipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike): Decipheriv;
+    /** AES-SIV ('aes-128-siv' …) takes a null IV */
+    function createCipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike | null): Cipheriv;
+    function createDecipheriv(algorithm: string, key: BinaryLike, iv: BinaryLike | null): Decipheriv;
     const webcrypto: typeof crypto;
 
     // scrypt, callback forms
@@ -792,7 +797,7 @@ declare module 'node:crypto' {
 
     // Keys
     type KeyObjectType = 'secret' | 'public' | 'private';
-    type KeyType = 'rsa' | 'ec' | 'ed25519' | 'x25519';
+    type KeyType = 'rsa' | 'rsa-pss' | 'dsa' | 'ec' | 'ed25519' | 'ed448' | 'x25519' | 'x448' | 'dh';
     type KeyFormat = 'pem' | 'der' | 'jwk';
     interface JsonWebKey {
       kty?: string;
@@ -809,10 +814,20 @@ declare module 'node:crypto' {
       modulusLength?: number;
       publicExponent?: bigint;
       namedCurve?: string;
+      /** RSA-PSS keys */
+      hashAlgorithm?: string;
+      mgf1HashAlgorithm?: string;
+      saltLength?: number;
+      trailerField?: number;
+      /** DSA keys */
+      divisorLength?: number;
     }
     interface KeyExportOptions<T extends KeyFormat> {
       type?: 'pkcs1' | 'spki' | 'pkcs8' | 'sec1';
       format: T;
+      /** Private keys: PBES2 encryption of the PKCS#8 output */
+      cipher?: string;
+      passphrase?: string | Buffer;
     }
     interface JwkKeyExportOptions {
       format: 'jwk';
@@ -876,6 +891,10 @@ declare module 'node:crypto' {
       modulusLength?: number;
       publicExponent?: number;
       namedCurve?: string;
+      /** RSA-PSS keys */
+      hashAlgorithm?: string;
+      mgf1HashAlgorithm?: string;
+      saltLength?: number;
     }
     function generateKeyPairSync(type: KeyType, options: KeyPairOptions<'pem', 'pem'>): KeyPairSyncResult<string, string>;
     function generateKeyPairSync(type: KeyType, options: KeyPairOptions<'der', 'der'>): KeyPairSyncResult<Buffer, Buffer>;
@@ -1018,6 +1037,19 @@ declare module 'node:crypto' {
       toString(): string;
       toJSON(): string;
       toLegacyObject(): Record<string, any>;
+    }
+
+    // PKCS#12 (PFX) bundles, and Netscape SPKAC certificates
+    interface PKCS12 {
+      privateKey: KeyObject | null;
+      certificate: X509Certificate | null;
+      additionalCertificates: X509Certificate[];
+    }
+    function parsePKCS12(bundle: Uint8Array, options?: { passphrase?: string | Uint8Array }): PKCS12;
+    class Certificate {
+      static verifySpkac(spkac: string | Uint8Array, encoding?: BufferEncoding): boolean;
+      static exportChallenge(spkac: string | Uint8Array, encoding?: BufferEncoding): Buffer;
+      static exportPublicKey(spkac: string | Uint8Array, encoding?: BufferEncoding): Buffer;
     }
 
     // webcrypto
@@ -1517,6 +1549,8 @@ declare module 'node:events' {
     static getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     static listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
     static readonly errorMonitor: unique symbol;
+    /** Symbol.for('nodejs.rejection'): a subclass method of this name handles captured rejections */
+    static readonly captureRejectionSymbol: unique symbol;
     static captureRejections: boolean;
     static getMaxListeners(emitter: EventEmitter | EventTarget): number;
     static setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
@@ -1538,6 +1572,7 @@ declare module 'node:events' {
     function getEventListeners(emitter: EventEmitter, name: string | symbol): Function[];
     function listenerCount(emitter: EventEmitter, eventName: string | symbol): number;
     const errorMonitor: typeof EventEmitter.errorMonitor;
+    const captureRejectionSymbol: typeof EventEmitter.captureRejectionSymbol;
     let captureRejections: boolean;
     function getMaxListeners(emitter: EventEmitter | EventTarget): number;
     function setMaxListeners(n?: number, ...eventTargets: (EventEmitter | EventTarget)[]): void;
@@ -1582,6 +1617,7 @@ declare module 'node:stream' {
       readonly readableEnded: boolean;
       readonly readableFlowing: boolean | null;
       readonly readableLength: number;
+      readonly readableHighWaterMark: number;
       readonly readableObjectMode: boolean;
       readonly destroyed: boolean;
       readonly closed: boolean;
@@ -1600,7 +1636,9 @@ declare module 'node:stream' {
       compose(stream: Duplex | ((source: any) => any)): Duplex;
       destroy(error?: Error): this;
       [Symbol.asyncIterator](): AsyncIterator<any>;
-      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
+      /** readable[Symbol.for('Stream.toAsyncStreamable')](): the chunks as batches of Uint8Arrays (stream/iter) */
+      [key: symbol]: any;
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy; type?: 'bytes' }): ReadableStream;
       static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
     }
     class Writable extends Stream {
@@ -1611,6 +1649,8 @@ declare module 'node:stream' {
       readonly writableEnded: boolean;
       readonly writableFinished: boolean;
       readonly writableLength: number;
+      readonly writableHighWaterMark: number;
+      readonly writableNeedDrain: boolean;
       readonly writableObjectMode: boolean;
       readonly destroyed: boolean;
       readonly closed: boolean;
@@ -1629,8 +1669,8 @@ declare module 'node:stream' {
       destroy(error?: Error): this;
     }
     class Duplex extends Readable implements Writable {
-      static toWeb(streamDuplex: Duplex): { readable: ReadableStream; writable: WritableStream };
-      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy }): ReadableStream;
+      static toWeb(streamDuplex: Duplex, options?: { readableType?: 'bytes' }): { readable: ReadableStream; writable: WritableStream };
+      static toWeb(streamReadable: Readable, options?: { strategy?: QueuingStrategy; type?: 'bytes' }): ReadableStream;
       static fromWeb(pair: { readable: ReadableStream; writable: WritableStream }, options?: DuplexOptions): Duplex;
       static fromWeb(readableStream: ReadableStream, options?: ReadableOptions): Readable;
       constructor(options?: DuplexOptions);
@@ -1638,6 +1678,8 @@ declare module 'node:stream' {
       readonly writableEnded: boolean;
       readonly writableFinished: boolean;
       readonly writableLength: number;
+      readonly writableHighWaterMark: number;
+      readonly writableNeedDrain: boolean;
       readonly writableObjectMode: boolean;
       _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
       _final(callback: (error?: Error | null) => void): void;
@@ -1658,7 +1700,12 @@ declare module 'node:stream' {
     class PassThrough extends Transform {}
     function pipeline<T extends Writable | Duplex>(...args: [...streams: (Readable | Writable | Duplex)[], callback: (err: NodeJS.ErrnoException | null) => void]): T;
     function finished(stream: Readable | Writable, callback: (err?: NodeJS.ErrnoException | null) => void): void;
-    function compose(...streams: (Readable | Writable | Duplex | ReadableStream | WritableStream | TransformStream)[]): Duplex;
+    /** Streams, web streams, or functions: an async generator over the chunks, a source generator, an async sink */
+    function compose(...streams: (Readable | Writable | Duplex | ReadableStream | WritableStream | TransformStream | ((source: AsyncIterable<any>) => any))[]): Duplex;
+    function getDefaultHighWaterMark(objectMode: boolean): number;
+    /** Two connected Duplexes: what one writes, the other reads */
+    function duplexPair(options?: DuplexOptions): [Duplex, Duplex];
+    function setDefaultHighWaterMark(objectMode: boolean, value: number): void;
     const promises: typeof import('node:stream/promises');
     const web: typeof import('node:stream/web');
   }
@@ -1725,24 +1772,48 @@ declare module 'node:http2' {
       readonly encrypted: boolean | undefined;
       readonly alpnProtocol: string | undefined;
       readonly socket: net.Socket;
+      /** 0 on the server (NGHTTP2_SESSION_SERVER), 1 on the client */
+      readonly type: number;
+      readonly connecting: boolean;
+      readonly localSettings: Settings;
+      readonly remoteSettings: Settings;
+      /** true while a SETTINGS frame this side sent waits for the peer's ACK */
+      readonly pendingSettingsAck: boolean;
       close(callback?: () => void): void;
       destroy(error?: Error, code?: number): void;
       ref(): void;
       unref(): void;
       setTimeout(msecs: number, callback?: () => void): void;
+      /** Sends a PING frame; the callback runs on the peer's ACK. Returns true when it was sent */
+      ping(callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
+      ping(payload: Buffer | Uint8Array, callback: (err: Error | null, duration: number, payload: Buffer) => void): boolean;
+      /** Sends a SETTINGS frame; the callback and 'localSettings' follow the peer's ACK */
+      settings(settings: Settings, callback?: (err: Error | null, settings: Settings, duration: number) => void): void;
+      goaway(code?: number, lastStreamID?: number, opaqueData?: Buffer | Uint8Array): void;
+      on(event: 'ping', listener: (payload: Buffer) => void): this;
+      on(event: 'localSettings' | 'remoteSettings', listener: (settings: Settings) => void): this;
+      on(event: 'goaway', listener: (errorCode: number, lastStreamID: number, opaqueData: Buffer) => void): this;
+      on(event: 'close', listener: () => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
     }
     interface ClientHttp2Session extends Http2Session {
       request(headers?: OutgoingHttpHeaders, options?: { endStream?: boolean }): ClientHttp2Stream;
       on(event: 'connect', listener: (session: ClientHttp2Session, socket: net.Socket) => void): this;
+      on(event: 'altsvc', listener: (alt: string, origin: string, streamId: number) => void): this;
       on(event: 'error', listener: (err: Error) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
-    interface ServerHttp2Session extends Http2Session {}
+    interface ServerHttp2Session extends Http2Session {
+      altsvc(alt: string, originOrStream: string | URL | number): void;
+      on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
+      on(event: string, listener: (...args: any[]) => void): this;
+    }
     type Http2ServerRequest = http.IncomingMessage;
     type Http2ServerResponse = http.ServerResponse;
     interface Http2Server extends http.Server {
       on(event: 'stream', listener: (stream: ServerHttp2Stream, headers: IncomingHttpHeaders, flags: number) => void): this;
       on(event: 'request', listener: (request: Http2ServerRequest, response: Http2ServerResponse) => void): this;
+      on(event: 'session', listener: (session: ServerHttp2Session) => void): this;
       on(event: string, listener: (...args: any[]) => void): this;
     }
     type Http2SecureServer = Http2Server;
@@ -1758,6 +1829,7 @@ declare module 'node:http2' {
       initialWindowSize?: number;
       maxFrameSize?: number;
       maxConcurrentStreams?: number;
+      maxHeaderSize?: number;
       maxHeaderListSize?: number;
       enableConnectProtocol?: boolean;
     }
@@ -1767,6 +1839,8 @@ declare module 'node:http2' {
     function connect(authority: string | URL, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
     function connect(authority: string | URL, options?: { ca?: string | Buffer | (string | Buffer)[]; rejectUnauthorized?: boolean; servername?: string }, listener?: (session: ClientHttp2Session, socket: net.Socket) => void): ClientHttp2Session;
     function getDefaultSettings(): Settings;
+    function getPackedSettings(settings?: Settings): Buffer;
+    function getUnpackedSettings(buf: Buffer | Uint8Array): Settings & { customSettings?: Record<string, number> };
     const constants: {
       readonly HTTP2_HEADER_STATUS: ':status';
       readonly HTTP2_HEADER_METHOD: ':method';
@@ -1879,6 +1953,11 @@ declare module 'node:stream/web' {
   const ReadableStreamDefaultReader: typeof globalThis.ReadableStreamDefaultReader;
   type ReadableStreamDefaultReader<R = any> = globalThis.ReadableStreamDefaultReader<R>;
   type ReadableStreamDefaultController<R = any> = globalThis.ReadableStreamDefaultController<R>;
+  const ReadableStreamBYOBReader: typeof globalThis.ReadableStreamBYOBReader;
+  type ReadableStreamBYOBReader = globalThis.ReadableStreamBYOBReader;
+  type ReadableByteStreamController = globalThis.ReadableByteStreamController;
+  type ReadableStreamBYOBRequest = globalThis.ReadableStreamBYOBRequest;
+  type UnderlyingByteSource = globalThis.UnderlyingByteSource;
   type ReadableStreamReadResult<R> = globalThis.ReadableStreamReadResult<R>;
   const WritableStream: typeof globalThis.WritableStream;
   type WritableStream<W = any> = globalThis.WritableStream<W>;
@@ -1990,22 +2069,43 @@ declare module 'node:readline' {
       input: Readable;
       output?: Writable;
       prompt?: string;
+      /** Line editing over keypresses (default: when stdin and stdout are terminals) */
       terminal?: boolean;
+      /** Tab completion: [completions, the substring they complete] (or through a callback) */
+      completer?: Completer | AsyncCompleter;
+      /** Initial history, most recent first */
+      history?: string[];
+      historySize?: number;
+      removeHistoryDuplicates?: boolean;
+    }
+    type CompleterResult = [string[], string];
+    type Completer = (line: string) => CompleterResult;
+    type AsyncCompleter = (line: string, callback: (err?: null | Error, result?: CompleterResult) => void) => void;
+    interface CursorPos {
+      rows: number;
+      cols: number;
     }
     class Interface extends EventEmitter implements AsyncIterable<string> {
       readonly closed: boolean;
+      readonly terminal: boolean;
+      /** The line being edited (terminal mode) */
+      readonly line: string;
+      readonly cursor: number;
+      /** Entered lines, most recent first (terminal mode) */
+      readonly history: string[];
+      getCursorPos(): CursorPos;
       question(query: string, callback: (answer: string) => void): void;
       prompt(preserveCursor?: boolean): void;
       setPrompt(prompt: string): void;
       getPrompt(): string;
-      write(data: string): void;
+      write(data: string | null, key?: Key): void;
       pause(): this;
       resume(): this;
       close(): void;
       [Symbol.asyncIterator](): AsyncIterator<string>;
     }
     function createInterface(options: ReadLineOptions): Interface;
-    function createInterface(input: Readable, output?: Writable): Interface;
+    function createInterface(input: Readable, output?: Writable, completer?: Completer | AsyncCompleter, terminal?: boolean): Interface;
     /** TypeNative extension: prints the prompt and reads one line from stdin, synchronously */
     function question(prompt: string): string;
     type Direction = -1 | 0 | 1;
@@ -2036,6 +2136,11 @@ declare module 'node:readline/promises' {
   namespace promises {
     class Interface extends EventEmitter implements AsyncIterable<string> {
       readonly closed: boolean;
+      readonly terminal: boolean;
+      readonly line: string;
+      readonly cursor: number;
+      readonly history: string[];
+      getCursorPos(): import('node:readline').CursorPos;
       question(query: string, options?: { signal?: AbortSignal }): Promise<string>;
       prompt(preserveCursor?: boolean): void;
       setPrompt(prompt: string): void;
@@ -2045,7 +2150,7 @@ declare module 'node:readline/promises' {
       close(): void;
       [Symbol.asyncIterator](): AsyncIterator<string>;
     }
-    function createInterface(options: { input: Readable; output?: Writable; prompt?: string; terminal?: boolean }): Interface;
+    function createInterface(options: import('node:readline').ReadLineOptions): Interface;
     function createInterface(input: Readable, output?: Writable): Interface;
   }
   export = promises;
@@ -2575,6 +2680,8 @@ declare module 'node:http' {
       setTimeout(timeout: number, callback?: () => void): this;
       setNoDelay(noDelay?: boolean): void;
       setSocketKeepAlive(enable?: boolean, initialDelay?: number): void;
+      /** Trailers, sent with a chunked body whose Trailer header names them */
+      addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void;
       abort(): void;
     }
     interface ServerOptions {
@@ -2582,6 +2689,9 @@ declare module 'node:http' {
       keepAliveTimeout?: number;
       requestTimeout?: number;
       headersTimeout?: number;
+      /** How outgoing header values are validated (Node 26.3) */
+      httpValidation?: 'strict' | 'relaxed' | 'insecure';
+      insecureHTTPParser?: boolean;
     }
     type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
     class Server extends net.Server {
@@ -2600,13 +2710,21 @@ declare module 'node:http' {
       keepAlive?: boolean;
       keepAliveMsecs?: number;
       maxSockets?: number;
+      maxTotalSockets?: number;
       maxFreeSockets?: number;
+      scheduling?: 'fifo' | 'lifo';
       timeout?: number;
     }
     class Agent {
       constructor(options?: AgentOptions);
-      readonly keepAlive: boolean;
+      keepAlive: boolean;
+      keepAliveMsecs: number;
       maxSockets: number;
+      maxTotalSockets: number;
+      maxFreeSockets: number;
+      scheduling: 'fifo' | 'lifo';
+      timeout?: number;
+      readonly options: AgentOptions;
       destroy(): void;
     }
     interface RequestOptions {
@@ -2624,6 +2742,9 @@ declare module 'node:http' {
       agent?: Agent | boolean;
       setHost?: boolean;
       family?: number;
+      /** How outgoing header values are validated (Node 26.3) */
+      httpValidation?: 'strict' | 'relaxed' | 'insecure';
+      insecureHTTPParser?: boolean;
       // https
       ca?: string | Buffer | Array<string | Buffer>;
       cert?: string | Buffer;
@@ -2696,9 +2817,13 @@ declare module 'node:tls' {
       version: string;
     }
     interface SecureContextOptions {
-      key?: string | Buffer;
-      cert?: string | Buffer;
+      key?: string | Buffer | Array<string | Buffer>;
+      cert?: string | Buffer | Array<string | Buffer>;
       ca?: string | Buffer | Array<string | Buffer>;
+      /** PKCS#12 (PFX) bundles, or an array of them and { buf, passphrase } */
+      pfx?: string | Buffer | Array<string | Buffer | { buf: string | Buffer; passphrase?: string }>;
+      /** for encrypted private keys and PFX bundles */
+      passphrase?: string;
       minVersion?: 'TLSv1' | 'TLSv1.1' | 'TLSv1.2' | 'TLSv1.3';
       maxVersion?: 'TLSv1' | 'TLSv1.1' | 'TLSv1.2' | 'TLSv1.3';
     }
@@ -2716,6 +2841,8 @@ declare module 'node:tls' {
       rejectUnauthorized?: boolean;
       ALPNProtocols?: string[];
       timeout?: number;
+      /** a session from an earlier connection's 'session' event or getSession() */
+      session?: Buffer;
       checkServerIdentity?: (hostname: string, cert: PeerCertificate) => Error | undefined;
     }
     function checkServerIdentity(hostname: string, cert: PeerCertificate | { subject?: Record<string, string>; subjectaltname?: string }): Error | undefined;
@@ -2732,11 +2859,16 @@ declare module 'node:tls' {
       getCertificate(): PeerCertificate | null;
       getProtocol(): string | null;
       getCipher(): CipherNameAndProtocol;
+      /** the current session as an opaque Buffer (client sockets) */
+      getSession(): Buffer | undefined;
+      isSessionReused(): boolean;
     }
     class Server extends net.Server {}
     const DEFAULT_MIN_VERSION: string;
     const DEFAULT_MAX_VERSION: string;
     const DEFAULT_ECDH_CURVE: string;
+    /** Mozilla's root certificates, as Node embeds them */
+    const rootCertificates: string[];
     function createServer(options: TlsOptions, secureConnectionListener?: (socket: TLSSocket) => void): Server;
     function connect(options: ConnectionOptions, secureConnectListener?: () => void): TLSSocket;
     function connect(port: number, host?: string, options?: ConnectionOptions, secureConnectListener?: () => void): TLSSocket;
@@ -3409,6 +3541,185 @@ declare module 'node:sqlite' {
     }
   }
   export = sqlite;
+}
+
+// node:ffi (Node 26): getCurrentEventLoop is left out, as a compiled program
+// has no libuv loop to hand out
+declare module 'node:ffi' {
+  namespace ffi {
+    type ArrayBufferView =
+      | Int8Array
+      | Uint8Array
+      | Uint8ClampedArray
+      | Int16Array
+      | Uint16Array
+      | Int32Array
+      | Uint32Array
+      | Float32Array
+      | Float64Array
+      | BigInt64Array
+      | BigUint64Array
+      | DataView;
+    interface DataTypeMap {
+      void: 'void';
+      char: 'number';
+      bool: 'number';
+      i8: 'number';
+      int8: 'number';
+      u8: 'number';
+      uint8: 'number';
+      i16: 'number';
+      int16: 'number';
+      u16: 'number';
+      uint16: 'number';
+      i32: 'number';
+      int32: 'number';
+      u32: 'number';
+      uint32: 'number';
+      i64: 'bigint';
+      int64: 'bigint';
+      u64: 'bigint';
+      uint64: 'bigint';
+      float: 'number';
+      f32: 'number';
+      float32: 'number';
+      double: 'number';
+      f64: 'number';
+      float64: 'number';
+      pointer: 'pointer';
+      ptr: 'pointer';
+      function: 'pointer';
+      buffer: 'pointer';
+      arraybuffer: 'pointer';
+      string: 'pointer';
+      str: 'pointer';
+    }
+    type ReturnType = keyof DataTypeMap;
+    type ArgumentType = Exclude<ReturnType, 'void'>;
+    interface ArgumentTypeMap {
+      number: number;
+      bigint: bigint;
+      pointer: bigint | string | ArrayBuffer | ArrayBufferView | null;
+    }
+    interface ReturnTypeMap {
+      void: void;
+      number: number;
+      bigint: bigint;
+      pointer: bigint;
+    }
+    interface FunctionSignature {
+      return?: ReturnType;
+      arguments?: readonly ArgumentType[];
+    }
+    interface FunctionDefinitions {
+      [symbol: string]: FunctionSignature;
+    }
+    type CallbackFunction<R extends ReturnType = any, P extends readonly ArgumentType[] = any[]> = (
+      ...args: { [K in keyof P]: ArgumentTypeMap[DataTypeMap[P[K]]] }
+    ) => ReturnTypeMap[DataTypeMap[R]];
+    interface WrappedFunction<R extends ReturnType = any, P extends readonly ArgumentType[] = any[]> extends CallbackFunction<R, P> {
+      readonly pointer: bigint;
+    }
+    type ReturnTypeFromFunctionSignature<T extends FunctionSignature> = 'return' extends keyof T
+      ? T extends { return: infer R extends ReturnType }
+        ? R
+        : any
+      : 'void';
+    type ArgumentTypesFromFunctionSignature<T extends FunctionSignature> = 'arguments' extends keyof T
+      ? T extends { arguments: infer P extends readonly ArgumentType[] }
+        ? P
+        : any[]
+      : [];
+    type CallbackFunctionFromSignature<T extends FunctionSignature> = CallbackFunction<
+      ReturnTypeFromFunctionSignature<T>,
+      ArgumentTypesFromFunctionSignature<T>
+    >;
+    type WrappedFunctionFromSignature<T extends FunctionSignature> = WrappedFunction<
+      ReturnTypeFromFunctionSignature<T>,
+      ArgumentTypesFromFunctionSignature<T>
+    >;
+    type WrappedFunctionsFromDefinitions<T extends FunctionDefinitions> = {
+      [K in keyof T]: WrappedFunctionFromSignature<T[K]>;
+    };
+    interface DynamicLibraryResult<T extends FunctionDefinitions> extends Disposable {
+      lib: DynamicLibrary;
+      functions: WrappedFunctionsFromDefinitions<T>;
+    }
+    /** 'dll' on Windows, 'dylib' on macOS, 'so' elsewhere */
+    const suffix: string;
+    function dlopen<const T extends FunctionDefinitions = {}>(path: string | null, definitions?: T): DynamicLibraryResult<T>;
+    function dlclose(handle: DynamicLibrary): void;
+    function dlsym(handle: DynamicLibrary, symbol: string): bigint;
+    class DynamicLibrary {
+      constructor(path: string | null);
+      readonly path: string;
+      readonly symbols: { [symbol: string]: bigint };
+      close(): void;
+      [Symbol.dispose](): void;
+      getFunction<const T extends FunctionSignature>(name: string, signature: T): WrappedFunctionFromSignature<T>;
+      getFunctions(): { [symbol: string]: WrappedFunction };
+      getFunctions<const T extends FunctionDefinitions>(definitions: T): WrappedFunctionsFromDefinitions<T>;
+      getSymbol(name: string): bigint;
+      getSymbols(): Record<string, bigint>;
+      /** Callbacks are trampolines that can't be freed; on Windows they take integer / pointer arguments only */
+      registerCallback(callback: () => void): bigint;
+      registerCallback<const T extends FunctionSignature>(signature: T, callback: CallbackFunctionFromSignature<T>): bigint;
+      unregisterCallback(pointer: bigint): void;
+      refCallback(pointer: bigint): void;
+      unrefCallback(pointer: bigint): void;
+    }
+    function getInt8(pointer: bigint, offset?: number): number;
+    function getUint8(pointer: bigint, offset?: number): number;
+    function getInt16(pointer: bigint, offset?: number): number;
+    function getUint16(pointer: bigint, offset?: number): number;
+    function getInt32(pointer: bigint, offset?: number): number;
+    function getUint32(pointer: bigint, offset?: number): number;
+    function getInt64(pointer: bigint, offset?: number): bigint;
+    function getUint64(pointer: bigint, offset?: number): bigint;
+    function getFloat32(pointer: bigint, offset?: number): number;
+    function getFloat64(pointer: bigint, offset?: number): number;
+    function setInt8(pointer: bigint, offset: number, value: number): void;
+    function setUint8(pointer: bigint, offset: number, value: number): void;
+    function setInt16(pointer: bigint, offset: number, value: number): void;
+    function setUint16(pointer: bigint, offset: number, value: number): void;
+    function setInt32(pointer: bigint, offset: number, value: number): void;
+    function setUint32(pointer: bigint, offset: number, value: number): void;
+    function setInt64(pointer: bigint, offset: number, value: number | bigint): void;
+    function setUint64(pointer: bigint, offset: number, value: number | bigint): void;
+    function setFloat32(pointer: bigint, offset: number, value: number): void;
+    function setFloat64(pointer: bigint, offset: number, value: number): void;
+    function toString(pointer: bigint): string | null;
+    function toBuffer(pointer: bigint, length: number, copy?: boolean): Buffer;
+    function toArrayBuffer(pointer: bigint, length: number, copy?: boolean): ArrayBuffer;
+    function exportString(string: string, pointer: bigint, length: number, encoding?: BufferEncoding): void;
+    function exportBuffer(buffer: Buffer, pointer: bigint, length: number): void;
+    function exportArrayBuffer(arrayBuffer: ArrayBuffer, pointer: bigint, length: number): void;
+    function exportArrayBufferView(arrayBufferView: ArrayBufferView, pointer: bigint, length: number): void;
+    function getRawPointer(source: ArrayBuffer | ArrayBufferView): bigint;
+    const types: {
+      readonly VOID: 'void';
+      readonly POINTER: 'pointer';
+      readonly BUFFER: 'buffer';
+      readonly ARRAY_BUFFER: 'arraybuffer';
+      readonly FUNCTION: 'function';
+      readonly BOOL: 'bool';
+      readonly CHAR: 'char';
+      readonly STRING: 'string';
+      readonly FLOAT: 'float';
+      readonly DOUBLE: 'double';
+      readonly INT_8: 'int8';
+      readonly UINT_8: 'uint8';
+      readonly INT_16: 'int16';
+      readonly UINT_16: 'uint16';
+      readonly INT_32: 'int32';
+      readonly UINT_32: 'uint32';
+      readonly INT_64: 'int64';
+      readonly UINT_64: 'uint64';
+      readonly FLOAT_32: 'float32';
+      readonly FLOAT_64: 'float64';
+    };
+  }
+  export = ffi;
 }
 
 declare module 'path' { import m = require('node:path'); export = m; }

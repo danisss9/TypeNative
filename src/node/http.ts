@@ -45,6 +45,29 @@ func tnStatusText(code int) string {
 	return http.StatusText(code)
 }
 
+// Header bytes the strict parser accepts: a token name, and a value without
+// control bytes other than tab (obs-text is allowed, as in Node's strict mode)
+func tnHTTP1ValidName(k []byte) bool {
+	if len(k) == 0 {
+		return false
+	}
+	for _, c := range k {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_\\x60|~", c) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func tnHTTP1ValidValue(v []byte) bool {
+	for _, c := range v {
+		if c != '\t' && (c < 0x20 || c == 0x7f) {
+			return false
+		}
+	}
+	return true
+}
+
 // Name / value pairs of a dynamic object (records, object literals, maps)
 func tnEntries(v interface{}) [][2]interface{} {
 	out := [][2]interface{}{}
@@ -542,6 +565,12 @@ type TnServerResponse struct {
 func (res *TnServerResponse) Get_headersSent() bool       { return res.headersSent || res.wroteHead }
 func (res *TnServerResponse) Get_req() *TnIncomingMessage { return res.req }
 func (res *TnServerResponse) Get_socket() *TnSocket       { return res.req.Get_socket() }
+func (res *TnServerResponse) Get_statusCode() float64     { return res.statusCode }
+func (res *TnServerResponse) Set_statusCode(v float64)    { res.statusCode = v }
+func (res *TnServerResponse) Get_statusMessage() string   { return res.statusMessage }
+func (res *TnServerResponse) Set_statusMessage(v string)  { res.statusMessage = v }
+func (res *TnServerResponse) Get_sendDate() bool          { return res.sendDate }
+func (res *TnServerResponse) Set_sendDate(v bool)         { res.sendDate = v }
 
 func (res *TnServerResponse) sig() chan struct{} {
 	res.mu.Lock()
@@ -669,7 +698,13 @@ func (res *TnServerResponse) flushHeaders() {
 	}
 }
 
-func (res *TnServerResponse) writeContinue() {}
+// res.writeContinue(): the 100 that answers Expect: 100-continue
+func (res *TnServerResponse) writeContinue() {
+	if res.headersSent {
+		return
+	}
+	res.post(tnResOp{info: true, status: 100, header: http.Header{}})
+}
 
 // res.writeInformation(status, headers): a 1xx response before the final one
 func (res *TnServerResponse) writeInformation(status float64, headers ...interface{}) {
@@ -1238,12 +1273,19 @@ type TnHttpServer struct {
 	headersTimeout   float64
 	requestTimeout   float64
 	maxHeadersCount  interface{}
+	// header value validation ('strict' by default; see node:http's option)
+	httpValidation string
 	// node:http2 servers (pseudo-headers, the 'stream' API)
 	h2 bool
 }
 
 // Set by node:http2: serves an HTTP/2 request through the 'stream' API (false when not handled)
 var tnHttp2StreamHook func(hs *TnHttpServer, w http.ResponseWriter, r *http.Request) bool
+
+// Set by node:http2: serves its servers' connections (a session each, over
+// golang.org/x/net/http2), and closes them all
+var tnHttp2ServeHook func(hs *TnHttpServer, ln net.Listener)
+var tnHttp2CloseAllHook func(hs *TnHttpServer)
 
 func (hs *TnHttpServer) Get_timeout() float64           { return hs.timeout }
 func (hs *TnHttpServer) Set_timeout(v float64)          { hs.timeout = v }
@@ -1301,6 +1343,11 @@ func (hs *TnHttpServer) serveConn(hc *tnHttpConn, local net.Addr) {
 		}
 		r, err := http.ReadRequest(br)
 		if err != nil {
+			// (Node answers a request it cannot parse with 400, then closes)
+			var ne net.Error
+			if !errors.As(err, &ne) || !ne.Timeout() {
+				hc.conn.Write([]byte("HTTP/1.1 400 Bad Request\\r\\nConnection: close\\r\\nContent-Length: 0\\r\\n\\r\\n"))
+			}
 			return
 		}
 		ka, upg := hs.serveHTTP1(hc, br, r, local, remoteAddr)
@@ -1374,6 +1421,12 @@ func (hs *TnHttpServer) tryFastHTTP1(hc *tnHttpConn, br *bufio.Reader, local net
 		}
 		for len(v) > 0 && (v[len(v)-1] == ' ' || v[len(v)-1] == '\\t') {
 			v = v[:len(v)-1]
+		}
+		if !tnHTTP1ValidName(k) {
+			return false, false
+		}
+		if hs.httpValidation != "relaxed" && hs.httpValidation != "insecure" && !tnHTTP1ValidValue(v) {
+			return false, false
 		}
 		switch len(k) {
 		case 6: // Expect
@@ -1663,8 +1716,21 @@ func (hs *TnHttpServer) serveHTTP1(hc *tnHttpConn, br *bufio.Reader, r *http.Req
 	if handled, upg := hs.serveUpgrade1(hc, br, r, local); handled {
 		return false, upg
 	}
-	if r.Header.Get("Expect") != "" && strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
-		hc.conn.Write([]byte("HTTP/1.1 100 Continue\\r\\n\\r\\n"))
+	// Expect: 100-continue is the 'checkContinue' event when somebody listens
+	// (the listener answers with res.writeContinue()); otherwise Node sends
+	// the 100 for us and emits 'request'. Any other Expect is 'checkExpectation'.
+	checkContinue := false
+	checkExpectation := false
+	if expect := r.Header.Get("Expect"); expect != "" {
+		if strings.EqualFold(expect, "100-continue") {
+			if hs.listenerCount("checkContinue") > 0 {
+				checkContinue = true
+			} else {
+				hc.conn.Write([]byte("HTTP/1.1 100 Continue\\r\\n\\r\\n"))
+			}
+		} else if hs.listenerCount("checkExpectation") > 0 {
+			checkExpectation = true
+		}
 	}
 	bodyDone := make(chan struct{})
 	var small []byte
@@ -1680,7 +1746,13 @@ func (hs *TnHttpServer) serveHTTP1(hc *tnHttpConn, br *bufio.Reader, r *http.Req
 		TnAsyncRun(hs.asyncCtx, func() {
 			req = hs.incoming(r, local)
 			res = tnNewServerResponse(req)
-			hs.emit("request", req, res)
+			if checkContinue {
+				hs.emit("checkContinue", req, res)
+			} else if checkExpectation {
+				hs.emit("checkExpectation", req, res)
+			} else {
+				hs.emit("request", req, res)
+			}
 			if small != nil {
 				if smallErr != nil {
 					req.aborted = true
@@ -1696,7 +1768,11 @@ func (hs *TnHttpServer) serveHTTP1(hc *tnHttpConn, br *bufio.Reader, r *http.Req
 				req.push(nil)
 				close(bodyDone)
 			} else {
-				tnPumpBody(r.Body, req, nil, func() { close(bodyDone) })
+				tnPumpBody(r.Body, req, func() {
+					for k, v := range r.Trailer {
+						req.Get_trailers().Set(strings.ToLower(k), strings.Join(v, ", "))
+					}
+				}, func() { close(bodyDone) })
 			}
 		})
 	})
@@ -1814,7 +1890,11 @@ func (hs *TnHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				req.push(nil)
 				close(bodyDone)
 			} else {
-				tnPumpBody(r.Body, req, nil, func() { close(bodyDone) })
+				tnPumpBody(r.Body, req, func() {
+					for k, v := range r.Trailer {
+						req.Get_trailers().Set(strings.ToLower(k), strings.Join(v, ", "))
+					}
+				}, func() { close(bodyDone) })
 			}
 		})
 	})
@@ -1999,18 +2079,33 @@ func tnServeOps(w http.ResponseWriter, r *http.Request, res *TnServerResponse, a
 }
 
 func TnNewHttpServer(secure bool, args ...interface{}) *TnHttpServer {
-	hs := &TnHttpServer{keepAliveTimeout: 5000, headersTimeout: 60000, requestTimeout: 300000, httpConns: map[*tnHttpConn]struct{}{}}
+	hs := &TnHttpServer{keepAliveTimeout: 5000, headersTimeout: 60000, requestTimeout: 300000, httpConns: map[*tnHttpConn]struct{}{}, httpValidation: "strict"}
 	hs.TnNetServer = *TnNewNetServer()
 	hs.connectionEvent = "connection"
 	for _, a := range args {
 		if tnIsFunc(a) {
 			hs.on("request", a)
-		} else if a != nil && secure {
+			continue
+		}
+		if a == nil {
+			continue
+		}
+		if secure {
 			cfg, err := tnTLSServerConfig(a)
 			if err != nil {
 				panic(err)
 			}
 			hs.tlsConfig = cfg
+		}
+		hs.httpValidation = tnHttpValidation(a)
+		if n, ok := tnNetNumber(TnGet(a, "keepAliveTimeout")); ok {
+			hs.keepAliveTimeout = n
+		}
+		if n, ok := tnNetNumber(TnGet(a, "headersTimeout")); ok {
+			hs.headersTimeout = n
+		}
+		if n, ok := tnNetNumber(TnGet(a, "requestTimeout")); ok {
+			hs.requestTimeout = n
 		}
 	}
 	hs.httpServer = &http.Server{Handler: hs, ErrorLog: log.New(io.Discard, "", 0)}
@@ -2018,9 +2113,8 @@ func TnNewHttpServer(secure bool, args ...interface{}) *TnHttpServer {
 		if hs.tlsConfig != nil {
 			ln = tls.NewListener(ln, hs.tlsConfig)
 		}
-		if hs.h2 {
-			hs.httpServer.IdleTimeout = time.Duration(hs.keepAliveTimeout * float64(time.Millisecond))
-			hs.httpServer.Serve(ln)
+		if hs.h2 && tnHttp2ServeHook != nil {
+			tnHttp2ServeHook(hs, ln)
 			return
 		}
 		local := ln.Addr()
@@ -2070,7 +2164,9 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 	TnLoopRef()
 	go func() {
 		if hs.h2 {
+			// GOAWAY on every session; 'close' once their connections are gone
 			hs.httpServer.Shutdown(context.Background())
+			hs.inFlight.Wait()
 		} else {
 			hs.inFlight.Wait()
 			hs.closeAllConnections()
@@ -2088,9 +2184,9 @@ func (hs *TnHttpServer) close(cb ...interface{}) *TnHttpServer {
 }
 
 func (hs *TnHttpServer) closeAllConnections() {
-	if hs.h2 && hs.httpServer != nil {
-		hs.httpServer.Close()
-		return
+	// (an http2 server's sessions; its HTTP/1 fallback connections are below)
+	if hs.h2 && tnHttp2CloseAllHook != nil {
+		tnHttp2CloseAllHook(hs)
 	}
 	hs.connMu.Lock()
 	conns := make([]*tnHttpConn, 0, len(hs.httpConns))
@@ -2104,11 +2200,8 @@ func (hs *TnHttpServer) closeAllConnections() {
 }
 
 func (hs *TnHttpServer) closeIdleConnections() {
-	if hs.h2 && hs.httpServer != nil {
-		hs.httpServer.SetKeepAlivesEnabled(false)
-		hs.httpServer.SetKeepAlivesEnabled(true)
-		return
-	}
+	// (an http2 server's sessions get GOAWAY from close(); this covers its
+	// HTTP/1 fallback connections)
 	hs.connMu.Lock()
 	var idle []*tnHttpConn
 	for hc := range hs.httpConns {
@@ -2129,43 +2222,254 @@ func (hs *TnHttpServer) listen(args ...interface{}) *TnHttpServer {
 
 // --- client ---
 
-// http.Agent: accepted for compatibility (Go's transport pools connections)
+// http.Agent: connection pooling mapped onto Go's transport (maxSockets is
+// MaxConnsPerHost plus a per-origin request limit, maxTotalSockets a
+// process-wide one, keepAlive decides whether idle connections are kept,
+// maxFreeSockets the idle pool size)
 type TnHttpAgent struct {
-	keepAlive  bool
-	maxSockets float64
-	options    interface{}
+	mu              sync.Mutex
+	keepAlive       bool
+	keepAliveMsecs  float64
+	maxSockets      float64
+	maxTotalSockets float64
+	maxFreeSockets  float64
+	scheduling      string
+	timeout         interface{}
+	options         interface{}
+	transports      map[string]*http.Transport
+	origins         map[string]*tnAgentOrigin
+	total           chan struct{}
 }
 
 func TnNewHttpAgent(options ...interface{}) *TnHttpAgent {
-	a := &TnHttpAgent{maxSockets: math.Inf(1)}
+	a := &TnHttpAgent{
+		keepAliveMsecs:  1000,
+		maxSockets:      math.Inf(1),
+		maxTotalSockets: math.Inf(1),
+		maxFreeSockets:  256,
+		scheduling:      "lifo",
+	}
 	if len(options) > 0 && options[0] != nil {
 		a.options = options[0]
 		a.keepAlive, _ = TnGetValue(options[0], "keepAlive").(bool)
-		if n, ok := tnNetNumber(TnGet(options[0], "maxSockets")); ok {
-			a.maxSockets = n
+		for _, f := range []struct {
+			name string
+			dst  *float64
+		}{
+			{"keepAliveMsecs", &a.keepAliveMsecs},
+			{"maxSockets", &a.maxSockets},
+			{"maxTotalSockets", &a.maxTotalSockets},
+			{"maxFreeSockets", &a.maxFreeSockets},
+		} {
+			if n, ok := tnNetNumber(TnGet(options[0], f.name)); ok {
+				*f.dst = n
+			}
+		}
+		if s := tnNetString(TnGet(options[0], "scheduling")); s != "" {
+			a.scheduling = s
+		}
+		if t := TnGet(options[0], "timeout"); t != nil && !TnIsNil(t) {
+			a.timeout = t
 		}
 	}
+	a.resetLimit()
 	return a
 }
 
-func (a *TnHttpAgent) destroy() {}
+// maxTotalSockets: a channel of tokens, one per in-flight request (a free
+// keep-alive connection doesn't hold one, so another origin can use the slot)
+func (a *TnHttpAgent) resetLimit() {
+	a.total = nil
+	if !math.IsInf(a.maxTotalSockets, 1) && a.maxTotalSockets > 0 {
+		n := int(a.maxTotalSockets)
+		if n < 1 {
+			n = 1
+		}
+		a.total = make(chan struct{}, n)
+	}
+}
 
-var tnHttpTransports sync.Map
+// A response body holds the agent's slots until it is closed: idle keep-alive
+// connections do not count against maxSockets / maxTotalSockets, so waiting
+// requests can reuse them instead of deadlocking on a dial limit
+type tnAgentBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
 
-func tnHttpTransport(cfg *tls.Config, key string) *http.Transport {
-	if t, ok := tnHttpTransports.Load(key); ok {
-		return t.(*http.Transport)
+func (b *tnAgentBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+// An upgraded (101) body is a ReadWriteCloser: keep its Write
+type tnAgentRWBody struct {
+	io.ReadWriteCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *tnAgentRWBody) Close() error {
+	err := b.ReadWriteCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+type tnAgentOrigin struct {
+	transport *http.Transport
+	rt        *tnAgentRoundTripper
+}
+
+// Gates each request on the per-origin and process-wide socket limits
+type tnAgentRoundTripper struct {
+	agent     *TnHttpAgent
+	transport *http.Transport
+	origin    chan struct{}
+}
+
+func (rt *tnAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	slots := []chan struct{}{}
+	rt.agent.mu.Lock()
+	total := rt.agent.total
+	rt.agent.mu.Unlock()
+	if rt.origin != nil {
+		slots = append(slots, rt.origin)
+	}
+	if total != nil {
+		slots = append(slots, total)
+	}
+	acquired := []chan struct{}{}
+	for _, sem := range slots {
+		select {
+		case sem <- struct{}{}:
+			acquired = append(acquired, sem)
+		case <-req.Context().Done():
+			for _, held := range acquired {
+				<-held
+			}
+			return nil, req.Context().Err()
+		}
+	}
+	release := func() {
+		for _, sem := range acquired {
+			<-sem
+		}
+	}
+	resp, err := rt.transport.RoundTrip(req)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok {
+		resp.Body = &tnAgentRWBody{ReadWriteCloser: rwc, release: release}
+	} else {
+		resp.Body = &tnAgentBody{ReadCloser: resp.Body, release: release}
+	}
+	return resp, nil
+}
+
+func (a *TnHttpAgent) Get_keepAlive() bool           { return a.keepAlive }
+func (a *TnHttpAgent) Set_keepAlive(v bool)          { a.keepAlive = v }
+func (a *TnHttpAgent) Get_keepAliveMsecs() float64   { return a.keepAliveMsecs }
+func (a *TnHttpAgent) Set_keepAliveMsecs(v float64)  { a.keepAliveMsecs = v }
+func (a *TnHttpAgent) Get_maxSockets() float64       { return a.maxSockets }
+func (a *TnHttpAgent) Set_maxSockets(v float64)      { a.maxSockets = v }
+func (a *TnHttpAgent) Get_maxTotalSockets() float64  { return a.maxTotalSockets }
+func (a *TnHttpAgent) Set_maxTotalSockets(v float64) { a.maxTotalSockets = v; a.resetLimit() }
+func (a *TnHttpAgent) Get_maxFreeSockets() float64   { return a.maxFreeSockets }
+func (a *TnHttpAgent) Set_maxFreeSockets(v float64)  { a.maxFreeSockets = v }
+func (a *TnHttpAgent) Get_scheduling() string        { return a.scheduling }
+func (a *TnHttpAgent) Set_scheduling(v string)       { a.scheduling = v }
+func (a *TnHttpAgent) Get_timeout() interface{}      { return a.timeout }
+func (a *TnHttpAgent) Set_timeout(v interface{})     { a.timeout = v }
+func (a *TnHttpAgent) Get_options() interface{}      { return a.options }
+
+// The transport of one origin (the TLS configuration is part of the key)
+func (a *TnHttpAgent) transport(cfg *tls.Config, key string) *tnAgentOrigin {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	if o, ok := a.origins[key]; ok {
+		return o
+	}
+	if a.transports == nil {
+		a.transports = map[string]*http.Transport{}
 	}
 	t := &http.Transport{
-		Proxy:              nil,
-		DisableCompression: true,
-		TLSClientConfig:    cfg,
-		ForceAttemptHTTP2:  false,
-		IdleConnTimeout:    5 * time.Second,
+		Proxy:               nil,
+		DisableCompression:  true,
+		TLSClientConfig:     cfg,
+		ForceAttemptHTTP2:   false,
+		DisableKeepAlives:   !a.keepAlive,
+		IdleConnTimeout:     0,
+		MaxIdleConnsPerHost: 256,
 	}
-	tnHttpTransports.Store(key, t)
-	return t
+	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
+		t.MaxConnsPerHost = int(a.maxSockets)
+	}
+	if !math.IsInf(a.maxFreeSockets, 1) && a.maxFreeSockets >= 0 {
+		t.MaxIdleConnsPerHost = int(a.maxFreeSockets)
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	if a.keepAlive {
+		dialer.KeepAlive = time.Duration(a.keepAliveMsecs * float64(time.Millisecond))
+	}
+	t.DialContext = dialer.DialContext
+	var origin chan struct{}
+	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
+		origin = make(chan struct{}, int(a.maxSockets))
+	}
+	a.transports[key] = t
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	o := &tnAgentOrigin{transport: t, rt: &tnAgentRoundTripper{agent: a, transport: t, origin: origin}}
+	a.origins[key] = o
+	return o
 }
+
+// A dedicated transport for a Unix socket (one origin)
+func (a *TnHttpAgent) unixOrigin(path string) *tnAgentOrigin {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	key := "unix://" + path
+	if a.origins == nil {
+		a.origins = map[string]*tnAgentOrigin{}
+	}
+	if o, ok := a.origins[key]; ok {
+		return o
+	}
+	t := &http.Transport{DisableCompression: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", path)
+	}}
+	var origin chan struct{}
+	if !math.IsInf(a.maxSockets, 1) && a.maxSockets > 0 {
+		origin = make(chan struct{}, int(a.maxSockets))
+	}
+	o := &tnAgentOrigin{transport: t, rt: &tnAgentRoundTripper{agent: a, transport: t, origin: origin}}
+	a.origins[key] = o
+	return o
+}
+
+func (a *TnHttpAgent) destroy() {
+	a.mu.Lock()
+	origins := a.origins
+	a.origins = nil
+	a.transports = nil
+	a.mu.Unlock()
+	for _, o := range origins {
+		o.transport.CloseIdleConnections()
+	}
+}
+
+var tnHttpGlobalAgent = TnNewHttpAgent(map[string]interface{}{"keepAlive": true})
+
+func TnHttpGlobalAgent() *TnHttpAgent { return tnHttpGlobalAgent }
 
 type TnClientRequest struct {
 	TnStream
@@ -2191,15 +2495,71 @@ type TnClientRequest struct {
 	socketPath  string
 	signal      *TnAbortSignal
 	res         *TnIncomingMessage
+	agent       *TnHttpAgent
+	validation  string
+	trailers    http.Header
+	trailerMu   sync.Mutex
+	// A streamed body's trailer map: empty when the request goes out (so Go
+	// declares no Trailer header), filled from addTrailers before the body ends
+	lateTrailers http.Header
 }
 
 func (cr *TnClientRequest) Get_headersSent() bool { return cr.started }
 func (cr *TnClientRequest) Get_socket() *TnSocket  { return TnNewSocket() }
 
+// httpValidation ('strict' rejects control bytes in header values; 'relaxed'
+// and 'insecure' accept them, as Node's lenient parser does)
+func tnHttpValidation(options interface{}) string {
+	mode := "strict"
+	if options == nil {
+		return mode
+	}
+	if v := TnGet(options, "httpValidation"); v != nil && !TnIsNil(v) {
+		s, ok := v.(string)
+		if !ok || (s != "strict" && s != "relaxed" && s != "insecure") {
+			received := fmt.Sprint(v)
+			if s, ok := v.(string); ok {
+				received = "'" + s + "'"
+			}
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The property 'options.httpValidation' must be one of: 'strict', 'relaxed', 'insecure'. Received "+received))
+		}
+		mode = s
+	}
+	if b, ok := TnGetValue(options, "insecureHTTPParser").(bool); ok && b {
+		mode = "insecure"
+	}
+	return mode
+}
+
+func tnHttpInvalidHeaderValue(name string) {
+	panic(TnNodeError("TypeError", "ERR_INVALID_CHAR", "Invalid character in header content [\\""+name+"\\"]"))
+}
+
+func (cr *TnClientRequest) checkHeaderValue(name string, value interface{}) {
+	if cr.validation != "strict" {
+		return
+	}
+	for _, v := range tnHeaderStrings(value) {
+		for i := 0; i < len(v); i++ {
+			c := v[i]
+			if c != '\\t' && (c < 0x20 || c == 0x7f) {
+				tnHttpInvalidHeaderValue(name)
+			}
+		}
+	}
+}
+
+func (cr *TnClientRequest) checkHeaders() {
+	for i := range cr.store.entries {
+		cr.checkHeaderValue(cr.store.entries[i].name, cr.store.entries[i].value)
+	}
+}
+
 func (cr *TnClientRequest) setHeader(name string, value interface{}) *TnClientRequest {
 	if cr.started {
 		panic(TnNodeError("Error", "ERR_HTTP_HEADERS_SENT", "Cannot set headers after they are sent to the client"))
 	}
+	cr.checkHeaderValue(name, value)
 	cr.store.set(name, value)
 	return cr
 }
@@ -2208,10 +2568,68 @@ func (cr *TnClientRequest) getHeaders() *TnMap[string, interface{}] { return cr.
 func (cr *TnClientRequest) getHeaderNames() []string { return cr.store.keys() }
 func (cr *TnClientRequest) getRawHeaderNames() []string { return cr.store.rawNames() }
 func (cr *TnClientRequest) hasHeader(name string) bool { return cr.store.has(name) }
-func (cr *TnClientRequest) removeHeader(name string) { cr.store.remove(name) }
-func (cr *TnClientRequest) flushHeaders() {}
+func (cr *TnClientRequest) removeHeader(name string)  { cr.store.remove(name) }
+func (cr *TnClientRequest) flushHeaders()             {}
 func (cr *TnClientRequest) setNoDelay(args ...interface{}) {}
 func (cr *TnClientRequest) setSocketKeepAlive(args ...interface{}) {}
+
+// addTrailers(headers): sent after a chunked body, as in Node. A streamed body
+// (write() before end()) carries them whether or not a Trailer header names
+// them; end(data) alone carries only declared ones (otherwise a Content-Length)
+func (cr *TnClientRequest) addTrailers(headers interface{}) {
+	cr.trailerMu.Lock()
+	defer cr.trailerMu.Unlock()
+	if cr.trailers == nil {
+		cr.trailers = http.Header{}
+	}
+	for _, e := range tnEntries(headers) {
+		for _, v := range tnHeaderStrings(e[1]) {
+			cr.trailers.Add(fmt.Sprint(e[0]), v)
+		}
+	}
+}
+
+// The trailer names the request declared (its Trailer header), with their
+// values filled in: Go sends exactly these keys after the chunked body
+func (cr *TnClientRequest) requestTrailers() http.Header {
+	declared := cr.store.get("Trailer")
+	if declared == nil {
+		return nil
+	}
+	cr.trailerMu.Lock()
+	defer cr.trailerMu.Unlock()
+	if cr.trailers == nil {
+		cr.trailers = http.Header{}
+	}
+	for _, line := range tnHeaderStrings(declared) {
+		for _, name := range strings.Split(line, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			canon := http.CanonicalHeaderKey(name)
+			if _, ok := cr.trailers[canon]; !ok {
+				cr.trailers[canon] = nil
+			}
+		}
+	}
+	if len(cr.trailers) == 0 {
+		return nil
+	}
+	// The same map addTrailers fills in before the body ends
+	return cr.trailers
+}
+
+func (cr *TnClientRequest) fillLateTrailers() {
+	if cr.lateTrailers == nil {
+		return
+	}
+	cr.trailerMu.Lock()
+	defer cr.trailerMu.Unlock()
+	for k, v := range cr.trailers {
+		cr.lateTrailers[k] = v
+	}
+}
 
 func (cr *TnClientRequest) setTimeout(ms float64, cb ...interface{}) *TnClientRequest {
 	cr.timeoutMs = ms
@@ -2454,6 +2872,23 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 	} else if !complete {
 		req.ContentLength = -1
 	}
+	// Trailers go with a chunked body whose Trailer header names them (also
+	// when end(data) carries the whole body, as Node does)
+	if tr := cr.requestTrailers(); tr != nil {
+		req.Trailer = tr
+		// Go writes the Trailer line from the map's keys
+		req.Header.Del("Trailer")
+		if complete {
+			if req.Body == nil {
+				req.Body = io.NopCloser(strings.NewReader(""))
+			}
+			req.ContentLength = -1
+		}
+	}
+	if req.Trailer == nil && !complete {
+		cr.lateTrailers = http.Header{}
+		req.Trailer = cr.lateTrailers
+	}
 	if cr.auth != "" {
 		parts := strings.SplitN(cr.auth, ":", 2)
 		if len(parts) == 2 {
@@ -2465,15 +2900,14 @@ func (cr *TnClientRequest) start(body []byte, complete bool) {
 	if _, ok := req.Header["User-Agent"]; !ok {
 		req.Header["User-Agent"] = nil
 	}
-	transport := tnHttpTransport(cr.tlsConfig, cr.tlsKey)
+	// One transport per origin (and TLS configuration): maxSockets is per
+	// origin, while the agent's total-sockets limit is shared by all of them
+	agentKey := fmt.Sprint(cr.protocol, "//", net.JoinHostPort(cr.host, cr.port), "|", cr.tlsKey)
+	origin := cr.agent.transport(cr.tlsConfig, agentKey)
 	if cr.socketPath != "" {
-		path := cr.socketPath
-		transport = &http.Transport{DisableCompression: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", path)
-		}}
+		origin = cr.agent.unixOrigin(cr.socketPath)
 	}
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: origin.rt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	TnLoopRef()
 	cr.armTimer()
 	host, port := cr.host, cr.port
@@ -2600,7 +3034,7 @@ func tnClientURL(cr *TnClientRequest, raw string) {
 
 // http.request(url | options, [options], [callback]) / https.request
 func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
-	cr := &TnClientRequest{method: "GET", path: "/", host: "localhost", protocol: "http:", setHost: true}
+	cr := &TnClientRequest{method: "GET", path: "/", host: "localhost", protocol: "http:", setHost: true, agent: TnHttpGlobalAgent(), validation: "strict"}
 	if secure {
 		cr.protocol = "https:"
 	}
@@ -2657,6 +3091,15 @@ func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
 			cr.timeoutMs = n
 		}
 		cr.store.setAll(TnGet(options, "headers"))
+		cr.validation = tnHttpValidation(options)
+		cr.checkHeaders()
+		if v := TnGet(options, "agent"); v != nil && !TnIsNil(v) {
+			if ag, ok := v.(*TnHttpAgent); ok && ag != nil {
+				cr.agent = ag
+			} else if b, ok := v.(bool); ok && !b {
+				cr.agent = TnNewHttpAgent()
+			}
+		}
 		if b, ok := TnGetValue(options, "rejectUnauthorized").(bool); ok && !b {
 			insecure = true
 		}
@@ -2710,6 +3153,8 @@ func TnHttpRequest(secure bool, args ...interface{}) *TnClientRequest {
 	cr.sinkFinal = func(done func(err interface{})) {
 		cr.start(nil, true)
 		if cr.bodyWriter != nil {
+			// The transport reads the trailers once the body's EOF arrives
+			cr.fillLateTrailers()
 			cr.bodyWriter.Close()
 		}
 		done(nil)
@@ -2744,7 +3189,7 @@ func TnHttpGet(secure bool, args ...interface{}) *TnClientRequest {
 
 const CLIENT_REQUEST_METHODS =
   STREAM_METHODS.replace('end=*TnStream', 'end=*TnClientRequest').replace('destroy=*TnStream', 'destroy=*TnClientRequest') +
-  '; setHeader=*TnClientRequest; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; getRawHeaderNames=[]string; hasHeader=bool; removeHeader=; flushHeaders=; setTimeout=*TnClientRequest; setNoDelay=; setSocketKeepAlive=; abort=';
+  '; setHeader=*TnClientRequest; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; getRawHeaderNames=[]string; hasHeader=bool; removeHeader=; addTrailers=; flushHeaders=; setTimeout=*TnClientRequest; setNoDelay=; setSocketKeepAlive=; abort=';
 const SERVER_RESPONSE_METHODS =
   STREAM_METHODS.replace('end=*TnStream', 'end=*TnServerResponse') +
   '; setHeader=*TnServerResponse; setHeaders=*TnServerResponse; appendHeader=*TnServerResponse; getHeader=interface{}; getHeaders=*TnMap[string, interface{}]; getHeaderNames=[]string; hasHeader=bool; removeHeader=; addTrailers=; writeHead=*TnServerResponse; flushHeaders=; writeContinue=; writeInformation=; setTimeout=*TnServerResponse';
@@ -2784,7 +3229,7 @@ export function registerHttp(r: NodeRegistry): void {
     SERVER_RESPONSE_METHODS,
     'statusCode=float64; statusMessage=string; sendDate=bool',
     STREAM_GETTERS + '; headersSent=bool; req=*TnIncomingMessage; socket=*TnSocket',
-    ''
+    'statusCode; statusMessage; sendDate'
   );
   defineClass(
     r,
@@ -2807,7 +3252,16 @@ export function registerHttp(r: NodeRegistry): void {
     'listening=bool; maxConnections=float64; timeout=float64; keepAliveTimeout=float64; headersTimeout=float64; requestTimeout=float64',
     'maxConnections; timeout; keepAliveTimeout; headersTimeout; requestTimeout'
   );
-  defineClass(r, 'http.Agent', '*TnHttpAgent', 'class', 'destroy=', 'keepAlive=bool; maxSockets=float64; options=interface{}', '', '');
+  defineClass(
+    r,
+    'http.Agent',
+    '*TnHttpAgent',
+    'class',
+    'destroy=',
+    'keepAlive=bool; keepAliveMsecs=float64; maxSockets=float64; maxTotalSockets=float64; maxFreeSockets=float64; scheduling=string; timeout=interface{}; options=interface{}',
+    '',
+    'keepAlive; keepAliveMsecs; maxSockets; maxTotalSockets; maxFreeSockets; scheduling; timeout'
+  );
   for (const name of ['IncomingMessage', 'ServerResponse', 'ClientRequest', 'Server', 'Agent']) {
     r.classes[`https.${name}`] = r.classes[`http.${name}`];
   }
@@ -2846,8 +3300,9 @@ export function registerHttp(r: NodeRegistry): void {
   r.paramTypers['http.ClientRequest#once'] = requestListeners;
   const serverListeners = (nodes: any[]): string[] => {
     const name = eventName(nodes);
-    if (name === 'request') return ['*TnIncomingMessage', '*TnServerResponse'];
+    if (name === 'request' || name === 'checkContinue' || name === 'checkExpectation') return ['*TnIncomingMessage', '*TnServerResponse'];
     if (name === 'stream') return ['*TnHttp2Stream', '*TnMap[string, interface{}]', 'float64'];
+    if (name === 'session') return ['*TnHttp2Session'];
     if (name === 'connection') return ['*TnSocket'];
     if (name === 'upgrade' || name === 'connect') return ['*TnIncomingMessage', '*TnSocket', '[]byte'];
     if (name === 'error' || name === 'clientError') return ['interface{}'];
@@ -2881,7 +3336,7 @@ export function registerHttp(r: NodeRegistry): void {
     };
     r.values[`${mod}.globalAgent`] = (_c: NodeCall) => {
       use();
-      return 'TnNewHttpAgent()';
+      return 'TnHttpGlobalAgent()';
     };
     r.valueTypes[`${mod}.globalAgent`] = '*TnHttpAgent';
     setResults(r, mod, 'createServer=*TnHttpServer; request=*TnClientRequest; get=*TnClientRequest');

@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`node:ffi`:** the Node 26 module — `dlopen` / `dlclose` / `dlsym`,
+  `DynamicLibrary` (`getFunction(s)`, `getSymbol(s)`, `symbols`, `close`,
+  `using`), wrappers' `.pointer`, `registerCallback` and friends, the
+  `get*` / `set*` memory accessors, `toString` / `toBuffer` /
+  `toArrayBuffer`, `export*`, `getRawPointer`, `suffix` and `types`, with
+  Node's argument checks and error codes. No cgo: `LoadLibrary` on
+  Windows, the vendored `github.com/ebitengine/purego` on Linux / macOS
+  (linked only into programs that import `node:ffi`). A JS throw in a
+  callback is rethrown once the native call returns; Windows callbacks
+  take integer / pointer arguments only. `getCurrentEventLoop` is 🚫 (no
+  libuv loop).
+- **`node:http`:** connection pooling options on `Agent` (`maxSockets`,
+  `maxTotalSockets`, `maxFreeSockets`, `keepAlive`, `keepAliveMsecs`,
+  `scheduling`), request trailers (`req.addTrailers` after a streamed
+  body, declared or not), `res.statusMessage` and `'checkContinue'` /
+  `'checkExpectation'`, and the Node 26.3 `httpValidation` option
+  (`'strict'` / `'relaxed'` / `'insecure'`, also `insecureHTTPParser`).
+- **`node:http2`:** frame-level session APIs on the vendored
+  `golang.org/x/net/http2` — `ping`, `settings`, `goaway`, `altsvc`, the
+  server's `'session'` event, `type`, `localSettings` / `remoteSettings` /
+  `pendingSettingsAck`, the peer's `'ping'` / `'localSettings'` /
+  `'remoteSettings'` / `'goaway'` / `'altsvc'` events, and
+  `getPackedSettings` / `getUnpackedSettings`. Sessions run x/net's
+  `ServeConn` / `NewClientConn` over a connection split into frames, so the
+  session's own frames never land inside one of the library's. Cleartext still uses prior
+  knowledge (no HTTP/1.1 `Upgrade: h2c` handshake), as in Node.
+- **Streams, events and readline (closing the remaining ❌ rows):**
+  `node:stream` backpressure — `highWaterMark` / `readableHighWaterMark` /
+  `writableHighWaterMark` (16 KiB or 16 objects by default,
+  `get/setDefaultHighWaterMark`), `write()` / `push()` returning `false`
+  at the mark, `'drain'` only after a `false` write, `writableNeedDrain`,
+  byte-counted `readableLength` / `writableLength`, read-ahead up to the
+  mark, and transforms holding their writer while their output is unread,
+  so `pipe` / `pipeline` pause a fast source; `compose` with async
+  generator functions, source generators and async sink functions;
+  `duplexPair` (Node 26.1 semantics); `Readable.toWeb` `type: 'bytes'` /
+  `Duplex.toWeb` `readableType`; and
+  `readable[Symbol.for('Stream.toAsyncStreamable')]()` (stream/iter
+  batches). `node:stream/web`: BYOB readers (`getReader({ mode: 'byob' })`,
+  `ReadableStreamBYOBReader`, `read(view, { min })` filling the caller's
+  view), byte-stream controllers' `byobRequest` (`view`, `respond`,
+  `respondWithNewView`) and `autoAllocateChunkSize`, and transferring
+  streams with `structuredClone(stream, { transfer: [stream] })` (others
+  throw a `DataCloneError`). `node:events`: an EventEmitter subclass's
+  `[Symbol.for('nodejs.rejection')]` / `[captureRejectionSymbol]` method
+  handles captured rejections (`captureRejectionSymbol` is exported), and
+  a subclass without a constructor passes its options on.
+  `node:readline`: terminal-mode line editing (`terminal: true`, or stdin
+  and stdout both terminals, in raw mode) — cursor keys, Emacs-style ctrl /
+  meta keys, `history` / `historySize` / `removeHistoryDuplicates` with
+  prefix search and `'history'` events, a sync or callback `completer` on
+  Tab, `line` / `cursor` / `getCursorPos()`, and `write(data, key)`.
+- **`node:crypto` keys beyond Go's standard library:** encrypted private
+  keys (PKCS#8 PBES2 with PBKDF2 + AES-CBC / 3DES, the legacy `DEK-Info`
+  PEM headers) and encrypted export (`cipher` / `passphrase`, PEM or DER);
+  `rsa-pss` (with its hash, MGF1 hash and salt length), `dsa` and `dh`
+  key types in PKCS#8 / SPKI, `ed448` / `x448` (signing, ECDH, JWK) and
+  `secp256k1` (`createECDH`, ECDSA, JWK). Ed448 / X448 come from the
+  vendored `cloudflare/circl`, secp256k1 from `decred/dcrd` (both pure Go),
+  linked only into programs that read key data or may generate such keys.
+  `crypto.Certificate` (`verifySpkac` / `exportChallenge` /
+  `exportPublicKey`) and `crypto.parsePKCS12(bundle, { passphrase })` —
+  Node 26's `{ privateKey, certificate, additionalCertificates }` — on the
+  vendored `go-pkcs12`, linked only by `parsePKCS12` and `pfx` options.
+- **`node:crypto` MACs and ciphers:** `createMac` gains `gmac`,
+  `poly1305`, `siphash` (64- / 128-bit), `blake2bmac` and `blake2smac`
+  (output length, salt, personalization), and `getCiphers` gains AES-SIV
+  and AES-GCM-SIV (`aes-128/192/256-siv`, `aes-128/192/256-gcm-siv`), all
+  in pure Go (S2V / CMAC, POLYVAL over GHASH's field).
+- **`node:tls` PFX, passphrases and sessions:** `pfx` (a Buffer or
+  `{ buf, passphrase }` entries) and `passphrase`-protected keys for
+  servers, clients and secure contexts; session resumption through the
+  `session` option, `'newSession'` / `'resumeSession'` events,
+  `getSession()` and `isSessionReused()`; and `tls.rootCertificates`,
+  Node's 118-certificate Mozilla bundle (linked only when read).
 - **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
   `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
   `PlainMonthDay`, `Duration` and `Now` — on Go's `time` and embedded

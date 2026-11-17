@@ -28,6 +28,11 @@ type TnStream struct {
 	tnSelf       interface{}
 	// readable
 	queue         []interface{}
+	// the buffered length: bytes (characters once decoded), or objects
+	queueLen      float64
+	readHWM       float64
+	readHWMSet    bool
+	readMoreScheduled bool
 	readEnded     bool
 	endEmitted    bool
 	flowing       int
@@ -39,6 +44,14 @@ type TnStream struct {
 	sourceStarted bool
 	// writable
 	writeQueue   []tnWriteReq
+	// bytes (or objects) queued or being written, and whether a write() returned false
+	writeLen     float64
+	writeHWM     float64
+	writeHWMSet  bool
+	needDrain    bool
+	transformHeld func()
+	// (duplexPair: this side's write callback, released once the other side reads)
+	pairHeld     func()
 	writing      bool
 	ending       bool
 	writeEnded   bool
@@ -100,6 +113,16 @@ func tnNewStreamBase(options []interface{}) *TnStream {
 		if enc, ok := tnStreamOption(s.options, "encoding").(string); ok && enc != "" {
 			s.setEncoding(enc)
 		}
+		if n, ok := tnStreamOption(s.options, "highWaterMark").(float64); ok {
+			s.readHWM, s.readHWMSet = n, true
+			s.writeHWM, s.writeHWMSet = n, true
+		}
+		if n, ok := tnStreamOption(s.options, "readableHighWaterMark").(float64); ok {
+			s.readHWM, s.readHWMSet = n, true
+		}
+		if n, ok := tnStreamOption(s.options, "writableHighWaterMark").(float64); ok {
+			s.writeHWM, s.writeHWMSet = n, true
+		}
 		for _, name := range []string{"read", "write", "transform", "flush", "final", "destroy"} {
 			if fn := tnStreamOption(s.options, name); fn != nil && reflect.ValueOf(fn).Kind() == reflect.Func && !reflect.ValueOf(fn).IsNil() {
 				s.setHook("_"+name, fn)
@@ -135,6 +158,60 @@ func TnNewTransform(options ...interface{}) *TnStream {
 
 func TnNewPassThrough(options ...interface{}) *TnStream {
 	return TnNewTransform(options...)
+}
+
+// stream.getDefaultHighWaterMark(objectMode) / setDefaultHighWaterMark(objectMode, n)
+var tnDefaultHWM = [2]float64{16384, 16}
+
+func TnGetDefaultHighWaterMark(objectMode bool) float64 {
+	if objectMode {
+		return tnDefaultHWM[1]
+	}
+	return tnDefaultHWM[0]
+}
+
+func TnSetDefaultHighWaterMark(objectMode bool, n float64) {
+	if objectMode {
+		tnDefaultHWM[1] = n
+	} else {
+		tnDefaultHWM[0] = n
+	}
+}
+
+// The highWaterMarks: the option, or the default for the stream's mode
+func (s *TnStream) readableHWM() float64 {
+	if s.readHWMSet {
+		return s.readHWM
+	}
+	return TnGetDefaultHighWaterMark(s.objectMode)
+}
+
+func (s *TnStream) writableHWM() float64 {
+	if s.writeHWMSet {
+		return s.writeHWM
+	}
+	return TnGetDefaultHighWaterMark(s.objectMode)
+}
+
+// A chunk's share of the buffered length
+func (s *TnStream) chunkSize(c interface{}) float64 {
+	if s.objectMode {
+		return 1
+	}
+	return float64(tnChunkLen(c))
+}
+
+func (s *TnStream) writeSize(c interface{}) float64 {
+	if s.objectMode {
+		return 1
+	}
+	switch x := c.(type) {
+	case []byte:
+		return float64(len(x))
+	case string:
+		return float64(len(x))
+	}
+	return 1
 }
 
 // Subclass overrides (_transform …) registered by the subclass constructor
@@ -183,6 +260,7 @@ func (s *TnStream) push(chunk interface{}, encoding ...string) bool {
 		if s.decoder != nil {
 			if rest := s.decoder.end(); rest != "" {
 				s.queue = append(s.queue, rest)
+				s.queueLen += s.chunkSize(rest)
 			}
 		}
 		s.scheduleFlow()
@@ -201,12 +279,58 @@ func (s *TnStream) push(chunk interface{}, encoding ...string) bool {
 		s.bytesRead += float64(len(b))
 	}
 	s.queue = append(s.queue, c)
+	s.queueLen += s.chunkSize(c)
 	s.scheduleFlow()
-	return len(s.queue) < 16
+	s.scheduleReadMore()
+	return s.queueLen < s.readableHWM()
 }
 
 func (s *TnStream) unshift(chunk interface{}, encoding ...string) {
-	s.queue = append([]interface{}{s.toChunk(chunk, "")}, s.queue...)
+	c := s.toChunk(chunk, "")
+	s.queue = append([]interface{}{c}, s.queue...)
+	s.queueLen += s.chunkSize(c)
+}
+
+// Takes the first buffered chunk
+func (s *TnStream) shiftChunk() interface{} {
+	chunk := s.queue[0]
+	s.queue = s.queue[1:]
+	s.queueLen -= s.chunkSize(chunk)
+	if len(s.queue) == 0 || s.queueLen < 0 {
+		s.queueLen = 0
+	}
+	return chunk
+}
+
+// Recounts the buffered length (after the queue changed wholesale)
+func (s *TnStream) recount() {
+	s.queueLen = 0
+	for _, c := range s.queue {
+		s.queueLen += s.chunkSize(c)
+	}
+}
+
+// Read-ahead (Node's maybeReadMore): _read again while the buffer is below
+// highWaterMark, until a call adds nothing synchronously
+func (s *TnStream) scheduleReadMore() {
+	if s.readMoreScheduled || s.readEnded || s.destroyed {
+		return
+	}
+	s.readMoreScheduled = true
+	s.post(func() {
+		s.readMoreScheduled = false
+		for !s.readEnded && !s.destroyed && !s.reading && s.queueLen < s.readableHWM() {
+			// (a flowing stream reads more once its consumer drained the buffer)
+			if s.flowing == 1 && len(s.queue) > 0 {
+				return
+			}
+			before, beforeChunks := s.queueLen, len(s.queue)
+			s.requestRead()
+			if s.queueLen == before && len(s.queue) == beforeChunks {
+				return
+			}
+		}
+	})
 }
 
 func (s *TnStream) scheduleFlow() {
@@ -229,8 +353,7 @@ func (s *TnStream) flow() {
 		return
 	}
 	for s.flowing == 1 && len(s.queue) > 0 {
-		chunk := s.queue[0]
-		s.queue = s.queue[1:]
+		chunk := s.shiftChunk()
 		if s.state == nil {
 			if s.fn0 != nil && s.ev0 == "data" {
 				if f, ok := s.fn0.(func(interface{})); ok {
@@ -289,13 +412,22 @@ func (s *TnStream) requestRead() {
 	if s.reading || s.readEnded || s.destroyed {
 		return
 	}
+	// (a full buffer waits for the consumer)
+	if len(s.queue) > 0 && s.queueLen >= s.readableHWM() {
+		return
+	}
 	if s.source != nil && !s.sourceStarted {
 		s.sourceStarted = true
 		s.source(s)
 	}
+	// (a transform's held write callback: its readable side wants more)
+	if cb := s.transformHeld; cb != nil {
+		s.transformHeld = nil
+		cb()
+	}
 	if fn := s.hook("_read"); fn != nil {
 		s.reading = true
-		TnInvoke(fn, float64(16384))
+		TnInvoke(fn, s.readableHWM())
 		s.reading = false
 	}
 }
@@ -434,8 +566,10 @@ func (s *TnStream) read(size ...float64) interface{} {
 		return nil
 	}
 	if s.objectMode {
-		chunk := s.queue[0]
-		s.queue = s.queue[1:]
+		chunk := s.shiftChunk()
+		if !s.readEnded {
+			s.requestRead()
+		}
 		s.emit("data", chunk)
 		return chunk
 	}
@@ -485,7 +619,8 @@ func (s *TnStream) read(size ...float64) interface{} {
 		}
 		s.queue = s.queue[1:]
 	}
-	if len(s.queue) == 0 && !s.readEnded {
+	s.recount()
+	if !s.readEnded {
 		s.requestRead()
 	}
 	var out interface{}
@@ -589,9 +724,14 @@ func (s *TnStream) write(chunk interface{}, args ...interface{}) bool {
 			enc = "utf8"
 		}
 	}
+	s.writeLen += s.writeSize(chunk)
+	ret := s.writeLen < s.writableHWM()
+	if !ret {
+		s.needDrain = true
+	}
 	s.writeQueue = append(s.writeQueue, tnWriteReq{chunk: chunk, encoding: enc, cb: cb})
 	s.processWrites()
-	return len(s.writeQueue) < 16
+	return ret
 }
 
 func (s *TnStream) processWrites() {
@@ -618,6 +758,10 @@ func (s *TnStream) processWrites() {
 			err = args[0]
 		}
 		s.writing = false
+		s.writeLen -= s.writeSize(req.chunk)
+		if s.writeLen < 0 || len(s.writeQueue) == 0 {
+			s.writeLen = 0
+		}
 		if b, ok := req.chunk.([]byte); ok {
 			s.bytesWritten += float64(len(b))
 		}
@@ -628,8 +772,14 @@ func (s *TnStream) processWrites() {
 			s.destroy(err)
 			return
 		}
-		if len(s.writeQueue) == 0 && !s.ending {
-			s.post(func() { s.emit("drain") })
+		// 'drain' once the buffer empties after a write() returned false
+		if len(s.writeQueue) == 0 && s.needDrain && !s.ending {
+			s.needDrain = false
+			s.post(func() {
+				if !s.destroyed {
+					s.emit("drain")
+				}
+			})
 		}
 		s.post(s.processWrites)
 	}
@@ -661,10 +811,24 @@ func (s *TnStream) runTransform(chunk interface{}, encoding string, done func(ar
 		done()
 		return
 	}
+	// As in Node, the write completes once the readable side has room: a
+	// transform whose output is not read holds its writer back
+	before := s.queueLen
+	settle := func(err interface{}) {
+		if err != nil && !TnIsNil(err) {
+			done(err)
+			return
+		}
+		if s.readEnded || s.writeEnded || s.queueLen == before || s.queueLen < s.readableHWM() {
+			done()
+			return
+		}
+		s.transformHeld = func() { done() }
+	}
 	fn := s.hook("_transform")
 	if fn == nil {
 		s.push(chunk)
-		done()
+		settle(nil)
 		return
 	}
 	TnInvoke(fn, chunk, encoding, func(args ...interface{}) {
@@ -672,9 +836,9 @@ func (s *TnStream) runTransform(chunk interface{}, encoding string, done func(ar
 			s.push(args[1])
 		}
 		if len(args) > 0 {
-			done(args[0])
+			settle(args[0])
 		} else {
-			done()
+			settle(nil)
 		}
 	})
 }
@@ -780,8 +944,11 @@ func (s *TnStream) Get_writableFinished() bool  { return s.finished }
 func (s *TnStream) Get_destroyed() bool         { return s.destroyed }
 func (s *TnStream) Get_closed() bool            { return s.closed }
 func (s *TnStream) Get_errored() interface{}    { return s.errored }
-func (s *TnStream) Get_readableLength() float64 { return float64(len(s.queue)) }
-func (s *TnStream) Get_writableLength() float64 { return float64(len(s.writeQueue)) }
+func (s *TnStream) Get_readableLength() float64 { return s.queueLen }
+func (s *TnStream) Get_writableLength() float64 { return s.writeLen }
+func (s *TnStream) Get_readableHighWaterMark() float64 { return s.readableHWM() }
+func (s *TnStream) Get_writableHighWaterMark() float64 { return s.writableHWM() }
+func (s *TnStream) Get_writableNeedDrain() bool { return s.needDrain }
 func (s *TnStream) Get_readableObjectMode() bool { return s.objectMode }
 func (s *TnStream) Get_writableObjectMode() bool { return s.objectMode }
 func (s *TnStream) Get_readableFlowing() interface{} {
@@ -829,6 +996,7 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 	switch x := iterable.(type) {
 	case string, []byte:
 		s.queue = append(s.queue, x)
+		s.recount()
 		s.readEnded = true
 		return s
 	}
@@ -841,6 +1009,7 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 		for i := 0; i < rv.Len(); i++ {
 			s.queue = append(s.queue, rv.Index(i).Interface())
 		}
+		s.recount()
 		s.readEnded = true
 	case reflect.Chan:
 		s.source = func(st *TnStream) {
@@ -854,8 +1023,14 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 					value := v.Interface()
 					TnLoopPost(func() { st.push(value) })
 				}
+				// (a generator that threw: its rejection destroys the stream)
+				reason, failed := tnRejections.Load(iterable)
 				TnLoopPost(func() {
 					defer TnLoopUnref()
+					if failed {
+						st.destroy(reason)
+						return
+					}
 					st.push(nil)
 				})
 			}()
@@ -902,6 +1077,99 @@ func (s *TnStream) compose(target interface{}, options ...interface{}) *TnStream
 		return TnPipe(s, dst.tnStream())
 	}
 	return TnReadableFrom(result)
+}
+
+// stream.duplexPair(options?): two Duplexes, each writing into the other's
+// readable side. A write completes once the other side reads it; end() ends
+// the other side's readable; destroy() ends it, destroy(err) destroys it too
+func TnDuplexPair(options ...interface{}) []*TnStream {
+	a, b := TnNewDuplex(options...), TnNewDuplex(options...)
+	tnLinkDuplexSide(a, b)
+	tnLinkDuplexSide(b, a)
+	return []*TnStream{a, b}
+}
+
+func tnLinkDuplexSide(side *TnStream, other *TnStream) {
+	side.setHook("_read", func(size float64) {
+		if cb := other.pairHeld; cb != nil {
+			other.pairHeld = nil
+			cb()
+		}
+	})
+	side.sink = func(chunk interface{}, done func(err interface{})) {
+		if !other.objectMode && tnChunkLen(chunk) == 0 {
+			side.post(func() { done(nil) })
+			return
+		}
+		other.push(chunk)
+		side.pairHeld = func() { done(nil) }
+	}
+	side.sinkFinal = func(done func(err interface{})) {
+		other.TnEventEmitter.once("end", func() { done(nil) })
+		other.push(nil)
+	}
+	side.setHook("_destroy", func(err interface{}, cb func(args ...interface{})) {
+		if !other.destroyed {
+			if err != nil && !TnIsNil(err) {
+				other.destroy()
+			} else if !other.readEnded {
+				other.push(nil)
+			}
+		}
+		cb(err)
+	})
+}
+
+// readable[Symbol.for('Stream.toAsyncStreamable')]() (stream/iter): the
+// chunks as Uint8Arrays, in batches of what arrived together
+func (s *TnStream) __toAsyncStreamable() chan [][]byte {
+	ch := make(chan [][]byte, 65536)
+	var batch [][]byte
+	scheduled, failed := false, false
+	flush := func() {
+		if len(batch) > 0 && !failed {
+			ch <- batch
+			batch = nil
+		}
+	}
+	s.on("data", func(chunk interface{}) {
+		if failed {
+			return
+		}
+		var b []byte
+		switch c := chunk.(type) {
+		case []byte:
+			b = c
+		case string:
+			b = []byte(c)
+		default:
+			failed = true
+			TnReject(ch, TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"value\\" argument must be of type string or an instance of ArrayBuffer, ArrayBufferView, Iterable, or AsyncIterable or one of toStreamable or toAsyncStreamable. Received "+TnJSString(chunk)))
+			s.destroy()
+			return
+		}
+		batch = append(batch, b)
+		if !scheduled {
+			scheduled = true
+			s.post(func() {
+				scheduled = false
+				flush()
+			})
+		}
+	})
+	s.TnEventEmitter.once("end", func() {
+		flush()
+		if !failed {
+			close(ch)
+		}
+	})
+	s.TnEventEmitter.once("error", func(err interface{}) {
+		if !failed {
+			failed = true
+			TnReject(ch, err)
+		}
+	})
+	return ch
 }
 
 // for await (const chunk of readable)
@@ -1323,9 +1591,9 @@ func TnZlibStream(format string, decompress bool, options ...interface{}) *TnStr
 // Go parameter types of option / override methods
 // Method and getter specs of TnStream, shared with classes that embed it (net.Socket, http messages)
 export const STREAM_METHODS =
-  'on=*TnStream; once=*TnStream; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; compose=*TnStream; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
+  'on=*TnStream; once=*TnStream; addListener=*TnEventEmitter; off=*TnEventEmitter; removeListener=*TnEventEmitter; removeAllListeners=*TnEventEmitter; emit=bool; listenerCount=float64; compose=*TnStream; __toAsyncStreamable=chan [][]byte; push=bool; unshift=; read=interface{}; resume=*TnStream; pause=*TnStream; isPaused=bool; setEncoding=*TnStream; destroy=*TnStream; write=bool; end=*TnStream; cork=; uncork=; setDefaultEncoding=*TnStream';
 export const STREAM_GETTERS =
-  'readable=bool; writable=bool; readableEnded=bool; writableEnded=bool; writableFinished=bool; destroyed=bool; closed=bool; errored=interface{}; readableLength=float64; writableLength=float64; readableObjectMode=bool; writableObjectMode=bool; readableFlowing=interface{}; bytesRead=float64; bytesWritten=float64; path=string';
+  'readable=bool; writable=bool; readableEnded=bool; writableEnded=bool; writableFinished=bool; destroyed=bool; closed=bool; errored=interface{}; readableLength=float64; writableLength=float64; readableHighWaterMark=float64; writableHighWaterMark=float64; writableNeedDrain=bool; readableObjectMode=bool; writableObjectMode=bool; readableFlowing=interface{}; bytesRead=float64; bytesWritten=float64; path=string';
 
 const STREAM_HOOK_PARAMS: Record<string, string[]> = {
   read: ['float64'],
@@ -1418,6 +1686,20 @@ func tnStdin() *bufio.Reader {
     return `TnReadableFrom(${call.args.join(', ')})`;
   };
   r.results['stream.Readable.from'] = '*TnStream';
+  r.functions['stream.duplexPair'] = (call: NodeCall) => {
+    use();
+    return `TnDuplexPair(${call.args.join(', ')})`;
+  };
+  r.results['stream.duplexPair'] = '[]*TnStream';
+  r.functions['stream.getDefaultHighWaterMark'] = (call: NodeCall) => {
+    use();
+    return `TnGetDefaultHighWaterMark(${call.args[0] ?? 'false'})`;
+  };
+  r.results['stream.getDefaultHighWaterMark'] = 'float64';
+  r.functions['stream.setDefaultHighWaterMark'] = (call: NodeCall) => {
+    use();
+    return `TnSetDefaultHighWaterMark(${call.args.join(', ')})`;
+  };
   const pipeline = (call: NodeCall) => {
     use();
     useHashStream(r, call.types);
