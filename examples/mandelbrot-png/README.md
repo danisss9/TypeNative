@@ -47,17 +47,17 @@ both runtimes rendering the same image, then decodes both PNGs (checking every
 chunk CRC) and compares the pixels.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
-TypeNative 0.5.0 (unreleased changes), default (non-`--release`) build.
+TypeNative 0.7.0, default (non-`--release`) build.
 
 | Runtime    | min       | median    | mean      | max       |
 |------------|-----------|-----------|-----------|-----------|
-| Node.js    | 499.84 ms | 513.64 ms | 508.85 ms | 518.01 ms |
-| TypeNative | 449.83 ms | 452.28 ms | 466.67 ms | 599.75 ms |
+| Node.js    | 455.84 ms | 462.40 ms | 467.48 ms | 507.02 ms |
+| TypeNative | 416.75 ms | 418.66 ms | 432.57 ms | 558.33 ms |
 
 **TypeNative is 1.1x faster end to end** (median). There's no JIT warm-up.
 The render loop itself takes about the same time in both runtimes. V8 compiles a tight float loop like the escape-time
 iteration into machine code about as good as Go's. The difference is mostly
 Node's startup. For recursion and
 call-heavy code the compute gap is larger (see [fibonacci](../fibonacci/),
-2.0x). This example's main advantage is distribution: one dependency-free
+2.1x). This example's main advantage is distribution: one dependency-free
 binary that writes images.

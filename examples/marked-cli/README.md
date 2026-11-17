@@ -93,29 +93,29 @@ checks that the two HTML outputs are identical:
   from a fixed-seed generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.5.0 (unreleased changes), default
-(non-`--release`) build. The binary is 6.5 MB.
+Node v26.13.0, Go 1.27.4, TypeNative 0.7.0, default
+(non-`--release`) build. The binary is 9.8 MB.
 
 (a) `marked < README.md` (3.5 KB), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 101.08 ms | 103.58 ms | 106.68 ms | 119.02 ms |
-| TypeNative | 11.98 ms  | 12.67 ms  | 20.14 ms  | 235.52 ms |
+| Node.js    | 104.86 ms | 106.91 ms | 108.76 ms | 122.06 ms |
+| TypeNative | 12.05 ms  | 13.10 ms  | 20.19 ms  | 228.66 ms |
 
 (b) `marked < generated.md` (10.0 MB, 114,893 lines), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 585.94 ms | 595.71 ms | 592.98 ms | 597.79 ms | 16.79         |
-| TypeNative | 500.79 ms | 511.86 ms | 509.63 ms | 513.24 ms | 19.54         |
+| Node.js    | 604.66 ms | 607.99 ms | 609.90 ms | 620.93 ms | 16.45         |
+| TypeNative | 521.38 ms | 534.45 ms | 532.89 ms | 539.79 ms | 18.71         |
 
-**Per call, TypeNative is 8.2x faster** (12.7 ms vs 103.6 ms, median). Node's
+**Per call, TypeNative is 8.2x faster** (13.1 ms vs 106.9 ms, median). Node's
 cost here is mostly startup: it loads and type-strips the 13 TypeScript files
 and compiles marked's regexes on every run. That's what you feel when a docs
 build or a hook renders one file per process.
 
-**On bulk throughput, TypeNative is 1.2x faster** (512 ms vs 596 ms). A
+**On bulk throughput, TypeNative is 1.1x faster** (534 ms vs 608 ms). A
 loaded document is cut before top-level ATX headings that follow a blank line
 and are outside a code fence; up to six worker processes each parse one
 contiguous run of sections, and their HTML is concatenated. Parsing the
@@ -128,18 +128,17 @@ their behavior is unchanged. The workers pass their assignment in `workerData`
 and return gzipped HTML through one temporary file: the worker IPC carries a
 single compact message, not several megabytes.
 
-**A single process is still about 1.5x slower than Node on 10 MB.** The
+**A single process is still about 1.6x slower than Node on 10 MB** (1.92 s vs
+1.22 s). The
 parallel path is what closes the gap; per section the remaining cost is
 TypeNative's regex VM, which interprets marked's patterns where V8's Irregexp
 compiles them to machine code, plus the object and match-array allocation each
-token costs. The fixes below cut the single-process time from 1,890 ms to
-about 1,620 ms before the parallel path; the parallel run then has six of those
-processes working on independent sections.
+token costs.
 
-The ReDoS inputs now favor the native binary: all of them together take 4.7 s
-natively and 13 s under Node, though most of Node's time there is starting up
-once per input. The slowest native case, `quadratic_inline_masking`, takes
-0.7 s against Node's 0.9 s.
+The ReDoS inputs now favor the native binary: all of them together take 0.8 s
+natively and 3.3 s under Node, though most of Node's time there is starting up
+once per input. The slowest native case, `backticks_alternating_in_link`, takes
+0.22 s against Node's 0.11 s.
 
 Getting here fixed performance bugs in TypeNative's runtime and compiler, all
 general:

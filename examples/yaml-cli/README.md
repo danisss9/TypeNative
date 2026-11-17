@@ -87,34 +87,34 @@ and checks that the two JSON outputs are identical:
   generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.6.1, default
+Node v26.13.0, Go 1.27.4, TypeNative 0.7.0, default
 (non-`--release`) build.
 
 (a) `yaml --json < docker-compose.yml`, 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 102.38 ms | 104.87 ms | 106.76 ms | 117.83 ms |
-| TypeNative | 8.23 ms   | 8.78 ms   | 9.89 ms   | 41.91 ms  |
+| Node.js    | 104.46 ms | 106.84 ms | 108.99 ms | 121.29 ms |
+| TypeNative | 8.84 ms   | 9.43 ms   | 10.51 ms  | 43.75 ms  |
 
 (b) `yaml --json < manifests.yaml` (10.0 MB), 5 runs each:
 
 | Runtime    | min      | median   | mean     | max      | MB/s (median) |
 | ---------- | -------- | -------- | -------- | -------- | ------------- |
-| Node.js    | 807.92 ms | 851.20 ms | 844.81 ms | 869.64 ms | 11.75        |
-| TypeNative | 741.86 ms | 753.61 ms | 751.74 ms | 760.93 ms | 13.27        |
+| Node.js    | 852.59 ms | 862.44 ms | 859.11 ms | 864.16 ms | 11.60        |
+| TypeNative | 762.03 ms | 779.90 ms | 776.40 ms | 781.36 ms | 12.83        |
 
-**Per call, TypeNative is 11.9x faster** (9 ms vs 105 ms, median). Node's
+**Per call, TypeNative is 11.3x faster** (9 ms vs 107 ms, median). Node's
 cost here is mostly startup. It loads and type-strips the 78 TypeScript
 files on every run before it reads a byte of input. That's what you feel
 when a tool calls the converter once per file.
 
-**On bulk throughput the two are close** (754 ms vs 851 ms, median; 13.3 vs
-11.8 MB/s). Both runtimes take the split-and-workers path for this input, so
+**On bulk throughput the two are close** (780 ms vs 862 ms, median; 12.8 vs
+11.6 MB/s). Both runtimes take the split-and-workers path for this input, so
 Node pays six worker startups while the native binary pays almost none; that
 largely cancels the native single-process deficit in this benchmark. Without
-the workers, the native process takes about 3.0 s for the same 10 MB (lex
-0.31 s, parse 0.91 s, compose 1.42 s, JSON 0.40 s) against Node's 1.3 s.
+the workers, the native process takes about 3.1 s for the same 10 MB against
+Node's 1.5 s.
 Once V8's JIT has warmed up, it runs this dynamic object-heavy code faster:
 the library passes structural object types and unions (`Scalar | YAMLMap |
 YAMLSeq | Pair`, CST tokens) that TypeNative holds as `interface{}`, so the

@@ -122,26 +122,26 @@ single-process path for both runtimes:
   fixed-seed generator, so every machine gets the same input).
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600 (6 cores, 12 threads),
-Node v26.13.0, Go 1.27.4, TypeNative 0.6.1, default (non-`--release`) build.
-The binary is 29.9 MB.
+Node v26.13.0, Go 1.27.4, TypeNative 0.7.0, default (non-`--release`) build.
+The binary is 35.5 MB.
 
-(a) `react-compile` (built-in demo), 5 runs each:
+(a) `react-compile` (built-in demo), 30 runs each:
 
 | Runtime    | min       | median    | mean      | max       |
 | ---------- | --------- | --------- | --------- | --------- |
-| Node.js    | 347.32 ms | 348.88 ms | 349.49 ms | 353.65 ms |
-| TypeNative |  97.67 ms |  99.61 ms | 107.70 ms | 142.96 ms |
+| Node.js    | 359.81 ms | 364.20 ms | 364.67 ms | 374.35 ms |
+| TypeNative | 101.20 ms | 103.26 ms | 104.99 ms | 151.30 ms |
 
 (b) `react-compile generated-screen.jsx`, 5 runs per size (medians):
 
 | Source            | Node.js    | TypeNative | TypeNative vs Node |
 | ----------------- | ---------- | ---------- | ------------------ |
-| 9 KB, 238 lines   |  704.90 ms |  275.08 ms | 2.6x faster        |
-| 17 KB, 460 lines  |  761.71 ms |  332.94 ms | 2.3x faster        |
-| 32 KB, 892 lines  |  874.53 ms |  418.38 ms | 2.1x faster        |
-| 64 KB, 1774 lines | 1,030.31 ms|  615.05 ms | 1.7x faster        |
+| 9 KB, 238 lines   |  723.84 ms |  292.53 ms | 2.5x faster        |
+| 17 KB, 460 lines  |  778.52 ms |  345.58 ms | 2.3x faster        |
+| 32 KB, 892 lines  |  898.47 ms |  429.55 ms | 2.1x faster        |
+| 64 KB, 1774 lines | 1,084.56 ms|  622.86 ms | 1.7x faster        |
 
-**Per call, TypeNative is 3.5x faster** (100 ms vs 349 ms, median). Node
+**Per call, TypeNative is 3.5x faster** (103 ms vs 364 ms, median). Node
 spends most of a short run loading and compiling the ~470 vendored modules;
 the native binary starts with them compiled in.
 

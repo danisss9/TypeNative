@@ -104,28 +104,29 @@ plain `node:http` client would cap out far below either server, so
 with it both servers would simply tie at the client's limit.
 
 **Environment:** Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4,
-TypeNative 0.6.1, default (non-`--release`) build, client
+TypeNative 0.7.0, default (non-`--release`) build, client
 and server on the same machine. Re-run variation is about ±20%; across runs
-TypeNative was 1.6–1.8x Node on GET and 1.6–1.8x on POST. The numbers below are
+TypeNative was 1.6–1.7x Node on GET and 1.4–1.8x on POST. The numbers below are
 medians over three runs.
 
 | Runtime    | Endpoint    |  req/s | p50 (ms) | p99 (ms) |
 |------------|-------------|-------:|---------:|---------:|
-| Node.js    | GET /todos  |  61957 |     0.23 |     0.63 |
-| TypeNative | GET /todos  | 106483 |     0.14 |     0.38 |
-| Node.js    | POST /todos |  68097 |     0.21 |     0.46 |
-| TypeNative | POST /todos | 114066 |     0.13 |     0.40 |
+| Node.js    | GET /todos  |  57265 |     0.24 |     0.68 |
+| TypeNative | GET /todos  |  94068 |     0.15 |     0.44 |
+| Node.js    | POST /todos |  60173 |     0.23 |     0.50 |
+| TypeNative | POST /todos | 102328 |     0.14 |     0.43 |
 
-**TypeNative serves ~1.7x more requests per second here**, with lower median
-latency on both routes. The compiled server reads requests and writes
+**TypeNative serves ~1.6x more GET and ~1.7x more POST requests per second
+here**, with lower median latency on both routes. The compiled server reads
+requests and writes
 responses on each connection's goroutine, and a handler that answers
 synchronously (`writeHead` + `end`, as both routes do) builds the response
 bytes right there, in one write: it never queues an operation for the event
 loop, which keeps the per-request hand-off to JavaScript to a single baton
-pass. JavaScript still runs one thing at a time, but at 105–115k req/s the
+pass. JavaScript still runs one thing at a time, but at 94–102k req/s the
 parallel socket I/O and HTTP handling stay ahead of that one thread.
 
-On top of that, the binary starts in ~7 ms instead of ~60 ms and is a
-single 11.4 MB executable with zero dependencies — `scp` it to a server and
+On top of that, the binary starts in a few milliseconds instead of ~45 ms and
+is a single 13.1 MB executable with zero dependencies — `scp` it to a server and
 run it, no Node install, no `node_modules` — and CPU-heavy work inside a
 handler runs ~2x faster (see the [fibonacci example](../fibonacci/README.md)).
