@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Temporal`:** the Node 26 global — `Instant`, `ZonedDateTime`,
+  `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`,
+  `PlainMonthDay`, `Duration` and `Now` — on Go's `time` and embedded
+  tzdata (the ISO 8601 calendar). Parsing (RFC 9557 / ISO 8601, extended
+  years, basic format, offsets, `[tz]` and `[u-ca]` annotations, duration
+  strings with fractional hours and minutes), `with`, `add` / `subtract`,
+  `until` / `since`, `round` / `total` with all nine rounding modes,
+  `relativeTo`, DST gap / overlap disambiguation, `getTimeZoneTransition`
+  and the `toString` options. `Temporal.Now.timeZoneId()` reads `TZ`, the
+  `/etc/localtime` link or the Windows registry (`TimeZoneKeyName`, mapped
+  to IANA). Named zones embed `time/tzdata` (+~450 KB, only in programs
+  that use Temporal); non-ISO calendars throw a `RangeError`, and
+  `toLocaleString` uses a fixed en-US format. `fs.Stats` gains
+  `atimeInstant` / `mtimeInstant` / `ctimeInstant` / `birthtimeInstant`
+  and `Date.prototype.toTemporalInstant` exists.
 - **`Intl`:** `NumberFormat` (decimal / percent / currency / unit styles,
   compact / scientific / engineering notation, significant and fraction
   digits, rounding modes and increments, `signDisplay`, `formatToParts`,
@@ -148,6 +163,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The self-hosted compiler's contextual typing is back, so
+  `npm run bootstrap:check` holds again.** `Array.prototype.slice` / `indexOf`
+  on a dynamic array (the AST's node lists) now dereference the parser's
+  slice reference, which had made every callback parameter list look empty in
+  the native build (`TnSlice` / `TnIndexOf`), and the handler tables and the
+  compiler's own array/object callbacks are explicitly typed. The Temporal
+  helper also self-compiles now, so `npm run build:native` works again.
 - **`navigator.language` no longer reports `C`:** a `LANG` / `LC_ALL` of
   `C.UTF-8` (Git Bash's default) passed the C-locale check before its codeset
   suffix was stripped, so the language was the one-letter `C`. The codeset is

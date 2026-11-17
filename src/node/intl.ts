@@ -5,7 +5,7 @@
 // the output matches Node; language tags and matching, plural rules,
 // collation and locale case mapping run on the vendored golang.org/x/text.
 // Registered beside registerWebAssembly in src/transpiler.ts.
-import { NodeRegistry, defineClass, defineHelper, setResults } from './registry.js';
+import { NodeCall, NodeRegistry, defineClass, defineHelper, setResults } from './registry.js';
 import { intlCoreData, intlNumberData, intlDateData, intlListRelData, intlDisplayData } from './intl_data.js';
 import { registerTemporalZones } from './temporal_zones.js';
 
@@ -4431,27 +4431,27 @@ export function registerIntl(r: NodeRegistry): void {
     'format=func(interface{}) string',
     ''
   );
-  r.constructors['Intl.NumberFormat'] = (c) => {
+  r.constructors['Intl.NumberFormat'] = (c: NodeCall) => {
     use('intlNumber');
     return `TnNewIntlNumberFormat(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.NumberFormat#format'] = (c) => {
+  r.methods['Intl.NumberFormat#format'] = (c: NodeCall) => {
     use('intlNumber');
     return `TnIntlNumberFormatAnyStr(${c.recv}, ${c.args[0] ?? 'nil'})`;
   };
-  r.methods['Intl.NumberFormat#formatToParts'] = (c) => {
+  r.methods['Intl.NumberFormat#formatToParts'] = (c: NodeCall) => {
     use('intlNumber');
     return `TnIntlNumberFormatAny(${c.recv}, ${c.args[0] ?? 'nil'})`;
   };
-  r.methods['Intl.NumberFormat#formatRange'] = (c) => {
+  r.methods['Intl.NumberFormat#formatRange'] = (c: NodeCall) => {
     use('intlNumber');
     return `TnIntlNumberFormatRange(${c.recv}, ${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.NumberFormat#formatRangeToParts'] = (c) => {
+  r.methods['Intl.NumberFormat#formatRangeToParts'] = (c: NodeCall) => {
     use('intlNumber');
     return `TnIntlNumberFormatRangeParts(${c.recv}, ${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.functions['Intl.NumberFormat.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.NumberFormat.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4472,27 +4472,27 @@ export function registerIntl(r: NodeRegistry): void {
     'format=func(interface{}) string',
     ''
   );
-  r.constructors['Intl.DateTimeFormat'] = (c) => {
+  r.constructors['Intl.DateTimeFormat'] = (c: NodeCall) => {
     use('intlDate');
     return `TnNewIntlDateTimeFormat(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.DateTimeFormat#format'] = (c) => {
+  r.methods['Intl.DateTimeFormat#format'] = (c: NodeCall) => {
     use('intlDate');
     return `TnIntlDateFormat(${c.recv}, TnNewDate(${c.args[0] ?? 'nil'}))`;
   };
-  r.methods['Intl.DateTimeFormat#formatToParts'] = (c) => {
+  r.methods['Intl.DateTimeFormat#formatToParts'] = (c: NodeCall) => {
     use('intlDate');
     return `TnIntlDateFormatParts(${c.recv}, TnNewDate(${c.args[0] ?? 'nil'}))`;
   };
-  r.methods['Intl.DateTimeFormat#formatRange'] = (c) => {
+  r.methods['Intl.DateTimeFormat#formatRange'] = (c: NodeCall) => {
     use('intlDate');
     return `TnIntlDateFormatRange(${c.recv}, TnNewDate(${c.args[0] ?? 'nil'}), TnNewDate(${c.args[1] ?? 'nil'}))`;
   };
-  r.methods['Intl.DateTimeFormat#formatRangeToParts'] = (c) => {
+  r.methods['Intl.DateTimeFormat#formatRangeToParts'] = (c: NodeCall) => {
     use('intlDate');
     return `TnIntlDateFormatRangeParts(${c.recv}, TnNewDate(${c.args[0] ?? 'nil'}), TnNewDate(${c.args[1] ?? 'nil'}))`;
   };
-  r.functions['Intl.DateTimeFormat.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.DateTimeFormat.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4504,15 +4504,15 @@ export function registerIntl(r: NodeRegistry): void {
 
   // --- Intl.Collator
   defineClass(r, 'Intl.Collator', '*TnIntlCollator', 'class', 'resolvedOptions=interface{}', '', 'compare=func(string, string) float64', '');
-  r.constructors['Intl.Collator'] = (c) => {
+  r.constructors['Intl.Collator'] = (c: NodeCall) => {
     use('intlCollate');
     return `TnNewIntlCollator(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.Collator#compare'] = (c) => {
+  r.methods['Intl.Collator#compare'] = (c: NodeCall) => {
     use('intlCollate');
     return `TnIntlCollatorCompare(${c.recv}, ${c.args[0]}, ${c.args[1]})`;
   };
-  r.functions['Intl.Collator.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.Collator.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4520,19 +4520,19 @@ export function registerIntl(r: NodeRegistry): void {
 
   // --- Intl.PluralRules
   defineClass(r, 'Intl.PluralRules', '*TnIntlPluralRules', 'class', 'resolvedOptions=interface{}', '', '', '');
-  r.constructors['Intl.PluralRules'] = (c) => {
+  r.constructors['Intl.PluralRules'] = (c: NodeCall) => {
     use('intlPlural');
     return `TnNewIntlPluralRules(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.PluralRules#select'] = (c) => {
+  r.methods['Intl.PluralRules#select'] = (c: NodeCall) => {
     use('intlPlural');
     return `TnIntlPluralSelect(${c.recv}, ${c.args[0] ?? 'nil'})`;
   };
-  r.methods['Intl.PluralRules#selectRange'] = (c) => {
+  r.methods['Intl.PluralRules#selectRange'] = (c: NodeCall) => {
     use('intlPlural');
     return `TnIntlPluralSelectRange(${c.recv}, ${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.functions['Intl.PluralRules.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.PluralRules.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4540,19 +4540,19 @@ export function registerIntl(r: NodeRegistry): void {
 
   // --- Intl.ListFormat
   defineClass(r, 'Intl.ListFormat', '*TnIntlListFormat', 'class', 'resolvedOptions=interface{}', '', '', '');
-  r.constructors['Intl.ListFormat'] = (c) => {
+  r.constructors['Intl.ListFormat'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnNewIntlListFormat(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.ListFormat#format'] = (c) => {
+  r.methods['Intl.ListFormat#format'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnIntlListFormatFormat(${c.recv}, ${c.args[0] ?? 'nil'})`;
   };
-  r.methods['Intl.ListFormat#formatToParts'] = (c) => {
+  r.methods['Intl.ListFormat#formatToParts'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnIntlListFormatParts(${c.recv}, ${c.args[0] ?? 'nil'})`;
   };
-  r.functions['Intl.ListFormat.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.ListFormat.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4560,19 +4560,19 @@ export function registerIntl(r: NodeRegistry): void {
 
   // --- Intl.RelativeTimeFormat
   defineClass(r, 'Intl.RelativeTimeFormat', '*TnIntlRelativeTimeFormat', 'class', 'resolvedOptions=interface{}', '', '', '');
-  r.constructors['Intl.RelativeTimeFormat'] = (c) => {
+  r.constructors['Intl.RelativeTimeFormat'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnNewIntlRelativeTimeFormat(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.RelativeTimeFormat#format'] = (c) => {
+  r.methods['Intl.RelativeTimeFormat#format'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnIntlRelativeFormat(${c.recv}, ${c.args[0] ?? 'nil'}, ${c.args[1] ?? '""'})`;
   };
-  r.methods['Intl.RelativeTimeFormat#formatToParts'] = (c) => {
+  r.methods['Intl.RelativeTimeFormat#formatToParts'] = (c: NodeCall) => {
     use('intlListRel');
     return `TnIntlRelativeParts(${c.recv}, ${c.args[0] ?? 'nil'}, ${c.args[1] ?? '""'})`;
   };
-  r.functions['Intl.RelativeTimeFormat.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.RelativeTimeFormat.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4581,15 +4581,15 @@ export function registerIntl(r: NodeRegistry): void {
   // --- Intl.Segmenter (segment() iterates; containing(i) reads one)
   defineClass(r, 'Intl.Segmenter', '*TnIntlSegmenter', 'class', 'resolvedOptions=interface{}', '', '', '');
   defineClass(r, 'Intl.Segments', '*TnIntlSegmentIter', 'class', 'tnItems=[]interface{}; containing=interface{}', '', '', '');
-  r.constructors['Intl.Segmenter'] = (c) => {
+  r.constructors['Intl.Segmenter'] = (c: NodeCall) => {
     use('intlSegmenter');
     return `TnNewIntlSegmenter(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.Segmenter#segment'] = (c) => {
+  r.methods['Intl.Segmenter#segment'] = (c: NodeCall) => {
     use('intlSegmenter');
     return `${c.recv}.segment(${c.args[0] ?? '""'})`;
   };
-  r.functions['Intl.Segmenter.supportedLocalesOf'] = (c) => {
+  r.functions['Intl.Segmenter.supportedLocalesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedLocalesOf(${c.args[0] ?? 'nil'})`;
   };
@@ -4599,11 +4599,11 @@ export function registerIntl(r: NodeRegistry): void {
 
   // --- Intl.DisplayNames
   defineClass(r, 'Intl.DisplayNames', '*TnIntlDisplayNames', 'class', 'resolvedOptions=interface{}', '', '', '');
-  r.constructors['Intl.DisplayNames'] = (c) => {
+  r.constructors['Intl.DisplayNames'] = (c: NodeCall) => {
     use('intlDisplay');
     return `TnNewIntlDisplayNames(${c.args[0] ?? 'nil'}, ${c.args[1] ?? 'nil'})`;
   };
-  r.methods['Intl.DisplayNames#of'] = (c) => {
+  r.methods['Intl.DisplayNames#of'] = (c: NodeCall) => {
     use('intlDisplay');
     return `${c.recv}.of(${c.args[0] ?? '""'})`;
   };
@@ -4620,17 +4620,17 @@ export function registerIntl(r: NodeRegistry): void {
     'baseName=string; language=string; script=interface{}; region=interface{}; numberingSystem=interface{}; calendar=interface{}; collation=interface{}; caseFirst=interface{}; numeric=bool; hourCycle=interface{}',
     ''
   );
-  r.constructors['Intl.Locale'] = (c) => {
+  r.constructors['Intl.Locale'] = (c: NodeCall) => {
     use('intlLocale');
     return `TnNewIntlLocale(${c.args[0] ?? '""'}, ${c.args[1] ?? 'nil'})`;
   };
 
   // --- Intl statics
-  r.functions['Intl.getCanonicalLocales'] = (c) => {
+  r.functions['Intl.getCanonicalLocales'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlGetCanonicalLocales(${c.args[0] ?? 'nil'})`;
   };
-  r.functions['Intl.supportedValuesOf'] = (c) => {
+  r.functions['Intl.supportedValuesOf'] = (c: NodeCall) => {
     use('intlCore');
     return `TnIntlSupportedValuesOf(${c.args[0] ?? '""'})`;
   };

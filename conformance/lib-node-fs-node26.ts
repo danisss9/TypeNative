@@ -24,6 +24,16 @@ assert(dirents.length === 1 && dirents[0].name === 'y.txt' && dirents[0].isFile(
 const st = fs.statfsSync(root);
 assert(st.bsize > 0 && st.blocks > 0 && st.bavail <= st.blocks && typeof st.type === 'number', 'statfsSync');
 
+// Temporal.Instant stat fields (Node 26)
+const fileStats = fs.statSync(path.join(root, 'x.txt'));
+assert(fileStats.mtimeInstant instanceof Temporal.Instant, 'mtimeInstant is an Instant');
+assert(fileStats.atimeInstant instanceof Temporal.Instant, 'atimeInstant is an Instant');
+assert(fileStats.ctimeInstant instanceof Temporal.Instant, 'ctimeInstant is an Instant');
+assert(fileStats.birthtimeInstant instanceof Temporal.Instant, 'birthtimeInstant is an Instant');
+assert(fileStats.mtimeInstant.epochMilliseconds === Math.floor(fileStats.mtimeMs), 'mtimeInstant matches mtimeMs');
+assert(fileStats.atimeInstant.epochMilliseconds === Math.floor(fileStats.atimeMs), 'atimeInstant matches atimeMs');
+assert(fileStats.birthtimeInstant.toZonedDateTimeISO('UTC').timeZoneId === 'UTC', 'instant converts to a zoned date time');
+
 // readFileSync into a buffer: a view of its leading bytes
 const target = Buffer.alloc(64);
 const read = fs.readFileSync(path.join(root, 'x.txt'), { buffer: target });

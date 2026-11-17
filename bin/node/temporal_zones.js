@@ -223,7 +223,7 @@ func tnTemporalWindowsZoneName() string {
 	}
 	defer syscall.RegCloseKey(key)
 	var buf [256]uint16
-	var n uint32
+	n := uint32(len(buf) * 2)
 	err = syscall.RegQueryValueEx(key, syscall.StringToUTF16Ptr("TimeZoneKeyName"), nil, nil, (*byte)(unsafe.Pointer(&buf[0])), &n)
 	if err != nil || n < 2 {
 		return ""
@@ -414,32 +414,45 @@ func (tz *tnTemporalTZ) resolveInstant(localSec int64, nsec int32, mode string) 
 }
 
 // The next offset change after an instant ('next'), or the most recent one
-// before it ('previous'); nil past the tzdata's first or last transition
+// before it ('previous'); nil past the tzdata's first or last transition.
+// ZoneBounds' bounds are only candidates: the embedded tzdata's first year
+// starts with a boundary at which the offset does not change (and an instant
+// can sit exactly on a boundary), so walk until one really changes.
 func (tz *tnTemporalTZ) zoneTransition(inst *TnTemporalInstant, next bool) *TnTemporalInstant {
 	if tz.fixed {
 		return nil
 	}
 	t := time.Unix(inst.sec, int64(inst.nsec)).In(tz.loc)
-	if !next {
-		start, _ := t.ZoneBounds()
-		if start.IsZero() {
+	for i := 0; i < 100000; i++ {
+		var bound time.Time
+		if next {
+			_, bound = t.ZoneBounds()
+		} else {
+			bound, _ = t.ZoneBounds()
+		}
+		if bound.IsZero() {
 			return nil
 		}
-		if start.Unix() == inst.sec && int64(start.Nanosecond()) == int64(inst.nsec) {
-			// (the instant is itself a transition: the one before it)
-			prev, _ := t.Add(-1).ZoneBounds()
-			if prev.IsZero() {
-				return nil
-			}
-			return tnTemporalInstantOfTime(prev)
+		if !next && bound.Unix() == t.Unix() && bound.Nanosecond() == t.Nanosecond() {
+			// (on the boundary itself: look at the interval before it)
+			t = bound.Add(-time.Nanosecond)
+			continue
 		}
-		return tnTemporalInstantOfTime(start)
+		before := bound.Add(-time.Nanosecond).In(tz.loc)
+		_, offBefore := before.Zone()
+		_, offAt := bound.In(tz.loc).Zone()
+		if offBefore == offAt {
+			// (a boundary where nothing changes: keep walking)
+			if next {
+				t = bound
+			} else {
+				t = before
+			}
+			continue
+		}
+		return tnTemporalInstantOfTime(bound)
 	}
-	_, end := t.ZoneBounds()
-	if end.IsZero() {
-		return nil
-	}
-	return tnTemporalInstantOfTime(end)
+	return nil
 }
 
 func tnTemporalInstantOfTime(t time.Time) *TnTemporalInstant {

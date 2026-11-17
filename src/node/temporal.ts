@@ -85,9 +85,9 @@ export function registerTemporal(r: NodeRegistry): void {
     'Temporal.ZonedDateTime',
     '*TnTemporalZonedDateTime',
     'class',
-    'add=*TnTemporalZonedDateTime; subtract=*TnTemporalZonedDateTime; with=*TnTemporalZonedDateTime; withCalendar=*TnTemporalZonedDateTime; withPlainTime=*TnTemporalZonedDateTime; withTimeZone=*TnTemporalZonedDateTime; until=*TnTemporalDuration; since=*TnTemporalDuration; equals=bool; round=*TnTemporalZonedDateTime; startOfDay=*TnTemporalZonedDateTime; getTimeZoneTransition=interface{}; toInstant=*TnTemporalInstant; toPlainDate=*TnTemporalPlainDate; toPlainTime=*TnTemporalPlainTime; toPlainDateTime=*TnTemporalPlainDateTime; hoursInDay=float64; toString=string; toJSON=string; toLocaleString=string; valueOf=',
+    'add=*TnTemporalZonedDateTime; subtract=*TnTemporalZonedDateTime; with=*TnTemporalZonedDateTime; withCalendar=*TnTemporalZonedDateTime; withPlainTime=*TnTemporalZonedDateTime; withTimeZone=*TnTemporalZonedDateTime; until=*TnTemporalDuration; since=*TnTemporalDuration; equals=bool; round=*TnTemporalZonedDateTime; startOfDay=*TnTemporalZonedDateTime; getTimeZoneTransition=interface{}; toInstant=*TnTemporalInstant; toPlainDate=*TnTemporalPlainDate; toPlainTime=*TnTemporalPlainTime; toPlainDateTime=*TnTemporalPlainDateTime; toString=string; toJSON=string; toLocaleString=string; valueOf=',
     '',
-    'calendarId=string; timeZoneId=string; era=interface{}; eraYear=interface{}; year=float64; month=float64; monthCode=string; day=float64; dayOfWeek=float64; dayOfYear=float64; weekOfYear=float64; yearOfWeek=float64; daysInWeek=float64; daysInMonth=float64; daysInYear=float64; monthsInYear=float64; inLeapYear=bool; hour=float64; minute=float64; second=float64; millisecond=float64; microsecond=float64; nanosecond=float64; epochMilliseconds=float64; epochNanoseconds=*tnbig.Int; offset=string; offsetNanoseconds=float64',
+    'calendarId=string; timeZoneId=string; era=interface{}; eraYear=interface{}; year=float64; month=float64; monthCode=string; day=float64; dayOfWeek=float64; dayOfYear=float64; weekOfYear=float64; yearOfWeek=float64; daysInWeek=float64; daysInMonth=float64; daysInYear=float64; monthsInYear=float64; inLeapYear=bool; hour=float64; minute=float64; second=float64; millisecond=float64; microsecond=float64; nanosecond=float64; epochMilliseconds=float64; epochNanoseconds=*tnbig.Int; offset=string; offsetNanoseconds=float64; hoursInDay=float64',
     ''
   );
   defineClass(
@@ -152,29 +152,29 @@ export function registerTemporal(r: NodeRegistry): void {
     if (result) r.results[key] = result;
   };
 
-  fn('Temporal.PlainDate.from', '*TnTemporalPlainDate', (c) => `TnTemporalPlainDateFrom(${c.args.join(', ')})`);
-  fn('Temporal.PlainDate.compare', 'float64', (c) => `TnTemporalPlainDateCompare(${c.args.join(', ')})`);
-  fn('Temporal.PlainTime.from', '*TnTemporalPlainTime', (c) => `TnTemporalPlainTimeFrom(${c.args.join(', ')})`);
-  fn('Temporal.PlainTime.compare', 'float64', (c) => `TnTemporalPlainTimeCompare(${c.args.join(', ')})`);
-  fn('Temporal.PlainDateTime.from', '*TnTemporalPlainDateTime', (c) => `TnTemporalPlainDateTimeFrom(${c.args.join(', ')})`);
-  fn('Temporal.PlainDateTime.compare', 'float64', (c) => `TnTemporalPlainDateTimeCompare(${c.args.join(', ')})`);
-  fn('Temporal.PlainYearMonth.from', '*TnTemporalPlainYearMonth', (c) => `TnTemporalPlainYearMonthFrom(${c.args.join(', ')})`);
-  fn('Temporal.PlainYearMonth.compare', 'float64', (c) => `TnTemporalPlainYearMonthCompare(${c.args.join(', ')})`);
-  fn('Temporal.PlainMonthDay.from', '*TnTemporalPlainMonthDay', (c) => `TnTemporalPlainMonthDayFrom(${c.args.join(', ')})`);
-  fn('Temporal.Instant.from', '*TnTemporalInstant', (c) => `TnTemporalInstantFrom(${c.args.join(', ')})`);
-  fn('Temporal.Instant.fromEpochMilliseconds', '*TnTemporalInstant', (c) => `TnTemporalInstantFromEpochMilliseconds(${c.args.join(', ')})`);
-  fn('Temporal.Instant.fromEpochNanoseconds', '*TnTemporalInstant', (c) => `TnTemporalInstantFromEpochNanoseconds(${c.args.join(', ')})`);
-  fn('Temporal.Instant.compare', 'float64', (c) => `TnTemporalInstantCompare(${c.args.join(', ')})`);
-  fn('Temporal.ZonedDateTime.from', '*TnTemporalZonedDateTime', (c) => `TnTemporalZonedDateTimeFrom(${c.args.join(', ')})`);
-  fn('Temporal.ZonedDateTime.compare', 'float64', (c) => `TnTemporalZonedDateTimeCompare(${c.args.join(', ')})`);
-  fn('Temporal.Duration.from', '*TnTemporalDuration', (c) => `TnTemporalDurationFrom(${c.args.join(', ')})`);
-  fn('Temporal.Duration.compare', 'float64', (c) => `TnTemporalDurationCompare(${c.args.join(', ')})`);
+  fn('Temporal.PlainDate.from', '*TnTemporalPlainDate', (c: NodeCall) => `TnTemporalPlainDateFrom(${c.args.join(', ')})`);
+  fn('Temporal.PlainDate.compare', 'float64', (c: NodeCall) => `TnTemporalPlainDateCompare(${c.args.join(', ')})`);
+  fn('Temporal.PlainTime.from', '*TnTemporalPlainTime', (c: NodeCall) => `TnTemporalPlainTimeFrom(${c.args.join(', ')})`);
+  fn('Temporal.PlainTime.compare', 'float64', (c: NodeCall) => `TnTemporalPlainTimeCompare(${c.args.join(', ')})`);
+  fn('Temporal.PlainDateTime.from', '*TnTemporalPlainDateTime', (c: NodeCall) => `TnTemporalPlainDateTimeFrom(${c.args.join(', ')})`);
+  fn('Temporal.PlainDateTime.compare', 'float64', (c: NodeCall) => `TnTemporalPlainDateTimeCompare(${c.args.join(', ')})`);
+  fn('Temporal.PlainYearMonth.from', '*TnTemporalPlainYearMonth', (c: NodeCall) => `TnTemporalPlainYearMonthFrom(${c.args.join(', ')})`);
+  fn('Temporal.PlainYearMonth.compare', 'float64', (c: NodeCall) => `TnTemporalPlainYearMonthCompare(${c.args.join(', ')})`);
+  fn('Temporal.PlainMonthDay.from', '*TnTemporalPlainMonthDay', (c: NodeCall) => `TnTemporalPlainMonthDayFrom(${c.args.join(', ')})`);
+  fn('Temporal.Instant.from', '*TnTemporalInstant', (c: NodeCall) => `TnTemporalInstantFrom(${c.args.join(', ')})`);
+  fn('Temporal.Instant.fromEpochMilliseconds', '*TnTemporalInstant', (c: NodeCall) => `TnTemporalInstantFromEpochMilliseconds(${c.args.join(', ')})`);
+  fn('Temporal.Instant.fromEpochNanoseconds', '*TnTemporalInstant', (c: NodeCall) => `TnTemporalInstantFromEpochNanoseconds(${c.args.join(', ')})`);
+  fn('Temporal.Instant.compare', 'float64', (c: NodeCall) => `TnTemporalInstantCompare(${c.args.join(', ')})`);
+  fn('Temporal.ZonedDateTime.from', '*TnTemporalZonedDateTime', (c: NodeCall) => `TnTemporalZonedDateTimeFrom(${c.args.join(', ')})`);
+  fn('Temporal.ZonedDateTime.compare', 'float64', (c: NodeCall) => `TnTemporalZonedDateTimeCompare(${c.args.join(', ')})`);
+  fn('Temporal.Duration.from', '*TnTemporalDuration', (c: NodeCall) => `TnTemporalDurationFrom(${c.args.join(', ')})`);
+  fn('Temporal.Duration.compare', 'float64', (c: NodeCall) => `TnTemporalDurationCompare(${c.args.join(', ')})`);
   fn('Temporal.Now.instant', '*TnTemporalInstant', () => `TnTemporalNowInstant()`);
   fn('Temporal.Now.timeZoneId', 'string', () => `TnTemporalNowTimeZoneId()`);
-  fn('Temporal.Now.plainDateISO', '*TnTemporalPlainDate', (c) => `TnTemporalNowPlainDateISO(${c.args.join(', ')})`);
-  fn('Temporal.Now.plainTimeISO', '*TnTemporalPlainTime', (c) => `TnTemporalNowPlainTimeISO(${c.args.join(', ')})`);
-  fn('Temporal.Now.plainDateTimeISO', '*TnTemporalPlainDateTime', (c) => `TnTemporalNowPlainDateTimeISO(${c.args.join(', ')})`);
-  fn('Temporal.Now.zonedDateTimeISO', '*TnTemporalZonedDateTime', (c) => `TnTemporalNowZonedDateTimeISO(${c.args.join(', ')})`);
+  fn('Temporal.Now.plainDateISO', '*TnTemporalPlainDate', (c: NodeCall) => `TnTemporalNowPlainDateISO(${c.args.join(', ')})`);
+  fn('Temporal.Now.plainTimeISO', '*TnTemporalPlainTime', (c: NodeCall) => `TnTemporalNowPlainTimeISO(${c.args.join(', ')})`);
+  fn('Temporal.Now.plainDateTimeISO', '*TnTemporalPlainDateTime', (c: NodeCall) => `TnTemporalNowPlainDateTimeISO(${c.args.join(', ')})`);
+  fn('Temporal.Now.zonedDateTimeISO', '*TnTemporalZonedDateTime', (c: NodeCall) => `TnTemporalNowZonedDateTimeISO(${c.args.join(', ')})`);
 
   setResults(r, 'Temporal.Now', 'instant=*TnTemporalInstant; timeZoneId=string');
 }

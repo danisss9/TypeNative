@@ -55,6 +55,8 @@ func tnTIsTimeUnit(unit string) bool {
 // Nanoseconds of one unit
 func tnTUnitNs(unit string) int64 {
 	switch unit {
+	case tnTDay:
+		return 86400000000000
 	case tnTHour:
 		return 3600000000000
 	case tnTMinute:
@@ -98,7 +100,7 @@ func tnTDaysInYear(y int64) int {
 
 // Days from 1970-01-01, as in the polyfill's ISODateToEpochDays
 func tnTDateToEpochDays(year int64, month, day int) int64 {
-	y := year + int64(floorDiv64(int(month-1), 12))
+	y := year + floorDiv64(int64(month-1), 12)
 	m := int(modEuclid64(int64(month-1), 12)) + 1
 	shiftedYear := y
 	shiftedMonth := m - 3
@@ -116,14 +118,19 @@ func tnTEpochDaysToYearDay(z int64) (int64, int, int) {
 	z += 719468
 	era := floorDiv64(z, 146097)
 	doe := z - era*146097
-	y := era*400 + (doe-doe/1460+doe/36524-doe/146096)/365
-	doy := doe - (365*y + y/4 - y/100)
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
 	mp := (5*doy + 2) / 153
 	d := int(doy - (153*mp+2)/5 + 1)
-	if mp < 10 {
-		return y, int(mp + 3), d
+	m := int(mp + 3)
+	if mp >= 10 {
+		m = int(mp - 9)
 	}
-	return y + 1, int(mp - 9), d
+	if m <= 2 {
+		y++
+	}
+	return y, m, d
 }
 
 func floorDiv64(a, b int64) int64 {
@@ -288,8 +295,20 @@ func tnTTdurNs(d tnTTimeDur) *tnbig.Int {
 }
 
 func tnTTdurOfNs(ns *tnbig.Int) tnTTimeDur {
+	// (a duration keeps the sign in both halves: -8s + 991990990ns is
+	// {-7, -8009010}, so its printed absolute value is 7.00800901)
 	q, r := new(tnbig.Int).QuoRem(ns, tnbig.NewInt(1000000000), new(tnbig.Int))
 	return tnTTimeDur{sec: q.Int64(), sub: int32(r.Int64())}
+}
+
+// Exact nanoseconds as seconds and a non-negative nanosecond remainder
+func tnTDivModNs(ns *tnbig.Int) (int64, int32) {
+	q, r := new(tnbig.Int).QuoRem(ns, tnbig.NewInt(1000000000), new(tnbig.Int))
+	if r.Sign() < 0 {
+		q.Sub(q, tnbig.NewInt(1))
+		r.Add(r, tnbig.NewInt(1000000000))
+	}
+	return q.Int64(), int32(r.Int64())
 }
 
 func tnTTdurSign(d tnTTimeDur) int {
@@ -359,46 +378,36 @@ func tnTTdurFromDurationFields(d *TnTemporalDuration) tnTTimeDur {
 // Round a time duration to an increment of a unit
 func tnTRoundTimeDuration(d tnTTimeDur, increment int64, unit string, mode string) tnTTimeDur {
 	divisor := tnTUnitNs(unit)
-	if increment != 1 && divisor != 1 {
-		panic(TnNodeError("RangeError", "", "roundingIncrement must be 1 for this unit"))
-	}
 	if divisor == 1 && increment == 1 {
 		return d
 	}
-	inc := divisor
-	if divisor == 1 {
-		inc = increment
-	}
+	inc := divisor * increment
 	return tnTTdurOfNs(tnTRoundNsAsIfPositive(tnTTdurNs(d), inc, mode))
 }
 
-// RoundNumberToIncrementAsIfPositive on exact nanoseconds
+// RoundNumberToIncrementAsIfPositive on exact nanoseconds: the magnitude is
+// rounded with the named mode, then the sign is restored (so a negative
+// duration rounds like its positive counterpart)
 func tnTRoundNsAsIfPositive(q *tnbig.Int, inc int64, mode string) *tnbig.Int {
-	quot, rem := new(tnbig.Int).QuoRem(q, tnbig.NewInt(inc), new(tnbig.Int))
-	if rem.Sign() == 0 {
-		return new(tnbig.Int).Mul(quot, tnbig.NewInt(inc))
-	}
-	incBig := tnbig.NewInt(inc)
 	neg := q.Sign() < 0
-	var r1, r2 *tnbig.Int
-	if neg {
-		r1 = new(tnbig.Int).Sub(quot, tnbig.NewInt(1))
-		r2 = quot
-	} else {
-		r1 = quot
-		r2 = new(tnbig.Int).Add(quot, tnbig.NewInt(1))
+	a := new(tnbig.Int).Abs(q)
+	incBig := tnbig.NewInt(inc)
+	quot, rem := new(tnbig.Int).QuoRem(a, incBig, new(tnbig.Int))
+	if rem.Sign() == 0 {
+		if neg {
+			return a.Neg(a)
+		}
+		return a
 	}
-	// cmp = sign of |2×remainder| - inc (extra sign flip for negatives keeps
-	// the comparison as if positive)
-	rem2 := new(tnbig.Int).Abs(new(tnbig.Int).Mul(rem, tnbig.NewInt(2)))
-	cmp := rem2.Cmp(incBig)
+	// (same as the float path: 2*remainder against the increment decides)
+	cmp := new(tnbig.Int).Mul(rem, tnbig.NewInt(2)).Cmp(incBig)
+	even := quot.Bit(0) == 0
+	rounded := tnTApplyUnsignedRoundingMode(quot, new(tnbig.Int).Add(quot, tnbig.NewInt(1)), cmp, even, tnTGetUnsignedRoundingMode(mode, neg))
+	rounded.Mul(rounded, incBig)
 	if neg {
-		cmp = -cmp
+		rounded.Neg(rounded)
 	}
-	even := new(tnbig.Int).Abs(r1).Bit(0) == 0
-	unsignedMode := tnTGetUnsignedRoundingMode(mode, neg)
-	rounded := tnTApplyUnsignedRoundingMode(r1, r2, cmp, even, unsignedMode)
-	return new(tnbig.Int).Mul(rounded, incBig)
+	return rounded
 }
 
 // GetUnsignedRoundingMode
@@ -461,19 +470,42 @@ func tnTApplyUnsignedRoundingMode(r1, r2 *tnbig.Int, cmp int, even bool, mode st
 }
 
 // RoundNumberToIncrement on float64 duration fields
+// Instant rounding: the timeline's quantity floored into the increment, so
+// the fraction is always positive — as Node rounds an instant (a negative
+// instant's expand/trunc pick the upper/lower boundary, not away/toward zero)
+func tnTRoundInstantNs(ns *tnbig.Int, inc int64, mode string) *tnbig.Int {
+	incBig := tnbig.NewInt(inc)
+	q, r := new(tnbig.Int).QuoRem(ns, incBig, new(tnbig.Int))
+	if r.Sign() < 0 {
+		q.Sub(q, tnbig.NewInt(1))
+		r.Add(r, incBig)
+	}
+	if r.Sign() == 0 {
+		return new(tnbig.Int).Mul(q, incBig)
+	}
+	cmp := new(tnbig.Int).Mul(r, tnbig.NewInt(2)).Cmp(incBig)
+	even := q.Bit(0) == 0
+	upper := new(tnbig.Int).Add(q, tnbig.NewInt(1))
+	rounded := tnTApplyUnsignedRoundingMode(q, upper, cmp, even, tnTGetUnsignedRoundingMode(mode, false))
+	return new(tnbig.Int).Mul(rounded, incBig)
+}
+
 func tnTRoundNumberToIncrement(quantity float64, increment int64, mode string) float64 {
-	q := math.Trunc(quantity / float64(increment))
-	rem := quantity - q*float64(increment)
+	// (the magnitude is rounded, then the sign restored: the unsigned mode
+	// accounts for the negative side, as ceil and floor differ there)
+	neg := quantity < 0
+	abs := math.Abs(quantity)
+	q := math.Trunc(abs / float64(increment))
+	rem := abs - q*float64(increment)
 	if rem == 0 {
+		if neg {
+			return -q * float64(increment)
+		}
 		return q * float64(increment)
 	}
-	neg := quantity < 0
-	r1 := math.Abs(q)
-	r2 := r1 + 1
-	cmp := math.Abs(rem*2) - float64(increment)
-	if neg {
-		cmp = -cmp
-	}
+	r1 := q
+	r2 := q + 1
+	cmp := rem*2 - float64(increment)
 	even := math.Mod(r1, 2) == 0
 	rounded := r1
 	if !tnTApplyUnsignedFloat(r1, r2, cmp, even, tnTGetUnsignedRoundingMode(mode, neg)) {
@@ -557,7 +589,7 @@ func tnTBalanceYearMonth(y int64, m int) (int64, int) {
 // AddDaysToISODate
 func tnTAddDays(d tnTDate, days int64) tnTDate {
 	epoch := tnTDateToEpochDays(d.y, d.m, d.d) + days
-	y, _ := tnTEpochDaysToYearDay(epoch)
+	y, _, _ := tnTEpochDaysToYearDay(epoch)
 	// Walk to the exact day: the year is known, then the month/day
 	rest := epoch - tnTDateToEpochDays(y, 1, 1)
 	for rest < 0 {
@@ -666,7 +698,9 @@ func tnTCalendarDateUntil(one, two tnTDate, largestUnit string) tnTDateDur {
 	constrained := tnTDate{y: intermediateY, m: intermediateM, d: day}
 	epochDays := tnTDateToEpochDays(two.y, two.m, two.d) - tnTDateToEpochDays(constrained.y, constrained.m, constrained.d)
 	if largestUnit == tnTWeek {
-		weeks = float64(floorDiv64(epochDays, 7))
+		// (truncation: a negative remainder keeps the difference's sign —
+		// -31 days is -4 weeks -3 days, not -5 weeks +4 days)
+		weeks = float64(epochDays / 7)
 		epochDays -= int64(weeks) * 7
 	}
 	days = float64(epochDays)
@@ -842,12 +876,6 @@ func tnTTemporalDurationFromInternal(internal tnTInternalDur, largestUnit string
 	ms := us / 1000
 	us -= ms * 1000
 	seconds := abs.sec
-	secCarry := seconds % 1000
-	seconds -= secCarry
-	ms += secCarry
-	msCarry := ms / 1000
-	ms -= msCarry * 1000
-	seconds += msCarry
 	minutes := seconds / 60
 	seconds -= minutes * 60
 	hours := minutes / 60
@@ -916,7 +944,8 @@ type TnTemporalInstant struct {
 }
 
 func (i *TnTemporalInstant) Get_epochMilliseconds() float64 {
-	return float64(i.sec)*1e3 + float64(i.nsec)/1e6
+	// (the spec's floor: whole milliseconds, as Node reports them)
+	return float64(i.sec*1000 + int64(i.nsec)/1000000)
 }
 
 func (i *TnTemporalInstant) Get_epochNanoseconds() *tnbig.Int { return tnTInstantNs(i) }
@@ -930,8 +959,8 @@ func tnTInstantNs(i *TnTemporalInstant) *tnbig.Int {
 }
 
 func tnTInstantOfNs(ns *tnbig.Int) *TnTemporalInstant {
-	q, r := new(tnbig.Int).QuoRem(ns, tnbig.NewInt(1000000000), new(tnbig.Int))
-	return &TnTemporalInstant{sec: q.Int64(), nsec: int32(r.Int64())}
+	sec, nsec := tnTDivModNs(ns)
+	return &TnTemporalInstant{sec: sec, nsec: nsec}
 }
 
 func tnTValidateInstantNs(ns *tnbig.Int) {
@@ -986,7 +1015,7 @@ func tnTBalanceDateTime(y int64, mo, d, h, mi, s, ms, us, ns int) tnTDateTime {
 // GetISODateTimeFor: a zone's local datetime at an instant
 func tnTGetISODateTimeFor(tz *tnTemporalTZ, ns *tnbig.Int) tnTDateTime {
 	inst := tnTInstantOfNs(ns)
-	local := inst.sec - tz.offsetSecAt(inst.sec, inst.nsec)
+	local := inst.sec + tz.offsetSecAt(inst.sec, inst.nsec)
 	days := floorDiv64(local, 86400)
 	rest := local - days*86400
 	y, m, d := tnTEpochDaysToYearDay(days)
@@ -1117,7 +1146,9 @@ func tnTParseISODateTime(s string) *tnTParsedISO {
 	c := &tnTStrCursor{s: s}
 	// Year: [±]YYYY or ±YYYYYY...
 	neg := false
+	signed := false
 	if c.peek() == '+' || c.peek() == '-' {
+		signed = true
 		neg = c.peek() == '-'
 		c.next()
 		if c.peek() == '0' {
@@ -1130,14 +1161,20 @@ func tnTParseISODateTime(s string) *tnTParsedISO {
 			c.i = start
 		}
 	}
-	yearStr, ok := c.digits(4, 9)
+	var yearStr string
+	var ok bool
+	if signed {
+		yearStr, ok = c.digits(4, 9)
+	} else {
+		yearStr, ok = c.digits(4, 4)
+	}
 	if !ok {
 		panic(TnNodeError("RangeError", "", "Invalid character while parsing year value."))
 	}
-	if neg && len(yearStr) < 6 {
+	if signed && len(yearStr) != 6 {
 		panic(TnNodeError("RangeError", "", "Invalid character while parsing year value."))
 	}
-	if !neg && len(yearStr) > 4 {
+	if !signed && len(yearStr) != 4 {
 		panic(TnNodeError("RangeError", "", "Invalid character while parsing year value."))
 	}
 	year := tnTCursorInt(yearStr)
@@ -1189,6 +1226,10 @@ func tnTParseISODateTime(s string) *tnTParsedISO {
 	}
 	// [!key=value] annotations and [Zone] annotation
 	out.cal = tnTParseAnnotations(c, s, &out.tzID)
+	if out.cal != "" && !strings.EqualFold(out.cal, "iso8601") {
+		// (non-ISO calendars need ICU: out of scope, as for an unknown one)
+		panic(TnNodeError("RangeError", "", "unsupported calendar: "+out.cal))
+	}
 	if !c.eof() {
 		panic(TnNodeError("RangeError", "", "Unrecognized text after ISO string: "+s))
 	}
@@ -1431,6 +1472,9 @@ func tnTParseDurationString(s string) *TnTemporalDuration {
 			if fractionUnit != "" {
 				panic(TnNodeError("RangeError", "", "Unexpected character found after parsing was completed."))
 			}
+			if len(fracStr) > 9 {
+				panic(TnNodeError("RangeError", "", "Fractional time exceeds nine digits."))
+			}
 			fractionUnit = unit
 			fractionDigits = (fracStr + "000000000")[:9]
 			fractionScale = fracScale
@@ -1443,17 +1487,17 @@ func tnTParseDurationString(s string) *TnTemporalDuration {
 	}
 	// The fractional smallest unit folds into the smaller units' nanoseconds
 	if fractionUnit != "" {
-		// only the smallest component may be fractional
+		// only the smallest component may be fractional: nothing smaller follows
+		fractionIndex := unitIndex[fractionUnit]
 		for _, u := range []string{"h", "mi", "s"} {
-			if u == fractionUnit {
-				break
-			}
-			if fields[unitIndex[u]] != 0 {
+			if unitIndex[u] > fractionIndex && fields[unitIndex[u]] != 0 {
 				panic(TnNodeError("RangeError", "", "only the smallest unit can be fractional"))
 			}
 		}
-		fields[unitIndex[fractionUnit]] = 0
-		excessNs := tnTCursorInt(fractionDigits) * fractionScale * int64(sign)
+		if fractionScale == 0 {
+			panic(TnNodeError("RangeError", "", "fractional years, months, weeks or days are not supported"))
+		}
+		excessNs := tnTCursorInt(fractionDigits) * (fractionScale / 1000000000)
 		fields[6] += math.Trunc(float64(excessNs) / 1e9)
 		excessNs -= int64(math.Trunc(float64(excessNs)/1e9)) * 1000000000
 		fields[7] += math.Trunc(float64(excessNs) / 1e6)
@@ -1464,6 +1508,20 @@ func tnTParseDurationString(s string) *TnTemporalDuration {
 	}
 	for i := 0; i < 10; i++ {
 		fields[i] *= sign
+	}
+	if fractionUnit != "" {
+		// The fractional part balances into the smaller time units: PT0.5H
+		// is PT30M, PT1.5H is PT1H30M (the parsed units do not rebalance
+		// otherwise: PT90M stays PT90M)
+		largestTimeUnit := tnTSecond
+		if fractionUnit == "h" || fields[4] != 0 {
+			largestTimeUnit = tnTHour
+		} else if fractionUnit == "mi" || fields[5] != 0 {
+			largestTimeUnit = tnTMinute
+		}
+		timeDur := tnTTdurFromComponents(fields[4], fields[5], fields[6], fields[7], fields[8], fields[9])
+		internal := tnTInternalDur{date: tnTDateDur{y: fields[0], mo: fields[1], w: fields[2], d: fields[3]}, time: timeDur}
+		return tnTTemporalDurationFromInternal(internal, largestTimeUnit)
 	}
 	return tnTMakeDuration(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], fields[9])
 }
@@ -1822,6 +1880,12 @@ func tnTInterpretISODateTimeOffset(date tnTDate, time tnTTime, hasOffset bool, o
 }
 // GetEpochNanosecondsFor
 func tnTGetEpochNanosecondsFor(tz *tnTemporalTZ, dt tnTDateTime, disambiguation string) *tnbig.Int {
+	if tz == nil {
+		// (a plain datetime: its UTC wall-clock reading is the epoch value)
+		ns := tnTUTCNs(dt.date, dt.time)
+		tnTValidateInstantNs(ns)
+		return ns
+	}
 	possible := tnTGetPossibleEpochNanoseconds(tz, dt)
 	return tnTDisambiguatePossible(possible, tz, dt, disambiguation)
 }
@@ -1879,9 +1943,13 @@ func tnTDisambiguatePossible(possible []*tnbig.Int, tz *tnTemporalTZ, dt tnTDate
 	timeNs := int64(dt.time.h)*3600000000000 + int64(dt.time.mi)*60000000000 + int64(dt.time.s)*1000000000 +
 		int64(dt.time.ms)*1000000 + int64(dt.time.us)*1000 + int64(dt.time.ns)
 	totalNs := timeNs + shiftNs
-	shiftedMinutes := dt.time.mi + int(floorDiv64(totalNs, 60000000000))
-	remainderNs := int(modEuclid64(totalNs, 60000000000))
-	shifted, deltaDays := tnTBalanceTime(dt.time.h, shiftedMinutes, dt.time.s, dt.time.ms, dt.time.us, remainderNs)
+	shifted, deltaDays := tnTBalanceTime(
+		int(floorDiv64(totalNs, 3600000000000)),
+		int(modEuclid64(floorDiv64(totalNs, 60000000000), 60)),
+		int(modEuclid64(floorDiv64(totalNs, 1000000000), 60)),
+		int(modEuclid64(floorDiv64(totalNs, 1000000), 1000)),
+		int(modEuclid64(floorDiv64(totalNs, 1000), 1000)),
+		int(modEuclid64(totalNs, 1000000000)))
 	shiftedDate := tnTAddDays(dt.date, int64(deltaDays))
 	possible = tnTGetPossibleEpochNanoseconds(tz, tnTDateTime{date: shiftedDate, time: shifted})
 	if disambiguation == "earlier" {
@@ -1928,7 +1996,9 @@ func tnTDifferenceISODateTime(dt1, dt2 tnTDateTime, largestUnit string) tnTInter
 }
 
 // DifferenceZonedDateTime (non-rounding): the local calendar difference plus
-// the remaining epoch time, with a day correction for DST shifts
+// the remaining epoch time. The calendar part starts from the local dates'
+// difference and steps one day back while its instant overshoots the end (a
+// DST shift, or an end time-of-day earlier than the start's).
 func tnTDifferenceZonedDateTime(ns1, ns2 *tnbig.Int, tz *tnTemporalTZ, largestUnit string) tnTInternalDur {
 	nsDiff := new(tnbig.Int).Sub(ns2, ns1)
 	if nsDiff.Sign() == 0 {
@@ -1943,28 +2013,19 @@ func tnTDifferenceZonedDateTime(ns1, ns2 *tnbig.Int, tz *tnTemporalTZ, largestUn
 	if dtStart.date.y == dtEnd.date.y && dtStart.date.m == dtEnd.date.m && dtStart.date.d == dtEnd.date.d {
 		return tnTInternalDur{date: tnTZeroDateDur(), time: tnTTdurOfNs(nsDiff)}
 	}
-	maxDayCorrection := 2
-	if sign == 1 {
-		maxDayCorrection = 1
-	}
-	dayCorrection := 0
-	timeDuration := tnTDifferenceTime(dtStart.time, dtEnd.time)
-	if tnTTdurSign(timeDuration) == sign {
-		dayCorrection++
-	}
-	var intermediateDate tnTDate
-	for ; dayCorrection <= maxDayCorrection; dayCorrection++ {
-		intermediateDate = tnTAddDays(dtEnd.date, int64(dayCorrection*sign))
-		intermediate := tnTDateTime{date: intermediateDate, time: dtStart.time}
-		intermediateNs := tnTGetEpochNanosecondsFor(tz, intermediate, "compatible")
-		timeDuration = tnTTdurOfNs(new(tnbig.Int).Sub(ns2, intermediateNs))
-		if tnTTdurSign(timeDuration) != sign {
+	dateLargestUnit := tnTLargerOfTwoUnits(tnTDay, largestUnit)
+	dateDifference := tnTCalendarDateUntilSigned(dtStart.date, dtEnd.date, dateLargestUnit)
+	var remainder tnTTimeDur
+	for i := 0; i < 3; i++ {
+		intermediateDate := tnTCalendarDateAdd(dtStart.date, dateDifference, "constrain")
+		intermediateNs := tnTGetEpochNanosecondsFor(tz, tnTDateTime{date: intermediateDate, time: dtStart.time}, "compatible")
+		remainder = tnTTdurOfNs(new(tnbig.Int).Sub(ns2, intermediateNs))
+		if tnTTdurSign(remainder) != -sign {
 			break
 		}
+		dateDifference.d -= float64(sign)
 	}
-	dateLargestUnit := tnTLargerOfTwoUnits(tnTDay, largestUnit)
-	dateDifference := tnTCalendarDateUntilSigned(dtStart.date, intermediateDate, dateLargestUnit)
-	return tnTCombineDateAndTime(dateDifference, timeDuration)
+	return tnTCombineDateAndTime(dateDifference, remainder)
 }
 
 // DifferenceEpochNanoseconds: an instant difference, rounded
@@ -2524,7 +2585,7 @@ func (d *TnTemporalDuration) toString(options ...interface{}) string {
 	largestUnit := tnTDefaultLargestUnit(d)
 	if !tnTIsZeroTdur(secondsDur) || largestUnit == tnTSecond || largestUnit == tnTMillisecond || largestUnit == tnTMicrosecond || largestUnit == tnTNanosecond || precision != "auto" {
 		secStr := strconv.FormatInt(absI64(secondsDur.sec), 10)
-		subStr := tnTFractionalSeconds(int64(absI64(secondsDur.sub)), precision)
+		subStr := tnTFractionalSeconds(absI64(int64(secondsDur.sub)), precision)
 		timePart += secStr + subStr + "S"
 	}
 	result := ""
@@ -2634,7 +2695,7 @@ func tnTAddDurations(operation string, duration *TnTemporalDuration, other inter
 		otherDur = otherDur.negated()
 	}
 	largestUnit := tnTLargerOfTwoUnits(tnTDefaultLargestUnit(duration), tnTDefaultLargestUnit(otherDur))
-	if tnTIsCalendarUnit(largestUnit) {
+	if largestUnit == tnTYear || largestUnit == tnTMonth || largestUnit == tnTWeek {
 		panic(TnNodeError("RangeError", "", "Largest unit cannot be a calendar unit when adding two durations."))
 	}
 	d1 := tnTToInternalDurationRecordWith24HourDays(duration)
@@ -2806,17 +2867,35 @@ func (d *TnTemporalDuration) total(totalOf interface{}) float64 {
 	}
 	plain, zoned := tnTOptRelativeTo(tnTOptionsArg([]interface{}{totalOf}))
 	if zoned != nil {
-		internal := tnTToInternalDurationRecord(d)
 		rel := zoned
 		relNs := tnTInstantNs(rel.instant)
-		targetNs := tnTAddZonedDateTime(relNs, rel.tz, internal, "constrain")
+		targetNs := tnTAddZonedDateTime(relNs, rel.tz, tnTToInternalDurationRecord(d), "constrain")
+		if tnTIsTimeUnit(unit) {
+			// (an exact epoch difference: the local calendar's days can hold
+			// 23 or 25 hours across a transition)
+			return tnTTotalTimeDuration(tnTTdurOfNs(new(tnbig.Int).Sub(targetNs, relNs)), unit)
+		}
 		return tnTTotalRelativeDuration(tnTDifferenceZonedDateTime(relNs, targetNs, rel.tz, unit), relNs, targetNs, tnTGetISODateTimeFor(rel.tz, relNs), rel.tz, unit)
 	}
 	if plain != nil {
-		internal := tnTToInternalDurationRecordWith24HourDays(d)
-		target := tnTCalendarDateAdd(*plain, tnTToDateDurationRecordWithoutTime(d), "constrain")
+		dateDuration := tnTDateDur{y: d.y, mo: d.mo, w: d.w, d: d.d}
+		// The time of day the duration ends at, and the days it completes
+		timeDuration := tnTTdurFromComponents(d.h, d.mi, d.s, d.ms, d.us, d.ns)
+		dayNs := tnbig.NewInt(86400000000000)
+		daysBig, remBig := new(tnbig.Int).QuoRem(tnTTdurNs(timeDuration), dayNs, new(tnbig.Int))
+		extraDays := daysBig.Int64()
+		rem := remBig.Int64()
+		if rem < 0 {
+			rem += 86400000000000
+			extraDays--
+		}
+		timeOfDay := tnTTime{
+			h: int(rem / 3600000000000), mi: int(rem / 60000000000) % 60, s: int(rem / 1000000000) % 60,
+			ms: int(rem / 1000000) % 1000, us: int(rem / 1000) % 1000, ns: int(rem % 1000),
+		}
+		target := tnTAddDays(tnTCalendarDateAdd(*plain, dateDuration, "constrain"), extraDays)
 		dt1 := tnTDateTime{date: *plain, time: tnTMidnight()}
-		dt2 := tnTDateTime{date: target, time: tnTMidnight()}
+		dt2 := tnTDateTime{date: target, time: timeOfDay}
 		diff := tnTDifferenceISODateTime(dt1, dt2, unit)
 		origin := tnTUTCNsOfDateTime(dt1)
 		dest := tnTUTCNsOfDateTime(dt2)
@@ -2968,6 +3047,9 @@ func tnTToPlainDate(item interface{}, options interface{}) *TnTemporalPlainDate 
 	}
 	if s, ok := item.(string); ok {
 		parsed := tnTParseISODateTime(s)
+		if parsed.utc || parsed.offset != "" {
+			panic(TnNodeError("RangeError", "", "Z designator or UTC offset is not valid for date parsing"))
+		}
 		date := tnTDate{y: parsed.y, m: parsed.mo, d: parsed.d}
 		tnTRejectDate(&date)
 		return &TnTemporalPlainDate{date: date}
@@ -2994,12 +3076,12 @@ func tnTToPlainDate(item interface{}, options interface{}) *TnTemporalPlainDate 
 }
 
 func tnTMonthFromCode(code string) float64 {
-	if len(code) == 4 && code[0] == 'M' && code[1] == '0' && code[3] >= '1' && code[3] <= '9' {
-		return float64(code[3] - '0')
-	}
 	if len(code) == 3 && code[0] == 'M' {
+		if code[1] == '0' && code[2] >= '1' && code[2] <= '9' {
+			return float64(code[2] - '0')
+		}
 		if code[1] == '1' && code[2] >= '0' && code[2] <= '2' {
-			return float64((code[1]-'0')*10 + code[2] - '0')
+			return float64(10 + int(code[2]-'0'))
 		}
 	}
 	panic(TnNodeError("RangeError", "", "invalid monthCode: "+code))
@@ -3282,11 +3364,40 @@ func tnTToPlainTime(item interface{}, options ...interface{}) *TnTemporalPlainTi
 
 // A time-only string: the T-prefixed form, a date-time string's time part,
 // or a bare HH[:MM[:SS[.frac]]]
+func tnTLooksLikeTimeOnly(s string) bool {
+	if len(s) >= 3 && s[2] == ':' {
+		return true
+	}
+	if strings.IndexByte(s, ':') >= 0 && strings.IndexByte(s, '-') < 0 {
+		return true
+	}
+	if len(s) == 4 || len(s) == 6 {
+		all := true
+		for i := 0; i < len(s); i++ {
+			if s[i] < '0' || s[i] > '9' {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
 func tnTParseTimeString(s string) *TnTemporalPlainTime {
 	c := &tnTStrCursor{s: s}
 	hasDate := false
 	if c.eatAny("Tt ") {
 		// The rest is a time
+	} else if tnTLooksLikeTimeOnly(s) {
+		// HH[:MM[:SS[.frac]]] or basic HHMM / HHMMSS
+		time := tnTParseTimeAfterSeparator(c, s)
+		if !c.eof() {
+			panic(TnNodeError("RangeError", "", "Unrecognized text after ISO string: "+s))
+		}
+		return &TnTemporalPlainTime{time: time}
 	} else {
 		// Possibly a date-time string
 		parsed := tnTParseISODateTime(s)
@@ -3484,21 +3595,15 @@ func (pt *TnTemporalPlainTime) toString(options ...interface{}) string {
 		smallestUnit = tnTOptUnit(options[0], "smallestUnit", "time", false, []string{tnTHour, tnTDay})
 		mode = tnTOptRoundingMode(options[0], "trunc")
 	}
+	prec, roundUnit, roundInc := tnTStringPrecision(smallestUnit, precision)
 	t := pt.time
-	if smallestUnit != "" || precision != "auto" {
-		roundUnit, roundInc := tnTNanosecond, int64(1)
-		if smallestUnit != "" {
-			roundUnit, roundInc = smallestUnit, 1
-		} else {
-			roundUnit, roundInc = tnTStringPrecisionUnit(precision)
-		}
+	if roundUnit != tnTNanosecond || roundInc != 1 {
 		quantity := int64(t.h)*3600000000000 + int64(t.mi)*60000000000 + int64(t.s)*1000000000 +
 			int64(t.ms)*1000000 + int64(t.us)*1000 + int64(t.ns)
-		rounded := tnTRoundNumberToIncrement(float64(quantity), tnTUnitNs(roundUnit)*roundInc, mode)
+		rounded := int64(tnTRoundNumberToIncrement(float64(quantity), tnTUnitNs(roundUnit)*roundInc, mode))
 		t, _ = tnTBalanceTime(int(rounded/3600000000000), int(rounded/60000000000)%60, int(rounded/1000000000)%60, 0, 0, int(rounded%1000000000))
 	}
-	_ = mode
-	return tnTTimeString(t, precision)
+	return tnTTimeString(t, prec)
 }
 
 func (pt *TnTemporalPlainTime) TnToString() string { return pt.toString() }
@@ -3603,6 +3708,9 @@ func tnTToPlainDateTime(item interface{}, options interface{}) *TnTemporalPlainD
 	}
 	if s, ok := item.(string); ok {
 		parsed := tnTParseISODateTime(s)
+		if parsed.utc {
+			panic(TnNodeError("RangeError", "", "UTC designator is not valid for DateTime parsing."))
+		}
 		date := tnTDate{y: parsed.y, m: parsed.mo, d: parsed.d}
 		tnTRejectDate(&date)
 		time := tnTMidnight()
@@ -3930,6 +4038,11 @@ func tnTToYearMonth(item interface{}, options interface{}) *TnTemporalPlainYearM
 	}
 	yearV := TnGet(item, "year")
 	monthV := TnGet(item, "month")
+	if TnIsNil(monthV) {
+		if codeV := TnGet(item, "monthCode"); !TnIsNil(codeV) {
+			monthV = tnTMonthFromCode(TnJSString(codeV))
+		}
+	}
 	if TnIsNil(yearV) || TnIsNil(monthV) {
 		panic(TnNodeError("TypeError", "", "Invalid YearMonth fields provided."))
 	}
@@ -4118,9 +4231,29 @@ func tnTToMonthDay(item interface{}, options interface{}) *TnTemporalPlainMonthD
 		return v
 	}
 	if s, ok := item.(string); ok {
-		parsed := tnTParseISODateTime(s)
-		date := tnTDate{y: parsed.y, m: parsed.mo, d: parsed.d}
-		if !tnTIsValidISODate(date.y, date.m, date.d) {
+		ref := s
+		if strings.HasPrefix(ref, "--") {
+			ref = ref[2:]
+		}
+		if idx := strings.IndexByte(ref, '['); idx >= 0 {
+			// (annotations are validated by the full parser below)
+			if !strings.Contains(ref[idx:], "u-ca=iso8601") && !strings.Contains(ref[idx:], "u-ca=ISO8601") {
+				panic(TnNodeError("RangeError", "", "unsupported calendar in "+s))
+			}
+			ref = ref[:idx]
+		}
+		var date tnTDate
+		if len(ref) == 8 || (len(ref) >= 10 && ref[4] == '-') {
+			parsed := tnTParseISODateTime(ref)
+			date = tnTDate{y: parsed.y, m: parsed.mo, d: parsed.d}
+		} else if len(ref) == 5 && ref[2] == '-' {
+			date = tnTDate{y: 1972, m: int(tnTCursorInt(ref[:2])), d: int(tnTCursorInt(ref[3:]))}
+		} else if len(ref) == 4 {
+			date = tnTDate{y: 1972, m: int(tnTCursorInt(ref[:2])), d: int(tnTCursorInt(ref[2:]))}
+		} else {
+			panic(TnNodeError("RangeError", "", s+" invalid for MM-DD format"))
+		}
+		if !tnTIsValidISODate(1972, date.m, date.d) {
 			panic(TnNodeError("RangeError", "", s+" invalid for MM-DD format"))
 		}
 		return &TnTemporalPlainMonthDay{date: tnTDate{y: 1972, m: date.m, d: date.d}}
@@ -4363,7 +4496,7 @@ func (i *TnTemporalInstant) round(roundTo interface{}) *TnTemporalInstant {
 	smallestUnit := tnTOptUnit(roundTo, "smallestUnit", "time", false, []string{tnTDay})
 	maximums := map[string]int64{tnTHour: 24, tnTMinute: 1440, tnTSecond: 86400, tnTMillisecond: 86400000, tnTMicrosecond: 86400000000, tnTNanosecond: 86400000000000}
 	tnTValidateRoundingIncrement(inc, maximums[smallestUnit], true)
-	ns := tnTRoundNsAsIfPositive(tnTInstantNs(i), tnTUnitNs(smallestUnit)*inc, mode)
+	ns := tnTRoundInstantNs(tnTInstantNs(i), tnTUnitNs(smallestUnit)*inc, mode)
 	return tnTInstantOfNs(ns)
 }
 
@@ -4393,7 +4526,7 @@ func (i *TnTemporalInstant) toString(options ...interface{}) string {
 		} else {
 			roundUnit, roundInc = tnTStringPrecisionUnit(precision)
 		}
-		ns = tnTRoundNsAsIfPositive(ns, tnTUnitNs(roundUnit)*roundInc, mode)
+		ns = tnTRoundInstantNs(ns, tnTUnitNs(roundUnit)*roundInc, mode)
 	}
 	value := tnTInstantOfNs(ns)
 	var dt tnTDateTime
@@ -4453,7 +4586,6 @@ func TnNewTemporalZonedDateTime(ns interface{}, tzArg interface{}) *TnTemporalZo
 func tnTToZonedDateTime(item interface{}, options interface{}) *TnTemporalZonedDateTime {
 	disambiguation := tnTOptDisambiguation(options)
 	offsetOpt := tnTOptOffsetOpt(options, "reject")
-	_ = offsetOpt
 	switch v := item.(type) {
 	case *TnTemporalZonedDateTime:
 		return v
@@ -4571,7 +4703,7 @@ func (z *TnTemporalZonedDateTime) Get_monthsInYear() float64 {
 func (z *TnTemporalZonedDateTime) Get_inLeapYear() bool { return tnTLeapYear(z.dateFields().y) }
 
 // hoursInDay: the local day's length, across DST shifts
-func (z *TnTemporalZonedDateTime) hoursInDay() float64 {
+func (z *TnTemporalZonedDateTime) Get_hoursInDay() float64 {
 	d := z.dateFields()
 	start := tnTStartOfDay(z.tz, d)
 	next := tnTStartOfDay(z.tz, tnTAddDays(d, 1))
@@ -4689,7 +4821,12 @@ func (z *TnTemporalZonedDateTime) with(zonedLike interface{}, options ...interfa
 	nanosecond := readTime("nanosecond", dt.time.ns)
 	date := tnTRegulateISODate(year, int(month), int(day), overflow)
 	time, _ := tnTBalanceTime(hour, minute, second, millisecond, microsecond, nanosecond)
-	ns := tnTGetEpochNanosecondsFor(z.tz, tnTDateTime{date: date, time: time}, disambiguation)
+	var ns *tnbig.Int
+	if v := TnGet(zonedLike, "offset"); !TnIsNil(v) {
+		ns = tnTInterpretISODateTimeOffset(date, time, true, tnTParseUTCOffset(TnJSString(v)), z.tz, disambiguation, offsetOpt, true)
+	} else {
+		ns = tnTGetEpochNanosecondsFor(z.tz, tnTDateTime{date: date, time: time}, disambiguation)
+	}
 	return tnTNewZoned(ns, z.tz)
 }
 
@@ -4828,7 +4965,7 @@ func (z *TnTemporalZonedDateTime) toString(options ...interface{}) string {
 		} else {
 			roundUnit, roundInc = tnTStringPrecisionUnit(precision)
 		}
-		ns = tnTRoundNsAsIfPositive(ns, tnTUnitNs(roundUnit)*roundInc, mode)
+		ns = tnTRoundInstantNs(ns, tnTUnitNs(roundUnit)*roundInc, mode)
 	}
 	value := tnTInstantOfNs(ns)
 	dt := tnTGetISODateTimeFor(z.tz, ns)

@@ -111,6 +111,10 @@ declare module 'node:fs' {
       mtime: Date;
       ctime: Date;
       birthtime: Date;
+      atimeInstant: Temporal.Instant;
+      mtimeInstant: Temporal.Instant;
+      ctimeInstant: Temporal.Instant;
+      birthtimeInstant: Temporal.Instant;
     }
     interface Dirent extends StatsBase {
       name: string;

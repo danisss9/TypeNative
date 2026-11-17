@@ -733,7 +733,11 @@ export function registerPath(r) {
         const fn = (name) => (call) => {
             r.helper('nodePath');
             // (a dynamic argument must hold a string, as Node checks)
-            const args = call.args.map((a, i) => (call.types[i] === 'interface{}' ? `TnPathArg(${a})` : a));
+            const args = [];
+            for (let i = 0; i < call.args.length; i++) {
+                const a = call.args[i];
+                args.push(call.types[i] === 'interface{}' ? `TnPathArg(${a})` : a);
+            }
             return `${style}.${name}(${args.join(', ')})`;
         };
         for (const name of ['join', 'resolve', 'normalize', 'relative', 'dirname', 'basename', 'extname', 'isAbsolute', 'parse', 'toNamespacedPath', 'matchesGlob']) {

@@ -1160,7 +1160,10 @@ export function registerSqlite(r) {
     defineClass(r, 'sqlite.StatementResultingChanges', '*TnSqliteRunResult', 'class', '', 'changes=interface{}; lastInsertRowid=interface{}', '', '');
     defineClass(r, 'sqlite.SQLTagStore', '*TnSqliteTagStore', 'class', 'get=interface{}; all=[]interface{}; iterate=*TnSqliteIterator; run=*TnSqliteRunResult; clear=', '', 'size=float64; capacity=float64; db=*TnSqliteDb', '');
     const limitNames = ['length', 'sqlLength', 'column', 'exprDepth', 'compoundSelect', 'vdbeOp', 'functionArg', 'attach', 'likePatternLength', 'variableNumber', 'triggerDepth'];
-    defineClass(r, 'sqlite.DatabaseLimits', '*TnSqliteLimits', 'class', '', '', limitNames.map((n) => `${n}=float64`).join('; '), limitNames.join('; '));
+    const limitSpecs = [];
+    for (const name of limitNames)
+        limitSpecs.push(`${name}=float64`);
+    defineClass(r, 'sqlite.DatabaseLimits', '*TnSqliteLimits', 'class', '', '', limitSpecs.join('; '), limitNames.join('; '));
     defineClass(r, 'sqlite.StatementIterator', '*TnSqliteIterator', 'class', 'next=*TnSqliteIteratorResult; TnRows=[]interface{}', '', '', '');
     defineClass(r, 'sqlite.StatementIteratorResult', '*TnSqliteIteratorResult', 'class', '', 'done=bool; value=interface{}', '', '');
     defineClass(r, 'sqlite.BackupProgressInfo', '*TnSqliteBackupProgress', 'class', '', 'totalPages=float64; remainingPages=float64', '', '');

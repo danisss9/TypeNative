@@ -527,7 +527,11 @@ export function registerDiagnosticsChannel(r: NodeRegistry): void {
     const posText = (c.args[1] || '').replace(/^float64\((.*)\)$/, '$1').replace(/[()\s]/g, '');
     const parsed = Number(posText);
     if (posText !== '' && !Number.isNaN(parsed)) position = parsed < 0 ? extra.length + parsed : parsed;
-    const wrapped = extra.map((a: string, i: number) => (i === position ? `TnTraceWrapCallback(${c.recv}, tnTraceCtx, ${a})` : a));
+    const wrapped: string[] = [];
+    for (let i = 0; i < extra.length; i++) {
+      const a = extra[i];
+      wrapped.push(i === position ? `TnTraceWrapCallback(${c.recv}, tnTraceCtx, ${a})` : a);
+    }
     const result = goFuncResult(fnType);
     const call = `(${c.args[0]})(${wrapped.join(', ')})`;
     if (result) return `TnTraceCallback(${c.recv}, ${context(c, 2)}, func(tnTraceCtx interface{}) ${result} { return ${call} })`;

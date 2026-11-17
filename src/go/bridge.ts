@@ -294,7 +294,7 @@ export function visitGoCall(node: AstNode): string | undefined {
 function instantiateResults(fn: GoFunc, argNodes: AstNode[]): string[] {
   if (fn.tparams.length === 0) return fn.results;
   const subst = inferTypeArgs(fn, argNodes);
-  return fn.results.map((r) => substituteType(r, subst));
+  return fn.results.map((r: string) => substituteType(r, subst));
 }
 
 function inferTypeArgs(fn: GoFunc, argNodes: AstNode[]): Record<string, string> {
@@ -511,7 +511,7 @@ function emitResults(call: string, results: string[], asStatement = false): stri
     if (asStatement) return wrapped;
     if (core.length === 1) return fromGo(wrapped, core[0]);
     // (A, B, error): pack the two values into a slice.
-    const temps = core.map((_, i) => `__v${i}`);
+    const temps = core.map((_: string, i: number) => `__v${i}`);
     return `func() []interface{} { ${temps.join(', ')} := ${wrapped}; return []interface{}{${packTuple(temps, core)}} }()`;
   }
   if (results.length === 1) {
@@ -521,14 +521,14 @@ function emitResults(call: string, results: string[], asStatement = false): stri
   // Multiple values: pack into a slice (TS tuple). Multi-value calls can't
   // appear in a composite literal, so go through temps.
   if (asStatement) return call;
-  const temps = results.map((_, i) => `__v${i}`);
+  const temps = results.map((_: string, i: number) => `__v${i}`);
   return `func() []interface{} { ${temps.join(', ')} := ${call}; return []interface{}{${packTuple(temps, results)}} }()`;
 }
 
 // Tuple elements read as TS-facing values (ints → float64), matching
 // goTupleTypes so destructuring can assert them back.
 function packTuple(temps: string[], types: string[]): string {
-  return temps.map((t, i) => fromGo(t, types[i])).join(', ');
+  return temps.map((t: string, i: number) => fromGo(t, types[i])).join(', ');
 }
 
 // TS-facing element types of a multi-value Go call ((A, B) or

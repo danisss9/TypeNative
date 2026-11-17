@@ -17809,12 +17809,16 @@ function buildLiteralCallbackInfo(
 ): ArrayCallbackInfo {
   {
     const paramCount = (callback.parameters ?? []).length;
+    // (a typed local: the AST's dynamic array dereferences once, and the
+    // slice below is a Go slice)
+    const allParameters: AstNode[] = callback.parameters ?? [];
+    const parameters = allParameters.slice(0, paramTypes.length);
     // ([k, v]) => … / ({ a }) => …: a temporary parameter unpacked first
     const unpack: string[] = [];
     // (a parameter annotated with a type of its own where the elements are
     // any values: asserted to it)
     const asserted = new Set<number>();
-    (callback.parameters ?? []).slice(0, paramTypes.length).forEach((p: AstNode, index: number) => {
+    parameters.forEach((p: AstNode, index: number) => {
       const annotated = isIdentifier(p.name) && p.type && paramTypes[index] === 'interface{}' && !p.dotDotDotToken ? getType(p.type) : '';
       if (annotated && annotated !== 'interface{}' && annotated !== ':' && !isUnboundGoType(annotated)) {
         asserted.add(index);
@@ -17827,9 +17831,7 @@ function buildLiteralCallbackInfo(
     const callbackReturnType =
       forcedReturnType ?? inferArrayCallbackReturnType(callback, elementType, elementType);
 
-    const params = (callback.parameters ?? [])
-      .slice(0, paramTypes.length)
-      .map((p: AstNode, index: number) => `${isIdentifier(p.name) && !asserted.has(index) ? getSafeName(p.name.text) : `__dp${index}`} ${paramTypes[index]}`);
+    const params = parameters.map((p: AstNode, index: number) => `${isIdentifier(p.name) && !asserted.has(index) ? getSafeName(p.name.text) : `__dp${index}`} ${paramTypes[index]}`);
 
     const prefix = unpack.join('');
     // (its returns convert to the result it is emitted with)
@@ -19208,41 +19210,41 @@ function getAcessString(leftSide: string, rightSide: string, objectType?: string
 type CallHandler = (caller: string, args: string[], typeArgs: string) => string;
 
 const callHandlers: Record<string, CallHandler> = {
-  assert: (_caller, args) => {
+  assert: (_caller: string, args: string[], _typeArgs: string) => {
     const message = args.length > 1 ? args[1] : '"Assertion failed"';
     return `if !(${args[0]}) {\n\t\tpanic(${message})\n\t}`;
   },
-  'console.log': (_caller, args) => consoleOut('Stdout', args),
-  'console.info': (_caller, args) => consoleOut('Stdout', args),
-  'console.debug': (_caller, args) => consoleOut('Stdout', args),
-  'console.trace': (_caller, args) => consoleOut('Stderr', args, 'Trace:'),
-  'console.dir': (_caller, args) => {
+  'console.log': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stdout', args),
+  'console.info': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stdout', args),
+  'console.debug': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stdout', args),
+  'console.trace': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stderr', args, 'Trace:'),
+  'console.dir': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('nodeUtil');
     return consoleOut('Stdout', [`TnInspect(${args.join(', ')})`], '', true);
   },
-  'console.assert': (_caller, args) => {
+  'console.assert': (_caller: string, args: string[], _typeArgs: string) => {
     const condition = args[0] ?? 'false';
     currentCallArgTypes = currentCallArgTypes.slice(1);
     const message = consoleOut('Stderr', args.slice(1), args.length > 1 ? 'Assertion failed:' : 'Assertion failed');
     return `if !(${condition}) {\n\t\t${message}\n\t}`;
   },
-  'console.table': (_caller, args) => {
+  'console.table': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('nodeUtil');
     return consoleOut('Stdout', [`TnConsoleTableString(${args.join(', ')})`], '', true);
   },
-  'console.count': (_caller, args) => {
+  'console.count': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleCount(${args.join(', ')})`;
   },
-  'console.countReset': (_caller, args) => {
+  'console.countReset': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleCountReset(${args.join(', ')})`;
   },
-  'console.group': (_caller, args) => {
+  'console.group': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleGroup(${consoleArgs(args).join(', ')})`;
   },
-  'console.groupCollapsed': (_caller, args) => {
+  'console.groupCollapsed': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleGroup(${consoleArgs(args).join(', ')})`;
   },
@@ -19250,15 +19252,15 @@ const callHandlers: Record<string, CallHandler> = {
     useHelper('console');
     return 'TnConsoleGroupEnd()';
   },
-  'console.time': (_caller, args) => {
+  'console.time': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleTime(${args.slice(0, 1).join(', ')})`;
   },
-  'console.timeEnd': (_caller, args) => {
+  'console.timeEnd': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     return `TnConsoleTimeEnd(${args.slice(0, 1).join(', ')})`;
   },
-  'console.timeLog': (_caller, args) => {
+  'console.timeLog': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('console');
     const label = args[0] ?? '"default"';
     currentCallArgTypes = currentCallArgTypes.slice(1);
@@ -19268,44 +19270,44 @@ const callHandlers: Record<string, CallHandler> = {
     const text = extra.length > 0 ? `strings.TrimSuffix(fmt.Sprintln(${extra.join(', ')}), "\\n")` : '""';
     return `TnConsoleTimeLog(${label}, ${text})`;
   },
-  'Math.hypot': (_caller, args) => mathCall('Hypot', args),
-  'Math.cbrt': (_caller, args) => mathCall('Cbrt', args),
-  'Math.exp': (_caller, args) => mathCall('Exp', args),
-  'Math.expm1': (_caller, args) => mathCall('Expm1', args),
-  'Math.log1p': (_caller, args) => mathCall('Log1p', args),
-  'Math.asin': (_caller, args) => mathCall('Asin', args),
-  'Math.acos': (_caller, args) => mathCall('Acos', args),
-  'Math.atan': (_caller, args) => mathCall('Atan', args),
-  'Math.atan2': (_caller, args) => mathCall('Atan2', args),
-  'Math.sinh': (_caller, args) => mathCall('Sinh', args),
-  'Math.cosh': (_caller, args) => mathCall('Cosh', args),
-  'Math.tanh': (_caller, args) => mathCall('Tanh', args),
-  'Math.asinh': (_caller, args) => mathCall('Asinh', args),
-  'Math.acosh': (_caller, args) => mathCall('Acosh', args),
-  'Math.atanh': (_caller, args) => mathCall('Atanh', args),
-  'Math.fround': (_caller, args) => `float64(float32(${args[0]}))`,
-  'RegExp.escape': (_caller, args) => {
+  'Math.hypot': (_caller: string, args: string[], _typeArgs: string) => mathCall('Hypot', args),
+  'Math.cbrt': (_caller: string, args: string[], _typeArgs: string) => mathCall('Cbrt', args),
+  'Math.exp': (_caller: string, args: string[], _typeArgs: string) => mathCall('Exp', args),
+  'Math.expm1': (_caller: string, args: string[], _typeArgs: string) => mathCall('Expm1', args),
+  'Math.log1p': (_caller: string, args: string[], _typeArgs: string) => mathCall('Log1p', args),
+  'Math.asin': (_caller: string, args: string[], _typeArgs: string) => mathCall('Asin', args),
+  'Math.acos': (_caller: string, args: string[], _typeArgs: string) => mathCall('Acos', args),
+  'Math.atan': (_caller: string, args: string[], _typeArgs: string) => mathCall('Atan', args),
+  'Math.atan2': (_caller: string, args: string[], _typeArgs: string) => mathCall('Atan2', args),
+  'Math.sinh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Sinh', args),
+  'Math.cosh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Cosh', args),
+  'Math.tanh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Tanh', args),
+  'Math.asinh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Asinh', args),
+  'Math.acosh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Acosh', args),
+  'Math.atanh': (_caller: string, args: string[], _typeArgs: string) => mathCall('Atanh', args),
+  'Math.fround': (_caller: string, args: string[], _typeArgs: string) => `float64(float32(${args[0]}))`,
+  'RegExp.escape': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     return `TnRegExpEscape(${args[0]})`;
   },
-  'Math.f16round': (_caller, args) => {
+  'Math.f16round': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     return `TnF16Round(${args[0]})`;
   },
-  'Math.imul': (_caller, args) => {
+  'Math.imul': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     return `float64(TnInt32(${args[0]}) * TnInt32(${args[1]}))`;
   },
-  'Math.clz32': (_caller, args) => {
+  'Math.clz32': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     importedPackages.add('math/bits');
     return `float64(bits.LeadingZeros32(TnUint32(${args[0]})))`;
   },
-  'Math.sumPrecise': (_caller, args) => {
+  'Math.sumPrecise': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     return `TnSumPrecise(${args[0]})`;
   },
-  'Number.isSafeInteger': (_caller, args) => {
+  'Number.isSafeInteger': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     // (no coercion: anything but a number is false)
     if (currentCallArgTypes[0] !== 'float64') {
@@ -19313,19 +19315,19 @@ const callHandlers: Record<string, CallHandler> = {
     }
     return `(${args[0]} == math.Trunc(${args[0]}) && math.Abs(${args[0]}) <= 9007199254740991)`;
   },
-  'Number.parseInt': (_caller, args) => {
+  'Number.parseInt': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     // (the string of a non-string value, as JS converts it)
     const str = currentCallArgTypes[0] === 'string' ? args[0] : jsStringOf(args[0], currentCallArgTypes[0]);
     return `TnParseInt(${str}, ${args[1] ?? '10'})`;
   },
-  'Number.parseFloat': (_caller, args) => {
+  'Number.parseFloat': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     return `TnParseFloat(${args[0]})`;
   },
-  'Object.groupBy': (_caller, args) => visitGroupBy(args, false),
-  'Map.groupBy': (_caller, args) => visitGroupBy(args, true),
-  'Iterator.concat': (_caller, args) => {
+  'Object.groupBy': (_caller: string, args: string[], _typeArgs: string) => visitGroupBy(args, false),
+  'Map.groupBy': (_caller: string, args: string[], _typeArgs: string) => visitGroupBy(args, true),
+  'Iterator.concat': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('iterators');
     const elem = iteratorConcatElementType(currentCallArgTypes);
     return `TnIterConcat[${elem}](${args.map((a, i) => {
@@ -19336,78 +19338,78 @@ const callHandlers: Record<string, CallHandler> = {
       return `TnIterFrom(TnAs[[]${elem}](${a}))`;
     }).join(', ')})`;
   },
-  'Iterator.from': (_caller, args) => {
+  'Iterator.from': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('iterators');
     const sourceType = (currentCallArgTypes[0] ?? '').replace(/^\*/, '');
     if (sourceType.startsWith('chan ')) return args[0];
     return `TnIterFrom(${args[0]})`;
   },
-  'Object.is': (_caller, args) => {
+  'Object.is': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     return `TnObjectIs(${args[0]}, ${args[1]})`;
   },
-  'Array.of': (_caller, args) => `${arrayOfGoType(currentCallArgTypes)}{${args.join(', ')}}`,
-  'String.fromCodePoint': (_caller, args) => `string([]rune{${args.map((a, i) => `rune(int(${numericArgument(a, i)}))`).join(', ')}})`,
-  'Symbol.for': (_caller, args) => {
+  'Array.of': (_caller: string, args: string[], _typeArgs: string) => `${arrayOfGoType(currentCallArgTypes)}{${args.join(', ')}}`,
+  'String.fromCodePoint': (_caller: string, args: string[], _typeArgs: string) => `string([]rune{${args.map((a, i) => `rune(int(${numericArgument(a, i)}))`).join(', ')}})`,
+  'Symbol.for': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('symbol');
     return `TnSymbolFor(${args[0]})`;
   },
-  'Symbol.keyFor': (_caller, args) => {
+  'Symbol.keyFor': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('symbol');
     return `TnSymbolKeyFor(${args[0]})`;
   },
-  BigInt: (_caller, args) => {
+  BigInt: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     return `TnBigIntOf(${args[0]})`;
   },
-  'BigInt.asIntN': (_caller, args) => {
+  'BigInt.asIntN': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     useHelper('dynamic');
     return `TnBigIntAsN(${args[0]}, TnAs[*tnbig.Int](${args[1]}), true)`;
   },
-  'BigInt.asUintN': (_caller, args) => {
+  'BigInt.asUintN': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
     useHelper('dynamic');
     return `TnBigIntAsN(${args[0]}, TnAs[*tnbig.Int](${args[1]}), false)`;
   },
-  isFinite: (_caller, args) => {
+  isFinite: (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `(!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]}))`;
   },
-  encodeURIComponent: (_caller, args) => {
+  encodeURIComponent: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('uri');
     return `TnEncodeURIComponent(${args[0]})`;
   },
-  encodeURI: (_caller, args) => {
+  encodeURI: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('uri');
     return `TnEncodeURI(${args[0]})`;
   },
-  decodeURIComponent: (_caller, args) => {
+  decodeURIComponent: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('uri');
     return `TnDecodeURIComponent(${args[0]})`;
   },
-  'Object.fromEntries': (_caller, args) => {
+  'Object.fromEntries': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     return `TnFromEntries(${args[0]})`;
   },
-  'Date.parse': (_caller, args) => {
+  'Date.parse': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('date');
     return `TnDateMs(TnParseDate(${args[0]}))`;
   },
-  'Date.UTC': (_caller, args) => {
+  'Date.UTC': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('time');
     const part = (i: number, fallback: string) => (args[i] ? `int(${args[i]})` : fallback);
     return `float64(time.Date(${part(0, '1970')}, time.Month(${part(1, '0')}+1), ${part(2, '1')}, ${part(3, '0')}, ${part(4, '0')}, ${part(5, '0')}, ${part(6, '0')}*1000000, time.UTC).UnixMilli())`;
   },
   // Promise.withResolvers<T>(): the promise channel and its resolve / reject
-  'Promise.withResolvers': (_caller, _args, typeArgs) => {
+  'Promise.withResolvers': (_caller: string, _args: string[], typeArgs: string) => {
     useHelper('promise');
     const t = typeArgs ? typeArgs.slice(1, -1) : 'interface{}';
     return `func() ${promiseWithResolversGoType(t)} { ch := make(chan ${t}, 1); return &struct{ promise chan ${t}; resolve func(...interface{}); reject func(...interface{}) }{promise: ch, resolve: TnResolver[${t}](ch), reject: TnRejecter[${t}](ch)} }()`;
   },
   // Promise.try(fn, ...args): fn runs now; its result (or a promise it
   // returns) settles the promise, and a throw rejects it
-  'Promise.try': (_caller, args) => {
+  'Promise.try': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('promise');
     const fnType = currentCallArgNodes[0] ? functionValueGoType(currentCallArgNodes[0]) : '';
     const result = fnType ? goFuncReturnType(fnType) ?? '' : '';
@@ -19419,27 +19421,27 @@ const callHandlers: Record<string, CallHandler> = {
     const settle = result ? `TnResolver[${t}](ch)(${call})` : `${call}; TnResolveZero(ch)`;
     return `func() chan ${t} { ch := make(chan ${t}, 1); func() { defer TnRejectExecutor(ch); ${settle} }(); return ch }()`;
   },
-  'Promise.resolve': (_caller, args) => {
+  'Promise.resolve': (_caller: string, args: string[], _typeArgs: string) => {
     const valueType = currentCallArgTypes[0] && currentCallArgTypes[0] !== 'nil' ? currentCallArgTypes[0] : 'interface{}';
     return `func() chan ${valueType} { __ch := make(chan ${valueType}, 1); __ch <- ${args[0] ?? 'nil'}; return __ch }()`;
   },
-  structuredClone: (_caller, args) => {
+  structuredClone: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('structuredClone');
     return `TnStructuredClone(${args[0]})`;
   },
-  setInterval: (_caller, args) => {
+  setInterval: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('timerWait');
     return `TnSetInterval(${args[1] ?? '0'}, ${args[0]})`;
   },
-  clearInterval: (_caller, args) => {
+  clearInterval: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('timerWait');
     return `TnClearInterval(${args[0]})`;
   },
-  queueMicrotask: (_caller, args) => {
+  queueMicrotask: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('timerWait');
     return `TnQueueMicrotask(${args[0]})`;
   },
-  clearTimeout: (_caller, args) => {
+  clearTimeout: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('timerWait');
     return `TnClearTimeout(${args[0]})`;
   },
@@ -19447,56 +19449,56 @@ const callHandlers: Record<string, CallHandler> = {
     importedPackages.add('math/rand');
     return 'rand.Float64()';
   },
-  'Math.floor': (_caller, args) => {
+  'Math.floor': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Floor(${args[0]})`;
   },
-  'Math.ceil': (_caller, args) => {
+  'Math.ceil': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Ceil(${args[0]})`;
   },
-  'Math.round': (_caller, args) => {
+  'Math.round': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Round(${args[0]})`;
   },
-  'Math.abs': (_caller, args) => {
+  'Math.abs': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Abs(${args[0]})`;
   },
   // Math.max(...arr) → slices.Max(arr); otherwise Go's variadic builtin
-  'Math.max': (_caller, args) => {
+  'Math.max': (_caller: string, args: string[], _typeArgs: string) => {
     if (args.length === 1 && args[0].endsWith('...')) {
       importedPackages.add('slices');
       return `slices.Max(${args[0].slice(0, -3)})`;
     }
     return `max(${args.join(', ')})`;
   },
-  'Math.min': (_caller, args) => {
+  'Math.min': (_caller: string, args: string[], _typeArgs: string) => {
     if (args.length === 1 && args[0].endsWith('...')) {
       importedPackages.add('slices');
       return `slices.Min(${args[0].slice(0, -3)})`;
     }
     return `min(${args.join(', ')})`;
   },
-  'Math.sqrt': (_caller, args) => {
+  'Math.sqrt': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Sqrt(${args[0]})`;
   },
-  'Math.pow': (_caller, args) => {
+  'Math.pow': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Pow(${args[0]}, ${args[1]})`;
   },
-  parseInt: (_caller, args) => {
+  parseInt: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     // (the string of a non-string value, as JS converts it)
     const str = currentCallArgTypes[0] === 'string' ? args[0] : jsStringOf(args[0], currentCallArgTypes[0]);
     return `TnParseInt(${str}, ${args[1] ?? '10'})`;
   },
-  parseFloat: (_caller, args) => {
+  parseFloat: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     return `TnParseFloat(${args[0]})`;
   },
-  'process.exit': (_caller, args) => {
+  'process.exit': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('os');
     return `os.Exit(int(${args[0] ?? '0'}))`;
   },
@@ -19504,7 +19506,7 @@ const callHandlers: Record<string, CallHandler> = {
     importedPackages.add('os');
     return `func() string { __d, _ := os.Getwd(); return __d }()`;
   },
-  'JSON.stringify': (_caller, args) => {
+  'JSON.stringify': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('jsonStringify');
     useHelper('dynamic');
     if (args.length === 1) return `TnJSONStringify(${args[0]}, "")`;
@@ -19512,7 +19514,7 @@ const callHandlers: Record<string, CallHandler> = {
     const replacer = jsonCallbackAdapter(replacerNode, args[1]) || (isNilLiteral(replacerNode) ? 'nil' : args[1]);
     return `TnJSONStringifyWith(${args[0]}, ${replacer}, ${args[2] ?? 'nil'})`;
   },
-  'JSON.parse': (_caller, args) => {
+  'JSON.parse': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('jsonStringify');
     // (a value not typed string — a T narrowed by typeof — is its string)
     if (args[0] && currentCallArgTypes[0] !== 'string') {
@@ -19526,25 +19528,25 @@ const callHandlers: Record<string, CallHandler> = {
     return `TnJSONParse(${args[0]})`;
   },
   // Maps / records have ordered keys; other objects go through reflection
-  'Object.keys': (_caller, args) => {
+  'Object.keys': (_caller: string, args: string[], _typeArgs: string) => {
     if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Keys()`;
     useHelper('dynamic');
     return `TnKeys(${args[0]})`;
   },
-  'Object.values': (_caller, args) => {
+  'Object.values': (_caller: string, args: string[], _typeArgs: string) => {
     if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Values()`;
     useHelper('dynamic');
     return `TnValues(${args[0]})`;
   },
   // Outside for...of (which iterates the map directly): [key, value] pairs
-  'Object.entries': (_caller, args) => {
+  'Object.entries': (_caller: string, args: string[], _typeArgs: string) => {
     if (isOrderedMapArg(currentCallArgNodes[0])) return `${args[0]}.Entries()`;
     useHelper('dynamic');
     return `TnEntries(${args[0]})`;
   },
   // Object.assign copies sources into a fresh ordered map (mutating structs is
   // not observable the way it is in JS)
-  'Object.assign': (_caller, args) => {
+  'Object.assign': (_caller: string, args: string[], _typeArgs: string) => {
     const call = currentCallNode;
     const targetType = call ? objectAssignTargetType(call) : undefined;
     // (an existing object is updated in place and returned, whatever its type)
@@ -19571,11 +19573,11 @@ const callHandlers: Record<string, CallHandler> = {
   // Promise.all: drain every promise channel, collect the results
   // (V8's; there are no V8 stack frames to capture)
   'Error.captureStackTrace': () => 'func() {}()',
-  'Error.isError': (_caller, args) => {
+  'Error.isError': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('error');
     return `TnIsErrorOf(interface{}(${args[0] ?? 'nil'}), "Error")`;
   },
-  'Promise.all': (_caller, args) => {
+  'Promise.all': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('promiseAll');
     // (values that may or may not be promises, an any[]: each awaited when it is one)
     const listNode = currentCallArgNodes[0];
@@ -19585,35 +19587,35 @@ const callHandlers: Record<string, CallHandler> = {
     }
     return `TnPromiseAll(${args[0] ?? '[]chan interface{}{}'})`;
   },
-  'Math.log': (_caller, args) => {
+  'Math.log': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Log(${args[0]})`;
   },
-  'Math.log2': (_caller, args) => {
+  'Math.log2': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Log2(${args[0]})`;
   },
-  'Math.log10': (_caller, args) => {
+  'Math.log10': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Log10(${args[0]})`;
   },
-  'Math.sin': (_caller, args) => {
+  'Math.sin': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Sin(${args[0]})`;
   },
-  'Math.cos': (_caller, args) => {
+  'Math.cos': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Cos(${args[0]})`;
   },
-  'Math.tan': (_caller, args) => {
+  'Math.tan': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Tan(${args[0]})`;
   },
-  'Math.trunc': (_caller, args) => {
+  'Math.trunc': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.Trunc(${args[0]})`;
   },
-  'Math.sign': (_caller, args) => {
+  'Math.sign': (_caller: string, args: string[], _typeArgs: string) => {
     return `func() float64 { if ${args[0]} > 0 { return 1 }; if ${args[0]} < 0 { return -1 }; return 0 }()`;
   },
   'Date.now': () => {
@@ -19621,9 +19623,9 @@ const callHandlers: Record<string, CallHandler> = {
     useHelper('clock');
     return 'float64(TnTimeNow().UnixMilli())';
   },
-  'console.error': (_caller, args) => consoleOut('Stderr', args),
-  'console.warn': (_caller, args) => consoleOut('Stderr', args),
-  'Array.isArray': (_caller, args) => {
+  'console.error': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stderr', args),
+  'console.warn': (_caller: string, args: string[], _typeArgs: string) => consoleOut('Stderr', args),
+  'Array.isArray': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('isArray');
     // (an array reference variable — possibly unset —: whether it is set)
     const arg = currentCallArgNodes[0] ? unwrapParentheses(currentCallArgNodes[0]) : undefined;
@@ -19631,37 +19633,37 @@ const callHandlers: Record<string, CallHandler> = {
     return `TnIsArray(${args[0]})`;
   },
   // (String(null): "null" — the literal's Go code, nil, is undefined's too)
-  'String': (_caller, args) => currentCallArgNodes[0] && unwrapParentheses(currentCallArgNodes[0]).kind === 'NullKeyword' ? '"null"' : jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
-  'String.fromCharCode': (_caller, args) => `string(rune(int(${args[0] ? numericArgument(args[0], 0) : '0'})))`,
+  'String': (_caller: string, args: string[], _typeArgs: string) => currentCallArgNodes[0] && unwrapParentheses(currentCallArgNodes[0]).kind === 'NullKeyword' ? '"null"' : jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
+  'String.fromCharCode': (_caller: string, args: string[], _typeArgs: string) => `string(rune(int(${args[0] ? numericArgument(args[0], 0) : '0'})))`,
   // Symbol(description) — unique values for record keys
-  Symbol: (_caller, args) => {
+  Symbol: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('symbol');
     return `TnNewSymbol(${args[0] ?? '""'})`;
   },
-  'Number': (_caller, args) => {
+  'Number': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
     return `TnNumber(${args[0]})`;
   },
-  'Number.isNaN': (_caller, args) => {
+  'Number.isNaN': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     if (currentCallArgTypes[0] !== 'float64') {
       return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && math.IsNaN(__n) }()`;
     }
     return `math.IsNaN(${args[0]})`;
   },
-  isNaN: (_caller, args) => {
+  isNaN: (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     return `math.IsNaN(${args[0]})`;
   },
   // (no coercion: anything but a number is false)
-  'Number.isFinite': (_caller, args) => {
+  'Number.isFinite': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     if (currentCallArgTypes[0] !== 'float64') {
       return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && !math.IsInf(__n, 0) && !math.IsNaN(__n) }()`;
     }
     return `!math.IsInf(${args[0]}, 0) && !math.IsNaN(${args[0]})`;
   },
-  'Number.isInteger': (_caller, args) => {
+  'Number.isInteger': (_caller: string, args: string[], _typeArgs: string) => {
     importedPackages.add('math');
     if (currentCallArgTypes[0] !== 'float64') {
       return `func() bool { __n, __ok := interface{}(${numberCheckArgument(args[0])}).(float64); return __ok && __n == math.Trunc(__n) && !math.IsInf(__n, 0) }()`;
@@ -19669,8 +19671,8 @@ const callHandlers: Record<string, CallHandler> = {
     return `(${args[0]} == math.Trunc(${args[0]}) && !math.IsInf(${args[0]}, 0))`;
   },
   // Object(x) is x (primitives are not boxed)
-  'Object': (_caller, args) => `interface{}(${args[0] ?? 'map[string]interface{}{}'})`,
-  'Boolean': (_caller, args) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
+  'Object': (_caller: string, args: string[], _typeArgs: string) => `interface{}(${args[0] ?? 'map[string]interface{}{}'})`,
+  'Boolean': (_caller: string, args: string[], _typeArgs: string) => `(${truthinessCheck(args[0] ?? 'false', currentCallArgTypes[0] ?? 'interface{}')})`,
 };
 
 // A call's argument as a number (an any or nullable value: its JS number)
@@ -19747,7 +19749,7 @@ function consoleArgs(args: string[]): string[] {
 }
 
 const stringMethodHandlers: Record<string, MethodHandler> = {
-  split: (obj, args) => {
+  split: (obj: string, args: string[]) => {
     // Regex separators: JS split (captures included, limit counts items)
     const limit = args.length >= 2 ? `int(${args[1]})` : '-1';
     if (args[0]?.startsWith('regexp.MustCompile(') || variableGoTypes.get(args[0]) === '*regexp.Regexp') {
@@ -19764,45 +19766,45 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     if (args.length >= 2) return `func() []string { __n := max(0, int(${args[1]})); if __n == 0 { return []string{} }; __p := strings.SplitN(${obj}, ${args[0]}, __n+1); return __p[:min(len(__p), __n)] }()`;
     return `strings.Split(${obj}, ${args[0]})`;
   },
-  trim: (obj) => {
+  trim: (obj: string) => {
     // (JS's whitespace: Unicode spaces, line terminators and the BOM)
     importedPackages.add('strings');
     useHelper('jsSpace');
     return `strings.TrimFunc(${obj}, TnIsJSSpace)`;
   },
-  trimStart: (obj) => {
+  trimStart: (obj: string) => {
     // (JS's whitespace: Unicode spaces, line terminators and the BOM)
     importedPackages.add('strings');
     useHelper('jsSpace');
     return `strings.TrimLeftFunc(${obj}, TnIsJSSpace)`;
   },
-  trimEnd: (obj) => {
+  trimEnd: (obj: string) => {
     // (JS's whitespace: Unicode spaces, line terminators and the BOM)
     importedPackages.add('strings');
     useHelper('jsSpace');
     return `strings.TrimRightFunc(${obj}, TnIsJSSpace)`;
   },
   // (JS's full case mapping: ß → SS, ﬁ → FI, final σ → ς)
-  toUpperCase: (obj) => {
+  toUpperCase: (obj: string) => {
     useHelper('jsCase');
     return `TnToUpperJS(${obj})`;
   },
-  toLowerCase: (obj) => {
+  toLowerCase: (obj: string) => {
     useHelper('jsCase');
     return `TnToLowerJS(${obj})`;
   },
   // (string positions are code points: see the strIndex helpers)
-  indexOf: (obj, args) => {
+  indexOf: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnStrIndexOf(${obj}, ${args[0]}, ${args[1] ?? '0'})`;
   },
-  charCodeAt: (obj, args) => {
+  charCodeAt: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnCharCodeAt(${obj}, ${args[0] ?? '0'})`;
   },
   // (the root collation: letters by base letter, then accents, then case; a
   // locale or options argument uses the full Intl.Collator instead)
-  localeCompare: (obj, args) => {
+  localeCompare: (obj: string, args: string[]) => {
     if (currentCallArgNodes[1] || currentCallArgNodes[2]) {
       useHelper('intlCollate');
       const locales = currentCallArgNodes[1] ? toGoValueOfType(currentCallArgNodes[1], 'interface{}') : 'nil';
@@ -19812,7 +19814,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     useHelper('builtins');
     return `TnLocaleCompare(${obj}, ${args[0]}, nil)`;
   },
-  includes: (obj, args) => {
+  includes: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     if (args.length >= 2) {
       useHelper('stringSearch');
@@ -19820,7 +19822,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     }
     return `strings.Contains(${obj}, ${args[0]})`;
   },
-  startsWith: (obj, args) => {
+  startsWith: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     if (args.length >= 2) {
       useHelper('stringSearch');
@@ -19828,7 +19830,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     }
     return `strings.HasPrefix(${obj}, ${args[0]})`;
   },
-  endsWith: (obj, args) => {
+  endsWith: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     if (args.length >= 2) {
       useHelper('stringSearch');
@@ -19837,7 +19839,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `strings.HasSuffix(${obj}, ${args[0]})`;
   },
   // (a replacement with $ patterns — $$, $&, $`, $' — is expanded like JS)
-  replace: (obj, args) => {
+  replace: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     // a pattern typed string | RegExp: which one is known at run time
     const replacementNode = currentCallArgNodes[1];
@@ -19851,7 +19853,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     }
     return `strings.Replace(${obj}, ${args[0]}, ${args[1]}, 1)`;
   },
-  replaceAll: (obj, args) => {
+  replaceAll: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     // a pattern typed string | RegExp: which one is known at run time
     const replacementNode = currentCallArgNodes[1];
@@ -19865,21 +19867,21 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     }
     return `strings.ReplaceAll(${obj}, ${args[0]}, ${args[1]})`;
   },
-  repeat: (obj, args) => {
+  repeat: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     return `strings.Repeat(${obj}, int(${args[0]}))`;
   },
-  charAt: (obj, args) => {
+  charAt: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnCharAt(${obj}, ${args[0] ?? '0'})`;
   },
-  substring: (obj, args) => {
+  substring: (obj: string, args: string[]) => {
     useHelper('strIndex');
     const end = optionalEndArgument(args);
     if (end) return `func() string { __e := ${end}; return TnSubstring(${obj}, ${args[0] ?? '0'}, TnDeref(__e), __e != nil) }()`;
     return `TnSubstring(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
-  slice: (obj, args) => {
+  slice: (obj: string, args: string[]) => {
     // (a Go array or slice of an unknown receiver slices as it is)
     if (currentReceiverGoType && currentReceiverGoType !== 'string') {
       if (args.length >= 2) return `${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}]`;
@@ -19891,7 +19893,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `TnStrSlice(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
   // (each argument String()ed: s.concat(value as string) of a number too)
-  concat: (obj, args) => {
+  concat: (obj: string, args: string[]) => {
     const argNodes = currentCallArgNodes;
     const parts = args.map((arg, i) => {
       let argNode = argNodes[i];
@@ -19908,22 +19910,22 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return [obj, ...parts].join(' + ');
   },
   // normalize('NFC' | 'NFD' | 'NFKC' | 'NFKD')
-  normalize: (obj, args) => {
+  normalize: (obj: string, args: string[]) => {
     importedPackages.add('golang.org/x/text/unicode/norm');
     const form = args[0] ?? '"NFC"';
     const literal = /^"(NFC|NFD|NFKC|NFKD)"$/.exec(form);
     if (literal) return `tnnorm.${literal[1]}.String(${obj})`;
     return `func() string { switch ${form} { case "NFD": return tnnorm.NFD.String(${obj}); case "NFKC": return tnnorm.NFKC.String(${obj}); case "NFKD": return tnnorm.NFKD.String(${obj}) }; return tnnorm.NFC.String(${obj}) }()`;
   },
-  padStart: (obj, args) => {
+  padStart: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnStrPad(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '" "'}, true)`;
   },
-  padEnd: (obj, args) => {
+  padEnd: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnStrPad(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '" "'}, false)`;
   },
-  match: (obj, args) => {
+  match: (obj: string, args: string[]) => {
     if (isTnRegexArg(args[0])) {
       useHelper('fancyRegex');
       return `${args[0]}.FindSub(${obj})`;
@@ -19931,7 +19933,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     useHelper('regexMatch');
     return `TnRegexpExec(${toGoRegexp(args[0])}, ${obj})`;
   },
-  matchAll: (obj, args) => {
+  matchAll: (obj: string, args: string[]) => {
     if (isTnRegexArg(args[0])) {
       useHelper('fancyRegex');
       return `${args[0]}.FindAllSub(${obj})`;
@@ -19940,7 +19942,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `TnRegexpMatchAll(${toGoRegexp(args[0])}, ${obj})`;
   },
   // A character index, like the other string methods
-  search: (obj, args) => {
+  search: (obj: string, args: string[]) => {
     useHelper('regexMatch');
     if (isTnRegexArg(args[0])) {
       useHelper('fancyRegex');
@@ -19948,31 +19950,31 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     }
     return `func() float64 { __s := ${obj}; return TnMatchCharIndex(__s, ${toGoRegexp(args[0])}.FindStringIndex(__s)) }()`;
   },
-  lastIndexOf: (obj, args) => {
+  lastIndexOf: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnStrLastIndexOf(${obj}, ${args[0]}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
-  codePointAt: (obj, args) => {
+  codePointAt: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnCodePointAt(${obj}, ${args[0] ?? '0'})`;
   },
-  substr: (obj, args) => {
+  substr: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnSubstr(${obj}, ${args[0] ?? '0'}, ${args[1] ?? '0'}, ${args.length >= 2})`;
   },
-  trimLeft: (obj) => {
+  trimLeft: (obj: string) => {
     // (JS's whitespace: Unicode spaces, line terminators and the BOM)
     importedPackages.add('strings');
     useHelper('jsSpace');
     return `strings.TrimLeftFunc(${obj}, TnIsJSSpace)`;
   },
-  trimRight: (obj) => {
+  trimRight: (obj: string) => {
     // (JS's whitespace: Unicode spaces, line terminators and the BOM)
     importedPackages.add('strings');
     useHelper('jsSpace');
     return `strings.TrimRightFunc(${obj}, TnIsJSSpace)`;
   },
-  toLocaleUpperCase: (obj, args) => {
+  toLocaleUpperCase: (obj: string, args: string[]) => {
     // with a locale: the locale's case mapping (tr/az/lt); else plain
     if (currentCallArgNodes[0]) {
       useHelper('intlCase');
@@ -19981,7 +19983,7 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     importedPackages.add('strings');
     return `strings.ToUpper(${obj})`;
   },
-  toLocaleLowerCase: (obj, args) => {
+  toLocaleLowerCase: (obj: string, args: string[]) => {
     if (currentCallArgNodes[0]) {
       useHelper('intlCase');
       return `TnIntlToLower(TnIntlCaseLoc(${args[0]}), ${obj})`;
@@ -19989,15 +19991,15 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     importedPackages.add('strings');
     return `strings.ToLower(${obj})`;
   },
-  isWellFormed: (obj) => {
+  isWellFormed: (obj: string) => {
     importedPackages.add('unicode/utf8');
     return `utf8.ValidString(${obj})`;
   },
-  toWellFormed: (obj) => {
+  toWellFormed: (obj: string) => {
     importedPackages.add('strings');
     return `strings.ToValidUTF8(${obj}, "\\uFFFD")`;
   },
-  at: (obj, args) => {
+  at: (obj: string, args: string[]) => {
     useHelper('strIndex');
     return `TnStrAt(${obj}, ${args[0] ?? '0'})`;
   },
@@ -20040,11 +20042,11 @@ function onlyTestedForTruthiness(node: AstNode): boolean {
 }
 
 const regexpMethodHandlers: Record<string, MethodHandler> = {
-  test: (obj, args) =>
+  test: (obj: string, args: string[]) =>
     currentReceiverGoType === '*TnRegex'
       ? `${obj}.Test(${regexSubject(args[0])})`
       : `${obj}.MatchString(${regexSubject(args[0])})`,
-  exec: (obj, args) => {
+  exec: (obj: string, args: string[]) => {
     args = [regexSubject(args[0])];
     // only its presence is tested (!!re.exec(s), if (a || re.exec(s))): no
     // match array to build
@@ -20064,7 +20066,7 @@ const regexpMethodHandlers: Record<string, MethodHandler> = {
 
 // d.setHours(h, …) & co.: Dates are values, so the variable is reassigned
 function dateSetter(field: string, utc: boolean): MethodHandler {
-  return (obj, args) => {
+  return (obj: string, args: string[]) => {
     useHelper('date');
     const call = `TnDateSet(${obj}, ${toGoStringLiteral(field)}, ${utc}${args.map((a) => `, ${a}`).join('')})`;
     return isAddressable(obj) ? `func() float64 { ${obj} = ${call}; return TnDateMs(${obj}) }()` : `TnDateMs(${call})`;
@@ -20072,7 +20074,7 @@ function dateSetter(field: string, utc: boolean): MethodHandler {
 }
 
 function dateFormatter(kind: string): MethodHandler {
-  return (obj) => {
+  return (obj: string) => {
     useHelper('date');
     return `TnDateFormat(${obj}, ${toGoStringLiteral(kind)})`;
   };
@@ -20081,7 +20083,7 @@ function dateFormatter(kind: string): MethodHandler {
 // d.toLocaleString(locales, options) & co.: the Intl date formatting (the
 // default locale follows the OS, as Node's do)
 function dateLocaleFormatter(kind: string): MethodHandler {
-  return (obj) => {
+  return (obj: string) => {
     useHelper('intlDate');
     const locales = currentCallArgNodes[0] ? toGoValueOfType(currentCallArgNodes[0], 'interface{}') : 'nil';
     const options = currentCallArgNodes[1] ? toGoValueOfType(currentCallArgNodes[1], 'interface{}') : 'nil';
@@ -20090,28 +20092,28 @@ function dateLocaleFormatter(kind: string): MethodHandler {
 }
 
 const dateMethodHandlers: Record<string, MethodHandler> = {
-  getTime: (obj) => {
+  getTime: (obj: string) => {
     useHelper('date');
     return `TnDateMs(${obj})`;
   },
-  getMilliseconds: (obj) => `float64((${obj}).Millisecond())`,
-  getSeconds: (obj) => `float64((${obj}).Second())`,
-  getMinutes: (obj) => `float64((${obj}).Minute())`,
-  getHours: (obj) => `float64((${obj}).Hour())`,
-  getDate: (obj) => `float64((${obj}).Day())`,
-  getDay: (obj) => `float64(int((${obj}).Weekday()))`,
-  getMonth: (obj) => `float64(int((${obj}).Month()) - 1)`,
-  getFullYear: (obj) => `float64((${obj}).Year())`,
+  getMilliseconds: (obj: string) => `float64((${obj}).Millisecond())`,
+  getSeconds: (obj: string) => `float64((${obj}).Second())`,
+  getMinutes: (obj: string) => `float64((${obj}).Minute())`,
+  getHours: (obj: string) => `float64((${obj}).Hour())`,
+  getDate: (obj: string) => `float64((${obj}).Day())`,
+  getDay: (obj: string) => `float64(int((${obj}).Weekday()))`,
+  getMonth: (obj: string) => `float64(int((${obj}).Month()) - 1)`,
+  getFullYear: (obj: string) => `float64((${obj}).Year())`,
   toISOString: dateFormatter('iso'),
   toJSON: dateFormatter('iso'),
-  getUTCMilliseconds: (obj) => `float64((${obj}).UTC().Nanosecond() / 1000000)`,
-  getUTCSeconds: (obj) => `float64((${obj}).UTC().Second())`,
-  getUTCMinutes: (obj) => `float64((${obj}).UTC().Minute())`,
-  getUTCHours: (obj) => `float64((${obj}).UTC().Hour())`,
-  getUTCDate: (obj) => `float64((${obj}).UTC().Day())`,
-  getUTCDay: (obj) => `float64(int((${obj}).UTC().Weekday()))`,
-  getUTCMonth: (obj) => `float64(int((${obj}).UTC().Month()) - 1)`,
-  getUTCFullYear: (obj) => `float64((${obj}).UTC().Year())`,
+  getUTCMilliseconds: (obj: string) => `float64((${obj}).UTC().Nanosecond() / 1000000)`,
+  getUTCSeconds: (obj: string) => `float64((${obj}).UTC().Second())`,
+  getUTCMinutes: (obj: string) => `float64((${obj}).UTC().Minute())`,
+  getUTCHours: (obj: string) => `float64((${obj}).UTC().Hour())`,
+  getUTCDate: (obj: string) => `float64((${obj}).UTC().Day())`,
+  getUTCDay: (obj: string) => `float64(int((${obj}).UTC().Weekday()))`,
+  getUTCMonth: (obj: string) => `float64(int((${obj}).UTC().Month()) - 1)`,
+  getUTCFullYear: (obj: string) => `float64((${obj}).UTC().Year())`,
   toString: dateFormatter('string'),
   toDateString: dateFormatter('date'),
   toTimeString: dateFormatter('time'),
@@ -20120,11 +20122,11 @@ const dateMethodHandlers: Record<string, MethodHandler> = {
   toLocaleDateString: dateLocaleFormatter('localeDate'),
   toLocaleTimeString: dateLocaleFormatter('localeTime'),
   toLocaleString: dateLocaleFormatter('locale'),
-  getTimezoneOffset: (obj) => {
+  getTimezoneOffset: (obj: string) => {
     useHelper('date');
     return `TnDateTimezoneOffset(${obj})`;
   },
-  valueOf: (obj) => {
+  valueOf: (obj: string) => {
     useHelper('date');
     return `TnDateMs(${obj})`;
   },
@@ -20143,7 +20145,7 @@ const dateMethodHandlers: Record<string, MethodHandler> = {
   setUTCMinutes: dateSetter('minutes', true),
   setUTCSeconds: dateSetter('seconds', true),
   setUTCMilliseconds: dateSetter('milliseconds', true),
-  toTemporalInstant: (obj) => {
+  toTemporalInstant: (obj: string) => {
     useHelper('date');
     return `TnDateToTemporalInstant(${obj})`;
   }
@@ -20188,7 +20190,7 @@ function pushStatement(target: string, args: string[], elementType?: string): st
 
 const arrayMethodHandlers: Record<string, MethodHandler> = {
   // push / unshift return the new length when their value is used
-  push: (obj, args) => {
+  push: (obj: string, args: string[]) => {
     const element = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType.slice(2) : undefined;
     // (an Array subclass's elements (seq.push(…), list.push(…) on T[] & {…}):
     // the embedded TnArray's reference, so the push reaches the instance)
@@ -20244,27 +20246,27 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
       ? `func() float64 { ${pushStatement(obj, args, element)}; return float64(len(${obj})) }()`
       : pushStatement(obj, args, element);
   },
-  pop: (obj) => {
+  pop: (obj: string) => {
     const elementType = receiverElementType();
     if (!isAddressable(obj)) {
       return `func() ${elementType} { __s := ${obj}; if len(__s) == 0 { var __zero ${elementType}; return __zero }; return __s[len(__s)-1] }()`;
     }
     return `func() ${elementType} { if len(${obj}) == 0 { var __zero ${elementType}; return __zero }; __last := ${obj}[len(${obj})-1]; ${obj} = ${obj}[:len(${obj})-1]; return __last }()`;
   },
-  shift: (obj) => {
+  shift: (obj: string) => {
     const elementType = receiverElementType();
     if (!isAddressable(obj)) {
       return `func() ${elementType} { __s := ${obj}; if len(__s) == 0 { var __zero ${elementType}; return __zero }; return __s[0] }()`;
     }
     return `func() ${elementType} { if len(${obj}) == 0 { var __zero ${elementType}; return __zero }; __first := ${obj}[0]; ${obj} = ${obj}[1:]; return __first }()`;
   },
-  unshift: (obj, args) => {
+  unshift: (obj: string, args: string[]) => {
     const prefix = appendArguments(`[]${receiverElementType()}{}`, args, receiverElementType());
     return currentCallNode && !isDiscardedValue(currentCallNode)
       ? `func() float64 { ${obj} = append(${prefix}, ${obj}...); return float64(len(${obj})) }()`
       : `${obj} = append(${prefix}, ${obj}...)`;
   },
-  join: (obj, args) => {
+  join: (obj: string, args: string[]) => {
     importedPackages.add('strings');
     // (elements of another type: each as String() gives it, null and undefined as '')
     if (currentReceiverGoType !== '[]string' && currentReceiverGoType !== '*[]string') {
@@ -20275,18 +20277,18 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   },
   // (a copy, as in JS: a reslice shares the backing array, and an append to
   // either side — next ??= block.slice(0, i); next.push(…) — overwrites the other)
-  slice: (obj, args) => {
+  slice: (obj: string, args: string[]) => {
     importedPackages.add('slices');
     if (args.length >= 2) return `slices.Clone(${obj}[${sliceIndex(obj, args[0])}:${sliceIndex(obj, args[1])}])`;
     return `slices.Clone(${obj}[${sliceIndex(obj, args[0])}:])`;
   },
-  reverse: (obj) => {
+  reverse: (obj: string) => {
     importedPackages.add('slices');
     const arrayType = currentReceiverGoType?.startsWith('[]') ? currentReceiverGoType : '[]interface{}';
     return `func() ${arrayType} { __s := ${obj}; slices.Reverse(__s); return __s }()`;
   },
   // Removes `deleteCount` elements at `start`, returns them; extra args are inserted
-  splice: (obj, args) => {
+  splice: (obj: string, args: string[]) => {
     const elementType = receiverElementType();
     if (args.length === 0) return `[]${elementType}{}`;
     // (an index held as any — a [key, value] pair destructured from a Map —: its number)
@@ -20303,26 +20305,26 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     const inserted = insert.length > 0 ? appendArguments(`${obj}[:__start]`, insert, elementType) : `${obj}[:__start]`;
     return `func() []${elementType} { __start := ${start}; __end := __start + max(0, int(${indexArg(1)})); if __end > len(${obj}) { __end = len(${obj}) }; __rm := append([]${elementType}{}, ${obj}[__start:__end]...); __tail := append([]${elementType}{}, ${obj}[__end:]...); ${obj} = ${inserted}; ${obj} = append(${obj}, __tail...); return __rm }()`;
   },
-  fill: (obj, args) => {
+  fill: (obj: string, args: string[]) => {
     const elementType = receiverElementType();
     const value = args[0] ?? '0';
     return `func() []${elementType} { __s := ${obj}; for __i := range __s { __s[__i] = ${value} }; return __s }()`;
   },
-  lastIndexOf: (obj, args) => {
+  lastIndexOf: (obj: string, args: string[]) => {
     const elementType = receiverElementType();
     return `func() float64 { __x := ${nullSearchValue(args[0])}; for __i := len(${obj}) - 1; __i >= 0; __i-- { if ${elementEqualsFor(elementType, `${obj}[__i]`, '__x')} { return float64(__i) } }; return float64(-1) }()`;
   },
   // Sorts in place and returns the array; without a comparator, compares as strings (like JS)
-  sort: (obj, args) => sortArray(obj, args),
+  sort: (obj: string, args: string[]) => sortArray(obj, args),
   // (from a start position: indexOf(x, from), negative from the end)
-  indexOf: (obj, args) => args.length > 1
+  indexOf: (obj: string, args: string[]) => args.length > 1
     ? (useHelper('dynamic'), `func() float64 { __s := ${obj}; __x := ${nullSearchValue(args[0])}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`)
     : `func() float64 { __x := ${nullSearchValue(args[0])}; for __i, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return float64(__i) } }; return float64(-1) }()`,
-  includes: (obj, args) => args.length > 1
+  includes: (obj: string, args: string[]) => args.length > 1
     ? (useHelper('dynamic'), `func() bool { __s := ${obj}; __x := ${nullSearchValue(args[0])}; for __i := TnSliceIndex(${args[1]}, len(__s)); __i < len(__s); __i++ { __v := __s[__i]; if ${elementEquals('__v', '__x')} { return true } }; return false }()`)
     : `func() bool { __x := ${nullSearchValue(args[0])}; for _, __v := range ${obj} { if ${elementEquals('__v', '__x')} { return true } }; return false }()`,
   // concat(a, [b, c], d): arrays are flattened one level, other values appended
-  concat: (obj, args) => {
+  concat: (obj: string, args: string[]) => {
     const parts = args.map((arg, i) => {
       // (typed elements into an any array — [].concat(Object.keys(o)) —: one by one)
       if (currentCallArgTypes[i]?.startsWith('[]') && receiverElementType() === 'interface{}' && currentCallArgTypes[i] !== '[]interface{}') return `for _, __v := range ${arg} { __r = append(__r, __v) }`;
@@ -20337,32 +20339,32 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
     });
     return `func() []${receiverElementType()} { __r := append([]${receiverElementType()}{}, ${obj}...); ${parts.join('; ')}; return __r }()`;
   },
-  toSorted: (obj, args) => {
+  toSorted: (obj: string, args: string[]) => {
     importedPackages.add('slices');
     return sortArray(`slices.Clone(${obj})`, args);
   },
   // copyWithin(target, start, end?): copies in place (overlap-safe) and returns the array
-  copyWithin: (obj, args) => {
+  copyWithin: (obj: string, args: string[]) => {
     const end = args[2] ? sliceIndex('__s', args[2]) : 'len(__s)';
     return `func() []${receiverElementType()} { __s := ${obj}; __t := ${sliceIndex('__s', args[0] ?? '0')}; __start := ${sliceIndex('__s', args[1] ?? '0')}; __end := ${end}; if __start < __end { copy(__s[__t:], __s[__start:__end]) }; return __s }()`;
   },
   // toSpliced(start, deleteCount?, ...items): a spliced copy
-  toSpliced: (obj, args) => {
+  toSpliced: (obj: string, args: string[]) => {
     importedPackages.add('slices');
     const elementType = receiverElementType();
     const end = args.length >= 2 ? `min(__start+max(int(${args[1]}), 0), len(__s))` : 'len(__s)';
     return `func() []${elementType} { __s := ${obj}; __start := ${sliceIndex('__s', args[0] ?? '0')}; return slices.Concat(__s[:__start:__start], []${elementType}{${args.slice(2).join(', ')}}, __s[${end}:]) }()`;
   },
-  toReversed: (obj) => {
+  toReversed: (obj: string) => {
     importedPackages.add('slices');
     return `func() []${receiverElementType()} { __s := slices.Clone(${obj}); slices.Reverse(__s); return __s }()`;
   },
-  with: (obj, args) => {
+  with: (obj: string, args: string[]) => {
     importedPackages.add('slices');
     return `func() []${receiverElementType()} { __s := slices.Clone(${obj}); __s[${sliceIndex('__s', args[0])}] = ${args[1]}; return __s }()`;
   },
   // [][]T → []T (one level, like JS's default depth)
-  flat: (obj, args) => {
+  flat: (obj: string, args: string[]) => {
     const elementType = receiverElementType();
     // (elements of any type — a T | T[] callback's results —: those that
     // are arrays spread, the rest kept)
@@ -20387,7 +20389,7 @@ const arrayMethodHandlers: Record<string, MethodHandler> = {
   },
   // padStart / padEnd for string arrays (rarely used, but added for completeness)
   // (undefined past either end: a primitive element is T | undefined, *T)
-  at: (obj, args) => {
+  at: (obj: string, args: string[]) => {
     // [...s].at(i): its i-th code point, without building the array of them
     const spreadString = currentCallNode && isPropertyAccessExpression(currentCallNode.expression)
       ? stringSpreadSource(currentCallNode.expression.expression)
@@ -20482,11 +20484,11 @@ function elementEquals(a: string, b: string): string {
 }
 
 const mapMethodHandlers: Record<string, MethodHandler> = {
-  set: (obj, args) => `${obj}.Set(${args[0]}, ${args[1]})`,
-  get: (obj, args) => `${obj}.Get(${args[0]})`,
-  getOrInsert: (obj, args) => `${obj}.GetOrInsert(${args[0]}, ${args[1]})`,
+  set: (obj: string, args: string[]) => `${obj}.Set(${args[0]}, ${args[1]})`,
+  get: (obj: string, args: string[]) => `${obj}.Get(${args[0]})`,
+  getOrInsert: (obj: string, args: string[]) => `${obj}.GetOrInsert(${args[0]}, ${args[1]})`,
   // (the callback as a func(K) V, whatever arity it was written with)
-  getOrInsertComputed: (obj, args) => {
+  getOrInsertComputed: (obj: string, args: string[]) => {
     const keyType = currentReceiverGoType ? extractMapKeyType(currentReceiverGoType) : 'interface{}';
     const valueType = currentReceiverGoType ? extractMapValueType(currentReceiverGoType) : 'interface{}';
     const cbNode = currentCallArgNodes[1];
@@ -20504,34 +20506,34 @@ const mapMethodHandlers: Record<string, MethodHandler> = {
     }
     return `${obj}.GetOrInsertComputed(${args[0]}, func(__k ${keyType}) ${valueType} { return ${value} })`;
   },
-  has: (obj, args) => `${obj}.Has(${args[0]})`,
-  delete: (obj, args) => `${obj}.Delete(${args[0]})`,
-  clear: (obj) => `${obj}.Clear()`,
-  keys: (obj) => `${obj}.Keys()`,
+  has: (obj: string, args: string[]) => `${obj}.Has(${args[0]})`,
+  delete: (obj: string, args: string[]) => `${obj}.Delete(${args[0]})`,
+  clear: (obj: string) => `${obj}.Clear()`,
+  keys: (obj: string) => `${obj}.Keys()`,
   // (arrays held by reference: their elements, as JS iterates the arrays)
-  values: (obj) => {
+  values: (obj: string) => {
     if (currentReceiverGoType && extractMapValueType(currentReceiverGoType).startsWith('*[]')) {
       useHelper('dynamic');
       return `TnDerefSlices(${obj}.Values())`;
     }
     return `${obj}.Values()`;
   },
-  entries: (obj) => `${obj}.Entries()`
+  entries: (obj: string) => `${obj}.Entries()`
 };
 
 const setMethodHandlers: Record<string, MethodHandler> = {
-  add: (obj, args) => `${obj}.Set(${args[0]}, struct{}{})`,
-  has: (obj, args) => `${obj}.Has(${args[0]})`,
-  delete: (obj, args) => `${obj}.Delete(${args[0]})`,
-  clear: (obj) => `${obj}.Clear()`,
-  values: (obj) => `${obj}.Keys()`,
-  union: (obj, args) => `${obj}.Union(${args[0]})`,
-  intersection: (obj, args) => `${obj}.Intersection(${args[0]})`,
-  difference: (obj, args) => `${obj}.Difference(${args[0]})`,
-  symmetricDifference: (obj, args) => `${obj}.SymmetricDifference(${args[0]})`,
-  isSubsetOf: (obj, args) => `${obj}.IsSubsetOf(${args[0]})`,
-  isSupersetOf: (obj, args) => `${args[0]}.IsSubsetOf(${obj})`,
-  isDisjointFrom: (obj, args) => `(${obj}.Intersection(${args[0]}).Len() == 0)`
+  add: (obj: string, args: string[]) => `${obj}.Set(${args[0]}, struct{}{})`,
+  has: (obj: string, args: string[]) => `${obj}.Has(${args[0]})`,
+  delete: (obj: string, args: string[]) => `${obj}.Delete(${args[0]})`,
+  clear: (obj: string) => `${obj}.Clear()`,
+  values: (obj: string) => `${obj}.Keys()`,
+  union: (obj: string, args: string[]) => `${obj}.Union(${args[0]})`,
+  intersection: (obj: string, args: string[]) => `${obj}.Intersection(${args[0]})`,
+  difference: (obj: string, args: string[]) => `${obj}.Difference(${args[0]})`,
+  symmetricDifference: (obj: string, args: string[]) => `${obj}.SymmetricDifference(${args[0]})`,
+  isSubsetOf: (obj: string, args: string[]) => `${obj}.IsSubsetOf(${args[0]})`,
+  isSupersetOf: (obj: string, args: string[]) => `${args[0]}.IsSubsetOf(${obj})`,
+  isDisjointFrom: (obj: string, args: string[]) => `(${obj}.Intersection(${args[0]}).Len() == 0)`
 };
 
 // A table entry only when the table itself has it (not Object.prototype's valueOf …)
@@ -20542,7 +20544,7 @@ function ownMethodHandler(table: Record<string, MethodHandler>, key: string): Me
 function getDynamicCallHandler(caller: string, objectType?: string): CallHandler | null {
   if (promiseResolveName && caller === promiseResolveName) {
     // The first resolution wins; later ones are ignored (as in JS)
-    return (_caller, args) => {
+    return (_caller: string, args: string[], _typeArgs: string) => {
       // resolve() without a value: the channel type's zero value
       if (args.length === 0 || args[0] === 'nil') {
         useHelper('promise');
@@ -20552,7 +20554,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     };
   }
   if (promiseRejectName && caller === promiseRejectName) {
-    return (_caller, args) => {
+    return (_caller: string, args: string[], _typeArgs: string) => {
       useHelper('promise');
       return `TnReject(ch, ${args[0] ?? 'nil'})`;
     };
@@ -20567,7 +20569,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     const receiverClassName = classNameOfGoType(currentReceiverGoType ?? '');
     if (receiverClassName && findClassMethod(receiverClassName, methodName)) return null;
     if (methodName === 'toString') {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         const obj = c.substring(0, dotIndex);
         if (currentReceiverGoType === 'time.Time') {
           useHelper('date');
@@ -20593,13 +20595,13 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     }
 
     if (methodName === 'toExponential') {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         useHelper('builtins');
         return `TnToExponential(${c.substring(0, dotIndex)}, ${args[0] ?? '0'}, ${args.length > 0})`;
       };
     }
     if (methodName === 'toPrecision') {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         importedPackages.add('strconv');
         return `strconv.FormatFloat(${c.substring(0, dotIndex)}, 'g', int(${args[0] ?? '-1'}), 64)`;
       };
@@ -20607,7 +20609,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     // number.toLocaleString(locales, options): the Intl number formatting
     // (the default locale follows the OS, as Node's do)
     if (methodName === 'toLocaleString' && (currentReceiverGoType === 'float64' || ((objectType === 'number' || objectType === 'float64') && currentReceiverGoType !== 'time.Time'))) {
-      return (c) => {
+      return (c: string, _args: string[], _typeArgs: string) => {
         useHelper('intlNumber');
         const locales = currentCallArgNodes[0] ? toGoValueOfType(currentCallArgNodes[0], 'interface{}') : 'nil';
         const options = currentCallArgNodes[1] ? toGoValueOfType(currentCallArgNodes[1], 'interface{}') : 'nil';
@@ -20616,7 +20618,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     }
     // bigint.toLocaleString(locales, options)
     if (methodName === 'toLocaleString' && currentReceiverGoType === '*tnbig.Int') {
-      return (c) => {
+      return (c: string, _args: string[], _typeArgs: string) => {
         useHelper('intlNumber');
         const locales = currentCallArgNodes[0] ? toGoValueOfType(currentCallArgNodes[0], 'interface{}') : 'nil';
         const options = currentCallArgNodes[1] ? toGoValueOfType(currentCallArgNodes[1], 'interface{}') : 'nil';
@@ -20625,7 +20627,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     }
     // number.toFixed(digits)
     if (methodName === 'toFixed') {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         useHelper('toFixed');
         return `TnToFixed(${c.substring(0, dotIndex)}, ${args[0] ?? '0'})`;
       };
@@ -20644,13 +20646,13 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
       const elementType = currentReceiverGoType.slice(5);
       const callbackNode = currentCallArgNodes[0];
       const extraArgs = currentCallArgNodes.slice(1);
-      return (c, args) => visitIteratorHelper(c.substring(0, dotIndex), helperName, elementType, args, callbackNode, extraArgs);
+      return (c: string, args: string[], _typeArgs: string) => visitIteratorHelper(c.substring(0, dotIndex), helperName, elementType, args, callbackNode, extraArgs);
     }
     if (currentReceiverGoType?.startsWith('*TnWeakRef[') && methodName === 'deref') {
-      return (c) => `${c.substring(0, dotIndex)}.deref()`;
+      return (c: string, _args: string[], _typeArgs: string) => `${c.substring(0, dotIndex)}.deref()`;
     }
     if (currentReceiverGoType === '*TnFinalizationRegistry' && (methodName === 'register' || methodName === 'unregister')) {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         const obj = c.substring(0, dotIndex);
         if (methodName === 'unregister') return `${obj}.unregister(${args[0]})`;
         return `TnRegistryRegister(${obj}, ${args[0]}, ${args[1] ?? 'nil'}, ${args[2] ?? 'nil'})`;
@@ -20663,7 +20665,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
       const isSet = extractMapValueType(currentReceiverGoType) === 'struct{}';
       handler = ownMethodHandler(isSet ? setMethodHandlers : mapMethodHandlers, methodName);
       if (handler) {
-        return (c, args) => {
+        return (c: string, args: string[], _typeArgs: string) => {
           const obj = c.substring(0, dotIndex);
           return handler!(obj, args);
         };
@@ -20690,7 +20692,7 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     }
 
     if (handler) {
-      return (c, args) => {
+      return (c: string, args: string[], _typeArgs: string) => {
         const obj = c.substring(0, dotIndex);
         return handler!(obj, args);
       };
@@ -30595,6 +30597,13 @@ func TnIncludes(v interface{}, x interface{}, from ...float64) bool {
 
 // x.indexOf(y, from?) of an any value (a string or an array)
 func TnIndexOf(v interface{}, x interface{}, from ...float64) float64 {
+	// (a dynamic array from a parsed AST or JSON: stored as a reference)
+	if p, ok := v.(*[]interface{}); ok {
+		if p == nil {
+			return -1
+		}
+		v = *p
+	}
 	start := 0
 	if len(from) > 0 && from[0] > 0 {
 		start = int(from[0])
@@ -30632,6 +30641,13 @@ var tnCharBoxes = func() (t [128]interface{}) {
 }()
 
 func TnSlice(v interface{}, bounds ...float64) interface{} {
+	// (a dynamic array from a parsed AST or JSON: stored as a reference)
+	if p, ok := v.(*[]interface{}); ok {
+		if p == nil {
+			return nil
+		}
+		v = *p
+	}
 	length := 0
 	switch t := v.(type) {
 	case string:

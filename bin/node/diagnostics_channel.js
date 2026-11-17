@@ -515,7 +515,11 @@ export function registerDiagnosticsChannel(r) {
         const parsed = Number(posText);
         if (posText !== '' && !Number.isNaN(parsed))
             position = parsed < 0 ? extra.length + parsed : parsed;
-        const wrapped = extra.map((a, i) => (i === position ? `TnTraceWrapCallback(${c.recv}, tnTraceCtx, ${a})` : a));
+        const wrapped = [];
+        for (let i = 0; i < extra.length; i++) {
+            const a = extra[i];
+            wrapped.push(i === position ? `TnTraceWrapCallback(${c.recv}, tnTraceCtx, ${a})` : a);
+        }
         const result = goFuncResult(fnType);
         const call = `(${c.args[0]})(${wrapped.join(', ')})`;
         if (result)

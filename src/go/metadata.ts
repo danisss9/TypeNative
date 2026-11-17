@@ -123,7 +123,7 @@ function parseParams(s: string): GoParam[] {
 
 function parseResults(s: string): string[] {
   if (!s) return [];
-  return splitTop(s).map((r) => unesc(r));
+  return splitTop(s).map((r: string) => unesc(r));
 }
 
 // The metadata of one Go package, parsed on demand and cached.
