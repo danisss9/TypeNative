@@ -226,25 +226,21 @@ async function worker() {
   }
 }
 
-// Build one sqlite probe alone first: the vendored driver is ~5 MB of Go, and
-// with a cold cache every sqlite probe would compile it at once (timing out
-// on small runners); afterwards the rest reuse the cached build
-const warm = jobs.find((j) => j.name.includes('sqlite'));
-if (warm) {
-  jobs.splice(jobs.indexOf(warm), 1);
-  jobs.unshift(warm);
-  idx = 1;
-  await runCounted(warm);
-}
-// The largest example (the React Compiler: ~450 transpiled modules) also runs
-// alone before the pack, so its build gets full cores instead of contending
-// with N-1 other jobs
-const heavy = jobs.find((j) => j.name === 'example-react-compiler');
-if (heavy) {
-  jobs.splice(jobs.indexOf(heavy), 1);
-  jobs.splice(idx, 0, heavy);
-  await runCounted(heavy);
-  idx++;
+// Build one sqlite probe and one intl probe alone first (both pull in large
+// vendored Go packages — sqlite and golang.org/x/text — that with a cold cache
+// would be compiled by many workers at once, timing out on small runners), and
+// run the largest example (React Compiler: ~450 transpiled modules) alone too so
+// its build gets full cores instead of contending with N-1 other jobs
+const soloRan = new Set();
+for (const pattern of ['sqlite', 'intl', 'example-react-compiler']) {
+  const j = jobs.find((job) => (pattern.startsWith('example-') ? job.name === pattern : job.name.includes(pattern)));
+  if (j) {
+    jobs.splice(jobs.indexOf(j), 1);
+    jobs.splice(idx, 0, j);
+    soloRan.add(j.name);
+    await runCounted(j);
+    idx++;
+  }
 }
 await Promise.all(Array.from({ length: N }, worker));
 console.log('');
@@ -253,7 +249,6 @@ console.log('');
 // can trip over a file another build holds, which says nothing about the
 // probe. One that passes alone is reported as flaky with its first failure,
 // so a real intermittent bug stays visible; one that fails again counts
-const soloRan = new Set([warm?.name, heavy?.name].filter(Boolean));
 const flaky = [];
 for (const f of [...failures]) {
   if (soloRan.has(f.name)) continue;

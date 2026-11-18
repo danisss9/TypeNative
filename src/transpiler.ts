@@ -6487,7 +6487,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             const loop = `for _, __yv := range ${source} {\n\t\t\tTnGenYield[${yieldType}](${asyncChannelVar}, ${value})\n\t\t}`;
             return isExpressionStatement(node.parent) ? `func() {\n\t\t${loop}\n\t}()` : `func() interface{} {\n\t\t${loop}\n\t\treturn nil\n\t}()`;
           }
-          return `for _, __yv := range ${source} {\n\t\t\t${asyncChannelVar} <- ${value}\n\t\t}`;
+          useHelper('eventLoop');
+          return `for _, __yv := range ${source} {\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${value})\n\t\t}`;
         }
         if (!isAsyncGen) {
           useHelper('generatorStep');
@@ -6504,8 +6505,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           }
           return call;
         }
+        useHelper('eventLoop');
         const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
-        return `for __yv := range ${visit(node.expression)} {\n\t\t\t${asyncChannelVar} <- ${forwarded}\n\t\t}`;
+        return `for {\n\t\t\t__yv, __ok := tnRawReceive(${visit(node.expression)})\n\t\t\tif !__ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${forwarded})\n\t\t}`;
       }
       const yielded = node.expression
         ? toGoValueOfType(node.expression, yieldType)
@@ -6521,7 +6523,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
         return call;
       }
-      return `${asyncChannelVar} <- ${yielded}`;
+      useHelper('eventLoop');
+      return `TnAsyncYield(${asyncChannelVar}, ${yielded})`;
     }
     return '';
   } else if (isAwaitExpression(node)) {
@@ -10542,7 +10545,8 @@ function widenToInterfaceParams(className: string, member: AstNode, signature: s
 
 function emitGeneratorGoroutineBody(chanType: string, channelVar: string, prologue: string, body: string, isAsyncGen: boolean): string {
   if (isAsyncGen) {
-    return `${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}`;
+    useHelper('eventLoop');
+    return `${prologue}${channelVar} := make(chan ${chanType})\n\tTnStartAsync(func() {\n\t\tdefer close(${channelVar})\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}`;
   }
   useHelper('generatorStep');
   return `${prologue}${channelVar} := make(chan ${chanType})\n\t__ctrl := TnGenStart(${channelVar})\n\tgo func() {\n\t\tdefer close(${channelVar})\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\tif ret, ok := r.(tnGenReturn); ok {\n\t\t\t\t\t__ctrl.finishReturn(ret.val)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\t__ctrl.finishError(r)\n\t\t\t} else {\n\t\t\t\t__ctrl.finishDone()\n\t\t\t}\n\t\t}()\n\t\tif !__ctrl.awaitStart() {\n\t\t\treturn\n\t\t}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}`;
@@ -13049,7 +13053,12 @@ function getRecordFunctionCall(node: AstNode): { receiver: AstNode; mapType: str
 function visitRecordFunctionCall(node: AstNode): string | undefined {
   const call = getRecordFunctionCall(node);
   if (!call) return undefined;
-  const args = (node.arguments ?? []).map((a: AstNode) => visit(a)).join(', ');
+  // (arguments as the function type's parameters: an array by its reference)
+  const fnType = extractMapValueType(call.mapType);
+  const paramTypes = goFuncParamTypes(fnType);
+  const argNodes: AstNode[] = node.arguments ?? [];
+  const typed = !paramTypes.some((t) => t.startsWith('...')) && !argNodes.some((a) => isSpreadElement(a)) && argNodes.length <= paramTypes.length;
+  const args = argNodes.map((a: AstNode, i: number) => (typed ? toGoValueOfType(a, paramTypes[i]) : visit(a))).join(', ');
   return `${visit(call.receiver)}.Get(${toGoStringLiteral(node.expression.name.text)})(${args})`;
 }
 
@@ -18912,14 +18921,11 @@ function getType(typeNode: AstNode, getArrayType = false): string {
   }
   if (isFunctionTypeNode(typeNode)) {
     // (...args: T[]) => R is variadic: func(...T) R
-    // (parameters as declarations emit them — optional ones nullable pointers —
-    // except that a function type's arrays are plain slices: function literals
-    // stored in the slot take them that way, see functionSlotParamType)
+    // (parameters as declarations emit them — optional ones nullable pointers,
+    // arrays as references)
     const params = (typeNode.parameters ?? [])
       .map((p) => {
-        let paramType = p.type ? getParameterGoType({ ...p, parent: typeNode }) : 'interface{}';
-        // (a method signature's are its Go method's: references)
-        if (paramType.startsWith('*[]') && !isMethodSignature(typeNode.parent)) paramType = paramType.slice(1);
+        const paramType = p.type ? getParameterGoType({ ...p, parent: typeNode }) : 'interface{}';
         if (p.dotDotDotToken && paramType.startsWith('[]')) return `...${paramType.slice(2)}`;
         return paramType;
       })
@@ -22835,8 +22841,8 @@ function getParameterGoType(param: AstNode): string {
         isTypeReferenceNode(param.type) &&
         isIdentifier(param.type.typeName) &&
         param.type.typeName.text === 'TemplateStringsArray';
-      // (a function literal stored where a function type is expected takes
-      // that type's parameter: a function type's arrays are plain slices)
+      // (a function literal stored where a plain-slice function type is expected
+      // — e.g. a Go-bridge callback — takes that type's parameter)
       const slotType = isArrowFunction(param.parent) || isFunctionExpression(param.parent) ? functionSlotParamType(param) : undefined;
       if (!isUnboundGoType(explicitType.slice(2)) && !isTaggedTemplateArray && slotType !== explicitType) {
         explicitType = `*${explicitType}`;
@@ -22879,8 +22885,8 @@ function getParameterGoType(param: AstNode): string {
     const contextualParam = contextualFn.parameters?.[index];
     const contextualParamType = contextualParam?.type;
     if (contextualParamType) {
-      const contextualGoType = getType(contextualParamType);
-      return contextualParam.questionToken ? makeNullableType(contextualGoType) : contextualGoType;
+      // (as the function type emits it: arrays as references)
+      return functionTypeParamGoType(contextualParam, contextualFn);
     }
   }
   // f = (x) => …, where f holds a function: the parameter of f's Go type
@@ -22900,6 +22906,18 @@ function getParameterGoType(param: AstNode): string {
   }
 
   return 'interface{}';
+}
+
+// The Go type of a function type's parameter, as the function type emits it:
+// arrays are references (*[]T), so a function value called through the slot
+// shares the caller's array — a push in it reaches the caller (JS passes the
+// array itself)
+function functionTypeParamGoType(param: AstNode, fnType: AstNode): string {
+  if (param.dotDotDotToken) {
+    const restType = getType(param.type);
+    return param.questionToken ? makeNullableType(restType) : restType;
+  }
+  return getParameterGoType({ ...param, parent: fnType });
 }
 
 function adaptReferenceParams(expr: AstNode, goType: string): string | undefined {
@@ -22929,7 +22947,8 @@ function functionSlotParamType(param: AstNode): string | undefined {
   const index = (fn?.parameters ?? []).indexOf(param);
   const contextualFn = getContextualFunctionType(fn);
   const contextualParam = contextualFn?.parameters?.[index];
-  if (contextualParam?.type) return getType(contextualParam.type);
+  // (as the function type emits it: arrays as references)
+  if (contextualParam?.type) return functionTypeParamGoType(contextualParam, contextualFn);
   const slot = fn?.parent && isBinaryExpression(fn.parent) && fn.parent.operatorToken.kind === 'EqualsToken' && fn.parent.right === fn
     ? inferExpressionType(fn.parent.left)
     : undefined;
@@ -23628,7 +23647,7 @@ function visitCallArguments(node: AstNode): string[] {
   if (!fn) {
     // A function-valued variable or field without a declared type
     // (const f = (xs: number[]) => …): its Go func type's parameters
-    const calleeType = isIdentifier(node.expression) || isPropertyAccessExpression(node.expression) || isCallExpression(node.expression) || isParenthesizedExpression(node.expression)
+    const calleeType = isIdentifier(node.expression) || isPropertyAccessExpression(node.expression) || isElementAccessExpression(node.expression) || isCallExpression(node.expression) || isParenthesizedExpression(node.expression)
       ? inferExpressionType(node.expression)
       : undefined;
     // (a variadic function value: its rest arguments converted to the element type)
@@ -23863,7 +23882,7 @@ function withContextualParameters(
   if (contextualParams.length <= declaredCount || info.signature.includes('...')) return info;
   const extra = contextualParams
     .slice(declaredCount)
-    .map((p) => `_ ${p.dotDotDotToken ? '...' : ''}${p.type ? (p.questionToken && !p.dotDotDotToken ? makeNullableType(getType(p.type)) : getType(p.type)) : 'interface{}'}`);
+    .map((p) => `_ ${p.type ? getParameterGoType({ ...p, parent: contextualFn }) : (p.dotDotDotToken ? '...interface{}' : 'interface{}')}`);
   const signature = [info.signature, ...extra].filter((part) => part).join(', ');
   return { ...info, signature };
 }
@@ -37988,6 +38007,19 @@ func TnStartAsync(body func()) {
 	}()
 	<-yielded
 	tnAsyncCtx = ctx
+}
+
+// Yields from an async generator: releases the JS baton if the consumer isn't
+// waiting yet so the event loop can run while the send blocks
+func TnAsyncYield[T any](ch chan T, v T) {
+	select {
+	case ch <- v:
+		return
+	default:
+	}
+	tnRelease()
+	ch <- v
+	tnAcquire()
 }
 
 func tnLoopNotify() {
