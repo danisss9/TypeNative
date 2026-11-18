@@ -25868,6 +25868,9 @@ function instanceMethodNames(cls) {
         .filter((n) => !!n);
 }
 function collectMixins() {
+    mixinBaseOf.clear();
+    mixinVirtualMethods.clear();
+    mixinBaseCtorSignatures.clear();
     for (const [name, declaration] of declaredClasses) {
         if (!declaration.tnMixin)
             continue;

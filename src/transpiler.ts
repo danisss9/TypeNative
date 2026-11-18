@@ -24641,6 +24641,9 @@ function instanceMethodNames(cls: AstNode): string[] {
 }
 
 function collectMixins(): void {
+  mixinBaseOf.clear();
+  mixinVirtualMethods.clear();
+  mixinBaseCtorSignatures.clear();
   for (const [name, declaration] of declaredClasses) {
     if (!declaration.tnMixin) continue;
     const base = classParentNames.get(name);

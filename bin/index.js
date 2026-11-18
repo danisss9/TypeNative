@@ -176,9 +176,14 @@ function hostTarget() {
     const lines = (result.stdout ?? '').trim().split('\n');
     return lines.length === 2 ? `${lines[0].trim()}/${lines[1].trim()}` : '';
 }
+const goCheckCache = new Map();
 // Checks the Go toolchain on the PATH (and a --target against the pairs it
 // supports); returns an error message, '' when usable
 export function checkGo(target) {
+    const cacheKey = target ?? '';
+    const cached = goCheckCache.get(cacheKey);
+    if (cached !== undefined)
+        return cached;
     const version = runCommand('go', ['version']);
     const found = (version.stdout ?? '').match(/go(\d+)\.(\d+)/);
     if (version.status !== 0 || !found) {
@@ -196,6 +201,7 @@ export function checkGo(target) {
             return `Go can't build for '${target}' ('go tool dist list' shows the os/arch pairs it supports)`;
         }
     }
+    goCheckCache.set(cacheKey, '');
     return '';
 }
 // A source path as diagnostics and Go line directives show it: relative to

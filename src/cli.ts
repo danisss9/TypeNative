@@ -3,14 +3,17 @@
 // Node CLI entry point (npm `bin`). Interactive prompts use inquirer here;
 // the actual compiler logic lives in the transpilable src/index.ts.
 
-import inquirer from 'inquirer';
+import module from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { run, createProject, parseCliArgs, usage } from './index.js';
-import { parseAstJson } from './parse-node.js';
-import { typeCheckNode } from './typecheck-node.js';
-import { VERSION } from './version.js';
+
+// V8's on-disk code cache for the compiler's modules (the transpiler and the
+// typescript package are megabytes of JS): later runs skip compiling them.
+// Enabled before they load, so they're imported dynamically below.
+module.enableCompileCache?.();
 
 (async function main() {
+  const { run, createProject, parseCliArgs, usage } = await import('./index.js');
+  const { VERSION } = await import('./version.js');
   const args = parseCliArgs(process.argv.slice(2));
   if (args.error) {
     console.error(`error: ${args.error}\nRun 'typenative --help' for the options.`);
@@ -29,7 +32,7 @@ import { VERSION } from './version.js';
   const source = args.source;
   const output = args.output;
 
-  const answers = await inquirer.prompt([
+  const questions = [
     {
       type: 'input',
       name: 'projectName',
@@ -64,7 +67,12 @@ import { VERSION } from './version.js';
       when: !newCommand && scriptMode && !source,
       default: `console.log('Hello, World!');`
     }
-  ]);
+  ];
+  // inquirer (~70 modules) loads only when a question will be asked: a fully
+  // flagged run (scripts, the conformance runner) skips its startup cost
+  const answers: Record<string, any> = questions.some((q) => q.when)
+    ? await (await import('inquirer')).default.prompt(questions as any)
+    : {};
 
   if (newCommand) {
     createProject(answers.projectName.trim(), answers.installDependencies);
@@ -73,6 +81,8 @@ import { VERSION } from './version.js';
 
   const sourcePath: string | null = answers.tsCode ? null : (source ?? answers.path ?? null);
 
+  const { parseAstJson } = await import('./parse-node.js');
+  const { typeCheckNode } = await import('./typecheck-node.js');
   const typesDir = fileURLToPath(new URL('../types', import.meta.url));
   run({
     source: sourcePath,

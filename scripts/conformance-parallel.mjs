@@ -2,7 +2,7 @@
 // (the CLI writes dist/ relative to cwd) so Go builds don't clash.
 // Each examples/<name>/main.ts is also built (not run) as `example-<name>`.
 // Usage: node scripts/conformance-parallel.mjs [--native] [filter]
-import { spawn, spawnSync } from 'node:child_process';
+import { fork, spawn, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -41,19 +41,23 @@ const examples = readdirSync(path.join(root, 'examples'), { withFileTypes: true 
   .sort();
 const exe = process.platform === 'win32' ? 'example.exe' : 'example';
 
+// Examples first (longest-job-first) so multi-second builds overlap with the
+// shorter probes instead of leaving a long tail at the end of the run.
 const jobs = [
+  ...examples.map((name) => ({
+    name,
+    build: true,
+    args: ['--source', path.join(root, 'examples', name.slice('example-'.length), 'main.ts'), '--output', exe]
+  })),
   ...probes.map((file) => ({
     name: file.replace(/\.tsx?$/, ''),
     args: ['--source', path.join(root, 'conformance', file), '--script', ...probeFlags(file)]
-  })),
-  ...examples.map((name) => ({
-    name,
-    args: ['--source', path.join(root, 'examples', name.slice('example-'.length), 'main.ts'), '--output', exe]
   }))
 ];
 
-// Each probe is a Go build; two per core keeps them busy while others type-check or run
-const N = Math.min(8, Math.max(2, os.availableParallelism() * 2));
+// One worker per logical core (min 4 for 2-core CI runners, max 16); overridable via CONFORMANCE_JOBS
+const N = Number(process.env.CONFORMANCE_JOBS) || Math.min(16, Math.max(4, os.availableParallelism()));
+const runStarted = Date.now();
 let idx = 0;
 let done = 0;
 const failures = [];
@@ -71,7 +75,35 @@ function killTree(p) {
   } catch { /* the group is already gone */ }
 }
 
-function runOne({ name, args: jobArgs }) {
+function formatFailure(code, timedOut, budget, started, out) {
+  if (code === 0 && !timedOut) return null;
+  const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
+  // The first recognizable error, else the last thing the probe printed
+  // (a `go build failed:` toolchain error, a log line): a bare exit code
+  // says nothing about where it stopped
+  const at = lines.findIndex((l) => /\.go:\d+|panic:|Unsupported syntax|Error|error TS\d+|assert|go build failed/.test(l));
+  // A go build failure prints '# command-line-arguments' and an empty
+  // line before the first error, so take a few lines: the reason alone
+  // would name nothing that failed to compile
+  const line =
+    at < 0
+      ? lines.slice(-2).join(' | ')
+      : lines[at] === 'go build failed:'
+        ? lines.slice(at, at + 4).join(' ')
+        : lines[at];
+  // taskkill /f exits the tree with 1, so a timeout on Windows otherwise
+  // reads as a plain failure
+  const status = timedOut ? `timed out after ${budget / 1000}s` : `exit ${code} after ${Math.round((Date.now() - started) / 1000)}s`;
+  return `${status}${line ? `: ${line}` : ''}`.slice(0, 240);
+}
+
+function removeTempDir(dir) {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch { /* Windows may briefly lock native.exe; leave tmp dir */ }
+}
+
+function runOneSpawn({ name, args: jobArgs }) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'conf-'));
   return new Promise((resolve) => {
     const [command, ...args] = compiler;
@@ -89,7 +121,6 @@ function runOne({ name, args: jobArgs }) {
     const budget = name.startsWith('example-') ? 600000 : 90000;
     const started = Date.now();
     let timedOut = false;
-    let reason = null;
     const t = setTimeout(() => {
       timedOut = true;
       killTree(p);
@@ -98,46 +129,100 @@ function runOne({ name, args: jobArgs }) {
       clearTimeout(t);
       // Anything the probe left running in its group goes too
       if (process.platform !== 'win32') killTree(p);
-      if (code !== 0 || timedOut) {
-        const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
-        // The first recognizable error, else the last thing the probe printed
-        // (a `go build failed:` toolchain error, a log line): a bare exit code
-        // says nothing about where it stopped
-        const at = lines.findIndex((l) => /\.go:\d+|panic:|Unsupported syntax|Error|error TS\d+|assert|go build failed/.test(l));
-        // A go build failure prints '# command-line-arguments' and an empty
-        // line before the first error, so take a few lines: the reason alone
-        // would name nothing that failed to compile
-        const line =
-          at < 0
-            ? lines.slice(-2).join(' | ')
-            : lines[at] === 'go build failed:'
-              ? lines.slice(at, at + 4).join(' ')
-              : lines[at];
-        // taskkill /f exits the tree with 1, so a timeout on Windows otherwise
-        // reads as a plain failure
-        const status = timedOut ? `timed out after ${budget / 1000}s` : `exit ${code} after ${Math.round((Date.now() - started) / 1000)}s`;
-        reason = `${status}${line ? `: ${line}` : ''}`.slice(0, 240);
-      }
-      try {
-        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-      } catch { /* Windows may briefly lock native.exe; leave tmp dir */ }
+      const reason = formatFailure(code, timedOut, budget, started, out);
+      removeTempDir(dir);
       resolve(reason);
     });
   });
 }
 
+// Persistent Node workers for !native: keeps V8, TypeScript, and parsed .d.ts
+// files warm across probes instead of paying cold-start on every probe.
+const workerPath = path.join(import.meta.dirname, 'conformance-worker.mjs');
+const activeWorkers = new Set();
+let nextJobId = 1;
+
+function spawnPoolWorker() {
+  const w = fork(workerPath, [], {
+    cwd: root,
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    detached: process.platform !== 'win32'
+  });
+  activeWorkers.add(w);
+  w.on('exit', () => activeWorkers.delete(w));
+  return w;
+}
+
+function runOnWorker(poolState, job) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'conf-'));
+  return new Promise((resolve) => {
+    if (!poolState.proc || !poolState.proc.connected) poolState.proc = spawnPoolWorker();
+    const w = poolState.proc;
+    const id = nextJobId++;
+    const budget = job.name.startsWith('example-') ? 600000 : 90000;
+    const started = Date.now();
+    let timedOut = false;
+    let settled = false;
+
+    const finish = (code, out) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      w.off('message', onMsg);
+      w.off('exit', onExit);
+      const reason = formatFailure(code, timedOut, budget, started, out);
+      removeTempDir(dir);
+      resolve(reason);
+    };
+
+    const onMsg = (msg) => {
+      if (msg && msg.id === id) finish(msg.code, msg.out ?? '');
+    };
+    const onExit = (code) => {
+      poolState.proc = null;
+      finish(code ?? 1, '');
+    };
+
+    const t = setTimeout(() => {
+      timedOut = true;
+      poolState.proc = null;
+      killTree(w);
+      finish(1, '');
+    }, budget);
+
+    w.on('message', onMsg);
+    w.on('exit', onExit);
+    w.send({ id, args: job.args, dir, build: !!job.build });
+  });
+}
+
+const soloPoolState = { proc: null };
+function runOne(job, poolState = soloPoolState) {
+  return native ? runOneSpawn(job) : runOnWorker(poolState, job);
+}
+
+// Wall time per job, for the slowest-jobs summary
+const durations = new Map();
+
 // A probe run in the pack; its failure (a reason) or null
-async function runCounted(job) {
-  const reason = await runOne(job);
+async function runCounted(job, poolState = soloPoolState) {
+  const started = Date.now();
+  const reason = await runOne(job, poolState);
+  durations.set(job.name, Date.now() - started);
   if (reason !== null) failures.push({ name: job.name, reason });
   done++;
   if (done % 10 === 0 || done === jobs.length) process.stdout.write(`\r${done}/${jobs.length}`);
 }
 
 async function worker() {
+  const poolState = { proc: null };
   while (idx < jobs.length) {
     const job = jobs[idx++];
-    await runCounted(job);
+    await runCounted(job, poolState);
+  }
+  if (poolState.proc) {
+    poolState.proc.kill();
+    poolState.proc = null;
   }
 }
 
@@ -178,6 +263,10 @@ for (const f of [...failures]) {
     f.reason = `${f.reason}; alone: ${retry}`.slice(0, 400);
   }
 }
+if (soloPoolState.proc) {
+  soloPoolState.proc.kill();
+  soloPoolState.proc = null;
+}
 failures.sort((a, b) => (a.name < b.name ? -1 : 1));
 flaky.sort((a, b) => (a.name < b.name ? -1 : 1));
 for (const f of flaky) console.log(`  ⚠ ${f.name} passed alone after failing in the pack: ${f.reason}`);
@@ -203,5 +292,8 @@ for (const [c, s] of cats) {
   console.log(`  ${c.padEnd(10)} ${s.passed}/${s.total} (${Math.round((s.passed / s.total) * 100)}%)`);
 }
 console.log(`  ${'total'.padEnd(10)} ${tot}/${jobs.length} (${Math.round((tot / jobs.length) * 100)}%)`);
+// Where the time went: the slowest jobs usually bound the run
+const slowest = [...durations].sort((a, b) => b[1] - a[1]).slice(0, 8);
+console.log(`  ${(runStarted ? Math.round((Date.now() - runStarted) / 1000) : 0)}s total; slowest: ${slowest.map(([n, ms]) => `${n} ${(ms / 1000).toFixed(1)}s`).join(', ')}`);
 if (skipped.length > 0) console.log(`  skipped on ${process.platform}: ${skipped.join(', ')}`);
 if (tot < jobs.length) process.exit(1);

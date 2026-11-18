@@ -9,31 +9,31 @@ import path from 'node:path';
 const TYPENATIVE_TYPES = ['typenative.d.ts', 'typenative-go.d.ts', 'typenative-npm.d.ts'];
 // TS18003: "No inputs were found in config file" (only the entry is checked)
 const NO_INPUTS_FOUND = 18003;
-// Type-checks entry with the nearest tsconfig.json's options (or TypeNative's
-// defaults, typed by typesDir). The program's roots are the entry plus the
-// config's .d.ts files, so other entry points in the same project don't
-// redeclare each other's globals.
-export function typeCheckNode(entry, typesDir) {
-    const entryPath = path.resolve(entry);
-    const roots = [entryPath];
-    const out = [];
+const contextCache = new Map();
+function getContext(entryDir, typesDir) {
+    const configPath = ts.findConfigFile(entryDir, ts.sys.fileExists);
+    const key = configPath ?? `default:${typesDir}`;
+    const cached = contextCache.get(key);
+    if (cached)
+        return { ctx: cached, errors: [...cached.configErrors] };
+    const configErrors = [];
+    const dtsRoots = [];
     let options;
-    const configPath = ts.findConfigFile(path.dirname(entryPath), ts.sys.fileExists);
     if (configPath) {
         const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, {
             ...ts.sys,
-            onUnRecoverableConfigFileDiagnostic: (d) => out.push(toDiagnostic(d))
+            onUnRecoverableConfigFileDiagnostic: (d) => configErrors.push(toDiagnostic(d))
         });
         if (!parsed)
-            return out;
+            return { ctx: null, errors: configErrors };
         for (const d of parsed.errors) {
             if (d.code !== NO_INPUTS_FOUND)
-                out.push(toDiagnostic(d));
+                configErrors.push(toDiagnostic(d));
         }
-        options = parsed.options;
+        options = { ...parsed.options, noEmit: true };
         for (const name of parsed.fileNames) {
             if (name.endsWith('.d.ts'))
-                roots.push(name);
+                dtsRoots.push(name);
         }
     }
     else {
@@ -50,12 +50,44 @@ export function typeCheckNode(entry, typesDir) {
             allowImportingTsExtensions: true,
             resolveJsonModule: true,
             jsx: ts.JsxEmit.Preserve,
-            skipLibCheck: true
+            skipLibCheck: true,
+            noEmit: true
         };
         for (const name of TYPENATIVE_TYPES)
-            roots.push(path.join(typesDir, name));
+            dtsRoots.push(path.join(typesDir, name));
     }
-    const program = ts.createProgram(roots, { ...options, noEmit: true });
+    // Reuse parsed .d.ts SourceFiles across checks in the same process (e.g.
+    // worker pools) so types/*.d.ts (~900 KB) isn't re-parsed for every probe.
+    const host = ts.createCompilerHost(options);
+    const sfCache = new Map();
+    const origGetSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion, ...rest) => {
+        if (fileName.endsWith('.d.ts')) {
+            let sf = sfCache.get(fileName);
+            if (!sf) {
+                sf = origGetSourceFile(fileName, languageVersion, ...rest);
+                if (sf)
+                    sfCache.set(fileName, sf);
+            }
+            return sf;
+        }
+        return origGetSourceFile(fileName, languageVersion, ...rest);
+    };
+    const ctx = { options, dtsRoots, configErrors, host };
+    contextCache.set(key, ctx);
+    return { ctx, errors: [...configErrors] };
+}
+// Type-checks entry with the nearest tsconfig.json's options (or TypeNative's
+// defaults, typed by typesDir). The program's roots are the entry plus the
+// config's .d.ts files, so other entry points in the same project don't
+// redeclare each other's globals.
+export function typeCheckNode(entry, typesDir) {
+    const entryPath = path.resolve(entry);
+    const { ctx, errors: out } = getContext(path.dirname(entryPath), typesDir);
+    if (!ctx)
+        return out;
+    const program = ts.createProgram([entryPath, ...ctx.dtsRoots], ctx.options, ctx.host, ctx.oldProgram);
+    ctx.oldProgram = program;
     for (const d of ts.getPreEmitDiagnostics(program)) {
         if (d.category === ts.DiagnosticCategory.Error)
             out.push(toDiagnostic(d));

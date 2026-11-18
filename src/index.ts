@@ -230,9 +230,14 @@ function hostTarget(): string {
   return lines.length === 2 ? `${lines[0].trim()}/${lines[1].trim()}` : '';
 }
 
+const goCheckCache = new Map<string, string>();
+
 // Checks the Go toolchain on the PATH (and a --target against the pairs it
 // supports); returns an error message, '' when usable
 export function checkGo(target: string | null): string {
+  const cacheKey = target ?? '';
+  const cached = goCheckCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const version = runCommand('go', ['version']);
   const found = (version.stdout ?? '').match(/go(\d+)\.(\d+)/);
   if (version.status !== 0 || !found) {
@@ -250,6 +255,7 @@ export function checkGo(target: string | null): string {
       return `Go can't build for '${target}' ('go tool dist list' shows the os/arch pairs it supports)`;
     }
   }
+  goCheckCache.set(cacheKey, '');
   return '';
 }
 
