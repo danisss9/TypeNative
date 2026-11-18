@@ -5554,25 +5554,29 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           }
         }
         useHelper('asyncWait');
+        useHelper('promise');
         const recv = visit(node.expression.expression);
         const cbs = (node.arguments ?? []).map((a) => visit(a));
         const cbExpr = cbs[0] ?? 'func(interface{}) {}';
         useHelper('eventLoop');
         // A callback without parameters (then(() => …)) takes no value
         const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
-        const receive = takesValue ? `__v := <-__tnP` : `<-__tnP`;
+        const receive = takesValue
+          ? `__received, __ok := TnLoopReceive(__tnP); __v, __reason, __rejected := tnSettled(__tnP, __received, __ok); _ = __reason`
+          : `__received, __ok := TnLoopReceive(__tnP); _, __reason, __rejected := tnSettled(__tnP, __received, __ok); _ = __reason`;
         const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
         // (used as a value — proms.push(p.then(cb)) —: the promise of the
         // callback's result, a channel that receives it once the callback ran)
         if (!isExpressionStatement(unwrapParenthesesUp(node).parent)) {
           const returns = !!cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && !!inferFunctionBodyReturnType(cb);
           const outType = thenResultType(node)?.slice(5) ?? 'interface{}';
-          const settle = returns ? `__out <- ${invoke}` : `${invoke}; __out <- *new(${outType})`;
-          return `func() chan ${outType} {\n\t\t__out := make(chan ${outType}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${settle} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})\n\t\treturn __out\n\t}()`;
+          const settle = returns ? `TnAsyncSend(__out, ${invoke})` : `${invoke}; TnResolveZero(__out)`;
+          return `func(__tnP ${recvType}) chan ${outType} {\n\t\t__out := make(chan ${outType}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tTnStartAsync(func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\tdefer TnAsyncClose(__out)\n\t\t\tdefer TnRejectOnPanic(__out)\n\t\t\t${receive}\n\t\t\tif __rejected {\n\t\t\t\ttnRejections.Store(__out, __reason)\n\t\t\t\treturn\n\t\t\t}\n\t\t\t${settle}\n\t\t})\n\t\treturn __out\n\t}(${recv})`;
         }
-        // The promise expression is a go-statement argument: it runs now, with
-        // the baton (exec() registering its listeners off the loop would race it)
-        return `__tnWaitGroup.Add(1)\n\t\tgo func(__tnCtx TnAsyncContext, __tnP ${recvType}) {\n\t\t\t${receive}\n\t\t\tTnLoopPost(func() {\n\t\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t\tTnAsyncRun(__tnCtx, func() { ${invoke} })\n\t\t\t})\n\t\t}(TnAsyncSnapshot(), ${recv})`;
+        // The promise expression is evaluated now, with the baton (exec()
+        // registering its listeners off the loop would race it); the callback
+        // runs as a microtask once the promise settles
+        return `func(__tnP ${recvType}) {\n\t\t__tnWaitGroup.Add(1)\n\t\tTnStartAsync(func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t${receive}\n\t\t\tif __rejected {\n\t\t\t\treturn\n\t\t\t}\n\t\t\t${invoke}\n\t\t})\n\t}(${recv})`;
       }
     }
     // Array.from(arrayLike, mapFn) — array-likes are { length } structs
@@ -19687,8 +19691,9 @@ const callHandlers: Record<string, CallHandler> = {
     return `func() chan ${t} { ch := make(chan ${t}, 1); func() { defer TnRejectExecutor(ch); ${settle} }(); return ch }()`;
   },
   'Promise.resolve': (_caller: string, args: string[], _typeArgs: string) => {
+    useHelper('promise');
     const valueType = currentCallArgTypes[0] && currentCallArgTypes[0] !== 'nil' ? currentCallArgTypes[0] : 'interface{}';
-    return `func() chan ${valueType} { __ch := make(chan ${valueType}, 1); __ch <- ${args[0] ?? 'nil'}; return __ch }()`;
+    return `TnPromiseResolve[${valueType}](${args[0] ?? 'nil'})`;
   },
   structuredClone: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('structuredClone');
@@ -24599,12 +24604,11 @@ function getPromiseChannelType(node: AstNode): string {
   return 'interface{}';
 }
 
-// An async function whose body never parks: it awaits only calls of other
-// such functions (their promises are settled by the time they return, and
-// TnAwait resumes on the spot on a settled promise), has no for await, and
-// returns no promise (whose value it would await). Called, it runs to its end
-// at once, so it runs on the caller's goroutine (TnRunAsyncInline) instead of
-// a goroutine of its own handing the JS baton back and forth (TnStartAsync).
+// An async function whose body has no await, no for await, and returns no
+// promise (whose value it would await): called, it runs to its end at once on
+// the caller's goroutine (TnRunAsyncInline) instead of a goroutine of its own
+// handing the JS baton back and forth (TnStartAsync). Functions with await
+// must suspend at their await and resume as a microtask.
 const asyncInlineCache = new Map<AstNode, boolean>();
 function asyncInlineEligible(fn: AstNode, visiting = new Set<AstNode>()): boolean {
   const cached = asyncInlineCache.get(fn);
@@ -24642,12 +24646,7 @@ function asyncInlineEligible(fn: AstNode, visiting = new Set<AstNode>()): boolea
     if (getEnclosingFunction(n) !== fn) return false;
     if (n.kind === 'ForOfStatement' && n.awaitModifier) return true;
     if (n.kind === 'YieldExpression') return true;
-    if (n.kind === 'AwaitExpression') {
-      const operand = unwrapParentheses(n.expression);
-      if (!isCallExpression(operand) || operand.questionDotToken || !isIdentifier(operand.expression)) return true;
-      const decl = declaredFunctions.get(operand.expression.text);
-      return !decl || !isFunctionDeclaration(decl) || decl.parent?.kind !== 'SourceFile' || !asyncInlineEligible(decl, visiting);
-    }
+    if (n.kind === 'AwaitExpression') return true;
     if (isReturnStatement(n) && n.expression && !plainValue(n.expression)) return true;
     return false;
   });
@@ -38608,7 +38607,22 @@ func TnRunLoop() {
 // promises settled, like Node's microtasks — awaiters racing for the baton
 // would resume out of order on a starved machine.
 var tnWakeMu sync.Mutex
-var tnAwaiting = map[any]chan struct{}{}
+var tnAwaiting = map[any][]chan struct{}{}
+
+func tnCancelAwait(ch any, tok chan struct{}) bool {
+	list := tnAwaiting[ch]
+	for i, t := range list {
+		if t == tok {
+			if len(list) == 1 {
+				delete(tnAwaiting, ch)
+			} else {
+				tnAwaiting[ch] = append(list[:i], list[i+1:]...)
+			}
+			return true
+		}
+	}
+	return false
+}
 
 // (baton holder) hands the baton to a parked awaiter and waits for it to park
 // again (or finish): JS keeps running one thing at a time
@@ -38631,31 +38645,47 @@ func tnWakeQueue(tok chan struct{}) {
 	tnLoopNotify()
 }
 
+// Yields one microtask tick while releasing the JS baton (used when awaiting
+// an already-settled promise or non-promise value inside an async function)
+func tnYieldMicrotask() {
+	tok := make(chan struct{})
+	tnWakeQueue(tok)
+	tnRelease()
+	<-tok
+}
+
 // (baton holder) Receives from a channel, running loop tasks while waiting;
-// once nothing is left it parks. A promise wake resumes in settlement order
-// with the baton handed over; a raw send (a generator yield) resumes the old
-// way, racing for the baton
+// once nothing is left it parks. An already-settled promise still yields one
+// microtask tick so the async function never resumes synchronously. A promise
+// wake resumes in settlement order with the baton handed over; a raw send (a
+// generator yield) resumes the old way, racing for the baton
 func TnLoopReceive[T any](ch chan T) (T, bool) {
 	ctx := tnAsyncCtx
 	defer func() { tnAsyncCtx = ctx }()
+	select {
+	case v, ok := <-ch:
+		tnYieldMicrotask()
+		return v, ok
+	default:
+	}
 	for {
-		select {
-		case v, ok := <-ch:
-			return v, ok
-		default:
-		}
-		TnRunMicrotasks()
-		if TnLoopRunPending() {
-			continue
+		if len(tnLendStack) == 0 {
+			TnRunMicrotasks()
+			if TnLoopRunPending() {
+				continue
+			}
 		}
 		tok := make(chan struct{})
 		tnWakeMu.Lock()
 		select {
 		case v, ok := <-ch:
 			tnWakeMu.Unlock()
+			if len(tnLendStack) > 0 {
+				tnYieldMicrotask()
+			}
 			return v, ok
 		default:
-			tnAwaiting[any(ch)] = tok
+			tnAwaiting[any(ch)] = append(tnAwaiting[any(ch)], tok)
 		}
 		tnWakeMu.Unlock()
 		tnRelease()
@@ -38664,10 +38694,7 @@ func TnLoopReceive[T any](ch chan T) (T, bool) {
 			// The value is taken; when a promise wake was queued (the token
 			// is gone) it hands the baton over, else take the baton ourselves
 			tnWakeMu.Lock()
-			_, raw := tnAwaiting[any(ch)]
-			if raw {
-				delete(tnAwaiting, any(ch))
-			}
+			raw := tnCancelAwait(any(ch), tok)
 			tnWakeMu.Unlock()
 			if raw {
 				tnAcquire()
@@ -38705,7 +38732,7 @@ func tnRawReceive[T any](ch chan T) (T, bool) {
 			tnWakeMu.Unlock()
 			return v, ok
 		default:
-			tnAwaiting[any(ch)] = tok
+			tnAwaiting[any(ch)] = append(tnAwaiting[any(ch)], tok)
 		}
 		tnWakeMu.Unlock()
 		stop := make(chan struct{})
@@ -38717,10 +38744,7 @@ func tnRawReceive[T any](ch chan T) (T, bool) {
 			// a promise wake was queued: wait for its hand-over (the stand-in
 			// keeps draining until then — it may be what delivers it)
 			tnWakeMu.Lock()
-			_, raw := tnAwaiting[any(ch)]
-			if raw {
-				delete(tnAwaiting, any(ch))
-			}
+			raw := tnCancelAwait(any(ch), tok)
 			tnWakeMu.Unlock()
 			if raw {
 				close(stop)
@@ -39228,121 +39252,147 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 	out := make(chan interface{}, 1)
 	ctx := TnAsyncSnapshot()
 	__tnWaitGroup.Add(1)
-	go func() {
+	TnStartAsync(func() {
 		defer __tnWaitGroup.Done()
-		received, ok := p.Recv()
-		var v interface{}
-		if received.IsValid() {
-			v = received.Interface()
-		}
-		var reason interface{}
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		var v, reason interface{}
 		rejected := false
-		if !ok {
-			reason, rejected = tnRejections.Load(p.Interface())
+		if ch, isUntyped := p.Interface().(chan interface{}); isUntyped {
+			received, ok := TnLoopReceive(ch)
+			v, reason, rejected = tnSettled(ch, received, ok)
+		} else if received, ok := p.TryRecv(); ok {
+			if received.IsValid() {
+				v = received.Interface()
+			}
+			tnYieldMicrotask()
+		} else if val, resolved := tnResolved.Load(p.Interface()); resolved {
+			v = val
+			tnYieldMicrotask()
+		} else if r, rej := tnRejections.Load(p.Interface()); rej {
+			reason, rejected = r, true
+			tnYieldMicrotask()
+		} else {
+			untyped := make(chan interface{}, 1)
+			go func() {
+				received, ok := p.Recv()
+				if !ok {
+					if val, resolved := tnResolved.Load(p.Interface()); resolved {
+						TnAsyncSend(untyped, val)
+						TnAsyncClose(untyped)
+						return
+					}
+					if r, rej := tnRejections.Load(p.Interface()); rej {
+						TnReject(untyped, r)
+						return
+					}
+					TnAsyncClose(untyped)
+					return
+				}
+				var val interface{}
+				if received.IsValid() {
+					val = received.Interface()
+				}
+				TnAsyncSend(untyped, val)
+				TnAsyncClose(untyped)
+			}()
+			received, ok := TnLoopReceive(untyped)
+			v, reason, rejected = tnSettled(untyped, received, ok)
 		}
 		if name == "finally" {
 			if onFulfilled != nil {
-				TnLoopCall(func() { TnAsyncRun(ctx, func() { TnCallValue(onFulfilled) }) })
+				TnAsyncRun(ctx, func() { TnCallValue(onFulfilled) })
 			}
 		} else if handler := map[bool]interface{}{false: onFulfilled, true: onRejected}[rejected]; handler != nil {
 			input := v
 			if rejected {
 				input = reason
 			}
-			var result, thrown interface{}
-			threw := false
-			TnLoopCall(func() {
-				TnAsyncRun(ctx, func() {
-					defer func() {
-						if r := recover(); r != nil {
-							thrown, threw = r, true
-						}
-					}()
-					result = TnCallValue(handler, input)
-				})
+			var result interface{}
+			TnAsyncRun(ctx, func() {
+				result = TnCallValue(handler, input)
 			})
-			if threw {
-				TnReject(out, thrown)
-				return
-			}
 			// (a handler returning a promise: settled with it)
 			if rv := reflect.ValueOf(result); rv.Kind() == reflect.Chan {
-				inner, innerOk := rv.Recv()
-				if !innerOk {
-					if r, innerRejected := tnRejections.Load(rv.Interface()); innerRejected {
-						TnReject(out, r)
-						return
-					}
-				}
-				result = nil
-				if inner.IsValid() {
-					result = inner.Interface()
-				}
+				result = TnAwaitValue(result, false)
 			}
 			v, rejected = result, false
 		}
 		if rejected {
-			TnReject(out, reason)
+			tnRejections.Store(out, reason)
 			return
 		}
 		TnAsyncSend(out, v)
-		TnAsyncClose(out)
-	}()
+	})
 	return out, true
 }`,
   functionValue: `// The global Function used as a value: an opaque sentinel
 type tnFunctionConstructor struct{}
 
 var TnFunction interface{} = &tnFunctionConstructor{}`,
-  promise: `// Promises are channels; a rejected promise is a closed channel with a reason
+  promise: `// Promises are channels; a settled promise is a closed channel with its value or reason
+var tnResolved sync.Map
 var tnRejections sync.Map
 
 // A throw inside a Promise executor rejects the promise
 func TnRejectExecutor[T any](ch chan T) {
 	if r := recover(); r != nil {
-		if _, rejected := tnRejections.Load(ch); !rejected && len(ch) == 0 {
-			TnReject(ch, r)
-		}
+		TnReject(ch, r)
 	}
 }
 
-// Promise resolution: the value (or rejection) is sent and the parked awaiter
+// Promise resolution: the value (or rejection) is stored and the channel closed
+// so any number of consumers (.then / await) can read it; parked awaiters are
 // woken in settlement order — Node runs promise continuations as ordered
 // microtasks; a bare channel wake would race for the baton and resume out of
 // order on a starved machine
 func TnAsyncSend[T any](ch chan T, v T) {
-	var tok chan struct{}
-	handoff := false
 	tnWakeMu.Lock()
 	select {
-	case ch <- v:
+	case _, ok := <-ch:
+		if !ok {
+			tnWakeMu.Unlock()
+			return
+		}
 	default:
 	}
-	if t, parked := tnAwaiting[any(ch)]; parked {
+	tnResolved.Store(any(ch), v)
+	close(ch)
+	toks := tnAwaiting[any(ch)]
+	if len(toks) > 0 {
 		delete(tnAwaiting, any(ch))
-		tok = t
-		handoff = true
 	}
 	tnWakeMu.Unlock()
-	if handoff {
+	for _, tok := range toks {
 		tnWakeQueue(tok)
 	}
 }
 
 func TnAsyncClose[T any](ch chan T) {
-	var tok chan struct{}
-	handoff := false
 	tnWakeMu.Lock()
+	select {
+	case _, ok := <-ch:
+		if !ok {
+			tnWakeMu.Unlock()
+			return
+		}
+	default:
+	}
 	close(ch)
-	if t, parked := tnAwaiting[any(ch)]; parked {
+	toks := tnAwaiting[any(ch)]
+	if len(toks) > 0 {
 		delete(tnAwaiting, any(ch))
-		tok = t
-		handoff = true
 	}
 	tnWakeMu.Unlock()
-	if handoff {
+	for _, tok := range toks {
 		tnWakeQueue(tok)
 	}
+}
+
+func TnPromiseResolve[T any](v T) chan T {
+	ch := make(chan T, 1)
+	TnAsyncSend(ch, v)
+	return ch
 }
 
 func TnResolveZero[T any](ch chan T) {
@@ -39369,16 +39419,30 @@ func TnRejecter[T any](ch chan T) func(...interface{}) {
 		if len(args) > 0 {
 			reason = args[0]
 		}
-		if _, rejected := tnRejections.Load(ch); rejected || len(ch) > 0 {
-			return
-		}
 		TnReject(ch, reason)
 	}
 }
 
 func TnReject[T any](ch chan T, reason interface{}) {
+	tnWakeMu.Lock()
+	select {
+	case _, ok := <-ch:
+		if !ok {
+			tnWakeMu.Unlock()
+			return
+		}
+	default:
+	}
 	tnRejections.Store(ch, reason)
-	TnAsyncClose(ch)
+	close(ch)
+	toks := tnAwaiting[any(ch)]
+	if len(toks) > 0 {
+		delete(tnAwaiting, any(ch))
+	}
+	tnWakeMu.Unlock()
+	for _, tok := range toks {
+		tnWakeQueue(tok)
+	}
 }
 
 // A detached call (\`main();\`): the process waits for it; a rejection is fatal
@@ -39415,6 +39479,12 @@ func TnRejectOnPanic[T any](ch chan T) {
 
 func tnSettled[T any](ch chan T, v T, ok bool) (T, interface{}, bool) {
 	if !ok {
+		if val, resolved := tnResolved.Load(any(ch)); resolved {
+			if typed, ok := val.(T); ok {
+				return typed, nil, false
+			}
+			return v, nil, false
+		}
 		if reason, rejected := tnRejections.Load(ch); rejected {
 			return v, reason, true
 		}
@@ -39453,21 +39523,27 @@ func TnAwaitValue(v interface{}, inline bool) interface{} {
 		go func() {
 			received, ok := rv.Recv()
 			if !ok {
+				if val, resolved := tnResolved.Load(rv.Interface()); resolved {
+					TnAsyncSend(untyped, val)
+					return
+				}
 				// (a rejected promise: a closed channel with its reason recorded)
 				if r, rejected := tnRejections.Load(rv.Interface()); rejected {
 					TnReject(untyped, r)
 					return
 				}
-				close(untyped)
+				TnAsyncClose(untyped)
 				return
 			}
-			untyped <- received.Interface()
-			close(untyped)
+			TnAsyncSend(untyped, received.Interface())
 		}()
 		if inline {
 			return TnAwaitInline(untyped)
 		}
 		return TnAwait(untyped)
+	}
+	if !inline {
+		tnYieldMicrotask()
 	}
 	return v
 }
@@ -39493,15 +39569,19 @@ func TnPromiseReject[T any](reason interface{}) chan T {
 func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 	out := make(chan T, 1)
 	ctx := TnAsyncSnapshot()
-	go func() {
-		v, reason, rejected := tnSettle(p)
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		received, ok := TnLoopReceive(p)
+		v, reason, rejected := tnSettled(p, received, ok)
 		if rejected {
 			e, _ := reason.(E)
-			TnLoopCall(func() { TnAsyncRun(ctx, func() { onRejected(e) }) })
+			TnAsyncRun(ctx, func() { onRejected(e) })
 		}
 		TnAsyncSend(out, v)
-		TnAsyncClose(out)
-	}()
+	})
 	return out
 }
 
@@ -39524,31 +39604,39 @@ func TnPromiseAs[T any](p chan interface{}, convert func(interface{}) T) chan T 
 func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 	out := make(chan T, 1)
 	ctx := TnAsyncSnapshot()
-	go func() {
-		v, reason, rejected := tnSettle(p)
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		received, ok := TnLoopReceive(p)
+		v, reason, rejected := tnSettled(p, received, ok)
 		if rejected {
 			e, _ := reason.(E)
-			TnLoopCall(func() { TnAsyncRun(ctx, func() { v = onRejected(e) }) })
+			TnAsyncRun(ctx, func() { v = onRejected(e) })
 		}
 		TnAsyncSend(out, v)
-		TnAsyncClose(out)
-	}()
+	})
 	return out
 }
 
 func TnPromiseFinally[T any](p chan T, onFinally func()) chan T {
 	out := make(chan T, 1)
 	onFinally = TnAsyncWrap(onFinally)
-	go func() {
-		v, reason, rejected := tnSettle(p)
-		TnLoopCall(onFinally)
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		defer TnAsyncClose(out)
+		defer TnRejectOnPanic(out)
+		received, ok := TnLoopReceive(p)
+		v, reason, rejected := tnSettled(p, received, ok)
+		onFinally()
 		if rejected {
-			TnReject(out, reason)
+			tnRejections.Store(out, reason)
 			return
 		}
 		TnAsyncSend(out, v)
-		TnAsyncClose(out)
-	}()
+	})
 	return out
 }
 
@@ -39641,12 +39729,14 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 			} else if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Chan {
 				r, ok := rv.Recv()
 				if !ok {
-					// (a rejected promise: a closed channel with its reason recorded)
-					if reason, rejected := tnRejections.Load(rv.Interface()); rejected {
+					if val, resolved := tnResolved.Load(rv.Interface()); resolved {
+						results[i] = val
+					} else if reason, rejected := tnRejections.Load(rv.Interface()); rejected {
 						TnReject(out, reason)
 						return
+					} else {
+						results[i] = nil
 					}
-					results[i] = nil
 				} else {
 					results[i] = r.Interface()
 				}
@@ -39687,8 +39777,7 @@ func TnFromAsyncChan[T any](ch chan T) chan []T {
 // Array.fromAsync over plain values: resolved with a copy of them
 func TnFromAsyncValues[T any](values []T) chan []T {
 	out := make(chan []T, 1)
-	out <- append([]T{}, values...)
-	close(out)
+	TnAsyncSend(out, append([]T{}, values...))
 	return out
 }
 

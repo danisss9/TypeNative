@@ -946,7 +946,7 @@ declare var Date: DateConstructor;
 // --- Promise (lowered to goroutines over channels) ---
 
 interface Promise<T> {
-  then(onfulfilled?: (value: T) => any): void;
+  then<TResult = T>(onfulfilled?: (value: T) => TResult | PromiseLike<TResult>): Promise<TResult>;
   catch(onrejected?: (reason: any) => any): Promise<T>;
   finally(onfinally?: () => void): Promise<T>;
 }
