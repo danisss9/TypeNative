@@ -454,7 +454,13 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 			}
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	startErr := cmd.Start()
+	// the child has its own copies of the extra pipes' write ends: close the
+	// parent's, or reading child.stdio[3+n] never sees EOF and 'close' never fires
+	for _, f := range cmd.ExtraFiles {
+		f.Close()
+	}
+	if err := startErr; err != nil {
 		spawnErr := tnSpawnError(err, file)
 		TnLoopPost(func() { cp.emit("error", spawnErr) })
 		return cp

@@ -1306,7 +1306,7 @@ const CLUSTER_EMITTER =
 const reuseSockHelper = (fd: string, opt: string) => `func tnReuseSockControl(network string, address string, c syscall.RawConn) error {
 	var serr error
 	if ctlErr := c.Control(func(fd uintptr) {
-		serr = syscall.SetsockoptInt(${fd}(fd), syscall.SOL_SOCKET, syscall.${opt}, 1)
+		serr = syscall.SetsockoptInt(${fd}(fd), syscall.SOL_SOCKET, ${opt}, 1)
 	}); ctlErr != nil {
 		return ctlErr
 	}
@@ -1314,9 +1314,19 @@ const reuseSockHelper = (fd: string, opt: string) => `func tnReuseSockControl(ne
 }`;
 
 export function registerCluster(r: NodeRegistry): void {
-  defineHelper(r, 'nodeReuseSock@windows', ['syscall'], [], reuseSockHelper('syscall.Handle', 'SO_REUSEADDR'));
-  for (const goos of ['linux', 'darwin', 'freebsd', 'netbsd', 'openbsd', 'dragonfly']) {
-    defineHelper(r, `nodeReuseSock@${goos}`, ['syscall'], [], reuseSockHelper('int', 'SO_REUSEPORT'));
+  defineHelper(r, 'nodeReuseSock@windows', ['syscall'], [], reuseSockHelper('syscall.Handle', 'syscall.SO_REUSEADDR'));
+  // Go's syscall package has no SO_REUSEPORT on Linux, so use its value: 0xf,
+  // except on mips* / sparc64 where it is 0x200
+  defineHelper(r, 'nodeReuseSock@linux', ['runtime', 'strings', 'syscall'], [], reuseSockHelper('int', 'tnLinuxSoReusePort()') + `
+
+func tnLinuxSoReusePort() int {
+	if strings.HasPrefix(runtime.GOARCH, "mips") || runtime.GOARCH == "sparc64" {
+		return 0x200
+	}
+	return 0xf
+}`);
+  for (const goos of ['darwin', 'freebsd', 'netbsd', 'openbsd', 'dragonfly']) {
+    defineHelper(r, `nodeReuseSock@${goos}`, ['syscall'], [], reuseSockHelper('int', 'syscall.SO_REUSEPORT'));
   }
   defineHelper(r, 'nodeReuseSock@other', ['syscall'], [], 'func tnReuseSockControl(network string, address string, c syscall.RawConn) error { return nil }');
   defineHelper(
