@@ -654,6 +654,12 @@ const classStaticMethods = new Set<string>();
 const classStaticProps = new Set<string>();
 // Static getters (`static get tagName()`): reads call C_Get_tagName()
 const classStaticGetters = new Set<string>();
+// Static setters (`static set tagName(v)` / `static accessor x`): writes call C_Set_tagName(v)
+const classStaticSetters = new Set<string>();
+// Classes with instance-level addInitializer callbacks (method/getter/setter)
+const classesWithInstanceInits = new Set<string>();
+// Classes whose __metadata package variable has been emitted
+const emittedClassMetadata = new Set<string>();
 // The Go parameter list of each class's NewC constructor
 const classConstructorSignatures = new Map<string, string>();
 // Set when the program uses classes as values (TnClass descriptors are emitted)
@@ -3669,6 +3675,9 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   classStaticMethods.clear();
   classStaticProps.clear();
   classStaticGetters.clear();
+  classStaticSetters.clear();
+  classesWithInstanceInits.clear();
+  emittedClassMetadata.clear();
   classConstructorSignatures.clear();
   classValuesUsed = false;
   emittedClasses.clear();
@@ -4451,6 +4460,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (hasQuestionDot(node)) {
       return visitOptionalElementAccess(node);
     }
+    // C[Symbol.metadata]: the class's decorator metadata object
+    if (isIdentifier(node.expression) && classNames.has(node.expression.text) && isSymbolMetadata(node.argumentExpression)) {
+      return ensureClassMetadata(getSafeName(node.expression.text));
+    }
     // Enum['Member'] is the member; NumericEnum[value] its name (reverse mapping)
     if (isIdentifier(node.expression) && enumNames.has(node.expression.text)) {
       const enumGoName = getSafeName(node.expression.text);
@@ -4645,10 +4658,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('isArray');
       return 'func(__v interface{}) bool { return TnIsArray(__v) }';
     }
-    // Symbol.hasInstance as a value: the well-known symbol
+    // Symbol.hasInstance / Symbol.metadata as values: well-known symbols
     if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'hasInstance' && !variableGoTypes.has('Symbol')) {
       useHelper('symbol');
       return 'TnSymbolHasInstance';
+    }
+    if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'metadata' && !variableGoTypes.has('Symbol')) {
+      useHelper('symbol');
+      return 'TnSymbolMetadata';
     }
     // fn.prototype on a function value (not a class): its prototype object
     if (node.name.text === 'prototype' && !isCallee(node) && !isAssignmentTarget(node) && !(isIdentifier(node.expression) && classNames.has(node.expression.text)) &&
@@ -6346,8 +6363,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `${visit(node.left.expression)}.Set(${toGoStringLiteral(node.left.name.text)}, ${toGoValueOfType(node.right, extractMapValueType(recordType))})`;
       }
     }
-    // Class setter writes are accessor calls: c.v = x → c.Set_v(x)
+    // Class setter writes are accessor calls: c.v = x → c.Set_v(x), C.v = x → C_Set_v(x)
     if (op === '=' && isPropertyAccessExpression(node.left)) {
+      if (isIdentifier(node.left.expression) && !hasQuestionDot(node.left)) {
+        const staticSetterName = memberKey(node.left.name);
+        const staticOwner = staticMemberOwner(node.left.expression.text, staticSetterName);
+        if (staticOwner && classStaticSetters.has(`${staticOwner}.${staticSetterName}`)) {
+          return `${staticOwner}_Set_${goFieldName(staticSetterName)}(${visit(node.right)})`;
+        }
+      }
       const ownerGoType = inferExpressionType(node.left.expression);
       // Object-literal setters are Set_x closure fields
       const literalSetter = `Set_${goFieldName(node.left.name.text)} func(`;
@@ -7330,10 +7354,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // (an abstract one is no field either: the subclasses declare it, as a
       // field or an accessor)
       if (isPropertyDeclaration(member) && !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword' || m.kind === 'AbstractKeyword')) {
-        const fieldName =
+        const rawFieldName =
           member.name?.kind === 'PrivateIdentifier'
             ? privateGoName(member.name.text)
             : visit(member.name);
+        const fieldName = isAutoAccessor(member) ? `__accessor_${rawFieldName}` : rawFieldName;
         let fieldType: string;
         if (member.type && isArrayTypeNode(member.type)) {
           fieldType = `[]${getType(member.type, true)}`;
@@ -7577,7 +7602,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             if (ownAccessorKeys.has(accessorKey)) continue;
             ownAccessorKeys.add(accessorKey);
             emittedMethodNames.add(memberKey(member.name) ?? '');
-            copiedMethods.push(emitAccessor(member, `${name}${typeParamNames}`, mockSlots));
+            copiedMethods.push(
+              getDecorators(member).length > 0
+                ? emitDecoratedAccessor(name, typeParamNames, member, visit(ancestor.name))
+                : emitAccessor(member, `${name}${typeParamNames}`, mockSlots)
+            );
             continue;
           }
           if (!isMethodDeclaration(member)) continue;
@@ -7719,7 +7748,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             : `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${fullSignature})${returnType} ${body}\n\n`;
         }
       } else if (isGetAccessor(member) || isSetAccessor(member)) {
-        result += emitAccessor(member, `${name}${typeParamNames}`, mockSlots);
+        result +=
+          getDecorators(member).length > 0
+            ? emitDecoratedAccessor(name, typeParamNames, member, name)
+            : emitAccessor(member, `${name}${typeParamNames}`, mockSlots);
+      } else if (isAutoAccessor(member)) {
+        result += emitAutoAccessor(name, typeParamNames, member, name);
       }
     }
     // an interface method the class never declares: a stub that throws when
@@ -7739,13 +7773,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // (a mixin's super.m() goes through __super: no copies)
     if (!mixinOf) result += emitSuperCopies(name, typeParamNames, node);
 
-    // Static property declarations → package-level vars named ClassName_propName
+    // Static property declarations → package-level vars named ClassName_propName (or ClassName__accessor_propName)
     for (const member of (node.members ?? [])) {
       if (
         isPropertyDeclaration(member) &&
         member.modifiers?.some((m: AstNode) => m.kind === 'StaticKeyword')
       ) {
-        const fieldName = visit(member.name);
+        const rawFieldName = visit(member.name);
+        const fieldName = isAutoAccessor(member) ? `_accessor_${rawFieldName}` : rawFieldName;
         const fieldType =
           member.type
             ? getOptionalNodeType(member.type, !!member.questionToken)
@@ -8036,7 +8071,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (isRecordTypeNode(contextualType)) {
       return visitMapLiteral(node, contextualType);
     }
-    let typeName = contextualType ? getTypeText(contextualType) : '';
+    let typeName =
+      contextualType && isTypeReferenceNode(contextualType) && isIdentifier(contextualType.typeName) && contextualType.typeName.text === 'ClassAccessorDecoratorResult'
+        ? ''
+        : contextualType
+          ? getTypeText(contextualType)
+          : '';
     // { ...ctx, indent: x }: a copy of ctx's object type, when it has every key
     const firstProp = (node.properties ?? [])[0];
     if ((!typeName || typeName === 'interface{}') && firstProp?.kind === 'SpreadAssignment') {
@@ -11649,17 +11689,31 @@ function emitConstructor(name: string, typeParams: string, typeParamNames: strin
 
 function fieldInitializers(classNode: AstNode): string {
   const counted = typeof classNode.covFields === 'number' ? `${coverageCount(classNode.covFields)}\n\t\t` : '';
-  return counted + (classNode.members ?? [])
+  const className = classNode.name ? visit(classNode.name) : '';
+  const instanceInits = className && classesWithInstanceInits.has(className) ? `TnRunInitializers(self, ${className}__instanceInits)\n\t\t` : '';
+  return counted + instanceInits + (classNode.members ?? [])
     .filter(
       (m: AstNode) =>
         isPropertyDeclaration(m) &&
-        m.initializer &&
+        (m.initializer || getDecorators(m).length > 0) &&
         (isIdentifier(m.name) || m.name?.kind === 'PrivateIdentifier') &&
         !(m.modifiers ?? []).some((mod: AstNode) => mod.kind === 'StaticKeyword')
     )
     .map((m: AstNode) => {
       const fieldName = memberKey(m.name);
-      return `self.${goFieldName(fieldName)} = ${toGoValueOfType(m.initializer, getPropertyDeclarationType(m))}\n\t\t`;
+      const goName = goFieldName(fieldName);
+      const targetField = isAutoAccessor(m) ? `__accessor_${goName}` : goName;
+      const fieldType = getPropertyDeclarationType(m);
+      if (getDecorators(m).length > 0) {
+        useHelper('decorators');
+        useHelper('dynamic');
+        const initExpr = m.initializer ? toGoValueOfType(m.initializer, fieldType) : 'nil';
+        return (
+          `self.${targetField} = TnAs[${fieldType}](TnRunFieldInitializers(self, ${className}_${goName}__fieldInits, ${initExpr}))\n\t\t` +
+          `TnRunInitializers(self, ${className}_${goName}__extraInits)\n\t\t`
+        );
+      }
+      return `self.${targetField} = ${toGoValueOfType(m.initializer, fieldType)}\n\t\t`;
     })
     .join('');
 }
@@ -13226,7 +13280,9 @@ function methodFuncType(member: AstNode): string {
   const params = paramTypes.join(', ');
   const ret = member.type
     ? getType(member.type)
-    : inferFunctionBodyReturnType(member) ?? '';
+    : isDescriptorMethod(member) && (member.name?.text === 'get' || member.name?.text === 'init')
+      ? 'interface{}'
+      : inferFunctionBodyReturnType(member) ?? '';
   return `func(${params})${ret ? ` ${ret}` : ''}`;
 }
 
@@ -15200,7 +15256,8 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
   }
   if (isFunctionPropertyAccess(expr)) return 'interface{}';
   if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Array' && expr.name.text === 'isArray' && !isCallee(expr) && !variableGoTypes.has('Array') && !classNames.has('Array')) return 'func(interface{}) bool';
-  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && expr.name.text === 'hasInstance' && !variableGoTypes.has('Symbol')) return '*TnSymbol';
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && (expr.name.text === 'hasInstance' || expr.name.text === 'metadata') && !variableGoTypes.has('Symbol')) return '*TnSymbol';
+  if (isElementAccessExpression(expr) && isIdentifier(expr.expression) && classNames.has(expr.expression.text) && isSymbolMetadata(expr.argumentExpression)) return '*TnMap[string, interface{}]';
   if (isPropertyAccessExpression(expr) && expr.name.text === 'prototype' && !(isIdentifier(expr.expression) && classNames.has(expr.expression.text)) && inferExpressionType(expr.expression)?.startsWith('func(')) return 'interface{}';
   if (isIdentifier(expr) && isAbsentGlobal(expr)) return 'interface{}';
   if (expr?.kind === 'TnExtendClass' || expr?.kind === 'TnNamespaceObject') return 'interface{}';
@@ -15604,8 +15661,23 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
 
   const regexPropertyType = inferRegexPropertyType(expr);
   if (regexPropertyType) return regexPropertyType;
-  if (isPropertyAccessExpression(expr) && inferExpressionType(expr.expression) === '*TnDecoratorContext') {
-    return ['static', 'private'].includes(expr.name.text) ? 'bool' : 'string';
+  if (isPropertyAccessExpression(expr)) {
+    const ownerType = inferExpressionType(expr.expression);
+    if (ownerType === '*TnDecoratorContext') {
+      if (['static', 'private'].includes(expr.name.text)) return 'bool';
+      if (expr.name.text === 'metadata') return '*TnMap[string, interface{}]';
+      if (expr.name.text === 'access') return '*TnDecoratorAccess';
+      return 'string';
+    }
+    if (ownerType === '*TnDecoratorAccess') {
+      if (expr.name.text === 'has') return 'func(interface{}) bool';
+      if (expr.name.text === 'get') return 'func(interface{}) interface{}';
+      if (expr.name.text === 'set') return 'func(interface{}, interface{})';
+    }
+    if (ownerType === '*TnAccessorTarget') {
+      if (expr.name.text === 'get') return 'func() interface{}';
+      if (expr.name.text === 'set') return 'func(interface{})';
+    }
   }
   if (isPropertyAccessExpression(expr) && expr.name.text === 'length' && hasDynamicProperties(expr.expression)) {
     // n?.length on an any value: undefined when n is nullish or has no length
@@ -18785,6 +18857,20 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     useHelper('decorators');
     return '*TnDecoratorContext';
   }
+  if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
+    if (typeNode.typeName.text === 'ClassAccessorDecoratorTarget') {
+      useHelper('decorators');
+      return '*TnAccessorTarget';
+    }
+    if (typeNode.typeName.text === 'ClassAccessorDecoratorResult') {
+      useHelper('decorators');
+      return 'interface{}';
+    }
+    if (typeNode.typeName.text === 'DecoratorMetadata' || typeNode.typeName.text === 'DecoratorMetadataObject') {
+      useHelper('orderedMap');
+      return '*TnMap[string, interface{}]';
+    }
+  }
   if (
     isTypeReferenceNode(typeNode) &&
     typeNode.typeName?.kind === 'QualifiedName' &&
@@ -19129,6 +19215,12 @@ function getType(typeNode: AstNode, getArrayType = false): string {
   if (typeNode.kind === 'IndexedAccessType') {
     const index = typeNode.indexType;
     const key = index?.kind === 'LiteralType' && isStringLiteral(index.literal) ? index.literal.text : undefined;
+    if (key && isTypeReferenceNode(typeNode.objectType) && isIdentifier(typeNode.objectType.typeName) && /DecoratorContext$/.test(typeNode.objectType.typeName.text)) {
+      if (key === 'access') { useHelper('decorators'); return '*TnDecoratorAccess'; }
+      if (key === 'metadata') { useHelper('orderedMap'); return '*TnMap[string, interface{}]'; }
+      if (key === 'kind' || key === 'name') return 'string';
+      if (key === 'static' || key === 'private') return 'bool';
+    }
     const member = key ? getMemberTypeNode(typeNode.objectType, key) : undefined;
     return member ? getType(member, getArrayType) || 'interface{}' : 'interface{}';
   }
@@ -21699,6 +21791,24 @@ function getDecorators(node: AstNode): AstNode[] {
   return (node.modifiers ?? []).filter((m: AstNode) => m.kind === 'Decorator');
 }
 
+function isAutoAccessor(member: AstNode): boolean {
+  return isPropertyDeclaration(member) && (member.modifiers ?? []).some((m: AstNode) => m.kind === 'AccessorKeyword');
+}
+
+function isSymbolMetadata(node: AstNode | undefined): boolean {
+  return !!node && isPropertyAccessExpression(node) && isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'metadata' && !variableGoTypes.has('Symbol');
+}
+
+function ensureClassMetadata(className: string): string {
+  const varName = `${className}__metadata`;
+  if (!emittedClassMetadata.has(className)) {
+    emittedClassMetadata.add(className);
+    useHelper('orderedMap');
+    mainPackageVariables.push(`var ${varName} *TnMap[string, interface{}]`);
+  }
+  return varName;
+}
+
 // `this` inside a function / function expression (not a class member, not an arrow's)
 // The plain function whose `this` a this expression is (arrows see their
 // enclosing function's), or undefined (a method's, a class's, top level)
@@ -21718,10 +21828,21 @@ function plainFunctionOfThis(node: AstNode): AstNode | undefined {
 // { get() { … this … } })): this is the object the property is on
 function isDescriptorMethod(n: AstNode | undefined): boolean {
   if (!n || !(isMethodDeclaration(n) || isGetAccessor(n) || isSetAccessor(n)) || !isObjectLiteralExpression(n.parent) || !isIdentifier(n.name)) return false;
-  if (!['get', 'set'].includes(n.name.text)) return false;
+  if (!['get', 'set', 'init'].includes(n.name.text)) return false;
   const call = n.parent.parent;
-  return !!call && isCallExpression(call) && isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.expression) &&
-    call.expression.expression.text === 'Object' && call.expression.name.text === 'defineProperty' && (call.arguments ?? [])[2] === n.parent;
+  if (!!call && isCallExpression(call) && isPropertyAccessExpression(call.expression) && isIdentifier(call.expression.expression) &&
+    call.expression.expression.text === 'Object' && call.expression.name.text === 'defineProperty' && (call.arguments ?? [])[2] === n.parent) {
+    return true;
+  }
+  // Accessor decorator result ({ get() { ... this ... }, set(v) { ... }, init(v) { ... } })
+  const fn = getEnclosingFunction(n.parent);
+  if (fn) {
+    const hasAccessorCtx = (fn.parameters ?? []).some((p: AstNode) =>
+      p.type && isTypeReferenceNode(p.type) && isIdentifier(p.type.typeName) && p.type.typeName.text === 'ClassAccessorDecoratorContext');
+    const returnsAccessorRes = !!fn.type && isTypeReferenceNode(fn.type) && isIdentifier(fn.type.typeName) && fn.type.typeName.text === 'ClassAccessorDecoratorResult';
+    if (hasAccessorCtx || returnsAccessorRes) return true;
+  }
+  return false;
 }
 
 // A plain function's this: its `this: T` annotation's Go type, else any
@@ -21936,6 +22057,34 @@ function visitFunctionCallApply(node: AstNode): string | undefined {
   return withThis(guarded, result);
 }
 
+function adaptDecoratorTarget(varName: string, decorator: AstNode): string {
+  let fnType = inferExpressionType(decorator.expression);
+  const expr = decorator.expression;
+  if (isCallExpression(expr) && isIdentifier(expr.expression)) {
+    const factory = declaredFunctions.get(expr.expression.text);
+    if (factory) fnType = factory.type ? getType(factory.type) : inferFunctionBodyReturnType(factory);
+  } else if (isIdentifier(expr)) {
+    const fn = declaredFunctions.get(expr.text);
+    const firstParamNode = (fn?.parameters ?? [])[0];
+    if (firstParamNode?.type) fnType = `func(${getType(firstParamNode.type)})`;
+  }
+  if (!fnType) return varName;
+  if (fnType.startsWith('func[')) {
+    const bracketEnd = fnType.indexOf('](');
+    if (bracketEnd > -1) fnType = 'func(' + fnType.slice(bracketEnd + 2);
+  }
+  if (!fnType.startsWith('func(')) return varName;
+  const firstParam = goFuncParamTypes(fnType)[0];
+  if (!firstParam || !firstParam.startsWith('func(') || firstParam === 'func(...interface{}) interface{}') return varName;
+  const pTypes = goFuncParamTypes(firstParam);
+  if (pTypes.some((p) => p.startsWith('...'))) return varName;
+  const retType = goFuncReturnType(firstParam);
+  const decls = pTypes.map((t, i) => `__dp${i} ${t}`).join(', ');
+  const args = pTypes.map((_, i) => `__dp${i}`).join(', ');
+  const body = retType ? `return TnAs[${retType}](__prev(${args}))` : `__prev(${args})`;
+  return `func(__prev func(...interface{}) interface{}) func(${decls})${retType ? ` ${retType}` : ''} { return func(${decls})${retType ? ` ${retType}` : ''} { ${body} } }(${varName})`;
+}
+
 // Whether a decorator call returns a value (a replacement), or only has effects
 function decoratorReturnsValue(decorator: AstNode): boolean {
   let fnType = inferExpressionType(decorator.expression);
@@ -21977,45 +22126,278 @@ function emitDecoratedMethod(className: string, typeParamNames: string, member: 
   );
 }
 
-// Applies a class's decorators where it is defined (in source order): each decorated
-// method's function is wrapped bottom-up, then class decorators run
+function emitDecoratedAccessor(className: string, typeParamNames: string, member: AstNode, ownerClass: string): string {
+  useHelper('decorators');
+  useHelper('dynamic');
+  const accessorName = isIdentifier(member.name) ? goFieldName(member.name.text) : visit(member.name);
+  const isStatic = (member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword');
+  if (isGetAccessor(member)) {
+    const returnType = member.type ? getType(member.type) : methodReturnGoType(member) || 'interface{}';
+    const body = visit(member.body!);
+    if (isStatic) {
+      return (
+        `func ${className}_Get_${accessorName}__undecorated() ${returnType} ${body}\n\n` +
+        `func ${className}_Get_${accessorName}() ${returnType} {\n\t\treturn TnAs[${returnType}](${ownerClass}_Get_${accessorName}__decorated())\n\t}\n\n`
+      );
+    }
+    return (
+      `func (self *${className}${typeParamNames}) Get_${accessorName}__undecorated() ${returnType} ${body}\n\n` +
+      `func (self *${className}${typeParamNames}) Get_${accessorName}() ${returnType} {\n\t\t__prevThis := TnThis\n\t\tTnThis = self\n\t\tdefer func() { TnThis = __prevThis }()\n\t\treturn TnAs[${returnType}](${ownerClass}_Get_${accessorName}__decorated())\n\t}\n\n`
+    );
+  }
+  const parameterInfo = getFunctionParametersInfo(member.parameters ?? []);
+  const names = splitGoParameters(parameterInfo.signature).map((p) => p.slice(0, p.indexOf(' ')));
+  const body = visit(member.body!, { prefixBlockContent: parameterInfo.prefixBlockContent });
+  const call = `${ownerClass}_Set_${accessorName}__decorated(${names.join(', ')})`;
+  if (isStatic) {
+    return (
+      `func ${className}_Set_${accessorName}__undecorated(${parameterInfo.signature}) ${body}\n\n` +
+      `func ${className}_Set_${accessorName}(${parameterInfo.signature}) {\n\t\t${call}\n\t}\n\n`
+    );
+  }
+  return (
+    `func (self *${className}${typeParamNames}) Set_${accessorName}__undecorated(${parameterInfo.signature}) ${body}\n\n` +
+    `func (self *${className}${typeParamNames}) Set_${accessorName}(${parameterInfo.signature}) {\n\t\t__prevThis := TnThis\n\t\tTnThis = self\n\t\tdefer func() { TnThis = __prevThis }()\n\t\t${call}\n\t}\n\n`
+  );
+}
+
+function emitAutoAccessor(className: string, typeParamNames: string, member: AstNode, ownerClass: string): string {
+  const rawName = member.name?.kind === 'PrivateIdentifier' ? privateGoName(member.name.text) : isIdentifier(member.name) ? goFieldName(member.name.text) : visit(member.name);
+  const accessorName = isIdentifier(member.name) ? goFieldName(member.name.text) : visit(member.name);
+  const fieldType = getPropertyDeclarationType(member);
+  const isStatic = (member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword');
+  const decorated = getDecorators(member).length > 0;
+  if (!decorated) {
+    if (isStatic) {
+      return (
+        `func ${className}_Get_${accessorName}() ${fieldType} { return ${className}__accessor_${rawName} }\n\n` +
+        `func ${className}_Set_${accessorName}(__v ${fieldType}) { ${className}__accessor_${rawName} = __v }\n\n`
+      );
+    }
+    return (
+      `func (self *${className}${typeParamNames}) Get_${accessorName}() ${fieldType} { return self.__accessor_${rawName} }\n\n` +
+      `func (self *${className}${typeParamNames}) Set_${accessorName}(__v ${fieldType}) { self.__accessor_${rawName} = __v }\n\n`
+    );
+  }
+  useHelper('decorators');
+  useHelper('dynamic');
+  if (isStatic) {
+    return (
+      `func ${className}_Get_${accessorName}() ${fieldType} {\n\t\treturn TnAs[${fieldType}](${ownerClass}_Get_${accessorName}__decorated())\n\t}\n\n` +
+      `func ${className}_Set_${accessorName}(__v ${fieldType}) {\n\t\t${ownerClass}_Set_${accessorName}__decorated(__v)\n\t}\n\n`
+    );
+  }
+  return (
+    `func (self *${className}${typeParamNames}) Get_${accessorName}() ${fieldType} {\n\t\t__prevThis := TnThis\n\t\tTnThis = self\n\t\tdefer func() { TnThis = __prevThis }()\n\t\treturn TnAs[${fieldType}](${ownerClass}_Get_${accessorName}__decorated())\n\t}\n\n` +
+    `func (self *${className}${typeParamNames}) Set_${accessorName}(__v ${fieldType}) {\n\t\t__prevThis := TnThis\n\t\tTnThis = self\n\t\tdefer func() { TnThis = __prevThis }()\n\t\t${ownerClass}_Set_${accessorName}__decorated(__v)\n\t}\n\n`
+  );
+}
+
+// Applies a class's decorators where it is defined (in source order): parameter,
+// method/getter/setter/field/accessor decorators bottom-up, then class decorators,
+// then static & class initializers.
 function visitClassDecorators(node: AstNode): string {
   const className = visit(node.name);
+  const classDecorators = getDecorators(node);
+  const hasAnyMemberDecorator = (node.members ?? []).some((m: AstNode) =>
+    getDecorators(m).length > 0 || (m.parameters ?? []).some((p: AstNode) => getDecorators(p).length > 0)
+  );
+  if (classDecorators.length === 0 && !hasAnyMemberDecorator) return '';
+
+  useHelper('decorators');
+  useHelper('dynamic');
+  const metadataVar = ensureClassMetadata(className);
   const statements: string[] = [];
+
+  // Inherit metadata from parent class if any
+  const parentClause = (node.heritageClauses ?? []).find((c: AstNode) => c.token === 'ExtendsKeyword');
+  const parentClass = parentClause ? (nodeParentGoName(parentClause.types[0].expression) || visit(parentClause.types[0].expression)) : '';
+  if (parentClass && parentClass !== 'Error' && parentClass !== 'Array') {
+    const parentMetaVar = ensureClassMetadata(parentClass);
+    statements.push(`${metadataVar} = TnInheritMetadata(${parentMetaVar})`);
+  } else {
+    statements.push(`${metadataVar} = TnNewMap[string, interface{}]()`);
+  }
+
+  const staticInitsVar = `${className}__staticInits`;
+  const classInitsVar = `${className}__classInits`;
+  const instanceInitsVar = `${className}__instanceInits`;
+  statements.push(`var ${staticInitsVar} []interface{}`);
+  statements.push(`var ${classInitsVar} []interface{}`);
+  let declaredInstanceInits = false;
+  const ensureInstanceInits = () => {
+    if (!declaredInstanceInits) {
+      declaredInstanceInits = true;
+      classesWithInstanceInits.add(className);
+      mainPackageVariables.push(`var ${instanceInitsVar} []interface{}`);
+    }
+    return instanceInitsVar;
+  };
+  const staticFieldRunners: string[] = [];
+
   for (const member of node.members ?? []) {
+    const isStatic = (member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword');
+    // Parameter decorators (legacy experimentalDecorators) on constructors & methods
+    if (isConstructorDeclaration(member) || isMethodDeclaration(member)) {
+      const params: AstNode[] = member.parameters ?? [];
+      const memberKeyStr = isConstructorDeclaration(member) ? 'nil' : toGoStringLiteral(memberKey(member.name) ?? visit(member.name));
+      for (let pi = params.length - 1; pi >= 0; pi--) {
+        const pDecs = getDecorators(params[pi]);
+        for (const dec of [...pDecs].reverse()) {
+          statements.push(`(${visit(dec.expression)})(New${className}, ${memberKeyStr}, float64(${pi}))`);
+        }
+      }
+    }
+
     const decorators = getDecorators(member);
     if (decorators.length === 0) continue;
-    if (!isMethodDeclaration(member) || !member.body) {
-      reportError(member, `Unsupported decorator on ${className}: only method and class decorators are supported`);
+
+    const isPrivate = member.name?.kind === 'PrivateIdentifier';
+    const rawName = isPrivate ? privateGoName(member.name.text) : visit(member.name);
+    const tsMemberName = isPrivate ? member.name.text : (memberKey(member.name) ?? rawName);
+
+    if (isMethodDeclaration(member) && member.body) {
+      const methodName = rawName;
+      const params = splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature);
+      const paramTypes = params.map((p) => p.slice(p.indexOf(' ') + 1));
+      const returnType = methodReturnGoType(member);
+      const varName = `${className}_${methodName}__decorated`;
+      mainPackageVariables.push(`var ${varName} func(...interface{}) interface{}`);
+      const args = paramTypes.map((t, i) => `TnAs[${t}](__args[${i}])`).join(', ');
+      const target = isStatic
+        ? `${className}_${methodName}__undecorated(${args})`
+        : `TnThis.(interface{ ${methodName}__undecorated(${paramTypes.join(', ')})${returnType ? ` ${returnType}` : ''} }).${methodName}__undecorated(${args})`;
+      statements.push(`${varName} = func(__args ...interface{}) interface{} { ${returnType ? `return ${target}` : `${target}; return nil`} }`);
+      const hasFn = isStatic ? 'func(__o interface{}) bool { return __o != nil }' : `func(__o interface{}) bool { _, ok := __o.(*${className}); return ok }`;
+      const getFn = isStatic
+        ? `func(__o interface{}) interface{} { return ${varName} }`
+        : `func(__o interface{}) interface{} { return func(__args ...interface{}) interface{} { return TnWithThis(__o, func() interface{} { return ${varName}(__args...) }) } }`;
+      const accessExpr = `&TnDecoratorAccess{has: ${hasFn}, get: ${getFn}}`;
+      const initsRef = `&${isStatic ? staticInitsVar : ensureInstanceInits()}`;
+      for (const decorator of [...decorators].reverse()) {
+        const context = `&TnDecoratorContext{kind: "method", name: ${toGoStringLiteral(tsMemberName)}, static: ${isStatic}, private: ${isPrivate}, access: ${accessExpr}, metadata: ${metadataVar}, initializers: ${initsRef}}`;
+        const call = `(${visit(decorator.expression)})(${adaptDecoratorTarget(varName, decorator)}, ${context})`;
+        statements.push(decoratorReturnsValue(decorator) ? `${varName} = TnDecorate(${varName}, ${call})` : call);
+      }
       continue;
     }
-    useHelper('decorators');
-    useHelper('dynamic');
-    const methodName = visit(member.name);
-    const isStatic = (member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword');
-    const isPrivate = member.name?.kind === 'PrivateIdentifier';
-    const params = splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature);
-    const paramTypes = params.map((p) => p.slice(p.indexOf(' ') + 1));
-    const returnType = methodReturnGoType(member);
-    const varName = `${className}_${methodName}__decorated`;
-    mainPackageVariables.push(`var ${varName} func(...interface{}) interface{}`);
-    const args = paramTypes.map((t, i) => `TnAs[${t}](__args[${i}])`).join(', ');
-    const target = isStatic
-      ? `${className}_${methodName}__undecorated(${args})`
-      : `TnThis.(interface{ ${methodName}__undecorated(${paramTypes.join(', ')})${returnType ? ` ${returnType}` : ''} }).${methodName}__undecorated(${args})`;
-    statements.push(`${varName} = func(__args ...interface{}) interface{} { ${returnType ? `return ${target}` : `${target}; return nil`} }`);
-    for (const decorator of [...decorators].reverse()) {
-      const context = `&TnDecoratorContext{kind: "method", name: ${toGoStringLiteral(isPrivate ? member.name.text : methodName)}, static: ${isStatic}, private: ${isPrivate}}`;
-      const call = `(${visit(decorator.expression)})(${varName}, ${context})`;
-      statements.push(decoratorReturnsValue(decorator) ? `${varName} = TnDecorate(${varName}, ${call})` : call);
+
+    if ((isGetAccessor(member) || isSetAccessor(member)) && member.body) {
+      const accessorName = isIdentifier(member.name) ? goFieldName(member.name.text) : rawName;
+      const isGetter = isGetAccessor(member);
+      const varName = `${className}_${isGetter ? 'Get' : 'Set'}_${accessorName}__decorated`;
+      mainPackageVariables.push(`var ${varName} func(...interface{}) interface{}`);
+      if (isGetter) {
+        const returnType = member.type ? getType(member.type) : methodReturnGoType(member) || 'interface{}';
+        const target = isStatic
+          ? `${className}_Get_${accessorName}__undecorated()`
+          : `TnThis.(interface{ Get_${accessorName}__undecorated() ${returnType} }).Get_${accessorName}__undecorated()`;
+        statements.push(`${varName} = func(__args ...interface{}) interface{} { return ${target} }`);
+      } else {
+        const params = splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature);
+        const paramTypes = params.map((p) => p.slice(p.indexOf(' ') + 1));
+        const argType = paramTypes[0] || 'interface{}';
+        const target = isStatic
+          ? `${className}_Set_${accessorName}__undecorated(TnAs[${argType}](__args[0]))`
+          : `TnThis.(interface{ Set_${accessorName}__undecorated(${argType}) }).Set_${accessorName}__undecorated(TnAs[${argType}](__args[0]))`;
+        statements.push(`${varName} = func(__args ...interface{}) interface{} { ${target}; return nil }`);
+      }
+      const hasFn = isStatic ? 'func(__o interface{}) bool { return __o != nil }' : `func(__o interface{}) bool { _, ok := __o.(*${className}); return ok }`;
+      const getFn = isGetter
+        ? (isStatic ? `func(__o interface{}) interface{} { return ${className}_Get_${accessorName}() }` : `func(__o interface{}) interface{} { return __o.(*${className}).Get_${accessorName}() }`)
+        : 'nil';
+      const setArgType = !isGetter ? (splitGoParameters(getFunctionParametersInfo(member.parameters ?? []).signature).map((p) => p.slice(p.indexOf(' ') + 1))[0] || 'interface{}') : 'interface{}';
+      const setFn = !isGetter
+        ? (isStatic ? `func(__o interface{}, __v interface{}) { ${className}_Set_${accessorName}(TnAs[${setArgType}](__v)) }` : `func(__o interface{}, __v interface{}) { __o.(*${className}).Set_${accessorName}(TnAs[${setArgType}](__v)) }`)
+        : 'nil';
+      const accessExpr = `&TnDecoratorAccess{has: ${hasFn}, get: ${getFn}, set: ${setFn}}`;
+      const initsRef = `&${isStatic ? staticInitsVar : ensureInstanceInits()}`;
+      for (const decorator of [...decorators].reverse()) {
+        const context = `&TnDecoratorContext{kind: "${isGetter ? 'getter' : 'setter'}", name: ${toGoStringLiteral(tsMemberName)}, static: ${isStatic}, private: ${isPrivate}, access: ${accessExpr}, metadata: ${metadataVar}, initializers: ${initsRef}}`;
+        const call = `(${visit(decorator.expression)})(${adaptDecoratorTarget(varName, decorator)}, ${context})`;
+        statements.push(decoratorReturnsValue(decorator) ? `${varName} = TnDecorate(${varName}, ${call})` : call);
+      }
+      continue;
     }
+
+    if (isPropertyDeclaration(member) && isAutoAccessor(member)) {
+      const goName = isPrivate ? privateGoName(member.name.text) : goFieldName(memberKey(member.name) ?? rawName);
+      const accessorName = isIdentifier(member.name) ? goFieldName(member.name.text) : rawName;
+      const fieldType = getPropertyDeclarationType(member);
+      const getVar = `${className}_Get_${accessorName}__decorated`;
+      const setVar = `${className}_Set_${accessorName}__decorated`;
+      const fieldInitsVar = `${className}_${goName}__fieldInits`;
+      const extraInitsVar = `${className}_${goName}__extraInits`;
+      mainPackageVariables.push(`var ${getVar} func(...interface{}) interface{}`);
+      mainPackageVariables.push(`var ${setVar} func(...interface{}) interface{}`);
+      mainPackageVariables.push(`var ${fieldInitsVar} []interface{}`);
+      mainPackageVariables.push(`var ${extraInitsVar} []interface{}`);
+      if (isStatic) {
+        statements.push(`${getVar} = func(__args ...interface{}) interface{} { return ${className}__accessor_${goName} }`);
+        statements.push(`${setVar} = func(__args ...interface{}) interface{} { ${className}__accessor_${goName} = TnAs[${fieldType}](__args[0]); return nil }`);
+      } else {
+        statements.push(`${getVar} = func(__args ...interface{}) interface{} { return TnThis.(*${className}).__accessor_${goName} }`);
+        statements.push(`${setVar} = func(__args ...interface{}) interface{} { TnThis.(*${className}).__accessor_${goName} = TnAs[${fieldType}](__args[0]); return nil }`);
+      }
+      const hasFn = isStatic ? 'func(__o interface{}) bool { return __o != nil }' : `func(__o interface{}) bool { _, ok := __o.(*${className}); return ok }`;
+      const getFn = isStatic ? `func(__o interface{}) interface{} { return ${className}_Get_${accessorName}() }` : `func(__o interface{}) interface{} { return __o.(*${className}).Get_${accessorName}() }`;
+      const setFn = isStatic ? `func(__o interface{}, __v interface{}) { ${className}_Set_${accessorName}(TnAs[${fieldType}](__v)) }` : `func(__o interface{}, __v interface{}) { __o.(*${className}).Set_${accessorName}(TnAs[${fieldType}](__v)) }`;
+      const accessExpr = `&TnDecoratorAccess{has: ${hasFn}, get: ${getFn}, set: ${setFn}}`;
+      for (const decorator of [...decorators].reverse()) {
+        const context = `&TnDecoratorContext{kind: "accessor", name: ${toGoStringLiteral(tsMemberName)}, static: ${isStatic}, private: ${isPrivate}, access: ${accessExpr}, metadata: ${metadataVar}, initializers: &${extraInitsVar}}`;
+        const targetArg = `&TnAccessorTarget{get: func() interface{} { return __prevGet() }, set: func(__v interface{}) { __prevSet(__v) }}`;
+        const call = `(${visit(decorator.expression)})(${targetArg}, ${context})`;
+        statements.push(
+          `func() { __prevGet := ${getVar}; __prevSet := ${setVar}; _ = __prevGet; _ = __prevSet; ${
+            decoratorReturnsValue(decorator) ? `TnDecorateAccessor(&${getVar}, &${setVar}, &${fieldInitsVar}, ${call})` : call
+          } }()`
+        );
+      }
+      if (isStatic) {
+        staticFieldRunners.push(
+          `${className}__accessor_${goName} = TnAs[${fieldType}](TnRunFieldInitializers(New${className}, ${fieldInitsVar}, ${className}__accessor_${goName}))`,
+          `TnRunInitializers(New${className}, ${extraInitsVar})`
+        );
+      }
+      continue;
+    }
+
+    if (isPropertyDeclaration(member)) {
+      const goName = isPrivate ? privateGoName(member.name.text) : goFieldName(memberKey(member.name) ?? rawName);
+      const fieldType = getPropertyDeclarationType(member);
+      const fieldInitsVar = `${className}_${goName}__fieldInits`;
+      const extraInitsVar = `${className}_${goName}__extraInits`;
+      mainPackageVariables.push(`var ${fieldInitsVar} []interface{}`);
+      mainPackageVariables.push(`var ${extraInitsVar} []interface{}`);
+      const hasFn = isStatic ? 'func(__o interface{}) bool { return __o != nil }' : `func(__o interface{}) bool { _, ok := __o.(*${className}); return ok }`;
+      const getFn = isStatic ? `func(__o interface{}) interface{} { return ${className}_${goName} }` : `func(__o interface{}) interface{} { return __o.(*${className}).${goName} }`;
+      const setFn = isStatic ? `func(__o interface{}, __v interface{}) { ${className}_${goName} = TnAs[${fieldType}](__v) }` : `func(__o interface{}, __v interface{}) { __o.(*${className}).${goName} = TnAs[${fieldType}](__v) }`;
+      const accessExpr = `&TnDecoratorAccess{has: ${hasFn}, get: ${getFn}, set: ${setFn}}`;
+      for (const decorator of [...decorators].reverse()) {
+        const context = `&TnDecoratorContext{kind: "field", name: ${toGoStringLiteral(tsMemberName)}, static: ${isStatic}, private: ${isPrivate}, access: ${accessExpr}, metadata: ${metadataVar}, initializers: &${extraInitsVar}}`;
+        const call = `(${visit(decorator.expression)})(nil, ${context})`;
+        statements.push(decoratorReturnsValue(decorator) ? `if __fi := interface{}(${call}); __fi != nil { ${fieldInitsVar} = append(${fieldInitsVar}, __fi) }` : call);
+      }
+      if (isStatic) {
+        staticFieldRunners.push(
+          `${className}_${goName} = TnAs[${fieldType}](TnRunFieldInitializers(New${className}, ${fieldInitsVar}, ${className}_${goName}))`,
+          `TnRunInitializers(New${className}, ${extraInitsVar})`
+        );
+      }
+      continue;
+    }
+
+    reportError(member, `Unsupported decorator on ${className}`);
   }
-  for (const decorator of [...getDecorators(node)].reverse()) {
-    useHelper('decorators');
-    const context = `&TnDecoratorContext{kind: "class", name: ${toGoStringLiteral(className)}}`;
+
+  for (const decorator of [...classDecorators].reverse()) {
+    const context = `&TnDecoratorContext{kind: "class", name: ${toGoStringLiteral(className)}, metadata: ${metadataVar}, initializers: &${classInitsVar}}`;
     const call = `(${visit(decorator.expression)})(New${className}, ${context})`;
     statements.push(decoratorReturnsValue(decorator) ? `TnDecorateClass(${call})` : call);
   }
+  statements.push(`TnRunInitializers(New${className}, ${staticInitsVar})`);
+  for (const r of staticFieldRunners) statements.push(r);
+  statements.push(`TnRunInitializers(New${className}, ${classInitsVar})`);
   return statements.map((statement) => `${statement};\n\t`).join('');
 }
 
@@ -22133,7 +22515,18 @@ function registerClassMembers(node: AstNode): void {
     const isStatic = memberModifiers?.some((m) => m.kind === 'StaticKeyword');
     const memberName = memberKey(member.name);
     if (isPropertyDeclaration(member) && memberName) {
-      if (isStatic) {
+      if (isAutoAccessor(member)) {
+        const propType = getPropertyDeclarationType(member);
+        if (isStatic) {
+          classStaticProps.add(`${className}.${memberName}`);
+          classStaticGetters.add(`${className}.${memberName}`);
+          classStaticSetters.add(`${className}.${memberName}`);
+        } else {
+          classGetterMethods.add(`${className}.${memberName}`);
+          classSetterMethods.add(`${className}.${memberName}`);
+          properties.set(memberName, propType);
+        }
+      } else if (isStatic) {
         classStaticProps.add(`${className}.${memberName}`);
       } else {
         properties.set(memberName, getPropertyDeclarationType(member));
@@ -22150,6 +22543,7 @@ function registerClassMembers(node: AstNode): void {
     if ((isGetAccessor(member) || isSetAccessor(member)) && memberName && isStatic) {
       classStaticProps.add(`${className}.${memberName}`);
       if (isGetAccessor(member)) classStaticGetters.add(`${className}.${memberName}`);
+      if (isSetAccessor(member)) classStaticSetters.add(`${className}.${memberName}`);
     }
     if (isGetAccessor(member) && memberName && !isStatic) {
       classGetterMethods.add(`${className}.${memberName}`);
@@ -26099,7 +26493,7 @@ const helperRequires: Record<string, string[]> = {
   builtins: ['error', 'dynamic', 'bigint'],
   date: ['error', 'dynamic'],
   goBlocking: ['error', 'eventLoop'],
-  decorators: ['functionThis'],
+  decorators: ['functionThis', 'orderedMap', 'dynamic'],
   functionThis: [],
   jsx: [],
   objectIntegrity: [],
@@ -37576,6 +37970,9 @@ func (s *TnSymbol) String() string { return "Symbol(" + s.description + ")" }
 // Symbol.hasInstance (x instanceof C asks C, when C defines it)
 var TnSymbolHasInstance = &TnSymbol{description: "Symbol.hasInstance"}
 
+// Symbol.metadata (class decorator metadata key)
+var TnSymbolMetadata = &TnSymbol{description: "Symbol.metadata"}
+
 // Symbol.for(key) / Symbol.keyFor(sym): the global symbol registry
 var tnSymbolRegistry = map[string]*TnSymbol{}
 
@@ -38677,15 +39074,37 @@ func TnWithThis[R any](this interface{}, f func() R) R {
 	defer func() { TnThis = prev }()
 	return f()
 }`,
-  decorators: `// The context a decorator receives (kind is "method" or "class")
-type TnDecoratorContext struct {
-	kind    string
-	name    string
-	static  bool
-	private bool
+  decorators: `// The access object a member decorator context receives
+type TnDecoratorAccess struct {
+	has func(interface{}) bool
+	get func(interface{}) interface{}
+	set func(interface{}, interface{})
 }
 
-// A method decorator's result replaces the method; undefined keeps it
+// The context a decorator receives
+type TnDecoratorContext struct {
+	kind         string
+	name         string
+	static       bool
+	private      bool
+	access       *TnDecoratorAccess
+	metadata     *TnMap[string, interface{}]
+	initializers *[]interface{}
+}
+
+func (c *TnDecoratorContext) addInitializer(fn interface{}) {
+	if c.initializers != nil && fn != nil {
+		*c.initializers = append(*c.initializers, fn)
+	}
+}
+
+// Target passed to an auto-accessor decorator
+type TnAccessorTarget struct {
+	get func() interface{}
+	set func(interface{})
+}
+
+// A method, getter, or setter decorator's result replaces the target; undefined keeps it
 func TnDecorate(prev func(...interface{}) interface{}, result interface{}) func(...interface{}) interface{} {
 	if result == nil {
 		return prev
@@ -38693,7 +39112,36 @@ func TnDecorate(prev func(...interface{}) interface{}, result interface{}) func(
 	if f, ok := result.(func(...interface{}) interface{}); ok && f != nil {
 		return f
 	}
-	return prev
+	return func(__args ...interface{}) interface{} {
+		return TnCallValue(result, __args...)
+	}
+}
+
+// An auto-accessor decorator's result ({ get, set, init }) updates the getter/setter/initializer list
+func TnDecorateAccessor(getPtr *func(...interface{}) interface{}, setPtr *func(...interface{}) interface{}, initsPtr *[]interface{}, result interface{}) {
+	if result == nil {
+		return
+	}
+	if g := TnGet(result, "get"); g != nil {
+		prevGet := *getPtr
+		_ = prevGet
+		*getPtr = func(__args ...interface{}) interface{} { return TnCallValue(g) }
+	}
+	if s := TnGet(result, "set"); s != nil {
+		prevSet := *setPtr
+		_ = prevSet
+		*setPtr = func(__args ...interface{}) interface{} {
+			var v interface{}
+			if len(__args) > 0 {
+				v = __args[0]
+			}
+			TnCallValue(s, v)
+			return nil
+		}
+	}
+	if initFn := TnGet(result, "init"); initFn != nil {
+		*initsPtr = append(*initsPtr, initFn)
+	}
 }
 
 // Class decorators may not replace a class (a Go type)
@@ -38701,6 +39149,36 @@ func TnDecorateClass(result interface{}) {
 	if result != nil {
 		panic("class decorators cannot replace the class")
 	}
+}
+
+func TnRunInitializers(thisVal interface{}, inits []interface{}) {
+	for _, fn := range inits {
+		if fn != nil {
+			TnWithThis(thisVal, func() interface{} { return TnCallValue(fn) })
+		}
+	}
+}
+
+func TnRunFieldInitializers(thisVal interface{}, inits []interface{}, initial interface{}) interface{} {
+	val := initial
+	for _, fn := range inits {
+		if fn != nil {
+			val = TnWithThis(thisVal, func() interface{} { return TnCallValue(fn, val) })
+		}
+	}
+	return val
+}
+
+func TnInheritMetadata(parent *TnMap[string, interface{}]) *TnMap[string, interface{}] {
+	m := TnNewMap[string, interface{}]()
+	if parent != nil {
+		for _, k := range parent.Keys() {
+			if v, ok := parent.Lookup(k); ok {
+				m.Set(k, v)
+			}
+		}
+	}
+	return m
 }`,
   stringSearch: `// startsWith/endsWith/includes(search, position): the position clamped, as in JS
 // (a JS position: UTF-16 units, as a byte offset into the Go string)
