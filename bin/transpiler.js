@@ -386,6 +386,7 @@ let asyncFunctionNode;
 // True while emitting the body of an async function (not a generator): its
 // return settles the promise (ordered wake); a generator's sends stay raw
 let asyncChannelIsAsync = false;
+let asyncChannelYieldType = 'interface{}';
 // Variables holding JS arrays: stored as *[]T so aliasing shares the slice
 // header (push/splice through any alias are visible everywhere)
 const referenceArrays = new Set();
@@ -6732,16 +6733,16 @@ function visitNode(node, options = {}) {
         // Inside a generator: yield sends the value over the generator's channel
         if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
             // (the value converted to what the generator's channel carries)
-            const yieldType = asyncFunctionNode ? getGeneratorYieldType(asyncFunctionNode) : 'interface{}';
+            const yieldType = asyncChannelYieldType;
             if (generatorSeqMode)
                 return visitSeqYield(node, yieldType);
+            const isAsyncGen = (asyncFunctionNode?.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
             if (node.asteriskToken) {
                 // yield* other(): forward every value of the delegated generator
                 // (each in step with this generator's consumer)
                 const delegatedType = inferExpressionType(node.expression) ?? '';
                 const elementType = delegatedType.startsWith('chan ') ? delegatedType.slice(5) : '';
                 useHelper('dynamic');
-                const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
                 // yield* xs of an array (or of any value: its elements, an array's
                 // or another iterable's)
                 if (!delegatedType.startsWith('chan ')) {
@@ -6750,21 +6751,44 @@ function visitNode(node, options = {}) {
                     if (!arrayElement)
                         useHelper('arraySubclass');
                     const value = (arrayElement || 'interface{}') === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
-                    if (!asyncChannelIsAsync)
+                    if (!isAsyncGen) {
                         useHelper('generatorStep');
-                    return `for _, __yv := range ${source} {\n\t\t\t${asyncChannelVar} <- ${value}${asyncChannelIsAsync ? '' : `; TnGenStep(${asyncChannelVar})`}\n\t\t}`;
+                        const loop = `for _, __yv := range ${source} {\n\t\t\tTnGenYield[${yieldType}](${asyncChannelVar}, ${value})\n\t\t}`;
+                        return isExpressionStatement(node.parent) ? `func() {\n\t\t${loop}\n\t}()` : `func() interface{} {\n\t\t${loop}\n\t\treturn nil\n\t}()`;
+                    }
+                    return `for _, __yv := range ${source} {\n\t\t\t${asyncChannelVar} <- ${value}\n\t\t}`;
                 }
-                if (!asyncChannelIsAsync) {
+                if (!isAsyncGen) {
                     useHelper('generatorStep');
-                    return `func() { __yg := TnGenLockstep(${visit(node.expression)}); for __yfirst := true; ; __yfirst = false { if !__yfirst { TnGenAck(__yg) }; __yv, __yok := <-__yg; if !__yok { TnGenDone(__yg); return }; ${asyncChannelVar} <- ${forwarded}; TnGenStep(${asyncChannelVar}) } }()`;
+                    useHelper('iterators');
+                    const conv = elementType === yieldType
+                        ? `func(__yv ${elementType}) ${yieldType} { return __yv }`
+                        : yieldType === 'interface{}'
+                            ? `func(__yv ${elementType}) interface{} { return __yv }`
+                            : `func(__yv ${elementType}) ${yieldType} { return TnAs[${yieldType}](interface{}(__yv)) }`;
+                    const call = `TnGenDelegate(${asyncChannelVar}, ${visit(node.expression)}, ${conv})`;
+                    const retType = delegatedGeneratorReturnType(node.expression);
+                    if (!isExpressionStatement(node.parent) && retType && retType !== 'interface{}') {
+                        return `TnAs[${retType}](${call})`;
+                    }
+                    return call;
                 }
+                const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
                 return `for __yv := range ${visit(node.expression)} {\n\t\t\t${asyncChannelVar} <- ${forwarded}\n\t\t}`;
             }
-            const yielded = node.expression ? toGoValueOfType(node.expression, yieldType) : 'nil';
-            // (a generator resumes only once its consumer has run: see TnGenStep)
-            if (!asyncChannelIsAsync) {
+            const yielded = node.expression
+                ? toGoValueOfType(node.expression, yieldType)
+                : (yieldType === 'interface{}' ? 'nil' : `*new(${yieldType})`);
+            // (a generator resumes only once its consumer has run: see TnGenYield / TnGenStep)
+            if (!isAsyncGen) {
                 useHelper('generatorStep');
-                return `${asyncChannelVar} <- ${yielded}; TnGenStep(${asyncChannelVar})`;
+                const call = `TnGenYield[${yieldType}](${asyncChannelVar}, ${yielded})`;
+                const nextType = getGeneratorNextType(asyncFunctionNode);
+                if (!isExpressionStatement(node.parent) && nextType !== 'interface{}') {
+                    useHelper('dynamic');
+                    return `TnAs[${nextType}](${call})`;
+                }
+                return call;
             }
             return `${asyncChannelVar} <- ${yielded}`;
         }
@@ -7167,8 +7191,10 @@ function visitNode(node, options = {}) {
         }
         // Inside an async function or generator the channel carries the result
         if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
+            const inTryReturn = tryReturn && getEnclosingFunction(node) === tryReturn.fn;
+            const genExit = inTryReturn ? tryAwareReturn('') : 'return';
             if (!node.expression)
-                return 'return';
+                return genExit + (options.inline ? '' : ';\n\t');
             // An async return settles its promise (ordered wake); a generator's
             // sends stay raw (their consumers receive raw)
             if (asyncChannelIsAsync) {
@@ -7193,7 +7219,12 @@ function visitNode(node, options = {}) {
                 }
                 return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); return` + (options.inline ? '' : ';\n\t');
             }
-            return `${asyncChannelVar} <- ${visit(node.expression)}; return` + (options.inline ? '' : ';\n\t');
+            const isAsyncGen = (asyncFunctionNode?.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
+            if (isAsyncGen) {
+                return `${asyncChannelVar} <- ${visit(node.expression)}; ${genExit}` + (options.inline ? '' : ';\n\t');
+            }
+            useHelper('generatorStep');
+            return `TnGenSetReturn(${asyncChannelVar}, ${visit(node.expression)}); ${genExit}` + (options.inline ? '' : ';\n\t');
         }
         const enclosingFn = getEnclosingFunction(node);
         const isAsync = enclosingFn?.modifiers?.some((m) => m.kind === 'AsyncKeyword');
@@ -10983,6 +11014,13 @@ function widenToInterfaceParams(className, member, signature, prefix) {
     }
     return { signature, prefix };
 }
+function emitGeneratorGoroutineBody(chanType, channelVar, prologue, body, isAsyncGen) {
+    if (isAsyncGen) {
+        return `${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}`;
+    }
+    useHelper('generatorStep');
+    return `${prologue}${channelVar} := make(chan ${chanType})\n\t__ctrl := TnGenStart(${channelVar})\n\tgo func() {\n\t\tdefer close(${channelVar})\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\tif ret, ok := r.(tnGenReturn); ok {\n\t\t\t\t\t__ctrl.finishReturn(ret.val)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\t__ctrl.finishError(r)\n\t\t\t} else {\n\t\t\t\t__ctrl.finishDone()\n\t\t\t}\n\t\t}()\n\t\tif !__ctrl.awaitStart() {\n\t\t\treturn\n\t\t}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}`;
+}
 // A generator method: a Go method returning the channel its body sends on
 // (registered for dispatch on any values; copied into subclasses as other
 // methods are, so `this` is the subclass there)
@@ -10991,20 +11029,24 @@ function emitGeneratorMethod(className, typeParamNames, member, genName) {
     const prevChannel = asyncChannelVar;
     const prevFn = asyncFunctionNode;
     const prevIsAsync = asyncChannelIsAsync;
+    const prevYieldType = asyncChannelYieldType;
     asyncChannelVar = '__ch';
     asyncFunctionNode = member;
     asyncChannelIsAsync = false;
+    asyncChannelYieldType = yieldType;
     const methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
     const genBody = visit(member.body, { prefixBlockContent: methodParameterInfo.prefixBlockContent });
     asyncChannelVar = prevChannel;
     asyncFunctionNode = prevFn;
     asyncChannelIsAsync = prevIsAsync;
+    asyncChannelYieldType = prevYieldType;
     if (genName !== 'Symbol_iterator')
         recordMethodSignature(className, memberKey(member.name) ?? genName, genName, methodParameterInfo.signature, `chan ${yieldType}`);
     const seq = generatorSeqEligible(member)
         ? `${lineMarker(member)}${emitGeneratorSeq(member, `func (self *${className}${typeParamNames}) ${genName}__seq`, methodParameterInfo, '')}\n\n`
         : '';
-    return `${lineMarker(member)}func (self *${className}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t__ch := make(chan ${yieldType})\n\tgo func() {\n\t\tdefer close(__ch)\n\t\t${genBody.trim()}\n\t}()\n\treturn __ch\n}\n\n${seq}`;
+    const isAsyncGen = (member.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
+    return `${lineMarker(member)}func (self *${className}${typeParamNames}) ${genName}(${methodParameterInfo.signature}) chan ${yieldType} {\n\t${emitGeneratorGoroutineBody(yieldType, '__ch', '', genBody, isAsyncGen)}\n}\n\n${seq}`;
 }
 // A sync generator a for…of can run without a goroutine: its push form
 // name__seq(args) is a Go range function whose yield runs the loop body (so
@@ -11066,10 +11108,17 @@ function emitGeneratorSeq(fn, header, parameterInfo, prologue) {
     useHelper('generatorStep');
     return `${header}(${parameterInfo.signature}) func(func(${yieldType}) bool) {\n\t${prologue}return func(__yield func(${yieldType}) bool) {\n\t\t__stop := new(tnGenStop)\n\t\t__yc := false\n\t\t_, _ = __stop, __yc\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil && r != interface{}(__stop) {\n\t\t\t\tpanic(r)\n\t\t\t}\n\t\t}()\n\t\t${body.trim()}\n\t}\n}`;
 }
-// A catch clause in a generator's push form: a panic raised while the
-// consumer's loop body ran (or the stop of a break) is not the generator's
+// A catch clause in a generator's push form or coroutine: a panic raised
+// while the consumer's loop body ran, or a generator return() unwind, is not
+// for the generator's catch clause
 function seqCatchGuard() {
-    return generatorSeqMode ? 'if __yc {\n\t\t\t\t\tpanic(r)\n\t\t\t\t}\n\t\t\t\t' : '';
+    if (generatorSeqMode)
+        return 'if __yc {\n\t\t\t\t\tpanic(r)\n\t\t\t\t}\n\t\t\t\t';
+    if (asyncChannelVar && !asyncChannelIsAsync && !(asyncFunctionNode?.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
+        useHelper('generatorStep');
+        return 'if _, __isGenRet := r.(tnGenReturn); __isGenRet {\n\t\t\t\t\tpanic(r)\n\t\t\t\t}\n\t\t\t\t';
+    }
+    return '';
 }
 // One yield of a generator's push form: the consumer's loop body runs for the
 // value; false (a break, a return out of the loop) stops the generator
@@ -11318,8 +11367,10 @@ function visitGeneratorItems(node) {
         useHelper('generatorSeq');
         return found.elem === elem ? `tnSeqCollect(${found.seq})` : `tnSeqCollect(tnSeqAs[${elem}](${found.seq}))`;
     }
-    if (node.chanType)
-        return `func() []${elem} { __out := []${elem}{}; for __v := range ${code} { __out = append(__out, __v) }; return __out }()`;
+    if (node.chanType) {
+        useHelper('iterators');
+        return `TnIterToArray(${code})`;
+    }
     useHelper('arraySubclass');
     return `TnToArray(${code})`;
 }
@@ -12718,7 +12769,7 @@ function visitObjectMemberAccess(node, goType) {
     const fallback = resultType === 'interface{}' ? 'TnGet(o, k)' : `TnAs[${resultType}](TnGet(o, k))`;
     return `func(o ${goType}, k string) ${resultType} { if __v, __ok := tnExpandoGet(o, k); __ok { return ${asResult} }; switch k { ${cases.join('; ')} }; return ${fallback} }(${object}, ${toGoValueOfType(key, 'string')})`;
 }
-const ITERATOR_HELPERS = new Set(['next', 'map', 'filter', 'flatMap', 'take', 'drop', 'toArray', 'forEach', 'some', 'every', 'find', 'reduce']);
+const ITERATOR_HELPERS = new Set(['next', 'return', 'throw', 'map', 'filter', 'flatMap', 'take', 'drop', 'toArray', 'forEach', 'some', 'every', 'find', 'reduce']);
 // A callback of an iterator helper as func(T, float64) R (its own arity may be smaller)
 function iteratorCallbackAdapter(callbackNode, callback, elementType, resultType) {
     const fnType = callbackNode ? functionValueGoType(callbackNode) : '';
@@ -12732,12 +12783,24 @@ function iteratorCallbackAdapter(callbackNode, callback, elementType, resultType
 }
 // gen.map(fn) / filter / take / drop / flatMap / toArray / forEach / some /
 // every / find / reduce / next() on a generator's channel
-function visitIteratorHelper(receiver, method, elementType, args, callbackNode, extraArgs) {
+function visitIteratorHelper(receiver, method, elementType, args, callbackNode, extraArgs, receiverNode) {
     useHelper('iterators');
     const callbackResult = goFuncReturnType(callbackNode ? functionValueGoType(callbackNode) : '') ?? 'interface{}';
+    const useAny = (method === 'next' || method === 'return' || method === 'throw') &&
+        generatorResultElementType(receiverNode, elementType, method, callbackNode) === 'interface{}';
     switch (method) {
         case 'next':
-            return `TnIterNext(${receiver})`;
+            if (useAny)
+                return `TnIterNextAny(${receiver}, ${args[0] ?? 'nil'})`;
+            return args.length > 0 ? `TnIterNextVal(${receiver}, ${args[0]})` : `TnIterNext(${receiver})`;
+        case 'return':
+            if (useAny)
+                return `TnIterReturnAny(${receiver}, ${args[0] ?? 'nil'}, ${args.length > 0})`;
+            return `TnIterReturn(${receiver}, ${args[0] ?? 'nil'}, ${args.length > 0})`;
+        case 'throw':
+            if (useAny)
+                return `TnIterThrowAny(${receiver}, ${args[0] ?? 'nil'})`;
+            return `TnIterThrow(${receiver}, ${args[0] ?? 'nil'})`;
         case 'map':
             return `TnIterMap(${receiver}, ${iteratorCallbackAdapter(callbackNode, args[0], elementType, callbackResult)})`;
         case 'flatMap':
@@ -12795,7 +12858,11 @@ function iteratorHelperGoType(expr, receiverType, method) {
     const callbackResult = expr.arguments?.[0] ? goFuncReturnType(functionValueGoType(expr.arguments[0])) : undefined;
     switch (method) {
         case 'next':
-            return `*TnIterResult[${elementType}]`;
+        case 'return':
+        case 'throw': {
+            const resElem = generatorResultElementType(expr.expression?.expression, elementType, method, expr.arguments?.[0]);
+            return `*TnIterResult[${resElem}]`;
+        }
         case 'map':
             return `chan ${callbackResult ?? 'interface{}'}`;
         case 'flatMap':
@@ -14652,7 +14719,8 @@ function iterableClassValues(code, iterable, limit) {
             return `func() []${elemType} { _ = ${code}; return []${elemType}{} }()`;
         return `func() []${elemType} { __out := []${elemType}{}; for __v := range ${code}.Symbol_iterator__seq() { __out = append(__out, __v); if len(__out) == ${limit} { break } }; return __out }()`;
     }
-    return `func() []${elemType} { __out := []${elemType}{}; for __v := range ${code}.Symbol_iterator() { __out = append(__out, __v) }; return __out }()`;
+    useHelper('iterators');
+    return `TnIterToArray(${code}.Symbol_iterator())`;
 }
 // bag[Symbol.iterator]() of a class with *[Symbol.iterator](): its class
 // and what it yields (undefined for any other expression)
@@ -14719,7 +14787,8 @@ function visitSpreadSource(expr) {
     // [...generator()]: every value it yields
     if (sourceType?.startsWith('chan ')) {
         const element = sourceType.slice(5);
-        return `func() []${element} { __out := []${element}{}; for __v := range ${visit(expr)} { __out = append(__out, __v) }; return __out }()`;
+        useHelper('iterators');
+        return `TnIterToArray(${visit(expr)})`;
     }
     // a dynamic value: its elements (any iterable)
     if (!sourceType || sourceType === 'interface{}') {
@@ -14921,6 +14990,8 @@ function inferExpectedTypeFromContext(node) {
                 isMethodDeclaration(scope) ||
                 isFunctionExpression(scope) ||
                 isArrowFunction(scope)) {
+                if (scope.asteriskToken)
+                    return getGeneratorReturnType(scope);
                 if (scope.type)
                     return getType(scope.type);
                 break;
@@ -15950,6 +16021,12 @@ function inferExpressionTypeOf(expr) {
         if (staticMethod && !staticMethod.asteriskToken && !(staticMethod.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword')) {
             return inferArrowFunctionGoType(staticMethod);
         }
+    }
+    if (expr.kind === 'YieldExpression') {
+        if (expr.asteriskToken) {
+            return delegatedGeneratorReturnType(expr.expression) ?? 'interface{}';
+        }
+        return getGeneratorNextType(getEnclosingFunction(expr));
     }
     if (isAwaitExpression(expr)) {
         // await unwraps the promise channel
@@ -21729,7 +21806,8 @@ function getDynamicCallHandler(caller, objectType) {
             const elementType = currentReceiverGoType.slice(5);
             const callbackNode = currentCallArgNodes[0];
             const extraArgs = currentCallArgNodes.slice(1);
-            return (c, args, _typeArgs) => visitIteratorHelper(c.substring(0, dotIndex), helperName, elementType, args, callbackNode, extraArgs);
+            const receiverNode = currentCallNode?.expression?.expression;
+            return (c, args, _typeArgs) => visitIteratorHelper(c.substring(0, dotIndex), helperName, elementType, args, callbackNode, extraArgs, receiverNode);
         }
         if (currentReceiverGoType?.startsWith('*TnWeakRef[') && methodName === 'deref') {
             return (c, _args, _typeArgs) => `${c.substring(0, dotIndex)}.deref()`;
@@ -25427,13 +25505,16 @@ function emitChannelFunction(node, isAsync, header) {
     const prevChannel = asyncChannelVar;
     const prevFn = asyncFunctionNode;
     const prevIsAsync = asyncChannelIsAsync;
+    const prevYieldType = asyncChannelYieldType;
     asyncChannelVar = channelVar;
     asyncFunctionNode = node;
     asyncChannelIsAsync = isAsync;
+    asyncChannelYieldType = chanType;
     const body = visit(node.body, { prefixBlockContent: parameterInfo.prefixBlockContent });
     asyncChannelVar = prevChannel;
     asyncFunctionNode = prevFn;
     asyncChannelIsAsync = prevIsAsync;
+    asyncChannelYieldType = prevYieldType;
     if (isAsync) {
         // The body runs synchronously until its first await, holding the JS baton
         // (a body that never parks runs on the caller's goroutine: see asyncInlineEligible)
@@ -25445,7 +25526,8 @@ function emitChannelFunction(node, isAsync, header) {
     const seq = !header && isFunctionDeclaration(node) && node.parent?.kind === 'SourceFile' && generatorSeqEligible(node)
         ? `\n\n${emitGeneratorSeq(node, `func ${name}__seq${typeParams}`, parameterInfo, prologue)}`
         : '';
-    return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType})\n\tgo func() {\n\t\tdefer close(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t}()\n\treturn ${channelVar}\n}` + seq);
+    const isAsyncGen = (node.modifiers ?? []).some((m) => m.kind === 'AsyncKeyword');
+    return (`${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${emitGeneratorGoroutineBody(chanType, channelVar, prologue, body, isAsyncGen)}\n}` + seq);
 }
 // The type a generator yields: from its first yield expression's operand
 // The generator functions whose yield type is being inferred
@@ -25487,6 +25569,105 @@ function getGeneratorYieldType(fn) {
     });
     generatorYieldsInferring.delete(fn);
     return found && found !== 'nil' ? found : 'interface{}';
+}
+function generatorTypeArg(fn, index) {
+    if (!fn)
+        return undefined;
+    const retType = fn.type ?? (isFunctionExpression(fn) ? resolveTypeNode(getContextualFunctionType(fn)?.type) : undefined);
+    if (retType && isTypeReferenceNode(retType) && isIdentifier(retType.typeName) && ['Generator', 'AsyncGenerator'].includes(retType.typeName.text) && (retType.typeArguments ?? []).length > index) {
+        const arg = retType.typeArguments[index];
+        if (arg && !['UndefinedKeyword', 'VoidKeyword', 'UnknownKeyword', 'AnyKeyword'].includes(arg.kind)) {
+            const goType = getType(arg);
+            if (goType && goType !== ':')
+                return goType;
+        }
+    }
+    return undefined;
+}
+function getGeneratorNextType(fn) {
+    return generatorTypeArg(fn, 2) ?? 'interface{}';
+}
+function getGeneratorReturnType(fn) {
+    const annotated = generatorTypeArg(fn, 1);
+    if (annotated)
+        return annotated;
+    if (!fn?.body)
+        return undefined;
+    let found;
+    containsNode(fn.body, (n) => {
+        if (isReturnStatement(n) && n.expression && getEnclosingFunction(n) === fn) {
+            found = inferExpressionType(n.expression);
+            return true;
+        }
+        return false;
+    });
+    return found;
+}
+function delegatedGeneratorReturnType(expr) {
+    if (!expr)
+        return undefined;
+    const bare = unwrapParentheses(expr);
+    if (isCallExpression(bare) && isIdentifier(bare.expression)) {
+        const decl = declaredFunctions.get(bare.expression.text);
+        if (decl?.asteriskToken)
+            return getGeneratorReturnType(decl);
+    }
+    return undefined;
+}
+function generatorResultElementType(receiverNode, elementType, method, arg0) {
+    if (elementType === 'interface{}')
+        return 'interface{}';
+    if (method === 'return' && arg0) {
+        const argType = inferExpressionType(arg0);
+        if (argType && argType !== elementType && argType !== 'nil')
+            return 'interface{}';
+    }
+    if (receiverNode) {
+        const bare = unwrapParentheses(receiverNode);
+        let fnDecl;
+        if (isCallExpression(bare) && isIdentifier(bare.expression)) {
+            fnDecl = declaredFunctions.get(bare.expression.text);
+        }
+        else if (isIdentifier(bare)) {
+            let decl;
+            for (let p = bare.parent; p && !decl; p = p.parent) {
+                if (isBlock(p) || p.kind === 'SourceFile') {
+                    for (const st of p.statements ?? []) {
+                        if (st.kind === 'VariableStatement') {
+                            for (const d of st.declarationList?.declarations ?? []) {
+                                if (isIdentifier(d.name) && d.name.text === bare.text) {
+                                    decl = d;
+                                    break;
+                                }
+                            }
+                        }
+                        if (decl)
+                            break;
+                    }
+                }
+            }
+            decl = decl ?? declaredVariables.get(bare.text);
+            if (decl?.type && isTypeReferenceNode(decl.type) && isIdentifier(decl.type.typeName) && ['Generator', 'AsyncGenerator'].includes(decl.type.typeName.text) && (decl.type.typeArguments ?? []).length > 1) {
+                const retArg = decl.type.typeArguments[1];
+                if (retArg && !['UndefinedKeyword', 'VoidKeyword'].includes(retArg.kind)) {
+                    const t = getType(retArg);
+                    if (t && t !== ':' && t !== elementType)
+                        return 'interface{}';
+                }
+            }
+            else if (decl?.initializer && isCallExpression(unwrapParentheses(decl.initializer))) {
+                const initCall = unwrapParentheses(decl.initializer);
+                if (isIdentifier(initCall.expression))
+                    fnDecl = declaredFunctions.get(initCall.expression.text);
+            }
+        }
+        if (fnDecl?.asteriskToken) {
+            const retType = getGeneratorReturnType(fnDecl);
+            if (retType && retType !== elementType && retType !== 'nil')
+                return 'interface{}';
+        }
+    }
+    return elementType;
 }
 function visitPromiseReturn(node, options) {
     const callback = node.arguments?.[0];
@@ -27224,6 +27405,8 @@ function needPkg(pkg) {
 // Marks a Go helper as used; also registers the packages the helper needs,
 // since the import list is serialized before helpers are emitted.
 const helperRequires = {
+    generatorStep: ['dynamic', 'error'],
+    iterators: ['generatorStep', 'dynamic'],
     generatorSeq: ['generatorStep', 'dynamic', 'arraySubclass'],
     regexReplaceFunc: ['strIndex'],
     replaceAny: ['fancyRegex', 'regexReplaceFunc', 'dynamic'],
@@ -28157,19 +28340,157 @@ func tnSeqCollect[T any](s func(func(T) bool)) []T {
 // yield it waits until the loop body has run for that value (JS resumes a
 // generator only on next()), so the body sees the state the generator saw
 var tnGenAcks sync.Map
+var tnGenCtrls sync.Map
+
+func init() {
+	tnGenWakeFn = TnGenWake
+}
 
 // A generator push form's stop token (one per run: a nested generator's
 // stop passes through the outer one). Not zero-sized, so each is unique
 type tnGenStop struct{ _ byte }
 
+type tnGenCmdKind uint8
+
+const (
+	tnGenCmdNext tnGenCmdKind = iota
+	tnGenCmdReturn
+	tnGenCmdThrow
+)
+
+type tnGenCmd struct {
+	kind tnGenCmdKind
+	val  interface{}
+}
+
+type tnGenReturn struct {
+	val interface{}
+}
+
+type tnGenCtrl struct {
+	in     chan tnGenCmd
+	mu     sync.Mutex
+	done   bool
+	hasRet bool
+	retVal interface{}
+	hasErr bool
+	errVal interface{}
+}
+
+func TnGenStart[T any](ch chan T) *tnGenCtrl {
+	ctrl := &tnGenCtrl{in: make(chan tnGenCmd)}
+	tnGenCtrls.Store(ch, ctrl)
+	return ctrl
+}
+
+func TnGenWake(ch interface{}) {
+	if c, ok := tnGenCtrls.Load(ch); ok {
+		ctrl := c.(*tnGenCtrl)
+		ctrl.mu.Lock()
+		done := ctrl.done
+		ctrl.mu.Unlock()
+		if !done {
+			ctrl.in <- tnGenCmd{kind: tnGenCmdNext}
+		}
+	}
+}
+
+func (c *tnGenCtrl) awaitStart() bool {
+	cmd := <-c.in
+	switch cmd.kind {
+	case tnGenCmdReturn:
+		c.mu.Lock()
+		c.hasRet = true
+		c.retVal = cmd.val
+		c.mu.Unlock()
+		return false
+	case tnGenCmdThrow:
+		if cmd.val == nil {
+			panic(tnGenNilErr{})
+		}
+		panic(cmd.val)
+	default:
+		return true
+	}
+}
+
+func (c *tnGenCtrl) finishDone() {
+	c.mu.Lock()
+	c.done = true
+	c.mu.Unlock()
+}
+
+func (c *tnGenCtrl) finishReturn(val interface{}) {
+	c.mu.Lock()
+	c.hasRet = true
+	c.retVal = val
+	c.done = true
+	c.mu.Unlock()
+}
+
+func (c *tnGenCtrl) finishError(err interface{}) {
+	c.mu.Lock()
+	c.hasErr = true
+	c.errVal = err
+	c.done = true
+	c.mu.Unlock()
+}
+
+func TnGenSetReturn[T any](ch chan T, val interface{}) {
+	if c, ok := tnGenCtrls.Load(ch); ok {
+		ctrl := c.(*tnGenCtrl)
+		ctrl.mu.Lock()
+		ctrl.hasRet = true
+		ctrl.retVal = val
+		ctrl.mu.Unlock()
+	}
+}
+
+func TnGenYieldCmd[T any](ch chan T, val T) tnGenCmd {
+	ch <- val
+	if c, ok := tnGenCtrls.Load(ch); ok {
+		return <-c.(*tnGenCtrl).in
+	}
+	return tnGenCmd{kind: tnGenCmdNext}
+}
+
+func TnGenYield[T any](ch chan T, val T) interface{} {
+	cmd := TnGenYieldCmd(ch, val)
+	switch cmd.kind {
+	case tnGenCmdReturn:
+		panic(tnGenReturn{val: cmd.val})
+	case tnGenCmdThrow:
+		if cmd.val == nil {
+			panic(tnGenNilErr{})
+		}
+		panic(cmd.val)
+	default:
+		return cmd.val
+	}
+}
+
+func tnGenPull[T any](ch chan T) (T, bool) {
+	TnGenWake(ch)
+	v, ok := <-ch
+	return v, ok
+}
+
 // Marks a generator's channel as consumed in step (before its first receive)
 func TnGenLockstep[T any](ch chan T) chan T {
+	if _, ok := tnGenCtrls.Load(ch); ok {
+		TnGenWake(ch)
+		return ch
+	}
 	tnGenAcks.Store(ch, make(chan struct{}, 1))
 	return ch
 }
 
 // The loop body ran for the last value received: the generator may go on
 func TnGenAck[T any](ch chan T) {
+	if _, ok := tnGenCtrls.Load(ch); ok {
+		TnGenWake(ch)
+		return
+	}
 	if ack, ok := tnGenAcks.Load(ch); ok {
 		select {
 		case ack.(chan struct{}) <- struct{}{}:
@@ -28203,10 +28524,141 @@ func TnIterFirst[T any](items []T) *TnIterResult[T] {
 	return &TnIterResult[T]{value: items[0]}
 }
 
-// it.next(): { value, done }
-func TnIterNext[T any](ch chan T) *TnIterResult[T] {
+// it.next() / next(v) / return(v) / throw(e): { value, done }
+func tnIterStep[T any, R any](ch chan T, kind tnGenCmdKind, val interface{}, hasVal bool, toRes func(T) R, castRet func(interface{}) R) *TnIterResult[R] {
+	if c, ok := tnGenCtrls.Load(ch); ok {
+		ctrl := c.(*tnGenCtrl)
+		ctrl.mu.Lock()
+		if ctrl.done {
+			ctrl.mu.Unlock()
+			if kind == tnGenCmdThrow {
+				if val == nil {
+					panic(nil)
+				}
+				panic(val)
+			}
+			if kind == tnGenCmdReturn && hasVal {
+				return &TnIterResult[R]{value: castRet(val), done: true}
+			}
+			return &TnIterResult[R]{done: true}
+		}
+		ctrl.mu.Unlock()
+		ctrl.in <- tnGenCmd{kind: kind, val: val}
+		v, ok := <-ch
+		if ok {
+			return &TnIterResult[R]{value: toRes(v), done: false}
+		}
+		ctrl.mu.Lock()
+		hasErr := ctrl.hasErr
+		errVal := ctrl.errVal
+		ctrl.hasErr = false
+		hasRet := ctrl.hasRet
+		retVal := ctrl.retVal
+		ctrl.hasRet = false
+		ctrl.mu.Unlock()
+		if hasErr {
+			if _, isNil := errVal.(tnGenNilErr); isNil {
+				panic(nil)
+			}
+			panic(errVal)
+		}
+		if hasRet {
+			return &TnIterResult[R]{value: castRet(retVal), done: true}
+		}
+		if kind == tnGenCmdReturn && hasVal {
+			return &TnIterResult[R]{value: castRet(val), done: true}
+		}
+		return &TnIterResult[R]{done: true}
+	}
+	if kind == tnGenCmdThrow {
+		panic(val)
+	}
+	if kind == tnGenCmdReturn {
+		if hasVal {
+			return &TnIterResult[R]{value: castRet(val), done: true}
+		}
+		return &TnIterResult[R]{done: true}
+	}
 	v, ok := <-ch
-	return &TnIterResult[T]{value: v, done: !ok}
+	if ok {
+		return &TnIterResult[R]{value: toRes(v), done: false}
+	}
+	return &TnIterResult[R]{done: true}
+}
+
+func tnIterCast[R any](v interface{}) R {
+	if v == nil {
+		var zero R
+		return zero
+	}
+	return TnAs[R](v)
+}
+
+func tnIterToAny[T any](v T) interface{} { return v }
+func tnIterId[T any](v T) T             { return v }
+func tnIterIdAny(v interface{}) interface{} { return v }
+
+func TnIterNext[T any](ch chan T) *TnIterResult[T] {
+	return tnIterStep[T, T](ch, tnGenCmdNext, nil, false, tnIterId[T], tnIterCast[T])
+}
+
+func TnIterNextVal[T any](ch chan T, val interface{}) *TnIterResult[T] {
+	return tnIterStep[T, T](ch, tnGenCmdNext, val, true, tnIterId[T], tnIterCast[T])
+}
+
+func TnIterReturn[T any](ch chan T, val interface{}, hasVal bool) *TnIterResult[T] {
+	return tnIterStep[T, T](ch, tnGenCmdReturn, val, hasVal, tnIterId[T], tnIterCast[T])
+}
+
+func TnIterThrow[T any](ch chan T, err interface{}) *TnIterResult[T] {
+	return tnIterStep[T, T](ch, tnGenCmdThrow, err, true, tnIterId[T], tnIterCast[T])
+}
+
+func TnIterNextAny[T any](ch chan T, val interface{}) *TnIterResult[interface{}] {
+	return tnIterStep[T, interface{}](ch, tnGenCmdNext, val, false, tnIterToAny[T], tnIterIdAny)
+}
+
+func TnIterReturnAny[T any](ch chan T, val interface{}, hasVal bool) *TnIterResult[interface{}] {
+	return tnIterStep[T, interface{}](ch, tnGenCmdReturn, val, hasVal, tnIterToAny[T], tnIterIdAny)
+}
+
+func TnIterThrowAny[T any](ch chan T, err interface{}) *TnIterResult[interface{}] {
+	return tnIterStep[T, interface{}](ch, tnGenCmdThrow, err, true, tnIterToAny[T], tnIterIdAny)
+}
+
+func TnGenDelegate[T any, S any](outerCh chan T, innerCh chan S, convert func(S) T) interface{} {
+	cmd := tnGenCmd{kind: tnGenCmdNext}
+	for {
+		var res *TnIterResult[interface{}]
+		var panicErr interface{}
+		var panicked bool
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicErr = r
+					panicked = true
+				}
+			}()
+			switch cmd.kind {
+			case tnGenCmdNext:
+				res = TnIterNextAny(innerCh, cmd.val)
+			case tnGenCmdReturn:
+				res = TnIterReturnAny(innerCh, cmd.val, true)
+			case tnGenCmdThrow:
+				res = TnIterThrowAny(innerCh, cmd.val)
+			}
+		}()
+		if panicked {
+			panic(panicErr)
+		}
+		if res.done {
+			if cmd.kind == tnGenCmdReturn {
+				panic(tnGenReturn{val: res.value})
+			}
+			return res.value
+		}
+		cmd = TnGenYieldCmd(outerCh, convert(TnAs[S](res.value)))
+	}
 }
 
 // Iterator.concat(a, b, …): each iterable's values in turn
@@ -28215,7 +28667,11 @@ func TnIterConcat[T any](chs ...chan T) chan T {
 	go func() {
 		defer close(ch)
 		for _, src := range chs {
-			for v := range src {
+			for {
+				v, ok := tnGenPull(src)
+				if !ok {
+					break
+				}
 				ch <- v
 			}
 		}
@@ -28240,7 +28696,11 @@ func TnIterMap[T, U any](ch chan T, fn func(T, float64) U) chan U {
 	go func() {
 		defer close(out)
 		i := 0.0
-		for v := range ch {
+		for {
+			v, ok := tnGenPull(ch)
+			if !ok {
+				break
+			}
 			out <- fn(v, i)
 			i++
 		}
@@ -28253,7 +28713,11 @@ func TnIterFilter[T any](ch chan T, fn func(T, float64) bool) chan T {
 	go func() {
 		defer close(out)
 		i := 0.0
-		for v := range ch {
+		for {
+			v, ok := tnGenPull(ch)
+			if !ok {
+				break
+			}
 			if fn(v, i) {
 				out <- v
 			}
@@ -28268,7 +28732,11 @@ func TnIterFlatMap[T, U any](ch chan T, fn func(T, float64) []U) chan U {
 	go func() {
 		defer close(out)
 		i := 0.0
-		for v := range ch {
+		for {
+			v, ok := tnGenPull(ch)
+			if !ok {
+				break
+			}
 			for _, u := range fn(v, i) {
 				out <- u
 			}
@@ -28286,7 +28754,11 @@ func TnIterTake[T any](ch chan T, n float64) chan T {
 			return
 		}
 		count := 0.0
-		for v := range ch {
+		for {
+			v, ok := tnGenPull(ch)
+			if !ok {
+				break
+			}
 			out <- v
 			count++
 			if count >= n {
@@ -28302,7 +28774,11 @@ func TnIterDrop[T any](ch chan T, n float64) chan T {
 	go func() {
 		defer close(out)
 		count := 0.0
-		for v := range ch {
+		for {
+			v, ok := tnGenPull(ch)
+			if !ok {
+				break
+			}
 			if count >= n {
 				out <- v
 			}
@@ -28314,7 +28790,11 @@ func TnIterDrop[T any](ch chan T, n float64) chan T {
 
 func TnIterToArray[T any](ch chan T) []T {
 	out := []T{}
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		out = append(out, v)
 	}
 	return out
@@ -28322,7 +28802,11 @@ func TnIterToArray[T any](ch chan T) []T {
 
 func TnIterForEach[T any](ch chan T, fn func(T, float64)) {
 	i := 0.0
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		fn(v, i)
 		i++
 	}
@@ -28330,7 +28814,11 @@ func TnIterForEach[T any](ch chan T, fn func(T, float64)) {
 
 func TnIterSome[T any](ch chan T, fn func(T, float64) bool) bool {
 	i := 0.0
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		if fn(v, i) {
 			return true
 		}
@@ -28341,7 +28829,11 @@ func TnIterSome[T any](ch chan T, fn func(T, float64) bool) bool {
 
 func TnIterEvery[T any](ch chan T, fn func(T, float64) bool) bool {
 	i := 0.0
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		if !fn(v, i) {
 			return false
 		}
@@ -28352,7 +28844,11 @@ func TnIterEvery[T any](ch chan T, fn func(T, float64) bool) bool {
 
 func TnIterFind[T any](ch chan T, fn func(T, float64) bool) T {
 	i := 0.0
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		if fn(v, i) {
 			return v
 		}
@@ -28364,7 +28860,11 @@ func TnIterFind[T any](ch chan T, fn func(T, float64) bool) T {
 
 func TnIterReduce[T, A any](ch chan T, fn func(A, T, float64) A, acc A, hasInitial bool) A {
 	i := 0.0
-	for v := range ch {
+	for {
+		v, ok := tnGenPull(ch)
+		if !ok {
+			break
+		}
 		if !hasInitial {
 			if a, ok := interface{}(v).(A); ok {
 				acc = a
@@ -30329,6 +30829,7 @@ func TnProtoMember(obj interface{}, name string) interface{} {
 // function-valued property (an object literal's method, a record's function)
 // then / catch / finally on a promise held as any (set when promises are used)
 var tnDynamicPromiseMethod func(p reflect.Value, name string, args []interface{}) (interface{}, bool)
+var tnGenWakeFn func(interface{})
 
 func TnCallMember(obj interface{}, name string, args ...interface{}) interface{} {
 	// a Map / Set's methods (Get, Set, Has … on the ordered map)
@@ -33916,6 +34417,9 @@ func TnToArray(v interface{}) []interface{} {
 	if rv.Kind() == reflect.Chan {
 		out := []interface{}{}
 		for {
+			if tnGenWakeFn != nil {
+				tnGenWakeFn(v)
+			}
 			x, ok := rv.Recv()
 			if !ok {
 				return out
@@ -38092,7 +38596,12 @@ var tnDOMExceptionCodes = map[string]float64{
 // A Node error: name ('TypeError', 'AssertionError'), code and message
 // A recovered panic as the value a JS catch receives: a Go runtime failure
 // (nil dereference, failed assertion …) is a TypeError
+type tnGenNilErr struct{}
+
 func TnCaught(r interface{}) interface{} {
+	if _, ok := r.(tnGenNilErr); ok {
+		return nil
+	}
 	if e, ok := r.(runtime.Error); ok {
 		return tnCaughtError(e.Error(), 2)
 	}
