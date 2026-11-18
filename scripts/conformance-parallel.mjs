@@ -104,11 +104,14 @@ function runOne({ name, args: jobArgs }) {
         // (a `go build failed:` toolchain error, a log line): a bare exit code
         // says nothing about where it stopped
         const at = lines.findIndex((l) => /\.go:\d+|panic:|Unsupported syntax|Error|error TS\d+|assert|go build failed/.test(l));
+        // A go build failure prints '# command-line-arguments' and an empty
+        // line before the first error, so take a few lines: the reason alone
+        // would name nothing that failed to compile
         const line =
           at < 0
             ? lines.slice(-2).join(' | ')
             : lines[at] === 'go build failed:'
-              ? lines.slice(at, at + 2).join(' ')
+              ? lines.slice(at, at + 4).join(' ')
               : lines[at];
         // taskkill /f exits the tree with 1, so a timeout on Windows otherwise
         // reads as a plain failure

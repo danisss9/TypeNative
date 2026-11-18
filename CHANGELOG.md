@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparison still worked. The React Compiler example's build failed its
   `EnterSSA` entry-block invariant on most fixtures because of it. Such reads
   now fall through to `TnGet`, which answers the collection properties.
+- **A program's own `assert`:** calls of a declared `assert` were lowered to the
+  global assertion's panic statement, so the declaration never ran (its Go
+  function was emitted but called from nowhere) and a failed check surfaced as
+  `panic: <message>` that a `try` / `catch` could not catch. A function,
+  variable, parameter or import named `assert` now shadows the builtin, while
+  an unimported global `assert(...)` keeps the statement form.
 
 ## [0.7.0] - 2026-11-17
 

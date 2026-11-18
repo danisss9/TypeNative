@@ -5734,7 +5734,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     currentReceiverGoType = isPropertyAccessExpression(node.expression)
       ? inferExpressionType(node.expression.expression)
       : undefined;
-    const call = getCallString(safeCaller, args, typeArgs, objectType);
+    const call = getCallString(safeCaller, args, typeArgs, objectType, node);
     const arrayBacks = arrayCallWriteBacks ?? [];
     arrayCallWriteBacks = abSaved;
     return arrayBacks.length > 0 ? wrapArrayCallWriteBacks(node, call, arrayBacks) : call;
@@ -14220,13 +14220,28 @@ function statementOfBranchingExpression(node: AstNode): AstNode | undefined {
   return result;
 }
 
+// Whether the program itself declares this name — a function, a class, a
+// variable, an import or an enclosing binding — shadowing the runtime builtin
+// of the same name (TypeNative's global assert, console…)
+function isUserDeclared(name: string, at: AstNode): boolean {
+  return (
+    declaredFunctions.has(name) ||
+    classNames.has(name) ||
+    variableGoTypes.has(name) ||
+    topLevelGoTypes.has(name) ||
+    importAliases.has(name) ||
+    isLocallyBound(at)
+  );
+}
+
 // An expression-bodied arrow whose callee emits Go statements (no value):
-// console.log(...), assert(...)
+// console.log(...), the global assert(...)
 function isVoidStatementCall(expr: AstNode): boolean {
   if (!isCallExpression(expr)) return false;
   if (isIdentifier(expr.expression)) {
     const name = expr.expression.text;
-    return name === 'assert' || (!!promiseResolveName && name === promiseResolveName) || (!!promiseRejectName && name === promiseRejectName);
+    if (name === 'assert') return !isUserDeclared(name, expr);
+    return (!!promiseResolveName && name === promiseResolveName) || (!!promiseRejectName && name === promiseRejectName);
   }
   return (
     isPropertyAccessExpression(expr.expression) &&
@@ -20789,15 +20804,20 @@ function getCallString(
   caller: string,
   args: string[],
   typeArgs: string = '',
-  objectType?: string
+  objectType?: string,
+  at?: AstNode
 ): string {
   // Parentheses from casts like `(mod as any).fn(...)` are stripped for lookup
   // (own entries only: a plain-object lookup would also find Object.prototype members)
   const bare = caller.replace(/[()]/g, '');
-  const handler =
-    (Object.hasOwn(callHandlers, caller) ? callHandlers[caller] : undefined) ??
-    (Object.hasOwn(callHandlers, bare) ? callHandlers[bare] : undefined) ??
-    getDynamicCallHandler(caller, objectType);
+  // A program's own `assert` (function, variable, parameter…) is a plain call;
+  // only the global assertion lowers to the panic statement
+  const ownAssert = bare === 'assert' && !!at && isUserDeclared('assert', at);
+  const handler = ownAssert
+    ? undefined
+    : (Object.hasOwn(callHandlers, caller) ? callHandlers[caller] : undefined) ??
+      (Object.hasOwn(callHandlers, bare) ? callHandlers[bare] : undefined) ??
+      getDynamicCallHandler(caller, objectType);
   if (handler) {
     return handler(caller, args, typeArgs);
   }

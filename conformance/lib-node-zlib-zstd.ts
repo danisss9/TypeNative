@@ -64,16 +64,24 @@ assert(zstdDecompressSync(Buffer.concat([frame, frame])).toString() === text + t
 
 // ---- async: callback and promisified ----
 const asyncResults: string[] = [];
-async function main(): Promise<void> {
-  await after(0, () => {
-    zstdCompress(big, (err, out) => {
-      assert(err === null && zstdDecompressSync(out).equals(big), 'callback compress');
-      zstdDecompress(frame, (err2, back) => {
-        assert(err2 === null && back.toString() === text, 'callback decompress');
-        asyncResults.push('done');
+// (waits for both callbacks: the codec runs off the loop, so the awaits below
+// say nothing about when they finish)
+function callbackRoundtrip(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    after(0, () => {
+      zstdCompress(big, (err, out) => {
+        assert(err === null && zstdDecompressSync(out).equals(big), 'callback compress');
+        zstdDecompress(frame, (err2, back) => {
+          assert(err2 === null && back.toString() === text, 'callback decompress');
+          asyncResults.push('done');
+          resolve();
+        });
       });
     });
   });
+}
+async function main(): Promise<void> {
+  await callbackRoundtrip();
   const p1 = await promisify(zstdCompress)(Buffer.from(text));
   assert(p1.equals(frame), 'promisified compress');
   const p2 = await promisify(zstdDecompress)(frame);
