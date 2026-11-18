@@ -59,6 +59,27 @@ func tnPermPath(p string) string {
 		p = abs
 	}
 	p = filepath.Clean(p)
+	// Resolve symlinks on the longest existing prefix (macOS /var -> /private/var)
+	// so grants and chdir/cwd paths match even when the leaf does not exist yet.
+	cur := p
+	var tail []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := make([]string, 0, 1+len(tail))
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			p = filepath.Join(parts...)
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
 	if runtime.GOOS == "windows" {
 		p = strings.ToLower(strings.TrimPrefix(p, "\\\\\\\\?\\\\"))
 	}

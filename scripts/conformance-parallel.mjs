@@ -253,8 +253,10 @@ console.log('');
 // can trip over a file another build holds, which says nothing about the
 // probe. One that passes alone is reported as flaky with its first failure,
 // so a real intermittent bug stays visible; one that fails again counts
+const soloRan = new Set([warm?.name, heavy?.name].filter(Boolean));
 const flaky = [];
 for (const f of [...failures]) {
+  if (soloRan.has(f.name)) continue;
   const retry = await runOne(jobs.find((j) => j.name === f.name));
   if (retry === null) {
     flaky.push(f);
