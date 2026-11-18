@@ -308,6 +308,37 @@ declare module 'node:fs' {
 declare module 'node:fs/promises' {
   import fs = require('node:fs');
   namespace promises {
+    interface FilePullOptions {
+      autoClose?: boolean;
+      chunkSize?: number;
+      start?: number;
+      limit?: number;
+      signal?: AbortSignal;
+    }
+    interface FilePullSyncOptions {
+      autoClose?: boolean;
+      chunkSize?: number;
+      start?: number;
+      limit?: number;
+    }
+    interface FileWriterOptions {
+      autoClose?: boolean;
+      chunkSize?: number;
+      start?: number;
+      limit?: number;
+    }
+    interface FileWriter {
+      write(chunk: string | Uint8Array, options?: { signal?: AbortSignal }): Promise<void>;
+      writev(chunks: readonly (string | Uint8Array)[], options?: { signal?: AbortSignal }): Promise<void>;
+      writeSync(chunk: string | Uint8Array): boolean;
+      writevSync(chunks: readonly (string | Uint8Array)[]): boolean;
+      end(options?: { signal?: AbortSignal }): Promise<number>;
+      endSync(): number;
+      fail(reason?: any): void;
+      [Symbol.dispose](): void;
+      [Symbol.asyncDispose](): Promise<void>;
+    }
+    type FilePullTransform = (chunks: Uint8Array[] | null, options?: { signal?: AbortSignal }) => any;
     interface FileHandle {
       readonly fd: number;
       readFile(options?: { encoding?: null } | null): Promise<Buffer>;
@@ -320,6 +351,11 @@ declare module 'node:fs/promises' {
       truncate(len?: number): Promise<void>;
       sync(): Promise<void>;
       close(): Promise<void>;
+      pull(options?: FilePullOptions): AsyncIterable<Uint8Array[]>;
+      pull(...args: (FilePullTransform | FilePullOptions)[]): AsyncIterable<Uint8Array[]>;
+      pullSync(options?: FilePullSyncOptions): Iterable<Uint8Array[]>;
+      pullSync(...args: (FilePullTransform | FilePullSyncOptions)[]): Iterable<Uint8Array[]>;
+      writer(options?: FileWriterOptions): FileWriter;
     }
     const constants: typeof fs.constants;
     function readFile(path: fs.PathLike, options?: { encoding?: null; flag?: string } | null): Promise<Buffer>;

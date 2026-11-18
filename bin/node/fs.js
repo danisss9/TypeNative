@@ -1132,7 +1132,10 @@ func TnFsExists(path string, cb interface{}) {
 
 // fs/promises FileHandle
 type TnFileHandle struct {
-	fd float64
+	fd     float64
+	mu     sync.Mutex
+	closed bool
+	locked bool
 }
 
 type TnFsReadResult struct {
@@ -1202,8 +1205,865 @@ func (h *TnFileHandle) sync() chan struct{} {
 	return TnFsPromiseVoid(func() { TnFsync(h.fd) })
 }
 
+func (h *TnFileHandle) closeSync() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	fd := h.fd
+	h.closed = true
+	h.fd = -1
+	h.mu.Unlock()
+	if fd >= 0 {
+		TnClose(fd)
+	}
+}
+
 func (h *TnFileHandle) close() chan struct{} {
-	return TnFsPromiseVoid(func() { TnClose(h.fd) })
+	return TnFsPromiseVoid(func() { h.closeSync() })
+}
+
+func (h *TnFileHandle) checkAvailable() {
+	h.mu.Lock()
+	closed, locked := h.closed || h.fd < 0, h.locked
+	h.mu.Unlock()
+	if closed {
+		panic(TnNodeError("Error", "ERR_INVALID_STATE", "The FileHandle is closed"))
+	}
+	if locked {
+		panic(TnNodeError("Error", "ERR_INVALID_STATE", "The FileHandle is locked"))
+	}
+}
+
+func (h *TnFileHandle) lockForIteration() float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.fd < 0 {
+		panic(TnNodeError("Error", "ERR_INVALID_STATE", "The FileHandle is closed"))
+	}
+	if h.locked {
+		panic(TnNodeError("Error", "ERR_INVALID_STATE", "The FileHandle is locked"))
+	}
+	h.locked = true
+	return h.fd
+}
+
+func (h *TnFileHandle) unlock() {
+	h.mu.Lock()
+	h.locked = false
+	h.mu.Unlock()
+}
+
+// FileHandle pull / pullSync / writer (stream/iter)
+const tnFsDefaultChunkSize = 131072
+
+type tnFileIterOpts struct {
+	autoClose bool
+	chunkSize int
+	start     int64
+	limit     int64
+	signal    interface{}
+}
+
+func tnFsParseIterOpts(opts interface{}, allowSignal bool) tnFileIterOpts {
+	res := tnFileIterOpts{
+		chunkSize: tnFsDefaultChunkSize,
+		start:     -1,
+		limit:     -1,
+	}
+	if opts == nil {
+		return res
+	}
+	if v := TnGetValue(opts, "autoClose"); v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.autoClose\\" property must be of type boolean"))
+		}
+		res.autoClose = b
+	}
+	if v := TnGetValue(opts, "start"); v != nil {
+		f, ok := v.(float64)
+		if !ok {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.start\\" property must be of type number"))
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < 0 {
+			panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", fmt.Sprintf("The value of \\"options.start\\" is out of range. It must be >= 0. Received %v", f)))
+		}
+		res.start = int64(f)
+	}
+	if v := TnGetValue(opts, "limit"); v != nil {
+		f, ok := v.(float64)
+		if !ok {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.limit\\" property must be of type number"))
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < 1 {
+			panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", fmt.Sprintf("The value of \\"options.limit\\" is out of range. It must be >= 1. Received %v", f)))
+		}
+		res.limit = int64(f)
+	}
+	if v := TnGetValue(opts, "chunkSize"); v != nil {
+		f, ok := v.(float64)
+		if !ok {
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"options.chunkSize\\" property must be of type number"))
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < 1 {
+			panic(TnNodeError("RangeError", "ERR_OUT_OF_RANGE", fmt.Sprintf("The value of \\"options.chunkSize\\" is out of range. It must be >= 1. Received %v", f)))
+		}
+		res.chunkSize = int(f)
+	}
+	if allowSignal {
+		if v := TnGetValue(opts, "signal"); v != nil {
+			res.signal = v
+		}
+	}
+	return res
+}
+
+func tnFsParsePullArgs(args []interface{}, allowSignal bool) ([]interface{}, tnFileIterOpts) {
+	var transforms []interface{}
+	var optsArg interface{}
+	for i, a := range args {
+		if a == nil {
+			continue
+		}
+		if reflect.ValueOf(a).Kind() == reflect.Func {
+			transforms = append(transforms, a)
+			continue
+		}
+		if i == len(args)-1 {
+			optsArg = a
+		}
+	}
+	return transforms, tnFsParseIterOpts(optsArg, allowSignal)
+}
+
+func tnFsReadChunk(fd float64, toRead int, pos int64) []byte {
+	f := tnFile(fd)
+	buf := make([]byte, toRead)
+	var n int
+	var err error
+	if pos >= 0 {
+		n, err = f.ReadAt(buf, pos)
+	} else {
+		n, err = f.Read(buf)
+	}
+	if err != nil && err != io.EOF {
+		tnFsCheck(err, "read", "")
+	}
+	if n == 0 {
+		return nil
+	}
+	return buf[:n]
+}
+
+func tnFsToBytes(v interface{}) ([]byte, *TnError) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		return []byte(x), nil
+	}
+	return nil, TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"chunk\\" argument must be an instance of Uint8Array or a string")
+}
+
+func tnFsToByteSlice(v interface{}) ([][]byte, *TnError) {
+	switch x := v.(type) {
+	case [][]byte:
+		return x, nil
+	case []string:
+		out := make([][]byte, len(x))
+		for i, s := range x {
+			out[i] = []byte(s)
+		}
+		return out, nil
+	case []interface{}:
+		out := make([][]byte, len(x))
+		for i, el := range x {
+			b, err := tnFsToBytes(el)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = b
+		}
+		return out, nil
+	}
+	return nil, TnNodeError("TypeError", "ERR_INVALID_ARG_TYPE", "The \\"chunks\\" argument must be an array of Uint8Array or string")
+}
+
+func tnFsNormalizeBatch(v interface{}) [][]byte {
+	if v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case [][]byte:
+		if len(x) == 0 {
+			return nil
+		}
+		return x
+	case []byte:
+		return [][]byte{x}
+	case string:
+		return [][]byte{[]byte(x)}
+	case []string:
+		if len(x) == 0 {
+			return nil
+		}
+		out := make([][]byte, len(x))
+		for i, s := range x {
+			out[i] = []byte(s)
+		}
+		return out
+	case []interface{}:
+		if len(x) == 0 {
+			return nil
+		}
+		out := make([][]byte, 0, len(x))
+		for _, el := range x {
+			if b, err := tnFsToBytes(el); err == nil {
+				out = append(out, b)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
+}
+
+func tnFsApplyTransforms(transforms []interface{}, batch [][]byte, async bool, signal interface{}) [][]byte {
+	if len(transforms) == 0 {
+		return batch
+	}
+	cur := batch
+	var arg interface{}
+	if cur != nil {
+		arg = cur
+	}
+	for _, tr := range transforms {
+		var res interface{}
+		if async && signal != nil {
+			res = TnInvoke(tr, arg, map[string]interface{}{"signal": signal})
+		} else {
+			res = TnInvoke(tr, arg)
+		}
+		if async {
+			res = TnAwaitValue(res, false)
+		}
+		cur = tnFsNormalizeBatch(res)
+		if cur == nil {
+			return nil
+		}
+		arg = cur
+	}
+	return cur
+}
+
+func tnFsFlushTransforms(transforms []interface{}, async bool, signal interface{}, emit func([][]byte) bool) {
+	for i, tr := range transforms {
+		var res interface{}
+		if async && signal != nil {
+			res = TnInvoke(tr, nil, map[string]interface{}{"signal": signal})
+		} else {
+			res = TnInvoke(tr, nil)
+		}
+		if async {
+			res = TnAwaitValue(res, false)
+		}
+		cur := tnFsNormalizeBatch(res)
+		if cur != nil && i+1 < len(transforms) {
+			cur = tnFsApplyTransforms(transforms[i+1:], cur, async, signal)
+		}
+		if len(cur) > 0 {
+			if !emit(cur) {
+				return
+			}
+		}
+	}
+}
+
+type TnFilePull struct {
+	handle     *TnFileHandle
+	opts       tnFileIterOpts
+	transforms []interface{}
+}
+
+func (h *TnFileHandle) pull(args ...interface{}) *TnFilePull {
+	h.checkAvailable()
+	transforms, opts := tnFsParsePullArgs(args, true)
+	return &TnFilePull{handle: h, opts: opts, transforms: transforms}
+}
+
+func (p *TnFilePull) tnIterator() iter.Seq[[][]byte] {
+	return func(yield func([][]byte) bool) {
+		fd := p.handle.lockForIteration()
+		TnLoopRef()
+		defer func() {
+			p.handle.unlock()
+			TnLoopUnref()
+			if p.opts.autoClose {
+				p.handle.closeSync()
+			}
+		}()
+		pos := p.opts.start
+		remaining := p.opts.limit
+		readSize := p.opts.chunkSize
+		signal := p.opts.signal
+		for remaining != 0 {
+			if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+				panic(TnGetValue(signal, "reason"))
+			}
+			toRead := readSize
+			if remaining > 0 && int64(toRead) > remaining {
+				toRead = int(remaining)
+			}
+			curPos := pos
+			chunk := TnAwait(TnFsPromise(func() []byte {
+				return tnFsReadChunk(fd, toRead, curPos)
+			}))
+			if len(chunk) == 0 {
+				break
+			}
+			if pos >= 0 {
+				pos += int64(len(chunk))
+			}
+			if remaining > 0 {
+				remaining -= int64(len(chunk))
+			}
+			batch := tnFsApplyTransforms(p.transforms, [][]byte{chunk}, true, signal)
+			if len(batch) > 0 {
+				if !yield(batch) {
+					return
+				}
+			}
+		}
+		if len(p.transforms) > 0 {
+			tnFsFlushTransforms(p.transforms, true, signal, yield)
+		}
+	}
+}
+
+type TnFilePullSync struct {
+	handle     *TnFileHandle
+	opts       tnFileIterOpts
+	transforms []interface{}
+}
+
+func (h *TnFileHandle) pullSync(args ...interface{}) *TnFilePullSync {
+	h.checkAvailable()
+	transforms, opts := tnFsParsePullArgs(args, false)
+	return &TnFilePullSync{handle: h, opts: opts, transforms: transforms}
+}
+
+func (p *TnFilePullSync) tnIterator() iter.Seq[[][]byte] {
+	return func(yield func([][]byte) bool) {
+		fd := p.handle.lockForIteration()
+		defer func() {
+			p.handle.unlock()
+			if p.opts.autoClose {
+				p.handle.closeSync()
+			}
+		}()
+		pos := p.opts.start
+		remaining := p.opts.limit
+		readSize := p.opts.chunkSize
+		for remaining != 0 {
+			toRead := readSize
+			if remaining > 0 && int64(toRead) > remaining {
+				toRead = int(remaining)
+			}
+			chunk := tnFsReadChunk(fd, toRead, pos)
+			if len(chunk) == 0 {
+				break
+			}
+			if pos >= 0 {
+				pos += int64(len(chunk))
+			}
+			if remaining > 0 {
+				remaining -= int64(len(chunk))
+			}
+			batch := tnFsApplyTransforms(p.transforms, [][]byte{chunk}, false, nil)
+			if len(batch) > 0 {
+				if !yield(batch) {
+					return
+				}
+			}
+		}
+		if len(p.transforms) > 0 {
+			tnFsFlushTransforms(p.transforms, false, nil, yield)
+		}
+	}
+}
+
+type TnFileWriter struct {
+	handle            *TnFileHandle
+	fd                float64
+	mu                sync.Mutex
+	autoClose         bool
+	pos               int64
+	bytesRemaining    int64
+	syncThreshold     int
+	totalBytesWritten int64
+	closed            bool
+	closing           bool
+	errored           bool
+	released          bool
+	errVal            interface{}
+	asyncPending      int
+	writeTail         chan struct{}
+	endDone           chan struct{}
+}
+
+func (h *TnFileHandle) writer(options ...interface{}) *TnFileWriter {
+	h.checkAvailable()
+	var optsArg interface{}
+	if len(options) > 0 {
+		optsArg = options[0]
+	}
+	opts := tnFsParseIterOpts(optsArg, false)
+	fd := h.lockForIteration()
+	TnLoopRef()
+	return &TnFileWriter{
+		handle:         h,
+		fd:             fd,
+		autoClose:      opts.autoClose,
+		pos:            opts.start,
+		bytesRemaining: opts.limit,
+		syncThreshold:  opts.chunkSize,
+	}
+}
+
+func (w *TnFileWriter) releaseLocked() {
+	if w.released {
+		return
+	}
+	w.released = true
+	w.handle.unlock()
+	TnLoopUnref()
+	if w.autoClose {
+		w.handle.closeSync()
+	}
+}
+
+func (w *TnFileWriter) writeBufAll(b []byte, position int64) (int64, error) {
+	f := tnFile(w.fd)
+	var written int64
+	for len(b) > 0 {
+		var n int
+		var err error
+		if position >= 0 {
+			n, err = f.WriteAt(b, position)
+		} else {
+			n, err = f.Write(b)
+		}
+		written += int64(n)
+		if position >= 0 {
+			position += int64(n)
+		}
+		b = b[n:]
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func tnFsWriterSignal(options []interface{}) interface{} {
+	if len(options) > 0 && options[0] != nil {
+		return TnGetValue(options[0], "signal")
+	}
+	return nil
+}
+
+func tnFsReject[T any](reason interface{}) chan T {
+	ch := make(chan T, 1)
+	TnReject(ch, reason)
+	return ch
+}
+
+func (w *TnFileWriter) write(chunk interface{}, options ...interface{}) chan struct{} {
+	b, typeErr := tnFsToBytes(chunk)
+	if typeErr != nil {
+		panic(typeErr)
+	}
+	signal := tnFsWriterSignal(options)
+	w.mu.Lock()
+	if w.errored {
+		reason := w.errVal
+		w.mu.Unlock()
+		return tnFsReject[struct{}](reason)
+	}
+	if w.closed {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("TypeError", "ERR_INVALID_STATE", "The writer is closed"))
+	}
+	if w.closing {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("TypeError", "ERR_INVALID_STATE", "The writer is closing"))
+	}
+	if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnGetValue(signal, "reason"))
+	}
+	if w.bytesRemaining >= 0 && int64(len(b)) > w.bytesRemaining {
+		rem := w.bytesRemaining
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("RangeError", "ERR_OUT_OF_RANGE", fmt.Sprintf("The value of \\"write\\" is out of range. It must be <= %d bytes. Received %d", rem, len(b))))
+	}
+	if w.bytesRemaining > 0 {
+		w.bytesRemaining -= int64(len(b))
+	}
+	position := w.pos
+	if w.pos >= 0 {
+		w.pos += int64(len(b))
+	}
+	prev := w.writeTail
+	next := make(chan struct{})
+	w.writeTail = next
+	w.asyncPending++
+	w.mu.Unlock()
+
+	ch := make(chan struct{}, 1)
+	TnLoopRef()
+	go func() {
+		defer TnLoopUnref()
+		if prev != nil {
+			<-prev
+		}
+		defer func() {
+			w.mu.Lock()
+			w.asyncPending--
+			if w.errored && w.asyncPending == 0 {
+				w.releaseLocked()
+			}
+			w.mu.Unlock()
+			close(next)
+		}()
+		w.mu.Lock()
+		if w.errored {
+			reason := w.errVal
+			w.mu.Unlock()
+			TnReject(ch, reason)
+			return
+		}
+		w.mu.Unlock()
+		if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+			TnReject(ch, TnGetValue(signal, "reason"))
+			return
+		}
+		written, err := w.writeBufAll(b, position)
+		w.mu.Lock()
+		w.totalBytesWritten += written
+		w.mu.Unlock()
+		if err != nil {
+			TnReject(ch, TnSysError(err, "write", ""))
+			return
+		}
+		TnAsyncSend(ch, struct{}{})
+	}()
+	return ch
+}
+
+func (w *TnFileWriter) writev(chunks interface{}, options ...interface{}) chan struct{} {
+	list, typeErr := tnFsToByteSlice(chunks)
+	if typeErr != nil {
+		panic(typeErr)
+	}
+	totalSize := 0
+	for _, b := range list {
+		totalSize += len(b)
+	}
+	signal := tnFsWriterSignal(options)
+	w.mu.Lock()
+	if w.errored {
+		reason := w.errVal
+		w.mu.Unlock()
+		return tnFsReject[struct{}](reason)
+	}
+	if w.closed {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("TypeError", "ERR_INVALID_STATE", "The writer is closed"))
+	}
+	if w.closing {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("TypeError", "ERR_INVALID_STATE", "The writer is closing"))
+	}
+	if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnGetValue(signal, "reason"))
+	}
+	if w.bytesRemaining >= 0 && int64(totalSize) > w.bytesRemaining {
+		rem := w.bytesRemaining
+		w.mu.Unlock()
+		return tnFsReject[struct{}](TnNodeError("RangeError", "ERR_OUT_OF_RANGE", fmt.Sprintf("The value of \\"writev\\" is out of range. It must be <= %d bytes. Received %d", rem, totalSize)))
+	}
+	if w.bytesRemaining > 0 {
+		w.bytesRemaining -= int64(totalSize)
+	}
+	position := w.pos
+	if w.pos >= 0 {
+		w.pos += int64(totalSize)
+	}
+	prev := w.writeTail
+	next := make(chan struct{})
+	w.writeTail = next
+	w.asyncPending++
+	w.mu.Unlock()
+
+	joined := make([]byte, 0, totalSize)
+	for _, b := range list {
+		joined = append(joined, b...)
+	}
+	ch := make(chan struct{}, 1)
+	TnLoopRef()
+	go func() {
+		defer TnLoopUnref()
+		if prev != nil {
+			<-prev
+		}
+		defer func() {
+			w.mu.Lock()
+			w.asyncPending--
+			if w.errored && w.asyncPending == 0 {
+				w.releaseLocked()
+			}
+			w.mu.Unlock()
+			close(next)
+		}()
+		w.mu.Lock()
+		if w.errored {
+			reason := w.errVal
+			w.mu.Unlock()
+			TnReject(ch, reason)
+			return
+		}
+		w.mu.Unlock()
+		if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+			TnReject(ch, TnGetValue(signal, "reason"))
+			return
+		}
+		written, err := w.writeBufAll(joined, position)
+		w.mu.Lock()
+		w.totalBytesWritten += written
+		w.mu.Unlock()
+		if err != nil {
+			TnReject(ch, TnSysError(err, "write", ""))
+			return
+		}
+		TnAsyncSend(ch, struct{}{})
+	}()
+	return ch
+}
+
+func (w *TnFileWriter) writeSync(chunk interface{}) bool {
+	b, typeErr := tnFsToBytes(chunk)
+	if typeErr != nil {
+		panic(typeErr)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.errored || w.closed || w.closing || w.asyncPending > 0 {
+		return false
+	}
+	if len(b) > w.syncThreshold {
+		return false
+	}
+	if len(b) == 0 {
+		return true
+	}
+	if w.bytesRemaining >= 0 && int64(len(b)) > w.bytesRemaining {
+		return false
+	}
+	written, err := w.writeBufAll(b, w.pos)
+	w.totalBytesWritten += written
+	if w.pos >= 0 {
+		w.pos += written
+	}
+	if err != nil {
+		if written == 0 {
+			return false
+		}
+		panic(TnSysError(err, "write", ""))
+	}
+	if w.bytesRemaining > 0 {
+		w.bytesRemaining -= int64(len(b))
+	}
+	return true
+}
+
+func (w *TnFileWriter) writevSync(chunks interface{}) bool {
+	list, typeErr := tnFsToByteSlice(chunks)
+	if typeErr != nil {
+		panic(typeErr)
+	}
+	totalSize := 0
+	for _, b := range list {
+		totalSize += len(b)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.errored || w.closed || w.closing || w.asyncPending > 0 {
+		return false
+	}
+	if totalSize > w.syncThreshold {
+		return false
+	}
+	if totalSize == 0 {
+		return true
+	}
+	if w.bytesRemaining >= 0 && int64(totalSize) > w.bytesRemaining {
+		return false
+	}
+	joined := make([]byte, 0, totalSize)
+	for _, b := range list {
+		joined = append(joined, b...)
+	}
+	written, err := w.writeBufAll(joined, w.pos)
+	w.totalBytesWritten += written
+	if w.pos >= 0 {
+		w.pos += written
+	}
+	if err != nil {
+		if written == 0 {
+			return false
+		}
+		panic(TnSysError(err, "write", ""))
+	}
+	if w.bytesRemaining > 0 {
+		w.bytesRemaining -= int64(totalSize)
+	}
+	return true
+}
+
+func (w *TnFileWriter) end(options ...interface{}) chan float64 {
+	signal := tnFsWriterSignal(options)
+	w.mu.Lock()
+	if w.errored {
+		reason := w.errVal
+		w.mu.Unlock()
+		return tnFsReject[float64](reason)
+	}
+	if w.closed {
+		total := float64(w.totalBytesWritten)
+		w.mu.Unlock()
+		ch := make(chan float64, 1)
+		TnAsyncSend(ch, total)
+		return ch
+	}
+	if w.closing {
+		done := w.endDone
+		w.mu.Unlock()
+		ch := make(chan float64, 1)
+		TnLoopRef()
+		go func() {
+			defer TnLoopUnref()
+			<-done
+			w.mu.Lock()
+			errored, reason, total := w.errored, w.errVal, float64(w.totalBytesWritten)
+			w.mu.Unlock()
+			if errored {
+				TnReject(ch, reason)
+			} else {
+				TnAsyncSend(ch, total)
+			}
+		}()
+		return ch
+	}
+	if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+		w.mu.Unlock()
+		return tnFsReject[float64](TnGetValue(signal, "reason"))
+	}
+	w.closing = true
+	prev := w.writeTail
+	done := make(chan struct{})
+	w.endDone = done
+	w.mu.Unlock()
+
+	ch := make(chan float64, 1)
+	TnLoopRef()
+	go func() {
+		defer TnLoopUnref()
+		if prev != nil {
+			<-prev
+		}
+		w.mu.Lock()
+		if w.errored {
+			reason := w.errVal
+			w.mu.Unlock()
+			close(done)
+			TnReject(ch, reason)
+			return
+		}
+		w.releaseLocked()
+		w.closing = false
+		w.closed = true
+		total := float64(w.totalBytesWritten)
+		w.mu.Unlock()
+		close(done)
+		TnAsyncSend(ch, total)
+	}()
+	return ch
+}
+
+func (w *TnFileWriter) endSync() float64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.errored || w.closing || w.asyncPending > 0 {
+		return -1
+	}
+	if w.closed {
+		return float64(w.totalBytesWritten)
+	}
+	w.closed = true
+	w.releaseLocked()
+	return float64(w.totalBytesWritten)
+}
+
+func (w *TnFileWriter) fail(reason ...interface{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.errored {
+		return
+	}
+	w.errored = true
+	w.closing = false
+	w.closed = true
+	if len(reason) > 0 && reason[0] != nil {
+		w.errVal = reason[0]
+	} else {
+		w.errVal = TnNodeError("Error", "ERR_INVALID_STATE", "The writer has failed")
+	}
+	if w.asyncPending == 0 {
+		w.releaseLocked()
+	}
+}
+
+func (w *TnFileWriter) __dispose() {
+	w.fail()
+}
+
+func (w *TnFileWriter) __asyncDispose() chan struct{} {
+	w.mu.Lock()
+	closing, done := w.closing, w.endDone
+	w.mu.Unlock()
+	if closing && done != nil {
+		ch := make(chan struct{}, 1)
+		TnLoopRef()
+		go func() {
+			defer TnLoopUnref()
+			<-done
+			TnAsyncSend(ch, struct{}{})
+		}()
+		return ch
+	}
+	w.fail()
+	ch := make(chan struct{}, 1)
+	TnAsyncSend(ch, struct{}{})
+	return ch
 }`;
 // Async names → their sync emitters
 const FS_ASYNC = [
@@ -1251,8 +2111,13 @@ function syncResultType(r, syncKey, call) {
 function registerFsAsync(r) {
     defineModule(r, 'fs/promises');
     r.namespaces['fs.promises'] = 'fs/promises';
-    defineHelper(r, 'nodeFsAsync', ['fmt', 'io'], ['nodeFs', 'eventLoop', 'promise', 'nodeInvoke'], fsAsyncHelper);
-    defineClass(r, 'fs/promises.FileHandle', '*TnFileHandle', 'class', 'writeFile=chan struct{}; appendFile=chan struct{}; read=chan *TnFsReadResult; write=chan *TnFsWriteResult; stat=chan *TnStats; truncate=chan struct{}; sync=chan struct{}; close=chan struct{}', '', 'fd=float64', '');
+    defineHelper(r, 'nodeFsAsync', ['fmt', 'io', 'iter', 'math', 'reflect', 'sync'], ['nodeFs', 'eventLoop', 'promise', 'nodeInvoke'], fsAsyncHelper);
+    defineClass(r, 'fs/promises.FileHandle', '*TnFileHandle', 'class', 'writeFile=chan struct{}; appendFile=chan struct{}; read=chan *TnFsReadResult; write=chan *TnFsWriteResult; stat=chan *TnStats; truncate=chan struct{}; sync=chan struct{}; close=chan struct{}; pull=*TnFilePull; pullSync=*TnFilePullSync; writer=*TnFileWriter', '', 'fd=float64', '');
+    defineClass(r, 'fs/promises.FilePull', '*TnFilePull', 'class', 'tnIterator=iter.Seq[[][]byte]', '', '', '');
+    defineClass(r, 'fs/promises.FilePullSync', '*TnFilePullSync', 'class', 'tnIterator=iter.Seq[[][]byte]', '', '', '');
+    defineClass(r, 'fs/promises.FileWriter', '*TnFileWriter', 'class', 'write=chan struct{}; writev=chan struct{}; writeSync=bool; writevSync=bool; end=chan float64; endSync=float64; fail=; __dispose=; __asyncDispose=chan struct{}', '', '', '');
+    r.iterators['*TnFilePull'] = 'tnIterator';
+    r.iterators['*TnFilePullSync'] = 'tnIterator';
     defineClass(r, 'fs.ReadResult', '*TnFsReadResult', 'class', '', 'bytesRead=float64; buffer=[]byte', '', '');
     defineClass(r, 'fs.WriteResult', '*TnFsWriteResult', 'class', '', 'bytesWritten=float64; buffer=interface{}', '', '');
     r.methods['fs/promises.FileHandle#readFile'] = (c) => {

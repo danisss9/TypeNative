@@ -130,6 +130,9 @@ interface AsyncGenerator<T = any, TReturn = any, TNext = any> extends AsyncItera
 interface Disposable {
   [Symbol.dispose](): void;
 }
+interface AsyncDisposable {
+  [Symbol.asyncDispose](): Promise<void>;
+}
 
 // await unwraps one thenable layer at a time (TypeScript's own definition,
 // which the checker relates to T for generic T)

@@ -9547,7 +9547,9 @@ function visitUsingDeclaration(statement: AstNode, rest: AstNode[]): string {
       const goType = inferExpressionType(d.initializer) ?? '';
       const className = goType.replace(/^\*/, '').replace(/\[.*$/, '');
       const classNode = declaredClasses.get(className);
-      const hasAsync = (classNode?.members ?? []).some((m: AstNode) => m.name?.text === '__asyncDispose');
+      const hasAsync =
+        (classNode?.members ?? []).some((m: AstNode) => m.name?.text === '__asyncDispose') ||
+        !!nodeRegistry.classes[nodeRegistry.classByGoType[goType]]?.methods['__asyncDispose'];
       if (isAwait && hasAsync) useHelper('promise');
       // The disposal may run on an async fn's goroutine or inline in a callback
       const awaitFn =
@@ -40803,6 +40805,7 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     }
     if (declaration && isIdentifier(declaration.name)) {
       const loopVar = bindIterVar(declaration.name, goIterElem(iterType));
+      if (loopVar !== '_' && !prefix) prefix = `_ = ${loopVar}\n\t\t`;
       return `for ${loopVar} := range ${iterExpr}${visitLoopBody(node.statement, prefix)}`;
     }
     return `for _ = range ${iterExpr}${visitLoopBody(node.statement)}`;
