@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-19
+
+### Added
+
+- **Generator control flow:** capturing a `yield`'s value
+  (`const v = yield x`), `next(value)` (sending a value in), `return(value)`
+  (unwinding the generator's `finally` blocks), `throw(err)`, and `yield*`
+  delegation to another generator or iterable (`syntax-generator-control.ts`).
+  Generators were goroutines feeding a channel, so values only flowed out.
+- **Stage 3 decorators:** field, `accessor`, getter/setter and parameter
+  decorators alongside the existing method and class decorators, with
+  `context.access`, `context.addInitializer` and `Symbol.metadata`, including
+  across inheritance (`syntax-decorators-stage3.ts`). Field and accessor
+  decorators previously failed the type check
+  (`ClassFieldDecoratorContext` / `ClassAccessorDecoratorContext` were not
+  declared).
+- **`FileHandle` `pull` / `pullSync` / `writer`:** `pull` / `pullSync` yield
+  `Uint8Array[]` batches with `start` / `limit` / `chunkSize` / `autoClose`, a
+  `signal` on `pull`, stateless transforms (sync or async) with a `null`
+  flush, and lazy handle locking; `writer` supports `write` / `writev` /
+  `writeSync` / `writevSync` / `end` / `endSync` / `fail`, `using` /
+  `await using` disposal, and eager locking
+  (`lib-node-fs-filehandle-iter.ts`). Node 26.13 ships these behind
+  `--experimental-stream-iter`.
+- **`node:zlib/iter` — iterable compression:** sync and async stateful
+  transforms (`{ transform }`) — `compressGzip(Sync)` / `decompressGzip(Sync)`
+  and the Deflate / Brotli / Zstd variants — with default streaming levels
+  (`4` for gzip / deflate, quality `6` for brotli, `3` for zstd),
+  `AbortSignal`, `maxOutputLength`, lazy codec linking, and
+  `FileHandle.pull` / `pullSync` pipeline support
+  (`lib-node-zlib-iter.ts`). Node 26.13 needs `--experimental-stream-iter`.
+- **Histogram statistics over HdrHistogram bucketed counts:** `percentileCI` /
+  `meanCI` (exact order-statistic and Student-t intervals), `ewma*` /
+  `burnRate` (the EWMA over `recordDelta`), `welchTest` / `ksTest` /
+  `mannWhitneyTest` / `cohensD` / `cliffsD`, `linearBuckets` / `logBuckets` /
+  `qrde` (Harrell-Davis), `diff`, the CBOR v2 `export` / `importHistogram`
+  blob format, and `createSlidingWindowHistogram` (lazy time / count-rotated
+  windows with chunk timers) (`lib-node-perf-histogram.ts`). Recordings now
+  keep HdrHistogram's significant-figures bucketing, so `cdf` / `ccdf` /
+  `countAt` / `skewness` / `kurtosis` / `snapshot` / `recordCorrected` /
+  `add` / `subtract` answer over bucketed counts instead of a list of raw
+  values.
+- **`node:test` `'test:interrupted'` and cross-platform SIGINT delivery:** the
+  event is emitted when `SIGINT` arrives mid-run — in standalone tests and in
+  `run()`'s `TestsStream` — listing the active tests for the `tap` and `spec`
+  reporters; `child.kill('SIGINT')` / `process.kill(pid, 'SIGINT')` deliver
+  `SIGINT` on Unix and, on Windows, `CTRL_BREAK_EVENT` into the child's
+  process group (`CREATE_NEW_PROCESS_GROUP`)
+  (`lib-node-test-interrupted.ts`).
+- **`node:sqlite` sessions:** `createSession` / `applyChangeset`, emulated
+  over SQLite's preupdate hook (the bundled SQLite build has no session
+  extension) — wire-compatible binary changesets (`'T'`) and patchsets
+  (`'P'`), `filter`, `onConflict`, `close` / `dispose`
+  (`lib-node-sqlite-session.ts`).
+- **`node:sqlite` virtual tables:** `database.createModule(name, options)`
+  (Node 26.11) — `columns` (`INTEGER` / `TEXT` / `REAL` / `BLOB` / `ANY`,
+  `hidden`), `rows` (arrays, generators, iterables), `directOnly` and
+  `useBigIntArguments`, registered as an eponymous virtual table /
+  table-valued function (`lib-node-sqlite-vtab.ts`).
+- **`@webviewjs/webview` desktop surface — menus, tray icons, notifications,
+  IPC, custom protocols and window controls** on Windows' embedded WebView2
+  (native Win32; other platforms, and Windows without the WebView2 runtime,
+  still open Chrome, Edge or Chromium as an app window):
+  - Window controls: `show`, `hide`, `focus`, `setSize`, `setMinSize`,
+    `setMaxSize`, `setPosition`, `center`, `setMaximized`, `setMinimized`,
+    `setFullscreen`, `setResizable`, `setDecorations`, `setClosable`,
+    `setMaximizable`, `setMinimizable`, `setAlwaysOnTop`,
+    `setAlwaysOnBottom`, `setContentProtection`, `setSkipTaskbar`,
+    `setEnable`, `startDragging`, `openFileDialog`, and the geometry / state
+    getters. In browser app windows they track state only.
+  - Menus: `app.setMenu`, `BrowserWindowOptions.menu`, `win.hasMenu` and
+    `'custom-menu-click'` — a native Win32 menu bar and popup menus with
+    submenus, separators, accelerators and roles.
+  - Tray icons: `app.createTrayIcon` and the `TrayIcon` methods with
+    `click` / `double-click` events — a native `Shell_NotifyIconW` icon with
+    PNG / RGBA icon decoding, tooltips and context menus.
+  - Notifications: `new Notification`, `permission`, `requestPermission` and
+    `show` / `click` / `close` — Win32 balloon notifications (`osascript` on
+    macOS, `notify-send` on Linux).
+  - IPC: `view.onIpcMessage` and `view.expose` (sync and async methods,
+    static properties) over embedded WebView2 — `window.ipc.postMessage`
+    (configurable via `ipcName`) and the `window.__webviewjs__` RPC.
+  - Custom protocols: `win.registerProtocol`,
+    `WebContext.isCustomProtocolRegistered` and the URI helpers, through
+    WebView2's `WebResourceRequested` interception, supporting Fetch
+    `Response` and `CustomProtocolResponse`.
+  - Webviews: `view.loadUrl`, `loadHtml`, `evaluateScript`, `reload`, `url`,
+    `zoom`, `setWebviewVisibility`, `focus` and `dispose` (`loadUrl`,
+    `loadHtml`, `evaluateScript` and `reload` throw
+    `ERR_WEBVIEW_UNSUPPORTED` in browser app windows).
+  - Events: `ready`, `window-close-requested`, `application-close-requested`,
+    `custom-menu-click`, and window `close` / `resize` / `move` / `focus` /
+    `blur` (a close from the program still skips `close` and
+    `window-close-requested`, as in the package).
+
 ### Fixed
 
 - **`size` / `length` on a `Set` or `Map` read as a reference:** `undefined`.
@@ -23,6 +118,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `panic: <message>` that a `try` / `catch` could not catch. A function,
   variable, parameter or import named `assert` now shadows the builtin, while
   an unimported global `assert(...)` keeps the statement form.
+- **Multiple consumers on a settled promise:** `.then` / `.catch` /
+  `.finally` callbacks and `await` on a settled `Promise.resolve(v)` held in a
+  variable — a channel has one consumer, so a `.then` registered before
+  `await p` never fired (skip the `await`, or build it with `new Promise`).
+  Promises now store their settled value and close their channel, so any
+  number of `.then` callbacks and `await`s receive it
+  (`lib-promise-resolve.ts`).
+- **Microtask order:** `await` inside an async function nobody awaits resumed
+  synchronously, and `.then` callbacks could run after a later
+  `setTimeout(…, 0)`. `await` now yields a microtask tick
+  (`tnYieldMicrotask`) so unawaited async functions never resume
+  synchronously, and `TnRunMicrotasks` drains `.then` / `.catch` / `.finally`
+  callbacks and promise continuations before timers
+  (`async-microtask-order.ts`).
+- **An array passed through a function-typed value (a callback slot) is now
+  shared with the callee:** a function type's array parameters were plain
+  slices, so the callee got a copy — its `push` didn't reach the caller (the
+  assignment itself compiled: an adapter passed the array's address, but the
+  copy remained). A function type's array parameters are now references
+  (`*[]T`), matching declared functions, so `push`, `pop`, `length` and
+  element writes in the callee reach the caller
+  (`semantics-callback-array-sharing.ts`).
+- **Generator and async follow-ups:** `for await…of` over a class whose
+  `Symbol.iterator` is a generator used the synchronous seq path instead of
+  the awaited channel; a generator's `yield` type was inferred from the
+  surrounding function rather than the generator being emitted; helpers that
+  read a settled promise (`assert.rejects` / `doesNotReject`,
+  `util.callbackify`, `Readable.from` over iterables) closed or drained the
+  channel directly instead of the settled-value and wake APIs; and emitted Go
+  files imported the packages of every registered helper instead of only the
+  used ones.
 
 ## [0.7.0] - 2026-11-17
 
