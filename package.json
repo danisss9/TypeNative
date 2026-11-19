@@ -7,9 +7,18 @@
     "typenative": "bin/cli.js"
   },
   "types": "./index.d.ts",
+  "files": [
+    "bin/",
+    "govendor/",
+    "types/",
+    "index.d.ts",
+    "go.d.ts",
+    "npm.d.ts"
+  ],
   "scripts": {
     "prebuild": "node scripts/gen-version.mjs",
     "build": "tsc",
+    "prepare": "npm run build",
     "prewatch": "node scripts/gen-version.mjs",
     "watch": "tsc --watch",
     "build:native": "node scripts/build-native.mjs",

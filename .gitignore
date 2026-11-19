@@ -92,3 +92,5 @@ examples/*/.cache
 tsconfig.tmp-intl.json
 # scratch files of in-progress work (spec dumps, build output)
 conformance/_tmp/
+# compiled TypeScript output (rebuilt by `npm run build` / `prepare`)
+bin/
