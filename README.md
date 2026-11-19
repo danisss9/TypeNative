@@ -1,6 +1,6 @@
 ﻿# TypeNative
 
-TypeNative is a TypeScript-to-Go transpiler, it turns TypeScript into Go code and compiles it to a single-file native executable, no Node.js runtime, no bundler, just a binary. Write TypeScript, ship native binaries.
+[TypeNative](https://typenative.dev) is a TypeScript-to-Go transpiler, it turns TypeScript into Go code and compiles it to a single-file native executable, no Node.js runtime, no bundler, just a binary. Write TypeScript, ship native binaries.
 
 ```ts
 // hello.ts

@@ -42,7 +42,7 @@
   "bugs": {
     "url": "https://github.com/danisss9/typenative/issues"
   },
-  "homepage": "https://github.com/danisss9/typenative#readme",
+  "homepage": "https://typenative.dev",
   "engines": {
     "node": ">=26"
   },
