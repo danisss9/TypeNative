@@ -3579,9 +3579,24 @@ declare module 'node:sqlite' {
       allowBareNamedParameters?: boolean;
       allowUnknownNamedParameters?: boolean;
     }
+    interface CreateSessionOptions {
+      table?: string;
+      db?: string;
+    }
+    interface ApplyChangesetOptions {
+      filter?: (tableName: string) => boolean;
+      onConflict?: (conflictType: number) => number;
+    }
+    interface Session {
+      changeset(): Uint8Array;
+      patchset(): Uint8Array;
+      close(): void;
+      [Symbol.dispose](): void;
+    }
     // SQLite runs as Wasm inside the program (github.com/ncruces/go-sqlite3):
-    // loadExtension and createSession / applyChangeset throw; serialize /
-    // deserialize go through a temporary file
+    // loadExtension throws; serialize / deserialize go through a temporary file;
+    // createSession / applyChangeset emulate the session extension over the
+    // preupdate hook.
     class DatabaseSync {
       constructor(path: string | Uint8Array | URL, options?: DatabaseSyncOptions);
       readonly isOpen: boolean;
@@ -3605,8 +3620,8 @@ declare module 'node:sqlite' {
       createTagStore(maxSize?: number): SQLTagStore;
       enableLoadExtension(allow: boolean): void;
       loadExtension(path: string, entryPoint?: string): void;
-      createSession(options?: { table?: string; db?: string }): never;
-      applyChangeset(changeset: Uint8Array, options?: object): boolean;
+      createSession(options?: CreateSessionOptions): Session;
+      applyChangeset(changeset: Uint8Array, options?: ApplyChangesetOptions): boolean;
       serialize(dbName?: string): Uint8Array;
       deserialize(buffer: Uint8Array, options?: { dbName?: string }): void;
     }

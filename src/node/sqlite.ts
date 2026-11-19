@@ -33,6 +33,8 @@ type TnSqliteDb struct {
 	// A JS throw inside a user-defined function, rethrown after the statement
 	pending    interface{}
 	hasPending bool
+	// Active sessions sharing this connection's preupdate hook
+	sessions []*TnSqliteSession
 }
 
 type TnSqliteStmt struct {
@@ -365,6 +367,11 @@ func (db *TnSqliteDb) setAuthorizer(callback interface{}) {
 
 func (db *TnSqliteDb) close() {
 	db.requireOpen()
+	for _, sess := range db.sessions {
+		sess.open = false
+	}
+	db.sessions = nil
+	db.conn.PreUpdateHook(nil)
 	for s := range db.live {
 		s.Close()
 	}
@@ -624,14 +631,1038 @@ func (db *TnSqliteDb) loadExtension(path string, entry ...interface{}) {
 	panic(tnSqliteState("Loading SQLite extensions is not supported: SQLite runs as Wasm inside the program"))
 }
 
-func (db *TnSqliteDb) createSession(options ...interface{}) interface{} {
-	db.requireOpen()
-	panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "Sessions are not supported: the bundled SQLite has no session extension"))
+// Session / changeset / patchset emulation over SQLite's preupdate hook.
+// Produces and consumes SQLite's official binary changeset ('T') and patchset
+// ('P') formats so buffers are wire-compatible with SQLite's session extension.
+type tnSqliteSessVal struct {
+	kind byte // 0=undefined, 1=INTEGER, 2=FLOAT, 3=TEXT, 4=BLOB, 5=NULL
+	i64  int64
+	f64  float64
+	str  string
+	blob []byte
 }
+
+type tnSqliteTableInfo struct {
+	cols   []string
+	pk     []byte // 0 if non-PK, else 1-based PK position
+	pkCols []int  // column indices where pk[i] != 0, in table column order
+}
+
+type tnSqliteSessRow struct {
+	key           string
+	pkVals        []tnSqliteSessVal
+	existedBefore bool
+	origOld       []tnSqliteSessVal
+	indirect      bool
+}
+
+type tnSqliteSessTable struct {
+	name  string
+	info  tnSqliteTableInfo
+	rows  map[string]*tnSqliteSessRow
+	order []string
+}
+
+type TnSqliteSession struct {
+	db         *TnSqliteDb
+	dbName     string
+	table      string
+	open       bool
+	tables     map[string]*tnSqliteSessTable
+	tableOrder []string
+}
+
+func tnSqliteQuoteIdent(name string) string {
+	return "\\"" + strings.ReplaceAll(name, "\\"", "\\"\\"") + "\\""
+}
+
+func tnSqliteValFromSQLite(v sqlite3.Value) tnSqliteSessVal {
+	switch v.Type() {
+	case sqlite3.INTEGER:
+		return tnSqliteSessVal{kind: 1, i64: v.Int64()}
+	case sqlite3.FLOAT:
+		return tnSqliteSessVal{kind: 2, f64: v.Float()}
+	case sqlite3.TEXT:
+		return tnSqliteSessVal{kind: 3, str: v.Text()}
+	case sqlite3.BLOB:
+		return tnSqliteSessVal{kind: 4, blob: append([]byte(nil), v.RawBlob()...)}
+	default:
+		return tnSqliteSessVal{kind: 5}
+	}
+}
+
+func tnSqliteValFromStmt(s *sqlite3.Stmt, col int) tnSqliteSessVal {
+	switch s.ColumnType(col) {
+	case sqlite3.INTEGER:
+		return tnSqliteSessVal{kind: 1, i64: s.ColumnInt64(col)}
+	case sqlite3.FLOAT:
+		return tnSqliteSessVal{kind: 2, f64: s.ColumnFloat(col)}
+	case sqlite3.TEXT:
+		return tnSqliteSessVal{kind: 3, str: s.ColumnText(col)}
+	case sqlite3.BLOB:
+		return tnSqliteSessVal{kind: 4, blob: append([]byte(nil), s.ColumnRawBlob(col)...)}
+	default:
+		return tnSqliteSessVal{kind: 5}
+	}
+}
+
+func tnSqliteBindSessVal(s *sqlite3.Stmt, idx int, v tnSqliteSessVal) error {
+	switch v.kind {
+	case 1:
+		return s.BindInt64(idx, v.i64)
+	case 2:
+		return s.BindFloat(idx, v.f64)
+	case 3:
+		return s.BindText(idx, v.str)
+	case 4:
+		return s.BindBlob(idx, v.blob)
+	default:
+		return s.BindNull(idx)
+	}
+}
+
+func tnSqliteSessValEqual(a, b tnSqliteSessVal) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case 0, 5:
+		return true
+	case 1:
+		return a.i64 == b.i64
+	case 2:
+		return math.Float64bits(a.f64) == math.Float64bits(b.f64)
+	case 3:
+		return a.str == b.str
+	case 4:
+		return len(a.blob) == len(b.blob) && string(a.blob) == string(b.blob)
+	}
+	return false
+}
+
+func tnSqliteAppendVarint(buf []byte, v uint64) []byte {
+	if v < 0x80 {
+		return append(buf, byte(v))
+	}
+	if v >= (1 << 56) {
+		return append(buf,
+			byte(v>>57)|0x80, byte(v>>50)|0x80, byte(v>>43)|0x80, byte(v>>36)|0x80,
+			byte(v>>29)|0x80, byte(v>>22)|0x80, byte(v>>15)|0x80, byte(v>>8)|0x80,
+			byte(v),
+		)
+	}
+	var tmp [9]byte
+	n := 0
+	for {
+		tmp[n] = byte(v & 0x7f)
+		n++
+		v >>= 7
+		if v == 0 {
+			break
+		}
+	}
+	for i := n - 1; i > 0; i-- {
+		buf = append(buf, tmp[i]|0x80)
+	}
+	return append(buf, tmp[0])
+}
+
+func tnSqliteReadVarint(b []byte, pos int) (uint64, int, bool) {
+	if pos >= len(b) {
+		return 0, pos, false
+	}
+	var v uint64
+	for i := 0; i < 8; i++ {
+		if pos+i >= len(b) {
+			return 0, pos, false
+		}
+		c := b[pos+i]
+		v = (v << 7) | uint64(c&0x7f)
+		if c&0x80 == 0 {
+			return v, pos + i + 1, true
+		}
+	}
+	if pos+8 >= len(b) {
+		return 0, pos, false
+	}
+	v = (v << 8) | uint64(b[pos+8])
+	return v, pos + 9, true
+}
+
+func tnSqliteAppendVal(buf []byte, v tnSqliteSessVal) []byte {
+	buf = append(buf, v.kind)
+	switch v.kind {
+	case 1:
+		var tmp [8]byte
+		binary.BigEndian.PutUint64(tmp[:], uint64(v.i64))
+		buf = append(buf, tmp[:]...)
+	case 2:
+		var tmp [8]byte
+		binary.BigEndian.PutUint64(tmp[:], math.Float64bits(v.f64))
+		buf = append(buf, tmp[:]...)
+	case 3:
+		buf = tnSqliteAppendVarint(buf, uint64(len(v.str)))
+		buf = append(buf, v.str...)
+	case 4:
+		buf = tnSqliteAppendVarint(buf, uint64(len(v.blob)))
+		buf = append(buf, v.blob...)
+	}
+	return buf
+}
+
+func tnSqliteReadVal(b []byte, pos int) (tnSqliteSessVal, int, bool) {
+	if pos >= len(b) {
+		return tnSqliteSessVal{}, pos, false
+	}
+	kind := b[pos]
+	pos++
+	switch kind {
+	case 0, 5:
+		return tnSqliteSessVal{kind: kind}, pos, true
+	case 1:
+		if pos+8 > len(b) {
+			return tnSqliteSessVal{}, pos, false
+		}
+		u := binary.BigEndian.Uint64(b[pos : pos+8])
+		return tnSqliteSessVal{kind: 1, i64: int64(u)}, pos + 8, true
+	case 2:
+		if pos+8 > len(b) {
+			return tnSqliteSessVal{}, pos, false
+		}
+		u := binary.BigEndian.Uint64(b[pos : pos+8])
+		return tnSqliteSessVal{kind: 2, f64: math.Float64frombits(u)}, pos + 8, true
+	case 3:
+		n, next, ok := tnSqliteReadVarint(b, pos)
+		if !ok || n > uint64(len(b)-next) {
+			return tnSqliteSessVal{}, pos, false
+		}
+		return tnSqliteSessVal{kind: 3, str: string(b[next : next+int(n)])}, next + int(n), true
+	case 4:
+		n, next, ok := tnSqliteReadVarint(b, pos)
+		if !ok || n > uint64(len(b)-next) {
+			return tnSqliteSessVal{}, pos, false
+		}
+		blob := append([]byte(nil), b[next:next+int(n)]...)
+		return tnSqliteSessVal{kind: 4, blob: blob}, next + int(n), true
+	default:
+		return tnSqliteSessVal{}, pos, false
+	}
+}
+
+func tnSqliteEncodePK(vals []tnSqliteSessVal) (string, bool) {
+	var buf []byte
+	for _, v := range vals {
+		if v.kind == 5 || v.kind == 0 {
+			return "", false
+		}
+		buf = tnSqliteAppendVal(buf, v)
+	}
+	return string(buf), true
+}
+
+func (db *TnSqliteDb) tableInfo(schema, table string) (tnSqliteTableInfo, error) {
+	q := fmt.Sprintf("PRAGMA %s.table_info(%s)", tnSqliteQuoteIdent(schema), tnSqliteQuoteIdent(table))
+	st, _, err := db.conn.Prepare(q)
+	if err != nil {
+		return tnSqliteTableInfo{}, err
+	}
+	defer st.Close()
+	var info tnSqliteTableInfo
+	for st.Step() {
+		name := st.ColumnText(1)
+		pk := byte(st.ColumnInt(5))
+		idx := len(info.cols)
+		info.cols = append(info.cols, name)
+		info.pk = append(info.pk, pk)
+		if pk != 0 {
+			info.pkCols = append(info.pkCols, idx)
+		}
+	}
+	if err := st.Err(); err != nil {
+		return tnSqliteTableInfo{}, err
+	}
+	return info, nil
+}
+
+func tnSqliteIsConstraint(err error) bool {
+	var se *sqlite3.Error
+	if errors.As(err, &se) {
+		return se.Code() == sqlite3.CONSTRAINT
+	}
+	if code, ok := err.(sqlite3.ErrorCode); ok {
+		return code == sqlite3.CONSTRAINT
+	}
+	if code, ok := err.(sqlite3.ExtendedErrorCode); ok {
+		return sqlite3.ErrorCode(code&0xff) == sqlite3.CONSTRAINT
+	}
+	return false
+}
+
+func (db *TnSqliteDb) onPreUpdate(pud sqlite3.PreUpdateData) {
+	if len(db.sessions) == 0 {
+		return
+	}
+	nCol := pud.Count()
+	indirect := pud.Depth() > 0
+	var oldVals []tnSqliteSessVal
+	var newVals []tnSqliteSessVal
+	readOld := func() []tnSqliteSessVal {
+		if oldVals == nil {
+			oldVals = make([]tnSqliteSessVal, nCol)
+			for i := 0; i < nCol; i++ {
+				if v, err := pud.Old(i); err == nil {
+					oldVals[i] = tnSqliteValFromSQLite(v)
+				} else {
+					oldVals[i] = tnSqliteSessVal{kind: 5}
+				}
+			}
+		}
+		return oldVals
+	}
+	readNew := func() []tnSqliteSessVal {
+		if newVals == nil {
+			newVals = make([]tnSqliteSessVal, nCol)
+			for i := 0; i < nCol; i++ {
+				if v, err := pud.New(i); err == nil {
+					newVals[i] = tnSqliteValFromSQLite(v)
+				} else {
+					newVals[i] = tnSqliteSessVal{kind: 5}
+				}
+			}
+		}
+		return newVals
+	}
+	for _, sess := range db.sessions {
+		if !sess.open {
+			continue
+		}
+		if !strings.EqualFold(pud.Schema, sess.dbName) {
+			continue
+		}
+		if sess.table != "" && !strings.EqualFold(pud.Table, sess.table) {
+			continue
+		}
+		tKey := strings.ToLower(pud.Table)
+		tbl, ok := sess.tables[tKey]
+		if !ok || len(tbl.info.cols) != nCol {
+			info, err := db.tableInfo(pud.Schema, pud.Table)
+			if err != nil || len(info.pkCols) == 0 {
+				continue
+			}
+			if !ok {
+				tbl = &tnSqliteSessTable{
+					name: pud.Table,
+					info: info,
+					rows: map[string]*tnSqliteSessRow{},
+				}
+				sess.tables[tKey] = tbl
+				sess.tableOrder = append(sess.tableOrder, tKey)
+			} else {
+				tbl.info = info
+			}
+		}
+		if len(tbl.info.pkCols) == 0 {
+			continue
+		}
+		extractPK := func(vals []tnSqliteSessVal) ([]tnSqliteSessVal, string, bool) {
+			pkVals := make([]tnSqliteSessVal, len(tbl.info.pkCols))
+			for i, colIdx := range tbl.info.pkCols {
+				if colIdx < len(vals) {
+					pkVals[i] = vals[colIdx]
+				} else {
+					pkVals[i] = tnSqliteSessVal{kind: 5}
+				}
+			}
+			key, valid := tnSqliteEncodePK(pkVals)
+			return pkVals, key, valid
+		}
+		recordKey := func(key string, pkVals []tnSqliteSessVal, existed bool, orig []tnSqliteSessVal) {
+			if row, exists := tbl.rows[key]; exists {
+				if !indirect {
+					row.indirect = false
+				}
+				return
+			}
+			var saved []tnSqliteSessVal
+			if existed {
+				saved = append([]tnSqliteSessVal(nil), orig...)
+			}
+			tbl.rows[key] = &tnSqliteSessRow{
+				key:           key,
+				pkVals:        pkVals,
+				existedBefore: existed,
+				origOld:       saved,
+				indirect:      indirect,
+			}
+			tbl.order = append(tbl.order, key)
+		}
+		switch pud.Op {
+		case sqlite3.AUTH_INSERT:
+			nv := readNew()
+			if pkVals, key, valid := extractPK(nv); valid {
+				recordKey(key, pkVals, false, nil)
+			}
+		case sqlite3.AUTH_DELETE:
+			ov := readOld()
+			if pkVals, key, valid := extractPK(ov); valid {
+				recordKey(key, pkVals, true, ov)
+			}
+		case sqlite3.AUTH_UPDATE:
+			ov := readOld()
+			nv := readNew()
+			oldPK, oldKey, oldValid := extractPK(ov)
+			newPK, newKey, newValid := extractPK(nv)
+			if oldValid {
+				recordKey(oldKey, oldPK, true, ov)
+			}
+			if newValid && (!oldValid || newKey != oldKey) {
+				recordKey(newKey, newPK, false, nil)
+			}
+		}
+	}
+}
+
+func (db *TnSqliteDb) createSession(options ...interface{}) *TnSqliteSession {
+	db.requireOpen()
+	dbName := "main"
+	table := ""
+	if len(options) > 0 && options[0] != nil {
+		if s := tnSqliteString(options[0], "db", ""); s != "" {
+			dbName = s
+		}
+		table = tnSqliteString(options[0], "table", "")
+	}
+	sess := &TnSqliteSession{
+		db:     db,
+		dbName: dbName,
+		table:  table,
+		open:   true,
+		tables: map[string]*tnSqliteSessTable{},
+	}
+	if len(db.sessions) == 0 {
+		db.conn.PreUpdateHook(db.onPreUpdate)
+	}
+	db.sessions = append(db.sessions, sess)
+	return sess
+}
+
+func (s *TnSqliteSession) requireOpen() {
+	s.db.requireOpen()
+	if !s.open {
+		panic(tnSqliteState("session is not open"))
+	}
+}
+
+func (s *TnSqliteSession) close() {
+	s.requireOpen()
+	s.open = false
+	for i, cur := range s.db.sessions {
+		if cur == s {
+			s.db.sessions = append(s.db.sessions[:i], s.db.sessions[i+1:]...)
+			break
+		}
+	}
+	if len(s.db.sessions) == 0 {
+		s.db.conn.PreUpdateHook(nil)
+	}
+}
+
+func (s *TnSqliteSession) __dispose() {
+	if s.open && s.db.conn != nil {
+		s.close()
+	}
+}
+
+func (s *TnSqliteSession) buildSet(isPatchset bool) []byte {
+	s.requireOpen()
+	out := []byte{}
+	for _, tKey := range s.tableOrder {
+		tbl := s.tables[tKey]
+		info, err := s.db.tableInfo(s.dbName, tbl.name)
+		if err != nil || len(info.cols) == 0 || len(info.pkCols) == 0 {
+			continue
+		}
+		nCol := len(info.cols)
+		colList := make([]string, nCol)
+		for i, c := range info.cols {
+			colList[i] = tnSqliteQuoteIdent(c)
+		}
+		whereParts := make([]string, len(info.pkCols))
+		for i, colIdx := range info.pkCols {
+			whereParts[i] = tnSqliteQuoteIdent(info.cols[colIdx]) + " = ?"
+		}
+		selSQL := fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s",
+			strings.Join(colList, ", "),
+			tnSqliteQuoteIdent(s.dbName),
+			tnSqliteQuoteIdent(tbl.name),
+			strings.Join(whereParts, " AND "),
+		)
+		st, _, err := s.db.conn.Prepare(selSQL)
+		if err != nil {
+			continue
+		}
+		var tableBuf []byte
+		for _, rKey := range tbl.order {
+			row := tbl.rows[rKey]
+			if len(row.pkVals) != len(info.pkCols) {
+				continue
+			}
+			for i, pv := range row.pkVals {
+				tnSqliteBindSessVal(st, i+1, pv)
+			}
+			existsNow := st.Step()
+			var curVals []tnSqliteSessVal
+			if existsNow {
+				curVals = make([]tnSqliteSessVal, nCol)
+				for i := 0; i < nCol; i++ {
+					curVals[i] = tnSqliteValFromStmt(st, i)
+				}
+			}
+			st.Reset()
+			st.ClearBindings()
+			var ind byte
+			if row.indirect {
+				ind = 1
+			}
+			if !row.existedBefore && !existsNow {
+				continue
+			}
+			if !row.existedBefore && existsNow {
+				tableBuf = append(tableBuf, 18, ind)
+				for i := 0; i < nCol; i++ {
+					tableBuf = tnSqliteAppendVal(tableBuf, curVals[i])
+				}
+				continue
+			}
+			orig := row.origOld
+			if len(orig) < nCol {
+				padded := make([]tnSqliteSessVal, nCol)
+				copy(padded, orig)
+				for i := len(orig); i < nCol; i++ {
+					padded[i] = tnSqliteSessVal{kind: 5}
+				}
+				orig = padded
+			}
+			if row.existedBefore && !existsNow {
+				tableBuf = append(tableBuf, 9, ind)
+				if isPatchset {
+					for _, colIdx := range info.pkCols {
+						tableBuf = tnSqliteAppendVal(tableBuf, orig[colIdx])
+					}
+				} else {
+					for i := 0; i < nCol; i++ {
+						tableBuf = tnSqliteAppendVal(tableBuf, orig[i])
+					}
+				}
+				continue
+			}
+			// Both existed before and exists now -> UPDATE if any column differs
+			changed := make([]bool, nCol)
+			anyChanged := false
+			for i := 0; i < nCol; i++ {
+				if !tnSqliteSessValEqual(orig[i], curVals[i]) {
+					changed[i] = true
+					anyChanged = true
+				}
+			}
+			if !anyChanged {
+				continue
+			}
+			tableBuf = append(tableBuf, 23, ind)
+			if isPatchset {
+				for i := 0; i < nCol; i++ {
+					if changed[i] || info.pk[i] != 0 {
+						tableBuf = tnSqliteAppendVal(tableBuf, curVals[i])
+					} else {
+						tableBuf = append(tableBuf, 0)
+					}
+				}
+			} else {
+				for i := 0; i < nCol; i++ {
+					if info.pk[i] != 0 || changed[i] {
+						tableBuf = tnSqliteAppendVal(tableBuf, orig[i])
+					} else {
+						tableBuf = append(tableBuf, 0)
+					}
+				}
+				for i := 0; i < nCol; i++ {
+					if changed[i] {
+						tableBuf = tnSqliteAppendVal(tableBuf, curVals[i])
+					} else {
+						tableBuf = append(tableBuf, 0)
+					}
+				}
+			}
+		}
+		st.Close()
+		if len(tableBuf) > 0 {
+			if isPatchset {
+				out = append(out, 'P')
+			} else {
+				out = append(out, 'T')
+			}
+			out = tnSqliteAppendVarint(out, uint64(nCol))
+			out = append(out, info.pk...)
+			out = append(out, tbl.name...)
+			out = append(out, 0)
+			out = append(out, tableBuf...)
+		}
+	}
+	return out
+}
+
+func (s *TnSqliteSession) changeset() []byte { return s.buildSet(false) }
+func (s *TnSqliteSession) patchset() []byte  { return s.buildSet(true) }
 
 func (db *TnSqliteDb) applyChangeset(changeset []byte, options ...interface{}) bool {
 	db.requireOpen()
-	panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "Changesets are not supported: the bundled SQLite has no session extension"))
+	var filterFn, conflictFn interface{}
+	if len(options) > 0 && options[0] != nil {
+		if v := TnGet(options[0], "filter"); v != nil {
+			if !tnSqliteIsFunc(v) {
+				panic(tnSqliteArgType("The \\"options.filter\\" argument must be a function."))
+			}
+			filterFn = v
+		}
+		if v := TnGet(options[0], "onConflict"); v != nil {
+			if !tnSqliteIsFunc(v) {
+				panic(tnSqliteArgType("The \\"options.onConflict\\" argument must be a function."))
+			}
+			conflictFn = v
+		}
+	}
+	if len(changeset) == 0 {
+		return true
+	}
+	callConflict := func(kind int) int {
+		if conflictFn == nil {
+			return 2 // SQLITE_CHANGESET_ABORT
+		}
+		res := TnInvoke(conflictFn, float64(kind))
+		n, ok := res.(float64)
+		if !ok || (n != 0 && n != 1 && n != 2) {
+			panic(tnSqliteCodeError(21, "bad parameter or other API misuse"))
+		}
+		action := int(n)
+		if action == 1 && kind != 1 && kind != 3 {
+			// SQLITE_CHANGESET_REPLACE is only valid for DATA (1) and CONFLICT (3)
+			panic(tnSqliteCodeError(21, "bad parameter or other API misuse"))
+		}
+		return action
+	}
+	corrupt := func() {
+		panic(tnSqliteCodeError(11, "database disk image is malformed"))
+	}
+
+	fkeyEnabled, _ := db.conn.Config(sqlite3.DBCONFIG_ENABLE_FKEY)
+	trigEnabled, _ := db.conn.Config(sqlite3.DBCONFIG_ENABLE_TRIGGER)
+	if fkeyEnabled {
+		db.conn.Config(sqlite3.DBCONFIG_ENABLE_FKEY, false)
+	}
+	if trigEnabled {
+		db.conn.Config(sqlite3.DBCONFIG_ENABLE_TRIGGER, false)
+	}
+	db.check(db.conn.Exec("SAVEPOINT __tn_changeset"))
+	committed := false
+	defer func() {
+		if !committed {
+			db.conn.Exec("ROLLBACK TO SAVEPOINT __tn_changeset")
+			db.conn.Exec("RELEASE SAVEPOINT __tn_changeset")
+		}
+		if fkeyEnabled {
+			db.conn.Config(sqlite3.DBCONFIG_ENABLE_FKEY, true)
+		}
+		if trigEnabled {
+			db.conn.Config(sqlite3.DBCONFIG_ENABLE_TRIGGER, true)
+		}
+	}()
+
+	pos := 0
+	for pos < len(changeset) {
+		hdr := changeset[pos]
+		if hdr != 'T' && hdr != 'P' {
+			corrupt()
+		}
+		isPatchset := hdr == 'P'
+		pos++
+		nColU, nextPos, ok := tnSqliteReadVarint(changeset, pos)
+		if !ok || nColU == 0 || nColU > 32767 {
+			corrupt()
+		}
+		nCol := int(nColU)
+		pos = nextPos
+		if pos+nCol > len(changeset) {
+			corrupt()
+		}
+		pkFlags := changeset[pos : pos+nCol]
+		pos += nCol
+		var pkCols []int
+		for i := 0; i < nCol; i++ {
+			if pkFlags[i] != 0 {
+				pkCols = append(pkCols, i)
+			}
+		}
+		if len(pkCols) == 0 {
+			corrupt()
+		}
+		nul := -1
+		for i := pos; i < len(changeset); i++ {
+			if changeset[i] == 0 {
+				nul = i
+				break
+			}
+		}
+		if nul < 0 {
+			corrupt()
+		}
+		tableName := string(changeset[pos:nul])
+		pos = nul + 1
+
+		applyTable := true
+		if filterFn != nil {
+			applyTable = TnTruthy(TnInvoke(filterFn, tableName))
+		}
+		var targetInfo tnSqliteTableInfo
+		if applyTable {
+			info, err := db.tableInfo("main", tableName)
+			db.check(err)
+			if len(info.cols) == 0 {
+				applyTable = false
+			} else {
+				if len(info.cols) < nCol {
+					panic(tnSqliteCodeError(17, "database schema has changed"))
+				}
+				for i := 0; i < nCol; i++ {
+					if (info.pk[i] != 0) != (pkFlags[i] != 0) {
+						panic(tnSqliteCodeError(17, "database schema has changed"))
+					}
+				}
+				for i := nCol; i < len(info.cols); i++ {
+					if info.pk[i] != 0 {
+						panic(tnSqliteCodeError(17, "database schema has changed"))
+					}
+				}
+				targetInfo = info
+			}
+		}
+
+		var qTable string
+		var colNames []string
+		var whereClause string
+		if applyTable {
+			qTable = tnSqliteQuoteIdent(tableName)
+			colNames = make([]string, nCol)
+			for i := 0; i < nCol; i++ {
+				colNames[i] = tnSqliteQuoteIdent(targetInfo.cols[i])
+			}
+			whereParts := make([]string, len(pkCols))
+			for i, colIdx := range pkCols {
+				whereParts[i] = colNames[colIdx] + " = ?"
+			}
+			whereClause = strings.Join(whereParts, " AND ")
+		}
+
+		selectRow := func(pkVals []tnSqliteSessVal) ([]tnSqliteSessVal, bool) {
+			selSQL := fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(colNames, ", "), qTable, whereClause)
+			st, _, err := db.conn.Prepare(selSQL)
+			db.check(err)
+			defer st.Close()
+			for i, v := range pkVals {
+				db.check(tnSqliteBindSessVal(st, i+1, v))
+			}
+			if !st.Step() {
+				db.check(st.Err())
+				return nil, false
+			}
+			vals := make([]tnSqliteSessVal, nCol)
+			for i := 0; i < nCol; i++ {
+				vals[i] = tnSqliteValFromStmt(st, i)
+			}
+			return vals, true
+		}
+
+		for pos < len(changeset) && changeset[pos] != 'T' && changeset[pos] != 'P' {
+			if pos+2 > len(changeset) {
+				corrupt()
+			}
+			op := changeset[pos]
+			indirect := changeset[pos+1]
+			if indirect > 1 {
+				corrupt()
+			}
+			pos += 2
+			var oldVals, newVals, delPK []tnSqliteSessVal
+			switch op {
+			case 18: // INSERT
+				newVals = make([]tnSqliteSessVal, nCol)
+				for i := 0; i < nCol; i++ {
+					v, next, ok := tnSqliteReadVal(changeset, pos)
+					if !ok || v.kind == 0 {
+						corrupt()
+					}
+					newVals[i] = v
+					pos = next
+				}
+			case 9: // DELETE
+				if isPatchset {
+					delPK = make([]tnSqliteSessVal, len(pkCols))
+					for i := 0; i < len(pkCols); i++ {
+						v, next, ok := tnSqliteReadVal(changeset, pos)
+						if !ok || v.kind == 0 {
+							corrupt()
+						}
+						delPK[i] = v
+						pos = next
+					}
+				} else {
+					oldVals = make([]tnSqliteSessVal, nCol)
+					for i := 0; i < nCol; i++ {
+						v, next, ok := tnSqliteReadVal(changeset, pos)
+						if !ok || v.kind == 0 {
+							corrupt()
+						}
+						oldVals[i] = v
+						pos = next
+					}
+				}
+			case 23: // UPDATE
+				if isPatchset {
+					newVals = make([]tnSqliteSessVal, nCol)
+					for i := 0; i < nCol; i++ {
+						v, next, ok := tnSqliteReadVal(changeset, pos)
+						if !ok {
+							corrupt()
+						}
+						newVals[i] = v
+						pos = next
+					}
+				} else {
+					oldVals = make([]tnSqliteSessVal, nCol)
+					for i := 0; i < nCol; i++ {
+						v, next, ok := tnSqliteReadVal(changeset, pos)
+						if !ok {
+							corrupt()
+						}
+						oldVals[i] = v
+						pos = next
+					}
+					newVals = make([]tnSqliteSessVal, nCol)
+					for i := 0; i < nCol; i++ {
+						v, next, ok := tnSqliteReadVal(changeset, pos)
+						if !ok {
+							corrupt()
+						}
+						newVals[i] = v
+						pos = next
+					}
+				}
+			default:
+				corrupt()
+			}
+			if !applyTable {
+				continue
+			}
+
+			switch op {
+			case 18: // INSERT
+				placeholders := make([]string, nCol)
+				for i := 0; i < nCol; i++ {
+					placeholders[i] = "?"
+				}
+				insSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", qTable, strings.Join(colNames, ", "), strings.Join(placeholders, ", "))
+				st, _, err := db.conn.Prepare(insSQL)
+				db.check(err)
+				for i, v := range newVals {
+					db.check(tnSqliteBindSessVal(st, i+1, v))
+				}
+				err = st.Exec()
+				st.Close()
+				if err != nil {
+					if !tnSqliteIsConstraint(err) {
+						db.check(err)
+					}
+					pkVals := make([]tnSqliteSessVal, len(pkCols))
+					for i, colIdx := range pkCols {
+						pkVals[i] = newVals[colIdx]
+					}
+					_, pkExists := selectRow(pkVals)
+					if pkExists {
+						action := callConflict(3) // SQLITE_CHANGESET_CONFLICT
+						if action == 2 {
+							return false
+						}
+						if action == 1 {
+							var setParts []string
+							var setVals []tnSqliteSessVal
+							for i := 0; i < nCol; i++ {
+								if pkFlags[i] == 0 {
+									setParts = append(setParts, colNames[i]+" = ?")
+									setVals = append(setVals, newVals[i])
+								}
+							}
+							if len(setParts) > 0 {
+								updSQL := fmt.Sprintf("UPDATE %s SET %s WHERE %s", qTable, strings.Join(setParts, ", "), whereClause)
+								ust, _, uerr := db.conn.Prepare(updSQL)
+								db.check(uerr)
+								for i, v := range setVals {
+									db.check(tnSqliteBindSessVal(ust, i+1, v))
+								}
+								for i, v := range pkVals {
+									db.check(tnSqliteBindSessVal(ust, len(setVals)+i+1, v))
+								}
+								uerr = ust.Exec()
+								ust.Close()
+								if uerr != nil {
+									if !tnSqliteIsConstraint(uerr) {
+										db.check(uerr)
+									}
+									if callConflict(4) == 2 {
+										return false
+									}
+								}
+							}
+						}
+					} else {
+						if callConflict(4) == 2 { // SQLITE_CHANGESET_CONSTRAINT
+							return false
+						}
+					}
+				}
+
+			case 9: // DELETE
+				pkVals := delPK
+				if !isPatchset {
+					pkVals = make([]tnSqliteSessVal, len(pkCols))
+					for i, colIdx := range pkCols {
+						pkVals[i] = oldVals[colIdx]
+					}
+				}
+				curVals, exists := selectRow(pkVals)
+				if !exists {
+					if callConflict(2) == 2 { // SQLITE_CHANGESET_NOTFOUND
+						return false
+					}
+					continue
+				}
+				if !isPatchset {
+					mismatch := false
+					for i := 0; i < nCol; i++ {
+						if !tnSqliteSessValEqual(curVals[i], oldVals[i]) {
+							mismatch = true
+							break
+						}
+					}
+					if mismatch {
+						action := callConflict(1) // SQLITE_CHANGESET_DATA
+						if action == 2 {
+							return false
+						}
+						if action == 0 {
+							continue
+						}
+					}
+				}
+				delSQL := fmt.Sprintf("DELETE FROM %s WHERE %s", qTable, whereClause)
+				dst, _, derr := db.conn.Prepare(delSQL)
+				db.check(derr)
+				for i, v := range pkVals {
+					db.check(tnSqliteBindSessVal(dst, i+1, v))
+				}
+				derr = dst.Exec()
+				dst.Close()
+				if derr != nil {
+					if !tnSqliteIsConstraint(derr) {
+						db.check(derr)
+					}
+					if callConflict(4) == 2 {
+						return false
+					}
+				}
+
+			case 23: // UPDATE
+				pkVals := make([]tnSqliteSessVal, len(pkCols))
+				if isPatchset {
+					for i, colIdx := range pkCols {
+						pkVals[i] = newVals[colIdx]
+					}
+				} else {
+					for i, colIdx := range pkCols {
+						pkVals[i] = oldVals[colIdx]
+					}
+				}
+				curVals, exists := selectRow(pkVals)
+				if !exists {
+					if callConflict(2) == 2 { // SQLITE_CHANGESET_NOTFOUND
+						return false
+					}
+					continue
+				}
+				if !isPatchset {
+					mismatch := false
+					for i := 0; i < nCol; i++ {
+						if oldVals[i].kind != 0 && !tnSqliteSessValEqual(curVals[i], oldVals[i]) {
+							mismatch = true
+							break
+						}
+					}
+					if mismatch {
+						action := callConflict(1) // SQLITE_CHANGESET_DATA
+						if action == 2 {
+							return false
+						}
+						if action == 0 {
+							continue
+						}
+					}
+				}
+				var setParts []string
+				var setVals []tnSqliteSessVal
+				for i := 0; i < nCol; i++ {
+					if newVals[i].kind != 0 && (!isPatchset || pkFlags[i] == 0) {
+						setParts = append(setParts, colNames[i]+" = ?")
+						setVals = append(setVals, newVals[i])
+					}
+				}
+				if len(setParts) > 0 {
+					updSQL := fmt.Sprintf("UPDATE %s SET %s WHERE %s", qTable, strings.Join(setParts, ", "), whereClause)
+					ust, _, uerr := db.conn.Prepare(updSQL)
+					db.check(uerr)
+					for i, v := range setVals {
+						db.check(tnSqliteBindSessVal(ust, i+1, v))
+					}
+					for i, v := range pkVals {
+						db.check(tnSqliteBindSessVal(ust, len(setVals)+i+1, v))
+					}
+					uerr = ust.Exec()
+					ust.Close()
+					if uerr != nil {
+						if !tnSqliteIsConstraint(uerr) {
+							db.check(uerr)
+						}
+						if callConflict(4) == 2 {
+							return false
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if fkeyEnabled {
+		st, _, err := db.conn.Prepare("PRAGMA foreign_key_check")
+		db.check(err)
+		hasFKViolation := st.Step()
+		st.Close()
+		if hasFKViolation {
+			action := callConflict(5) // SQLITE_CHANGESET_FOREIGN_KEY
+			if action == 2 {
+				panic(tnSqliteCodeError(19, "constraint failed"))
+			}
+		}
+	}
+	db.check(db.conn.Exec("RELEASE SAVEPOINT __tn_changeset"))
+	committed = true
+	return true
 }
 
 // serialize(dbName = 'main') / deserialize(buffer, { dbName }): the database
@@ -1159,7 +2190,7 @@ export function registerSqlite(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeSqlite',
-    ['github.com/ncruces/go-sqlite3', 'errors', 'fmt', 'math', 'math/big', 'os', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'],
+    ['github.com/ncruces/go-sqlite3', 'encoding/binary', 'errors', 'fmt', 'math', 'math/big', 'os', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'],
     ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise'],
     sqliteHelper
   );
@@ -1169,9 +2200,19 @@ export function registerSqlite(r: NodeRegistry): void {
     'sqlite.DatabaseSync',
     '*TnSqliteDb',
     'class',
-    'open=; close=; exec=; prepare=*TnSqliteStmt; location=*string; function=; aggregate=; enableLoadExtension=; enableDefensive=; loadExtension=; setAuthorizer=; createTagStore=*TnSqliteTagStore; createSession=interface{}; applyChangeset=bool; serialize=[]byte; deserialize=',
+    'open=; close=; exec=; prepare=*TnSqliteStmt; location=*string; function=; aggregate=; enableLoadExtension=; enableDefensive=; loadExtension=; setAuthorizer=; createTagStore=*TnSqliteTagStore; createSession=*TnSqliteSession; applyChangeset=bool; serialize=[]byte; deserialize=',
     '',
     'isOpen=bool; isTransaction=bool; limits=*TnSqliteLimits',
+    ''
+  );
+  defineClass(
+    r,
+    'sqlite.Session',
+    '*TnSqliteSession',
+    'class',
+    'changeset=[]byte; patchset=[]byte; close=; __dispose=',
+    '',
+    '',
     ''
   );
   defineClass(
