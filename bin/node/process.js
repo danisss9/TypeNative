@@ -433,7 +433,12 @@ func TnProcessKill(pid float64, signal ...interface{}) bool {
 	if sig == 0 {
 		return true
 	}
-	if sig == 9 || sig == 15 || runtime.GOOS == "windows" {
+	if sig == 2 && runtime.GOOS == "windows" {
+		if tnWindowsCtrlBreak(int(pid)) {
+			return true
+		}
+		err = p.Kill()
+	} else if sig == 9 || sig == 15 || runtime.GOOS == "windows" {
 		err = p.Kill()
 	} else {
 		err = p.Signal(syscall.Signal(sig))
@@ -712,7 +717,14 @@ export function registerProcess(r) {
     r.objects['process.hrtime'] = true;
     r.objects['process.memoryUsage'] = true;
     defineHelper(r, 'nodePerm', ['os', 'path/filepath', 'runtime', 'strings', 'sync'], ['error', 'dynamic'], permHelper);
-    defineHelper(r, 'nodeProcess', ['fmt', 'math/big', 'os', 'runtime', 'strings', 'syscall', 'time'], ['error', 'orderedMap', 'dynamic', 'nodePerm'], processHelper);
+    defineHelper(r, 'nodeProcessSignal@windows', ['syscall'], [], `var tnProcGenCtrlEvent = syscall.NewLazyDLL("kernel32.dll").NewProc("GenerateConsoleCtrlEvent")
+
+func tnWindowsCtrlBreak(pid int) bool {
+	r, _, _ := tnProcGenCtrlEvent.Call(syscall.CTRL_BREAK_EVENT, uintptr(pid))
+	return r != 0
+}`);
+    defineHelper(r, 'nodeProcessSignal@other', [], [], 'func tnWindowsCtrlBreak(pid int) bool { return false }');
+    defineHelper(r, 'nodeProcess', ['fmt', 'math/big', 'os', 'runtime', 'strings', 'syscall', 'time'], ['error', 'orderedMap', 'dynamic', 'nodePerm', 'nodeProcessSignal@os'], processHelper);
     defineClass(r, 'process.MemoryUsage', '*TnMemoryUsage', 'class', '', 'rss=float64; heapTotal=float64; heapUsed=float64; external=float64; arrayBuffers=float64', '', '');
     const use = () => r.helper('nodeProcess');
     defineHelper(r, 'nodeTtyOS@linux', ['os', 'runtime', 'strings', 'syscall', 'unsafe'], [], linuxTtyHelper);

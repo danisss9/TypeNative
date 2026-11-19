@@ -31,6 +31,7 @@ type TnTestEventData struct {
 	duration_ms float64
 	success     bool
 	summary     *TnCoverageSummary
+	tests       []*TnTestEventData
 }
 
 type TnTestEventDetails struct {
@@ -185,6 +186,24 @@ func tnTestEventOf(v interface{}) *TnTestEvent {
 	}
 	if s := TnGet(raw, "summary"); s != nil {
 		d.summary = tnCoverageSummaryOf(s)
+	}
+	if tests := tnTestList(TnGet(raw, "tests")); tests != nil {
+		for _, item := range tests {
+			if item == nil {
+				continue
+			}
+			if typed, ok := item.(*TnTestEventData); ok {
+				d.tests = append(d.tests, typed)
+			} else {
+				d.tests = append(d.tests, &TnTestEventData{
+					name:    tnTestStr(TnGet(item, "name")),
+					nesting: tnTestNum(TnGet(item, "nesting")),
+					file:    tnTestStr(TnGet(item, "file")),
+					line:    tnTestNum(TnGet(item, "line")),
+					column:  tnTestNum(TnGet(item, "column")),
+				})
+			}
+		}
 	}
 	return e
 }
@@ -419,6 +438,14 @@ func (r *tnTapReporter) report(e *TnTestEvent) string {
 	case "test:coverage":
 		if d.summary != nil {
 			out += tnCoverageReport(indent, d.summary, "# ", "", tnTestPalette{}, true)
+		}
+	case "test:interrupted":
+		for _, t := range d.tests {
+			msg := "Interrupted while running: " + t.name
+			if t.file != "" {
+				msg += " at " + t.file + ":" + TnNumStr(t.line) + ":" + TnNumStr(t.column)
+			}
+			out += "# " + tnTapEscape(msg) + "\\n"
 		}
 	}
 	return out
@@ -677,6 +704,25 @@ func (r *tnSpecReporter) report(e *TnTestEvent) string {
 		if d.file == "" {
 			return r.failures()
 		}
+	case "test:interrupted":
+		if len(d.tests) == 0 {
+			return ""
+		}
+		lines := []string{"\\n" + r.p.yellow() + "Interrupted while running:" + r.p.white() + "\\n"}
+		for _, t := range d.tests {
+			msg := tnSpecIndent(t.nesting) + "\\u26a0 " + t.name
+			if t.file != "" {
+				rel := t.file
+				if r.cwd != "" {
+					if p, err := filepath.Rel(r.cwd, t.file); err == nil {
+						rel = p
+					}
+				}
+				msg += " " + r.p.gray() + "(" + rel + ":" + TnNumStr(t.line) + ":" + TnNumStr(t.column) + ")" + r.p.white()
+			}
+			lines = append(lines, msg)
+		}
+		return strings.Join(lines, "\\n") + "\\n"
 	}
 	return ""
 }
@@ -1347,7 +1393,7 @@ func tnTestNow() float64 { return float64(time.Since(tnTestEpoch).Nanoseconds())
     const use = () => r.helper('nodeTestReporters');
     // Event data, for typed reads in run() listeners (stream.on('test:pass', (data) => …))
     defineClass(r, 'test.TestEvent', '*TnTestEvent', 'class', '', 'data=*TnTestEventData', 'type=string', '');
-    defineClass(r, 'test.TestEventData', '*TnTestEventData', 'class', '', 'name=string; nesting=float64; testNumber=float64; details=*TnTestEventDetails; skip=interface{}; todo=interface{}; file=string; line=float64; column=float64; count=float64; message=string; level=string; counts=*TnTestCounts; duration_ms=float64; success=bool; summary=*TnCoverageSummary', '', '');
+    defineClass(r, 'test.TestEventData', '*TnTestEventData', 'class', '', 'name=string; nesting=float64; testNumber=float64; details=*TnTestEventDetails; skip=interface{}; todo=interface{}; file=string; line=float64; column=float64; count=float64; message=string; level=string; counts=*TnTestCounts; duration_ms=float64; success=bool; summary=*TnCoverageSummary; tests=[]*TnTestEventData', '', '');
     defineClass(r, 'test.TestEventDetails', '*TnTestEventDetails', 'class', '', 'duration_ms=float64; passed=bool', 'type=string; error=interface{}', '');
     defineClass(r, 'test.TestCounts', '*TnTestCounts', 'class', '', 'tests=float64; failed=float64; passed=float64; cancelled=float64; skipped=float64; todo=float64; topLevel=float64; suites=float64', '', '');
     const counts = 'totalLineCount=float64; totalBranchCount=float64; totalFunctionCount=float64; coveredLineCount=float64; coveredBranchCount=float64; coveredFunctionCount=float64; coveredLinePercent=float64; coveredBranchPercent=float64; coveredFunctionPercent=float64';

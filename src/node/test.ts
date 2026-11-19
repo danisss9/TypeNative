@@ -51,6 +51,7 @@ var tnTestRunning *TnTestNode
 var tnTestScheduled bool
 var tnTestStart float64
 var tnTestCounts = map[string]int{}
+var tnTestInterrupted sync.Once
 
 // Hooks of the optional parts: a run() child sends its events to the parent;
 // coverage and snapshots finish when the run does
@@ -772,12 +773,49 @@ func tnTestNote(nesting int, message string, level string, n *TnTestNode) *TnTes
 	return &TnTestEvent{type_: "test:diagnostic", data: d}
 }
 
+func tnFindRunningTests(n *TnTestNode, depth int) []*TnTestEventData {
+	var out []*TnTestEventData
+	for _, child := range n.children {
+		if child.started && child.status == "" {
+			sub := tnFindRunningTests(child, depth+1)
+			if len(sub) > 0 {
+				out = append(out, sub...)
+			} else {
+				out = append(out, &TnTestEventData{
+					name:    child.name,
+					nesting: float64(depth),
+					file:    child.file,
+					line:    child.line,
+					column:  child.column,
+				})
+			}
+		}
+	}
+	return out
+}
+
 func tnRunRoot() {
 	tnTestStart = tnTestNow()
 	cfg := tnTestFilters()
 	for _, s := range tnTestSinks {
 		s.write(s.reporter.begin())
 	}
+	onInterrupt := func(args ...interface{}) {
+		tnTestInterrupted.Do(func() {
+			running := tnFindRunningTests(tnTestRoot, 0)
+			if len(running) > 0 {
+				tnTestEmit(&TnTestEvent{type_: "test:interrupted", data: &TnTestEventData{tests: running}})
+			}
+			for _, s := range tnTestSinks {
+				if s.file {
+					s.out.Close()
+				}
+			}
+			os.Exit(1)
+		})
+	}
+	TnProcessOn("SIGINT", onInterrupt, true)
+	defer tnProcessEmitter.off("SIGINT", onInterrupt)
 	root := tnTestRoot
 	if cfg.active() {
 		tnTestPrune(root)
@@ -1676,7 +1714,7 @@ export function registerTest(r: NodeRegistry): void {
   defineHelper(
     r,
     'nodeTest',
-    ['crypto/rand', 'fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'time'],
+    ['crypto/rand', 'fmt', 'math', 'os', 'path/filepath', 'reflect', 'regexp', 'strconv', 'strings', 'sync', 'time'],
     ['eventLoop', 'promise', 'nodeInvoke', 'dynamic', 'nodeEvents', 'nodeProcess', 'nodeUtil', 'nodeAssert', 'arraySubclass', 'error', 'timerWait', 'clock', 'nodeTestReport', 'nodeTestClock@os'],
     testHelper
   );

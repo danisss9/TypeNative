@@ -40,8 +40,10 @@ func tnTestWriteFrame(e *TnTestEvent) {
 }
 
 type tnTestRunFile struct {
-	entry string
-	path  string
+	entry    string
+	path     string
+	cmd      *exec.Cmd
+	started  bool
 	// events held back while an earlier file is still reporting
 	held     []*TnTestEvent
 	finished bool
@@ -64,6 +66,8 @@ type tnTestRun struct {
 	coverage    []*TnCoverageSummary
 	start       time.Time
 	success     bool
+	interrupted bool
+	onInterrupt interface{}
 }
 
 // run(options): files pairs each entry id with the file's path
@@ -89,6 +93,10 @@ func TnTestRun(options interface{}, files ...[]string) *TnStream {
 	if r.concurrency < 1 {
 		r.concurrency = 1
 	}
+	r.onInterrupt = func(args ...interface{}) {
+		r.interrupt()
+	}
+	TnProcessOn("SIGINT", r.onInterrupt, true)
 	TnLoopRef()
 	TnLoopPost(func() {
 		if options != nil {
@@ -100,6 +108,37 @@ func TnTestRun(options interface{}, files ...[]string) *TnStream {
 		r.fill()
 	})
 	return s
+}
+
+func (r *tnTestRun) interrupt() {
+	if r.interrupted {
+		return
+	}
+	r.interrupted = true
+	if r.onInterrupt != nil {
+		tnProcessEmitter.off("SIGINT", r.onInterrupt)
+		r.onInterrupt = nil
+	}
+	var running []*TnTestEventData
+	for _, f := range r.files {
+		if f.started && !f.finished {
+			running = append(running, &TnTestEventData{
+				name:    f.path,
+				nesting: 0,
+				file:    f.path,
+				line:    1,
+				column:  1,
+			})
+			if f.cmd != nil && f.cmd.Process != nil {
+				f.cmd.Process.Kill()
+			}
+		}
+	}
+	if len(running) > 0 {
+		r.emit(&TnTestEvent{type_: "test:interrupted", data: &TnTestEventData{tests: running}})
+	}
+	r.stream.push(nil)
+	TnLoopUnref()
 }
 
 func (r *tnTestRun) emit(e *TnTestEvent) {
@@ -183,6 +222,9 @@ func (r *tnTestRun) fill() {
 
 // Events of the file reporting now are relayed at once; later files' wait
 func (r *tnTestRun) deliver(f *tnTestRunFile, e *TnTestEvent) {
+	if r.interrupted {
+		return
+	}
 	if r.reporting < len(r.files) && r.files[r.reporting] == f {
 		r.relay(f, e)
 		return
@@ -254,6 +296,8 @@ func (r *tnTestRun) startFile(f *tnTestRunFile) {
 		r.fileDone(f, 1, "")
 		return
 	}
+	f.started = true
+	f.cmd = cmd
 	r.emit(&TnTestEvent{type_: "test:dequeue", data: &TnTestEventData{name: f.path, file: f.path, line: 1, column: 1}})
 	var timer *time.Timer
 	if r.options != nil {
@@ -315,6 +359,10 @@ func (r *tnTestRun) startFile(f *tnTestRunFile) {
 // A child exited: its file's summary (or a failure when it crashed), then
 // the next files' held events
 func (r *tnTestRun) fileDone(f *tnTestRunFile, code int, signal string) {
+	f.cmd = nil
+	if r.interrupted {
+		return
+	}
 	f.exitCode, f.signal = code, signal
 	r.running--
 	r.drain()
@@ -385,6 +433,13 @@ func (r *tnTestRun) closeFile(f *tnTestRunFile) {
 }
 
 func (r *tnTestRun) finish() {
+	if r.interrupted {
+		return
+	}
+	if r.onInterrupt != nil {
+		tnProcessEmitter.off("SIGINT", r.onInterrupt)
+		r.onInterrupt = nil
+	}
 	r.emit(&TnTestEvent{type_: "test:plan", data: &TnTestEventData{count: r.topLevel}})
 	c := r.counts
 	duration := math.Round(float64(time.Since(r.start).Nanoseconds())/1e2) / 1e4

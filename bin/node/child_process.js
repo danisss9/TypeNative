@@ -348,13 +348,28 @@ func (cp *TnChildProcess) kill(signal ...interface{}) bool {
 		return false
 	}
 	cp.killed = true
-	cp.signalCode = "SIGTERM"
+	sig := "SIGTERM"
 	if len(signal) > 0 {
-		if s, ok := signal[0].(string); ok {
-			cp.signalCode = s
+		switch s := signal[0].(type) {
+		case string:
+			sig = s
+		case float64:
+			switch int(s) {
+			case 1:
+				sig = "SIGHUP"
+			case 2:
+				sig = "SIGINT"
+			case 3:
+				sig = "SIGQUIT"
+			case 9:
+				sig = "SIGKILL"
+			case 15:
+				sig = "SIGTERM"
+			}
 		}
 	}
-	return cp.cmd.Process.Kill() == nil
+	cp.signalCode = sig
+	return tnSignalChild(cp.cmd.Process, sig) == nil
 }
 
 func tnPipeSource(r io.Reader, s *TnStream, done *sync.WaitGroup) {
@@ -454,6 +469,7 @@ func TnSpawn(file string, args []string, options ...interface{}) *TnChildProcess
 			}
 		}
 	}
+	tnPrepareChild(cmd)
 	startErr := cmd.Start()
 	// the child has its own copies of the extra pipes' write ends: close the
 	// parent's, or reading child.stdio[3+n] never sees EOF and 'close' never fires
@@ -632,13 +648,55 @@ const unixDetachHelper = `func tnDetach(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setsid = true
+}
+
+func tnPrepareChild(cmd *exec.Cmd) {}
+
+func tnSignalChild(p *os.Process, sig string) error {
+	switch sig {
+	case "SIGINT":
+		return p.Signal(syscall.SIGINT)
+	case "SIGHUP":
+		return p.Signal(syscall.SIGHUP)
+	case "SIGQUIT":
+		return p.Signal(syscall.SIGQUIT)
+	case "SIGTERM":
+		return p.Signal(syscall.SIGTERM)
+	case "SIGUSR1":
+		return p.Signal(syscall.SIGUSR1)
+	case "SIGUSR2":
+		return p.Signal(syscall.SIGUSR2)
+	default:
+		return p.Kill()
+	}
 }`;
-const windowsDetachHelper = `func tnDetach(cmd *exec.Cmd) {
+const windowsDetachHelper = `var tnChildGenCtrlEvent = syscall.NewLazyDLL("kernel32.dll").NewProc("GenerateConsoleCtrlEvent")
+
+func tnDetach(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 	cmd.SysProcAttr.CreationFlags |= 0x8 | 0x200
+}
+
+func tnPrepareChild(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// CREATE_NEW_PROCESS_GROUP so GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)
+	// delivers os.Interrupt (SIGINT) to this child alone, not the parent
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+}
+
+func tnSignalChild(p *os.Process, sig string) error {
+	if sig == "SIGINT" {
+		r, _, _ := tnChildGenCtrlEvent.Call(syscall.CTRL_BREAK_EVENT, uintptr(p.Pid))
+		if r != 0 {
+			return nil
+		}
+	}
+	return p.Kill()
 }`;
 // Extra stdio on Windows: os/exec's ExtraFiles are not supported there, so
 // each extra 'pipe' entry is a named pipe — the parent serves it, the child
@@ -674,10 +732,10 @@ func tnOpenExtraPipe(name string) (*os.File, error) { return nil, os.ErrNotExist
 export function registerChildProcess(r) {
     defineModule(r, 'child_process');
     for (const goos of ['linux', 'darwin', 'freebsd', 'openbsd', 'netbsd', 'dragonfly', 'solaris', 'illumos', 'aix']) {
-        defineHelper(r, `nodeChildOS@${goos}`, ['os/exec', 'syscall'], [], unixDetachHelper);
+        defineHelper(r, `nodeChildOS@${goos}`, ['os', 'os/exec', 'syscall'], [], unixDetachHelper);
     }
-    defineHelper(r, 'nodeChildOS@windows', ['os/exec', 'syscall'], [], windowsDetachHelper);
-    defineHelper(r, 'nodeChildOS@other', ['os/exec'], [], 'func tnDetach(cmd *exec.Cmd) {}');
+    defineHelper(r, 'nodeChildOS@windows', ['os', 'os/exec', 'syscall'], [], windowsDetachHelper);
+    defineHelper(r, 'nodeChildOS@other', ['os', 'os/exec'], [], 'func tnDetach(cmd *exec.Cmd) {}\nfunc tnPrepareChild(cmd *exec.Cmd) {}\nfunc tnSignalChild(p *os.Process, sig string) error { return p.Kill() }');
     defineHelper(r, 'nodeChildPipes@windows', ['os', 'syscall', 'unsafe'], [], windowsExtraPipesHelper);
     defineHelper(r, 'nodeChildPipes@other', ['os'], [], otherExtraPipesHelper);
     defineHelper(r, 'nodeChild', ['bytes', 'errors', 'fmt', 'io', 'io/fs', 'os', 'os/exec', 'reflect', 'runtime', 'strconv', 'strings', 'sync', 'unsafe'], ['nodeStream', 'fsErrors', 'nodeFs', 'buffer', 'dynamic', 'nodeInvoke', 'eventLoop', 'promise', 'nodeChildOS@os', 'nodeChildPipes@os'], childHelper);
