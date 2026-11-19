@@ -3984,52 +3984,348 @@ declare module 'http2' { import m = require('node:http2'); export = m; }
 // implement it (under Node.js the real package runs). The real 'close' event can
 // be cancelled; compiled, the window is already gone, so preventDefault is absent.
 declare module '@webviewjs/webview' {
+  enum FullscreenType {
+    Exclusive = 0,
+    Borderless = 1
+  }
+  enum Theme {
+    Light = 0,
+    Dark = 1,
+    System = 2
+  }
+  enum ProgressBarState {
+    None = 0,
+    Normal = 1,
+    Indeterminate = 2,
+    Paused = 3,
+    Error = 4
+  }
+  enum ControlFlow {
+    Poll = 0,
+    Wait = 1,
+    WaitUntil = 2,
+    Exit = 3,
+    ExitWithCode = 4
+  }
+  interface CustomMenuEvent {
+    id: string;
+    windowId: number;
+  }
   interface ApplicationEvent {
     event: string;
+    customMenuEvent?: CustomMenuEvent;
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+  }
+  interface HeaderData {
+    key: string;
+    value?: string;
+  }
+  interface IpcMessage {
+    body: Buffer;
+    method: string;
+    headers: HeaderData[];
+    uri: string;
+  }
+  interface CustomProtocolResponse {
+    statusCode?: number;
+    headers?: HeaderData[];
+    body: Buffer;
+    mimeType?: string;
+  }
+  type BrowserWindowProtocolHandler = (
+    request: Request
+  ) => Response | CustomProtocolResponse | Promise<Response | CustomProtocolResponse>;
+  interface Dimensions {
+    width: number;
+    height: number;
+  }
+  interface Position {
+    x: number;
+    y: number;
+  }
+  interface MenuItemOptions {
+    id?: string;
+    label?: string;
+    enabled?: boolean;
+    accelerator?: string;
+    submenu?: MenuOptions;
+    role?: string;
+  }
+  interface MenuOptions {
+    items: MenuItemOptions[];
+  }
+  interface TrayIconImage {
+    data: Buffer;
+    width?: number;
+    height?: number;
+  }
+  interface TrayIconOptions {
+    id?: string;
+    icon?: TrayIconImage;
+    tooltip?: string;
+    title?: string;
+    menu?: MenuOptions;
+    iconIsTemplate?: boolean;
+    menuOnLeftClick?: boolean;
+    menuOnRightClick?: boolean;
+  }
+  interface TrayRect {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }
+  interface TrayEventPayload {
+    event: string;
+    id: string;
+    x: number;
+    y: number;
+    rect: TrayRect;
+    button?: string;
+    buttonState?: string;
+  }
+  type TrayEventName = 'click' | 'double-click' | 'enter' | 'move' | 'leave';
+  class TrayIcon {
+    readonly id: string;
+    setIcon(icon: Uint8Array | number[], width?: number | null, height?: number | null): void;
+    removeIcon(): void;
+    setMenu(menu?: MenuOptions | null): void;
+    setTooltip(tooltip?: string | null): void;
+    setTitle(title?: string | null): void;
+    setVisible(visible: boolean): void;
+    setIconAsTemplate(value: boolean): void;
+    setShowMenuOnLeftClick(value: boolean): void;
+    setShowMenuOnRightClick(value: boolean): void;
+    showMenu(): void;
+    rect(): TrayRect | null;
+    dispose(): void;
+    isDisposed(): boolean;
+    on(event: TrayEventName, listener: (event: TrayEventPayload) => void): this;
+    once(event: TrayEventName, listener: (event: TrayEventPayload) => void): this;
+    off(event: TrayEventName, listener: (event: TrayEventPayload) => void): this;
+  }
+  type NotificationPermission = 'granted';
+  type NotificationDirection = 'auto' | 'ltr' | 'rtl';
+  type NotificationEventName = 'click' | 'close' | 'error' | 'show';
+  interface NotificationAction {
+    action: string;
+    title: string;
+    icon?: string;
+  }
+  interface NotificationOptions {
+    body?: string;
+    icon?: string;
+    image?: string | Buffer;
+    badge?: string;
+    tag?: string;
+    data?: unknown;
+    dir?: NotificationDirection;
+    lang?: string;
+    renotify?: boolean;
+    requireInteraction?: boolean;
+    persistent?: boolean;
+    actions?: NotificationAction[];
+    silent?: boolean;
+    timestamp?: number;
+    vibrate?: number | number[];
+  }
+  interface NotificationEvent {
+    type: NotificationEventName;
+    target: Notification;
+    action?: string;
+    error?: Error;
+  }
+  class Notification {
+    constructor(title: string, options?: NotificationOptions);
+    static readonly permission: NotificationPermission;
+    static requestPermission(): Promise<NotificationPermission>;
+    close(): void;
+    readonly title: string;
+    readonly body: string;
+    readonly icon: string;
+    readonly image: string | Buffer;
+    readonly badge: string;
+    readonly tag: string;
+    readonly data: unknown;
+    readonly dir: NotificationDirection;
+    readonly lang: string;
+    readonly renotify: boolean;
+    readonly requireInteraction: boolean;
+    readonly persistent: boolean;
+    readonly actions: NotificationAction[];
+    readonly silent: boolean;
+    readonly timestamp: number;
+    readonly vibrate: number | number[];
+    onclick: ((event: NotificationEvent) => void) | null;
+    onclose: ((event: NotificationEvent) => void) | null;
+    onerror: ((event: NotificationEvent) => void) | null;
+    onshow: ((event: NotificationEvent) => void) | null;
+    on(event: NotificationEventName, listener: (event: NotificationEvent) => void): this;
+    once(event: NotificationEventName, listener: (event: NotificationEvent) => void): this;
+    off(event: NotificationEventName, listener: (event: NotificationEvent) => void): this;
+  }
+  interface FileFilter {
+    name: string;
+    extensions: string[];
+  }
+  interface FileDialogOptions {
+    multiple?: boolean;
+    title?: string;
+    defaultPath?: string;
+    filters?: FileFilter[];
   }
   interface WebContextOptions {
     // Where the webview keeps its profile. Needed under Node.js on Windows: the
     // default is beside node.exe, which Program Files makes read-only
     dataDirectory?: string;
+    allowsAutomation?: boolean;
   }
   interface BrowserWindowOptions {
     title?: string;
     width?: number;
     height?: number;
+    x?: number;
+    y?: number;
     // width and height in logical pixels, which follow the display's scaling, rather
     // than physical ones
     logical?: boolean;
     resizable?: boolean;
+    visible?: boolean;
+    decorations?: boolean;
+    maximized?: boolean;
+    maximizable?: boolean;
+    minimizable?: boolean;
+    focused?: boolean;
+    alwaysOnTop?: boolean;
+    alwaysOnBottom?: boolean;
+    contentProtection?: boolean;
+    fullscreen?: FullscreenType;
+    windowsSkipTaskbar?: boolean;
+    menu?: MenuOptions;
+    showMenu?: boolean;
   }
   interface WebviewOptions {
     url?: string;
     html?: string;
     enableDevtools?: boolean;
     webContext?: WebContext | null;
+    ipcName?: string;
+    autoNormalizeLoadUrl?: boolean;
+    useHttpsScheme?: boolean;
   }
-  class WebContext {}
+  class WebContext {
+    readonly dataDirectory: string | null;
+    isCustomProtocolRegistered(scheme: string): boolean;
+    setAllowsAutomation(flag: boolean): void;
+    dispose(): void;
+    isDisposed(): boolean;
+  }
   class Webview {
     loadUrl(url: string): void;
     loadHtml(html: string): void;
     evaluateScript(js: string): void;
     reload(): void;
+    url(): string | null;
+    onIpcMessage(handler?: ((message: IpcMessage) => void) | null): void;
+    expose(name: string, target: Record<string, unknown>): void;
+    zoom(scaleFactor: number): void;
+    setWebviewVisibility(visible: boolean): void;
+    focus(): void;
+    dispose(): void;
+    isDisposed(): boolean;
   }
+  type BrowserWindowEventName = 'close' | 'resize' | 'move' | 'focus' | 'blur';
   class BrowserWindow {
     createWebview(options?: WebviewOptions): Webview;
+    registerProtocol(name: string, handler: BrowserWindowProtocolHandler): void;
+    id(): number;
+    readonly isChild: boolean;
+    readonly title: string;
+    readonly width: number;
+    readonly height: number;
+    readonly x: number;
+    readonly y: number;
+    readonly fullscreen: FullscreenType | null;
+    hasMenu(): boolean;
     setTitle(title: string): void;
+    show(): void;
+    hide(): void;
+    setVisible(visible: boolean): void;
+    isVisible(): boolean;
+    focus(): void;
+    isFocused(): boolean;
+    setMaximized(value: boolean): void;
+    isMaximized(): boolean;
+    setMinimized(value: boolean): void;
+    isMinimized(): boolean;
+    setResizable(resizable: boolean): void;
+    isResizable(): boolean;
+    setDecorations(enabled: boolean): void;
+    isDecorated(): boolean;
+    setClosable(closable: boolean): void;
+    isClosable(): boolean;
+    setMaximizable(maximizable: boolean): void;
+    isMaximizable(): boolean;
+    setMinimizable(minimizable: boolean): void;
+    isMinimizable(): boolean;
+    setAlwaysOnTop(enabled: boolean): void;
+    setAlwaysOnBottom(enabled: boolean): void;
+    setContentProtection(enabled: boolean): void;
+    setSkipTaskbar(skip: boolean): void;
+    setEnable(enabled: boolean): void;
+    setFullscreen(fullscreenType?: FullscreenType | null): void;
+    setSize(width: number, height: number, logical?: boolean | null): Dimensions | null;
+    setMinSize(width: number, height: number, logical?: boolean | null): void;
+    setMaxSize(width: number, height: number, logical?: boolean | null): void;
+    getInnerSize(logical?: boolean | null): Dimensions;
+    getOuterSize(logical?: boolean | null): Dimensions;
+    setPosition(x: number, y: number, logical?: boolean | null): void;
+    getPosition(logical?: boolean | null): Position;
+    center(): void;
+    scaleFactor(): number;
+    startDragging(): void;
+    requestRedraw(): void;
+    openFileDialog(options?: FileDialogOptions | null): string[];
     close(): void;
-    on(event: 'close', listener: (event: ApplicationEvent) => void): this;
-    once(event: 'close', listener: (event: ApplicationEvent) => void): this;
+    dispose(): void;
+    isDisposed(): boolean;
+    on(event: BrowserWindowEventName, listener: (event: ApplicationEvent) => void): this;
+    once(event: BrowserWindowEventName, listener: (event: ApplicationEvent) => void): this;
+    off(event: BrowserWindowEventName, listener: (event: ApplicationEvent) => void): this;
   }
-  type ApplicationEventName = 'ready' | 'window-close-requested' | 'application-close-requested';
+  type ApplicationEventName = 'ready' | 'window-close-requested' | 'application-close-requested' | 'custom-menu-click';
+  interface ApplicationOptions {
+    controlFlow?: ControlFlow;
+    waitTime?: number;
+    exitCode?: number;
+  }
+  interface ApplicationRunOptions {
+    interval?: number;
+    ref?: boolean;
+  }
   class Application {
+    constructor(options?: ApplicationOptions | null);
     createWebContext(options?: WebContextOptions): WebContext;
     createBrowserWindow(options?: BrowserWindowOptions): BrowserWindow;
+    createChildBrowserWindow(options?: BrowserWindowOptions): BrowserWindow;
+    createTrayIcon(options?: TrayIconOptions): TrayIcon;
+    setMenu(menuOptions?: MenuOptions | null): void;
+    setDockIcon(icon: Buffer): void;
+    removeDockIcon(): void;
     isReady(): boolean;
-    run(): void;
-    whenReady(): Promise<void>;
+    run(options?: ApplicationRunOptions | null): void;
+    whenReady(options?: ApplicationRunOptions | null): Promise<void>;
     exit(): void;
     on(event: ApplicationEventName, listener: (event: ApplicationEvent) => void): this;
     once(event: ApplicationEventName, listener: (event: ApplicationEvent) => void): this;
+    off(event: ApplicationEventName, listener: (event: ApplicationEvent) => void): this;
   }
+  function originalUriPrefix(protocol: string): string;
+  function workAroundUriPrefix(httpOrHttps: string, protocol: string): string;
+  function applyUriWorkAround(uri: string, httpOrHttps: string, protocol: string): string;
+  function revertUriWorkAround(uri: string, httpOrHttps: string, protocol: string): string;
+  function isWorkAroundUri(uri: string, httpOrHttps: string, protocol: string): boolean;
 }
