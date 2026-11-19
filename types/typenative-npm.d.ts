@@ -3593,6 +3593,17 @@ declare module 'node:sqlite' {
       close(): void;
       [Symbol.dispose](): void;
     }
+    interface VirtualTableColumn {
+      name: string;
+      type: 'INTEGER' | 'TEXT' | 'REAL' | 'BLOB' | 'ANY';
+      hidden?: boolean;
+    }
+    interface CreateModuleOptions {
+      columns: VirtualTableColumn[];
+      rows: (...args: any[]) => Iterable<SQLInputValue[]>;
+      directOnly?: boolean;
+      useBigIntArguments?: boolean;
+    }
     // SQLite runs as Wasm inside the program (github.com/ncruces/go-sqlite3):
     // loadExtension throws; serialize / deserialize go through a temporary file;
     // createSession / applyChangeset emulate the session extension over the
@@ -3611,6 +3622,7 @@ declare module 'node:sqlite' {
       function(name: string, fn: (...args: any[]) => SQLInputValue): void;
       aggregate(name: string, options: AggregateOptions): void;
       aggregate<T extends SQLInputValue>(name: string, options: AggregateOptions<T>): void;
+      createModule(name: string, options: CreateModuleOptions): void;
       setAuthorizer(
         callback:
           | ((actionCode: number, arg1: string | null, arg2: string | null, dbName: string | null, triggerOrView: string | null) => number)

@@ -498,6 +498,10 @@ func tnSqliteResult(ctx sqlite3.Context, v interface{}) {
 			ctx.ResultInt64(x.Int64())
 		}
 	default:
+		if _, isNull := v.(interface{ TnIsNullValue() }); isNull {
+			ctx.ResultNull()
+			return
+		}
 		rv := reflect.ValueOf(v)
 		switch {
 		case rv.Kind() >= reflect.Int && rv.Kind() <= reflect.Float64 && rv.Kind() != reflect.Uintptr:
@@ -506,6 +510,8 @@ func tnSqliteResult(ctx sqlite3.Context, v interface{}) {
 			panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "Asynchronous user-defined functions are not supported"))
 		case (rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Func || rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map) && rv.IsNil():
 			ctx.ResultNull()
+		case rv.Kind() == reflect.Pointer && rv.Elem().Kind() != reflect.Struct:
+			tnSqliteResult(ctx, rv.Elem().Interface())
 		default:
 			panic(TnNodeError("Error", "ERR_SQLITE_ERROR", "Returned JavaScript value cannot be converted to a SQLite value"))
 		}
@@ -614,6 +620,451 @@ func (db *TnSqliteDb) aggregate(name string, options interface{}) {
 		return a
 	})
 	db.check(err)
+}
+
+// createModule(name, options): virtual-table module backed by JS callbacks
+type tnSqliteVTabCol struct {
+	name       string
+	typ        string
+	hidden     bool
+	hiddenIdx  int
+	visibleIdx int
+}
+
+type tnSqliteVTab struct {
+	db      *TnSqliteDb
+	cols    []tnSqliteVTabCol
+	nHidden int
+	rowsFn  interface{}
+	bigInts bool
+}
+
+type tnSqliteVTabCursor struct {
+	vt       *tnSqliteVTab
+	args     []interface{}
+	rowid    int64
+	eof      bool
+	curRow   interface{}
+	isSlice  bool
+	rvSlice  reflect.Value
+	sliceIdx int
+	isChan   bool
+	chanVal  interface{}
+	rvChan   reflect.Value
+	nextFn   interface{}
+	returnFn interface{}
+}
+
+func tnSqliteIsObject(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	switch v.(type) {
+	case string, float64, bool, *tnbig.Int:
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array, reflect.Func, reflect.Chan:
+		return false
+	case reflect.Pointer:
+		if rv.IsNil() || rv.Elem().Kind() == reflect.Slice {
+			return false
+		}
+	}
+	if rv.Kind() >= reflect.Int && rv.Kind() <= reflect.Complex128 {
+		return false
+	}
+	return true
+}
+
+func tnSqliteOptBool(obj interface{}, key string, errMsg string) bool {
+	v := TnGetValue(obj, key)
+	if v == nil {
+		return false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case *bool:
+		if b == nil {
+			return false
+		}
+		return *b
+	}
+	panic(tnSqliteArgType(errMsg))
+}
+
+func (db *TnSqliteDb) callVTab(fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if !db.hasPending {
+				db.pending, db.hasPending = r, true
+			}
+			err = errors.New(fmt.Sprint(r))
+		}
+	}()
+	return fn()
+}
+
+func (vt *tnSqliteVTab) BestIndex(idx *sqlite3.IndexInfo) error {
+	var used []string
+	seen := make([]bool, vt.nHidden)
+	argv := 1
+	for i, c := range idx.Constraint {
+		if c.Op != sqlite3.INDEX_CONSTRAINT_EQ {
+			continue
+		}
+		if c.Column < 0 || c.Column >= len(vt.cols) || !vt.cols[c.Column].hidden {
+			continue
+		}
+		if !c.Usable {
+			return sqlite3.CONSTRAINT
+		}
+		hIdx := vt.cols[c.Column].hiddenIdx
+		if seen[hIdx] {
+			continue
+		}
+		seen[hIdx] = true
+		idx.ConstraintUsage[i].ArgvIndex = argv
+		idx.ConstraintUsage[i].Omit = true
+		used = append(used, strconv.Itoa(hIdx))
+		argv++
+	}
+	idx.IdxStr = strings.Join(used, ",")
+	idx.EstimatedCost = 1000.0 / float64(1+len(used))
+	return nil
+}
+
+func (vt *tnSqliteVTab) Open() (sqlite3.VTabCursor, error) {
+	return &tnSqliteVTabCursor{vt: vt, eof: true}, nil
+}
+
+func (cur *tnSqliteVTabCursor) closeIter() {
+	if !cur.eof {
+		if cur.isChan {
+			if c, ok := tnGenCtrls.Load(cur.chanVal); ok {
+				ctrl := c.(*tnGenCtrl)
+				ctrl.mu.Lock()
+				done := ctrl.done
+				ctrl.mu.Unlock()
+				if !done {
+					ctrl.in <- tnGenCmd{kind: tnGenCmdReturn}
+					for {
+						if _, ok := cur.rvChan.Recv(); !ok {
+							break
+						}
+					}
+					ctrl.mu.Lock()
+					hasErr := ctrl.hasErr
+					errVal := ctrl.errVal
+					ctrl.hasErr = false
+					ctrl.mu.Unlock()
+					if hasErr && !cur.vt.db.hasPending {
+						if _, isNil := errVal.(tnGenNilErr); isNil {
+							cur.vt.db.pending, cur.vt.db.hasPending = nil, true
+						} else {
+							cur.vt.db.pending, cur.vt.db.hasPending = errVal, true
+						}
+					}
+				}
+			}
+		} else if cur.returnFn != nil {
+			_ = cur.vt.db.callVTab(func() error {
+				TnInvoke(cur.returnFn)
+				return nil
+			})
+		}
+	}
+	cur.eof = true
+	cur.curRow = nil
+	cur.isSlice = false
+	cur.rvSlice = reflect.Value{}
+	cur.sliceIdx = 0
+	cur.isChan = false
+	cur.chanVal = nil
+	cur.rvChan = reflect.Value{}
+	cur.nextFn = nil
+	cur.returnFn = nil
+}
+
+func (cur *tnSqliteVTabCursor) Close() error {
+	cur.closeIter()
+	return nil
+}
+
+func (cur *tnSqliteVTabCursor) initIter(res interface{}) error {
+	if res == nil {
+		return errors.New("The \\"options.rows\\" function must return an iterable object")
+	}
+	rv := reflect.ValueOf(res)
+	if m := rv.MethodByName("Symbol_iterator"); m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() >= 1 {
+		res = m.Call(nil)[0].Interface()
+		if res == nil {
+			return errors.New("The \\"options.rows\\" function must return an iterable object")
+		}
+		rv = reflect.ValueOf(res)
+	}
+	if m, ok := res.(interface{ Entries() [][]interface{} }); ok {
+		res = m.Entries()
+		rv = reflect.ValueOf(res)
+	} else if s, ok := res.(interface{ TnItems() *[]interface{} }); ok {
+		res = *s.TnItems()
+		rv = reflect.ValueOf(res)
+	}
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+		rv = rv.Elem()
+	}
+	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+		cur.isSlice = true
+		cur.rvSlice = rv
+		cur.sliceIdx = 0
+		return nil
+	}
+	if rv.Kind() == reflect.Chan {
+		cur.isChan = true
+		cur.chanVal = res
+		cur.rvChan = rv
+		return nil
+	}
+	if nextFn := TnGet(res, "next"); tnSqliteIsFunc(nextFn) {
+		cur.nextFn = nextFn
+		if retFn := TnGet(res, "return"); tnSqliteIsFunc(retFn) {
+			cur.returnFn = retFn
+		}
+		return nil
+	}
+	return errors.New("The \\"options.rows\\" function must return an iterable object")
+}
+
+func (cur *tnSqliteVTabCursor) advance() {
+	cur.curRow = nil
+	if cur.isSlice {
+		if cur.sliceIdx >= cur.rvSlice.Len() {
+			cur.eof = true
+			return
+		}
+		cur.curRow = cur.rvSlice.Index(cur.sliceIdx).Interface()
+		cur.sliceIdx++
+		cur.rowid++
+		return
+	}
+	if cur.isChan {
+		if c, ok := tnGenCtrls.Load(cur.chanVal); ok {
+			ctrl := c.(*tnGenCtrl)
+			ctrl.mu.Lock()
+			done := ctrl.done
+			ctrl.mu.Unlock()
+			if done {
+				cur.eof = true
+				return
+			}
+			ctrl.in <- tnGenCmd{kind: tnGenCmdNext}
+			v, ok := cur.rvChan.Recv()
+			if ok {
+				cur.curRow = v.Interface()
+				cur.rowid++
+				return
+			}
+			ctrl.mu.Lock()
+			hasErr := ctrl.hasErr
+			errVal := ctrl.errVal
+			ctrl.hasErr = false
+			ctrl.mu.Unlock()
+			cur.eof = true
+			if hasErr {
+				if _, isNil := errVal.(tnGenNilErr); isNil {
+					panic(nil)
+				}
+				panic(errVal)
+			}
+			return
+		}
+		v, ok := cur.rvChan.Recv()
+		if ok {
+			cur.curRow = v.Interface()
+			cur.rowid++
+			return
+		}
+		cur.eof = true
+		return
+	}
+	if cur.nextFn != nil {
+		step := TnInvoke(cur.nextFn)
+		if tnSqliteFlag(step, "done", false) {
+			cur.eof = true
+			return
+		}
+		cur.curRow = TnGetValue(step, "value")
+		cur.rowid++
+		return
+	}
+	cur.eof = true
+}
+
+func (cur *tnSqliteVTabCursor) Filter(idxNum int, idxStr string, arg ...sqlite3.Value) error {
+	cur.closeIter()
+	cur.rowid = 0
+	cur.eof = false
+	cur.args = make([]interface{}, cur.vt.nHidden)
+	return cur.vt.db.callVTab(func() error {
+		if idxStr != "" {
+			parts := strings.Split(idxStr, ",")
+			for i, p := range parts {
+				if i >= len(arg) {
+					break
+				}
+				hIdx, err := strconv.Atoi(p)
+				if err == nil && hIdx >= 0 && hIdx < len(cur.args) {
+					cur.args[hIdx] = cur.vt.db.argValue(arg[i], cur.vt.bigInts)
+				}
+			}
+		}
+		res := TnInvoke(cur.vt.rowsFn, cur.args...)
+		if err := cur.initIter(res); err != nil {
+			cur.eof = true
+			return err
+		}
+		cur.advance()
+		return nil
+	})
+}
+
+func (cur *tnSqliteVTabCursor) Next() error {
+	return cur.vt.db.callVTab(func() error {
+		cur.advance()
+		return nil
+	})
+}
+
+func (cur *tnSqliteVTabCursor) EOF() bool {
+	return cur.eof
+}
+
+func (cur *tnSqliteVTabCursor) Column(ctx sqlite3.Context, n int) error {
+	if n < 0 || n >= len(cur.vt.cols) {
+		ctx.ResultNull()
+		return nil
+	}
+	col := cur.vt.cols[n]
+	return cur.vt.db.callVTab(func() error {
+		if col.hidden {
+			if col.hiddenIdx < len(cur.args) {
+				tnSqliteResult(ctx, cur.args[col.hiddenIdx])
+			} else {
+				ctx.ResultNull()
+			}
+			return nil
+		}
+		if cur.curRow == nil {
+			ctx.ResultNull()
+			return nil
+		}
+		rv := reflect.ValueOf(cur.curRow)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Slice {
+			rv = rv.Elem()
+		}
+		if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && col.visibleIdx < rv.Len() {
+			tnSqliteResult(ctx, rv.Index(col.visibleIdx).Interface())
+		} else {
+			ctx.ResultNull()
+		}
+		return nil
+	})
+}
+
+func (cur *tnSqliteVTabCursor) RowID() (int64, error) {
+	return cur.rowid, nil
+}
+
+func (db *TnSqliteDb) createModule(name interface{}, opts ...interface{}) {
+	db.requireOpen()
+	nameStr, ok := name.(string)
+	if !ok {
+		panic(tnSqliteArgType("The \\"name\\" argument must be a string."))
+	}
+	var options interface{}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	if !tnSqliteIsObject(options) {
+		panic(tnSqliteArgType("The \\"options\\" argument must be an object."))
+	}
+	colsVal := TnGetValue(options, "columns")
+	if colsVal == nil {
+		panic(tnSqliteArgType("The \\"options.columns\\" argument must be an array."))
+	}
+	colsRV := reflect.ValueOf(colsVal)
+	if colsRV.Kind() == reflect.Pointer && !colsRV.IsNil() && colsRV.Elem().Kind() == reflect.Slice {
+		colsRV = colsRV.Elem()
+	}
+	if colsRV.Kind() != reflect.Slice && colsRV.Kind() != reflect.Array {
+		panic(tnSqliteArgType("The \\"options.columns\\" argument must be an array."))
+	}
+	if colsRV.Len() == 0 {
+		panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The \\"options.columns\\" array must not be empty."))
+	}
+	cols := make([]tnSqliteVTabCol, colsRV.Len())
+	defs := make([]string, colsRV.Len())
+	nHidden := 0
+	nVisible := 0
+	for i := 0; i < colsRV.Len(); i++ {
+		c := colsRV.Index(i).Interface()
+		if !tnSqliteIsObject(c) {
+			panic(tnSqliteArgType("Each column in \\"options.columns\\" must be an object."))
+		}
+		cName, ok := TnGetValue(c, "name").(string)
+		if !ok {
+			panic(tnSqliteArgType("The column \\"name\\" property must be a string."))
+		}
+		cType, ok := TnGetValue(c, "type").(string)
+		if !ok {
+			panic(tnSqliteArgType("The column \\"type\\" property must be a string."))
+		}
+		switch cType {
+		case "INTEGER", "TEXT", "REAL", "BLOB", "ANY":
+		default:
+			panic(TnNodeError("TypeError", "ERR_INVALID_ARG_VALUE", "The column \\"type\\" property must be one of 'INTEGER', 'TEXT', 'REAL', 'BLOB', or 'ANY'."))
+		}
+		hidden := tnSqliteOptBool(c, "hidden", "The column \\"hidden\\" property must be a boolean.")
+		col := tnSqliteVTabCol{name: cName, typ: cType, hidden: hidden}
+		def := tnSqliteQuoteIdent(cName) + " " + cType
+		if hidden {
+			col.hiddenIdx = nHidden
+			nHidden++
+			def += " HIDDEN"
+		} else {
+			col.visibleIdx = nVisible
+			nVisible++
+		}
+		cols[i] = col
+		defs[i] = def
+	}
+	rowsFn := TnGet(options, "rows")
+	if !tnSqliteIsFunc(rowsFn) {
+		panic(tnSqliteArgType("The \\"options.rows\\" argument must be a function."))
+	}
+	directOnly := tnSqliteOptBool(options, "directOnly", "The \\"options.directOnly\\" argument must be a boolean.")
+	bigInts := tnSqliteOptBool(options, "useBigIntArguments", "The \\"options.useBigIntArguments\\" argument must be a boolean.")
+	createSQL := "CREATE TABLE x(" + strings.Join(defs, ", ") + ")"
+	ctor := func(conn *sqlite3.Conn, module, schema, table string, arg ...string) (*tnSqliteVTab, error) {
+		if err := conn.DeclareVTab(createSQL); err != nil {
+			return nil, err
+		}
+		if directOnly {
+			if err := conn.VTabConfig(sqlite3.VTAB_DIRECTONLY); err != nil {
+				return nil, err
+			}
+		}
+		return &tnSqliteVTab{
+			db:      db,
+			cols:    cols,
+			nHidden: nHidden,
+			rowsFn:  rowsFn,
+			bigInts: bigInts,
+		}, nil
+	}
+	db.check(sqlite3.CreateModule(db.conn, nameStr, nil, ctor))
 }
 
 func (db *TnSqliteDb) enableLoadExtension(allow bool) {
@@ -2191,7 +2642,7 @@ export function registerSqlite(r: NodeRegistry): void {
     r,
     'nodeSqlite',
     ['github.com/ncruces/go-sqlite3', 'encoding/binary', 'errors', 'fmt', 'math', 'math/big', 'os', 'reflect', 'runtime', 'sort', 'strconv', 'strings', 'time', 'unsafe'],
-    ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise'],
+    ['dynamic', 'orderedMap', 'nodeInvoke', 'eventLoop', 'promise', 'generatorStep'],
     sqliteHelper
   );
   const use = () => r.helper('nodeSqlite');
@@ -2200,7 +2651,7 @@ export function registerSqlite(r: NodeRegistry): void {
     'sqlite.DatabaseSync',
     '*TnSqliteDb',
     'class',
-    'open=; close=; exec=; prepare=*TnSqliteStmt; location=*string; function=; aggregate=; enableLoadExtension=; enableDefensive=; loadExtension=; setAuthorizer=; createTagStore=*TnSqliteTagStore; createSession=*TnSqliteSession; applyChangeset=bool; serialize=[]byte; deserialize=',
+    'open=; close=; exec=; prepare=*TnSqliteStmt; location=*string; function=; aggregate=; createModule=; enableLoadExtension=; enableDefensive=; loadExtension=; setAuthorizer=; createTagStore=*TnSqliteTagStore; createSession=*TnSqliteSession; applyChangeset=bool; serialize=[]byte; deserialize=',
     '',
     'isOpen=bool; isTransaction=bool; limits=*TnSqliteLimits',
     ''
