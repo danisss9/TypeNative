@@ -1016,6 +1016,7 @@ func TnReadableFrom(iterable interface{}, options ...interface{}) *TnStream {
 			TnLoopRef()
 			go func() {
 				for {
+					TnGenWake(iterable)
 					v, ok := rv.Recv()
 					if !ok {
 						break
@@ -1612,7 +1613,7 @@ export function registerStream(r: NodeRegistry): void {
     r,
     'nodeStream',
     ['encoding/json', 'math/big', 'os', 'reflect', 'strconv', 'unicode/utf8'],
-    ['nodeEvents', 'buffer', 'stringDecoder', 'eventLoop', 'promise', 'dynamic', 'nodeInvoke', 'stdinReader'],
+    ['nodeEvents', 'buffer', 'stringDecoder', 'eventLoop', 'promise', 'dynamic', 'nodeInvoke', 'stdinReader', 'generatorStep'],
     streamHelper
   );
   defineHelper(r, 'stdinReader', ['bufio', 'os'], [], `// One buffered reader shared by process.stdin, readline and question()

@@ -1340,17 +1340,20 @@ func TnCallbackify(fn interface{}) func(args ...interface{}) {
 			v, ok := result.Recv()
 			var reason interface{}
 			rejected := false
+			var value interface{}
 			if !ok {
-				reason, rejected = tnRejections.Load(result.Interface())
+				if resolved, hasVal := tnResolved.Load(result.Interface()); hasVal {
+					value = resolved
+				} else {
+					reason, rejected = tnRejections.Load(result.Interface())
+				}
+			} else if v.IsValid() {
+				value = v.Interface()
 			}
 			TnLoopPost(func() {
 				if rejected {
 					TnInvoke(cb, reason)
 					return
-				}
-				var value interface{}
-				if v.IsValid() {
-					value = v.Interface()
 				}
 				TnInvoke(cb, nil, value)
 			})

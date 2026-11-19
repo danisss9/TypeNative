@@ -959,7 +959,12 @@ func tnWasmResponseBytes[T any](r *TnResponse, out chan T, deliver func([]byte))
 						failure = rec
 					}
 				}()
-				data = <-body
+				v, reason, rejected := tnSettle(body)
+				if rejected {
+					failure = reason
+					return
+				}
+				data = v
 			}()
 			TnLoopPost(func() {
 				if failure != nil {
@@ -989,7 +994,12 @@ func tnWasmStreamingValue[T any](v interface{}, out chan T, deliver func([]byte)
 		TnLoopRef()
 		go func() {
 			defer TnLoopUnref()
-			tnWasmStreamingValue(<-s, out, deliver)
+			val, reason, rejected := tnSettle(s)
+			if rejected {
+				TnReject(out, reason)
+				return
+			}
+			tnWasmStreamingValue(val, out, deliver)
 		}()
 	default:
 		TnReject(out, tnWasmStreamingTypeError(v))
@@ -1008,7 +1018,12 @@ func tnWasmStreamingBytes[T any](src interface{}, out chan T, deliver func([]byt
 		TnLoopRef()
 		go func() {
 			defer TnLoopUnref()
-			tnWasmResponseBytes(<-s, out, deliver)
+			val, reason, rejected := tnSettle(s)
+			if rejected {
+				TnReject(out, reason)
+				return
+			}
+			tnWasmResponseBytes(val, out, deliver)
 		}()
 	case chan interface{}:
 		tnWasmStreamingValue(s, out, deliver)
@@ -1020,7 +1035,7 @@ func tnWasmStreamingBytes[T any](src interface{}, out chan T, deliver func([]byt
 func TnWasmCompileStreaming(src interface{}) chan *TnWasmModule {
 	ch := make(chan *TnWasmModule, 1)
 	tnWasmStreamingBytes(src, ch, func(b []byte) {
-		ch <- TnNewWasmModule(b)
+		TnAsyncSend(ch, TnNewWasmModule(b))
 	})
 	return ch
 }
@@ -1029,7 +1044,7 @@ func TnWasmInstantiateStreaming(src interface{}, importObject ...interface{}) ch
 	ch := make(chan *TnWasmInstantiated, 1)
 	tnWasmStreamingBytes(src, ch, func(b []byte) {
 		m := TnNewWasmModule(b)
-		ch <- &TnWasmInstantiated{module: m, instance: TnNewWasmInstance(m, importObject...)}
+		TnAsyncSend(ch, &TnWasmInstantiated{module: m, instance: TnNewWasmInstance(m, importObject...)})
 	})
 	return ch
 }`;

@@ -10660,10 +10660,12 @@ function emitGeneratorSeq(fn: AstNode, header: string, parameterInfo: { signatur
   const prevChannel = asyncChannelVar;
   const prevFn = asyncFunctionNode;
   const prevIsAsync = asyncChannelIsAsync;
+  const prevYieldType = asyncChannelYieldType;
   const prevSeq = generatorSeqMode;
   asyncChannelVar = '__ch';
   asyncFunctionNode = fn;
   asyncChannelIsAsync = false;
+  asyncChannelYieldType = yieldType;
   generatorSeqMode = true;
   let body: string;
   try {
@@ -10672,6 +10674,7 @@ function emitGeneratorSeq(fn: AstNode, header: string, parameterInfo: { signatur
     asyncChannelVar = prevChannel;
     asyncFunctionNode = prevFn;
     asyncChannelIsAsync = prevIsAsync;
+    asyncChannelYieldType = prevYieldType;
     generatorSeqMode = prevSeq;
   }
   useHelper('generatorStep');
@@ -26359,11 +26362,12 @@ function goFileImportLines(fileCode: string): string {
     .join('\n');
 }
 
-// Every Go package some helper imports
+// Every Go package a used helper imports
 function allHelperPackages(): Set<string> {
   const all = new Set<string>();
-  for (const pkgs of Object.values(helperPackages)) for (const pkg of pkgs) all.add(pkg);
-  for (const pkgs of Object.values(nodeRegistry.helperPackages)) for (const pkg of pkgs as string[]) all.add(pkg);
+  for (const id of usedHelpers) {
+    for (const pkg of helperPackages[id] ?? nodeRegistry.helperPackages[id] ?? []) all.add(pkg);
+  }
   return all;
 }
 
@@ -40828,19 +40832,24 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     const iterClass = iterType.slice(1).replace(/\[.*\]$/, '');
     const yieldType = classIteratorYieldType(iterClass);
     if (yieldType) {
-      const declaration = isVariableDeclarationList(node.initializer)
-        ? node.initializer.declarations[0]
-        : undefined;
-      if (declaration && isIdentifier(declaration.name)) {
-        registerLocalVariable(declaration.name.text, yieldType);
-        const iteratorMember = findClassGenerator(iterClass, 'Symbol_iterator');
-        if (iteratorMember && generatorSeqEligible(iteratorMember)) {
-          const loopVar = visit(declaration.name);
-          return `for ${loopVar} := range ${iterExpr}.Symbol_iterator__seq()${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
+      if (node.awaitModifier) {
+        iterExpr = `${iterExpr}.Symbol_iterator()`;
+        iterType = `chan ${yieldType}`;
+      } else {
+        const declaration = isVariableDeclarationList(node.initializer)
+          ? node.initializer.declarations[0]
+          : undefined;
+        if (declaration && isIdentifier(declaration.name)) {
+          registerLocalVariable(declaration.name.text, yieldType);
+          const iteratorMember = findClassGenerator(iterClass, 'Symbol_iterator');
+          if (iteratorMember && generatorSeqEligible(iteratorMember)) {
+            const loopVar = visit(declaration.name);
+            return `for ${loopVar} := range ${iterExpr}.Symbol_iterator__seq()${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
+          }
+          return lockstepRange(visit(declaration.name), `${iterExpr}.Symbol_iterator()`, node.statement);
         }
-        return lockstepRange(visit(declaration.name), `${iterExpr}.Symbol_iterator()`, node.statement);
+        return `for _ = range ${iterExpr}.Symbol_iterator()${visitLoopBody(node.statement)}`;
       }
-      return `for _ = range ${iterExpr}.Symbol_iterator()${visitLoopBody(node.statement)}`;
     }
   }
   if (iterType?.startsWith('chan ')) {

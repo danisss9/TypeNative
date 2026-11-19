@@ -222,7 +222,7 @@ func TnAssertDoesNotThrow(fn func(), msg ...interface{}) {
 func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...interface{}) chan struct{} {
 	out := make(chan struct{}, 1)
 	go func() {
-		defer close(out)
+		defer TnAsyncClose(out)
 		defer TnRejectOnPanic(out)
 		_, reason, rejected := tnSettle(p)
 		if !rejected {
@@ -243,7 +243,7 @@ func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...inter
 func TnAssertDoesNotReject[T any](p chan T, msg ...interface{}) chan struct{} {
 	out := make(chan struct{}, 1)
 	go func() {
-		defer close(out)
+		defer TnAsyncClose(out)
 		defer TnRejectOnPanic(out)
 		_, reason, rejected := tnSettle(p)
 		if rejected {
