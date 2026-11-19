@@ -1,23 +1,68 @@
-name: Prepare Subfolder for Website
+name: Deploy website
+
+# Uploads www/ to the OVH web hosting over SFTP whenever it changes on main.
+#
+# Repository settings → Secrets and variables → Actions:
+#   secret    OVH_SFTP_PASSWORD     FTP password of the hosting (OVH Control Panel → FTP-SSH)
+#   variable  OVH_SFTP_HOST         ftp.cluster129.hosting.ovh.net
+#   variable  OVH_SFTP_USER         typenat
+#   variable  OVH_SSH_KNOWN_HOSTS   the server's host key line, from:
+#                                   ssh-keyscan -t ed25519 ftp.cluster129.hosting.ovh.net
 
 on:
   push:
     branches:
       - main
+    paths:
+      - 'www/**'
+      - '.github/workflows/deploy-website.yml'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
 
 jobs:
-  split-folder:
+  deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Push subfolder to deploy branch
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: deploy
-          publish_dir: ./www
+      - name: Lint PHP with PHP 8.4
+        run: |
+          docker run --rm -v "$PWD/www:/site:ro" php:8.4-cli \
+            sh -c 'find /site -name "*.php" -print0 | xargs -0 -n1 php -l > /dev/null'
+
+      - name: Install lftp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+
+      - name: Pin the OVH host key
+        env:
+          KNOWN_HOSTS: ${{ vars.OVH_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$KNOWN_HOSTS" || { echo "Set the OVH_SSH_KNOWN_HOSTS variable"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # Uploads new and changed files into the hosting's www/ folder (hidden files
+      # such as .htaccess and .ovhconfig included). Files that exist only on the
+      # server are left alone; add --delete to mirror to remove them too.
+      - name: Upload www/ over SFTP
+        env:
+          LFTP_PASSWORD: ${{ secrets.OVH_SFTP_PASSWORD }}
+          SFTP_HOST: ${{ vars.OVH_SFTP_HOST }}
+          SFTP_USER: ${{ vars.OVH_SFTP_USER }}
+        run: |
+          lftp --env-password -u "$SFTP_USER" "sftp://$SFTP_HOST" <<'EOF'
+          set cmd:fail-exit yes
+          set net:max-retries 2
+          set net:reconnect-interval-base 5
+          set sftp:connect-program "ssh -a -x -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts"
+          mirror --reverse --verbose --parallel=4 --exclude-glob README.md www/ www/
+          EOF

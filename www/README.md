@@ -47,11 +47,16 @@ Then open http://127.0.0.1:8080. The built-in server ignores `.htaccess`, so red
    ```
 
    `www/.ovhconfig` carries the same settings for the document root. Changing the FTP-root file applies to every site on the plan. The site turns off PHP error display itself, because OVH shows errors on PHP 8.x even in production mode.
-3. **Upload** the *contents* of this folder into `/www/` over FTP or SFTP, for example with FileZilla (turn on *Server → Force showing hidden files* so `.htaccess`, `.ovhconfig`, `app/.htaccess` and `assets/.htaccess` go up too). On plans with SSH:
+3. **Upload**: [`.github/workflows/deploy-website.yml`](../.github/workflows/deploy-website.yml) does this automatically. On every push to `main` that changes `www/` (or on demand from the Actions tab), it lints the PHP with PHP 8.4 and mirrors this folder into the hosting's `www/` over SFTP, checking the server's pinned host key. It needs these repository settings (Settings → Secrets and variables → Actions):
 
-   ```sh
-   scp -r www/. LOGIN@ssh.clusterXXX.hosting.ovh.net:www/
-   ```
+   | Kind | Name | Value |
+   | --- | --- | --- |
+   | Secret | `OVH_SFTP_PASSWORD` | the hosting's FTP password |
+   | Variable | `OVH_SFTP_HOST` | `ftp.cluster129.hosting.ovh.net` |
+   | Variable | `OVH_SFTP_USER` | `typenat` |
+   | Variable | `OVH_SSH_KNOWN_HOSTS` | output of `ssh-keyscan -t ed25519 ftp.cluster129.hosting.ovh.net` |
+
+   To upload by hand instead, copy the *contents* of this folder into `/www/` with an SFTP client such as FileZilla (turn on *Server → Force showing hidden files* so `.htaccess`, `.ovhconfig`, `app/.htaccess` and `assets/.htaccess` go up too).
 
 4. **Check** the deployed site:
 
