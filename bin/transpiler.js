@@ -34807,6 +34807,19 @@ func TnToArray(v interface{}) []interface{} {
 	if m := rv.MethodByName("Symbol_iterator"); m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() == 1 {
 		return TnToArray(m.Call(nil)[0].Interface())
 	}
+	// (a Go iter.Seq[T] — func(func(T) bool): collect its yielded values)
+	if rv.Kind() == reflect.Func && rv.Type().NumIn() == 1 && rv.Type().NumOut() == 0 {
+		yt := rv.Type().In(0)
+		if yt.Kind() == reflect.Func && yt.NumIn() == 1 && yt.NumOut() == 1 && yt.Out(0).Kind() == reflect.Bool {
+			out := []interface{}{}
+			yieldFn := reflect.MakeFunc(yt, func(args []reflect.Value) []reflect.Value {
+				out = append(out, args[0].Interface())
+				return []reflect.Value{reflect.ValueOf(true)}
+			})
+			rv.Call([]reflect.Value{yieldFn})
+			return out
+		}
+	}
 	// (a generator: its values until it returns)
 	if rv.Kind() == reflect.Chan {
 		out := []interface{}{}

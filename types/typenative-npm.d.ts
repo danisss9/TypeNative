@@ -338,7 +338,9 @@ declare module 'node:fs/promises' {
       [Symbol.dispose](): void;
       [Symbol.asyncDispose](): Promise<void>;
     }
-    type FilePullTransform = (chunks: Uint8Array[] | null, options?: { signal?: AbortSignal }) => any;
+    type FilePullTransform =
+      | ((chunks: Uint8Array[] | null, options?: { signal?: AbortSignal }) => any)
+      | { transform(source: any, options?: { signal?: AbortSignal }): any };
     interface FileHandle {
       readonly fd: number;
       readFile(options?: { encoding?: null } | null): Promise<Buffer>;
@@ -1417,6 +1419,40 @@ declare module 'node:zlib' {
     function setMaxZipContentSize(size: number): void;
   }
   export = zlib;
+}
+
+declare module 'node:zlib/iter' {
+  namespace zlibIter {
+    interface SyncTransformObject {
+      transform(source: Iterable<Uint8Array[] | null>): Generator<Uint8Array[], void>;
+    }
+    interface AsyncTransformObject {
+      transform(
+        source: AsyncIterable<Uint8Array[] | null> | Iterable<Uint8Array[] | null>,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<Uint8Array[], void>;
+    }
+    type ZlibIterOptions = import('node:zlib').ZlibOptions & { maxOutputLength?: number };
+    type BrotliIterOptions = import('node:zlib').BrotliOptions & { maxOutputLength?: number };
+    type ZstdIterOptions = import('node:zlib').ZstdOptions & { maxOutputLength?: number };
+    function compressGzipSync(options?: ZlibIterOptions): SyncTransformObject;
+    function decompressGzipSync(options?: ZlibIterOptions): SyncTransformObject;
+    function compressDeflateSync(options?: ZlibIterOptions): SyncTransformObject;
+    function decompressDeflateSync(options?: ZlibIterOptions): SyncTransformObject;
+    function compressBrotliSync(options?: BrotliIterOptions): SyncTransformObject;
+    function decompressBrotliSync(options?: BrotliIterOptions): SyncTransformObject;
+    function compressZstdSync(options?: ZstdIterOptions): SyncTransformObject;
+    function decompressZstdSync(options?: ZstdIterOptions): SyncTransformObject;
+    function compressGzip(options?: ZlibIterOptions): AsyncTransformObject;
+    function decompressGzip(options?: ZlibIterOptions): AsyncTransformObject;
+    function compressDeflate(options?: ZlibIterOptions): AsyncTransformObject;
+    function decompressDeflate(options?: ZlibIterOptions): AsyncTransformObject;
+    function compressBrotli(options?: BrotliIterOptions): AsyncTransformObject;
+    function decompressBrotli(options?: BrotliIterOptions): AsyncTransformObject;
+    function compressZstd(options?: ZstdIterOptions): AsyncTransformObject;
+    function decompressZstd(options?: ZstdIterOptions): AsyncTransformObject;
+  }
+  export = zlibIter;
 }
 
 declare module 'node:timers' {
@@ -3804,6 +3840,7 @@ declare module 'assert' { import m = require('node:assert'); export = m; }
 declare module 'assert/strict' { import m = require('node:assert/strict'); export = m; }
 declare module 'crypto' { import m = require('node:crypto'); export = m; }
 declare module 'zlib' { import m = require('node:zlib'); export = m; }
+declare module 'zlib/iter' { import m = require('node:zlib/iter'); export = m; }
 declare module 'timers' { import m = require('node:timers'); export = m; }
 declare module 'timers/promises' { import m = require('node:timers/promises'); export = m; }
 declare module 'perf_hooks' { import m = require('node:perf_hooks'); export = m; }

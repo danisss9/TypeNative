@@ -1320,6 +1320,20 @@ func tnFsParseIterOpts(opts interface{}, allowSignal bool) tnFileIterOpts {
 	return res
 }
 
+type tnFsStatefulTransform interface {
+	tnTransformSeq(seq iter.Seq[[][]byte], signal interface{}) iter.Seq[[][]byte]
+}
+
+func tnFsIsStatefulTransform(a interface{}) bool {
+	if _, ok := a.(tnFsStatefulTransform); ok {
+		return true
+	}
+	if tf := TnGetValue(a, "transform"); tf != nil && reflect.ValueOf(tf).Kind() == reflect.Func {
+		return true
+	}
+	return false
+}
+
 func tnFsParsePullArgs(args []interface{}, allowSignal bool) ([]interface{}, tnFileIterOpts) {
 	var transforms []interface{}
 	var optsArg interface{}
@@ -1327,7 +1341,7 @@ func tnFsParsePullArgs(args []interface{}, allowSignal bool) ([]interface{}, tnF
 		if a == nil {
 			continue
 		}
-		if reflect.ValueOf(a).Kind() == reflect.Func {
+		if reflect.ValueOf(a).Kind() == reflect.Func || tnFsIsStatefulTransform(a) {
 			transforms = append(transforms, a)
 			continue
 		}
@@ -1483,6 +1497,65 @@ func tnFsFlushTransforms(transforms []interface{}, async bool, signal interface{
 	}
 }
 
+func tnFsHasStatefulTransform(transforms []interface{}) bool {
+	for _, tr := range transforms {
+		if tnFsIsStatefulTransform(tr) {
+			return true
+		}
+	}
+	return false
+}
+
+func tnFsComposeTransforms(base iter.Seq[[][]byte], transforms []interface{}, async bool, signal interface{}) iter.Seq[[][]byte] {
+	seq := base
+	for _, tr := range transforms {
+		curSeq := seq
+		curTr := tr
+		if st, ok := curTr.(tnFsStatefulTransform); ok {
+			outSeq := st.tnTransformSeq(curSeq, signal)
+			seq = func(yield func([][]byte) bool) {
+				for batch := range outSeq {
+					if len(batch) > 0 {
+						if !yield(batch) {
+							return
+						}
+					}
+				}
+				yield(nil)
+			}
+		} else {
+			seq = func(yield func([][]byte) bool) {
+				for batch := range curSeq {
+					var arg interface{}
+					if batch != nil {
+						arg = batch
+					}
+					var res interface{}
+					if async && signal != nil {
+						res = TnInvoke(curTr, arg, map[string]interface{}{"signal": signal})
+					} else {
+						res = TnInvoke(curTr, arg)
+					}
+					if async {
+						res = TnAwaitValue(res, false)
+					}
+					out := tnFsNormalizeBatch(res)
+					if len(out) > 0 {
+						if !yield(out) {
+							return
+						}
+					}
+					if batch == nil {
+						yield(nil)
+						return
+					}
+				}
+			}
+		}
+	}
+	return seq
+}
+
 type TnFilePull struct {
 	handle     *TnFileHandle
 	opts       tnFileIterOpts
@@ -1510,6 +1583,44 @@ func (p *TnFilePull) tnIterator() iter.Seq[[][]byte] {
 		remaining := p.opts.limit
 		readSize := p.opts.chunkSize
 		signal := p.opts.signal
+		if tnFsHasStatefulTransform(p.transforms) {
+			base := func(emit func([][]byte) bool) {
+				for remaining != 0 {
+					if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
+						panic(TnGetValue(signal, "reason"))
+					}
+					toRead := readSize
+					if remaining > 0 && int64(toRead) > remaining {
+						toRead = int(remaining)
+					}
+					curPos := pos
+					chunk := TnAwait(TnFsPromise(func() []byte {
+						return tnFsReadChunk(fd, toRead, curPos)
+					}))
+					if len(chunk) == 0 {
+						break
+					}
+					if pos >= 0 {
+						pos += int64(len(chunk))
+					}
+					if remaining > 0 {
+						remaining -= int64(len(chunk))
+					}
+					if !emit([][]byte{chunk}) {
+						return
+					}
+				}
+				emit(nil)
+			}
+			for batch := range tnFsComposeTransforms(base, p.transforms, true, signal) {
+				if len(batch) > 0 {
+					if !yield(batch) {
+						return
+					}
+				}
+			}
+			return
+		}
 		for remaining != 0 {
 			if signal != nil && TnTruthy(TnGetValue(signal, "aborted")) {
 				panic(TnGetValue(signal, "reason"))
@@ -1568,6 +1679,38 @@ func (p *TnFilePullSync) tnIterator() iter.Seq[[][]byte] {
 		pos := p.opts.start
 		remaining := p.opts.limit
 		readSize := p.opts.chunkSize
+		if tnFsHasStatefulTransform(p.transforms) {
+			base := func(emit func([][]byte) bool) {
+				for remaining != 0 {
+					toRead := readSize
+					if remaining > 0 && int64(toRead) > remaining {
+						toRead = int(remaining)
+					}
+					chunk := tnFsReadChunk(fd, toRead, pos)
+					if len(chunk) == 0 {
+						break
+					}
+					if pos >= 0 {
+						pos += int64(len(chunk))
+					}
+					if remaining > 0 {
+						remaining -= int64(len(chunk))
+					}
+					if !emit([][]byte{chunk}) {
+						return
+					}
+				}
+				emit(nil)
+			}
+			for batch := range tnFsComposeTransforms(base, p.transforms, false, nil) {
+				if len(batch) > 0 {
+					if !yield(batch) {
+						return
+					}
+				}
+			}
+			return
+		}
 		for remaining != 0 {
 			toRead := readSize
 			if remaining > 0 && int64(toRead) > remaining {

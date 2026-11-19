@@ -6,6 +6,7 @@
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, defineModule, setResults } from './registry.js';
 import { zipHelper, zipContainersHelper, zipStreamHelper } from './zlib_zip.js';
+import { zlibIterHelper } from './zlib_iter.js';
 
 const zlibHelper = `// node:zlib
 func tnZlibInput(v interface{}) []byte {
@@ -50,6 +51,8 @@ func tnZlibError(err error) *TnError {
 // linked only into programs that use it
 var tnBrotliEncode func(data []byte, options []interface{}) []byte
 var tnBrotliDecode func(data []byte) []byte
+var tnBrotliIterNewWriter func(w io.Writer, options []interface{}) io.WriteCloser
+var tnBrotliIterNewReader func(r io.Reader) (io.Reader, func(error) *TnError)
 
 // Set by the nodeZstd helper, so the Zstd codec (a vendored module) is
 // linked only into programs that use it
@@ -57,6 +60,8 @@ var tnZstdEncode func(data []byte, options []interface{}) []byte
 // The ZIP archive writer's Zstd method (nil unless the codec is linked)
 var tnZipZstdEncode func(data []byte) []byte
 var tnZstdDecode func(data []byte) []byte
+var tnZstdIterNewWriter func(w io.Writer, options []interface{}) (io.WriteCloser, error)
+var tnZstdIterNewReader func(r io.Reader) (io.ReadCloser, func(error) *TnError)
 
 func tnCompress(format string, data []byte, options []interface{}) []byte {
 	if format == "brotli" {
@@ -212,12 +217,12 @@ const brotliHelper = `// node:zlib Brotli (github.com/andybalholm/brotli)
 func init() {
 	tnBrotliEncode = tnBrotliCompress
 	tnBrotliDecode = tnBrotliDecompress
+	tnBrotliIterNewWriter = tnBrotliNewIterWriter
+	tnBrotliIterNewReader = tnBrotliNewIterReader
 }
 
-// Options: { params: { [BROTLI_PARAM_QUALITY]: q, [BROTLI_PARAM_LGWIN]: w } };
-// out-of-range values are clamped, as in Node
-func tnBrotliCompress(data []byte, options []interface{}) []byte {
-	opts := brotli.WriterOptions{Quality: 11}
+func tnBrotliOptions(options []interface{}, defaultQuality int) brotli.WriterOptions {
+	opts := brotli.WriterOptions{Quality: defaultQuality}
 	if len(options) > 0 && options[0] != nil {
 		if params := TnGet(options[0], "params"); params != nil {
 			if q, ok := TnGetValue(params, "1").(float64); ok {
@@ -228,8 +233,27 @@ func tnBrotliCompress(data []byte, options []interface{}) []byte {
 			}
 		}
 	}
+	return opts
+}
+
+func tnBrotliNewIterWriter(w io.Writer, options []interface{}) io.WriteCloser {
+	return brotli.NewWriterOptions(w, tnBrotliOptions(options, 6))
+}
+
+func tnBrotliNewIterReader(r io.Reader) (io.Reader, func(error) *TnError) {
+	return brotli.NewReader(r), func(err error) *TnError {
+		if err == nil || err == io.EOF || err.Error() == "brotli: excessive input" {
+			return nil
+		}
+		return tnBrotliError(err)
+	}
+}
+
+// Options: { params: { [BROTLI_PARAM_QUALITY]: q, [BROTLI_PARAM_LGWIN]: w } };
+// out-of-range values are clamped, as in Node
+func tnBrotliCompress(data []byte, options []interface{}) []byte {
 	var buf bytes.Buffer
-	w := brotli.NewWriterOptions(&buf, opts)
+	w := brotli.NewWriterOptions(&buf, tnBrotliOptions(options, 11))
 	w.Write(data)
 	w.Close()
 	return buf.Bytes()
@@ -246,16 +270,11 @@ var tnBrotliErrors = map[string]int{
 	"UNREACHABLE": -31,
 }
 
-func tnBrotliDecompress(data []byte) []byte {
-	out, err := io.ReadAll(brotli.NewReader(bytes.NewReader(data)))
-	if err == nil || err.Error() == "brotli: excessive input" {
-		// Node ignores bytes after the end of the stream
-		return out
-	}
+func tnBrotliError(err error) *TnError {
 	if err == io.ErrUnexpectedEOF || err == io.EOF {
 		e := TnNodeError("Error", "Z_BUF_ERROR", "unexpected end of file")
 		e.props["errno"] = float64(-5)
-		panic(e)
+		return e
 	}
 	name := strings.TrimPrefix(err.Error(), "brotli: ")
 	errno, known := tnBrotliErrors[name]
@@ -272,7 +291,16 @@ func tnBrotliDecompress(data []byte) []byte {
 	}
 	e := TnNodeError("Error", "ERR__"+name, "Decompression failed")
 	e.props["errno"] = float64(errno)
-	panic(e)
+	return e
+}
+
+func tnBrotliDecompress(data []byte) []byte {
+	out, err := io.ReadAll(brotli.NewReader(bytes.NewReader(data)))
+	if err == nil || err.Error() == "brotli: excessive input" {
+		// Node ignores bytes after the end of the stream
+		return out
+	}
+	panic(tnBrotliError(err))
 }`;
 
 // Zstd's frames are located by hand before decoding: libzstd ignores bytes
@@ -287,6 +315,50 @@ func init() {
 	// (the ZIP archive writer's method: 'zstd' entries use it when the codec
 	// is linked)
 	tnZipZstdEncode = func(data []byte) []byte { return tnZstdCompress(data, nil) }
+	tnZstdIterNewWriter = tnZstdNewIterWriter
+	tnZstdIterNewReader = tnZstdNewIterReader
+}
+
+func tnZstdNewIterWriter(w io.Writer, options []interface{}) (io.WriteCloser, error) {
+	opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(tnZstdLevel(options)))}
+	if len(options) > 0 && options[0] != nil {
+		if params := TnGet(options[0], "params"); params != nil {
+			if win, ok := TnGetValue(params, "101").(float64); ok && win >= 10 && win <= 31 {
+				opts = append(opts, zstd.WithWindowSize(1<<uint(win)))
+			}
+		}
+	}
+	return zstd.NewWriter(w, opts...)
+}
+
+func tnZstdNewIterReader(r io.Reader) (io.ReadCloser, func(error) *TnError) {
+	d, err := zstd.NewReader(r)
+	if err != nil {
+		panic(TnNodeError("Error", "ZSTD_error_GENERIC", "zstd decompression failed"))
+	}
+	return d.IOReadCloser(), func(err error) *TnError {
+		if err == nil || err == io.EOF {
+			return nil
+		}
+		if err == io.ErrUnexpectedEOF || strings.Contains(err.Error(), "unexpected EOF") {
+			e := TnNodeError("Error", "Z_BUF_ERROR", "unexpected end of file")
+			e.props["errno"] = float64(-5)
+			return e
+		}
+		if err == zstd.ErrMagicMismatch || strings.Contains(err.Error(), "magic") {
+			e := TnNodeError("Error", "ZSTD_error_prefix_unknown", "Unknown frame descriptor")
+			e.props["errno"] = float64(10)
+			return e
+		}
+		if strings.Contains(err.Error(), "checksum") || strings.Contains(err.Error(), "CRC") {
+			e := TnNodeError("Error", "ZSTD_error_checksum_wrong", "Restored data doesn't match checksum")
+			e.props["errno"] = float64(22)
+			return e
+		}
+		e := TnNodeError("Error", "ZSTD_error_corruption_detected", "Data corruption detected")
+		e.props["errno"] = float64(20)
+		return e
+	}
 }
 
 // The \`level\` option (default 3) or \`params[ZSTD_c_compressionLevel]\`;
@@ -583,9 +655,12 @@ const ZSTD_CONSTANTS: Record<string, number> = {
 
 export function registerZlib(r: NodeRegistry): void {
   defineModule(r, 'zlib');
+  defineModule(r, 'zlib/iter');
   defineHelper(r, 'nodeZlib', ['bytes', 'compress/flate', 'compress/gzip', 'compress/zlib', 'hash/crc32', 'io', 'strings'], ['error', 'buffer', 'dynamic', 'eventLoop', 'promise', 'nodeInvoke'], zlibHelper);
   defineHelper(r, 'nodeBrotli', ['bytes', 'github.com/andybalholm/brotli', 'io', 'strings'], ['nodeZlib'], brotliHelper);
-  defineHelper(r, 'nodeZstd', ['bytes', 'github.com/klauspost/compress/zstd', 'strings'], ['nodeZlib'], zstdHelper);
+  defineHelper(r, 'nodeZstd', ['bytes', 'github.com/klauspost/compress/zstd', 'io', 'strings'], ['nodeZlib'], zstdHelper);
+  defineHelper(r, 'nodeZlibIter', ['bytes', 'compress/gzip', 'compress/zlib', 'io', 'iter', 'reflect'], ['nodeZlib', 'generatorStep', 'dynamic', 'error', 'buffer'], zlibIterHelper);
+  defineClass(r, 'zlib/iter.Transform', '*TnZlibIterTransform', 'class', 'transform=iter.Seq[[][]byte]', '', '', '');
   // Codec entries pull in the codec's helper too
   const use = (format: string) => r.helper(format === 'brotli' ? 'nodeBrotli' : format === 'zstd' ? 'nodeZstd' : 'nodeZlib');
   const formats: Record<string, string> = {
@@ -656,6 +731,35 @@ export function registerZlib(r: NodeRegistry): void {
     return `TnCrc32(${call.args.join(', ')})`;
   };
   setResults(r, 'zlib', 'crc32=float64');
+  // node:zlib/iter — iterable compression / decompression transforms (sync + async)
+  const iterTransforms: Record<string, [string, boolean, boolean]> = {
+    compressGzipSync: ['gzip', true, false],
+    decompressGzipSync: ['gzip', false, false],
+    compressDeflateSync: ['deflate', true, false],
+    decompressDeflateSync: ['deflate', false, false],
+    compressBrotliSync: ['brotli', true, false],
+    decompressBrotliSync: ['brotli', false, false],
+    compressZstdSync: ['zstd', true, false],
+    decompressZstdSync: ['zstd', false, false],
+    compressGzip: ['gzip', true, true],
+    decompressGzip: ['gzip', false, true],
+    compressDeflate: ['deflate', true, true],
+    decompressDeflate: ['deflate', false, true],
+    compressBrotli: ['brotli', true, true],
+    decompressBrotli: ['brotli', false, true],
+    compressZstd: ['zstd', true, true],
+    decompressZstd: ['zstd', false, true]
+  };
+  for (const name of Object.keys(iterTransforms)) {
+    const [format, compress, async] = iterTransforms[name];
+    r.functions[`zlib/iter.${name}`] = (call: NodeCall) => {
+      use(format);
+      r.helper('nodeZlibIter');
+      const args = [JSON.stringify(format), compress ? 'true' : 'false', async ? 'true' : 'false', ...call.args];
+      return `TnNewZlibIterTransform(${args.join(', ')})`;
+    };
+    r.results[`zlib/iter.${name}`] = '*TnZlibIterTransform';
+  }
   // ZIP archives (Node 26.8): ZipEntry / ZipBuffer / ZipFile, createZipArchive(Sync), zipFiles
   defineHelper(
     r,
