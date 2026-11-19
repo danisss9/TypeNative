@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- Source of og-image.png (1200×630). Re-render after editing; see www/README.md. -->
+  <defs>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3178c6"/>
+      <stop offset="1" stop-color="#00add8"/>
+    </linearGradient>
+    <linearGradient id="headline" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6cb4ff"/>
+      <stop offset="1" stop-color="#34d3f2"/>
+    </linearGradient>
+    <radialGradient id="glow-a" cx="0.22" cy="0.3" r="0.55">
+      <stop offset="0" stop-color="#3178c6" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#3178c6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-b" cx="0.88" cy="0.12" r="0.5">
+      <stop offset="0" stop-color="#00add8" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#00add8" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#ffffff" stroke-opacity="0.04" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0b0e14"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect width="1200" height="630" fill="url(#glow-a)"/>
+  <rect width="1200" height="630" fill="url(#glow-b)"/>
+
+  <g transform="translate(80 76)">
+    <rect width="64" height="64" rx="16" fill="url(#mark)"/>
+    <path d="M19 20 31 32 19 44" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="35" y="38" width="13" height="7.2" rx="2.4" fill="#fff"/>
+    <text x="88" y="45" fill="#e8ebf2" font-family="Segoe UI, system-ui, sans-serif" font-size="38" font-weight="700" letter-spacing="-0.5">TypeNative</text>
+  </g>
+
+  <g font-family="Segoe UI, system-ui, sans-serif" font-weight="800" font-size="84" letter-spacing="-3">
+    <text x="76" y="300" fill="#e8ebf2">Write TypeScript.</text>
+    <text x="76" y="396" fill="url(#headline)">Ship native binaries.</text>
+  </g>
+
+  <g font-family="Segoe UI, system-ui, sans-serif" font-size="26" font-weight="600" fill="#e8ebf2">
+    <rect x="80" y="476" width="268" height="60" rx="12" fill="#131925" stroke="#232c3d"/>
+    <text x="104" y="515"><tspan fill="#6cb4ff">9.2×</tspan> faster startup</text>
+    <rect x="364" y="476" width="258" height="60" rx="12" fill="#131925" stroke="#232c3d"/>
+    <text x="388" y="515"><tspan fill="#6cb4ff">6.7×</tspan> less memory</text>
+    <rect x="638" y="476" width="288" height="60" rx="12" fill="#131925" stroke="#232c3d"/>
+    <text x="662" y="515">One file, no runtime</text>
+  </g>
+
+  <text x="1120" y="118" text-anchor="end" fill="#8a93a6" font-family="Cascadia Code, Consolas, monospace" font-size="24">typenative.dev</text>
+</svg>

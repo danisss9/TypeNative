@@ -1,0 +1,2 @@
+# The PHP application is never served directly; only index.php includes it.
+Require all denied
