@@ -5,6 +5,7 @@
 // createHistogram, monitorEventLoopDelay, eventLoopUtilization.
 
 import { NodeRegistry, NodeCall, defineClass, defineHelper, setResults } from './registry.js';
+import { registerHistogram } from './histogram.js';
 
 const uncaughtHelper = `// process.on('uncaughtException') & co.
 // set/addUncaughtExceptionCaptureCallback: the set one takes every error; an
@@ -436,270 +437,6 @@ func TnPerfTimerify[F any](fn F, name string) F {
 	return wrapped.Interface().(F)
 }
 
-// Histograms (createHistogram / monitorEventLoopDelay): values in nanoseconds
-type TnHistogram struct {
-	values   []float64
-	exceeds  float64
-	enabled  bool
-	stop     chan struct{}
-	interval float64
-	last     time.Time
-}
-
-func TnCreateHistogram(options ...interface{}) *TnHistogram { return &TnHistogram{} }
-
-func (h *TnHistogram) record(value interface{}) {
-	switch v := value.(type) {
-	case float64:
-		h.values = append(h.values, v)
-	case *tnbig.Int:
-		f, _ := new(tnbig.Float).SetInt(v).Float64()
-		h.values = append(h.values, f)
-	}
-}
-
-func (h *TnHistogram) recordDelta() {
-	now := time.Now()
-	if !h.last.IsZero() {
-		h.values = append(h.values, float64(now.Sub(h.last).Nanoseconds()))
-	}
-	h.last = now
-}
-
-func (h *TnHistogram) sorted() []float64 {
-	out := append([]float64{}, h.values...)
-	sort.Float64s(out)
-	return out
-}
-
-func (h *TnHistogram) Get_count() float64 { return float64(len(h.values)) }
-func (h *TnHistogram) Get_min() float64 {
-	if len(h.values) == 0 {
-		return 9223372036854776000
-	}
-	return h.sorted()[0]
-}
-func (h *TnHistogram) Get_max() float64 {
-	if len(h.values) == 0 {
-		return 0
-	}
-	s := h.sorted()
-	return s[len(s)-1]
-}
-func (h *TnHistogram) Get_mean() float64 {
-	if len(h.values) == 0 {
-		return math.NaN()
-	}
-	sum := 0.0
-	for _, v := range h.values {
-		sum += v
-	}
-	return sum / float64(len(h.values))
-}
-func (h *TnHistogram) Get_stddev() float64 {
-	if len(h.values) == 0 {
-		return math.NaN()
-	}
-	mean := h.Get_mean()
-	sum := 0.0
-	for _, v := range h.values {
-		sum += (v - mean) * (v - mean)
-	}
-	return math.Sqrt(sum / float64(len(h.values)))
-}
-func (h *TnHistogram) Get_exceeds() float64 { return h.exceeds }
-
-func (h *TnHistogram) percentile(p float64) float64 {
-	if len(h.values) == 0 {
-		return 0
-	}
-	s := h.sorted()
-	i := int(math.Ceil(p/100*float64(len(s)))) - 1
-	if i < 0 {
-		i = 0
-	}
-	if i >= len(s) {
-		i = len(s) - 1
-	}
-	return s[i]
-}
-
-func (h *TnHistogram) Get_percentiles() *TnMap[float64, float64] {
-	m := TnNewMap[float64, float64]()
-	for _, p := range []float64{0, 50, 75, 87.5, 93.75, 96.875, 98.4375, 99.21875, 100} {
-		m.Set(p, h.percentile(p))
-	}
-	return m
-}
-
-// Node 26 histogram statistics over the recorded values
-func (h *TnHistogram) countAt(v float64) float64 {
-	n := 0
-	for _, x := range h.values {
-		if x == v {
-			n++
-		}
-	}
-	return float64(n)
-}
-
-// cdf(v): the share of values at or below v; ccdf(v): above it
-func (h *TnHistogram) cdf(v float64) float64 {
-	if len(h.values) == 0 {
-		return 0
-	}
-	n := 0
-	for _, x := range h.values {
-		if x <= v {
-			n++
-		}
-	}
-	return float64(n) / float64(len(h.values))
-}
-
-func (h *TnHistogram) ccdf(v float64) float64 {
-	if len(h.values) == 0 {
-		return 0
-	}
-	return 1 - h.cdf(v)
-}
-
-// The population's central moments m2, m3, m4
-func (h *TnHistogram) moments() (float64, float64, float64) {
-	n := float64(len(h.values))
-	if n == 0 {
-		return 0, 0, 0
-	}
-	mean := h.Get_mean()
-	var m2, m3, m4 float64
-	for _, x := range h.values {
-		d := x - mean
-		m2 += d * d
-		m3 += d * d * d
-		m4 += d * d * d * d
-	}
-	return m2 / n, m3 / n, m4 / n
-}
-
-func (h *TnHistogram) Get_skewness() float64 {
-	m2, m3, _ := h.moments()
-	if m2 == 0 {
-		return 0
-	}
-	return m3 / math.Pow(m2, 1.5)
-}
-
-// kurtosis: the excess kurtosis (a normal distribution's is 0)
-func (h *TnHistogram) Get_kurtosis() float64 {
-	m2, _, m4 := h.moments()
-	if m2 == 0 {
-		return 0
-	}
-	return m4/(m2*m2) - 3
-}
-
-// recordCorrected(value, expectedInterval): the samples a stalled recorder
-// missed are added too (value - interval, value - 2·interval, …)
-func (h *TnHistogram) recordCorrected(value interface{}, interval float64) {
-	h.record(value)
-	v, ok := value.(float64)
-	if !ok || interval <= 0 {
-		return
-	}
-	for missing := v - interval; missing >= interval; missing -= interval {
-		h.values = append(h.values, missing)
-	}
-}
-
-// add(other) / subtract(other): other's values merged in or taken out
-func (h *TnHistogram) add(other *TnHistogram) {
-	h.values = append(h.values, other.values...)
-	h.exceeds += other.exceeds
-}
-
-func (h *TnHistogram) subtract(other *TnHistogram) {
-	for _, v := range other.values {
-		for i, x := range h.values {
-			if x == v {
-				h.values = append(h.values[:i], h.values[i+1:]...)
-				break
-			}
-		}
-	}
-}
-
-// snapshot(): the statistics as a plain object
-func (h *TnHistogram) snapshot() *TnMap[string, interface{}] {
-	m := TnNewMap[string, interface{}]()
-	m.Set("count", h.Get_count())
-	m.Set("min", h.Get_min())
-	m.Set("max", h.Get_max())
-	m.Set("mean", h.Get_mean())
-	m.Set("exceeds", h.Get_exceeds())
-	m.Set("stddev", h.Get_stddev())
-	m.Set("skewness", h.Get_skewness())
-	m.Set("kurtosis", h.Get_kurtosis())
-	percentiles := TnNewMap[string, interface{}]()
-	pm := h.Get_percentiles()
-	for _, k := range pm.Keys() {
-		percentiles.Set(TnNumStr(k), pm.Get(k))
-	}
-	m.Set("percentiles", percentiles)
-	return m
-}
-
-func (h *TnHistogram) reset() {
-	h.values = nil
-	h.exceeds = 0
-}
-
-// monitorEventLoopDelay({ resolution }): samples how late a timer fires on the loop
-func TnMonitorEventLoopDelay(options ...interface{}) *TnHistogram {
-	h := &TnHistogram{interval: 10}
-	if len(options) > 0 && options[0] != nil {
-		if n, ok := TnGetValue(options[0], "resolution").(float64); ok && n > 0 {
-			h.interval = n
-		}
-	}
-	return h
-}
-
-func (h *TnHistogram) enable() bool {
-	if h.enabled {
-		return false
-	}
-	h.enabled = true
-	h.stop = make(chan struct{})
-	stop := h.stop
-	period := time.Duration(h.interval * float64(time.Millisecond))
-	go func() {
-		ticker := time.NewTicker(period)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case expected := <-ticker.C:
-				TnLoopPost(func() {
-					if h.enabled {
-						h.values = append(h.values, math.Max(float64(time.Since(expected).Nanoseconds()), 1))
-					}
-				})
-			}
-		}
-	}()
-	return true
-}
-
-func (h *TnHistogram) disable() bool {
-	if !h.enabled {
-		return false
-	}
-	h.enabled = false
-	close(h.stop)
-	return true
-}
-
 // eventLoopUtilization(): idle / active time of the loop (approximate: CPU time)
 type TnLoopUtilization struct {
 	idle        float64
@@ -772,7 +509,7 @@ export function registerSystemExtra(r: NodeRegistry): void {
   defineHelper(r, 'nodeSystemOS@windows', ['syscall', 'unsafe'], [], windowsSystemHelper);
   defineHelper(r, 'nodeSystemOS@other', [], [], otherSystemHelper);
   defineHelper(r, 'nodeSystem', ['math', 'os', 'os/exec', 'runtime', 'runtime/metrics', 'strconv', 'strings', 'time'], ['nodeSystemOS@os'], systemHelper);
-  defineHelper(r, 'nodePerfExtra', ['math', 'math/big', 'reflect', 'sort', 'time'], ['nodePerf', 'nodeSystem', 'eventLoop', 'nodeInvoke', 'dynamic', 'orderedMap'], perfExtraHelper);
+  defineHelper(r, 'nodePerfExtra', ['math', 'reflect', 'sort'], ['nodePerf', 'nodeSystem', 'eventLoop', 'nodeInvoke', 'dynamic'], perfExtraHelper);
 
   // uncaught exception capture callbacks
   r.functions['process.setUncaughtExceptionCaptureCallback'] = (c: NodeCall) => {
@@ -871,20 +608,8 @@ export function registerSystemExtra(r: NodeRegistry): void {
     return 'TnPerfObservedTypes()';
   };
   r.valueTypes['perf_hooks.PerformanceObserver.supportedEntryTypes'] = '[]string';
-  defineClass(
-    r,
-    'perf_hooks.Histogram',
-    '*TnHistogram',
-    'class',
-    'record=; recordDelta=; recordCorrected=; percentile=float64; reset=; enable=bool; disable=bool; countAt=float64; cdf=float64; ccdf=float64; add=; subtract=; snapshot=*TnMap[string, interface{}]',
-    '',
-    'count=float64; min=float64; max=float64; mean=float64; stddev=float64; exceeds=float64; percentiles=*TnMap[float64, float64]; skewness=float64; kurtosis=float64',
-    ''
-  );
-  for (const name of ['RecordableHistogram', 'IntervalHistogram']) r.classes[`perf_hooks.${name}`] = r.classes['perf_hooks.Histogram'];
+  registerHistogram(r);
   defineClass(r, 'perf_hooks.EventLoopUtilization', '*TnLoopUtilization', 'class', '', 'idle=float64; active=float64; utilization=float64', '', '');
-  fn('perf_hooks.createHistogram', '*TnHistogram', 'nodePerfExtra', (c: NodeCall) => `TnCreateHistogram(${c.args.join(', ')})`);
-  fn('perf_hooks.monitorEventLoopDelay', '*TnHistogram', 'nodePerfExtra', (c: NodeCall) => `TnMonitorEventLoopDelay(${c.args.join(', ')})`);
   for (const key of [...perf('performance.timerify'), 'perf_hooks.timerify']) {
     r.functions[key] = (c: NodeCall) => {
       r.helper('nodePerfExtra');

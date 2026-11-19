@@ -1494,15 +1494,73 @@ declare module 'node:perf_hooks' {
     const PerformanceObserver: typeof globalThis.PerformanceObserver;
     type PerformanceObserver = globalThis.PerformanceObserver;
     type PerformanceObserverEntryList = globalThis.PerformanceObserverEntryList;
+    interface PercentileCI {
+      readonly value: number;
+      readonly lower: number;
+      readonly upper: number;
+    }
+    interface MeanCI {
+      readonly mean: number;
+      readonly lower: number;
+      readonly upper: number;
+    }
+    interface ConfidenceInterval {
+      readonly lower: number;
+      readonly upper: number;
+    }
+    interface WelchResult {
+      readonly tStatistic: number;
+      readonly degreesOfFreedom: number;
+      readonly pValue: number;
+      readonly confidenceInterval: ConfidenceInterval;
+    }
+    interface MannWhitneyResult {
+      readonly uStatistic: number;
+      readonly zScore: number;
+      readonly pValue: number;
+    }
+    interface QrdeResult {
+      readonly probabilities: Float64Array;
+      readonly quantiles: Float64Array;
+      readonly densities: Float64Array;
+      readonly count: bigint;
+      readonly bucketCount: number;
+      readonly corrections: number;
+      readonly dequantize: 'hdr' | 'none';
+    }
     interface Histogram {
       readonly count: number;
+      readonly countBigInt: bigint;
       readonly min: number;
+      readonly minBigInt: bigint;
       readonly max: number;
+      readonly maxBigInt: bigint;
       readonly mean: number;
       readonly stddev: number;
       readonly exceeds: number;
+      readonly exceedsBigInt: bigint;
       readonly percentiles: Map<number, number>;
+      readonly percentilesBigInt: Map<number, bigint>;
+      readonly resetCount: number;
+      readonly ewmaMean: number;
+      readonly ewmaStddev: number;
+      readonly ewmaErrorRate: number;
       percentile(percentile: number): number;
+      percentileBigInt(percentile: number): bigint;
+      percentilesAt(percentiles: number[]): Map<number, number>;
+      percentileCI(percentile: number, options?: { confidence?: number }): PercentileCI;
+      meanCI(options?: { confidence?: number }): MeanCI;
+      burnRate(sloTarget: number): number;
+      welchTest(other: Histogram, options?: { confidence?: number }): WelchResult;
+      ksTest(other: Histogram): number;
+      mannWhitneyTest(other: Histogram): MannWhitneyResult;
+      cohensD(other: Histogram): number;
+      cliffsD(other: Histogram): number;
+      linearBuckets(stepSize: number): Map<number, number>;
+      logBuckets(start: number, factor: number): Map<number, number>;
+      qrde(options?: { bins?: number; dequantize?: 'hdr' | 'none' }): Promise<QrdeResult>;
+      diff(other: Histogram): Histogram;
+      export(): Uint8Array;
       reset(): void;
       /** Node 26: skewness / excess kurtosis of the values */
       readonly skewness: number;
@@ -1512,7 +1570,8 @@ declare module 'node:perf_hooks' {
       /** The share of values at or below value / above it */
       cdf(value: number): number;
       ccdf(value: number): number;
-      snapshot(): {
+      snapshot(): Histogram;
+      toJSON(): {
         count: number;
         min: number;
         max: number;
@@ -1521,6 +1580,9 @@ declare module 'node:perf_hooks' {
         stddev: number;
         skewness: number;
         kurtosis: number;
+        ewmaMean: number;
+        ewmaStddev: number;
+        ewmaErrorRate: number;
         percentiles: Record<string, number>;
       };
     }
@@ -1536,7 +1598,29 @@ declare module 'node:perf_hooks' {
       enable(): boolean;
       disable(): boolean;
     }
-    function createHistogram(options?: { lowest?: number | bigint; highest?: number | bigint; figures?: number }): RecordableHistogram;
+    interface SlidingWindowHistogram {
+      record(val: number | bigint): void;
+      snapshot(): Histogram;
+      reset(): void;
+    }
+    interface CreateHistogramOptions {
+      lowest?: number | bigint;
+      highest?: number | bigint;
+      figures?: number;
+      halfLife?: number;
+      threshold?: number | bigint;
+    }
+    interface SlidingWindowHistogramOptions {
+      chunks: number;
+      chunkDuration?: number;
+      recordsPerChunk?: number;
+      lowest?: number | bigint;
+      highest?: number | bigint;
+      figures?: number;
+    }
+    function createHistogram(options?: CreateHistogramOptions): RecordableHistogram;
+    function createSlidingWindowHistogram(options: SlidingWindowHistogramOptions): SlidingWindowHistogram;
+    function importHistogram(data: Uint8Array): RecordableHistogram;
     function monitorEventLoopDelay(options?: { resolution?: number }): IntervalHistogram;
   }
   export = perf_hooks;
