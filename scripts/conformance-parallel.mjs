@@ -103,13 +103,20 @@ function removeTempDir(dir) {
   } catch { /* Windows may briefly lock native.exe; leave tmp dir */ }
 }
 
-function runOneSpawn({ name, args: jobArgs }) {
+function runOneSpawn({ name, args: jobArgs, build }) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'conf-'));
   return new Promise((resolve) => {
     const [command, ...args] = compiler;
+    // Examples are only compiled (never executed); disabling Go inlining for
+    // the main package cuts `go tool compile` peak RAM by >3x on huge examples
+    // (react-compiler) so 7 GB macOS CI runners don't thrash swap and time out.
+    const env = build
+      ? { ...process.env, GOFLAGS: `${process.env.GOFLAGS ?? ''} -gcflags=-l`.trim() }
+      : process.env;
     // Its own process group (POSIX) so a timeout can kill the whole group
     const p = spawn(command, [...args, ...jobArgs], {
       cwd: dir,
+      env,
       detached: process.platform !== 'win32'
     });
     let out = '';
@@ -241,6 +248,12 @@ for (const pattern of ['sqlite', 'intl', 'example-react-compiler']) {
     await runCounted(j);
     idx++;
   }
+}
+// Release the solo worker's heap (e.g. react-compiler's ASTs) before spawning N
+// parallel workers; retries below will spawn a fresh one only if needed.
+if (soloPoolState.proc) {
+  soloPoolState.proc.kill();
+  soloPoolState.proc = null;
 }
 await Promise.all(Array.from({ length: N }, worker));
 console.log('');

@@ -78,29 +78,29 @@ const plural = (loc) => new Intl.PluralRules(loc);
 
 // A pattern part: kind, width, range source (dates: 0 shared / 's'tart / 'e'nd)
 // and the literal text (literals, exponent separators, inline percent signs).
-// Emitted as Go composite literals; see tnIntlPart in intl.ts.
-function part(kind, width, src, text) {
-  return `{${goByte(kind)}, ${goByte(width)}, ${goByte(src)}, ${JSON.stringify(text ?? '')}}`;
-}
-function goByte(c) {
-  if (c === 0 || c === undefined || c === null) return '0';
-  return `'${c}'`;
-}
-const partsLit = (list) => `{${list.join(', ')}}`;
-
-function groupRows(rows) {
-  const byLocale = new Map();
-  for (const [loc, key, value] of rows) {
-    if (!byLocale.has(loc)) byLocale.set(loc, []);
-    byLocale.get(loc).push(`\t\t${JSON.stringify(key)}: ${JSON.stringify(value)}`);
+// Encoded as a 3-byte ASCII header ('-' for 0) + literal text inside a compact
+// JSON string constant, decoded lazily at run time (see tnIntlPartsTable in
+// intl.ts) so Go doesn't compile tens of thousands of map-literal init ops.
+function encodeByte(c) {
+  if (c === 0 || c === undefined || c === null) return '-';
+  if (typeof c !== 'string' || c.length !== 1 || c === '-') {
+    throw new Error(`Invalid part byte: ${JSON.stringify(c)}`);
   }
-  return [...byLocale.entries()].map(([loc, kvs]) => `\t${JSON.stringify(loc)}: {\n${kvs.join(',\n')},\n\t}`);
+  return c;
+}
+function encodePart(kind, width, src, text) {
+  return `${encodeByte(kind)}${encodeByte(width)}${encodeByte(src)}${text ?? ''}`;
 }
 
 const goComment = (comment) => comment.split('\n').map((l) => (l.startsWith('//') ? l : `// ${l}`)).join('\n') + '\n';
 
 function goStringMap(name, rows, comment) {
-  return `${goComment(comment)}var ${name} = map[string]map[string]string{\n${groupRows(rows).join(',\n')},\n}\n`;
+  const obj = Object.create(null);
+  for (const [loc, key, value] of rows) {
+    if (!obj[loc]) obj[loc] = Object.create(null);
+    obj[loc][key] = value;
+  }
+  return `${goComment(comment)}var ${name} = tnIntlStringTable{raw: ${JSON.stringify(JSON.stringify(obj))}}\n`;
 }
 
 // A flat map (one [key, value] per row)
@@ -111,15 +111,12 @@ function goFlatMap(name, rows, comment) {
 
 function goPartsMap(name, rows, comment) {
   // rows: [locale, key, [[kind,width,src,text]...]]
-  const byLocale = new Map();
+  const obj = Object.create(null);
   for (const [loc, key, plist] of rows) {
-    if (!byLocale.has(loc)) byLocale.set(loc, []);
-    byLocale.get(loc).push(`\t\t${JSON.stringify(key)}: ${partsLit(plist.map((p) => part(...p)))}`);
+    if (!obj[loc]) obj[loc] = Object.create(null);
+    obj[loc][key] = plist.map((p) => encodePart(...p));
   }
-  const entries = [...byLocale.entries()].map(
-    ([loc, kvs]) => `\t${JSON.stringify(loc)}: {\n${kvs.join(',\n')},\n\t}`
-  );
-  return `${goComment(comment)}var ${name} = map[string]map[string][]tnIntlPart{\n${entries.join(',\n')},\n}\n`;
+  return `${goComment(comment)}var ${name} = tnIntlPartsTable{raw: ${JSON.stringify(JSON.stringify(obj))}}\n`;
 }
 
 const goSlice = (name, values, comment) =>

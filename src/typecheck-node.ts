@@ -98,7 +98,9 @@ export function typeCheckNode(entry: string, typesDir: string): TypeCheckDiagnos
   if (!ctx) return out;
 
   const program = ts.createProgram([entryPath, ...ctx.dtsRoots], ctx.options, ctx.host, ctx.oldProgram);
-  ctx.oldProgram = program;
+  // Don't retain a huge multi-module Program (e.g. examples/react-compiler) in
+  // memory across transpilation and `go build`, where RAM is tight on CI.
+  ctx.oldProgram = program.getSourceFiles().length <= 50 ? program : undefined;
   for (const d of ts.getPreEmitDiagnostics(program)) {
     if (d.category === ts.DiagnosticCategory.Error) out.push(toDiagnostic(d));
   }

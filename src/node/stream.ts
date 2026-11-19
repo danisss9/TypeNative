@@ -748,6 +748,7 @@ func (s *TnStream) processWrites() {
 	s.writeQueue = s.writeQueue[1:]
 	s.writing = true
 	called := false
+	sync := true
 	done := func(args ...interface{}) {
 		if called {
 			return
@@ -775,13 +776,21 @@ func (s *TnStream) processWrites() {
 		// 'drain' once the buffer empties after a write() returned false
 		if len(s.writeQueue) == 0 && s.needDrain && !s.ending {
 			s.needDrain = false
-			s.post(func() {
-				if !s.destroyed {
-					s.emit("drain")
-				}
-			})
+			if sync {
+				s.post(func() {
+					if !s.destroyed {
+						s.emit("drain")
+					}
+				})
+			} else if !s.destroyed {
+				s.emit("drain")
+			}
 		}
-		s.post(s.processWrites)
+		if sync {
+			s.post(s.processWrites)
+		} else {
+			s.processWrites()
+		}
 	}
 	if s.sink == nil && s.tnSelf != nil {
 		if init, ok := s.tnSelf.(interface{ tnInitSink() }); ok {
@@ -801,6 +810,7 @@ func (s *TnStream) processWrites() {
 		}
 		TnInvoke(fn, req.chunk, req.encoding, done)
 	}
+	sync = false
 }
 
 func (s *TnStream) runTransform(chunk interface{}, encoding string, done func(args ...interface{})) {

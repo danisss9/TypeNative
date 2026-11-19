@@ -41,6 +41,61 @@ type tnIntlPart struct {
 	text  string
 }
 
+// Lazy JSON-backed locale tables (see scripts/gen-intl-data.mjs): stored as
+// single string literals so Go doesn't compile massive map-literal init()s.
+type tnIntlStringTable struct {
+	raw  string
+	once sync.Once
+	data map[string]map[string]string
+}
+
+func (t *tnIntlStringTable) get(key string) map[string]string {
+	t.once.Do(func() {
+		_ = json.Unmarshal([]byte(t.raw), &t.data)
+	})
+	return t.data[key]
+}
+
+type tnIntlPartsTable struct {
+	raw  string
+	once sync.Once
+	data map[string]map[string][]tnIntlPart
+}
+
+func (t *tnIntlPartsTable) get(key string) map[string][]tnIntlPart {
+	t.once.Do(func() {
+		var raw map[string]map[string][]string
+		_ = json.Unmarshal([]byte(t.raw), &raw)
+		out := make(map[string]map[string][]tnIntlPart, len(raw))
+		for loc, m := range raw {
+			lm := make(map[string][]tnIntlPart, len(m))
+			for k, list := range m {
+				parts := make([]tnIntlPart, len(list))
+				for i, s := range list {
+					var p tnIntlPart
+					if len(s) >= 3 {
+						if s[0] != '-' {
+							p.kind = s[0]
+						}
+						if s[1] != '-' {
+							p.width = s[1]
+						}
+						if s[2] != '-' {
+							p.src = s[2]
+						}
+						p.text = s[3:]
+					}
+					parts[i] = p
+				}
+				lm[k] = parts
+			}
+			out[loc] = lm
+		}
+		t.data = out
+	})
+	return t.data[key]
+}
+
 func tnIntlRangeError(msg string) { panic(TnNodeError("RangeError", "", msg)) }
 
 func tnIntlHasString(list []string, s string) bool {
@@ -535,22 +590,22 @@ func tnIntlSystemLocale() string {
 const intlNumberSymsGo = `// Intl: the number symbol tables (keyed by generated locale; every resolved
 // data locale is present, with en as the guard)
 func tnIntlNumSym(data string, key string) string {
-	if m := tnIntlNumberNames[data]; m != nil {
+	if m := tnIntlNumberNames.get(data); m != nil {
 		if v, ok := m[key]; ok {
 			return v
 		}
 	}
-	if m := tnIntlNumberNames["en"]; m != nil {
+	if m := tnIntlNumberNames.get("en"); m != nil {
 		return m[key]
 	}
 	return ""
 }
 
 func tnIntlNumParts(data string) map[string][]tnIntlPart {
-	if m := tnIntlNumberParts[data]; m != nil {
+	if m := tnIntlNumberParts.get(data); m != nil {
 		return m
 	}
-	return tnIntlNumberParts["en"]
+	return tnIntlNumberParts.get("en")
 }
 
 // The digits a locale formats with: its -u-nu- numbering system's, else the
@@ -1439,7 +1494,7 @@ func TnIntlNumberFormatCompact(f *TnIntlNumberFormat, x interface{}) []interface
 	divisor := -1
 	if p >= 3 {
 		// (the locale's own table only: en's thousands don't apply to de)
-		if d, ok := tnIntlNumberNames[f.loc.data]["cmpD:"+styleKey+":"+strconv.Itoa(p)]; ok {
+		if d, ok := tnIntlNumberNames.get(f.loc.data)["cmpD:"+styleKey+":"+strconv.Itoa(p)]; ok {
 			divisor, _ = strconv.Atoi(d)
 		}
 	}
@@ -1724,22 +1779,22 @@ const intlDateGo = `// Intl.DateTimeFormat: the generated patterns probed by exa
 
 // The date name and pattern tables (en as the guard)
 func tnIntlName(data string, key string) string {
-	if m := tnIntlDateNames[data]; m != nil {
+	if m := tnIntlDateNames.get(data); m != nil {
 		if v, ok := m[key]; ok {
 			return v
 		}
 	}
-	if m := tnIntlDateNames["en"]; m != nil {
+	if m := tnIntlDateNames.get("en"); m != nil {
 		return m[key]
 	}
 	return ""
 }
 
 func tnIntlDatePartsOf(data string) map[string][]tnIntlPart {
-	if m := tnIntlDateParts[data]; m != nil {
+	if m := tnIntlDateParts.get(data); m != nil {
 		return m
 	}
-	return tnIntlDateParts["en"]
+	return tnIntlDateParts.get("en")
 }
 
 type TnIntlDateTimeFormat struct {
@@ -2312,7 +2367,7 @@ func tnIntlFieldsOf(t time.Time, loc *time.Location) tnIntlDateFields {
 // The zone name a width renders: the generated tables for the named zones
 // (the winter W / summer S variants by the offset), generic offsets otherwise
 func tnIntlZoneName(f *TnIntlDateTimeFormat, t time.Time, width byte, fields tnIntlDateFields) string {
-	table := tnIntlZoneNames[f.zoneID]
+	table := tnIntlZoneNames.get(f.zoneID)
 	widths := map[byte]string{'s': "short", 'l': "long", 'g': "shortG", 'G': "longG", 'o': "short", 'O': "long"}
 	key := widths[width]
 	if table != nil {
@@ -3068,17 +3123,17 @@ func (p *TnIntlPluralRules) resolvedOptions() interface{} {
 const intlListRelGo = `// Intl.ListFormat and Intl.RelativeTimeFormat: the generated patterns
 
 func tnIntlListParts(data string) map[string]string {
-	if m := tnIntlList[data]; m != nil {
+	if m := tnIntlList.get(data); m != nil {
 		return m
 	}
-	return tnIntlList["en"]
+	return tnIntlList.get("en")
 }
 
 func tnIntlRelParts(data string) map[string]string {
-	if m := tnIntlRel[data]; m != nil {
+	if m := tnIntlRel.get(data); m != nil {
 		return m
 	}
-	return tnIntlRel["en"]
+	return tnIntlRel.get("en")
 }
 
 type TnIntlListFormat struct {
@@ -3879,10 +3934,10 @@ const intlDisplayGo = `// Intl.DisplayNames: the generated tables (the names Nod
 // back to golang.org/x/text/language/display for codes they don't list
 
 func tnIntlDisplayNames(data string) map[string]string {
-	if m := tnIntlDisplay[data]; m != nil {
+	if m := tnIntlDisplay.get(data); m != nil {
 		return m
 	}
-	return tnIntlDisplay["en"]
+	return tnIntlDisplay.get("en")
 }
 
 type TnIntlDisplayNames struct {
@@ -4402,7 +4457,7 @@ export function registerIntl(r: NodeRegistry): void {
   defineHelper(r, 'intlDisplayData', [], ['intlCoreData'], intlDisplayData);
   defineHelper(r, 'intlLocaleOS@windows', ['os', 'strings', 'syscall', 'unsafe'], [], intlLocaleOSWindows);
   defineHelper(r, 'intlLocaleOS@other', ['os', 'strings'], [], intlLocaleOSOther);
-  defineHelper(r, 'intlCore', ['math', 'regexp', 'strconv', 'strings', 'sync', 'golang.org/x/text/language', 'golang.org/x/text/feature/plural'], ['intlCoreData', 'intlLocaleOS@os', 'error', 'dynamic', 'arraySubclass', 'bigint'], intlCoreGo);
+  defineHelper(r, 'intlCore', ['encoding/json', 'math', 'regexp', 'strconv', 'strings', 'sync', 'golang.org/x/text/language', 'golang.org/x/text/feature/plural'], ['intlCoreData', 'intlLocaleOS@os', 'error', 'dynamic', 'arraySubclass', 'bigint'], intlCoreGo);
   defineHelper(r, 'intlNumberSyms', [], ['intlCore', 'intlNumberData'], intlNumberSymsGo);
   defineHelper(r, 'intlNumber', ['math', 'strconv', 'strings'], ['intlCore', 'intlNumberSyms'], intlNumberGo);
   defineHelper(r, 'intlDate', ['fmt', 'math', 'os', 'strconv', 'strings', 'sync', 'time'], ['intlCore', 'intlDateData', 'intlNumberSyms', 'nodeTemporalLocalZone@os'], intlDateGo);

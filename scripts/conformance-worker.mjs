@@ -47,6 +47,11 @@ process.on('message', (msg) => {
   };
 
   let exitCode = null;
+  const prevGoFlags = process.env.GOFLAGS;
+  // Examples are only compiled (never executed); disabling Go inlining for the
+  // main package cuts `go tool compile` peak RAM by >3x on huge examples so
+  // 7 GB macOS CI runners don't thrash swap and time out.
+  if (build) process.env.GOFLAGS = `${prevGoFlags ?? ''} -gcflags=-l`.trim();
   process.chdir(dir);
   process.stdout.write = append;
   process.stderr.write = append;
@@ -79,6 +84,8 @@ process.on('message', (msg) => {
       exitCode = 1;
     }
   } finally {
+    if (prevGoFlags === undefined) delete process.env.GOFLAGS;
+    else process.env.GOFLAGS = prevGoFlags;
     process.stdout.write = origStdoutWrite;
     process.stderr.write = origStderrWrite;
     process.exit = origExit;
