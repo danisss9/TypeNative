@@ -1016,6 +1016,20 @@ export function registerDns(r: NodeRegistry): void {
   defineModule(r, 'dns');
   defineModule(r, 'dns/promises');
   r.namespaces['dns.promises'] = 'dns/promises';
+  for (const [k, v] of [
+    ['NODATA', 'ENODATA'], ['FORMERR', 'EFORMERR'], ['SERVFAIL', 'ESERVFAIL'],
+    ['NOTFOUND', 'ENOTFOUND'], ['NOTIMP', 'ENOTIMP'], ['REFUSED', 'EREFUSED'],
+    ['BADQUERY', 'EBADQUERY'], ['BADNAME', 'EBADNAME'], ['BADFAMILY', 'EBADFAMILY'],
+    ['BADRESP', 'EBADRESP'], ['CONNREFUSED', 'ECONNREFUSED'], ['TIMEOUT', 'ETIMEOUT'],
+    ['EOF', 'EOF'], ['FILE', 'EFILE'], ['NOMEM', 'ENOMEM'],
+    ['DESTRUCTION', 'EDESTRUCTION'], ['BADSTR', 'EBADSTR'], ['BADFLAGS', 'EBADFLAGS'],
+    ['NONAME', 'ENONAME'], ['BADHINTS', 'EBADHINTS'], ['NOTINITIALIZED', 'ENOTINITIALIZED'],
+    ['LOADIPHLPAPI', 'ELOADIPHLPAPI'], ['ADDRGETNETWORKPARAMS', 'EADDRGETNETWORKPARAMS'],
+    ['CANCELLED', 'ECANCELLED']
+  ]) {
+    r.values[`dns.${k}`] = () => `"${v}"`;
+    r.results[`dns.${k}`] = 'string';
+  }
   defineHelper(r, 'nodeDns', ['context', 'errors', 'golang.org/x/net/dns/dnsmessage', 'io', 'net', 'net/netip', 'os', 'strconv', 'strings', 'sync', 'sync/atomic', 'time'], ['nodeNet', 'netErrors', 'eventLoop', 'promise', 'nodeInvoke', 'dynamic'], dnsHelper);
   const use = () => r.helper('nodeDns');
   defineClass(r, 'dns.LookupAddress', '*TnLookupAddress', 'class', '', 'address=string; family=float64', '', '');

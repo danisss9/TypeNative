@@ -17,7 +17,8 @@ Node vs TypeNative on the same workload and a README documenting the results.
 | [marked-cli](marked-cli/)         | The `marked` markdown CLI from its unmodified source, 100% Node parity     | **8.2x faster per call** (13 vs 107 ms); 1.1x faster on 10 MB‡ |
 | [openai-chat](openai-chat/)       | Chat client for any OpenAI-compatible API: streaming `fetch` + SSE parsing, readline REPL | **1.1x faster per answer** (700 vs 766 ms streamed)          |
 | [angular-templates](angular-templates/) | Angular's template compiler (`@angular/compiler`, 233 files) to Ivy instructions, 100% Node parity | **4.3x faster per template** (52 vs 223 ms); 1.2x faster at 64 KB§ |
-| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form, 100% Node parity | **3.5x faster per file** (103 vs 364 ms); **1.7x faster at 64 KB** (623 vs 1,085 ms) |
+| [react-compiler](react-compiler/) | The React Compiler (`babel-plugin-react-compiler` + Babel 7.29 + zod 4, ~470 files) compiling components to their auto-memoized form, 100% Node parity | **3.5x faster per file** (103 vs 364 ms); **1.7x faster at 64 KB** (623 vs 1,085 ms)¶ |
+| [mongodb-driver](mongodb-driver/) | Official `mongodb` 7.9.1 driver + `bson` 7.3.4 (164 files), live TCP OP_MSG wire protocol & EJSON CLI, 100% Node parity | **5.2x faster `ping`** (33.8 vs 175.7 ms); **4.5x faster CRUD** (40.3 vs 181.9 ms); **1.1x faster BSON**‖ |
 
 \* Windows 11 Pro, AMD Ryzen 5 7600, Node v26.13.0, Go 1.27.4, TypeNative
 0.7.0, all examples. See each example's README for full
@@ -48,6 +49,14 @@ against Node byte for byte (memoized code, `// CompileSuccess` memo slot and
 block counts, and compile errors with their code frames) on 15 fixtures
 covering components, hooks, the compiler's pragmas, JSX outlining, TypeScript
 syntax and the error paths.
+
+‖ Measured on the same machine with TypeNative 0.7.1 against a bundled local
+TCP OP_MSG/OP_QUERY mock server (no external `mongod` required). Cold CLI
+commands are 4.5x–5.2x faster and pure BSON serialize+deserialize is 1.1x
+faster (28,111 vs 25,658 docs/s); a warm 2,000-command sequential OP_MSG loop
+runs at 0.48x Node's throughput (2,449 vs 5,072 cmds/s). mongodb-driver's
+[parity.mjs](mongodb-driver/parity.mjs) verifies all 13 BSON/EJSON and live
+wire-protocol cases byte for byte against Node.
 
 ## Running an example
 
@@ -94,6 +103,7 @@ cd examples/marked-cli     && node bench.mjs   # and node parity.mjs
 cd examples/openai-chat    && node bench.mjs   # against a local mock API, no key needed
 cd examples/angular-templates && node bench.mjs   # and node parity.mjs
 cd examples/react-compiler  && node parity.mjs   # and node bench.mjs
+cd examples/mongodb-driver  && node parity.mjs   # and node bench.mjs (bundled OP_MSG mock server)
 ```
 
 TypeNative's clearest wins are process startup and memory. Startup is about

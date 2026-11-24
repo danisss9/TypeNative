@@ -222,9 +222,15 @@ export function registerTimers(r: NodeRegistry): void {
     };
     r.results[`timers.${name}`] = result;
   };
-  timer('setTimeout', (c: NodeCall) => `TnSetTimeout(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*TnTimeout');
+  const delayArg = (c: NodeCall, idx: number) =>
+    c.args[idx] === undefined
+      ? '0'
+      : c.types[idx] === '*float64'
+        ? `func() float64 { if __d := ${c.args[idx]}; __d != nil { return *__d }; return 0 }()`
+        : c.args[idx];
+  timer('setTimeout', (c: NodeCall) => `TnSetTimeout(${delayArg(c, 1)}, ${callback(c, 2)})`, '*TnTimeout');
   timer('clearTimeout', (c: NodeCall) => `TnClearTimeout(${c.args[0]})`, '');
-  timer('setInterval', (c: NodeCall) => `TnSetInterval(${c.args[1] ?? '0'}, ${callback(c, 2)})`, '*TnInterval');
+  timer('setInterval', (c: NodeCall) => `TnSetInterval(${delayArg(c, 1)}, ${callback(c, 2)})`, '*TnInterval');
   timer('clearInterval', (c: NodeCall) => `TnClearInterval(${c.args[0]})`, '');
   timer('setImmediate', (c: NodeCall) => `TnSetImmediate(${callback(c, 1)})`, '*TnTimeout');
   // Timeout / Immediate / interval handles

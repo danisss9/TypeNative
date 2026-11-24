@@ -98,6 +98,24 @@ func tnDecodeUTF8(b []byte) string {
 	return sb.String()
 }
 
+func init() {
+	tnBufferToStringHook = func(b []byte, args ...interface{}) string {
+		enc := ""
+		var bounds []float64
+		if len(args) > 0 {
+			if s, ok := args[0].(string); ok {
+				enc = s
+			}
+		}
+		for i := 1; i < len(args) && i < 3; i++ {
+			if args[i] != nil {
+				bounds = append(bounds, TnNumber(args[i]))
+			}
+		}
+		return TnBufferToString(b, enc, bounds...)
+	}
+}
+
 func TnBufferToString(b []byte, enc string, bounds ...float64) string {
 	b = TnBufferSlice(b, bounds...)
 	switch tnEncoding(enc) {
@@ -830,7 +848,7 @@ type TnTextEncoder struct {
 	encoding string
 }
 
-func (e *TnTextEncoder) encode(s ...string) []byte {
+func (e TnTextEncoder) encode(s ...string) []byte {
 	if len(s) == 0 {
 		return []byte{}
 	}
@@ -1026,7 +1044,7 @@ export function registerBuffer(r: NodeRegistry): void {
   };
   r.constructors['util.TextEncoder'] = (_c: NodeCall) => {
     use();
-    return '&TnTextEncoder{encoding: "utf-8"}';
+    return '(&TnTextEncoder{encoding: "utf-8"})';
   };
   r.constructors['util.TextDecoder'] = (call: NodeCall) => {
     use();
@@ -1072,7 +1090,10 @@ export function registerBuffer(r: NodeRegistry): void {
   method('write', 'float64', (c: NodeCall) => `TnBufferWrite(${c.recv}, ${c.args.join(', ')})`);
   method('copy', 'float64', (c: NodeCall) => `TnBufferCopy(${c.recv}, ${c.args.join(', ')})`);
   method('at', 'float64', (c: NodeCall) => `float64(TnAt(${c.recv}, func() float64 { if __i := ${c.args[0]}; __i < 0 { return float64(len(${c.recv})) + __i } else { return __i } }()))`);
-  method('set', '', (c: NodeCall) => `copy(${c.recv}[int(${c.args[1] ?? '0'}):], ${c.args[0]})`);
+  method('set', '', (c: NodeCall) => {
+    const src = c.types[0] === '[]byte' ? c.args[0] : `TnAs[[]byte](${c.args[0]})`;
+    return `copy(${c.recv}[int(${c.args[1] ?? '0'}):], ${src})`;
+  });
   method('toLocaleString', 'string', (c: NodeCall) => `TnBufferToString(${c.recv}, "")`);
   method('inspect', 'string', (c: NodeCall) => `TnBufferInspect(${c.recv})`);
   const widths: Record<string, number> = { '8': 1, '16': 2, '32': 4 };

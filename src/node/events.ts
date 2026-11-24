@@ -850,7 +850,15 @@ func TnProcessEmitExit(code float64) {
 	tnProcessEmitter.emit("exit", code)
 }
 
-func init() { tnBeforeExit = TnProcessEmitExit }`;
+func init() {
+	tnBeforeExit = TnProcessEmitExit
+	tnTypeConverters[reflect.TypeOf((*TnEventEmitter)(nil))] = func(v interface{}) (interface{}, bool) {
+		if e, ok := v.(interface{ tnEmitter() *TnEventEmitter }); ok {
+			return e.tnEmitter(), true
+		}
+		return nil, false
+	}
+}`;
 
 const eventsSymbolHelper = `// Symbol event names: each symbol is its own listener key
 func TnEventKey(v interface{}) string {

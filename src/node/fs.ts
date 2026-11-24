@@ -1079,7 +1079,14 @@ export function registerFs(r: NodeRegistry): void {
   fn('symlinkSync', '', (c: NodeCall) => `TnSymlink(${c.args[0]}, ${c.args[1]})`);
   fn('readlinkSync', 'string', (c: NodeCall) => `TnReadlink(${c.args[0]})`);
   fn('linkSync', '', (c: NodeCall) => `TnLink(${c.args[0]}, ${c.args[1]})`);
-  fn('accessSync', '', (c: NodeCall) => `TnAccess(${c.args[0]}, ${c.args[1] ?? '0'})`);
+  fn('accessSync', '', (c: NodeCall) => {
+    const mode = c.args[1] === undefined
+      ? '0'
+      : c.types[1] === '*float64'
+        ? `func() float64 { if __m := ${c.args[1]}; __m != nil { return *__m }; return 0 }()`
+        : c.args[1];
+    return `TnAccess(${c.args[0]}, ${mode})`;
+  });
   fn('openSync', 'float64', (c: NodeCall) => `TnOpen(${c.args[0]}, ${c.args[1] ?? '"r"'}${c.args[2] ? `, ${c.args[2]}` : ''})`);
   fn('closeSync', '', (c: NodeCall) => `TnClose(${c.args[0]})`);
   fn('readSync', 'float64', (c: NodeCall) => `TnReadSync(${c.args.join(', ')})`);

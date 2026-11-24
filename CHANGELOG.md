@@ -5,10 +5,22 @@ All notable changes to TypeNative will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.2] - 2026-11-24
 
 ### Added
 
+- **MongoDB driver example (`examples/mongodb-driver`):** compiles the official
+  `mongodb` 7.9.1 Node.js driver and `bson` 7.3.4 (164 vendored TypeScript
+  files) with full typechecking into a single native CLI binary (`25.6 MB`)
+  speaking live TCP OP_MSG / OP_QUERY wire protocol. Ships with a bundled local
+  wire-protocol mock server, a 13/13 byte-for-byte Node.js parity suite
+  (`parity.mjs`), and a 4-workload benchmark (`bench.mjs`: 5.2x faster cold
+  `ping`, 4.5x faster end-to-end CRUD, 1.1x faster BSON throughput).
+- **Two-argument `Promise#then` and `Promise` channel conversions:**
+  `p.then(onFulfilled, onRejected)` now preserves the rejection handler via
+  `TnPromiseThen2` / `TnPromiseThenVoid2`, and `convertBetweenGoTypes` adapts
+  mismatched `chan T` / `chan interface{}` / `chan struct{}` promise channels
+  via `TnPromiseAs` / `TnPromiseConvert` instead of producing nil channels.
 - **Symbol-keyed class members:** `get [sym]()`, `[sym]()`, `[sym] = …` and
   `static [sym]`, including `Symbol.for(...)`, exported `unique symbol`
   constants used across modules, and namespace-qualified keys
@@ -19,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks are hoisted, and `super()` may follow validation inside an `else if`
   chain (a throwing branch needs none)
   (`syntax-class-alias-local-super.ts`).
-- **`declare` members:** ambient `declare const` globals and `declare` class
-  fields are erased instead of emitted as zero-valued Go declarations.
+- **`declare` members:** ambient platform `declare const` globals and inherited
+  `declare` class fields are erased instead of emitted as shadowing Go
+  declarations, while non-inherited `declare` class fields and user ambient
+  globals still emit storage.
 
 ### Changed
 
@@ -79,6 +93,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the base type compile.
 - **Variadic `super(...args)`** is forwarded to the parent constructor's
   variadic parameters.
+- **Interface inheritance through type aliases:** `interface X extends Alias`
+  now resolves `Omit<…>` and intersection type aliases (with cycle guards)
+  instead of dropping inherited fields.
+- **Polymorphic constructors & inherited async/generator methods:** constructor
+  interfaces with static members (`{ new (...): T; make(...): T }`) preserve
+  `*TnClass` values, static `new this(...)` dispatches polymorphically through
+  `TnThis`, `TnCallMember` binds `TnThis` across dynamic member calls, and
+  concrete subclasses now properly register copied `async` methods and
+  computed `[Symbol.iterator]` / `[Symbol.asyncIterator]` generator methods.
+- **Async control flow, optional calls & typed-nil nullish checks:** `return
+  expr` inside `try`/`catch` in `async` functions now sets the try-wrapper exit
+  flag cleanly; `TnAwait` works inside `async function*` generators; optional
+  method calls on nilable Go interfaces (`x?.[sym]()`) emit nil guards; `??=`
+  checks `TnIsNil` on `interface{}` slots (handling typed-nil pointers);
+  `Pick<ClassName, …>` / plain object literals with getter keys no longer emit
+  invalid struct literals; `TnHas` recognizes class getters; `tnConvPlan`
+  guards cyclic struct graphs; and dynamic dispatchers cover `EventEmitter`,
+  `Stream`/`Socket`, `[]byte`, and `Date`.
 
 ## [0.7.1] - 2026-11-19
 

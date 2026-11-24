@@ -961,6 +961,15 @@ func (s *TnStream) Get_bytesRead() float64    { return s.bytesRead }
 func (s *TnStream) Get_bytesWritten() float64 { return s.bytesWritten }
 func (s *TnStream) Get_path() string          { return s.path }
 
+func init() {
+	tnTypeConverters[reflect.TypeOf((*TnStream)(nil))] = func(v interface{}) (interface{}, bool) {
+		if s, ok := v.(tnStreamLike); ok {
+			return s.tnStream(), true
+		}
+		return nil, false
+	}
+}
+
 // src.pipe(dest, { end }): returns dest
 func TnPipe[D tnStreamLike](source tnStreamLike, dest D, options ...interface{}) D {
 	src := source.tnStream()

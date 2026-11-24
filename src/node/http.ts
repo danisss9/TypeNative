@@ -2499,6 +2499,18 @@ type TnClientRequest struct {
 
 func (cr *TnClientRequest) Get_headersSent() bool { return cr.started }
 func (cr *TnClientRequest) Get_socket() *TnSocket  { return TnNewSocket() }
+func (cr *TnClientRequest) on(event string, fn interface{}) *TnClientRequest {
+	cr.TnStream.on(event, fn)
+	return cr
+}
+func (cr *TnClientRequest) once(event string, fn interface{}) *TnClientRequest {
+	cr.TnStream.once(event, fn)
+	return cr
+}
+func (cr *TnClientRequest) addListener(event string, fn interface{}) *TnClientRequest {
+	cr.TnStream.addListener(event, fn)
+	return cr
+}
 
 // httpValidation ('strict' rejects control bytes in header values; 'relaxed'
 // and 'insecure' accept them, as Node's lenient parser does)

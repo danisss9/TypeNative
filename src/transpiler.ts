@@ -1240,9 +1240,9 @@ function lowerIndexSignatures(node: AstNode): void {
     }
     return;
   }
-  // { [k: string]: any; type: string; … }: an open object, any property may
-  // be on it (values of other object types pass for it): a dynamic value
-  const openSignature = members.length > 1 && members.some((m: AstNode) => m.kind === 'IndexSignature' && isAnyTypeNode(m.type));
+  // { [k: string]: any; type: string; … } or { new (…): C; make(…): C }:
+  // an open object or constructor-with-statics type (holds a *TnClass value)
+  const openSignature = members.length > 1 && members.some((m: AstNode) => (m.kind === 'IndexSignature' && isAnyTypeNode(m.type)) || m.kind === 'ConstructSignature');
   if (openSignature && (node.kind === 'TypeLiteral' || node.kind === 'InterfaceDeclaration')) {
     if (node.kind === 'TypeLiteral') {
       for (const key of Object.keys(node)) if (key !== 'parent' && key !== 'line' && key !== 'column') delete node[key];
@@ -3942,8 +3942,9 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   for (const [className, declaration] of declaredClasses) {
     for (const clause of declaration.heritageClauses ?? []) {
       const parent = clause.types?.[0]?.expression;
-      if (clause.token === 'ExtendsKeyword' && isIdentifier(parent) && declaredClasses.has(parent.text)) {
-        classParentNames.set(className, parent.text);
+      const resolvedParent = isIdentifier(parent) ? (classAliases.get(parent.text) ?? parent.text) : undefined;
+      if (clause.token === 'ExtendsKeyword' && resolvedParent && declaredClasses.has(resolvedParent)) {
+        classParentNames.set(className, resolvedParent);
       }
     }
   }
@@ -4144,13 +4145,25 @@ function collectInterfaceProperties(iface: AstNode, into: Map<string, string>, s
     if (clause.token === 'ExtendsKeyword') {
       for (const type of clause.types ?? []) {
         const heritage = heritageObjectType(type);
-        if (!heritage) continue;
-        // (Omit<Base, 'a' | 'b'> / Pick<Base, …>: Base's properties, filtered)
-        const inherited = new Map<string, string>();
-        collectInterfaceProperties(heritage.base, inherited, seen);
-        inherited.forEach((goType, key) => {
-          if (heritage.keys === undefined || heritage.keys.includes(key) === heritage.pick) into.set(key, goType);
-        });
+        if (heritage) {
+          // (Omit<Base, 'a' | 'b'> / Pick<Base, …>: Base's properties, filtered)
+          const inherited = new Map<string, string>();
+          collectInterfaceProperties(heritage.base, inherited, seen);
+          inherited.forEach((goType, key) => {
+            if (heritage.keys === undefined || heritage.keys.includes(key) === heritage.pick) into.set(key, goType);
+          });
+        } else if (isIdentifier(type.expression)) {
+          // (interface X extends TypeAlias where TypeAlias is an intersection, Omit/Pick, or object alias)
+          const aliasName = type.expression.text;
+          if (!seen.has(aliasName) && !valueShadowedTypeNames.has(aliasName) && !openObjectTypeNames.has(aliasName)) {
+            const alias = declaredTypeAliases.get(aliasName) ?? typeAliases.get(aliasName);
+            if (alias && alias.kind !== 'AnyKeyword') {
+              const ref: AstNode = { kind: 'TypeReference', typeName: type.expression, typeArguments: type.typeArguments };
+              const inherited = objectTypeFieldMap(ref, seen);
+              inherited.forEach((goType, key) => into.set(key, goType));
+            }
+          }
+        }
       }
     }
   }
@@ -4298,7 +4311,12 @@ function heritageObjectType(type: AstNode): { base: AstNode; keys: string[] | un
     return { base: base, keys: keys, pick: name === 'Pick' };
   }
   if (['Partial', 'Required', 'Readonly'].includes(name) && args.length === 1 && !declaredInterfaces.has(name)) {
-    const base = named(args[0]);
+    const inner = args[0];
+    if (inner && isTypeReferenceNode(inner) && isIdentifier(inner.typeName)) {
+      const nested = heritageObjectType({ expression: inner.typeName, typeArguments: inner.typeArguments });
+      if (nested) return nested;
+    }
+    const base = named(inner);
     return base ? { base: base, keys: undefined, pick: false } : undefined;
   }
   const iface = declaredInterfaces.has(name) ? declaredInterfaces.get(name) : undefined;
@@ -4321,9 +4339,16 @@ function visitScoped(node: AstNode, options: VisitNodeOptions = {}): string {
   if (node && node.kind === 'Identifier' && intLocalReads.has(node)) return `float64(${intLocalReads.get(node)!.name})`;
   // (const x = a & b in a block: an int32, see visitInt32Const)
   if (node && node.kind === 'VariableStatement') {
-    // `declare const Buffer: …` names an ambient global: its value is the
-    // platform's (the built-in Buffer / TextDecoder), not a zero-value var
-    if (node.ambient) return '';
+    // `declare const Buffer: …` names a built-in platform global: its value is
+    // the platform's (Buffer / TextDecoder / WebAssembly), not a zero-value var.
+    // User ambient globals like `declare const BUILD: string | undefined` still
+    // emit a zero-valued var so `typeof BUILD === 'undefined'` compiles.
+    if (node.ambient) {
+      const decls = node.declarationList?.declarations ?? [];
+      if (decls.length > 0 && decls.every((d: AstNode) => isIdentifier(d.name) && ambientPlatformGlobals.has(d.name.text))) {
+        return '';
+      }
+    }
     const int32Const = visitInt32Const(node) ?? visitInt32MutLocal(node) ?? visitSeqOrPullGenLocal(node);
     if (int32Const) return int32Const;
   }
@@ -4895,11 +4920,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
       }
     }
-    // this.x in a static method (arrows inside it too): the class's x
+    // this.x in a static method, static field initializer, or static { } block (arrows inside them too): the class's x
     if (node.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(node.expression)) {
-      let fn: AstNode | undefined = node.parent;
-      while (fn && (!FUNCTION_LIKE_KINDS.has(fn.kind) || isArrowFunction(fn))) fn = fn.parent;
-      const owner = fn && (isMethodDeclaration(fn) || isGetAccessor(fn) || isSetAccessor(fn)) && hasModifier(fn, 'StaticKeyword') ? getEnclosingClassName(fn) : undefined;
+      const owner = enclosingStaticOwnerClass(node);
       if (owner) {
         const classRef: AstNode = { kind: 'Identifier', text: owner, parent: node, line: node.line, column: node.column };
         const access: AstNode = { ...node, expression: classRef };
@@ -4912,14 +4935,24 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('isArray');
       return 'func(__v interface{}) bool { return TnIsArray(__v) }';
     }
-    // Symbol.hasInstance / Symbol.metadata as values: well-known symbols
-    if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'hasInstance' && !variableGoTypes.has('Symbol')) {
-      useHelper('symbol');
-      return 'TnSymbolHasInstance';
-    }
-    if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && node.name.text === 'metadata' && !variableGoTypes.has('Symbol')) {
-      useHelper('symbol');
-      return 'TnSymbolMetadata';
+    // Well-known Symbol.* constants as values
+    if (isIdentifier(node.expression) && node.expression.text === 'Symbol' && !variableGoTypes.has('Symbol')) {
+      const wellKnown: Record<string, string> = {
+        hasInstance: 'TnSymbolHasInstance',
+        metadata: 'TnSymbolMetadata',
+        toStringTag: 'TnSymbolToStringTag',
+        iterator: 'TnSymbolIterator',
+        asyncIterator: 'TnSymbolAsyncIterator',
+        dispose: 'TnSymbolDispose',
+        asyncDispose: 'TnSymbolAsyncDispose',
+        toPrimitive: 'TnSymbolToPrimitive',
+        species: 'TnSymbolSpecies',
+        isConcatSpreadable: 'TnSymbolIsConcatSpreadable'
+      };
+      if (wellKnown[node.name.text]) {
+        useHelper('symbol');
+        return wellKnown[node.name.text];
+      }
     }
     // fn.prototype on a function value (not a class): its prototype object
     if (node.name.text === 'prototype' && !isCallee(node) && !isAssignmentTarget(node) && !(isIdentifier(node.expression) && classNames.has(node.expression.text)) &&
@@ -4952,6 +4985,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // (in a mixin: the class it extends at run time, __super)
       if (ownerClass && mixinBaseOf.has(ownerClass) && isCallee(node)) return `self.__super.${visit(node.name)}`;
       if (parentName) {
+        // super.m() inside a static method calls Parent_m
+        const enclosingFn = getEnclosingFunction(node);
+        if (enclosingFn && (isMethodDeclaration(enclosingFn) || isGetAccessor(enclosingFn) || isSetAccessor(enclosingFn)) && hasModifier(enclosingFn, 'StaticKeyword')) {
+          return `${getSafeName(parentName)}_${visit(node.name)}`;
+        }
         // super.x on an accessor reads the parent's getter
         if (!isCallee(node) && !isAssignmentTarget(node) && classGetterMethods.has(`${parentName}.${node.name.text}`)) {
           return `self.${goFieldName(parentName)}.Get_${visit(node.name)}()`;
@@ -5178,18 +5216,36 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           registerLocalVariable(bindingName(el, localName), 'float64');
           continue;
         }
+        const isGlobalThisInit = (() => {
+          let u = node.initializer;
+          while (u && (isParenthesizedExpression(u) || isAsExpression(u) || u.kind === 'SatisfiesExpression' || isNonNullExpression(u))) u = u.expression;
+          return !!u && isIdentifier(u) && (u.text === 'globalThis' || (u.text === 'global' && isNodeGlobalObject(u)));
+        })();
+        const isMapSource = isGlobalThisInit || (!!initType && (initType.startsWith('*TnMap[string, ') || initType === 'map[string]interface{}'));
+        const mapPropRead = !isGlobalThisInit && initType?.startsWith('*TnMap[string, ')
+          ? `(${initExpr}).Get(${toGoStringLiteral(propName)})`
+          : `(${initExpr})[${toGoStringLiteral(propName)}]`;
         if (!defaultVal && classGetterMethods.has(`${structName}.${propName}`)) {
           parts.push(`${localName} := (${initExpr}).Get_${goFieldName(propName)}()`);
         } else if (!defaultVal && isStructGetterField(structName, propName)) {
           parts.push(`${localName} := (${initExpr}).${goFieldName(propName)}()`);
         } else if (defaultVal) {
           // Missing property (nil) takes the default
-          const defType = inferExpressionType(defaultVal) ?? fieldType ?? 'interface{}';
+          const rawDefType = inferExpressionType(defaultVal);
+          const defType = (rawDefType && rawDefType !== 'nil' ? rawDefType : undefined) ?? (fieldType && fieldType !== 'nil' ? fieldType : undefined) ?? 'interface{}';
           const tmp = getTempName('destructure');
           useHelper('dynamic');
+          const rawRead = isMapSource
+            ? mapPropRead
+            : !initType || initType === 'interface{}'
+              ? `TnGetRef(${initExpr}, ${toGoStringLiteral(propName)})`
+              : `(${initExpr}).${goFieldName(propName)}`;
+          const returnExpr = defType === 'interface{}' ? tmp : `TnAs[${defType}](${tmp})`;
           parts.push(
-            `${localName} := func() ${defType} { ${tmp} := interface{}((${initExpr}).${goFieldName(propName)}); if TnIsNil(${tmp}) { return ${visit(defaultVal)} }; return TnAs[${defType}](${tmp}) }()`
+            `${localName} := func() ${defType} { ${tmp} := interface{}(${rawRead}); if TnIsNil(${tmp}) { return ${visit(defaultVal)} }; return ${returnExpr} }()`
           );
+        } else if (isMapSource) {
+          parts.push(`${localName} := ${mapPropRead}`);
         } else if (!initType || initType === 'interface{}') {
           // a dynamic source: its property by name (undefined when missing)
           useHelper('dynamic');
@@ -5229,7 +5285,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
         registerLocalVariable(
           bindingName(el, localName),
-          defaultVal ? (inferExpressionType(defaultVal) ?? fieldType) : (fieldType ?? (!initType || initType === 'interface{}' ? 'interface{}' : undefined))
+          defaultVal
+            ? ((() => { const t = inferExpressionType(defaultVal); return t && t !== 'nil' ? t : (fieldType && fieldType !== 'nil' ? fieldType : 'interface{}'); })())
+            : isMapSource
+              ? (initType?.startsWith('*TnMap[string, ') ? extractMapValueType(initType) : 'interface{}')
+              : (fieldType ?? (!initType || initType === 'interface{}' ? 'interface{}' : undefined))
         );
         // the member's declared type (its function type's optional parameters …)
         const sourceTypeNode = getExpressionTypeNode(node.initializer);
@@ -5788,15 +5848,19 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const args = (node.arguments ?? []).map((a) => visit(a)).join(', ');
       return `func(${parameterInfo.signature})${returnType} ${visit(fn.body!, { prefixBlockContent: parameterInfo.prefixBlockContent }).trimEnd()}(${args})`;
     }
-    // Handle setTimeout specially to get raw delay value
-    if (isIdentifier(node.expression) && node.expression.text === 'setTimeout') {
+    // Handle global setTimeout specially to get raw delay value (skip when imported from node:timers/promises)
+    if (isIdentifier(node.expression) && node.expression.text === 'setTimeout' && !nodeLocalNames.has('setTimeout')) {
       useHelper('timerWait');
       importedPackages.add('time');
       const callback = visit((node.arguments ?? [])[0]);
       const delayNode = (node.arguments ?? [])[1];
-      const delay = isNumericLiteral(delayNode) ? delayNode.text : visit(delayNode);
+      const delay = !delayNode
+        ? '0'
+        : isNumericLiteral(delayNode)
+          ? delayNode.text
+          : asFloatOperand(delayNode, visit(delayNode));
       // Registered on the wait group so the process lives until it fires (or is cleared)
-      return `TnSetTimeout(${delay ?? '0'}, func() { (${callback.trim()})() })`;
+      return `TnSetTimeout(${delay}, func() { (${callback.trim()})() })`;
     }
     // p.then(cb) on a channel-based Promise: wait for the value, run the callback
     if (
@@ -5845,17 +5909,39 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // A callback without parameters (then(() => …)) takes no value
         const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
         const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
+        const rejArg = thenArgs[1];
+        const hasRejected =
+          !!rejArg &&
+          rejArg.kind !== 'NullKeyword' &&
+          rejArg.kind !== 'VoidExpression' &&
+          !(isIdentifier(rejArg) && rejArg.text === 'undefined');
+        const rejCode = hasRejected ? cbs[1] : '';
+        const rejZeroParam =
+          hasRejected &&
+          (isArrowFunction(rejArg) || isFunctionExpression(rejArg)) &&
+          (rejArg.parameters ?? []).length === 0;
         // (used as a value — proms.push(p.then(cb)) —: the promise of the
         // callback's result, a channel that receives it once the callback ran)
         if (!isExpressionStatement(unwrapParenthesesUp(node).parent)) {
           const returns = !!cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && !!inferFunctionBodyReturnType(cb);
           const outType = thenResultType(node)?.slice(5) ?? 'interface{}';
           const body = returns ? `return ${invoke}` : `${invoke}; var __zero ${outType}; return __zero`;
+          if (hasRejected) {
+            const rejReturns = (isArrowFunction(rejArg) || isFunctionExpression(rejArg)) && !!inferFunctionBodyReturnType(rejArg);
+            const rejInvoke = rejZeroParam ? `(${rejCode})()` : `(${rejCode})(__e)`;
+            const rejBody = rejReturns ? `return ${rejInvoke}` : `${rejInvoke}; var __zero ${outType}; return __zero`;
+            const rejParamType = rejZeroParam ? 'interface{}' : (goFuncParamTypes(inferExpressionType(rejArg) ?? '')[0] || 'interface{}');
+            return `TnPromiseThen2[${elemType}, ${outType}, ${rejParamType}](${recv}, func(__v ${elemType}) ${outType} { _ = __v; ${body} }, func(__e ${rejParamType}) ${outType} { _ = __e; ${rejBody} })`;
+          }
           return `TnPromiseThen[${elemType}, ${outType}](${recv}, func(__v ${elemType}) ${outType} { _ = __v; ${body} })`;
         }
         // The promise expression is evaluated now, with the baton (exec()
         // registering its listeners off the loop would race it); the callback
         // runs as a microtask once the promise settles
+        if (hasRejected) {
+          const rejHandler = rejZeroParam ? `func(_ interface{}) { (${rejCode})() }` : rejCode;
+          return `TnPromiseThenVoid2(${recv}, func(__v ${elemType}) { _ = __v; ${invoke} }, ${rejHandler})`;
+        }
         if (takesValue) {
           return `TnPromiseThenVoid(${recv}, func(__v ${elemType}) { ${invoke} })`;
         }
@@ -6600,6 +6686,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         const eq = `TnParseFloat(${visit(strNode)}) == ${visit(numNode)}`;
         return op === '==' ? eq : `!(${eq})`;
       }
+      if (
+        (leftType?.startsWith('func(') || rightType?.startsWith('func(')) &&
+        !isNilLiteral(node.left) &&
+        !isNilLiteral(node.right)
+      ) {
+        useHelper('dynamic');
+        return `${op === '!=' ? '!' : ''}TnSame(${visit(node.left)}, ${visit(node.right)})`;
+      }
     }
     // new.target === C → the target class name is C's
     if ((op === '==' || op === '!=') && (isNewTargetNode(node.left) || isNewTargetNode(node.right))) {
@@ -6622,7 +6716,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // buf[i] = v on a Buffer / Uint8Array: bytes wrap modulo 256
     if (op === '=' && isElementAccessExpression(node.left) && inferExpressionType(node.left.expression) === '[]byte') {
       useHelper('buffer');
-      return `${visit(node.left.expression)}[int(${visit(node.left.argumentExpression)})] = TnByte(${visit(node.right)})`;
+      return `${visit(node.left.expression)}[int(${visit(node.left.argumentExpression)})] = TnByte(${asFloatOperand(node.right, visit(node.right))})`;
     }
     // obj[key] = v on a class instance or typed object: the field the key
     // names takes the value (with its declared type); one it does not take —
@@ -6833,7 +6927,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             return isExpressionStatement(node.parent) ? `func() {\n\t\t${loop}\n\t}()` : `func() interface{} {\n\t\t${loop}\n\t\treturn nil\n\t}()`;
           }
           useHelper('eventLoop');
-          return `for _, __yv := range ${source} {\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${value})\n\t\t}`;
+          return `for _, __yv := range ${source} {\n\t\t\tTnAsyncYield[${yieldType}](${asyncChannelVar}, ${value})\n\t\t}`;
         }
         if (!isAsyncGen) {
           useHelper('generatorStep');
@@ -6852,7 +6946,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
         useHelper('eventLoop');
         const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
-        return `for {\n\t\t\t__yv, __ok := tnRawReceiveAsync(${visit(node.expression)})\n\t\t\tif !__ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${forwarded})\n\t\t}`;
+        return `for {\n\t\t\t__yv, __ok := tnRawReceiveAsync(${visit(node.expression)})\n\t\t\tif !__ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tTnAsyncYield[${yieldType}](${asyncChannelVar}, ${forwarded})\n\t\t}`;
       }
       const yielded = node.expression
         ? toGoValueOfType(node.expression, yieldType)
@@ -6869,7 +6963,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return call;
       }
       useHelper('eventLoop');
-      return `TnAsyncYield(${asyncChannelVar}, ${yielded})`;
+      return `TnAsyncYield[${yieldType}](${asyncChannelVar}, ${yielded})`;
     }
     return '';
   } else if (isAwaitExpression(node)) {
@@ -6880,8 +6974,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // inline on the loop goroutine (an async callback) must keep draining the
     // loop itself
     useHelper('promise');
+    const isAsyncEnclosing =
+      asyncChannelIsAsync || !!(asyncFunctionNode?.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword');
     const awaitFn =
-      asyncChannelVar && asyncChannelIsAsync && getEnclosingFunction(node) === asyncFunctionNode
+      asyncChannelVar && isAsyncEnclosing && getEnclosingFunction(node) === asyncFunctionNode
         ? 'TnAwait'
         : 'TnAwaitInline';
     // a value that may or may not be a promise (any): awaited when it is one
@@ -7286,11 +7382,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // given —: that object is the new instance)
     let ctorOfReturn: AstNode | undefined = node.parent;
     while (ctorOfReturn && !FUNCTION_LIKE_KINDS.has(ctorOfReturn.kind)) ctorOfReturn = ctorOfReturn.parent;
-    if (node.expression && ctorOfReturn && isConstructorDeclaration(ctorOfReturn) && node.expression.kind !== 'ThisKeyword') {
-      const owner = getEnclosingClassName(node);
-      if (owner) {
-        useHelper('dynamic');
-        return `return TnAs[*${getSafeName(owner)}](interface{}(${visit(node.expression)}))` + (options.inline ? '' : ';\n\t');
+    if (ctorOfReturn && isConstructorDeclaration(ctorOfReturn)) {
+      if (!node.expression) {
+        return 'return self' + (options.inline ? '' : ';\n\t');
+      }
+      if (node.expression.kind !== 'ThisKeyword') {
+        const owner = getEnclosingClassName(node);
+        if (owner) {
+          useHelper('dynamic');
+          return `return TnAs[*${getSafeName(owner)}](interface{}(${visit(node.expression)}))` + (options.inline ? '' : ';\n\t');
+        }
       }
     }
     // return f() where f returns nothing: call it, then return
@@ -7336,7 +7437,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         if (asyncDirectReturn) {
           return `return ${returned}` + (options.inline ? '' : ';\n\t');
         }
-        return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); __done = true; return` + (options.inline ? '' : ';\n\t');
+        return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); __done = true; ${genExit}` + (options.inline ? '' : ';\n\t');
       }
       const isAsyncGen = (asyncFunctionNode?.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword');
       if (isAsyncGen) {
@@ -7749,8 +7850,13 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     for (const member of (node.members ?? [])) {
       // static properties are package-level Class_name variables, not fields
       // (an abstract one is no field either: the subclasses declare it, as a
-      // field or an accessor)
-      if (isPropertyDeclaration(member) && !hasModifier(member, 'DeclareKeyword') && !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword' || m.kind === 'AbstractKeyword')) {
+      // field or an accessor; a `declare` property that re-types an ancestor
+      // member is also omitted so it does not shadow the inherited field/method)
+      const isInheritedDeclare =
+        hasModifier(member, 'DeclareKeyword') &&
+        !!memberKey(member.name) &&
+        ancestorDeclaresMember(node, memberKey(member.name)!);
+      if (isPropertyDeclaration(member) && !isInheritedDeclare && !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword' || m.kind === 'AbstractKeyword')) {
         const rawFieldName =
           member.name?.kind === 'PrivateIdentifier'
             ? privateGoName(member.name.text)
@@ -8023,14 +8129,34 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             continue;
           }
           if (!isMethodDeclaration(member)) continue;
-          // (an inherited generator method: the embedded parent's, promoted;
-          // dispatched on any values too)
-          if (member.body && member.asteriskToken && isIdentifier(member.name) && !ownMethodNames.has(member.name.text) &&
+          // (an inherited generator method — including [Symbol.iterator] / [Symbol.asyncIterator] —
+          // copied into the subclass so `this` dispatches to the subclass's overrides)
+          if (member.body && member.asteriskToken &&
             !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword')) {
-            ownMethodNames.add(member.name.text);
-            emittedMethodNames.add(member.name.text);
-            copiedMethods.push(emitGeneratorMethod(name, typeParamNames, member, goFieldName(member.name.text)));
-            continue;
+            let genKey: string | undefined;
+            let genGoName: string | undefined;
+            if (isIdentifier(member.name)) {
+              genKey = member.name.text;
+              genGoName = goFieldName(member.name.text);
+            } else if (
+              member.name?.kind === 'ComputedPropertyName' &&
+              isPropertyAccessExpression(member.name.expression) &&
+              isIdentifier(member.name.expression.expression) &&
+              member.name.expression.expression.text === 'Symbol' &&
+              (member.name.expression.name.text === 'iterator' || member.name.expression.name.text === 'asyncIterator')
+            ) {
+              genKey = 'Symbol_iterator';
+              genGoName = 'Symbol_iterator';
+            }
+            if (genKey && genGoName && !ownMethodNames.has(genKey) && !isAbstractClass) {
+              ownMethodNames.add(genKey);
+              emittedMethodNames.add(genKey);
+              const prevCopyClass = methodCopyClass;
+              methodCopyClass = name;
+              copiedMethods.push(emitGeneratorMethod(name, typeParamNames, member, genGoName));
+              methodCopyClass = prevCopyClass;
+              continue;
+            }
           }
           if (!member.body || member.asteriskToken) continue; // abstract / generator
           if (member.modifiers?.some((m: AstNode) => m.kind === 'StaticKeyword')) continue;
@@ -8048,7 +8174,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             continue;
           }
           if ((member.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) {
+            const asyncSig = withContextualParameters(member, getFunctionParametersInfo(member.parameters ?? [])).signature;
+            recordMethodSignature(name, methodName, goMethodName, asyncSig, `chan ${getPromiseChannelType(member)}`);
+            const prevCopyClass = methodCopyClass;
+            methodCopyClass = name;
             copiedMethods.push(`${lineMarker(member)}${emitChannelFunction(member, true, `func (self *${name}${typeParamNames}) ${goMethodName}`)}\n`);
+            methodCopyClass = prevCopyClass;
             continue;
           }
           let methodParameterInfo = getFunctionParametersInfo(member.parameters ?? []);
@@ -8115,15 +8246,41 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         const isStatic = member.modifiers?.some((m) => m.kind === 'StaticKeyword');
         if (!member.body) {
           // an abstract method: subclasses implement it. A stub on the base
-          // keeps calls made through the base type compiling; a concrete
-          // instance always dispatches to its own method.
-          if (isAbstractClass && !isStatic) {
-            const params = getFunctionParametersInfo(member.parameters ?? []);
+          // keeps calls made through the base type compiling (and satisfies
+          // implemented interfaces); overload signatures without `abstract`
+          // are skipped because the implementation body follows.
+          if (isAbstractClass && !isStatic && hasModifier(member, 'AbstractKeyword')) {
+            const widened = widenToInterfaceParams(name, member, methodParameterInfo.signature, methodParameterInfo.prefixBlockContent);
+            const extraParams = interfaceExtraParams.get(memberKey(member.name) ?? methodName) ?? '';
+            const fullSig = [widened.signature, extraParams].filter(Boolean).join(', ');
             useHelper('error');
             if (!emittedMethodNames.has(methodName)) {
-              result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${params.signature})${returnType} { panic(TnNodeError("TypeError", "", "self.${methodName} is not a function")) }\n\n`;
+              result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${fullSig})${returnType} { panic(TnNodeError("TypeError", "", "self.${methodName} is not a function")) }\n\n`;
               emittedMethodNames.add(methodName);
             }
+          }
+          continue;
+        }
+        // A concrete method on an abstract class with an explicit `this: SubClass`
+        // annotation (e.g., Babel's `LValParser` layers typing `this: Parser`) is
+        // only callable on that concrete subclass, which copies the real body onto
+        // `*SubClass`. Emit a panic stub on the abstract base so sibling methods
+        // calling `this.m(...)` still compile without typechecking `SubClass`-only
+        // member calls against `*AbstractBase`.
+        if (
+          isAbstractClass &&
+          !isStatic &&
+          member.tnThisType &&
+          isTypeReferenceNode(member.tnThisType) &&
+          visit(member.tnThisType.typeName) !== name
+        ) {
+          const widened = widenToInterfaceParams(name, member, methodParameterInfo.signature, methodParameterInfo.prefixBlockContent);
+          const extraParams = interfaceExtraParams.get(memberKey(member.name) ?? methodName) ?? '';
+          const fullSig = [widened.signature, extraParams].filter(Boolean).join(', ');
+          useHelper('error');
+          if (!emittedMethodNames.has(methodName)) {
+            result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${fullSig})${returnType} { panic(TnNodeError("TypeError", "", "self.${methodName} is not a function")) }\n\n`;
+            emittedMethodNames.add(methodName);
           }
           continue;
         }
@@ -8133,6 +8290,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         } else if (isAsyncMethod) {
           // async methods run like async functions: a promise channel
           const header = isStatic ? `func ${name}_${methodName}` : `func (self *${name}${typeParamNames}) ${methodName}`;
+          if (!isStatic) {
+            const asyncSig = withContextualParameters(member, getFunctionParametersInfo(member.parameters ?? [])).signature;
+            emittedMethodNames.add(memberKey(member.name) ?? methodName);
+            recordMethodSignature(name, memberKey(member.name) ?? methodName, methodName, asyncSig, `chan ${getPromiseChannelType(member)}`);
+          }
           result += `${lineMarker(member)}${emitChannelFunction(member, true, header)}\n\n`;
         } else if (isStatic) {
           // Static methods become package-level functions named ClassName_methodName
@@ -8218,13 +8380,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           member.type
             ? getOptionalNodeType(member.type, !!member.questionToken)
             : toFieldGoType(member.initializer ? inferExpressionType(member.initializer) : undefined);
-        // (one reading a module variable — static globals = [...lower] — is
-        // set when the module's code runs, after that variable: a Go
-        // initializer would run before it)
-        const readsModuleVariable = !!member.initializer && containsNode(member.initializer, (n: AstNode) =>
-          isIdentifier(n) && declaredVariables.has(n.text) && !isFieldNameIdentifier(n) && !isLocallyBound(n));
+        // (one reading a module variable or calling a function/constructor —
+        // static globals = [...lower] or static ZERO = Long.fromInt(0) — is set
+        // when the module's code runs, avoiding Go package-level init cycles)
+        const needsDefer = (n: AstNode): boolean =>
+          isCallExpression(n) || isNewExpression(n) ||
+          (isIdentifier(n) && n.text !== 'undefined' && n.text !== 'NaN' && n.text !== 'Infinity' && !isFieldNameIdentifier(n) && !isLocallyBound(n));
+        const deferStaticInit = !!member.initializer && (
+          needsDefer(member.initializer) ||
+          containsNode(member.initializer, needsDefer)
+        );
         const staticSink = staticInitSinks?.get(node);
-        if (readsModuleVariable && staticSink && fieldType && fieldType !== ':') {
+        if (deferStaticInit && staticSink && fieldType && fieldType !== ':') {
           staticSink.push(`${name}_${fieldName} = ${toGoValueOfType(member.initializer, fieldType)}`);
           result += `var ${name}_${fieldName} ${fieldType}\n\n`;
           continue;
@@ -8233,10 +8400,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         result += `var ${name}_${fieldName} ${fieldType}${initializer}\n\n`;
       }
     }
-    // static { … } blocks run once at program start, after the static fields
+    // static { … } blocks run once after the class's static fields
+    const blockSink = staticInitSinks?.get(node);
     for (const member of node.members ?? []) {
       if (member.kind === 'ClassStaticBlockDeclaration' && member.body) {
-        result += `func init() ${visit(member.body).trimEnd()}\n\n`;
+        if (blockSink) {
+          blockSink.push(`func() ${visit(member.body).trimEnd()}()`);
+        } else {
+          result += `func init() ${visit(member.body).trimEnd()}\n\n`;
+        }
       }
     }
 
@@ -8439,8 +8611,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (param.initializer || param.dotDotDotToken) break;
       args.push(`*new(${getParameterGoType(param)})`);
     }
-    // new this(…) in a static method: the class declaring it
-    if (thisOwner) return `New${getSafeName(thisOwner)}(${args.join(', ')})`;
+    // new this(…) in a static method: when the class has subclasses, construct
+    // the runtime receiver class (TnThis) if invoked on a subclass constructor
+    if (thisOwner) {
+      if (subclassNames(thisOwner).length > 0) {
+        useHelper('classes');
+        useHelper('dynamic');
+        useHelper('error');
+        return `func() interface{} { if __cls, ok := TnThis.(*TnClass); ok && __cls != nil && __cls.New != nil { return TnNew(__cls${args.length ? ', ' + args.join(', ') : ''}) }; return New${getSafeName(thisOwner)}(${args.join(', ')}) }()`;
+      }
+      return `New${getSafeName(thisOwner)}(${args.join(', ')})`;
+    }
     // new X(…) where X holds a class value (tag.nodeClass, this.constructor)
     // (or a variable holding one: let cls = Parser; … new cls(…))
     const classVariable = isIdentifier(node.expression) && !classNames.has(node.expression.text) && inferExpressionType(node.expression) === '*TnClass';
@@ -8519,6 +8700,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       const coversKeys = !!fields && (node.properties ?? []).every((p: AstNode) =>
         p.kind === 'SpreadAssignment' || ((isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && isIdentifier(p.name) && fields.has(p.name.text)));
       if (coversKeys && isObjectTypeName(structName)) typeName = spreadType;
+    }
+    const bareTypeName = typeName.replace(/^\*/, '');
+    if (bareTypeName && declaredClasses.has(bareTypeName)) {
+      const cls = declaredClasses.get(bareTypeName);
+      const directFields = new Set<string>([
+        ...(cls?.members ?? []).filter((m: AstNode) => isPropertyDeclaration(m) && isIdentifier(m.name)).map((m: AstNode) => m.name.text),
+        ...getParameterProperties(cls ?? {}).map((p: AstNode) => p.name?.text).filter(Boolean)
+      ]);
+      const hasNonDirectProp = (node.properties ?? []).some(
+        (p: AstNode) => (isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && isIdentifier(p.name) && !directFields.has(p.name.text)
+      );
+      if (hasNonDirectProp) typeName = '';
     }
     if (!typeName || typeName === 'interface{}') {
       return visitAnonymousStructLiteral(node);
@@ -8660,6 +8853,22 @@ export type VisitNodeOptions = {
 // A value of Go type `from` where `to` is expected (conversions in adapters)
 function convertBetweenGoTypes(value: string, from: string, to: string): string {
   if (from === to || to === 'interface{}') return value;
+  if (from.startsWith('chan ') && to.startsWith('chan ')) {
+    const fromElem = from.slice(5);
+    const toElem = to.slice(5);
+    useHelper('promise');
+    if (toElem === 'struct{}') {
+      if (fromElem === 'interface{}') {
+        return `TnPromiseAs[struct{}](${value}, func(_ interface{}) struct{} { return struct{}{} })`;
+      }
+      return `TnPromiseConvert[${fromElem}, struct{}](${value}, func(_ ${fromElem}) struct{} { return struct{}{} })`;
+    }
+    useHelper('dynamic');
+    if (fromElem === 'interface{}') {
+      return `TnPromiseAs[${toElem}](${value}, func(__v interface{}) ${toElem} { return TnAs[${toElem}](__v) })`;
+    }
+    return `TnPromiseConvert[${fromElem}, ${toElem}](${value}, func(__v ${fromElem}) ${toElem} { return TnAs[${toElem}](interface{}(__v)) })`;
+  }
   useHelper('dynamic');
   if (NULLABLE_PRIMITIVE_TYPES.includes(to)) return `TnAsPtr[${to.slice(1)}](interface{}(${value}))`;
   return `TnAs[${to}](interface{}(${value}))`;
@@ -9186,7 +9395,9 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       const nullishBranch = isConditionalExpression(call) && (isNilLiteral(unwrapParentheses(call.whenTrue)) || isNilLiteral(unwrapParentheses(call.whenFalse)));
       // (a read of another element type: the elements boxed into the slot's)
       const elem = goType.replace(/^\*\[\]/, '');
-      const ownSlice = (inferExpressionType(expr) ?? '').replace(/^\*/, '');
+      const rawExprType = inferExpressionType(expr) ?? '';
+      if (rawExprType === goType) return visit(expr);
+      const ownSlice = rawExprType.replace(/^\*/, '');
       const boxedRead =
         ownSlice.startsWith('[]') && ownSlice !== `[]${elem}` && ownSlice !== '[]interface{}'
           ? () => {
@@ -9198,7 +9409,11 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       // (an optional chain: a?.items is undefined when a is)
       if (nullableResult || nullishBranch || isOptionalChain(call)) {
         useHelper('slicePtr');
-        return `TnSlicePtr(${boxedRead()})`;
+        const inner = boxedRead();
+        if (inner === 'nil' || ownSlice === 'interface{}' || ownSlice === '') {
+          return inner === 'nil' ? `TnSlicePtr[${elem}](nil)` : (useHelper('dynamic'), `TnSlicePtr[${elem}](TnAs[[]${elem}](${inner}))`);
+        }
+        return `TnSlicePtr[${elem}](${inner})`;
       }
       // a read out of a Map / Record: undefined (nil) when the key is missing,
       // not a pointer to the map's zero-length value
@@ -9648,12 +9863,26 @@ function declaredTypeNodeOf(expr: AstNode): AstNode | undefined {
   return variableTypeNodes.get(expr.text);
 }
 
+// Whether an identifier refers to an optional parameter without a default value
+function isOptionalParamWithoutDefault(expr: AstNode): boolean {
+  for (let node = expr.parent; node; node = node.parent) {
+    if (!FUNCTION_LIKE_KINDS.has(node.kind)) continue;
+    const param = (node.parameters ?? []).filter((p: AstNode) => isIdentifier(p.name) && p.name.text === expr.text)[0];
+    if (param) return !!param.questionToken && !param.initializer && !param.dotDotDotToken;
+  }
+  return false;
+}
+
 // typeof x !== tag (or the else of typeof x === tag) on a dynamic variable
 // declared as a union: the one member the tag doesn't cover, if one remains
 function typeofExcludedNarrowing(operand: AstNode, tag: string): string[] {
   if (!isIdentifier(operand) || !untypedVariable(operand.text) || referenceArrays.has(operand.text)) return [];
   const declared = resolveTypeNode(declaredTypeNodeOf(operand));
   if (!declared || !isUnionTypeNode(declared)) return [];
+  const members: AstNode[] = [...(declared.types ?? [])];
+  if (isOptionalParamWithoutDefault(operand) && !members.some((t: AstNode) => (resolveTypeNode(t) ?? t).kind === 'UndefinedKeyword')) {
+    members.push({ kind: 'UndefinedKeyword' } as AstNode);
+  }
   const coveredBy = (t: AstNode): boolean => {
     const r = resolveTypeNode(t) ?? t;
     if (tag === 'string') return r.kind === 'StringKeyword' || isLiteralTypeNode(r) && r.literal?.kind === 'StringLiteral' || r.kind === 'TemplateLiteralType';
@@ -9662,9 +9891,9 @@ function typeofExcludedNarrowing(operand: AstNode, tag: string): string[] {
     if (tag === 'undefined') return r.kind === 'UndefinedKeyword';
     return false;
   };
-  const rest = (declared.types ?? []).filter((t: AstNode) => !coveredBy(t));
+  const rest = members.filter((t: AstNode) => !coveredBy(t));
   // (any member the tag might still cover — unknown, an alias — keeps it dynamic)
-  if (rest.length !== 1 || rest.length === (declared.types ?? []).length) return [];
+  if (rest.length !== 1 || rest.length === members.length) return [];
   const goType = getType(rest[0]);
   if (!goType || goType === 'interface{}' || goType === ':') return [];
   return [typeofNarrowingKey(operand.text, goType)];
@@ -9704,12 +9933,24 @@ function nullishTargetTest(target: AstNode): string {
       const map = visit(target.expression);
       const key = toGoValueOfType(target.argumentExpression, extractMapKeyType(mapType));
       const missing = `!${map}.Has(${key})`;
-      return isNilableGoType(extractMapValueType(mapType)) ? `(${missing} || ${map}.Get(${key}) == nil)` : missing;
+      const valType = extractMapValueType(mapType);
+      if (valType === 'interface{}') {
+        useHelper('dynamic');
+        return `(${missing} || TnIsNil(${map}.Get(${key})))`;
+      }
+      return isNilableGoType(valType) ? `(${missing} || ${map}.Get(${key}) == nil)` : missing;
     }
   }
   // (an array reference is the *[]T itself: nil when unset — the default read
   // would dereference it)
   if (isIdentifier(target) && isReferenceArrayRead(target)) return `${getSafeName(target.text)} == nil`;
+  // An interface{} slot may hold TnNull or a typed nil pointer (*T)(nil);
+  // Go's `== nil` is false for both, so test with TnIsNil.
+  const targetType = inferExpressionType(target);
+  if (!targetType || targetType === 'interface{}') {
+    useHelper('dynamic');
+    return `TnIsNil(${visit(target)})`;
+  }
   return `${visit(target)} == nil`;
 }
 
@@ -10540,8 +10781,9 @@ function visitBitwise(node: AstNode, op: string): string | undefined {
       const res = bitwiseInt(node, bitOp, mutTarget, true);
       return `${mutTarget} = ${res.unsigned ? `int32(${res.code})` : res.code}`;
     }
-    const left = asFloatOperand(node.left, visit(node.left));
-    return `${left} = float64(${bitwiseInt(node, bitOp, left).code})`;
+    const rawLeft = visit(node.left);
+    const left = asFloatOperand(node.left, rawLeft);
+    return `${rawLeft} = float64(${bitwiseInt(node, bitOp, left).code})`;
   }
   return `float64(${bitwiseInt(node, bitOp).code})`;
 }
@@ -12329,6 +12571,82 @@ function emitDynamicDispatchers(): string {
     // (String's replace on a value that turns out to be a string)
     if (method === 'replace' || method === 'replaceAll') {
       cases.push(`\tcase string:\n\t\treturn TnStringReplaceAny(o, TnArg(__args, 0), TnJSString(TnArg(__args, 1)), ${method === 'replaceAll'})`);
+    }
+    // (EventEmitter methods inherited via *TnEventEmitter on dynamic receivers)
+    if (usedHelpers.has('nodeEvents')) {
+      if (method === 'emit') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\treturn o.tnEmitter().emit(TnJSString(TnArg(__args, 0)), func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)`);
+      } else if (method === 'on' || method === 'once' || method === 'off' || method === 'addListener' || method === 'removeListener' || method === 'prependListener' || method === 'prependOnceListener') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\to.tnEmitter().${method}(TnJSString(TnArg(__args, 0)), TnArg(__args, 1))\n\t\treturn o`);
+      } else if (method === 'removeAllListeners') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\tif len(__args) > 0 && __args[0] != nil { o.tnEmitter().removeAllListeners(TnJSString(__args[0])) } else { o.tnEmitter().removeAllListeners() }\n\t\treturn o`);
+      } else if (method === 'listeners' || method === 'rawListeners') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\treturn o.tnEmitter().${method}(TnJSString(TnArg(__args, 0)))`);
+      } else if (method === 'listenerCount') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\treturn o.tnEmitter().listenerCount(TnJSString(TnArg(__args, 0)), func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)`);
+      } else if (method === 'eventNames') {
+        cases.push(`\tcase interface{ tnEmitter() *TnEventEmitter }:\n\t\treturn o.tnEmitter().eventNames()`);
+      }
+    }
+    // (Node Buffer / Uint8Array methods on dynamic []byte receivers)
+    if (usedHelpers.has('buffer')) {
+      if (method === 'write') {
+        cases.push(`\tcase []byte:\n\t\treturn TnBufferWrite(o, TnJSString(TnArg(__args, 0)), func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)`);
+      } else if (method === 'copy') {
+        cases.push(`\tcase []byte:\n\t\t__nums := make([]float64, 0, len(__args))\n\t\tfor __i := 1; __i < len(__args); __i++ { if __args[__i] != nil { __nums = append(__nums, TnAs[float64](__args[__i])) } }\n\t\treturn TnBufferCopy(o, TnAs[[]byte](TnArg(__args, 0)), __nums...)`);
+      } else if (method === 'swap16' || method === 'swap32' || method === 'swap64') {
+        cases.push(`\tcase []byte:\n\t\treturn TnBufferSwap(o, ${Number(method.slice(4)) / 8})`);
+      } else if (method === 'set') {
+        cases.push(`\tcase []byte:\n\t\t__off := 0\n\t\tif len(__args) > 1 && __args[1] != nil { __off = int(TnAs[float64](__args[1])) }\n\t\tcopy(o[__off:], TnAs[[]byte](TnArg(__args, 0)))\n\t\treturn nil`);
+      } else if (method === 'subarray' || method === 'slice') {
+        cases.push(`\tcase []byte:\n\t\t__nums := make([]float64, 0, len(__args))\n\t\tfor _, __a := range __args { if __a != nil { __nums = append(__nums, TnAs[float64](__a)) } }\n\t\treturn TnBufferSlice(o, __nums...)`);
+      } else if (method === 'equals') {
+        cases.push(`\tcase []byte:\n\t\treturn bytes.Equal(o, TnAs[[]byte](TnArg(__args, 0)))`);
+      } else if (method === 'compare') {
+        cases.push(`\tcase []byte:\n\t\treturn float64(bytes.Compare(o, TnAs[[]byte](TnArg(__args, 0))))`);
+      }
+    }
+    // (Node Stream methods on *TnStream and embedders like *TnSocket)
+    if (usedHelpers.has('nodeStream')) {
+      if (method === 'pipe') {
+        cases.push(`\tcase tnStreamLike:\n\t\tif __dst, __ok := TnArg(__args, 0).(tnStreamLike); __ok {\n\t\t\treturn TnPipe(o, __dst, func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)\n\t\t}`);
+      } else if (method === 'write') {
+        cases.push(`\tcase interface{ write(interface{}, ...interface{}) bool }:\n\t\treturn o.write(TnArg(__args, 0), func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)`);
+      } else if (method === 'end' || method === 'destroy') {
+        cases.push(`\tcase interface{ ${method}(...interface{}) *TnStream }:\n\t\to.${method}(__args...)\n\t\treturn o`);
+      } else if (method === 'pause' || method === 'resume') {
+        cases.push(`\tcase interface{ ${method}() *TnStream }:\n\t\to.${method}()\n\t\treturn o`);
+      } else if (method === 'read') {
+        cases.push(`\tcase interface{ read(...float64) interface{} }:\n\t\tif len(__args) > 0 && __args[0] != nil { return o.read(TnAs[float64](__args[0])) }\n\t\treturn o.read()`);
+      } else if (method === 'setEncoding') {
+        cases.push(`\tcase interface{ setEncoding(string) *TnStream }:\n\t\to.setEncoding(TnJSString(TnArg(__args, 0)))\n\t\treturn o`);
+      } else if (method === 'cork' || method === 'uncork') {
+        cases.push(`\tcase interface{ ${method}() }:\n\t\to.${method}()\n\t\treturn nil`);
+      }
+    }
+    // (Node net/tls Socket methods on *TnSocket and embedders)
+    if (usedHelpers.has('nodeNet')) {
+      if (method === 'setKeepAlive') {
+        cases.push(`\tcase interface{ setKeepAlive(...interface{}) *TnSocket }:\n\t\to.setKeepAlive(__args...)\n\t\treturn o`);
+      } else if (method === 'setNoDelay') {
+        cases.push(`\tcase interface{ setNoDelay(...bool) *TnSocket }:\n\t\tif len(__args) > 0 && __args[0] != nil { o.setNoDelay(TnTruthy(__args[0])) } else { o.setNoDelay() }\n\t\treturn o`);
+      } else if (method === 'setTimeout') {
+        cases.push(`\tcase interface{ setTimeout(float64, ...interface{}) *TnSocket }:\n\t\to.setTimeout(TnAs[float64](TnArg(__args, 0)), func() []interface{} { if len(__args) > 1 { return __args[1:] }; return nil }()...)\n\t\treturn o`);
+      } else if (method === 'address') {
+        cases.push(`\tcase interface{ address() *TnAddressInfo }:\n\t\treturn o.address()`);
+      } else if (method === 'ref' || method === 'unref' || method === 'resetAndDestroy') {
+        cases.push(`\tcase interface{ ${method}() *TnSocket }:\n\t\to.${method}()\n\t\treturn o`);
+      } else if (method === 'destroySoon') {
+        cases.push(`\tcase interface{ destroySoon() }:\n\t\to.destroySoon()\n\t\treturn nil`);
+      }
+    }
+    // (Date methods on dynamic time.Time receivers)
+    if (usedHelpers.has('date')) {
+      if (method === 'getTime' || method === 'valueOf') {
+        cases.push(`\tcase time.Time:\n\t\treturn TnDateMs(o)`);
+      } else if (method === 'toISOString' || method === 'toJSON') {
+        cases.push(`\tcase time.Time:\n\t\treturn TnDateFormat(o, "iso")`);
+      }
     }
     const suffix = dispatcherSuffix(method);
     const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
@@ -15049,7 +15367,9 @@ function getTypeText(typeNode: AstNode): string {
     UTILITY_TYPES.has(typeNode.typeName.text) &&
     typeNode.typeArguments?.length
   ) {
-    return getTypeText(typeNode.typeArguments[0]);
+    const inner = getTypeText(typeNode.typeArguments[0]);
+    if (typeNode.typeName.text === 'Pick' && declaredClasses.has(inner)) return 'interface{}';
+    return inner;
   }
   if (isTypeReferenceNode(typeNode) && isIdentifier(typeNode.typeName)) {
     // (an erased type parameter: no type of its own)
@@ -16212,10 +16532,17 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
       const sig = mixinVirtualSignature(base, expr.expression.name.text);
       if (sig) return sig.result || undefined;
     }
+    if (expr.expression.expression.kind === 'SuperKeyword' && owner) {
+      const parentName = classParentNames.get(owner);
+      if (parentName) {
+        const superRet = classMethodReturnTypes.get(parentName)?.get(expr.expression.name.text);
+        if (superRet) return superRet;
+      }
+    }
   }
   if (isFunctionPropertyAccess(expr)) return 'interface{}';
   if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Array' && expr.name.text === 'isArray' && !isCallee(expr) && !variableGoTypes.has('Array') && !classNames.has('Array')) return 'func(interface{}) bool';
-  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && (expr.name.text === 'hasInstance' || expr.name.text === 'metadata') && !variableGoTypes.has('Symbol')) return '*TnSymbol';
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression) && expr.expression.text === 'Symbol' && ['hasInstance', 'metadata', 'toStringTag', 'iterator', 'asyncIterator', 'dispose', 'asyncDispose', 'toPrimitive', 'species', 'isConcatSpreadable'].includes(expr.name.text) && !variableGoTypes.has('Symbol')) return '*TnSymbol';
   if (isElementAccessExpression(expr) && isIdentifier(expr.expression) && classNames.has(expr.expression.text) && isSymbolMetadata(expr.argumentExpression)) return '*TnMap[string, interface{}]';
   if (isPropertyAccessExpression(expr) && expr.name.text === 'prototype' && !(isIdentifier(expr.expression) && classNames.has(expr.expression.text)) && inferExpressionType(expr.expression)?.startsWith('func(')) return 'interface{}';
   if (isIdentifier(expr) && isAbsentGlobal(expr)) return 'interface{}';
@@ -16331,6 +16658,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     return 'bool';
   if (expr.kind === 'NullKeyword') return 'nil';
   if (isIdentifier(expr) && expr.text === 'undefined') return 'nil';
+  if (isIdentifier(expr) && (expr.text === 'NaN' || expr.text === 'Infinity') && !variableGoTypes.has(expr.text) && !topLevelGoTypes.has(expr.text)) return 'float64';
   if (isIdentifier(expr)) {
     // A primitive-typed parameter of an enclosing function: its annotation,
     // not a same-named variable registered earlier (inferring the return type
@@ -16394,11 +16722,10 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     (isIdentifier(expr.expression) && (variableGoTypes.get(expr.expression.text) === 'interface{}' || (!classNames.has(expr.expression.text) && isDynamicValue(expr.expression)))))) {
     return 'interface{}';
   }
-  // new this(…) in a static method: an instance of the class declaring it
+  // new this(…) in a static method: an instance of the class (or a subclass)
   if (isNewExpression(expr) && expr.expression.kind === 'ThisKeyword') {
     const owner = getEnclosingClassName(expr);
-    // (NewC's result, even for a class with subclasses)
-    if (owner) return `*${getSafeName(owner)}`;
+    if (owner) return subclassNames(owner).length > 0 ? 'interface{}' : `*${getSafeName(owner)}`;
   }
   if (isNewExpression(expr) && isIdentifier(expr.expression)) {
     const ctorName = expr.expression.text;
@@ -16514,6 +16841,7 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
         : '';
     const promiseType = inferPromiseCallType(expr);
     if (promiseType) return promiseType;
+    if (callee === 'String.fromCharCode' || callee === 'String.fromCodePoint') return 'string';
     // f.call(thisArg, …) / f.apply(thisArg, args) on a function value: its result
     if (isPropertyAccessExpression(expr.expression) && ['call', 'apply'].includes(expr.expression.name.text) && !isObjectToStringCall(expr)) {
       const fnType = functionValueGoType(expr.expression.expression);
@@ -16770,6 +17098,13 @@ function inferExpressionTypeOf(expr: AstNode): string | undefined {
     if (isIdentifier(expr.expression) && classNames.has(expr.expression.text) && !variableGoTypes.has(expr.expression.text)) {
       const staticType = staticPropertyGoType(expr.expression.text, memberKey(expr.name));
       if (staticType) return staticType;
+    }
+    if (expr.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(expr.expression)) {
+      const staticOwner = enclosingStaticOwnerClass(expr);
+      if (staticOwner) {
+        const staticType = staticPropertyGoType(staticOwner, memberKey(expr.name));
+        if (staticType) return staticType;
+      }
     }
     // x.constructor: a class value (or nil)
     if (expr.name.text === 'constructor') return 'interface{}';
@@ -17494,6 +17829,8 @@ function inferPromiseCallType(expr: AstNode): string | undefined {
   if (thenType) return thenType;
   if (isPromiseStaticCall(expr, new Set(['reject']))) return `chan ${getRejectedPromiseType(expr)}`;
   if (isPromiseStaticCall(expr, PROMISE_COMBINATORS)) {
+    const arg0 = (expr.arguments ?? [])[0];
+    if (expr.expression.name.text === 'race' && arg0 && inferExpressionType(arg0) === '[]interface{}') return 'chan interface{}';
     const elem = promiseAllElementType(expr) ?? 'interface{}';
     return expr.expression.name.text === 'allSettled' ? `chan []*TnSettled[${elem}]` : `chan ${elem}`;
   }
@@ -17517,7 +17854,13 @@ function visitPromiseCall(node: AstNode): string | undefined {
   if (isPromiseStaticCall(node, PROMISE_COMBINATORS)) {
     useHelper('promise');
     const name = node.expression.name.text;
-    return `TnPromise${name[0].toUpperCase()}${name.slice(1)}(${args[0] ? visit(args[0]) : '[]chan interface{}{}'})`;
+    const listArg = args[0] ? visit(args[0]) : '[]chan interface{}{}';
+    const listType = args[0] ? inferExpressionType(args[0]) : '';
+    if (name === 'race' && (listType === '[]interface{}' || listArg.startsWith('[]interface{}'))) {
+      useHelper('promiseAll');
+      return `TnPromiseRaceValues(${listArg})`;
+    }
+    return `TnPromise${name[0].toUpperCase()}${name.slice(1)}(${listArg})`;
   }
   if (!isPromiseMethodCall(node)) return undefined;
   useHelper('promise');
@@ -18132,12 +18475,12 @@ const UTILITY_TYPES = new Set(['Partial', 'Required', 'Readonly', 'Pick', 'Omit'
 // "name T" field declarations of an object type (type literal, alias or interface)
 // An object type's fields (name → Go type): an interface's with inherited
 // ones, a type literal's or object type alias's; methods are func fields
-function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
+function objectTypeFieldMap(typeNode: AstNode, seen = new Set<string>()): Map<string, string> {
   const out = new Map<string, string>();
   let members: AstNode[] = [];
   // (A & B & { c }: every part's fields — aliases of intersections too)
   if (typeNode.kind === 'IntersectionType') {
-    for (const t of typeNode.types ?? []) for (const [field, fieldType] of objectTypeFieldMap(t)) if (!out.has(field)) out.set(field, fieldType);
+    for (const t of typeNode.types ?? []) for (const [field, fieldType] of objectTypeFieldMap(t, seen)) if (!out.has(field)) out.set(field, fieldType);
     return out;
   }
   if (typeNode.kind === 'TypeLiteral') members = typeNode.members ?? [];
@@ -18148,13 +18491,13 @@ function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
     // (a program's own Omit / Pick alias — zod declares one — means the same)
     if ((name === 'Pick' || name === 'Omit') && (typeNode.typeArguments ?? []).length === 2 && !declaredInterfaces.has(name)) {
       const keys = getMappedTypeKeys(typeNode.typeArguments[1]);
-      const base = objectTypeFieldMap(typeNode.typeArguments[0]);
+      const base = objectTypeFieldMap(typeNode.typeArguments[0], seen);
       if (!keys) return base;
       for (const [field, fieldType] of base) if (keys.includes(goFieldName(field)) === (name === 'Pick')) out.set(field, fieldType);
       return out;
     }
     if (UTILITY_TYPES.has(name) && (typeNode.typeArguments ?? []).length > 0 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
-      return objectTypeFieldMap(typeNode.typeArguments[0]);
+      return objectTypeFieldMap(typeNode.typeArguments[0], seen);
     }
     // Record<'a' | 'b', V>: a field per key (V, nullable — a key may be unset)
     if (name === 'Record' && (typeNode.typeArguments ?? []).length === 2 && !declaredTypeAliases.has(name) && !declaredInterfaces.has(name)) {
@@ -18171,9 +18514,10 @@ function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
         return out;
       }
     }
+    if (seen.has(name)) return out;
     const iface = declaredInterfaces.get(name);
     if (iface) {
-      collectInterfaceProperties(iface, out);
+      collectInterfaceProperties(iface, out, seen);
       return out;
     }
     // (the interface was renamed for a collision with another module's same-
@@ -18181,30 +18525,31 @@ function objectTypeFieldMap(typeNode: AstNode): Map<string, string> {
     // the ones the name means here)
     const byOriginal = interfacesByOriginalName.get(name);
     if (byOriginal && byOriginal.length > 0) {
-      for (const candidate of byOriginal) collectInterfaceProperties(candidate, out);
+      for (const candidate of byOriginal) collectInterfaceProperties(candidate, out, seen);
       return out;
     }
     const alias = declaredTypeAliases.get(name) ?? typeAliases.get(name);
     // (an object type known by its fields only: one of another file)
     const known = !alias ? interfacePropertyTypes.get(name) : undefined;
     if (known) return new Map(known);
+    if (alias) seen.add(name);
     if (alias?.kind === 'TypeLiteral') members = alias.members ?? [];
     else if (alias?.kind === 'UnionType') {
       // a union of object types (type Token = A | B | …): every member's fields
       const merged = new Map<string, string>();
       for (const t of alias.types ?? []) {
-        for (const [field, fieldType] of objectTypeFieldMap(t)) if (!merged.has(field)) merged.set(field, fieldType);
+        for (const [field, fieldType] of objectTypeFieldMap(t, seen)) if (!merged.has(field)) merged.set(field, fieldType);
       }
       return merged;
-    } else if (alias) return objectTypeFieldMap(alias);
+    } else if (alias) return objectTypeFieldMap(alias, seen);
     else if (isUnionTypeNode(typeNode)) {
       const merged = new Map<string, string>();
       for (const t of typeNode.types ?? []) {
-        for (const [field, fieldType] of objectTypeFieldMap(t)) if (!merged.has(field)) merged.set(field, fieldType);
+        for (const [field, fieldType] of objectTypeFieldMap(t, seen)) if (!merged.has(field)) merged.set(field, fieldType);
       }
       return merged;
     }
-  } else if (typeNode.kind === 'ParenthesizedType') return objectTypeFieldMap(typeNode.type);
+  } else if (typeNode.kind === 'ParenthesizedType') return objectTypeFieldMap(typeNode.type, seen);
   for (const m of members) {
     if (isPropertySignature(m) && isIdentifier(m.name)) out.set(m.name.text, getObjectFieldNodeType(m.type, !!m.questionToken));
     else if (isMethodSignature(m) && isIdentifier(m.name)) out.set(m.name.text, methodSignatureFieldType(m));
@@ -18948,7 +19293,8 @@ function visitOptionalCall(node: AstNode): string {
     const value = nullable === resultType ? code : `func() ${nullable} { __v := ${code}; return &__v }()`;
     return `func() ${nullable} { if ${baseExpr} == nil { return *new(${nullable}) }; return ${value} }()`;
   }
-  if (!baseType || !baseType.startsWith('*') || baseType.startsWith('*TnMap[')) {
+  const isNilableInterface = !!baseType && !baseType.startsWith('*') && declaredInterfaces.has(baseType) && !interfaceHasProperties(declaredInterfaces.get(baseType)!);
+  if (!baseType || (!baseType.startsWith('*') && !isNilableInterface) || baseType.startsWith('*TnMap[')) {
     const plainAccess: AstNode = { ...node.expression, questionDotToken: undefined };
     const plainCall: AstNode = { ...node, questionDotToken: undefined, expression: plainAccess };
     plainAccess.parent = plainCall;
@@ -18961,9 +19307,9 @@ function visitOptionalCall(node: AstNode): string {
   if (parentKind === 'ExpressionStatement' || (parentKind === 'ArrowFunction' && node.parent.body === node)) {
     const guard = getTempName('optc');
     const call = makeNarrowedReceiverCall(node, guard, baseType);
-    // (an object pointer — printer.tokenMap?.find(…), a class instance — is
+    // (an object pointer — printer.tokenMap?.find(…), a class instance, or a Go interface — is
     // used as it is; a nullable primitive or array reference is dereferenced)
-    const narrowed = /^\*[A-Za-z_]/.test(baseType) && !NULLABLE_PRIMITIVE_TYPES.includes(baseType) ? [] : [guard];
+    const narrowed = (isNilableInterface || (/^\*[A-Za-z_]/.test(baseType) && !NULLABLE_PRIMITIVE_TYPES.includes(baseType))) ? [] : [guard];
     const callType = withNarrowingType(narrowed, () => inferExpressionType(call));
     if (parentKind === 'ExpressionStatement' || callType === '') {
       const callCode = withNarrowing(narrowed, () => visit(call));
@@ -19194,7 +19540,14 @@ function destructureCallbackParam(pattern: AstNode, source: string, goType: stri
         useHelper('dynamic');
         value = `TnGetRef(${source}, ${JSON.stringify(field)})`;
       } else {
-        value = `${source}.${goFieldName(field)}`;
+        const structName = goType.replace(/^\*/, '');
+        if (classGetterMethods.has(`${structName}.${field}`)) {
+          value = `${source}.Get_${goFieldName(field)}()`;
+        } else if (isStructGetterField(structName, field)) {
+          value = `${source}.${goFieldName(field)}()`;
+        } else {
+          value = `${source}.${goFieldName(field)}`;
+        }
         valueType =
           declaredMemberType(goType, field, false, true) ?? getStructFieldGoType(goType, field) ?? 'interface{}';
       }
@@ -19895,9 +20248,12 @@ function getType(typeNode: AstNode, getArrayType = false): string {
     useHelper('jsx');
     return 'TnJsxNode';
   }
-  // readonly T[] → T[]; keyof T → string
+  // readonly T[] → T[]; keyof T → float64 if T has only numeric keys, else string
   if (typeNode.kind === 'TypeOperator') {
-    return typeNode.operator === 'KeyOfKeyword' ? 'string' : getType(typeNode.type, getArrayType);
+    if (typeNode.operator === 'KeyOfKeyword') {
+      return keyofGoType(typeNode.type);
+    }
+    return getType(typeNode.type, getArrayType);
   }
   // typeof x → x's type
   if (typeNode.kind === 'TypeQuery' && isIdentifier(typeNode.exprName)) {
@@ -20016,6 +20372,17 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       const goTypes = new Set<string>(nonNullTypes.map((t: AstNode) => getType(t)));
       const only: string = [...goTypes][0];
       if (goTypes.size === 1 && only.startsWith('func(')) return only;
+    }
+    // Numeric literal unions (0 | 1 | -1): float64 (or *float64 when nullable)
+    if (
+      nonNullTypes.length > 1 &&
+      nonNullTypes.every(
+        (t: AstNode) =>
+          isLiteralTypeNode(t) &&
+          (t.literal?.kind === 'NumericLiteral' || t.literal?.kind === 'PrefixUnaryExpression')
+      )
+    ) {
+      return nonNullTypes.length < typeNode.types.length ? '*float64' : 'float64';
     }
     // Non-nullable union or multi-type union → interface{}
     return 'interface{}';
@@ -20165,18 +20532,36 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       return promiseWithResolversGoType(getType(typeNode.typeArguments[0]));
     }
     // Pick<T, 'a' | 'b'> / Omit<T, 'c'> of an object type: a struct of those
-    // fields only (spreading one must not set T's other fields)
+    // fields only (spreading one must not set T's other fields).
+    // Omit over a Record-extending / index-signature interface stays an open map.
     if ((name === 'Pick' || name === 'Omit') && typeNode.typeArguments?.length === 2 && !declaredTypeAliases.has(name)) {
+      if (name === 'Omit' && hasOpenIndexSignature(typeNode.typeArguments[0])) {
+        useHelper('orderedMap');
+        return '*TnMap[string, interface{}]';
+      }
       const baseType = getType(typeNode.typeArguments[0]);
       const keys = getMappedTypeKeys(typeNode.typeArguments[1]);
       if (keys && (baseType.startsWith('*struct{') || (baseType.startsWith('*') && isObjectTypeName(baseType.slice(1))))) {
         const fields = [...objectTypeFieldMap(typeNode.typeArguments[0])].filter(([k]) => keys.includes(goFieldName(k)) === (name === 'Pick'));
         if (fields.length > 0) return `*struct{ ${fields.map(([k, t]) => `${goFieldName(k)} ${t}`).join('; ')} }`;
       }
+      // Pick<ClassName, 'a' | 'b'> accepts both class instances (whose picked
+      // members may be getters) and plain object literals with those keys.
+      if (name === 'Pick' && baseType.startsWith('*') && declaredClasses.has(baseType.slice(1))) {
+        return 'interface{}';
+      }
     }
     // Partial / Required / Readonly / Pick / Omit / NonNullable<T, ...> → T's Go type
     if (UTILITY_TYPES.has(name) && typeNode.typeArguments?.length) {
       return getType(typeNode.typeArguments[0], getArrayType);
+    }
+    // ReturnType<T>: return type of a function type (e.g. ReturnType<typeof fn>)
+    if (name === 'ReturnType' && !declaredTypeAliases.has(name) && (typeNode.typeArguments ?? []).length === 1) {
+      const fnGoType = getType(typeNode.typeArguments[0], getArrayType);
+      if (fnGoType.startsWith('func(')) {
+        return goFuncReturnType(fnGoType) || 'interface{}';
+      }
+      return 'interface{}';
     }
     // InstanceType<typeof C>: C's instances (Uint8Array: a []byte)
     if (name === 'InstanceType' && !declaredTypeAliases.has(name) && (typeNode.typeArguments ?? []).length === 1) {
@@ -20734,6 +21119,14 @@ const callHandlers: Record<string, CallHandler> = {
   },
   queueMicrotask: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('timerWait');
+    const cbType = currentCallArgTypes[0];
+    if (cbType && cbType !== 'func()') {
+      if (cbType.startsWith('func()')) {
+        return `TnQueueMicrotask(func() { (${args[0]})() })`;
+      }
+      useHelper('dynamic');
+      return `TnQueueMicrotask(func() { TnInvoke(${args[0]}, nil) })`;
+    }
     return `TnQueueMicrotask(${args[0]})`;
   },
   clearTimeout: (_caller: string, args: string[], _typeArgs: string) => {
@@ -20929,7 +21322,21 @@ const callHandlers: Record<string, CallHandler> = {
   },
   // (String(null): "null" — the literal's Go code, nil, is undefined's too)
   'String': (_caller: string, args: string[], _typeArgs: string) => currentCallArgNodes[0] && unwrapParentheses(currentCallArgNodes[0]).kind === 'NullKeyword' ? '"null"' : jsStringOf(args[0] ?? '""', currentCallArgTypes[0]),
-  'String.fromCharCode': (_caller: string, args: string[], _typeArgs: string) => `string(rune(int(${args[0] ? numericArgument(args[0], 0) : '0'})))`,
+  'String.fromCharCode': (_caller: string, args: string[], _typeArgs: string) => {
+    if (args.length === 1 && !args[0].endsWith('...')) {
+      return `string(rune(int(${numericArgument(args[0], 0)})))`;
+    }
+    if (args.length === 0) return '""';
+    if (args.length === 1 && args[0].endsWith('...')) {
+      const slice = args[0].slice(0, -3);
+      useHelper('dynamic');
+      importedPackages.add('strings');
+      return `func() string { var __sb strings.Builder; for _, __c := range ${slice} { __sb.WriteRune(rune(int(TnNumber(__c)))) }; return __sb.String() }()`;
+    }
+    importedPackages.add('strings');
+    const parts = args.map((a, i) => `__sb.WriteRune(rune(int(${numericArgument(a, i)})))`).join('; ');
+    return `func() string { var __sb strings.Builder; ${parts}; return __sb.String() }()`;
+  },
   // Symbol(description) — unique values for record keys
   Symbol: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('symbol');
@@ -21872,6 +22279,9 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     if (methodName === 'toString' && objectType === 'class') return null;
     const receiverClassName = classNameOfGoType(currentReceiverGoType ?? '');
     if (receiverClassName && findClassMethod(receiverClassName, methodName)) return null;
+    if (methodName === 'valueOf' && (currentReceiverGoType === 'float64' || objectType === 'number' || objectType === 'float64')) {
+      return (c: string) => c.substring(0, dotIndex);
+    }
     if (methodName === 'toString') {
       return (c: string, args: string[], _typeArgs: string) => {
         const obj = c.substring(0, dotIndex);
@@ -21883,11 +22293,15 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
           // bigint.toString(radix)
           if (currentReceiverGoType === '*tnbig.Int') return `${obj}.Text(int(${args[0]}))`;
           importedPackages.add('strconv');
+          if (currentCallArgTypes[0] === '*float64') {
+            useHelper('dynamic');
+            return `func() string { if ${args[0]} != nil { return strconv.FormatInt(int64(${obj}), int(*${args[0]})) }; return TnNumStr(${obj}) }()`;
+          }
           return `strconv.FormatInt(int64(${obj}), int(${args[0]}))`;
         }
         return jsStringOf(
           obj,
-          objectType === 'number' || objectType === 'float64'
+          objectType === 'number' || objectType === 'float64' || currentReceiverGoType === 'float64'
             ? 'float64'
             : currentReceiverGoType === 'interface{}' ||
                 currentReceiverGoType?.startsWith('[]') ||
@@ -23528,6 +23942,64 @@ function isDynamicGoType(goType: string | undefined): boolean {
   return goType === 'interface{}';
 }
 
+const ambientPlatformGlobals = new Set([
+  'Buffer', 'TextDecoder', 'TextEncoder', 'WebAssembly', 'atob', 'btoa',
+  'process', 'console', 'globalThis', 'global', 'URL', 'URLSearchParams',
+  'AbortController', 'AbortSignal', 'Event', 'EventTarget', 'Headers',
+  'Request', 'Response', 'fetch', 'crypto', 'performance',
+  'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+  'queueMicrotask', 'structuredClone', 'ReadableStream', 'WritableStream',
+  'TransformStream', 'Intl', 'Temporal', 'Symbol', 'Deno', 'Bun',
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+  'URIError', 'EvalError', 'AggregateError', 'Promise', 'Map', 'Set',
+  'WeakMap', 'WeakSet', 'Array', 'Object', 'Function', 'Number', 'String',
+  'Boolean', 'BigInt', 'Math', 'JSON', 'Date', 'RegExp', 'Reflect', 'Proxy',
+  'Uint8Array', 'Int8Array', 'Uint16Array', 'Int16Array', 'Uint32Array',
+  'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array',
+  'BigUint64Array', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView'
+]);
+
+const ERROR_BUILTIN_NAMES = new Set([
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+  'URIError', 'EvalError', 'AggregateError'
+]);
+const ERROR_BUILTIN_FIELDS = new Set(['name', 'message', 'stack', 'cause']);
+
+function ancestorDeclaresMember(classNode: AstNode, memberName: string): boolean {
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  const enqueueParents = (cls: AstNode): boolean => {
+    for (const clause of cls.heritageClauses ?? []) {
+      if (clause.token !== 'ExtendsKeyword') continue;
+      const expr = clause.types?.[0]?.expression;
+      if (!expr) continue;
+      const raw = isIdentifier(expr) ? expr.text : visit(expr);
+      const resolved = classAliases.get(raw) ?? raw;
+      if (ERROR_BUILTIN_NAMES.has(resolved) && ERROR_BUILTIN_FIELDS.has(memberName)) return true;
+      if (!seen.has(resolved)) {
+        seen.add(resolved);
+        queue.push(resolved);
+      }
+    }
+    return false;
+  };
+  if (enqueueParents(classNode)) return true;
+  while (queue.length > 0) {
+    const ancName = queue.pop()!;
+    const anc = declaredClasses.get(ancName);
+    if (!anc) continue;
+    for (const p of getParameterProperties(anc)) {
+      if (isIdentifier(p.name) && p.name.text === memberName) return true;
+    }
+    for (const m of anc.members ?? []) {
+      if ((m.modifiers ?? []).some((mod: AstNode) => mod.kind === 'StaticKeyword')) continue;
+      if (memberKey(m.name) === memberName) return true;
+    }
+    if (enqueueParents(anc)) return true;
+  }
+  return false;
+}
+
 // A class's name, fields, methods, accessors and static members in the
 // lookup tables (from its declaration, before or while it is emitted)
 function registerClassMembers(node: AstNode): void {
@@ -23548,7 +24020,11 @@ function registerClassMembers(node: AstNode): void {
     const memberModifiers = (member as AstNode).modifiers;
     const isStatic = memberModifiers?.some((m) => m.kind === 'StaticKeyword');
     const memberName = memberKey(member.name);
-    if (isPropertyDeclaration(member) && memberName && !hasModifier(member, 'DeclareKeyword')) {
+    const isInheritedDeclare =
+      hasModifier(member, 'DeclareKeyword') &&
+      !!memberName &&
+      ancestorDeclaresMember(node, memberName);
+    if (isPropertyDeclaration(member) && memberName && !isInheritedDeclare) {
       if (isAutoAccessor(member)) {
         const propType = getPropertyDeclarationType(member);
         if (isStatic) {
@@ -23607,7 +24083,9 @@ function registerClassMembers(node: AstNode): void {
   let parentClassName: string | null = null;
   for (const clause of node.heritageClauses ?? []) {
     if (clause.token === 'ExtendsKeyword') {
-      parentClassName = nodeParentGoName(clause.types[0].expression) || visit(clause.types[0].expression);
+      const parentExpr = clause.types[0].expression;
+      const resolvedAlias = isIdentifier(parentExpr) ? classAliases.get(parentExpr.text) : undefined;
+      parentClassName = nodeParentGoName(parentExpr) || resolvedAlias || visit(parentExpr);
     }
   }
   if (parentClassName && parentClassName !== 'Error' && !(parentClassName === 'Array' && !declaredClasses.has('Array'))) {
@@ -23727,11 +24205,114 @@ function collectClassImplementedInterfaces(): void {
 // ancestor) declares m: a method added to the prototype at run time, or a
 // member of a class TypeScript narrowed it to — called / read by name
 // (this counts in plain functions, whose this may be any instance)
+function enclosingStaticOwnerClass(node: AstNode): string | undefined {
+  let fn: AstNode | undefined = node.parent;
+  while (
+    fn &&
+    (!FUNCTION_LIKE_KINDS.has(fn.kind) || isArrowFunction(fn)) &&
+    fn.kind !== 'ClassStaticBlockDeclaration' &&
+    !(isPropertyDeclaration(fn) && hasModifier(fn, 'StaticKeyword'))
+  ) {
+    fn = fn.parent;
+  }
+  const isStaticOwner =
+    !!fn &&
+    (fn.kind === 'ClassStaticBlockDeclaration' ||
+      ((isMethodDeclaration(fn) || isGetAccessor(fn) || isSetAccessor(fn) || isPropertyDeclaration(fn)) &&
+        hasModifier(fn, 'StaticKeyword')));
+  return isStaticOwner ? getEnclosingClassName(fn!) : undefined;
+}
+
+function hasOpenIndexSignature(typeNode: AstNode | undefined, depth = 0): boolean {
+  if (!typeNode || depth > 8) return false;
+  let resolved = resolveTypeNode(typeNode) ?? typeNode;
+  if (isTypeReferenceNode(resolved) && isIdentifier(resolved.typeName)) {
+    resolved = declaredTypeAliases.get(resolved.typeName.text) ?? declaredInterfaces.get(resolved.typeName.text) ?? resolved;
+  }
+  if (resolved.kind === 'TypeLiteral' || isInterfaceDeclaration(resolved)) {
+    if ((resolved.members ?? []).some((m: AstNode) => m.kind === 'IndexSignature')) return true;
+    for (const clause of resolved.heritageClauses ?? []) {
+      for (const t of clause.types ?? []) {
+        const expr = t.expression;
+        if (isIdentifier(expr) && expr.text === 'Record') return true;
+        if (isIdentifier(expr) && declaredInterfaces.has(expr.text)) {
+          if (hasOpenIndexSignature(declaredInterfaces.get(expr.text), depth + 1)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function isNumericComputedKeyExpr(expr: AstNode | undefined): boolean {
+  if (!expr) return false;
+  if (isNumericLiteral(expr)) return true;
+  if (inferExpressionType(expr) === 'float64') return true;
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression)) {
+    let decl = declaredVariables.get(expr.expression.text);
+    if (!decl) {
+      for (const [k, v] of declaredVariables) {
+        if (originalTopNames.get(k) === expr.expression.text) {
+          decl = v;
+          break;
+        }
+      }
+    }
+    let init = decl?.initializer;
+    while (init && (init.kind === 'AsExpression' || init.kind === 'SatisfiesExpression' || isParenthesizedExpression(init))) {
+      init = init.expression;
+    }
+    if (
+      init &&
+      isCallExpression(init) &&
+      isPropertyAccessExpression(init.expression) &&
+      isIdentifier(init.expression.expression) &&
+      init.expression.expression.text === 'Object' &&
+      init.expression.name.text === 'freeze' &&
+      init.arguments?.[0]
+    ) {
+      init = init.arguments[0];
+      while (init && (init.kind === 'AsExpression' || init.kind === 'SatisfiesExpression' || isParenthesizedExpression(init))) {
+        init = init.expression;
+      }
+    }
+    if (init && isObjectLiteralExpression(init)) {
+      const prop = (init.properties ?? []).find(
+        (p: AstNode) => isPropertyAssignment(p) && isIdentifier(p.name) && p.name.text === expr.name.text
+      );
+      if (prop && isNumericLiteral(prop.initializer)) return true;
+    }
+  }
+  return false;
+}
+
+function keyofGoType(typeNode: AstNode | undefined): string {
+  if (!typeNode) return 'string';
+  let target = resolveTypeNode(typeNode) ?? typeNode;
+  if (isTypeReferenceNode(target) && isIdentifier(target.typeName)) {
+    target = declaredTypeAliases.get(target.typeName.text) ?? declaredInterfaces.get(target.typeName.text) ?? target;
+  }
+  const members: AstNode[] = target?.members ?? [];
+  if (
+    members.length > 0 &&
+    members.every(
+      (m: AstNode) =>
+        m.kind === 'PropertySignature' &&
+        m.name?.kind === 'ComputedPropertyName' &&
+        isNumericComputedKeyExpr(m.name.expression)
+    )
+  ) {
+    return 'float64';
+  }
+  return 'string';
+}
+
 function isUndeclaredClassMember(access: AstNode): boolean {
   if (!isPropertyAccessExpression(access) || access.name?.kind === 'PrivateIdentifier') return false;
   // (this.isScope() in a class whose prototype gets methods assigned —
   // Object.assign(NodePath.prototype, validators) —: called by name)
   if (access.expression.kind === 'ThisKeyword' && !plainFunctionOfThis(access.expression)) {
+    if (enclosingStaticOwnerClass(access)) return false;
     const className = getEnclosingClassName(access);
     return !!className && isCallee(access) && classNames.has(className) && !classHasMember(className, memberKey(access.name) ?? '') && !findClassMethod(className, memberKey(access.name) ?? '');
   }
@@ -23900,8 +24481,8 @@ function primitiveTypeParameterConstraint(typeNode: AstNode, name: string): stri
     const tp = (n.typeParameters ?? []).find((p: AstNode) => p.name?.text === name);
     if (!tp) continue;
     const kind = tp.constraint?.kind;
-    // (<K extends keyof T>: a property name, a string)
-    if (isKeyofConstraint(tp.constraint)) return 'string';
+    // (<K extends keyof T>: a property name, float64 if T has only numeric keys else string)
+    if (isKeyofConstraint(tp.constraint)) return keyofGoType(tp.constraint.type);
     return kind === 'BooleanKeyword' ? 'bool' : kind === 'NumberKeyword' ? 'float64' : kind === 'StringKeyword' ? 'string' : undefined;
   }
   return undefined;
@@ -24785,6 +25366,10 @@ function isVoidCall(expr: AstNode): boolean {
   // parseObjPropValue(…): void)
   const vtVoidSig = mixinVtCallSignature(expr);
   if (vtVoidSig) return !vtVoidSig.result;
+  // resolve(v) / reject(err) inside a Promise executor return nothing
+  if (isIdentifier(expr.expression) && ((promiseResolveName && expr.expression.text === promiseResolveName) || (promiseRejectName && expr.expression.text === promiseRejectName))) {
+    return true;
+  }
   // process.exit() / process.abort() return nothing (they never return)
   if (isPropertyAccessExpression(expr.expression) && isIdentifier(expr.expression.expression) && expr.expression.expression.text === 'process' &&
     !variableGoTypes.has('process') && ['exit', 'abort'].includes(expr.expression.name.text)) return true;
@@ -30759,6 +31344,17 @@ func TnGet(obj interface{}, key string) interface{} {
 		if key == "length" {
 			return float64(len(o))
 		}
+	case []byte:
+		switch key {
+		case "length", "byteLength":
+			return float64(len(o))
+		case "byteOffset":
+			return float64(0)
+		case "BYTES_PER_ELEMENT":
+			return float64(1)
+		case "buffer":
+			return o
+		}
 	case string:
 		if key == "length" {
 			return float64(tnStrCount(o))
@@ -31552,6 +32148,9 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 	if fn == nil {
 		panic(TnNodeError("TypeError", "", fmt.Sprintf("%s is not a function", name)))
 	}
+	prev := TnThis
+	TnThis = obj
+	defer func() { TnThis = prev }()
 	return TnCallValue(fn, args...)
 }
 
@@ -32340,7 +32939,12 @@ func TnIsSlice(v interface{}) bool {
 }
 
 // x.toString(radix?) on any value: a number in the radix, else its string form
+var tnBufferToStringHook func(b []byte, args ...interface{}) string
+
 func TnToStringOf(v interface{}, args ...interface{}) string {
+	if b, ok := v.([]byte); ok && tnBufferToStringHook != nil {
+		return tnBufferToStringHook(b, args...)
+	}
 	if n, ok := v.(float64); ok && len(args) > 0 {
 		if radix, ok := args[0].(float64); ok && radix != 10 && n == math.Trunc(n) && !math.IsInf(n, 0) {
 			return strconv.FormatInt(int64(n), int(radix))
@@ -32958,6 +33562,12 @@ func TnHas(obj interface{}, key interface{}) bool {
 		if rv.IsNil() {
 			return false
 		}
+		// (a class getter Get_<k>: JS 'in' checks prototype accessors too)
+		if k, ok := key.(string); ok {
+			if rv.MethodByName("Get_"+k).IsValid() || rv.MethodByName("Get_"+k+"_").IsValid() {
+				return true
+			}
+		}
 		rv = rv.Elem()
 	}
 	if rv.Kind() == reflect.Struct {
@@ -33030,7 +33640,7 @@ func tnCollectStructKeys(st reflect.Type, base uintptr, p *tnStructPlan) {
 		if strings.HasPrefix(field.Name, "__") {
 			continue
 		}
-		k := tnStructKey{key: strings.TrimSuffix(field.Name, "_"), offset: base + field.Offset}
+		k := tnStructKey{key: strings.ReplaceAll(strings.TrimSuffix(field.Name, "_"), "ǂ", "$"), offset: base + field.Offset}
 		ft := field.Type
 		k.field = (*[2]unsafe.Pointer)(unsafe.Pointer(&ft))[1]
 		if ft.Kind() == reflect.Interface {
@@ -34017,6 +34627,11 @@ func (p *tnConvPlan) convert(v interface{}) reflect.Value {
 	return p.convertTo(v, true)
 }
 
+// Active recursive struct conversions: breaks cycles when a struct's field
+// converts back to the same (src, dst) pair currently being populated
+var tnConvActive sync.Map
+var tnConvActiveCount atomic.Int32
+
 // (identity false: a copy no other conversion will look for — TnAsCopy)
 func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 	src := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
@@ -34028,6 +34643,12 @@ func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 	}
 	if p.widen && tnAllocationCovers(src, p.dst) {
 		return reflect.NewAt(p.dst, src)
+	}
+	activeKey := tnConvIdentityKey{uintptr(src), p.dst}
+	if tnConvActiveCount.Load() > 0 {
+		if prev, active := tnConvActive.Load(activeKey); active {
+			return reflect.NewAt(p.dst, prev.(unsafe.Pointer))
+		}
 	}
 	// (one object stays one object: converting it to the same type again gives
 	// the same converted object, its fields refreshed from the source — JS
@@ -34044,6 +34665,20 @@ func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 	if cached {
 		reflect.NewAt(p.dst, dst).Elem().SetZero()
 	}
+	activeTracked := false
+	trackActive := func() {
+		if !activeTracked {
+			activeTracked = true
+			tnConvActive.Store(activeKey, dst)
+			tnConvActiveCount.Add(1)
+		}
+	}
+	defer func() {
+		if activeTracked {
+			tnConvActive.Delete(activeKey)
+			tnConvActiveCount.Add(-1)
+		}
+	}()
 	for i := range p.fields {
 		f := &p.fields[i]
 		a, b := unsafe.Add(src, f.from), unsafe.Add(dst, f.to)
@@ -34074,8 +34709,11 @@ func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 			df = reflect.NewAt(df.Type(), unsafe.Pointer(df.UnsafeAddr())).Elem()
 			if sf.Type().AssignableTo(df.Type()) {
 				df.Set(sf)
-			} else if converted, cok := TnConvertDynamic(sf.Interface(), df.Type()); cok {
-				df.Set(converted)
+			} else {
+				trackActive()
+				if converted, cok := TnConvertDynamic(sf.Interface(), df.Type()); cok {
+					df.Set(converted)
+				}
 			}
 		}
 	}
@@ -34085,6 +34723,7 @@ func (p *tnConvPlan) convertTo(v interface{}, identity bool) reflect.Value {
 	if !tnExpandoTypes.has(v) {
 		return out
 	}
+	trackActive()
 	for _, ef := range p.expandos {
 		value, ok := tnExpandoGet(v, ef.name)
 		if !ok || value == nil {
@@ -34449,7 +35088,7 @@ func TnConvertDynamic(v interface{}, t reflect.Type) (reflect.Value, bool) {
 		out := reflect.New(t).Elem()
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			name := strings.TrimSuffix(field.Name, "_")
+			name := strings.ReplaceAll(strings.TrimSuffix(field.Name, "_"), "ǂ", "$")
 			value, present := m[name]
 			if !present {
 				continue
@@ -38900,7 +39539,7 @@ func tnOwnProps(src interface{}) []tnProp {
 					continue
 				}
 			}
-			out = append(out, tnProp{strings.TrimSuffix(t.Field(i).Name, "_"), f.Interface()})
+			out = append(out, tnProp{strings.ReplaceAll(strings.TrimSuffix(t.Field(i).Name, "_"), "ǂ", "$"), f.Interface()})
 		}
 	}
 	if !rv.CanAddr() {
@@ -39112,14 +39751,15 @@ func tnAssignInto(dst *TnMap[string, interface{}], src interface{}) {
 			if rv.Field(i).Kind() == reflect.Func || (len(name) > 1 && name[0] == '_' && name[1] == '_') {
 				continue
 			}
+			jsName := strings.ReplaceAll(strings.TrimSuffix(name, "_"), "ǂ", "$")
 			if !rv.Field(i).CanInterface() {
 				if !rv.Field(i).CanAddr() {
 					continue
 				}
-				dst.Set(rt.Field(i).Name, reflect.NewAt(rv.Field(i).Type(), unsafe.Pointer(rv.Field(i).UnsafeAddr())).Elem().Interface())
+				dst.Set(jsName, reflect.NewAt(rv.Field(i).Type(), unsafe.Pointer(rv.Field(i).UnsafeAddr())).Elem().Interface())
 				continue
 			}
-			dst.Set(rt.Field(i).Name, rv.Field(i).Interface())
+			dst.Set(jsName, rv.Field(i).Interface())
 		}
 	}
 }`,
@@ -39790,11 +40430,17 @@ func (s *TnSymbol) String() string { return "Symbol(" + s.description + ")" }
 // Marks symbol values for typeof (TnTypeOf), which is emitted without this helper
 func (s *TnSymbol) TnSymbolValue() {}
 
-// Symbol.hasInstance (x instanceof C asks C, when C defines it)
+// Well-known symbols
 var TnSymbolHasInstance = &TnSymbol{description: "Symbol.hasInstance"}
-
-// Symbol.metadata (class decorator metadata key)
 var TnSymbolMetadata = &TnSymbol{description: "Symbol.metadata"}
+var TnSymbolToStringTag = &TnSymbol{description: "Symbol.toStringTag"}
+var TnSymbolIterator = &TnSymbol{description: "Symbol.iterator"}
+var TnSymbolAsyncIterator = &TnSymbol{description: "Symbol.asyncIterator"}
+var TnSymbolDispose = &TnSymbol{description: "Symbol.dispose"}
+var TnSymbolAsyncDispose = &TnSymbol{description: "Symbol.asyncDispose"}
+var TnSymbolToPrimitive = &TnSymbol{description: "Symbol.toPrimitive"}
+var TnSymbolSpecies = &TnSymbol{description: "Symbol.species"}
+var TnSymbolIsConcatSpreadable = &TnSymbol{description: "Symbol.isConcatSpreadable"}
 
 // Symbol.for(key) / Symbol.keyFor(sym): the global symbol registry
 var tnSymbolRegistry = map[string]*TnSymbol{}
@@ -40036,16 +40682,21 @@ func (t *TnInterval) start(stop chan struct{}) {
 	}()
 }
 
-func TnClearInterval(t *TnInterval) {
-	if t != nil {
-		t.once.Do(func() {
-			atomic.StoreInt32(&t.stopped, 1)
-			close(t.stop)
-			if t.refd {
-				t.refd = false
-				__tnTimers.Done()
-			}
-		})
+func TnClearInterval(v interface{}) {
+	switch t := v.(type) {
+	case *TnInterval:
+		if t != nil {
+			t.once.Do(func() {
+				atomic.StoreInt32(&t.stopped, 1)
+				close(t.stop)
+				if t.refd {
+					t.refd = false
+					__tnTimers.Done()
+				}
+			})
+		}
+	case *TnTimeout:
+		TnClearTimeout(t)
 	}
 }
 
@@ -40081,17 +40732,22 @@ func (t *TnInterval) close() *TnInterval {
 	return t
 }
 
-func TnClearTimeout(t *TnTimeout) {
-	if t != nil && t.active {
-		t.active = false
-		delete(__tnPendingTimers, t)
-		if t.timer != nil {
-			t.timer.Stop()
+func TnClearTimeout(v interface{}) {
+	switch t := v.(type) {
+	case *TnTimeout:
+		if t != nil && t.active {
+			t.active = false
+			delete(__tnPendingTimers, t)
+			if t.timer != nil {
+				t.timer.Stop()
+			}
+			if t.refd {
+				t.refd = false
+				__tnTimers.Done()
+			}
 		}
-		if t.refd {
-			t.refd = false
-			__tnTimers.Done()
-		}
+	case *TnInterval:
+		TnClearInterval(t)
 	}
 }`,
   clock: `// The current time; node:test mock timers can replace it (Date.now / new Date())
@@ -41707,6 +42363,102 @@ func TnPromiseThen[T, U any](p chan T, fn func(T) U) chan U {
 	return out
 }
 
+func TnPromiseThenVoid2[T any, E any](p chan T, onFulfilled func(T), onRejected func(E)) {
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-p:
+		if ok && cap(p) == 1 {
+			tnReputLocked(p, v)
+		}
+		tnWakeMu.Unlock()
+		val, reason, rejected := tnSettled(p, v, ok)
+		__tnWaitGroup.Add(1)
+		TnQueueMicrotask(func() {
+			defer __tnWaitGroup.Done()
+			if rejected {
+				e, _ := reason.(E)
+				onRejected(e)
+				return
+			}
+			onFulfilled(val)
+		})
+		return
+	default:
+		tnWakeMu.Unlock()
+	}
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		received, ok := TnLoopReceive(p)
+		val, reason, rejected := tnSettled(p, received, ok)
+		if rejected {
+			e, _ := reason.(E)
+			onRejected(e)
+			return
+		}
+		onFulfilled(val)
+	})
+}
+
+func TnPromiseThen2[T, U, E any](p chan T, onFulfilled func(T) U, onRejected func(E) U) chan U {
+	out := make(chan U, 1)
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-p:
+		if ok && cap(p) == 1 {
+			tnReputLocked(p, v)
+		}
+		tnWakeMu.Unlock()
+		val, reason, rejected := tnSettled(p, v, ok)
+		__tnWaitGroup.Add(1)
+		TnQueueMicrotask(func() {
+			defer __tnWaitGroup.Done()
+			sent := false
+			defer func() {
+				if !sent {
+					TnAsyncClose(out)
+				}
+			}()
+			defer TnRejectOnPanic(out)
+			var res U
+			if rejected {
+				e, _ := reason.(E)
+				res = onRejected(e)
+			} else {
+				res = onFulfilled(val)
+			}
+			TnAsyncSend(out, res)
+			sent = true
+		})
+		return out
+	default:
+		tnWakeMu.Unlock()
+	}
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
+		defer TnRejectOnPanic(out)
+		received, ok := TnLoopReceive(p)
+		val, reason, rejected := tnSettled(p, received, ok)
+		var res U
+		if rejected {
+			e, _ := reason.(E)
+			res = onRejected(e)
+		} else {
+			res = onFulfilled(val)
+		}
+		TnAsyncSend(out, res)
+		sent = true
+	})
+	return out
+}
+
 func TnPromiseReject[T any](reason interface{}) chan T {
 	ch := make(chan T)
 	TnReject(ch, reason)
@@ -41742,6 +42494,19 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 // interface{} returned as Promise<T>): settles with the value converted
 func TnPromiseAs[T any](p chan interface{}, convert func(interface{}) T) chan T {
 	out := make(chan T, 1)
+	go func() {
+		v, reason, rejected := tnSettle(p)
+		if rejected {
+			TnReject(out, reason)
+			return
+		}
+		TnAsyncSend(out, convert(v))
+	}()
+	return out
+}
+
+func TnPromiseConvert[T, U any](p chan T, convert func(T) U) chan U {
+	out := make(chan U, 1)
 	go func() {
 		v, reason, rejected := tnSettle(p)
 		if rejected {
@@ -41875,6 +42640,42 @@ func TnPromiseAny[T any](chs []chan T) chan T {
 	return out
 }`,
   promiseAll: `// Promise.all over values of any kind: promises awaited, others kept
+func TnPromiseRaceValues(values []interface{}) chan interface{} {
+	out := make(chan interface{}, 1)
+	var once sync.Once
+	for _, v := range values {
+		go func(v interface{}) {
+			if ch, ok := v.(chan interface{}); ok {
+				r, reason, rejected := tnSettle(ch)
+				once.Do(func() {
+					if rejected {
+						TnReject(out, reason)
+						return
+					}
+					TnAsyncSend(out, r)
+				})
+			} else if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Chan {
+				r, ok := rv.Recv()
+				if !ok {
+					if val, resolved := tnResolved.Load(rv.Interface()); resolved {
+						once.Do(func() { TnAsyncSend(out, val) })
+					} else if reason, rejected := tnRejections.Load(rv.Interface()); rejected {
+						once.Do(func() { TnReject(out, reason) })
+					} else {
+						once.Do(func() { TnAsyncSend(out, interface{}(nil)) })
+					}
+				} else {
+					tnReputReflect(rv, r)
+					once.Do(func() { TnAsyncSend(out, r.Interface()) })
+				}
+			} else {
+				once.Do(func() { TnAsyncSend(out, v) })
+			}
+		}(v)
+	}
+	return out
+}
+
 func TnPromiseAllValues(values []interface{}) chan []interface{} {
 	out := make(chan []interface{}, 1)
 	go func() {
