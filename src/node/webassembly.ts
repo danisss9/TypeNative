@@ -446,7 +446,12 @@ func tnWasmExportFunc(fn wazeroapi.Function) func(args ...interface{}) interface
 		size = len(results)
 	}
 	return func(args ...interface{}) interface{} {
-		stack := make([]uint64, size)
+		// (a stack array for the common small arities: no allocation per call)
+		var stackArr [8]uint64
+		stack := stackArr[:size]
+		if size > len(stackArr) {
+			stack = make([]uint64, size)
+		}
 		for i, t := range params {
 			var a interface{}
 			if i < len(args) {

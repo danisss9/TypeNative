@@ -621,7 +621,14 @@ func (d *TnDataView) Get_byteLength() float64 {
 }
 
 func (d *TnDataView) at(method string, offset float64, size int) []byte {
-	d.check("DataView.prototype." + method)
+	// (inlined check: the method name is only needed on the panic path, so
+	// the common case does not build the string)
+	if d.gen != tnABGen.Load() {
+		d.resync()
+	}
+	if d.oob {
+		panic(tnABOutOfBounds("DataView.prototype." + method))
+	}
 	if !(offset >= 0) || offset != math.Trunc(offset) || int(offset)+size > len(d.view) {
 		panic(tnTypedRangeError("Offset is outside the bounds of the DataView"))
 	}

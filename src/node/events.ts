@@ -15,7 +15,9 @@ type tnEmitterState struct {
 	order             []string
 	maxListeners      float64
 	warned            map[string]bool
-	mu                sync.Mutex
+	// (listener lists are copy-on-write, so emit reads under a read lock;
+	// only a once-listener's removal takes the write lock)
+	mu                sync.RWMutex
 	captureRejections bool
 }
 
@@ -280,20 +282,15 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 		return true
 	}
 	s := e.st()
-	s.mu.Lock()
 	// (listener lists are copy-on-write — adds append past this length, removals
-	// build a new slice — so the list as it is now is the emit's snapshot)
+	// build a new slice — so the list as it is now is the emit's snapshot; a
+	// read lock is enough unless a once listener must be removed)
+	s.mu.RLock()
 	list := s.events[event]
-	// once listeners are removed before they run
-	for i, l := range list {
+	hasOnce := false
+	for _, l := range list {
 		if l.once {
-			kept := append([]*tnListener{}, list[:i]...)
-			for _, rest := range list[i+1:] {
-				if !rest.once {
-					kept = append(kept, rest)
-				}
-			}
-			e.setListeners(event, kept)
+			hasOnce = true
 			break
 		}
 	}
@@ -302,7 +299,25 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 		monitors = s.events[TnErrorMonitor]
 	}
 	capture := s.captureRejections
-	s.mu.Unlock()
+	s.mu.RUnlock()
+	if hasOnce {
+		s.mu.Lock()
+		list = s.events[event]
+		// once listeners are removed before they run
+		for i, l := range list {
+			if l.once {
+				kept := append([]*tnListener{}, list[:i]...)
+				for _, rest := range list[i+1:] {
+					if !rest.once {
+						kept = append(kept, rest)
+					}
+				}
+				e.setListeners(event, kept)
+				break
+			}
+		}
+		s.mu.Unlock()
+	}
 	for _, l := range monitors {
 		TnInvoke(l.fn, args...)
 	}

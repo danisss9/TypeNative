@@ -3704,6 +3704,8 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   dynamicMethodCalls.clear();
   dynamicSeqCalls.clear();
   typedDispatchers.clear();
+  typedAccessors.clear();
+  typedAccessorCache.clear();
   hierarchySignatureCache.clear();
   adapterOptionalMethods.clear();
   methodPresenceChecks.clear();
@@ -3805,7 +3807,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   const emitted = stripEmbedDirectives(stripGoStrings(`${mainCode}\n${outsideCode}\n${packageVariables.join('\n')}`));
   const coverageCode = coverageFiles.length > 0 ? `\n\n${coverageTables()}` : '';
   // (generated before the helpers: they may use more of them)
-  const dispatchCode = dynamicMethodCalls.size > 0 ? `\n\n${emitDynamicDispatchers()}` : '';
+  const dispatchCode = dynamicMethodCalls.size > 0 || typedAccessors.size > 0 ? `\n\n${emitDynamicDispatchers()}${emitTypedAccessors()}` : '';
   const classCode = (classValuesUsed ? `\n\n${emitClassDescriptors()}` : '') + `\n\n${emitToJSONWrappers()}` + emitMixinSupport();
   let helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
   // Object literal allocations: TnLit where the struct may be a strict prefix
@@ -4613,6 +4615,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     if (hasDynamicProperties(node.expression) && !isCallee(node) && !isProcessEnv(node.expression)) {
       useHelper('dynamic');
+      // (a getter the receiver's declared class has: a direct call through a
+      // typed dispatcher, as when the receiver itself is typed — c.value on a
+      // Counter-typed c reads c.Get_value())
+      if (isIdentifier(node.name) && !isAssignmentTarget(node) && !hasQuestionDot(node)) {
+        const prop = memberKey(node.name) ?? node.name.text;
+        const acc = typedAccessorFor(node.expression, prop, 'get');
+        if (acc) {
+          typedAccessors.set(`get:${acc.name}`, { prop: acc.prop, kind: 'get', goType: acc.goType, classes: acc.classes });
+          return `TnAccGet_${acc.name}(${visit(node.expression)})`;
+        }
+      }
       return `TnGetRef(${visit(node.expression)}, "${node.name.text}")`;
     }
     // Error.stackTraceLimit / Error.prepareStackTrace (V8's): properties of
@@ -5172,6 +5185,17 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (node.type && !isInferredAny) variableTypeNodes.set(node.name.text, node.type);
       else if (!node.type && assertedObjectTypeNode(node.initializer)) variableTypeNodes.set(node.name.text, assertedObjectTypeNode(node.initializer)!);
       else variableTypeNodes.delete(node.name.text);
+      // (an unannotated variable whose initializer's type names a class or an
+      // interface — const c = counters[i] with counters: Counter[] — keeps
+      // that name, so member calls on it can dispatch on the class)
+      if (!node.type && !variableClassNames.has(node.name.text) && node.initializer) {
+        const initTypeNode = getExpressionTypeNode(node.initializer);
+        const initName =
+          initTypeNode && isTypeReferenceNode(initTypeNode) && isIdentifier(initTypeNode.typeName) && !(initTypeNode.typeArguments ?? []).length
+            ? initTypeNode.typeName.text
+            : undefined;
+        if (initName && (declaredClasses.has(initName) || declaredInterfaces.has(initName))) variableClassNames.set(node.name.text, initName);
+      }
       if (node.initializer && isArrayBufferExpression(node.initializer)) arrayBufferVariables.add(node.name.text);
       else arrayBufferVariables.delete(node.name.text);
       if (node.initializer && isGoRefCall(node.initializer)) goRefVariables.add(node.name.text);
@@ -6358,6 +6382,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     if (op === '=' && isPropertyAccessExpression(node.left) && isDynamicValue(node.left.expression)) {
       useHelper('dynamic');
+      // (a setter the receiver's declared class has: a direct call through a
+      // typed dispatcher — c.value = v on a Counter-typed c calls c.Set_value(v))
+      if (isIdentifier(node.left.name) && !hasQuestionDot(node.left)) {
+        const prop = memberKey(node.left.name) ?? node.left.name.text;
+        const acc = typedAccessorFor(node.left.expression, prop, 'set');
+        if (acc) {
+          typedAccessors.set(`set:${acc.name}`, { prop: acc.prop, kind: 'set', goType: acc.goType, classes: acc.classes });
+          return `TnAccSet_${acc.name}(${visit(node.left.expression)}, ${toGoValueOfType(node.right, acc.goType)})`;
+        }
+      }
       return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'interface{}')})`;
     }
     // record.key = v on a Record (an ordered map): a key write
@@ -8106,6 +8140,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // { ...base, x: 1, ...more } → a fresh object of the type, each source's
     // properties copied in order (unset fields of a typed source are absent)
     if ((node.properties ?? []).some((p) => p.kind === 'SpreadAssignment')) {
+      // ({ ...base, x: 1 } of a known struct type: a direct field copy, no
+      // dynamic map per evaluation)
+      const statically = staticSpreadLiteral(node, typeName);
+      if (statically) return statically;
       useHelper('objectAssignTo');
       const sources: string[] = [];
       let run: AstNode[] = [];
@@ -11467,6 +11505,102 @@ function emitTypedDispatchers(): string {
 
 function dispatcherSuffix(method: string): string {
   return method.replace(/[^A-Za-z0-9_]/g, '_');
+}
+
+// Typed accessor dispatchers: c.prop on a dynamic receiver whose declared type
+// is a class C whose hierarchy declares prop as an accessor (never a field or
+// method): TnAccGet_C_prop(recv) / TnAccSet_C_prop(recv, v) switch on the
+// receiver's class and call its Get_prop / Set_prop directly, without boxing
+// the value or going through reflection.
+type TypedAccessor = { prop: string; kind: 'get' | 'set'; goType: string; classes: string[] };
+const typedAccessors = new Map<string, TypedAccessor>();
+const typedAccessorCache = new Map<string, { name: string; typeName: string; prop: string; goType: string; classes: string[] } | undefined>();
+
+// The typed accessor dispatcher a property read/write on a dynamic receiver
+// goes through, when the receiver's declared class has one for the property
+function typedAccessorFor(receiver: AstNode, prop: string, kind: 'get' | 'set'): { name: string; typeName: string; prop: string; goType: string; classes: string[] } | undefined {
+  const typeName = staticReceiverTypeName(receiver);
+  if (!typeName) return undefined;
+  const cacheKey = `${kind}:${typeName}.${prop}`;
+  if (typedAccessorCache.has(cacheKey)) return typedAccessorCache.get(cacheKey);
+  const result = typedAccessorForUncached(typeName, prop, kind);
+  typedAccessorCache.set(cacheKey, result);
+  return result;
+}
+
+function typedAccessorForUncached(typeName: string, prop: string, kind: 'get' | 'set'): { name: string; typeName: string; prop: string; goType: string; classes: string[] } | undefined {
+  if (!declaredClasses.has(typeName)) return undefined;
+  const cls = declaredClasses.get(typeName);
+  if (cls && (cls.typeParameters ?? []).length) return undefined;
+  const declared = classMember(typeName, kind, prop);
+  if (!declared || !declared.body) return undefined;
+  let goType: string | undefined;
+  if (kind === 'get') {
+    if (!declared.type) return undefined;
+    goType = getType(declared.type);
+  } else {
+    const p = (declared.parameters ?? [])[0];
+    if (!p || !isIdentifier(p.name) || !p.type || p.dotDotDotToken || p.initializer) return undefined;
+    goType = getType(p.type);
+  }
+  if (!goType || !isTypedDispatchType(goType)) return undefined;
+  const classes = dispatchHierarchy(typeName);
+  const sigClasses: string[] = [];
+  for (const className of classes) {
+    const c = declaredClasses.get(className);
+    if (!c || (c.typeParameters ?? []).length) return undefined;
+    if (mixinBaseOf.has(className)) return undefined;
+    for (const m of c.members ?? []) {
+      if (memberKey(m.name) !== prop) continue;
+      // (a field or method of the same name shadows the accessor on this class)
+      if (isPropertyDeclaration(m) || isMethodDeclaration(m)) return undefined;
+    }
+    // (an own accessor override must declare the same Go type)
+    const own = (c.members ?? []).find((m: AstNode) => (kind === 'get' ? isGetAccessor(m) : isSetAccessor(m)) && memberKey(m.name) === prop && !!m.body);
+    if (own) {
+      let ownType: string | undefined;
+      if (kind === 'get') {
+        if (!own.type) return undefined;
+        ownType = getType(own.type);
+      } else {
+        const p = (own.parameters ?? [])[0];
+        if (!p || !p.type) return undefined;
+        ownType = getType(p.type);
+      }
+      if (ownType !== goType) return undefined;
+    }
+    sigClasses.push(className);
+  }
+  if (sigClasses.length === 0) return undefined;
+  return { name: `${dispatcherSuffix(typeName)}_${dispatcherSuffix(prop)}`, typeName, prop, goType, classes: sigClasses };
+}
+
+// The TnAccGet_C_prop / TnAccSet_C_prop dispatchers (see typedAccessorFor)
+function emitTypedAccessors(): string {
+  const out: string[] = [];
+  for (const [key, a] of [...typedAccessors].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))) {
+    const name = key.slice(key.indexOf(':') + 1);
+    const propLit = toGoStringLiteral(a.prop);
+    const goName = kindAccessorGoName(a.kind, a.prop);
+    const cases = a.classes
+      .map((c) => {
+        const safe = getSafeName(c);
+        return a.kind === 'get' ? `\tcase *${safe}:\n\t\treturn o.${goName}()` : `\tcase *${safe}:\n\t\to.${goName}(__v)\n\t\treturn`;
+      })
+      .join('\n');
+    if (a.kind === 'get') {
+      const fallback = a.goType === 'interface{}' ? `TnGetRef(__recv, ${propLit})` : `TnAs[${a.goType}](TnGetRef(__recv, ${propLit}))`;
+      out.push(`func TnAccGet_${name}(__recv interface{}) ${a.goType} {\n\tswitch o := __recv.(type) {\n${cases}\n\t}\n\treturn ${fallback}\n}`);
+    } else {
+      out.push(`func TnAccSet_${name}(__recv interface{}, __v ${a.goType}) {\n\tswitch o := __recv.(type) {\n${cases}\n\t}\n\tTnSet(__recv, ${propLit}, __v)\n}`);
+    }
+  }
+  return out.length > 0 ? `\n\n${out.join('\n\n')}` : '';
+}
+
+// get x() → Get_x, set x(v) → Set_x (as the class emitter names them)
+function kindAccessorGoName(kind: 'get' | 'set', prop: string): string {
+  return `${kind === 'get' ? 'Get' : 'Set'}_${goFieldName(prop)}`;
 }
 
 // A parameter's value from a dispatcher's argument list
@@ -17385,6 +17519,60 @@ function staticObjectAssign(call: AstNode, targetType: string, argCodes: string[
     steps.push(`${sourceTemp} := ${argCodes[i]}; _ = ${sourceTemp}; if ${sourceTemp} != nil { ${assignments.join('; ')} }`);
   }
   return `func() ${targetType} { ${targetTemp} := &${target}{${parts.join(', ')}}; ${steps.join('; ')}; return ${targetTemp} }()`;
+}
+
+// { ...base, x: 1 } where the literal's type is a known struct: the fields
+// copied directly, in order, instead of a dynamic map + TnAssignTo per
+// evaluation. Bails (undefined) on anything the dynamic path would do
+// differently: accessors on the class, sources that aren't known structs,
+// computed or non-simple properties.
+function staticSpreadLiteral(node: AstNode, typeName: string): string | undefined {
+  if (typeName.startsWith('*TnMap[') || typeName === 'interface{}' || typeName === '') return undefined;
+  const target = typeName.replace(/^\*/, '').replace(/\[.*\]$/, '');
+  const targetFields = goStructFields(target);
+  if (!targetFields) return undefined;
+  // (an accessor's writes go through its setter: keep those on the dynamic path)
+  for (let cls: string | undefined = target; cls; cls = classParentNames.get(cls)) {
+    const decl = declaredClasses.get(cls);
+    if (!decl) break;
+    if ((decl.members ?? []).some((m: AstNode) => isGetAccessor(m) || isSetAccessor(m))) return undefined;
+  }
+  const fields = new Map(targetFields);
+  const temp = getTempName('spr');
+  const steps: string[] = [];
+  let sawSpread = false;
+  for (const p of node.properties ?? []) {
+    if (p.kind === 'SpreadAssignment') {
+      sawSpread = true;
+      const srcNode = unwrapParentheses(p.expression);
+      if (isObjectLiteralExpression(srcNode) || isObjectCreateNull(srcNode)) return undefined;
+      const srcType = inferExpressionType(srcNode) ?? '';
+      if (!srcType.startsWith('*') || srcType.startsWith('*TnMap[')) return undefined;
+      const srcFields = goStructFields(srcType.slice(1).replace(/\[.*\]$/, ''));
+      if (!srcFields) return undefined;
+      const srcTemp = getTempName('src');
+      const assigns: string[] = [];
+      for (const [name, from] of srcFields) {
+        if (name === '__keys') continue;
+        const to = fields.get(name);
+        if (to === undefined) continue;
+        const read = `${srcTemp}.${name}`;
+        const write = from === to ? read : convertBetweenGoTypes(read, from, to);
+        assigns.push(isNilableGoType(from) ? `if ${read} != nil { ${temp}.${name} = ${write} }` : `${temp}.${name} = ${write}`);
+      }
+      steps.push(`${srcTemp} := ${visit(srcNode)}; _ = ${srcTemp}; if ${srcTemp} != nil { ${assigns.join('; ')} }`);
+    } else if ((isPropertyAssignment(p) || isShorthandPropertyAssignment(p)) && isIdentifier(p.name)) {
+      const field = goFieldName(p.name.text);
+      const fieldType = fields.get(field);
+      if (fieldType === undefined) return undefined;
+      const value = isPropertyAssignment(p) ? p.initializer : p.name;
+      steps.push(`${temp}.${field} = ${toGoValueOfType(value, fieldType)}`);
+    } else {
+      return undefined;
+    }
+  }
+  if (!sawSpread) return undefined;
+  return `func() *${target} { ${temp} := &${target}{}; ${steps.join('; ')}; return ${temp} }()`;
 }
 
 // A fresh empty value of a pointer Go type (&S{}, an empty Map)
@@ -27248,7 +27436,7 @@ const helperPackages: Record<string, string[]> = {
   jsonTyped: ['reflect', 'strings', 'strconv', 'sync', 'unsafe', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
   objectAssignTo: ['reflect', 'unsafe', 'sort', 'fmt', 'strings'],
-  typeOf: ['reflect'],
+  typeOf: ['reflect', 'math/big'],
   isArray: ['reflect'],
   iterators: [],
   weakRefs: ['weak', 'runtime', 'sync'],
@@ -27725,7 +27913,7 @@ func TnGenDelegate[T any, S any](outerCh chan T, innerCh chan S, convert func(S)
 
 // Iterator.concat(a, b, …): each iterable's values in turn
 func TnIterConcat[T any](chs ...chan T) chan T {
-	ch := make(chan T)
+	ch := make(chan T, 64)
 	go func() {
 		defer close(ch)
 		for _, src := range chs {
@@ -27743,7 +27931,7 @@ func TnIterConcat[T any](chs ...chan T) chan T {
 
 // Iterator.from(array)
 func TnIterFrom[T any](values []T) chan T {
-	ch := make(chan T)
+	ch := make(chan T, min(len(values), 1024))
 	go func() {
 		defer close(ch)
 		for _, v := range values {
@@ -27754,7 +27942,7 @@ func TnIterFrom[T any](values []T) chan T {
 }
 
 func TnIterMap[T, U any](ch chan T, fn func(T, float64) U) chan U {
-	out := make(chan U)
+	out := make(chan U, 64)
 	go func() {
 		defer close(out)
 		i := 0.0
@@ -27771,7 +27959,7 @@ func TnIterMap[T, U any](ch chan T, fn func(T, float64) U) chan U {
 }
 
 func TnIterFilter[T any](ch chan T, fn func(T, float64) bool) chan T {
-	out := make(chan T)
+	out := make(chan T, 64)
 	go func() {
 		defer close(out)
 		i := 0.0
@@ -27790,7 +27978,7 @@ func TnIterFilter[T any](ch chan T, fn func(T, float64) bool) chan T {
 }
 
 func TnIterFlatMap[T, U any](ch chan T, fn func(T, float64) []U) chan U {
-	out := make(chan U)
+	out := make(chan U, 64)
 	go func() {
 		defer close(out)
 		i := 0.0
@@ -27809,7 +27997,7 @@ func TnIterFlatMap[T, U any](ch chan T, fn func(T, float64) []U) chan U {
 }
 
 func TnIterTake[T any](ch chan T, n float64) chan T {
-	out := make(chan T)
+	out := make(chan T, 64)
 	go func() {
 		defer close(out)
 		if n <= 0 {
@@ -27832,7 +28020,7 @@ func TnIterTake[T any](ch chan T, n float64) chan T {
 }
 
 func TnIterDrop[T any](ch chan T, n float64) chan T {
-	out := make(chan T)
+	out := make(chan T, 64)
 	go func() {
 		defer close(out)
 		count := 0.0
@@ -28695,6 +28883,29 @@ func TnGetRef(obj interface{}, key string) interface{} {
 			obj = origin
 		}
 	}
+	// (a record held as any — a TnMap: its own lookup answers, no reflection;
+	// its accessors live in the map itself, so only a defineProperty accessor
+	// beside it — impossible for a TnMap — could shadow)
+	if m, ok := obj.(interface {
+		TnProp(string) (interface{}, bool)
+		TnSetProp(string, interface{}) bool
+	}); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+		if v, present := m.TnProp(key); present {
+			// (an array entry read as a reference: boxed, and the box stored
+			// back — every binding of the value shares the array, as JS arrays do)
+			if box, boxed := tnBoxSliceRef(v); boxed {
+				m.TnSetProp(key, box)
+				return box
+			}
+			return v
+		}
+		// (a missing data key is undefined — except the collection
+		// pseudo-properties, which TnGet answers)
+		if key != "length" && key != "size" {
+			return nil
+		}
+		return TnGet(obj, key)
+	}
 	// (an accessor shadows the property: reads go through it, see TnGet —
 	// only objects of a type that ever had one can)
 	if obj != nil && tnAnyAccessors.Load() && tnAccessorTypes.has(obj) {
@@ -28722,6 +28933,23 @@ func TnGetRef(obj interface{}, key string) interface{} {
 func TnGetPeek(obj interface{}, key string) interface{} {
 	if o, ok := obj.(map[string]interface{}); ok {
 		return o[key]
+	}
+	// (a record held as any — a TnMap: its own lookup answers, no reflection)
+	if m, ok := obj.(interface {
+		TnProp(string) (interface{}, bool)
+		TnSetProp(string, interface{}) bool
+	}); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+		if v, present := m.TnProp(key); present {
+			if box, boxed := tnBoxSliceRef(v); boxed {
+				m.TnSetProp(key, box)
+				return box
+			}
+			return v
+		}
+		if key != "length" && key != "size" {
+			return nil
+		}
+		return TnGet(obj, key)
 	}
 	if obj != nil {
 		if p := tnPlanOf(obj, key); p.kind != tnFieldSlow && !p.own {
@@ -29899,8 +30127,15 @@ func TnCallMember(obj interface{}, name string, args ...interface{}) interface{}
 		// (a plain object's own function property named add / get / set …:
 		// a WebAssembly instance's exports, a record of callbacks)
 		if kind.TnJSKind() == 0 {
-			if fn := TnGet(obj, name); fn != nil && reflect.ValueOf(fn).Kind() == reflect.Func {
-				return TnCallValue(fn, args...)
+			if fn := TnGet(obj, name); fn != nil {
+				// (a WebAssembly export's variadic function, called directly:
+				// no reflection, no TnCallValue type switch per call)
+				if f, ok := fn.(func(...interface{}) interface{}); ok {
+					return f(args...)
+				}
+				if reflect.ValueOf(fn).Kind() == reflect.Func {
+					return TnCallValue(fn, args...)
+				}
 			}
 		}
 		if v, handled := tnCallCollection(obj, kind.TnJSKind() == 2, name, args); handled {
@@ -30390,6 +30625,13 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		o[key] = tnBoxArray(value)
 		return
 	}
+	// (a record held as any — a TnMap: its key, stored without reflection
+	// (its accessors live in the map itself, so only a defineProperty
+	// accessor beside it — impossible for a TnMap — could shadow)
+	if r, ok := obj.(interface{ TnSetProp(string, interface{}) bool }); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) && r.TnSetProp(key, value) {
+		tnExpandoDelete(obj, key)
+		return
+	}
 	// (an error's own property: error.missingPlugins = …, read back by prop)
 	if e, ok := obj.(*TnError); ok && e != nil && key != "message" && key != "stack" {
 		if e.props == nil {
@@ -30409,12 +30651,6 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		if acc.set != nil {
 			acc.set(value)
 		}
-		return
-	}
-	// (a record — a TnMap held as any, such as a {} literal: its key, as
-	// tnSetMember's Set call stores it, without reflection)
-	if r, ok := obj.(interface{ TnSetProp(string, interface{}) bool }); ok && r.TnSetProp(key, value) {
-		tnExpandoDelete(obj, key)
 		return
 	}
 	if obj != nil {
@@ -31470,17 +31706,152 @@ func TnHas(obj interface{}, key interface{}) bool {
 // An object's own enumerable properties, for structs (object literals, typed
 // objects, class instances): the data fields in declaration order, without
 // #private fields, embedded types and unset optional primitives
+// The static property list of a struct type, found once per type: Object.keys /
+// values / entries on a class instance read through it instead of reflection
+// on every call
+type tnStructKey struct {
+	key     string
+	offset  uintptr
+	field   unsafe.Pointer // the field's type (what an interface box holds)
+	rt      reflect.Type   // set for a non-empty interface field: read through it
+	unwrap  uint8          // an optional primitive pointer: 1 string, 2 float64, 3 bool
+	skipNil bool           // an optional field: absent while unset
+	iface   bool           // an interface field: its nil test reads the type word
+	ifaceAll bool          // the field's type is exactly interface{}
+	ref     bool           // a reference-kind field (ptr, map, chan, func): the box's data word is the value itself
+}
+
+type tnStructPlan struct {
+	keys    []tnStructKey
+	hasKeys bool // a __keys field: the literal's creation-order key list
+}
+
+var tnStructPlans sync.Map // reflect.Type → *tnStructPlan
+
+func tnStructPlanOf(st reflect.Type) *tnStructPlan {
+	if p, ok := tnStructPlans.Load(st); ok {
+		return p.(*tnStructPlan)
+	}
+	p := &tnStructPlan{}
+	tnCollectStructKeys(st, 0, p)
+	if _, ok := st.FieldByName("__keys"); ok {
+		p.hasKeys = true
+	}
+	tnStructPlans.Store(st, p)
+	return p
+}
+
+func tnCollectStructKeys(st reflect.Type, base uintptr, p *tnStructPlan) {
+	for i := 0; i < st.NumField(); i++ {
+		field := st.Field(i)
+		// a parent class's fields come first (TypeNative's own runtime types
+		// embedded by Node subclasses are not properties)
+		if field.Anonymous {
+			if field.Type.Kind() == reflect.Struct && !strings.HasPrefix(field.Type.Name(), "Tn") {
+				tnCollectStructKeys(field.Type, base+field.Offset, p)
+			}
+			continue
+		}
+		if strings.HasPrefix(field.Name, "__") {
+			continue
+		}
+		k := tnStructKey{key: strings.TrimSuffix(field.Name, "_"), offset: base + field.Offset}
+		ft := field.Type
+		k.field = (*[2]unsafe.Pointer)(unsafe.Pointer(&ft))[1]
+		if ft.Kind() == reflect.Interface {
+			if ft.NumMethod() == 0 {
+				k.ifaceAll = true
+			} else {
+				k.rt = ft
+			}
+			k.iface = true
+		} else {
+			switch ft.Kind() {
+			case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+				k.ref = true
+			}
+		}
+		if field.Tag.Get("tn") == "optional" && (ft.Kind() == reflect.Pointer || ft.Kind() == reflect.Interface) {
+			k.skipNil = true
+		}
+		// optional primitives (*string & co.): absent when unset, else their value
+		if ft.Kind() == reflect.Pointer {
+			switch ft.Elem().Kind() {
+			case reflect.String:
+				k.unwrap = 1
+			case reflect.Float64:
+				k.unwrap = 2
+			case reflect.Bool:
+				k.unwrap = 3
+			}
+			if k.unwrap != 0 {
+				k.skipNil = true
+			}
+		}
+		p.keys = append(p.keys, k)
+	}
+}
+
+// The key's value read without reflection; false when an optional field is unset
+func tnReadStructKey(k *tnStructKey, base unsafe.Pointer) (interface{}, bool) {
+	f := unsafe.Add(base, k.offset)
+	if k.skipNil {
+		if *(*unsafe.Pointer)(f) == nil {
+			return nil, false
+		}
+		switch k.unwrap {
+		case 1:
+			return *(*string)(*(*unsafe.Pointer)(f)), true
+		case 2:
+			return *(*float64)(*(*unsafe.Pointer)(f)), true
+		case 3:
+			return *(*bool)(*(*unsafe.Pointer)(f)), true
+		}
+	}
+	if k.ifaceAll {
+		return *(*interface{})(f), true
+	}
+	if k.rt != nil {
+		return reflect.NewAt(k.rt, f).Elem().Interface(), true
+	}
+	var v interface{}
+	e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+	e[0] = k.field
+	if k.ref {
+		// (a pointer, map, chan or func field: the interface's data word is
+		// the value itself, not the field's address)
+		e[1] = *(*unsafe.Pointer)(f)
+	} else {
+		e[1] = f
+	}
+	return v, true
+}
+
 func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
-	rv := reflect.ValueOf(obj)
-	if !rv.IsValid() || rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+	rt := reflect.TypeOf(obj)
+	if rt == nil || rt.Kind() != reflect.Pointer || rt.Elem().Kind() != reflect.Struct {
 		return nil, nil, false
 	}
-	keys := []string{}
-	values := []interface{}{}
-	tnCollectStructProps(rv.Elem(), &keys, &values)
+	base := (*[2]unsafe.Pointer)(unsafe.Pointer(&obj))[1]
+	if base == nil {
+		return nil, nil, false
+	}
+	plan := tnStructPlanOf(rt.Elem())
+	keys := make([]string, 0, len(plan.keys)+4)
+	values := make([]interface{}, 0, len(plan.keys)+4)
+	for i := range plan.keys {
+		v, ok := tnReadStructKey(&plan.keys[i], base)
+		if !ok {
+			continue
+		}
+		keys = append(keys, plan.keys[i].key)
+		values = append(values, v)
+	}
 	// (a literal's own key list, __keys: its keys in creation order, those it
 	// wrote as undefined included — they are own keys in JS)
-	if order := rv.Elem().FieldByName("__keys"); order.IsValid() && order.Kind() == reflect.Pointer && !order.IsNil() {
+	rv := reflect.ValueOf(obj)
+	if plan.hasKeys {
+		if order := rv.Elem().FieldByName("__keys"); order.IsValid() && order.Kind() == reflect.Pointer && !order.IsNil() {
 		listed := *(*[]string)(unsafe.Pointer(order.Pointer()))
 		at := map[string]int{}
 		for i, k := range keys {
@@ -31506,6 +31877,7 @@ func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
 			}
 		}
 		keys, values = ordered, orderedValues
+		}
 	}
 	// (the object's added properties come after its fields, in insertion
 	// order: a field that didn't take the value reads as undefined, so it is
@@ -31529,42 +31901,6 @@ func tnStructProps(obj interface{}) ([]string, []interface{}, bool) {
 		values = append(values, value)
 	}
 	return keys, values, true
-}
-
-func tnCollectStructProps(sv reflect.Value, keys *[]string, values *[]interface{}) {
-	st := sv.Type()
-	for i := 0; i < st.NumField(); i++ {
-		field := st.Field(i)
-		// a parent class's fields come first (TypeNative's own runtime types
-		// embedded by Node subclasses are not properties)
-		if field.Anonymous {
-			if field.Type.Kind() == reflect.Struct && !strings.HasPrefix(field.Type.Name(), "Tn") {
-				tnCollectStructProps(sv.Field(i), keys, values)
-			}
-			continue
-		}
-		if strings.HasPrefix(field.Name, "__") {
-			continue
-		}
-		f := sv.Field(i)
-		value := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
-		// an optional object field: absent when unset
-		if field.Tag.Get("tn") == "optional" && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
-			continue
-		}
-		// optional primitives (*string & co.): absent when unset, else their value
-		if value.Kind() == reflect.Pointer {
-			switch value.Type().Elem().Kind() {
-			case reflect.String, reflect.Float64, reflect.Bool:
-				if value.IsNil() {
-					continue
-				}
-				value = value.Elem()
-			}
-		}
-		*keys = append(*keys, strings.TrimSuffix(field.Name, "_"))
-		*values = append(*values, value.Interface())
-	}
 }
 
 // Object.values / Object.entries on any object
@@ -33584,9 +33920,6 @@ type tnStrIdx struct {
 // Slices of an ASCII string: nothing to remember
 var tnStrIdxASCII = &tnStrIdx{ascii: true}
 
-// Shorter strings are tested for ASCII each time: it costs less than an index
-const tnStrShort = 512
-
 // (the string indexed last: a scan over one string finds it first)
 var tnStrIdxLast atomic.Pointer[tnStrIdx]
 var tnStrIdxCache [8]atomic.Pointer[tnStrIdx]
@@ -33597,38 +33930,10 @@ var tnStrIdxNext atomic.Uint32
 var tnStrIdxBig [4]atomic.Pointer[tnStrIdx]
 var tnStrIdxBigNext atomic.Uint32
 
-// Whether a short string is all ASCII, remembered for the last one asked
-// about: a lexer reads each character of one line with charCodeAt(i) and
-// tests i < line.length, which would otherwise rescan the line every time
-// (the entry holds the string, so its memory can't be reused by another)
-type tnStrShortEntry struct {
-	s     string
-	ascii bool
-}
-
-// (guarded by a mutex: a pointer published then replaced would race with a
-// reader, and an entry per miss is an allocation per inline token)
-var tnStrShortMu sync.Mutex
-var tnStrShortS string
-var tnStrShortA bool
-
-func tnStrShortASCII(s string) bool {
-	if len(s) <= 64 {
-		return tnStrIsASCII(s)
-	}
-	tnStrShortMu.Lock()
-	if len(tnStrShortS) == len(s) && unsafe.StringData(tnStrShortS) == unsafe.StringData(s) {
-		ascii := tnStrShortA
-		tnStrShortMu.Unlock()
-		return ascii
-	}
-	tnStrShortMu.Unlock()
-	ascii := tnStrIsASCII(s)
-	tnStrShortMu.Lock()
-	tnStrShortS, tnStrShortA = s, ascii
-	tnStrShortMu.Unlock()
-	return ascii
-}
+// Whether a short string is all ASCII is kept in the same lock-free index
+// cache as long strings (tnStrIdxLast / tnStrIdxCache): a lexer reads each
+// character of one line with charCodeAt(i) and tests i < line.length, which
+// would otherwise rescan the line on every call
 
 func tnStrIsASCII(s string) bool {
 	i := 0
@@ -33651,6 +33956,11 @@ func tnStrIndexOf(s string) *tnStrIdx {
 	p := unsafe.StringData(s)
 	if c := tnStrIdxLast.Load(); c != nil && c.p == p && c.n == len(s) {
 		return c
+	}
+	// (a short ASCII string needs no index at all: code points are bytes, and
+	// the scan is a few vectorized loads — cheaper than an entry per string)
+	if len(s) < 32 && tnStrIsASCII(s) {
+		return tnStrIdxASCII
 	}
 	cache := tnStrIdxCache[:]
 	if len(s) >= 4096 {
@@ -33709,9 +34019,6 @@ func (c *tnStrIdx) slice(p *byte, n int) *tnStrIdx {
 
 // The number of code points
 func tnStrCount(s string) int {
-	if len(s) < tnStrShort && tnStrShortASCII(s) {
-		return len(s)
-	}
 	c := tnStrIndexOf(s)
 	if c.ascii {
 		return len(s)
@@ -33723,9 +34030,6 @@ func tnStrCount(s string) int {
 func tnStrByte(s string, i int) int {
 	if i <= 0 {
 		return 0
-	}
-	if len(s) < tnStrShort && tnStrIsASCII(s) {
-		return min(i, len(s))
 	}
 	c := tnStrIndexOf(s)
 	if c.ascii {
@@ -33741,9 +34045,6 @@ func tnStrByte(s string, i int) int {
 func tnStrRune(s string, b int) int {
 	if b <= 0 {
 		return 0
-	}
-	if len(s) < tnStrShort && tnStrIsASCII(s) {
-		return b
 	}
 	c := tnStrIndexOf(s)
 	if c.ascii {
@@ -33780,37 +34081,31 @@ func TnStrLength(s string) float64 { return float64(tnStrCount(s)) }
 
 // Whether code points are bytes in s (an operation asks once, not per offset)
 func tnStrASCII(s string) bool {
-	if len(s) < tnStrShort {
-		return tnStrShortASCII(s)
-	}
-	return tnStrIndexOf(s).ascii
-}
-
-// Whether code point n of s is byte n: everything up to it is ASCII
-func tnStrDirect(s string, n int) bool {
-	if n >= len(s) {
-		return false
-	}
-	if len(s) < tnStrShort {
-		// (an early index needs only its prefix; a later one asks once per string)
-		if n < 64 {
-			return tnStrIsASCII(s[:n+1])
-		}
-		return tnStrShortASCII(s) || tnStrIsASCII(s[:n+1])
-	}
 	return tnStrIndexOf(s).ascii
 }
 
 // s[i] / s.charAt(i): "" out of range
 func TnCharAt(s string, i float64) string {
 	n := tnStrPos(i)
-	if i >= 0 && tnStrDirect(s, n) {
+	c := tnStrIndexOf(s)
+	if i >= 0 && n < len(s) && c.ascii {
 		return s[n : n+1]
 	}
-	if i < 0 || n >= tnStrCount(s) {
+	count := len(s)
+	if !c.ascii {
+		count = len(c.offs) - 1
+	}
+	if i < 0 || n >= count {
 		return ""
 	}
-	b := tnStrByte(s, n)
+	b := min(n, len(s))
+	if !c.ascii {
+		if n >= len(c.offs) {
+			b = len(s)
+		} else {
+			b = c.offs[n] - c.base
+		}
+	}
 	if s[b] < 0x80 {
 		return s[b : b+1]
 	}
@@ -33821,13 +34116,27 @@ func TnCharAt(s string, i float64) string {
 // s.charCodeAt(i): NaN out of range
 func TnCharCodeAt(s string, i float64) float64 {
 	n := tnStrPos(i)
-	if i >= 0 && tnStrDirect(s, n) {
+	// (one index lookup per call: tnStrDirect / tnStrCount / tnStrByte below
+	// all read the same cached index)
+	c := tnStrIndexOf(s)
+	if i >= 0 && n < len(s) && c.ascii {
 		return float64(s[n])
 	}
-	if i < 0 || n >= tnStrCount(s) {
+	count := len(s)
+	if !c.ascii {
+		count = len(c.offs) - 1
+	}
+	if i < 0 || n >= count {
 		return math.NaN()
 	}
-	b := tnStrByte(s, n)
+	b := min(n, len(s))
+	if !c.ascii {
+		if n >= len(c.offs) {
+			b = len(s)
+		} else {
+			b = c.offs[n] - c.base
+		}
+	}
 	if s[b] < 0x80 {
 		return float64(s[b])
 	}
@@ -34067,19 +34376,20 @@ func TnDeref[T any](p *T) T {
 			return "undefined"
 		}
 		return "boolean"
-	}
-	// (an unset function or object field is undefined)
-	rv := reflect.ValueOf(v)
-	// (a bigint, a symbol: told by their Go types)
-	switch rv.Type().String() {
-	case "*big.Int":
-		if rv.IsNil() {
+	case *tnbig.Int:
+		// (a bigint: told by its Go type, without building the type's name)
+		if t == nil {
 			return "undefined"
 		}
 		return "bigint"
-	case "*main.TnSymbol":
+	}
+	// (a symbol: its type is only emitted when symbols are used — the marker
+	// interface matches it structurally, and never matches anything else)
+	if _, isSym := v.(interface{ TnSymbolValue() }); isSym {
 		return "symbol"
 	}
+	// (an unset function or object field is undefined)
+	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.Func:
 		if rv.IsNil() {
@@ -36004,39 +36314,73 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 }
 
 // Set operations (ES2025), in the receiver's insertion order then the argument's
-func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
+
+// A fresh result map for a set operation, with room for every key
+func tnSetResult[K comparable, V any](m, o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
+	if n := len(m.values) + len(o.values); n > 0 {
+		r.values = make(map[K]V, n)
+	}
+	return r
+}
+
+// Set without the accessor check (a fresh result map has none): the hot path
+// of the set operations
+func (m *TnMap[K, V]) setFast(k K, v V) {
+	h := m.hk(k)
+	if _, ok := m.values[h]; !ok {
+		m.pushKey(k)
+		if _, isIndex := tnIndexKey(any(k)); isIndex {
+			m.indexKeys = true
+		}
+	}
+	m.values[h] = v
+}
+
+func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
+	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
-		r.Set(k, m.values[m.hk(k)])
+		r.setFast(k, m.values[m.hk(k)])
 	}
 	for _, k := range o.liveKeys() {
-		r.Set(k, o.values[o.hk(k)])
+		r.setFast(k, o.values[o.hk(k)])
 	}
 	return r
 }
 
 func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
-	r := TnNewMap[K, V]()
+	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
 		if o.Has(k) {
-			r.Set(k, m.values[m.hk(k)])
+			r.setFast(k, m.values[m.hk(k)])
 		}
 	}
 	return r
 }
 
 func (m *TnMap[K, V]) Difference(o *TnMap[K, V]) *TnMap[K, V] {
-	r := TnNewMap[K, V]()
+	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
 		if !o.Has(k) {
-			r.Set(k, m.values[m.hk(k)])
+			r.setFast(k, m.values[m.hk(k)])
 		}
 	}
 	return r
 }
 
 func (m *TnMap[K, V]) SymmetricDifference(o *TnMap[K, V]) *TnMap[K, V] {
-	return m.Difference(o).Union(o.Difference(m))
+	r := tnSetResult(m, o)
+	for _, k := range m.liveKeys() {
+		if !o.Has(k) {
+			r.setFast(k, m.values[m.hk(k)])
+		}
+	}
+	for _, k := range o.liveKeys() {
+		if !m.Has(k) {
+			r.setFast(k, o.values[o.hk(k)])
+		}
+	}
+	return r
 }
 
 func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
@@ -37984,6 +38328,9 @@ func TnNewSymbol(description string) *TnSymbol {
 
 // String(sym): Symbol(description) (also a symbol property's key)
 func (s *TnSymbol) String() string { return "Symbol(" + s.description + ")" }
+
+// Marks symbol values for typeof (TnTypeOf), which is emitted without this helper
+func (s *TnSymbol) TnSymbolValue() {}
 
 // Symbol.hasInstance (x instanceof C asks C, when C defines it)
 var TnSymbolHasInstance = &TnSymbol{description: "Symbol.hasInstance"}
