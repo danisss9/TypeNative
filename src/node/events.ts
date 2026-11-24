@@ -29,11 +29,10 @@ var TnCaptureRejections = false
 
 // EventEmitter: embeddable (class X extends EventEmitter), state allocated lazily
 type TnEventEmitter struct {
-	state *tnEmitterState
-	ev0   string
-	fn0   interface{}
-	ev1   string
-	fn1   interface{}
+	state    *tnEmitterState
+	inlineEv [4]string
+	inlineFn [4]interface{}
+	inlineN  int
 	// A subclass instance (class X extends EventEmitter): its own
 	// [Symbol.for('nodejs.rejection')] method handles captured rejections
 	tnSelf interface{}
@@ -66,18 +65,15 @@ func (e *TnEventEmitter) tnEmitter() *TnEventEmitter { return e }
 func (e *TnEventEmitter) st() *tnEmitterState {
 	if e.state == nil {
 		s := &tnEmitterState{events: map[string][]*tnListener{}, maxListeners: -1, captureRejections: TnCaptureRejections}
-		if e.fn0 != nil {
-			s.order = append(s.order, e.ev0)
-			s.events[e.ev0] = []*tnListener{{fn: e.fn0}}
-			e.ev0, e.fn0 = "", nil
-		}
-		if e.fn1 != nil {
-			if _, ok := s.events[e.ev1]; !ok {
-				s.order = append(s.order, e.ev1)
+		for i := 0; i < e.inlineN; i++ {
+			ev, fn := e.inlineEv[i], e.inlineFn[i]
+			if _, ok := s.events[ev]; !ok {
+				s.order = append(s.order, ev)
 			}
-			s.events[e.ev1] = append(s.events[e.ev1], &tnListener{fn: e.fn1})
-			e.ev1, e.fn1 = "", nil
+			s.events[ev] = append(s.events[ev], &tnListener{fn: fn})
+			e.inlineEv[i], e.inlineFn[i] = "", nil
 		}
+		e.inlineN = 0
 		e.state = s
 	}
 	return e.state
@@ -113,15 +109,11 @@ func (e *TnEventEmitter) prependOnceListener(event string, fn interface{}) *TnEv
 }
 
 func (e *TnEventEmitter) add(event string, fn interface{}, prepend bool, once bool) *TnEventEmitter {
-	if e.state == nil && !prepend && !once && !TnCaptureRejections && event != "newListener" {
-		if e.fn0 == nil {
-			e.ev0, e.fn0 = event, fn
-			return e
-		}
-		if e.fn1 == nil {
-			e.ev1, e.fn1 = event, fn
-			return e
-		}
+	if e.state == nil && !prepend && !once && !TnCaptureRejections && event != "newListener" && e.inlineN < len(e.inlineFn) {
+		e.inlineEv[e.inlineN] = event
+		e.inlineFn[e.inlineN] = fn
+		e.inlineN++
+		return e
 	}
 	s := e.st()
 	if len(s.events["newListener"]) > 0 {
@@ -158,18 +150,19 @@ func (e *TnEventEmitter) add(event string, fn interface{}, prepend bool, once bo
 
 func (e *TnEventEmitter) removeListener(event string, fn interface{}) *TnEventEmitter {
 	if e.state == nil {
-		if e.fn0 == nil && e.fn1 == nil {
+		if e.inlineN == 0 {
 			return e
 		}
 		id := tnFuncID(fn)
-		if e.fn1 != nil && e.ev1 == event && tnFuncID(e.fn1) == id {
-			e.ev1, e.fn1 = "", nil
-			return e
-		}
-		if e.fn0 != nil && e.ev0 == event && tnFuncID(e.fn0) == id {
-			e.ev0, e.fn0 = e.ev1, e.fn1
-			e.ev1, e.fn1 = "", nil
-			return e
+		for i := e.inlineN - 1; i >= 0; i-- {
+			if e.inlineEv[i] == event && tnFuncID(e.inlineFn[i]) == id {
+				for j := i; j < e.inlineN-1; j++ {
+					e.inlineEv[j], e.inlineFn[j] = e.inlineEv[j+1], e.inlineFn[j+1]
+				}
+				e.inlineN--
+				e.inlineEv[e.inlineN], e.inlineFn[e.inlineN] = "", nil
+				break
+			}
 		}
 		return e
 	}
@@ -217,17 +210,23 @@ func (e *TnEventEmitter) setListeners(event string, list []*tnListener) {
 func (e *TnEventEmitter) removeAllListeners(event ...string) *TnEventEmitter {
 	if e.state == nil {
 		if len(event) == 0 {
-			e.ev0, e.fn0 = "", nil
-			e.ev1, e.fn1 = "", nil
+			for i := 0; i < e.inlineN; i++ {
+				e.inlineEv[i], e.inlineFn[i] = "", nil
+			}
+			e.inlineN = 0
 			return e
 		}
-		if e.fn1 != nil && e.ev1 == event[0] {
-			e.ev1, e.fn1 = "", nil
+		w := 0
+		for i := 0; i < e.inlineN; i++ {
+			if e.inlineEv[i] != event[0] {
+				e.inlineEv[w], e.inlineFn[w] = e.inlineEv[i], e.inlineFn[i]
+				w++
+			}
 		}
-		if e.fn0 != nil && e.ev0 == event[0] {
-			e.ev0, e.fn0 = e.ev1, e.fn1
-			e.ev1, e.fn1 = "", nil
+		for i := w; i < e.inlineN; i++ {
+			e.inlineEv[i], e.inlineFn[i] = "", nil
 		}
+		e.inlineN = w
 		return e
 	}
 	s := e.st()
@@ -244,24 +243,24 @@ func (e *TnEventEmitter) removeAllListeners(event ...string) *TnEventEmitter {
 
 func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 	if e.state == nil {
-		var f0, f1 interface{}
-		if e.fn0 != nil && e.ev0 == event {
-			f0 = e.fn0
-		}
-		if e.fn1 != nil && e.ev1 == event {
-			f1 = e.fn1
+		var matched [4]interface{}
+		mn := 0
+		for i := 0; i < e.inlineN; i++ {
+			if e.inlineEv[i] == event {
+				matched[mn] = e.inlineFn[i]
+				mn++
+			}
 		}
 		// events.errorMonitor sees an 'error' before the error listeners,
 		// whatever their registration order
 		if event == "error" {
-			if e.fn0 != nil && e.ev0 == TnErrorMonitor {
-				TnInvoke(e.fn0, args...)
-			}
-			if e.fn1 != nil && e.ev1 == TnErrorMonitor {
-				TnInvoke(e.fn1, args...)
+			for i := 0; i < e.inlineN; i++ {
+				if e.inlineEv[i] == TnErrorMonitor {
+					TnInvoke(e.inlineFn[i], args...)
+				}
 			}
 		}
-		if f0 == nil && f1 == nil {
+		if mn == 0 {
 			if event == "error" {
 				if len(args) > 0 {
 					if _, ok := args[0].(error); ok {
@@ -273,11 +272,8 @@ func (e *TnEventEmitter) emit(event string, args ...interface{}) bool {
 			}
 			return false
 		}
-		if f0 != nil {
-			TnInvoke(f0, args...)
-		}
-		if f1 != nil {
-			TnInvoke(f1, args...)
+		for i := 0; i < mn; i++ {
+			TnInvoke(matched[i], args...)
 		}
 		return true
 	}
@@ -419,11 +415,10 @@ func TnAddAbortListener(signal *TnAbortSignal, listener interface{}) *TnDisposab
 func (e *TnEventEmitter) listeners(event string) []interface{} {
 	if e.state == nil {
 		out := []interface{}{}
-		if e.fn0 != nil && e.ev0 == event {
-			out = append(out, e.fn0)
-		}
-		if e.fn1 != nil && e.ev1 == event {
-			out = append(out, e.fn1)
+		for i := 0; i < e.inlineN; i++ {
+			if e.inlineEv[i] == event {
+				out = append(out, e.inlineFn[i])
+			}
 		}
 		return out
 	}
@@ -447,11 +442,10 @@ func (e *TnEventEmitter) listenerCount(event string, fn ...interface{}) float64 
 		if wantFilter {
 			wantID = tnFuncID(fn[0])
 		}
-		if e.fn0 != nil && e.ev0 == event && (!wantFilter || tnFuncID(e.fn0) == wantID) {
-			n++
-		}
-		if e.fn1 != nil && e.ev1 == event && (!wantFilter || tnFuncID(e.fn1) == wantID) {
-			n++
+		for i := 0; i < e.inlineN; i++ {
+			if e.inlineEv[i] == event && (!wantFilter || tnFuncID(e.inlineFn[i]) == wantID) {
+				n++
+			}
 		}
 		return float64(n)
 	}
@@ -473,11 +467,18 @@ func (e *TnEventEmitter) listenerCount(event string, fn ...interface{}) float64 
 func (e *TnEventEmitter) eventNames() []string {
 	if e.state == nil {
 		out := []string{}
-		if e.fn0 != nil {
-			out = append(out, e.ev0)
-		}
-		if e.fn1 != nil && (e.fn0 == nil || e.ev1 != e.ev0) {
-			out = append(out, e.ev1)
+		for i := 0; i < e.inlineN; i++ {
+			ev := e.inlineEv[i]
+			seen := false
+			for _, prev := range out {
+				if prev == ev {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				out = append(out, ev)
+			}
 		}
 		return out
 	}

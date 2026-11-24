@@ -440,6 +440,130 @@ const interfacesByOriginalName = new Map<string, AstNode[]>();
 const declaredTypeAliases = new Map<string, AstNode>();
 // Package-level declarations of the main file's top-level variables
 const mainPackageVariables: string[] = [];
+const hoistedBigInts = new Map<string, string>();
+
+// String variables proven all-ASCII inside an active fast-path loop branch
+// (goName -> optional int loop counter proven 0 <= idx < len(goName))
+const asciiStringGoVars = new Map<string, { idxVar?: string }>();
+
+// Whether a string identifier `name` is safe to specialize with an ASCII fast
+// path over `body`: never written/redeclared in `body`, and actually indexed
+// via charCodeAt / charAt / [i] inside `body`
+function asciiLoopCandidate(loopNode: AstNode, cond: AstNode | undefined, body: AstNode): { strName: string; goStr: string; counterName?: string; counterInit?: number; counterStep?: number } | undefined {
+  if (!cond || loopNode.parent?.kind === 'LabeledStatement') return undefined;
+  const c = unwrapParentheses(cond);
+  if (!isBinaryExpression(c) || c.operatorToken.kind !== 'LessThanToken') return undefined;
+  const rhs = unwrapParentheses(c.right);
+  if (!isPropertyAccessExpression(rhs) || rhs.name.text !== 'length' || !isIdentifier(rhs.expression)) return undefined;
+  if (inferExpressionType(rhs.expression) !== 'string') return undefined;
+  const strName: string = rhs.expression.text;
+  const goStr = getSafeName(strName);
+  if (asciiStringGoVars.has(goStr)) return undefined;
+  // Require at least one charCodeAt / charAt / [idx] on strName and zero writes/shadowing of strName
+  let usesCharAccess = false;
+  let unsafe = false;
+  const check = (n: AstNode | undefined): void => {
+    if (!n || unsafe) return;
+    if ((n.kind === 'VariableDeclaration' || n.kind === 'Parameter' || n.kind === 'BindingElement') && n.name && isIdentifier(n.name) && n.name.text === strName) {
+      unsafe = true;
+      return;
+    }
+    if (isBinaryExpression(n) && ASSIGNMENT_OPERATORS.has(n.operatorToken.kind) && isIdentifier(unwrapParentheses(n.left)) && unwrapParentheses(n.left).text === strName) {
+      unsafe = true;
+      return;
+    }
+    if (isCallExpression(n) && isPropertyAccessExpression(n.expression) && isIdentifier(n.expression.expression) && n.expression.expression.text === strName && (n.expression.name.text === 'charCodeAt' || n.expression.name.text === 'charAt' || n.expression.name.text === 'codePointAt')) {
+      usesCharAccess = true;
+    }
+    if (isElementAccessExpression(n) && isIdentifier(n.expression) && n.expression.text === strName) {
+      usesCharAccess = true;
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'parent') continue;
+      const v = (n as any)[key];
+      if (Array.isArray(v)) {
+        for (const ch of v) if (ch && typeof ch === 'object' && typeof ch.kind === 'string') check(ch);
+      } else if (v && typeof v === 'object' && typeof v.kind === 'string') check(v);
+    }
+  };
+  check(body);
+  if (!usesCharAccess || unsafe) return undefined;
+  if (isForStatement(loopNode)) {
+    const list = loopNode.initializer;
+    const inc = loopNode.incrementor;
+    if (list && isVariableDeclarationList(list) && list.declarationKind === 'let' && (list.declarations ?? []).length === 1) {
+      const decl = list.declarations[0];
+      if (isIdentifier(decl.name) && !decl.type && decl.initializer) {
+        const initVal = literalInt32(decl.initializer);
+        if (initVal !== undefined && initVal >= 0 && isIdentifier(unwrapParentheses(c.left)) && unwrapParentheses(c.left).text === decl.name.text) {
+          let step: number | undefined;
+          if (inc && (isPostfixUnaryExpression(inc) || isPrefixUnaryExpression(inc)) && inc.operator === 'PlusPlusToken' && isIdentifier(inc.operand) && inc.operand.text === decl.name.text) {
+            step = 1;
+          } else if (inc && isBinaryExpression(inc) && inc.operatorToken.kind === 'PlusEqualsToken' && isIdentifier(inc.left) && inc.left.text === decl.name.text) {
+            const sv = literalInt32(inc.right);
+            if (sv !== undefined && sv > 0) step = sv;
+          }
+          if (step !== undefined) {
+            return { strName, goStr, counterName: decl.name.text, counterInit: initVal, counterStep: step };
+          }
+        }
+      }
+    }
+  }
+  return { strName, goStr };
+}
+
+// Hoists a compile-time BigInt literal (or constant shift) to a read-only
+// package-level *tnbig.Int so hot loops never re-parse strings with SetString
+function hoistBigIntLiteral(rawText: string): string {
+  useHelper('bigint');
+  const clean = rawText.replace(/_/g, '').replace(/n$/i, '');
+  const existing = hoistedBigInts.get(clean);
+  if (existing) return existing;
+  const name = `__tnBig_${hoistedBigInts.size}`;
+  hoistedBigInts.set(clean, name);
+  if (/^-?\d+$/.test(clean) && clean.replace(/^-/, '').length <= 18) {
+    mainPackageVariables.push(`var ${name} = tnbig.NewInt(${clean})`);
+  } else if (/^-?0x[0-9a-fA-F]+$/i.test(clean) && clean.replace(/^-?0x/i, '').length <= 15) {
+    mainPackageVariables.push(`var ${name} = tnbig.NewInt(${clean})`);
+  } else {
+    mainPackageVariables.push(`var ${name} = TnBigInt("${clean}")`);
+  }
+  return name;
+}
+
+function bigIntLiteralText(node: AstNode): string | undefined {
+  const e = unwrapParentheses(node);
+  if (e.kind === 'BigIntLiteral') return String(e.text).replace(/_/g, '').replace(/n$/i, '');
+  if (isPrefixUnaryExpression(e) && e.operator === 'MinusToken' && e.operand.kind === 'BigIntLiteral') {
+    return '-' + String(e.operand.text).replace(/_/g, '').replace(/n$/i, '');
+  }
+  return undefined;
+}
+
+function bigIntSmallUint(node: AstNode): number | undefined {
+  const txt = bigIntLiteralText(node);
+  if (!txt || txt.startsWith('-')) return undefined;
+  const n = Number(txt);
+  return Number.isInteger(n) && n >= 0 && n <= 1_000_000 ? n : undefined;
+}
+
+function isFreshBigIntExpr(node: AstNode): boolean {
+  const e = unwrapParentheses(node);
+  if (isBinaryExpression(e)) {
+    const k = e.operatorToken.kind;
+    if (['PlusToken', 'MinusToken', 'AsteriskToken', 'SlashToken', 'PercentToken', 'AsteriskAsteriskToken',
+      'AmpersandToken', 'BarToken', 'CaretToken', 'LessThanLessThanToken', 'GreaterThanGreaterThanToken'].includes(k)) {
+      // Do not mutate a hoisted constant shift (1n << 401n)
+      if (k === 'LessThanLessThanToken' && bigIntLiteralText(e.left) !== undefined && bigIntSmallUint(e.right) !== undefined) return false;
+      return true;
+    }
+  }
+  if (isCallExpression(e) && isIdentifier(e.expression) && e.expression.text === 'BigInt' && (e.arguments ?? []).length === 1) {
+    return inferExpressionType(e.arguments[0]) === 'float64';
+  }
+  return false;
+}
 // True while emitting a separate Go file, whose top-level statements sit at package scope
 let emittingModuleFile = false;
 const importedPackages = new Set<string>();
@@ -482,6 +606,8 @@ const classSetterMethods = new Set<string>();
 const classIteratorMethods = new Map<string, string>();
 // Every parsed class declaration by name (for inheritance lookup)
 const declaredClasses = new Map<string, AstNode>();
+// `const Alias = Base as …`: a base class reached through a value alias
+const classAliases = new Map<string, string>();
 // Class → parent class name (skip the Error special case)
 const classParentNames = new Map<string, string>();
 // Interfaces with properties that a class implements (and the interfaces
@@ -497,6 +623,9 @@ let asyncChannelVar: string | undefined;
 // Emitting a generator's push form (name__seq): yield calls the consumer's
 // loop body instead of sending on a channel (see emitGeneratorSeq)
 let generatorSeqMode = false;
+// Emitting an async function's direct-await sibling (name__await): return
+// returns the resolved value directly without allocating a channel
+let asyncDirectReturn = false;
 let asyncFunctionNode: AstNode | undefined;
 // True while emitting the body of an async function (not a generator): its
 // return settles the promise (ordered wake); a generator's sends stay raw
@@ -3192,7 +3321,7 @@ function lowerSymbolKeys(sourceFile: AstNode): void {
   for (const stmt of sourceFile.statements) {
     if (!isVariableStatement(stmt) || stmt.exported || hasModifier(stmt, 'ExportKeyword')) continue;
     for (const d of stmt.declarationList?.declarations ?? []) {
-      if (isIdentifier(d.name) && isSymbolCallExpression(d.initializer)) names.add(d.name.text);
+      if (isIdentifier(d.name) && isSymbolKeyDeclaration(d)) names.add(d.name.text);
     }
   }
   retainSymbolsUsedAsValues(sourceFile, names);
@@ -3201,7 +3330,7 @@ function lowerSymbolKeys(sourceFile: AstNode): void {
   for (const stmt of sourceFile.statements) {
     if (!isVariableStatement(stmt) || stmt.exported || hasModifier(stmt, 'ExportKeyword')) continue;
     const declarations = (stmt.declarationList?.declarations ?? []).filter(
-      (d: AstNode) => !(isIdentifier(d.name) && names.has(d.name.text) && isSymbolCallExpression(d.initializer))
+      (d: AstNode) => !(isIdentifier(d.name) && names.has(d.name.text) && isSymbolKeyDeclaration(d))
     );
     if (stmt.declarationList) stmt.declarationList.declarations = declarations;
   }
@@ -3218,11 +3347,21 @@ function lowerSymbolKeys(sourceFile: AstNode): void {
 function retainSymbolsUsedAsValues(sourceFile: AstNode, names: Set<string>, shared = false): void {
   const keyUses = new Set<AstNode>();
   const symbolTyped = { found: false };
+  // The `symbol` in `const K: unique symbol = …` is still key-only; any other
+  // use of the symbol type means the file can hold a symbol as a value.
+  const uniqueSymbolTypes = new Set<AstNode>();
+  const collectUniqueTypes = (node: AstNode): void => {
+    if (node.kind === 'VariableDeclaration' && node.type?.kind === 'TypeOperator' && node.type.operator === 'UniqueKeyword') {
+      if (node.type.type) uniqueSymbolTypes.add(node.type.type);
+    }
+    for (const child of childNodes(node)) collectUniqueTypes(child);
+  };
+  collectUniqueTypes(sourceFile);
   const markKeyUses = (node: AstNode): void => {
     for (const child of childNodes(node)) markKeyUses(child);
-    if (node.kind === 'SymbolKeyword') symbolTyped.found = true;
+    if (node.kind === 'SymbolKeyword' && !uniqueSymbolTypes.has(node)) symbolTyped.found = true;
     if (node.name?.kind === 'ComputedPropertyName' && isIdentifier(node.name.expression)) keyUses.add(node.name.expression);
-    if (node.kind === 'ElementAccessExpression' && !hasQuestionDot(node) && isIdentifier(node.argumentExpression)) keyUses.add(node.argumentExpression);
+    if (node.kind === 'ElementAccessExpression' && isIdentifier(node.argumentExpression)) keyUses.add(node.argumentExpression);
     if (shared && (node.kind === 'ImportSpecifier' || node.kind === 'ExportSpecifier')) {
       if (node.name) keyUses.add(node.name);
       if (node.propertyName) keyUses.add(node.propertyName);
@@ -3252,21 +3391,28 @@ function retainSymbolsUsedAsValues(sourceFile: AstNode, names: Set<string>, shar
 
 // [K]: v / [K] = v / o[K] for a module-level Symbol constant K: the key
 // becomes the constant's name (a plain field or property)
+function symbolKeyText(expr: AstNode | undefined, names: Set<string>): string | undefined {
+  if (!expr) return undefined;
+  if (isIdentifier(expr) && names.has(expr.text)) return expr.text;
+  // constants.BSON_VERSION_SYMBOL: a namespace-qualified symbol constant
+  if (isPropertyAccessExpression(expr) && names.has(expr.name.text)) return expr.name.text;
+  return undefined;
+}
+
 function rewriteSymbolKeyUses(sourceFile: AstNode, names: Set<string>): void {
   const rewrite = (node: AstNode): void => {
     for (const child of childNodes(node)) rewrite(child);
-    if (node.name?.kind === 'ComputedPropertyName' && isIdentifier(node.name.expression) && names.has(node.name.expression.text)) {
-      node.name = { kind: 'Identifier', text: node.name.expression.text };
+    const memberSymbol = node.name?.kind === 'ComputedPropertyName' ? symbolKeyText(node.name.expression, names) : undefined;
+    if (memberSymbol) {
+      node.name = { kind: 'Identifier', text: memberSymbol };
     }
-    if (
-      node.kind === 'ElementAccessExpression' &&
-      !hasQuestionDot(node) &&
-      isIdentifier(node.argumentExpression) &&
-      names.has(node.argumentExpression.text)
-    ) {
-      node.kind = 'PropertyAccessExpression';
-      node.name = { kind: 'Identifier', text: node.argumentExpression.text };
-      delete node.argumentExpression;
+    if (node.kind === 'ElementAccessExpression') {
+      const key = symbolKeyText(node.argumentExpression, names);
+      if (key) {
+        node.kind = 'PropertyAccessExpression';
+        node.name = { kind: 'Identifier', text: key };
+        delete node.argumentExpression;
+      }
     }
   };
   rewrite(sourceFile);
@@ -3283,7 +3429,7 @@ function lowerSharedSymbolKeys(asts: AstNode[]): void {
     for (const stmt of ast.statements) {
       if (!isVariableStatement(stmt) || !(stmt.exported || hasModifier(stmt, 'ExportKeyword'))) continue;
       for (const d of stmt.declarationList?.declarations ?? []) {
-        if (isIdentifier(d.name) && isSymbolCallExpression(d.initializer)) names.add(d.name.text);
+        if (isIdentifier(d.name) && isSymbolKeyDeclaration(d)) names.add(d.name.text);
       }
     }
   }
@@ -3299,7 +3445,7 @@ function lowerSharedSymbolKeys(asts: AstNode[]): void {
     for (const stmt of ast.statements) {
       if (isVariableStatement(stmt)) {
         const declarations = (stmt.declarationList?.declarations ?? []).filter(
-          (d: AstNode) => !(isIdentifier(d.name) && names.has(d.name.text) && isSymbolCallExpression(d.initializer))
+          (d: AstNode) => !(isIdentifier(d.name) && names.has(d.name.text) && isSymbolKeyDeclaration(d))
         );
         if (stmt.declarationList) stmt.declarationList.declarations = declarations;
       }
@@ -3309,6 +3455,12 @@ function lowerSharedSymbolKeys(asts: AstNode[]): void {
           (el: AstNode) => !(el.propertyName ? isIdentifier(el.propertyName) && names.has(el.propertyName.text) : isIdentifier(el.name) && names.has(el.name.text))
         );
         stmt.importClause.namedBindings.elements = elements;
+      }
+      // export {X} from ... (a re-export: the binding no longer exists)
+      if (stmt.kind === 'ExportDeclaration' && (stmt.exportClause?.elements ?? []).length > 0) {
+        stmt.exportClause.elements = (stmt.exportClause.elements ?? []).filter(
+          (el: AstNode) => !(el.propertyName ? isIdentifier(el.propertyName) && names.has(el.propertyName.text) : isIdentifier(el.name) && names.has(el.name.text))
+        );
       }
     }
     ast.statements = ast.statements.filter(
@@ -3323,14 +3475,29 @@ function lowerSharedSymbolKeys(asts: AstNode[]): void {
   }
 }
 
-// Symbol('…') / Symbol() — the description is not observable through keys
+// Symbol('…') / Symbol() / Symbol.for('…') — the description is not
+// observable through keys
 function isSymbolCallExpression(node: AstNode | undefined): boolean {
+  if (!node || node.kind !== 'CallExpression') return false;
+  if (isIdentifier(node.expression) && node.expression.text === 'Symbol') {
+    return (node.arguments ?? []).every((a: AstNode) => isStringLiteral(a));
+  }
   return (
-    node?.kind === 'CallExpression' &&
-    isIdentifier(node.expression) &&
-    node.expression.text === 'Symbol' &&
-    (node.arguments ?? []).every((a: AstNode) => isStringLiteral(a))
+    isPropertyAccessExpression(node.expression) &&
+    isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'Symbol' &&
+    node.expression.name.text === 'for' &&
+    isStringLiteral((node.arguments ?? [])[0])
   );
+}
+
+// `const K: unique symbol = …` — the type alone says it is a key-only symbol
+function isUniqueSymbolDeclaration(decl: AstNode): boolean {
+  return decl.type?.kind === 'TypeOperator' && decl.type.operator === 'UniqueKeyword';
+}
+
+function isSymbolKeyDeclaration(decl: AstNode): boolean {
+  return isIdentifier(decl.name) && (isSymbolCallExpression(decl.initializer) || isUniqueSymbolDeclaration(decl));
 }
 
 // `Object.setPrototypeOf(this, X.prototype)` in a constructor: the workaround for
@@ -3565,6 +3732,16 @@ let targetGoos = 'linux';
 // Whether the file being parsed is .tsx
 let currentFileIsTsx = false;
 
+function emitOutsideNodes(): string {
+  const parts: string[] = [];
+  // a hoisted local class or function can be appended while another outside
+  // node's body is emitted: keep going until the list stops growing
+  for (let i = 0; i < outsideNodes.length; i++) {
+    parts.push(withLineMarker(outsideNodes[i], visit(outsideNodes[i], { isOutside: true })));
+  }
+  return parts.join('\n');
+}
+
 export function transpileToNative(code: string, options?: TranspileOptions): TranspileResult {
   fileResolver = options?.readFile ?? null;
   embedResolver = options?.resolveEmbed ?? null;
@@ -3686,6 +3863,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   classIteratorMethods.clear();
   seedNodeClassTables();
   declaredClasses.clear();
+  classAliases.clear();
   classParentNames.clear();
   classImplementedInterfaces.clear();
   functionsUsedAsValuesCache = undefined;
@@ -3695,6 +3873,8 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   primitiveEnumGoTypes.clear();
   helperProvidedPackages.clear();
   mainPackageVariables.length = 0;
+  hoistedBigInts.clear();
+  asciiStringGoVars.clear();
   keyOrderTables.clear();
   regexSites.clear();
   mergedUnionStructs.clear();
@@ -3728,6 +3908,36 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
         }
       }
     }
+  }
+  // Aliases of a class used as a base: `const B = A as …`, `class T extends B`
+  for (const mod of linkedModules.values()) {
+    for (const statement of mod.ast.statements ?? []) {
+      if (!isVariableStatement(statement)) continue;
+      for (const d of statement.declarationList?.declarations ?? []) {
+        if (!isIdentifier(d.name) || !d.initializer) continue;
+        let init = d.initializer;
+        while (
+          init.kind === 'ParenthesizedExpression' ||
+          init.kind === 'AsExpression' ||
+          init.kind === 'TypeAssertionExpression' ||
+          init.kind === 'SatisfiesExpression' ||
+          init.kind === 'NonNullExpression'
+        ) init = init.expression;
+        if (isIdentifier(init) && declaredClasses.has(init.text)) classAliases.set(d.name.text, init.text);
+      }
+    }
+  }
+  // (chained aliases: const C = B, const B = A)
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    for (const [alias, target] of classAliases) {
+      const resolved = classAliases.get(target);
+      if (resolved && resolved !== alias) {
+        classAliases.set(alias, resolved);
+        changed = true;
+      }
+    }
+    if (!changed) break;
   }
   for (const [className, declaration] of declaredClasses) {
     for (const clause of declaration.heritageClauses ?? []) {
@@ -3782,7 +3992,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
     }
   }
   const transpiledCode = visit(sourceFile, { addFunctionOutside: true });
-  const transpiledCodeOutside = outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n');
+  const transpiledCodeOutside = emitOutsideNodes();
   // Worker / fork files, including the ones they start in turn
   while (pendingEntryPoints.length > 0) {
     const entry = pendingEntryPoints.shift()!;
@@ -4111,7 +4321,10 @@ function visitScoped(node: AstNode, options: VisitNodeOptions = {}): string {
   if (node && node.kind === 'Identifier' && intLocalReads.has(node)) return `float64(${intLocalReads.get(node)!.name})`;
   // (const x = a & b in a block: an int32, see visitInt32Const)
   if (node && node.kind === 'VariableStatement') {
-    const int32Const = visitInt32Const(node);
+    // `declare const Buffer: …` names an ambient global: its value is the
+    // platform's (the built-in Buffer / TextDecoder), not a zero-value var
+    if (node.ambient) return '';
+    const int32Const = visitInt32Const(node) ?? visitInt32MutLocal(node) ?? visitSeqOrPullGenLocal(node);
     if (int32Const) return int32Const;
   }
   // (a generator call spread — [...g()], f(...g()) —: collected through its push form)
@@ -4382,7 +4595,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     return `float64(${node.text})`;
   } else if (node.kind === 'BigIntLiteral') {
     useHelper('bigint');
-    return `TnBigInt("${String(node.text).replace(/n$/, '')}")`;
+    return hoistBigIntLiteral(String(node.text));
   } else if (isToken(node) && node.kind === 'TrueKeyword') {
     return `true`;
   } else if (isToken(node) && node.kind === 'FalseKeyword') {
@@ -4497,8 +4710,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const targetType = inferExpressionType(node.expression);
     if (targetType === 'string') {
       // s[i] in JS is a one-character string ("" when out of range)
+      const strCode = visit(node.expression);
+      const asciiInfo = asciiStringGoVars.get(strCode);
+      if (asciiInfo) {
+        const idxExpr = numericIndex(node.argumentExpression);
+        if (asciiInfo.idxVar && idxExpr === `float64(${asciiInfo.idxVar})`) {
+          return `${strCode}[${asciiInfo.idxVar} : ${asciiInfo.idxVar}+1]`;
+        }
+        useHelper('strIndex');
+        return `TnAsciiCharAt(${strCode}, ${idxExpr})`;
+      }
       useHelper('dynamic');
-      return `TnCharAt(${visit(node.expression)}, ${numericIndex(node.argumentExpression)})`;
+      return `TnCharAt(${strCode}, ${numericIndex(node.argumentExpression)})`;
     }
     if (targetType?.startsWith('*TnMap[')) {
       return `${visit(node.expression)}.Get(${toGoValueOfType(node.argumentExpression, extractMapKeyType(targetType))})`;
@@ -4513,6 +4736,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     // Typed array elements read as numbers (out of range: 0); BigInt64Array's as bigints
     if ((isTypedArrayGoType(targetType) || isBigIntArrayGoType(targetType)) && !isAssignmentTarget(node)) {
+      const intIdx = isTypedArrayGoType(targetType) ? intIndexExpr(node.argumentExpression) : undefined;
+      if (intIdx) return `${visit(node.expression)}.GetInt(${intIdx})`;
       return `${visit(node.expression)}.Get(${visit(node.argumentExpression)})`;
     }
     // Buffer / Uint8Array elements read as numbers
@@ -4547,6 +4772,22 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // (stack traces are the runtime's own: a function that does nothing)
     return 'func(__args ...interface{}) {}';
   } else if (isPropertyAccessExpression(node)) {
+      // super.method() / super.getter: resolve before other handlers, some of
+      // which probe the receiver (a generic method's type arguments do)
+      if (node.expression.kind === 'SuperKeyword') {
+        const ownerClass = getEnclosingClassName(node);
+        const parentName = ownerClass ? classParentNames.get(ownerClass) : undefined;
+        if (ownerClass && mixinBaseOf.has(ownerClass) && isCallee(node)) return `self.__super.${visit(node.name)}`;
+        if (parentName) {
+          if (!isCallee(node) && !isAssignmentTarget(node) && classGetterMethods.has(`${parentName}.${node.name.text}`)) {
+            return `self.${goFieldName(parentName)}.Get_${visit(node.name)}()`;
+          }
+          const superMethod = abstractSuperMethod(ownerClass!, node.name.text);
+          if (superMethod) return `self.${superCopyName(superMethod.owner, node.name.text)}`;
+          return `self.${goFieldName(parentName)}.${visit(node.name)}`;
+        }
+        return visit(node.name);
+      }
       // a?.b.c (the chain goes on past the guard): all of it runs only if a is set
       if (!isCallee(node) && !isAssignmentTarget(node) && isOptionalChainContinuation(node)) {
         const continuation = visitOptionalChainContinuation(node);
@@ -5565,6 +5806,24 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     ) {
       const recvType = inferExpressionType(node.expression.expression);
       if (recvType?.startsWith('chan ')) {
+        // p.then(undefined, onRejected) is p.catch(onRejected)
+        const thenArgs = node.arguments ?? [];
+        const firstThenArg = thenArgs[0];
+        const firstIsNullish =
+          !firstThenArg ||
+          firstThenArg.kind === 'NullKeyword' ||
+          firstThenArg.kind === 'VoidExpression' ||
+          (isIdentifier(firstThenArg) && firstThenArg.text === 'undefined');
+        if (firstIsNullish && thenArgs[1]) {
+          useHelper('promise');
+          const rejected = thenArgs[1];
+          const rejectedCode = visit(rejected);
+          const handler =
+            (isArrowFunction(rejected) || isFunctionExpression(rejected)) && (rejected.parameters ?? []).length === 0
+              ? `func(_ interface{}) { (${rejectedCode})() }`
+              : rejectedCode;
+          return `TnPromiseCatch(${visit(node.expression.expression)}, ${handler})`;
+        }
         const elemType = recvType.slice(5) || 'interface{}';
         const cb = (node.arguments ?? [])[0];
         if (cb && (isArrowFunction(cb) || isFunctionExpression(cb))) {
@@ -5585,22 +5844,22 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         useHelper('eventLoop');
         // A callback without parameters (then(() => …)) takes no value
         const takesValue = !(cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && (cb.parameters ?? []).length === 0);
-        const receive = takesValue
-          ? `__received, __ok := TnLoopReceive(__tnP); __v, __reason, __rejected := tnSettled(__tnP, __received, __ok); _ = __reason`
-          : `__received, __ok := TnLoopReceive(__tnP); _, __reason, __rejected := tnSettled(__tnP, __received, __ok); _ = __reason`;
         const invoke = takesValue ? `(${cbExpr})(__v)` : `(${cbExpr})()`;
         // (used as a value — proms.push(p.then(cb)) —: the promise of the
         // callback's result, a channel that receives it once the callback ran)
         if (!isExpressionStatement(unwrapParenthesesUp(node).parent)) {
           const returns = !!cb && (isArrowFunction(cb) || isFunctionExpression(cb)) && !!inferFunctionBodyReturnType(cb);
           const outType = thenResultType(node)?.slice(5) ?? 'interface{}';
-          const settle = returns ? `TnAsyncSend(__out, ${invoke})` : `${invoke}; TnResolveZero(__out)`;
-          return `func(__tnP ${recvType}) chan ${outType} {\n\t\t__out := make(chan ${outType}, 1)\n\t\t__tnWaitGroup.Add(1)\n\t\tTnStartAsync(func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\tdefer TnAsyncClose(__out)\n\t\t\tdefer TnRejectOnPanic(__out)\n\t\t\t${receive}\n\t\t\tif __rejected {\n\t\t\t\ttnRejections.Store(__out, __reason)\n\t\t\t\treturn\n\t\t\t}\n\t\t\t${settle}\n\t\t})\n\t\treturn __out\n\t}(${recv})`;
+          const body = returns ? `return ${invoke}` : `${invoke}; var __zero ${outType}; return __zero`;
+          return `TnPromiseThen[${elemType}, ${outType}](${recv}, func(__v ${elemType}) ${outType} { _ = __v; ${body} })`;
         }
         // The promise expression is evaluated now, with the baton (exec()
         // registering its listeners off the loop would race it); the callback
         // runs as a microtask once the promise settles
-        return `func(__tnP ${recvType}) {\n\t\t__tnWaitGroup.Add(1)\n\t\tTnStartAsync(func() {\n\t\t\tdefer __tnWaitGroup.Done()\n\t\t\t${receive}\n\t\t\tif __rejected {\n\t\t\t\treturn\n\t\t\t}\n\t\t\t${invoke}\n\t\t})\n\t}(${recv})`;
+        if (takesValue) {
+          return `TnPromiseThenVoid(${recv}, func(__v ${elemType}) { ${invoke} })`;
+        }
+        return `TnPromiseThenVoid0(${recv}, func() { ${invoke} })`;
       }
     }
     // Array.from(arrayLike, mapFn) — array-likes are { length } structs
@@ -5807,7 +6066,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // -10n / -x on bigints (*big.Int)
     if (node.operator === 'MinusToken' && node.operand.kind === 'BigIntLiteral') {
       useHelper('bigint');
-      return `TnBigInt("-${String(node.operand.text).replace(/n$/, '')}")`;
+      return hoistBigIntLiteral(`-${String(node.operand.text)}`);
     }
     if (node.operator === 'MinusToken' && inferExpressionType(node.operand) === '*tnbig.Int') {
       return `new(tnbig.Int).Neg(${visit(node.operand)})`;
@@ -6048,6 +6307,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     const bitwise = visitBitwise(node, op);
     if (bitwise) return bitwise;
+    if (op === '=' && int32MutWrites.has(node)) {
+      const targetName = int32MutWrites.get(node)!;
+      return `${targetName} = ${int32Operand(node.right)}`;
+    }
     // BigInt arithmetic and comparisons (*big.Int)
     const bigLeft = inferExpressionType(node.left);
     const bigRight = inferExpressionType(node.right);
@@ -6120,6 +6383,25 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         return `${bl} = new(tnbig.Int).${compound[op]}(${bl}, ${br})`;
       }
       if (op === '**=' && bigLeft === '*tnbig.Int') return `${bl} = new(tnbig.Int).Exp(${bl}, ${br}, nil)`;
+      // Fast bit-0 test: (e & 1n) === 1n / (e & 1n) === 0n / (e & 1n) !== 0n
+      if (op === '==' || op === '!=') {
+        const leftU = unwrapParentheses(node.left);
+        const rightTxt = bigIntLiteralText(node.right);
+        if ((rightTxt === '0' || rightTxt === '1') && isBinaryExpression(leftU) && leftU.operatorToken.kind === 'AmpersandToken' && bigIntLiteralText(leftU.right) === '1' && inferExpressionType(leftU.left) === '*tnbig.Int') {
+          const target = visit(leftU.left);
+          return `${target}.Bit(0) ${op} ${rightTxt}`;
+        }
+      }
+      // Fast zero comparisons: x.Sign() instead of x.Cmp(__tnBig_0)
+      const leftTxt = bigIntLiteralText(node.left);
+      const rightTxt = bigIntLiteralText(node.right);
+      if (rightTxt === '0' && ['==', '!=', '<', '>', '<=', '>='].includes(op)) {
+        return `${bl}.Sign() ${op} 0`;
+      }
+      if (leftTxt === '0' && ['==', '!=', '<', '>', '<=', '>='].includes(op)) {
+        const flip: Record<string, string> = { '==': '==', '!=': '!=', '<': '>', '>': '<', '<=': '>=', '>=': '<=' };
+        return `${br}.Sign() ${flip[op]} 0`;
+      }
       if (op === '==') return `${bl}.Cmp(${br}) == 0`;
       if (op === '!=') return `${bl}.Cmp(${br}) != 0`;
       if (op === '<') return `${bl}.Cmp(${br}) < 0`;
@@ -6127,11 +6409,12 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (op === '<=') return `${bl}.Cmp(${br}) <= 0`;
       if (op === '>=') return `${bl}.Cmp(${br}) >= 0`;
       useHelper('bigint');
-    if (op === '+') return `new(tnbig.Int).Add(${bl}, ${br})`;
-      if (op === '-') return `new(tnbig.Int).Sub(${bl}, ${br})`;
-      if (op === '*') return `new(tnbig.Int).Mul(${bl}, ${br})`;
-      if (op === '/') return `new(tnbig.Int).Div(${bl}, ${br})`;
-      if (op === '%') return `new(tnbig.Int).Rem(${bl}, ${br})`;
+      const freshLeft = isFreshBigIntExpr(node.left);
+      if (op === '+') return freshLeft ? `tnBigAddIn(${bl}, ${br})` : `new(tnbig.Int).Add(${bl}, ${br})`;
+      if (op === '-') return freshLeft ? `tnBigSubIn(${bl}, ${br})` : `new(tnbig.Int).Sub(${bl}, ${br})`;
+      if (op === '*') return freshLeft ? `tnBigMulIn(${bl}, ${br})` : `new(tnbig.Int).Mul(${bl}, ${br})`;
+      if (op === '/') return freshLeft ? `tnBigDivIn(${bl}, ${br})` : `new(tnbig.Int).Div(${bl}, ${br})`;
+      if (op === '%') return freshLeft ? `tnBigRemIn(${bl}, ${br})` : `new(tnbig.Int).Rem(${bl}, ${br})`;
       if (op === '**') return `new(tnbig.Int).Exp(${bl}, ${br}, nil)`;
     }
     // number | undefined operands: undefined reads as NaN (`w > 0` is false)
@@ -6569,7 +6852,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         }
         useHelper('eventLoop');
         const forwarded = elementType === yieldType ? '__yv' : yieldType === 'interface{}' ? 'interface{}(__yv)' : `TnAs[${yieldType}](interface{}(__yv))`;
-        return `for {\n\t\t\t__yv, __ok := tnRawReceive(${visit(node.expression)})\n\t\t\tif !__ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${forwarded})\n\t\t}`;
+        return `for {\n\t\t\t__yv, __ok := tnRawReceiveAsync(${visit(node.expression)})\n\t\t\tif !__ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tTnAsyncYield(${asyncChannelVar}, ${forwarded})\n\t\t}`;
       }
       const yielded = node.expression
         ? toGoValueOfType(node.expression, yieldType)
@@ -6608,7 +6891,18 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       useHelper('dynamic');
       return `TnAwaitValue(interface{}(${visit(node.expression)}), ${awaitFn === 'TnAwaitInline'})`;
     }
-    return `${awaitFn}(${visit(node.expression)})`;
+    const exprCode = visit(node.expression);
+    if (awaitFn === 'TnAwait') {
+      if (exprCode.startsWith('TnPromiseAll(') && exprCode.endsWith(')')) {
+        return `TnAwaitAll(${exprCode.slice('TnPromiseAll('.length)}`;
+      }
+      const directCall = asyncDirectAwaitCall(node.expression, exprCode);
+      if (directCall) {
+        const resType = awaitedType.slice(5) || 'interface{}';
+        return `func() ${resType} {\n\t\tif tnCanDirectAwait() {\n\t\t\t__r := ${directCall}\n\t\t\ttnYieldMicrotaskFast()\n\t\t\treturn __r\n\t\t}\n\t\treturn TnAwait(${exprCode})\n\t}()`;
+      }
+    }
+    return `${awaitFn}(${exprCode})`;
   } else if (isVariableDeclarationList(node)) {
     // const x = f(op), op converted to the parameter's object type (a copy)
     // and f changing its fields: the changes are copied back (flat: the
@@ -6698,6 +6992,40 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   } else if (isForStatement(node)) {
     const multi = visitMultiForHeader(node);
     if (multi) return multi;
+    const asciiCand = asciiLoopCandidate(node, node.condition, node.statement);
+    if (asciiCand) {
+      useHelper('strIndex');
+      const idxVar = asciiCand.counterName && intLocalReadsIn(asciiCand.counterName, [node.condition, node.statement].filter(Boolean))
+        ? getSafeName(asciiCand.counterName)
+        : undefined;
+      // Fast ASCII branch
+      asciiStringGoVars.set(asciiCand.goStr, { idxVar });
+      let fastLoop: string;
+      const customReads: AstNode[] = [];
+      if (idxVar && asciiCand.counterStep === 1) {
+        fastLoop = visitIntCounterFor(node) ?? `for ${node.initializer ? forHeaderInit(visit(node.initializer, { inline: true })) : ''}; ${node.condition ? toGoCondition(node.condition) : ''}; ${node.incrementor ? visit(node.incrementor, { inline: true }) : ''}${visitLoopBody(node.statement)}`;
+      } else if (idxVar && asciiCand.counterName && asciiCand.counterInit !== undefined && asciiCand.counterStep !== undefined) {
+        const reads = intLocalReadsIn(asciiCand.counterName, [node.condition, node.statement].filter(Boolean));
+        if (reads) {
+          for (const r of reads) {
+            intLocalReads.set(r, { name: idxVar, kind: 'int' });
+            customReads.push(r);
+          }
+          fastLoop = `for ${idxVar} := ${asciiCand.counterInit}; ${idxVar} < len(${asciiCand.goStr}); ${idxVar} += ${asciiCand.counterStep}${visitLoopBody(node.statement)}`;
+        } else {
+          fastLoop = `for ${node.initializer ? forHeaderInit(visit(node.initializer, { inline: true })) : ''}; ${node.condition ? toGoCondition(node.condition) : ''}; ${node.incrementor ? visit(node.incrementor, { inline: true }) : ''}${visitLoopBody(node.statement)}`;
+        }
+      } else {
+        fastLoop = `for ${node.initializer ? forHeaderInit(visit(node.initializer, { inline: true })) : ''}; ${node.condition ? toGoCondition(node.condition) : ''}; ${node.incrementor ? visit(node.incrementor, { inline: true }) : ''}${visitLoopBody(node.statement)}`;
+      }
+      for (const r of customReads) intLocalReads.delete(r);
+      asciiStringGoVars.delete(asciiCand.goStr);
+      // General UTF-16 / rune fallback branch
+      const slowLoop = visitIntCounterFor(node) ?? `for ${node.initializer ? forHeaderInit(visit(node.initializer, { inline: true })) : ''}; ${
+        node.condition ? toGoCondition(node.condition) : ''
+      }; ${node.incrementor ? visit(node.incrementor, { inline: true }) : ''}${visitLoopBody(node.statement)}`;
+      return `if tnStrASCII(${asciiCand.goStr}) {\n\t\t${fastLoop}\n\t} else {\n\t\t${slowLoop}\n\t}\n`;
+    }
     const intCounter = visitIntCounterFor(node);
     if (intCounter) return intCounter;
     // (`for (i; …)`: an initializer that is a bare name does nothing)
@@ -6827,6 +7155,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         inline: true
       })}) {\n\t\t\tbreak\n\t\t}\n\t\t`;
       return `for ${visitLoopBody(node.statement, prefix)}`;
+    }
+    const asciiWhile = asciiLoopCandidate(node, node.expression, node.statement);
+    if (asciiWhile) {
+      useHelper('strIndex');
+      asciiStringGoVars.set(asciiWhile.goStr, {});
+      const fastWhile = `for ${toGoCondition(node.expression)}${visitLoopBody(node.statement)}`;
+      asciiStringGoVars.delete(asciiWhile.goStr);
+      const slowWhile = `for ${toGoCondition(node.expression)}${visitLoopBody(node.statement)}`;
+      return `if tnStrASCII(${asciiWhile.goStr}) {\n\t\t${fastWhile}\n\t} else {\n\t\t${slowWhile}\n\t}\n`;
     }
     return `for ${toGoCondition(node.expression)}${visitLoopBody(node.statement)}`;
   } else if (isDoStatement(node)) {
@@ -6974,7 +7311,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if (asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode) {
       const inTryReturn = tryReturn && getEnclosingFunction(node) === tryReturn.fn;
       const genExit = inTryReturn ? tryAwareReturn('') : 'return';
-      if (!node.expression) return genExit + (options.inline ? '' : ';\n\t');
+      if (!node.expression) return (asyncDirectReturn ? 'return' : genExit) + (options.inline ? '' : ';\n\t');
       // An async return settles its promise (ordered wake); a generator's
       // sends stay raw (their consumers receive raw)
       if (asyncChannelIsAsync) {
@@ -6996,7 +7333,10 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           useHelper('dynamic');
           returned = `TnAs[${chanType}](interface{}(${returned}))`;
         }
-        return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); return` + (options.inline ? '' : ';\n\t');
+        if (asyncDirectReturn) {
+          return `return ${returned}` + (options.inline ? '' : ';\n\t');
+        }
+        return `TnAsyncSend[${chanType}](${asyncChannelVar}, ${returned}); __done = true; return` + (options.inline ? '' : ';\n\t');
       }
       const isAsyncGen = (asyncFunctionNode?.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword');
       if (isAsyncGen) {
@@ -7141,8 +7481,9 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
 
     const name = visit(node.name, { inline: true });
     const safeName = getSafeName(name);
+    const bodyPrefix = int32ParamPrologue(node, parameterInfo);
     const literal = `func${typeParams}(${parameterInfo.signature})${returnType} ${visit(node.body!, {
-      prefixBlockContent: parameterInfo.prefixBlockContent
+      prefixBlockContent: bodyPrefix
     }).trimEnd()}`;
     if (isFunctionExpression(node)) {
       // A named function expression is a value; its name is visible only in
@@ -7347,6 +7688,15 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       registerClassMembers(node);
       return visitClassDecorators(node);
     }
+    // A class declared inside a function or block (compiled JS does this):
+    // Go has no local types with methods, so hoist the declaration to the
+    // module and leave the statement position empty.
+    const classParentKind = node.parent?.kind;
+    if (!options.isOutside && classParentKind && classParentKind !== 'SourceFile' && classParentKind !== 'ModuleBlock') {
+      registerClassMembers(node);
+      outsideNodes.push(node);
+      return visitClassDecorators(node);
+    }
 
     const name = visit(node.name!);
     emittedClasses.add(name);
@@ -7359,7 +7709,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     if ((node.heritageClauses ?? [])) {
       for (const clause of (node.heritageClauses ?? [])) {
         if (clause.token === 'ExtendsKeyword') {
-          parentClass = nodeParentGoName(clause.types[0].expression) || visit(clause.types[0].expression);
+          const parentExpr = clause.types[0].expression;
+          // (a base reached through a const alias: class T extends LongWithoutOverridesClass)
+          let aliasExpr = parentExpr;
+          while (
+            aliasExpr.kind === 'ParenthesizedExpression' ||
+            aliasExpr.kind === 'AsExpression' ||
+            aliasExpr.kind === 'NonNullExpression'
+          ) aliasExpr = aliasExpr.expression;
+          const aliasTarget = isIdentifier(aliasExpr) ? classAliases.get(aliasExpr.text) : undefined;
+          parentClass = nodeParentGoName(parentExpr) || aliasTarget || visit(parentExpr);
         }
       }
     }
@@ -7391,7 +7750,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       // static properties are package-level Class_name variables, not fields
       // (an abstract one is no field either: the subclasses declare it, as a
       // field or an accessor)
-      if (isPropertyDeclaration(member) && !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword' || m.kind === 'AbstractKeyword')) {
+      if (isPropertyDeclaration(member) && !hasModifier(member, 'DeclareKeyword') && !(member.modifiers ?? []).some((m: AstNode) => m.kind === 'StaticKeyword' || m.kind === 'AbstractKeyword')) {
         const rawFieldName =
           member.name?.kind === 'PrivateIdentifier'
             ? privateGoName(member.name.text)
@@ -7456,11 +7815,25 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // init plus the field initializers
     const isSuperCoveredIf = (s: AstNode): boolean => {
       if (!isIfStatement(s) || !s.elseStatement) return false;
-      const startsWithSuper = (branch: AstNode): boolean => {
-        const first = isBlock(branch) ? (branch.statements ?? [])[0] : branch;
-        return !!first && (isCtorSuperCall(first) || (isIfStatement(first) && isSuperCoveredIf(first)));
+      const branchCovers = (branch: AstNode): boolean => {
+        // an else-if chain: every one of its branches must cover
+        if (isIfStatement(branch) && branch.elseStatement) {
+          return branchCovers(branch.thenStatement) && branchCovers(branch.elseStatement);
+        }
+        // a branch may validate its arguments before calling super(), as
+        // compiled JS does; exactly one super call on the branch's path.
+        // A branch that only throws never reaches construction and needs none.
+        let supers = 0;
+        let throws = 0;
+        const countSupers = (node: AstNode): void => {
+          if (isCtorSuperCall(node)) supers += 1;
+          if (node.kind === 'ThrowStatement') throws += 1;
+          for (const child of childNodes(node)) countSupers(child);
+        };
+        countSupers(branch);
+        return supers === 1 || (supers === 0 && throws > 0);
       };
-      return startsWithSuper(s.thenStatement) && startsWithSuper(s.elseStatement);
+      return branchCovers(s.thenStatement) && branchCovers(s.elseStatement);
     };
     const hasNestedSuperCall = (node: AstNode): boolean =>
       containsNode(node, (n: AstNode) => isCtorSuperCall(n));
@@ -7509,6 +7882,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // (converted to the parent constructor's parameter types)
         const parentParams = !nodeParentClassKeys.has(parentClass ?? '') && parentClass ? constructorParameterNodes(parentClass) : [];
         const args = (call.arguments ?? []).map((a: AstNode, i: number) => {
+          // super(...args): forward the slice to a variadic parent constructor
+          if (isSpreadElement(a)) return `${visit(a.expression)}...`;
           const param = parentParams[i];
           // (an optional array passes its reference: nil is undefined)
           if (param?.initializer && isIdentifier(a) && referenceArrays.has(a.text)) return getSafeName(a.text);
@@ -7738,9 +8113,20 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         // (a method returning one of its array arguments returns a reference)
         const returnType = ownReturnType ? ` ${returnsArrayReference(member) ? '*' : ''}${ownReturnType}` : '';
         const isStatic = member.modifiers?.some((m) => m.kind === 'StaticKeyword');
-        if (!member.body) continue; // abstract method — implemented by subclasses
-        // (only reachable via subclasses, which copy it; super.m() runs a copy too)
-        if (isAbstractClass && !isStatic) continue;
+        if (!member.body) {
+          // an abstract method: subclasses implement it. A stub on the base
+          // keeps calls made through the base type compiling; a concrete
+          // instance always dispatches to its own method.
+          if (isAbstractClass && !isStatic) {
+            const params = getFunctionParametersInfo(member.parameters ?? []);
+            useHelper('error');
+            if (!emittedMethodNames.has(methodName)) {
+              result += `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${params.signature})${returnType} { panic(TnNodeError("TypeError", "", "self.${methodName} is not a function")) }\n\n`;
+              emittedMethodNames.add(methodName);
+            }
+          }
+          continue;
+        }
         const isAsyncMethod = (member.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword');
         if (getDecorators(member).length > 0) {
           result += emitDecoratedMethod(name, typeParamNames, member, name);
@@ -7786,10 +8172,19 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
             : `${lineMarker(member)}func (self *${name}${typeParamNames}) ${methodName}(${fullSignature})${returnType} ${body}\n\n`;
         }
       } else if (isGetAccessor(member) || isSetAccessor(member)) {
-        result +=
-          getDecorators(member).length > 0
-            ? emitDecoratedAccessor(name, typeParamNames, member, name)
-            : emitAccessor(member, `${name}${typeParamNames}`, mockSlots);
+        if (!member.body && isAbstractClass && isGetAccessor(member)) {
+          // an abstract getter: subclasses implement it; the base's own methods
+          // (and calls through the base type) need a definition to compile
+          const accessorName = isIdentifier(member.name) ? goFieldName(member.name.text) : visit(member.name);
+          const returnType = member.type ? getType(member.type) : 'interface{}';
+          useHelper('error');
+          result += `${lineMarker(member)}func (self *${name}${typeParamNames}) Get_${accessorName}() ${returnType} { panic(TnNodeError("TypeError", "", "self.${accessorName} is not a function")) }\n\n`;
+        } else {
+          result +=
+            getDecorators(member).length > 0
+              ? emitDecoratedAccessor(name, typeParamNames, member, name)
+              : emitAccessor(member, `${name}${typeParamNames}`, mockSlots);
+        }
       } else if (isAutoAccessor(member)) {
         result += emitAutoAccessor(name, typeParamNames, member, name);
       }
@@ -8231,8 +8626,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
   }
 
   const syntaxKind = node.kind;
-  if (!['VariableStatement', 'EndOfFileToken'].includes(syntaxKind)) {
-    // The Go output would be incomplete: an error, not a guess (its children
+  if (!['VariableStatement', 'EndOfFileToken'].includes(syntaxKind)) {    // The Go output would be incomplete: an error, not a guess (its children
     // are not visited, which would only report follow-on errors)
     reportError(node, `Unsupported syntax: ${syntaxKind}`);
     return '';
@@ -9644,8 +10038,12 @@ function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
       return `TnJSString(${peekRead(visit(side))})`;
     }
     useHelper('dynamic');
+    const raw = peekRead(visit(side));
     // - * / % convert with ToNumber ('6' - 1, date - date); + keeps the number cast
-    return op === '+' || op === '+=' ? `TnAs[float64](${visit(side)})` : `TnNumber(${visit(side)})`;
+    if ((op === '+' || op === '+=') && raw.startsWith('TnDynamicAdd(') && goParenEnd(raw, 'TnDynamicAdd'.length) === raw.length - 1) {
+      return `TnDynamicAddFloat(${raw.slice('TnDynamicAdd('.length, -1)})`;
+    }
+    return op === '+' || op === '+=' ? `TnAs[float64](${raw})` : `TnNumber(${raw})`;
   };
   // Two dynamic operands: + decides at run time, as in JS
   if ((op === '+' || op === '+=') && leftDynamic && rightDynamic && !isConcat) {
@@ -10108,18 +10506,40 @@ function visitBitwise(node: AstNode, op: string): string | undefined {
       return t === 'interface{}' || t === 'any' || !t ? `TnAs[*tnbig.Int](${code})` : code;
     };
     const bl = asBig(node.left);
-    const br = asBig(node.right);
+    const shiftConst = (bitOp === '<<' || bitOp === '>>') ? bigIntSmallUint(node.right) : undefined;
+    const br = shiftConst !== undefined ? '' : asBig(node.right);
     const methods: Record<string, string> = { '&': 'And', '|': 'Or', '^': 'Xor' };
     let bigValue: string;
     if (methods[bitOp]) bigValue = `new(tnbig.Int).${methods[bitOp]}(${bl}, ${br})`;
-    else if (bitOp === '<<') bigValue = `TnBigShift(${bl}, ${br})`;
-    else if (bitOp === '>>') bigValue = `TnBigShift(${bl}, new(tnbig.Int).Neg(${br}))`;
-    else bigValue = `func() *tnbig.Int { panic(TnNodeError("TypeError", "", "BigInts have no unsigned right shift, use >> instead")) }()`;
+    else if (bitOp === '<<') {
+      const lhsTxt = !isAssignment ? bigIntLiteralText(node.left) : undefined;
+      if (lhsTxt !== undefined && shiftConst !== undefined && shiftConst <= 4096) {
+        const key = `${lhsTxt}<<${shiftConst}`;
+        let name = hoistedBigInts.get(key);
+        if (!name) {
+          name = `__tnBig_${hoistedBigInts.size}`;
+          hoistedBigInts.set(key, name);
+          mainPackageVariables.push(`var ${name} = new(tnbig.Int).Lsh(${hoistBigIntLiteral(lhsTxt)}, ${shiftConst})`);
+        }
+        bigValue = name;
+      } else if (shiftConst !== undefined) {
+        bigValue = `new(tnbig.Int).Lsh(${bl}, ${shiftConst})`;
+      } else {
+        bigValue = `TnBigShift(${bl}, ${br})`;
+      }
+    } else if (bitOp === '>>') {
+      bigValue = shiftConst !== undefined ? `new(tnbig.Int).Rsh(${bl}, ${shiftConst})` : `TnBigShift(${bl}, new(tnbig.Int).Neg(${br}))`;
+    } else bigValue = `func() *tnbig.Int { panic(TnNodeError("TypeError", "", "BigInts have no unsigned right shift, use >> instead")) }()`;
     if (bitOp === '>>>') useHelper('error');
     return isAssignment ? `${bl} = ${bigValue}` : bigValue;
   }
   useHelper('dynamic');
   if (isAssignment) {
+    const mutTarget = int32MutWrites.get(node);
+    if (mutTarget) {
+      const res = bitwiseInt(node, bitOp, mutTarget, true);
+      return `${mutTarget} = ${res.unsigned ? `int32(${res.code})` : res.code}`;
+    }
     const left = asFloatOperand(node.left, visit(node.left));
     return `${left} = float64(${bitwiseInt(node, bitOp, left).code})`;
   }
@@ -10143,6 +10563,165 @@ const bitwiseOps: Record<string, string> = {
 // every read is an operand of arithmetic, a comparison, a bitwise operator,
 // an index or a template, so no other emitter sees the Go integer.
 const intLocalReads = new WeakMap<AstNode, { name: string; kind: 'int' | 'int32' }>();
+const int32MutWrites = new WeakMap<AstNode, string>();
+
+const BITWISE_ASSIGN_KINDS = new Set([
+  'AmpersandEqualsToken', 'BarEqualsToken', 'CaretEqualsToken',
+  'LessThanLessThanEqualsToken', 'GreaterThanGreaterThanEqualsToken', 'GreaterThanGreaterThanGreaterThanEqualsToken'
+]);
+
+function isMathImulCall(n: AstNode | undefined): boolean {
+  if (!n) return false;
+  const e = unwrapParentheses(n);
+  return isCallExpression(e) && isPropertyAccessExpression(e.expression) && isIdentifier(e.expression.expression) &&
+    e.expression.expression.text === 'Math' && e.expression.name.text === 'imul' && (e.arguments ?? []).length === 2;
+}
+
+function isInt32ProducingExpr(n: AstNode | undefined): boolean {
+  if (!n) return false;
+  const e = unwrapParentheses(n);
+  if (isMathImulCall(e)) return true;
+  if (literalInt32(e) !== undefined) return true;
+  if (isPrefixUnaryExpression(e) && e.operator === 'TildeToken') return true;
+  if (isBinaryExpression(e) && bitwiseOps[e.operatorToken.kind]) {
+    return inferExpressionType(e.left) !== '*tnbig.Int' && inferExpressionType(e.right) !== '*tnbig.Int';
+  }
+  return false;
+}
+
+// Finds all reads and writes of a bitwise-only mutable int32 variable/param in
+// `scopes`: every read is a bitwise or Math.imul operand, every write is a
+// bitwise compound assignment or assignment of an int32-producing expression,
+// and no nested function or redeclaration touches the name.
+function bitwiseMutVarIn(name: string, scopes: AstNode[]): { reads: AstNode[]; writes: AstNode[] } | undefined {
+  const reads: AstNode[] = [];
+  const writes: AstNode[] = [];
+  let ok = true;
+  const walk = (n: AstNode | undefined, depth: number): void => {
+    if (!n || !ok) return;
+    if (isFunctionDeclaration(n) || isFunctionExpression(n) || isArrowFunction(n) || isMethodDeclaration(n)) {
+      // Do not unbox if captured by a nested closure
+      walkChildren(n, depth + 1);
+      return;
+    }
+    if (isIdentifier(n) && n.text === name) {
+      const parent = n.parent;
+      if (parent && (isPropertyAccessExpression(parent) && parent.name === n || parent.kind === 'PropertyAssignment' && parent.name === n ||
+        (isMethodDeclaration(parent) || isPropertyDeclaration(parent) || isGetAccessor(parent) || parent.kind === 'SetAccessor' || parent.kind === 'PropertySignature' || parent.kind === 'MethodSignature') && parent.name === n)) return;
+      if (depth > 0) {
+        ok = false;
+        return;
+      }
+      let child: AstNode = n;
+      let up = parent;
+      while (up && isParenthesizedExpression(up)) {
+        child = up;
+        up = up.parent;
+      }
+      if (up && isBinaryExpression(up) && up.left === child) {
+        if (BITWISE_ASSIGN_KINDS.has(up.operatorToken.kind)) {
+          // Statement-level compound assignment only (its value is not used as float64)
+          if (up.parent && up.parent.kind === 'ExpressionStatement') {
+            writes.push(up);
+            return;
+          }
+          ok = false;
+          return;
+        }
+        if (up.operatorToken.kind === 'EqualsToken') {
+          if (up.parent && up.parent.kind === 'ExpressionStatement' && isInt32ProducingExpr(up.right)) {
+            writes.push(up);
+            return;
+          }
+          ok = false;
+          return;
+        }
+      }
+      const isBitwiseRead = !!up && (
+        (isBinaryExpression(up) && !!bitwiseOps[up.operatorToken.kind]) ||
+        (isBinaryExpression(up) && BITWISE_ASSIGN_KINDS.has(up.operatorToken.kind) && up.right === child) ||
+        (isPrefixUnaryExpression(up) && up.operator === 'TildeToken') ||
+        (isMathImulCall(up) && (up.arguments?.[0] === child || up.arguments?.[1] === child))
+      );
+      if (!isBitwiseRead) {
+        ok = false;
+        return;
+      }
+      reads.push(n);
+      return;
+    }
+    if ((n.kind === 'VariableDeclaration' || n.kind === 'Parameter' || isFunctionDeclaration(n) || isClassDeclaration(n) || n.kind === 'BindingElement') && n.name && isIdentifier(n.name) && n.name.text === name) {
+      ok = false;
+      return;
+    }
+    walkChildren(n, depth);
+  };
+  const walkChildren = (n: AstNode, depth: number): void => {
+    for (const key of Object.keys(n)) {
+      if (key === 'parent') continue;
+      const v = (n as any)[key];
+      if (Array.isArray(v)) {
+        for (const c of v) if (c && typeof c === 'object' && typeof c.kind === 'string') walk(c, depth);
+      } else if (v && typeof v === 'object' && typeof v.kind === 'string') walk(v, depth);
+    }
+  };
+  for (const s of scopes) walk(s, 0);
+  return ok && writes.length > 0 ? { reads, writes } : undefined;
+}
+
+// Emits a Go int32 expression for a Math.imul or bitwise operand (folding literals & nested ops)
+function int32Operand(node: AstNode): string {
+  const c = literalInt32(node);
+  if (c !== undefined) return `int32(${c})`;
+  const n = nestedBitwise(node);
+  if (n) return n.unsigned ? `int32(${n.code})` : n.code;
+  return `TnInt32(${asFloatOperand(node, visit(node))})`;
+}
+
+// Mutable int32 local: `let h = 0x811c9dc5;` in a block where every read/write is bitwise or Math.imul
+function visitInt32MutLocal(node: AstNode): string | undefined {
+  const list = node.declarationList;
+  if (!list || list.declarationKind !== 'let' || (list.declarations ?? []).length !== 1) return undefined;
+  const block = node.parent;
+  if (!block || (block.kind !== 'Block' && block.kind !== 'CaseClause' && block.kind !== 'DefaultClause')) return undefined;
+  const decl = list.declarations[0];
+  if (!isIdentifier(decl.name) || decl.type || !decl.initializer) return undefined;
+  const init = unwrapParentheses(decl.initializer);
+  if (!isInt32ProducingExpr(init)) return undefined;
+  const name: string = decl.name.text;
+  const statements: AstNode[] = block.statements ?? [];
+  const at = statements.indexOf(node);
+  if (at < 0) return undefined;
+  if (intLocalReadsIn(name, statements.slice(0, at)) === undefined) return undefined;
+  const info = bitwiseMutVarIn(name, statements.slice(at + 1));
+  if (!info) return undefined;
+  const goName = getSafeName(name);
+  variableGoTypes.set(name, 'float64');
+  const initCode = int32Operand(init);
+  for (const r of info.reads) intLocalReads.set(r, { name: goName, kind: 'int32' });
+  for (const w of info.writes) int32MutWrites.set(w, goName);
+  return `${goName} := ${initCode};\n\t_ = ${goName};\n\t`;
+}
+
+// Bitwise-only float64 parameters of a plain function: unboxed once into int32 locals on entry
+function int32ParamPrologue(fn: AstNode, parameterInfo: { signature: string; prefixBlockContent: string }): string {
+  if (!fn.body || !isBlock(fn.body)) return parameterInfo.prefixBlockContent;
+  let extra = '';
+  for (const p of fn.parameters ?? []) {
+    if (!isIdentifier(p.name) || p.dotDotDotToken || p.initializer || p.questionToken) continue;
+    const name: string = p.name.text;
+    if (getParameterGoType(p) !== 'float64') continue;
+    const info = bitwiseMutVarIn(name, [fn.body]);
+    if (!info) continue;
+    useHelper('dynamic');
+    const goName = getSafeName(name);
+    const localName = `__${goName}_i32`;
+    for (const r of info.reads) intLocalReads.set(r, { name: localName, kind: 'int32' });
+    for (const w of info.writes) int32MutWrites.set(w, localName);
+    extra += `${localName} := TnInt32(${goName})\n\t_ = ${localName}\n\t`;
+  }
+  return parameterInfo.prefixBlockContent + extra;
+}
 
 const INT_LOCAL_OPERATORS = new Set([
   'PlusToken', 'MinusToken', 'AsteriskToken', 'SlashToken', 'PercentToken', 'AsteriskAsteriskToken',
@@ -10173,6 +10752,7 @@ function intLocalReadsIn(name: string, scopes: AstNode[], skip?: AstNode): AstNo
       const safe = !!up && (
         (isBinaryExpression(up) && INT_LOCAL_OPERATORS.has(up.operatorToken.kind)) ||
         (isElementAccessExpression(up) && up.argumentExpression === child) ||
+        (isCallExpression(up) && isPropertyAccessExpression(up.expression) && ['charCodeAt', 'charAt', 'codePointAt'].includes(up.expression.name.text) && up.arguments?.[0] === child) ||
         up.kind === 'TemplateSpan' ||
         (isPrefixUnaryExpression(up) && ['MinusToken', 'PlusToken', 'TildeToken'].includes(up.operator))
       );
@@ -10262,6 +10842,22 @@ function nestedBitwise(side: AstNode): { code: string; unsigned: boolean } | und
   // (an integer local: its Go integer)
   const intLocal = isIdentifier(side) ? intLocalReads.get(side) : undefined;
   if (intLocal) return { code: intLocal.kind === 'int32' ? intLocal.name : `int32(${intLocal.name})`, unsigned: false };
+  // (Math.imul(a, b): int32 product directly, no float64 round trip)
+  if (isMathImulCall(side)) {
+    useHelper('dynamic');
+    return { code: `(${int32Operand(side.arguments[0])} * ${int32Operand(side.arguments[1])})`, unsigned: false };
+  }
+  // (s.charCodeAt(i) inside an ASCII fast-path loop: int32(s[i]) directly)
+  if (isCallExpression(side) && isPropertyAccessExpression(side.expression) && side.expression.name.text === 'charCodeAt' && isIdentifier(side.expression.expression) && (side.arguments ?? []).length === 1) {
+    const goStr = getSafeName(side.expression.expression.text);
+    const asciiInfo = asciiStringGoVars.get(goStr);
+    if (asciiInfo?.idxVar && isIdentifier(unwrapParentheses(side.arguments[0]))) {
+      const argRead = intLocalReads.get(unwrapParentheses(side.arguments[0]));
+      if (argRead && argRead.name === asciiInfo.idxVar) {
+        return { code: `int32(${goStr}[${asciiInfo.idxVar}])`, unsigned: false };
+      }
+    }
+  }
   if (!isBinaryExpression(side)) return undefined;
   const bitOp = bitwiseOps[side.operatorToken.kind];
   if (!bitOp) return undefined;
@@ -10272,7 +10868,7 @@ function nestedBitwise(side: AstNode): { code: string; unsigned: boolean } | und
 // The Go int32 (or, for >>>, uint32) expression of a number bitwise op.
 // Literal operands convert at compile time (i & 1023, x >> 3); a compound
 // assignment passes its target's code as leftCode.
-function bitwiseInt(node: AstNode, bitOp: string, leftCode?: string): { code: string; unsigned: boolean } {
+function bitwiseInt(node: AstNode, bitOp: string, leftCode?: string, leftIsInt32 = false): { code: string; unsigned: boolean } {
   const leftConst = leftCode !== undefined ? undefined : literalInt32(node.left);
   const rightConst = literalInt32(node.right);
   // (both literals: the whole result, as Go rejects a constant shift that overflows)
@@ -10280,7 +10876,7 @@ function bitwiseInt(node: AstNode, bitOp: string, leftCode?: string): { code: st
     const folded: Record<string, number> = { '&': leftConst & rightConst, '|': leftConst | rightConst, '^': leftConst ^ rightConst, '<<': leftConst << rightConst, '>>': leftConst >> rightConst, '>>>': leftConst >>> rightConst };
     return { code: `${folded[bitOp]}`, unsigned: bitOp === '>>>' };
   }
-  const leftNested = leftCode !== undefined || leftConst !== undefined ? undefined : nestedBitwise(node.left);
+  const leftNested = leftIsInt32 && leftCode !== undefined ? { code: leftCode, unsigned: false } : (leftCode !== undefined || leftConst !== undefined ? undefined : nestedBitwise(node.left));
   const rightNested = rightConst !== undefined ? undefined : nestedBitwise(node.right);
   const left = leftCode ?? (leftConst !== undefined || leftNested ? '' : asFloatOperand(node.left, visit(node.left)));
   const right = rightConst !== undefined || rightNested ? '' : asFloatOperand(node.right, visit(node.right));
@@ -11362,7 +11958,7 @@ function isTypedDispatchType(goType: string): boolean {
   return /^\*[A-Za-z_][A-Za-z0-9_]*$/.test(goType) && !NULLABLE_PRIMITIVE_TYPES.includes(goType) && !goType.startsWith('*Tn');
 }
 
-// The class or interface a dynamic receiver is declared as (non-generic)
+// The class, interface, or structural type alias a dynamic receiver is declared as (non-generic)
 function staticReceiverTypeName(receiver: AstNode): string | undefined {
   const expr = unwrapParentheses(receiver);
   const declared = isIdentifier(expr) ? declaredTypeNodeOf(expr) ?? getExpressionTypeNode(expr) : getExpressionTypeNode(expr);
@@ -11373,7 +11969,10 @@ function staticReceiverTypeName(receiver: AstNode): string | undefined {
   const cls = declaredClasses.get(name);
   if (cls) return (cls.typeParameters ?? []).length ? undefined : name;
   const iface = declaredInterfaces.get(name);
-  return iface && !(iface.typeParameters ?? []).length ? name : undefined;
+  if (iface) return (iface.typeParameters ?? []).length ? undefined : name;
+  const alias = declaredTypeAliases.get(name);
+  if (alias && alias.kind === 'TypeLiteral') return name;
+  return undefined;
 }
 
 // The classes a receiver declared as C can be: C, its subclasses, and the
@@ -11419,12 +12018,20 @@ function hierarchySignature(typeName: string, method: string): { params: string[
 
 function hierarchySignatureUncached(typeName: string, method: string): { params: string[]; result: string; classes: string[] } | undefined {
   let declared: AstNode | undefined;
+  let isStructural = false;
   if (declaredClasses.has(typeName)) declared = findClassMethod(typeName, method);
-  else {
+  else if (declaredInterfaces.has(typeName)) {
     const iface = declaredInterfaces.get(typeName);
     const members = (iface?.members ?? []).filter((m: AstNode) => isMethodSignature(m) && isIdentifier(m.name) && m.name.text === method);
     if (members.length !== 1) return undefined;
     declared = members[0];
+    isStructural = true;
+  } else {
+    const alias = declaredTypeAliases.get(typeName);
+    const members = (alias?.members ?? []).filter((m: AstNode) => isMethodSignature(m) && isIdentifier(m.name) && m.name.text === method);
+    if (members.length !== 1) return undefined;
+    declared = members[0];
+    isStructural = true;
   }
   if (!declared || declared.questionToken) return undefined;
   const sig = typedDispatchSignature(declared);
@@ -11440,7 +12047,7 @@ function hierarchySignatureUncached(typeName: string, method: string): { params:
     if (!own || `${own.params.join(',')}->${own.result}` !== key) return undefined;
     classes.push(className);
   }
-  return classes.length > 0 ? { ...sig, classes } : undefined;
+  return classes.length > 0 || isStructural ? { ...sig, classes } : undefined;
 }
 
 // The typed dispatcher a call recv.m(a) on a dynamic receiver goes through
@@ -11496,9 +12103,11 @@ function emitTypedDispatchers(): string {
       cases.push(`\tcase *${getSafeName(className)}:\n\t\t${d.result ? `return ${call}` : `${call}\n\t\treturn`}`);
     }
     const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
+    const fnType = `func(${d.params.join(', ')})${d.result ? ` ${d.result}` : ''}`;
+    const mapFast = `\tif __m, __ok := __recv.(*TnMap[string, interface{}]); __ok && __m != nil {\n\t\tif __fn, __has := tnMapGetStr(__m, ${toGoStringLiteral(d.method)}); __has {\n\t\t\tif __f, __ok := __fn.(${fnType}); __ok && __f != nil {\n\t\t\t\t${d.result ? `return __f(${argNames.join(', ')})` : `__f(${argNames.join(', ')})\n\t\t\t\treturn`}\n\t\t\t}\n\t\t}\n\t}\n`;
     const boxed = `TnCall_${dispatcherSuffix(d.method)}(${['__recv', ...argNames].join(', ')})`;
     const fallback = d.result === '' ? `\t${boxed}\n` : d.result === 'interface{}' ? `\treturn ${boxed}\n` : `\treturn TnAs[${d.result}](${boxed})\n`;
-    out.push(`func TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${fallback}}`);
+    out.push(`func TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${mapFast}${fallback}}`);
   }
   return out.join('\n\n');
 }
@@ -12101,10 +12710,40 @@ function isArrayBufferTypeNode(typeNode: AstNode): boolean {
   return name === 'ArrayBuffer' || name === 'SharedArrayBuffer' || name === 'ArrayBufferLike';
 }
 
+// A Go int expression for an element index that is already an exact integer
+// (an integer local, a small integer literal, or their +/-/bitmask), so
+// TypedArray.GetInt / SetInt skip float64 conversion and truncation checks
+function intIndexExpr(node: AstNode): string | undefined {
+  const e = unwrapParentheses(node);
+  if (isIdentifier(e)) {
+    const local = intLocalReads.get(e);
+    if (local) return local.kind === 'int' ? local.name : `int(${local.name})`;
+    return undefined;
+  }
+  if (isNumericLiteral(e)) {
+    const v = Number(String(e.text).replace(/_/g, ''));
+    if (Number.isInteger(v) && v >= 0 && v <= 0x7fffffff) return String(v);
+    return undefined;
+  }
+  if (isBinaryExpression(e)) {
+    const kind = e.operatorToken.kind;
+    if (kind === 'PlusToken' || kind === 'MinusToken') {
+      const l = intIndexExpr(e.left);
+      const r = intIndexExpr(e.right);
+      if (l && r) return `(${l} ${kind === 'PlusToken' ? '+' : '-'} ${r})`;
+    }
+  }
+  return undefined;
+}
+
 // ta[i] = v / ta[i] op= v: one Set with the value converted like JS
 function visitTypedArrayAssignment(target: AstNode, op: string, right: AstNode): string | undefined {
   const value = visit(right);
-  if (op === '=') return `${visit(target.expression)}.Set(${visit(target.argumentExpression)}, ${value})`;
+  if (op === '=') {
+    const intIdx = intIndexExpr(target.argumentExpression);
+    if (intIdx) return `${visit(target.expression)}.SetInt(${intIdx}, ${value})`;
+    return `${visit(target.expression)}.Set(${visit(target.argumentExpression)}, ${value})`;
+  }
   const arr = getTempName('ta');
   const index = getTempName('i');
   const current = `${arr}.Get(${index})`;
@@ -12399,6 +13038,152 @@ function iteratorCallbackAdapter(callbackNode: AstNode | undefined, callback: st
   return `func(__v ${elementType}, __i float64) ${resultType} { return ${value} }`;
 }
 
+const storedSeqVars = new WeakMap<AstNode, string>();
+const pullIterVars = new WeakMap<AstNode, string>();
+
+// Detects a local `const g = syncGen(...)` in a block whose uses are either:
+// (a) a single `for (const x of g)` / `[...g]` → emit `g := syncGen__seq(...)`, or
+// (b) only 0-arg `g.next()` / `g.return()` calls → emit `g := TnPullStart(syncGen__seq(...))` (iter.Pull)
+function visitSeqOrPullGenLocal(node: AstNode): string | undefined {
+  const list = node.declarationList;
+  if (!list || (list.declarationKind !== 'const' && list.declarationKind !== 'let') || (list.declarations ?? []).length !== 1) return undefined;
+  const block = node.parent;
+  if (!block || (block.kind !== 'Block' && block.kind !== 'CaseClause' && block.kind !== 'DefaultClause')) return undefined;
+  const decl = list.declarations[0];
+  if (!isIdentifier(decl.name) || !decl.initializer) return undefined;
+  const initExpr = unwrapParentheses(decl.initializer);
+  if (!isCallExpression(initExpr) || initExpr.questionDotToken) return undefined;
+  const initType = inferExpressionType(initExpr);
+  if (!initType || !initType.startsWith('chan ')) return undefined;
+  // Must be a sync generator eligible for __seq
+  const callee = initExpr.expression;
+  let seqEligible = false;
+  if (isIdentifier(callee)) {
+    const fnDecl = declaredFunctions.get(callee.text);
+    seqEligible = !!fnDecl && isFunctionDeclaration(fnDecl) && fnDecl.parent?.kind === 'SourceFile' && generatorSeqEligible(fnDecl);
+  }
+  if (!seqEligible) return undefined;
+  const name: string = decl.name.text;
+  const statements: AstNode[] = block.statements ?? [];
+  const at = statements.indexOf(node);
+  if (at < 0) return undefined;
+  const after = statements.slice(at + 1);
+  // Scan all references to `name` in `after`
+  const refs: AstNode[] = [];
+  let unsafe = false;
+  const walk = (n: AstNode | undefined, depth: number): void => {
+    if (!n || unsafe) return;
+    if (isFunctionDeclaration(n) || isFunctionExpression(n) || isArrowFunction(n) || isMethodDeclaration(n)) {
+      walkKids(n, depth + 1);
+      return;
+    }
+    if (isIdentifier(n) && n.text === name) {
+      const p = n.parent;
+      if (p && (isPropertyAccessExpression(p) && p.name === n || p.kind === 'PropertyAssignment' && p.name === n ||
+        (isMethodDeclaration(p) || isPropertyDeclaration(p) || isGetAccessor(p) || p.kind === 'SetAccessor' || p.kind === 'PropertySignature' || p.kind === 'MethodSignature') && p.name === n)) return;
+      if (depth > 0) {
+        unsafe = true;
+        return;
+      }
+      refs.push(n);
+      return;
+    }
+    if ((n.kind === 'VariableDeclaration' || n.kind === 'Parameter' || isFunctionDeclaration(n) || isClassDeclaration(n) || n.kind === 'BindingElement') && n.name && isIdentifier(n.name) && n.name.text === name) {
+      unsafe = true;
+      return;
+    }
+    walkKids(n, depth);
+  };
+  const walkKids = (n: AstNode, depth: number): void => {
+    for (const k of Object.keys(n)) {
+      if (k === 'parent') continue;
+      const v = (n as any)[k];
+      if (Array.isArray(v)) {
+        for (const c of v) if (c && typeof c === 'object' && typeof c.kind === 'string') walk(c, depth);
+      } else if (v && typeof v === 'object' && typeof v.kind === 'string') walk(v, depth);
+    }
+  };
+  for (const s of after) walk(s, 0);
+  if (unsafe || refs.length === 0) return undefined;
+  // Check (a): single reference directly as the expression of a non-await for..of
+  const singleForOf = refs.length === 1 && refs[0].parent && isForOfStatement(refs[0].parent) && refs[0].parent.expression === refs[0] && !refs[0].parent.awaitModifier;
+  // Check (b): every reference is 0-arg `name.next()` or `name.return()`
+  const allPullCalls = !singleForOf && refs.every((r) => {
+    const p = r.parent;
+    if (!p || !isPropertyAccessExpression(p) || p.expression !== r || hasQuestionDot(p)) return false;
+    const m = p.name.text;
+    if (m !== 'next' && m !== 'return') return false;
+    const call = p.parent;
+    return !!call && isCallExpression(call) && call.expression === p && (call.arguments ?? []).length === 0;
+  });
+  if (!singleForOf && !allPullCalls) return undefined;
+  const visitedInit = visit(initExpr);
+  const seqInfo = generatorSeqOf(initExpr, visitedInit);
+  if (!seqInfo) return undefined;
+  const goName = getSafeName(name);
+  registerLocalVariable(name, initType);
+  if (singleForOf) {
+    storedSeqVars.set(refs[0], seqInfo.elem);
+    return `${goName} := ${seqInfo.seq};\n\t_ = ${goName};\n\t`;
+  }
+  useHelper('iterators');
+  for (const r of refs) pullIterVars.set(r, seqInfo.elem);
+  return `${goName} := TnPullStart(${seqInfo.seq});\n\t_ = ${goName};\n\t`;
+}
+
+// Emits a zero-goroutine push-iterator expression `func(func(T) bool)` for an
+// iterator helper chain rooted at `Iterator.from(slice)` or a __seq generator.
+function emitIteratorSeqSource(expr: AstNode | undefined): { code: string; elemType: string } | undefined {
+  if (!expr) return undefined;
+  const e = unwrapParentheses(expr);
+  if (!isCallExpression(e) || e.questionDotToken) return undefined;
+  // Iterator.from(slice)
+  if (isPropertyAccessExpression(e.expression) && isIdentifier(e.expression.expression) && e.expression.expression.text === 'Iterator' && e.expression.name.text === 'from' && (e.arguments ?? []).length === 1) {
+    const arg = e.arguments[0];
+    const srcType = (inferExpressionType(arg) ?? '').replace(/^\*/, '');
+    if (srcType.startsWith('[]') && srcType !== '[]byte') {
+      useHelper('iterators');
+      return { code: `TnSeqFromSlice(${visit(arg)})`, elemType: srcType.slice(2) };
+    }
+    return emitIteratorSeqSource(arg);
+  }
+  // Intermediate iterator helper stage: recv.filter / map / flatMap / take / drop
+  if (isPropertyAccessExpression(e.expression) && !hasQuestionDot(e.expression) && isIdentifier(e.expression.name)) {
+    const method: string = e.expression.name.text;
+    if (['map', 'filter', 'flatMap', 'take', 'drop'].includes(method)) {
+      const inner = emitIteratorSeqSource(e.expression.expression);
+      if (inner) {
+        useHelper('iterators');
+        const cbNode = e.arguments?.[0];
+        const visitedArgs = (e.arguments ?? []).map((a: AstNode) => visit(a));
+        if (method === 'take') return { code: `TnSeqTake(${inner.code}, ${visitedArgs[0]})`, elemType: inner.elemType };
+        if (method === 'drop') return { code: `TnSeqDrop(${inner.code}, ${visitedArgs[0]})`, elemType: inner.elemType };
+        if (method === 'filter') return { code: `TnSeqFilter(${inner.code}, ${iteratorCallbackAdapter(cbNode, visitedArgs[0], inner.elemType, 'bool')})`, elemType: inner.elemType };
+        const cbRes = goFuncReturnType(cbNode ? functionValueGoType(cbNode) : '') ?? 'interface{}';
+        if (method === 'map') return { code: `TnSeqMap(${inner.code}, ${iteratorCallbackAdapter(cbNode, visitedArgs[0], inner.elemType, cbRes)})`, elemType: cbRes };
+        if (method === 'flatMap') {
+          const outSlice = cbRes.startsWith('[]') ? cbRes : '[]interface{}';
+          return { code: `TnSeqFlatMap(${inner.code}, ${iteratorCallbackAdapter(cbNode, visitedArgs[0], inner.elemType, outSlice)})`, elemType: outSlice.slice(2) };
+        }
+      }
+    }
+  }
+  // Sync generator call with __seq form (e.g. words(512), naturals())
+  const initType = inferExpressionType(e);
+  if (initType?.startsWith('chan ')) {
+    const callee = e.expression;
+    if (isIdentifier(callee)) {
+      const fnDecl = declaredFunctions.get(callee.text);
+      if (fnDecl && isFunctionDeclaration(fnDecl) && fnDecl.parent?.kind === 'SourceFile' && generatorSeqEligible(fnDecl)) {
+        const visited = visit(e);
+        const seq = generatorSeqOf(e, visited);
+        if (seq) return { code: seq.seq, elemType: seq.elem };
+      }
+    }
+  }
+  return undefined;
+}
+
 // gen.map(fn) / filter / take / drop / flatMap / toArray / forEach / some /
 // every / find / reduce / next() on a generator's channel
 function visitIteratorHelper(
@@ -12411,6 +13196,37 @@ function visitIteratorHelper(
   receiverNode?: AstNode
 ): string {
   useHelper('iterators');
+  // Coroutine-backed local generator (iter.Pull)
+  if (receiverNode && isIdentifier(unwrapParentheses(receiverNode)) && pullIterVars.has(unwrapParentheses(receiverNode))) {
+    if (method === 'next' && args.length === 0) return `${receiver}.Next()`;
+    if (method === 'return' && args.length === 0) return `${receiver}.Return()`;
+  }
+  // Terminal over a push-iterator chain: zero goroutines, zero channels
+  if (receiverNode && ['toArray', 'forEach', 'some', 'every', 'find', 'reduce'].includes(method)) {
+    const seq = emitIteratorSeqSource(receiverNode);
+    if (seq) {
+      switch (method) {
+        case 'toArray':
+          return `TnSeqToArray(${seq.code})`;
+        case 'forEach':
+          return `TnSeqForEach(${seq.code}, ${iteratorCallbackAdapter(callbackNode, args[0], seq.elemType, '')})`;
+        case 'some':
+        case 'every':
+        case 'find': {
+          const name = { some: 'Some', every: 'Every', find: 'Find' }[method];
+          return `TnSeq${name}(${seq.code}, ${iteratorCallbackAdapter(callbackNode, args[0], seq.elemType, 'bool')})`;
+        }
+        case 'reduce': {
+          const accType = extraArgs[0] ? inferExpressionType(extraArgs[0]) ?? seq.elemType : seq.elemType;
+          const fnType = callbackNode ? functionValueGoType(callbackNode) : '';
+          const arity = goFuncParamTypes(fnType).length;
+          const call = `${args[0]}(${['__a', '__v', '__i'].slice(0, arity).join(', ')})`;
+          const reducer = `func(__a ${accType}, __v ${seq.elemType}, __i float64) ${accType} { return ${call} }`;
+          return `TnSeqReduce(${seq.code}, ${reducer}, ${args[1] ?? `*new(${accType})`}, ${args.length > 1})`;
+        }
+      }
+    }
+  }
   const callbackResult = goFuncReturnType(callbackNode ? functionValueGoType(callbackNode) : '') ?? 'interface{}';
   const useAny = (method === 'next' || method === 'return' || method === 'throw') &&
     generatorResultElementType(receiverNode, elementType, method, callbackNode) === 'interface{}';
@@ -18434,6 +19250,8 @@ function visitArrayHigherOrderCall(node: AstNode): string | undefined {
   }
 
   const arrayExprNode = node.expression.expression;
+  // super.map(…) is the parent class's method, never an array helper
+  if (arrayExprNode.kind === 'SuperKeyword') return undefined;
   // generators (channels) take the iterator helpers instead
   if (!typedReceiver && inferExpressionType(arrayExprNode)?.startsWith('chan ')) return undefined;
   // a class's own map() / filter() / … method
@@ -19329,7 +20147,11 @@ function getType(typeNode: AstNode, getArrayType = false): string {
       typeNode.typeArguments &&
       typeNode.typeArguments.length === 2
     ) {
-      return (name === 'Record' ? mapGoType : jsMapGoType)(getType(typeNode.typeArguments[0]), getType(typeNode.typeArguments[1]));
+      const keyType = getType(typeNode.typeArguments[0]);
+      let valueType = getType(typeNode.typeArguments[1]);
+      // (`Record<string, never>` and other empty types: Go has no value type)
+      if (valueType === 'never' || valueType === 'undefined' || valueType === 'void' || valueType === '') valueType = 'interface{}';
+      return (name === 'Record' ? mapGoType : jsMapGoType)(keyType === 'never' ? 'interface{}' : keyType, valueType);
     }
     if ((name === 'Set' || name === 'ReadonlySet') && typeNode.typeArguments && typeNode.typeArguments.length === 1) {
       return mapGoType(getType(typeNode.typeArguments[0]), 'struct{}');
@@ -19596,6 +20418,7 @@ function isNilLiteral(node: AstNode): boolean {
 
 function getAcessString(leftSide: string, rightSide: string, objectType?: string): string {
   if (rightSide === 'length' && objectType === 'string') {
+    if (asciiStringGoVars.has(leftSide)) return `float64(len(${leftSide}))`;
     // JS .length counts UTF-16 code units; code points match for the BMP
     // (O(1) for ASCII and recently indexed strings)
     useHelper('strIndex');
@@ -19758,6 +20581,9 @@ const callHandlers: Record<string, CallHandler> = {
   },
   'Math.imul': (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('dynamic');
+    if (currentCallArgNodes.length >= 2) {
+      return `float64((${int32Operand(currentCallArgNodes[0])} * ${int32Operand(currentCallArgNodes[1])}))`;
+    }
     return `float64(TnInt32(${args[0]}) * TnInt32(${args[1]}))`;
   },
   'Math.clz32': (_caller: string, args: string[], _typeArgs: string) => {
@@ -19822,6 +20648,7 @@ const callHandlers: Record<string, CallHandler> = {
   },
   BigInt: (_caller: string, args: string[], _typeArgs: string) => {
     useHelper('builtins');
+    if (currentCallArgTypes[0] === 'float64') return `TnBigIntFromFloat(${args[0]})`;
     return `TnBigIntOf(${args[0]})`;
   },
   'BigInt.asIntN': (_caller: string, args: string[], _typeArgs: string) => {
@@ -20267,6 +21094,15 @@ const stringMethodHandlers: Record<string, MethodHandler> = {
     return `TnStrIndexOf(${obj}, ${args[0]}, ${args[1] ?? '0'})`;
   },
   charCodeAt: (obj: string, args: string[]) => {
+    const asciiInfo = asciiStringGoVars.get(obj);
+    if (asciiInfo) {
+      const idx = args[0] ?? '0';
+      if (asciiInfo.idxVar && idx === `float64(${asciiInfo.idxVar})`) {
+        return `float64(${obj}[${asciiInfo.idxVar}])`;
+      }
+      useHelper('strIndex');
+      return `TnAsciiCharCodeAt(${obj}, ${idx})`;
+    }
     useHelper('strIndex');
     return `TnCharCodeAt(${obj}, ${args[0] ?? '0'})`;
   },
@@ -21014,11 +21850,11 @@ function getDynamicCallHandler(caller: string, objectType?: string): CallHandler
     // The first resolution wins; later ones are ignored (as in JS)
     return (_caller: string, args: string[], _typeArgs: string) => {
       // resolve() without a value: the channel type's zero value
+      useHelper('promise');
       if (args.length === 0 || args[0] === 'nil') {
-        useHelper('promise');
         return 'TnResolveZero(ch)';
       }
-      return `select { case ch <- ${args[0]}: default: }`;
+      return `TnAsyncSend(ch, ${args[0]})`;
     };
   }
   if (promiseRejectName && caller === promiseRejectName) {
@@ -22712,7 +23548,7 @@ function registerClassMembers(node: AstNode): void {
     const memberModifiers = (member as AstNode).modifiers;
     const isStatic = memberModifiers?.some((m) => m.kind === 'StaticKeyword');
     const memberName = memberKey(member.name);
-    if (isPropertyDeclaration(member) && memberName) {
+    if (isPropertyDeclaration(member) && memberName && !hasModifier(member, 'DeclareKeyword')) {
       if (isAutoAccessor(member)) {
         const propType = getPropertyDeclarationType(member);
         if (isStatic) {
@@ -24849,6 +25685,91 @@ function asyncInlineEligible(fn: AstNode, visiting = new Set<AstNode>()): boolea
   return !blocked;
 }
 
+// Top-level async function eligible for a direct-await sibling (`name__await`):
+// runs on the caller's goroutine without allocating a channel or spawning a goroutine
+// when directly awaited (`await f(args)`) with no active async_hooks or pending microtasks
+function asyncAwaitSiblingEligible(fn: AstNode): boolean {
+  if (!fn || !isFunctionDeclaration(fn) || fn.parent?.kind !== 'SourceFile') return false;
+  if (fn.asteriskToken || !(fn.modifiers ?? []).some((m: AstNode) => m.kind === 'AsyncKeyword')) return false;
+  if (!fn.body || !isBlock(fn.body)) return false;
+  if ((fn.typeParameters ?? []).length > 0) return false;
+  if (thisPrologue(fn) !== '') return false;
+  return !containsNode(fn.body, (n) => {
+    if (getEnclosingFunction(n) !== fn) return false;
+    if (n.kind === 'TryStatement' || n.kind === 'YieldExpression') return true;
+    if (n.kind === 'ClassDeclaration' || n.kind === 'ClassExpression' || n.kind === 'FunctionDeclaration') return true;
+    if (isIdentifier(n) && n.text === 'arguments') return true;
+    if (isPropertyAccessExpression(n) && n.name.text === 'enterWith') return true;
+    if (isReturnStatement(n) && n.expression) {
+      const bare = unwrapParentheses(n.expression);
+      if (isNewExpression(bare) && isIdentifier(bare.expression) && bare.expression.text === 'Promise') return true;
+    }
+    return false;
+  });
+}
+
+function isLocalShadowing(node: AstNode, name: string): boolean {
+  for (let p: AstNode | undefined = node.parent; p && p.kind !== 'SourceFile'; p = p.parent) {
+    if (isFunctionDeclaration(p) || isFunctionExpression(p) || isArrowFunction(p) || isMethodDeclaration(p)) {
+      for (const param of p.parameters ?? []) {
+        if (isIdentifier(param.name) && param.name.text === name) return true;
+      }
+    }
+    if (isBlock(p)) {
+      for (const st of p.statements ?? []) {
+        if (st.kind === 'VariableStatement') {
+          for (const d of st.declarationList?.declarations ?? []) {
+            if (isIdentifier(d.name) && d.name.text === name) return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function asyncDirectAwaitCall(expr: AstNode, code: string): string | undefined {
+  const call = unwrapParentheses(expr);
+  if (!isCallExpression(call) || call.questionDotToken) return undefined;
+  if (!isIdentifier(call.expression) || (call.typeArguments ?? []).length > 0) return undefined;
+  const fnName = call.expression.text;
+  const decl = declaredFunctions.get(fnName);
+  if (!decl || !asyncAwaitSiblingEligible(decl)) return undefined;
+  if (isLocalShadowing(call, fnName)) return undefined;
+  const goName = getSafeName(fnName);
+  if (!code.startsWith(`${goName}(`)) return undefined;
+  return `${goName}__await${code.slice(goName.length)}`;
+}
+
+function emitAsyncAwaitSibling(
+  node: AstNode,
+  name: string,
+  parameterInfo: { signature: string; prefixBlockContent?: string },
+  chanType: string
+): string {
+  const prevChannel = asyncChannelVar;
+  const prevFn = asyncFunctionNode;
+  const prevIsAsync = asyncChannelIsAsync;
+  const prevYieldType = asyncChannelYieldType;
+  const prevDirect = asyncDirectReturn;
+  asyncChannelVar = '__ch';
+  asyncFunctionNode = node;
+  asyncChannelIsAsync = true;
+  asyncChannelYieldType = chanType;
+  asyncDirectReturn = true;
+  let body: string;
+  try {
+    body = visit(node.body!, { prefixBlockContent: parameterInfo.prefixBlockContent });
+  } finally {
+    asyncChannelVar = prevChannel;
+    asyncFunctionNode = prevFn;
+    asyncChannelIsAsync = prevIsAsync;
+    asyncChannelYieldType = prevYieldType;
+    asyncDirectReturn = prevDirect;
+  }
+  return `func ${name}__await(${parameterInfo.signature}) (__tnRes ${chanType}) {\n\t${body.trim()}\n\treturn\n}`;
+}
+
 // A function whose body runs in a goroutine and communicates over a channel:
 // async functions (return sends) and generators (yield sends)
 // `header` replaces `func name[T]` (methods: `func (self *C) name`)
@@ -24870,22 +25791,28 @@ function emitChannelFunction(node: AstNode, isAsync: boolean, header?: string): 
   const prevFn = asyncFunctionNode;
   const prevIsAsync = asyncChannelIsAsync;
   const prevYieldType = asyncChannelYieldType;
+  const prevDirect = asyncDirectReturn;
   asyncChannelVar = channelVar;
   asyncFunctionNode = node;
   asyncChannelIsAsync = isAsync;
   asyncChannelYieldType = chanType;
+  asyncDirectReturn = false;
   const body = visit(node.body!, { prefixBlockContent: parameterInfo.prefixBlockContent });
   asyncChannelVar = prevChannel;
   asyncFunctionNode = prevFn;
   asyncChannelIsAsync = prevIsAsync;
   asyncChannelYieldType = prevYieldType;
+  asyncDirectReturn = prevDirect;
   if (isAsync) {
     // The body runs synchronously until its first await, holding the JS baton
     // (a body that never parks runs on the caller's goroutine: see asyncInlineEligible)
     useHelper('eventLoop');
     const start = asyncInlineEligible(node) ? 'TnRunAsyncInline' : 'TnStartAsync';
+    const sibling = !header && asyncAwaitSiblingEligible(node)
+      ? `\n\n${emitAsyncAwaitSibling(node, name, parameterInfo, chanType)}`
+      : '';
     return (
-      `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\t${start}(func() {\n\t\tdefer TnAsyncClose(${channelVar})${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}`
+      `${declaration}(${parameterInfo.signature}) chan ${chanType} {\n\t${prologue}${channelVar} := make(chan ${chanType}, 1)\n\t${start}(func() {\n\t\t__done := false\n\t\tdefer func() {\n\t\t\tif !__done {\n\t\t\t\tTnAsyncClose(${channelVar})\n\t\t\t}\n\t\t}()${rejectOnPanic}\n\t\t${body.trim()}\n\t})\n\treturn ${channelVar}\n}` + sibling
     );
   }
   // (a top-level generator declaration: also its push form, see generatorSeqEligible)
@@ -26247,9 +27174,7 @@ function includeLocalImport(
   if (loaded) statementLines.unshift(loaded.trim());
   emittingModuleFile = prevEmittingModuleFile;
 
-  const fileOutside = localizeGoPaths(
-    outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n')
-  );
+  const fileOutside = localizeGoPaths(emitOutsideNodes());
   for (const [cls, at] of [...staticSlots].sort((a, b) => b[1] - a[1])) {
     const inits = staticInitSinks.get(cls) ?? [];
     if (inits.length > 0) statementLines.splice(at, 0, ...inits.map((line) => withLineMarker(cls, localizeGoPaths(line))));
@@ -26365,9 +27290,7 @@ function compileEntryPoint(id: string, file: ResolvedSourceFile): void {
     if (!result.trim()) continue;
     statements.push(withLineMarker(stmt, localizeGoPaths(result)) + coverageAfter(stmt));
   }
-  const fileOutside = localizeGoPaths(
-    outsideNodes.map((n) => withLineMarker(n, visit(n, { isOutside: true }))).join('\n')
-  );
+  const fileOutside = localizeGoPaths(emitOutsideNodes());
   // its top-level variables live in its own Go file
   const fileVars = mainPackageVariables.splice(varsBefore).map((v) => localizeGoPaths(v));
   const fnName = `tnEntry_${id}`;
@@ -26695,7 +27618,7 @@ const helperRequires: Record<string, string[]> = {
   globalThis: ['dynamic'],
   namedGroups: ['orderedMap', 'regexMatch'],
   fancyRegex: ['orderedMap', 'regexMatch', 'regexEngine'],
-  dynamic: ['error', 'strIndex', 'toFixed', 'functionThis'],
+  dynamic: ['error', 'strIndex', 'toFixed', 'functionThis', 'orderedMap'],
   orderedMap: ['dynamic'],
   mapAssign: ['dynamic', 'orderedMap'],
   regexMatch: ['strIndex'],
@@ -27438,7 +28361,7 @@ const helperPackages: Record<string, string[]> = {
   objectAssignTo: ['reflect', 'unsafe', 'sort', 'fmt', 'strings'],
   typeOf: ['reflect', 'math/big'],
   isArray: ['reflect'],
-  iterators: [],
+  iterators: ['iter'],
   weakRefs: ['weak', 'runtime', 'sync'],
   builtins: ['math', 'strconv', 'strings', 'math/big', 'unicode'],
   date: ['time', 'math', 'regexp', 'strings', 'strconv', 'fmt'],
@@ -28126,6 +29049,198 @@ func TnIterReduce[T, A any](ch chan T, fn func(A, T, float64) A, acc A, hasIniti
 		i++
 	}
 	return acc
+}
+
+// Coroutine-backed pull iterator (iter.Pull) for local sync generators driven via .next()
+type TnPullIter[T any] struct {
+	next func() (T, bool)
+	stop func()
+	done bool
+}
+
+func TnPullStart[T any](seq func(func(T) bool)) *TnPullIter[T] {
+	next, stop := iter.Pull(seq)
+	return &TnPullIter[T]{next: next, stop: stop}
+}
+
+func (p *TnPullIter[T]) Next() *TnIterResult[T] {
+	if p.done {
+		return &TnIterResult[T]{done: true}
+	}
+	v, ok := p.next()
+	if !ok {
+		p.done = true
+		p.stop()
+		return &TnIterResult[T]{done: true}
+	}
+	return &TnIterResult[T]{value: v, done: false}
+}
+
+func (p *TnPullIter[T]) Return() *TnIterResult[T] {
+	if !p.done {
+		p.done = true
+		p.stop()
+	}
+	return &TnIterResult[T]{done: true}
+}
+
+// Synchronous push-iterator (iter.Seq) helpers: zero goroutines, zero channels
+func TnSeqFromSlice[T any](values []T) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		for _, v := range values {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+func TnSeqMap[T, U any](seq func(func(T) bool), fn func(T, float64) U) func(func(U) bool) {
+	return func(yield func(U) bool) {
+		i := 0.0
+		seq(func(v T) bool {
+			u := fn(v, i)
+			i++
+			return yield(u)
+		})
+	}
+}
+
+func TnSeqFilter[T any](seq func(func(T) bool), fn func(T, float64) bool) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		i := 0.0
+		seq(func(v T) bool {
+			ok := fn(v, i)
+			i++
+			if ok {
+				return yield(v)
+			}
+			return true
+		})
+	}
+}
+
+func TnSeqFlatMap[T, U any](seq func(func(T) bool), fn func(T, float64) []U) func(func(U) bool) {
+	return func(yield func(U) bool) {
+		i := 0.0
+		seq(func(v T) bool {
+			items := fn(v, i)
+			i++
+			for _, u := range items {
+				if !yield(u) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
+
+func TnSeqTake[T any](seq func(func(T) bool), n float64) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		if n <= 0 {
+			return
+		}
+		count := 0.0
+		seq(func(v T) bool {
+			if !yield(v) {
+				return false
+			}
+			count++
+			return count < n
+		})
+	}
+}
+
+func TnSeqDrop[T any](seq func(func(T) bool), n float64) func(func(T) bool) {
+	return func(yield func(T) bool) {
+		count := 0.0
+		seq(func(v T) bool {
+			if count < n {
+				count++
+				return true
+			}
+			count++
+			return yield(v)
+		})
+	}
+}
+
+func TnSeqToArray[T any](seq func(func(T) bool)) []T {
+	out := []T{}
+	seq(func(v T) bool {
+		out = append(out, v)
+		return true
+	})
+	return out
+}
+
+func TnSeqForEach[T any](seq func(func(T) bool), fn func(T, float64)) {
+	i := 0.0
+	seq(func(v T) bool {
+		fn(v, i)
+		i++
+		return true
+	})
+}
+
+func TnSeqSome[T any](seq func(func(T) bool), fn func(T, float64) bool) bool {
+	i := 0.0
+	found := false
+	seq(func(v T) bool {
+		if fn(v, i) {
+			found = true
+			return false
+		}
+		i++
+		return true
+	})
+	return found
+}
+
+func TnSeqEvery[T any](seq func(func(T) bool), fn func(T, float64) bool) bool {
+	i := 0.0
+	all := true
+	seq(func(v T) bool {
+		if !fn(v, i) {
+			all = false
+			return false
+		}
+		i++
+		return true
+	})
+	return all
+}
+
+func TnSeqFind[T any](seq func(func(T) bool), fn func(T, float64) bool) T {
+	i := 0.0
+	var found T
+	seq(func(v T) bool {
+		if fn(v, i) {
+			found = v
+			return false
+		}
+		i++
+		return true
+	})
+	return found
+}
+
+func TnSeqReduce[T, A any](seq func(func(T) bool), fn func(A, T, float64) A, acc A, hasInitial bool) A {
+	i := 0.0
+	seq(func(v T) bool {
+		if !hasInitial {
+			if a, ok := interface{}(v).(A); ok {
+				acc = a
+			}
+			hasInitial = true
+		} else {
+			acc = fn(acc, v, i)
+		}
+		i++
+		return true
+	})
+	return acc
 }`,
   weakRefs: `// WeakRef: a weak pointer to an object (Go's weak package)
 type TnWeakRef[T any] struct{ p weak.Pointer[T] }
@@ -28523,6 +29638,22 @@ func TnObjectIs(a, b interface{}) bool {
 	return TnSame(a, b)
 }
 
+// BigInt(number): fast int64 path for all safe/64-bit integers (no big.Float alloc)
+func TnBigIntFromFloat(x float64) *tnbig.Int {
+	if x > -9.2e18 && x < 9.2e18 {
+		ix := int64(x)
+		if float64(ix) == x {
+			return tnbig.NewInt(ix)
+		}
+		panic(TnNodeError("RangeError", "", "The number "+TnNumStr(x)+" cannot be converted to a BigInt because it is not an integer"))
+	}
+	if x != math.Trunc(x) || math.IsInf(x, 0) || math.IsNaN(x) {
+		panic(TnNodeError("RangeError", "", "The number "+TnNumStr(x)+" cannot be converted to a BigInt because it is not an integer"))
+	}
+	b, _ := new(tnbig.Float).SetFloat64(x).Int(nil)
+	return b
+}
+
 // BigInt(value): integers, numeric strings, booleans and bigints
 func TnBigIntOf(v interface{}) *tnbig.Int {
 	switch x := v.(type) {
@@ -28534,11 +29665,7 @@ func TnBigIntOf(v interface{}) *tnbig.Int {
 		}
 		return tnbig.NewInt(0)
 	case float64:
-		if x != math.Trunc(x) || math.IsInf(x, 0) || math.IsNaN(x) {
-			panic(TnNodeError("RangeError", "", "The number "+TnNumStr(x)+" cannot be converted to a BigInt because it is not an integer"))
-		}
-		b, _ := new(tnbig.Float).SetFloat64(x).Int(nil)
-		return b
+		return TnBigIntFromFloat(x)
 	case string:
 		t := strings.TrimSpace(x)
 		if t == "" {
@@ -28861,12 +29988,103 @@ func tnPlainValue(v interface{}) interface{} {
 // obj.key read by the program: as TnGet, but an array field reads as a
 // reference to it — JS arrays are shared, so a push or splice through the
 // value read changes the field
+// Concrete non-generic lookup/store on *TnMap[string, interface{}]: Go compiles
+// m.keys[i] == key to direct inline length+pointer compares instead of an
+// indirect dictionary equal call on generic K comparable.
+func tnMapGetStr(m *TnMap[string, interface{}], key string) (interface{}, bool) {
+	if m.values == nil {
+		keys := m.keys
+		for i := 0; i < len(keys); i++ {
+			if keys[i] == key {
+				return m.vals[i], true
+			}
+		}
+		return nil, false
+	}
+	if m.accessors != nil {
+		if a, ok := m.accessors[key]; ok {
+			if a.Get == nil {
+				return nil, true
+			}
+			return a.Get(), true
+		}
+	}
+	v, ok := m.values[key]
+	return v, ok
+}
+
+func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
+	if m.values == nil {
+		keys := m.keys
+		for i := 0; i < len(keys); i++ {
+			if keys[i] == key {
+				m.vals[i] = val
+				return
+			}
+		}
+		if len(keys) < 8 {
+			m.keyMode = 1
+			m.keys = append(keys, key)
+			m.vals = append(m.vals, val)
+			if _, isIndex := tnIndexKey(key); isIndex {
+				m.indexKeys = true
+			}
+			return
+		}
+		m.keyMode = 1
+		m.promote()
+	}
+	if m.accessors != nil {
+		if a, ok := m.accessors[key]; ok {
+			if a.Set != nil {
+				a.Set(val)
+			}
+			return
+		}
+	}
+	if _, ok := m.values[key]; !ok {
+		m.pushKey(key)
+		if _, isIndex := tnIndexKey(key); isIndex {
+			m.indexKeys = true
+		}
+	}
+	m.values[key] = val
+}
+
 func TnGetRef(obj interface{}, key string) interface{} {
+	// (a plain object / record held as any — *TnMap[string, interface{}]: concrete
+	// type check + non-generic string scan avoids itab lookup and generic dict calls)
+	if m, ok := obj.(*TnMap[string, interface{}]); ok {
+		if m == nil {
+			return nil
+		}
+		if !tnAnyAccessors.Load() || !tnAccessorTypes.has(obj) {
+			if v, present := tnMapGetStr(m, key); present {
+				switch v.(type) {
+				case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+					return v
+				}
+				if box, boxed := tnBoxSliceRef(v); boxed {
+					tnMapSetStr(m, key, box)
+					return box
+				}
+				return v
+			}
+			if key != "length" && key != "size" {
+				return nil
+			}
+			return TnGet(obj, key)
+		}
+	}
 	// (a JSON-like object: no views, accessors or fields, a missing key is undefined)
 	if o, ok := obj.(map[string]interface{}); ok {
 		v, present := o[key]
 		if !present {
 			return nil
+		}
+		switch v.(type) {
+		case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+			return v
 		}
 		// (an array entry read as a reference: boxed, and the box stored back
 		// — every binding of the value shares the array, as JS arrays do)
@@ -28883,14 +30101,16 @@ func TnGetRef(obj interface{}, key string) interface{} {
 			obj = origin
 		}
 	}
-	// (a record held as any — a TnMap: its own lookup answers, no reflection;
-	// its accessors live in the map itself, so only a defineProperty accessor
-	// beside it — impossible for a TnMap — could shadow)
+	// (another typed TnMap held as any — e.g. Record<string, number>)
 	if m, ok := obj.(interface {
 		TnProp(string) (interface{}, bool)
 		TnSetProp(string, interface{}) bool
 	}); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
 		if v, present := m.TnProp(key); present {
+			switch v.(type) {
+			case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+				return v
+			}
 			// (an array entry read as a reference: boxed, and the box stored
 			// back — every binding of the value shares the array, as JS arrays do)
 			if box, boxed := tnBoxSliceRef(v); boxed {
@@ -28931,19 +30151,29 @@ func TnGetRef(obj interface{}, key string) interface{} {
 // a conversion): a string or number stays in its field instead of being
 // boxed, so the result must not outlive the expression
 func TnGetPeek(obj interface{}, key string) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok {
+		if m == nil {
+			return nil
+		}
+		if !tnAnyAccessors.Load() || !tnAccessorTypes.has(obj) {
+			if v, present := tnMapGetStr(m, key); present {
+				return v
+			}
+			if key != "length" && key != "size" {
+				return nil
+			}
+			return TnGet(obj, key)
+		}
+	}
 	if o, ok := obj.(map[string]interface{}); ok {
 		return o[key]
 	}
-	// (a record held as any — a TnMap: its own lookup answers, no reflection)
+	// (another typed TnMap held as any: its own lookup answers, no reflection)
 	if m, ok := obj.(interface {
 		TnProp(string) (interface{}, bool)
 		TnSetProp(string, interface{}) bool
 	}); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
 		if v, present := m.TnProp(key); present {
-			if box, boxed := tnBoxSliceRef(v); boxed {
-				m.TnSetProp(key, box)
-				return box
-			}
 			return v
 		}
 		if key != "length" && key != "size" {
@@ -30566,7 +31796,7 @@ func tnBoxArray(v interface{}) interface{} {
 	switch a := v.(type) {
 	case []interface{}:
 		return &a
-	case nil, float64, string, bool, []byte, map[string]interface{}, *[]interface{}:
+	case nil, float64, string, bool, []byte, map[string]interface{}, *[]interface{}, *TnMap[string, interface{}]:
 		return v
 	}
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice {
@@ -30609,10 +31839,27 @@ func tnSetLength(obj interface{}, value interface{}) bool {
 }
 
 func TnSet(obj interface{}, key string, value interface{}) {
+	// (a plain object / record held as any — *TnMap[string, interface{}]: concrete
+	// check avoids interface assertion, view lookup, and expando lookup)
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+		switch value.(type) {
+		case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+			tnMapSetStr(m, key, value)
+			return
+		}
+		if box, boxed := tnBoxSliceRef(value); boxed {
+			tnMapSetStr(m, key, box)
+			return
+		}
+		tnMapSetStr(m, key, value)
+		return
+	}
 	// (a view copy — a merged-union narrowing of a wider object — forwards
 	// field writes to its origin: JS object identity)
-	if origin, ok := tnViewOrigin(obj); ok {
-		obj = origin
+	if tnAnyViews.Load() {
+		if origin, ok := tnViewOrigin(obj); ok {
+			obj = origin
+		}
 	}
 	// arr.length = n: the array truncates, or grows with undefineds
 	if key == "length" {
@@ -30625,11 +31872,8 @@ func TnSet(obj interface{}, key string, value interface{}) {
 		o[key] = tnBoxArray(value)
 		return
 	}
-	// (a record held as any — a TnMap: its key, stored without reflection
-	// (its accessors live in the map itself, so only a defineProperty
-	// accessor beside it — impossible for a TnMap — could shadow)
+	// (another typed TnMap held as any: its key, stored without reflection)
 	if r, ok := obj.(interface{ TnSetProp(string, interface{}) bool }); ok && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) && r.TnSetProp(key, value) {
-		tnExpandoDelete(obj, key)
 		return
 	}
 	// (an error's own property: error.missingPlugins = …, read back by prop)
@@ -30919,7 +32163,21 @@ func TnSame(a interface{}, b interface{}) bool {
 
 // a + b on two dynamic values: numbers (and booleans, null) add; anything
 // else concatenates as strings ('a' + 1, [1] + [2])
+func TnDynamicAddFloat(a interface{}, b interface{}) float64 {
+	if af, ok := a.(float64); ok {
+		if bf, ok := b.(float64); ok {
+			return af + bf
+		}
+	}
+	return TnAs[float64](TnDynamicAdd(a, b))
+}
+
 func TnDynamicAdd(a interface{}, b interface{}) interface{} {
+	if af, ok := a.(float64); ok {
+		if bf, ok := b.(float64); ok {
+			return af + bf
+		}
+	}
 	numeric := func(v interface{}) bool {
 		switch v.(type) {
 		case float64, int, bool, nil:
@@ -31190,17 +32448,34 @@ func TnAt[T any](s []T, i float64) T {
 
 func TnLength(v interface{}) float64 {
 	switch t := v.(type) {
-	case interface{ Len() int }:
-		if t != nil {
-			return float64(t.Len())
-		}
 	case string:
 		return float64(tnStrCount(t))
-	case []interface{}:
-		return float64(len(t))
 	case *[]interface{}:
 		if t != nil {
 			return float64(len(*t))
+		}
+		return 0
+	case []interface{}:
+		return float64(len(t))
+	case []string:
+		return float64(len(t))
+	case []float64:
+		return float64(len(t))
+	case []byte:
+		return float64(len(t))
+	case *[]string:
+		if t != nil {
+			return float64(len(*t))
+		}
+		return 0
+	case *[]float64:
+		if t != nil {
+			return float64(len(*t))
+		}
+		return 0
+	case interface{ Len() int }:
+		if t != nil {
+			return float64(t.Len())
 		}
 	case interface{ TnItems() *[]interface{} }:
 		return float64(len(*t.TnItems()))
@@ -31566,8 +32841,8 @@ func TnParseInt(s string, radix float64) float64 {
 // Almost every operand of a bitwise op is already an int32 (flags, masks,
 // indexes): that path is one compare and a conversion, small enough to inline
 func TnInt32(f float64) int32 {
-	if f >= -2147483648 && f <= 2147483647 {
-		return int32(f)
+	if f > -9.2e18 && f < 9.2e18 {
+		return int32(int64(f))
 	}
 	return tnInt32Wide(f)
 }
@@ -33922,18 +35197,34 @@ var tnStrIdxASCII = &tnStrIdx{ascii: true}
 
 // (the string indexed last: a scan over one string finds it first)
 var tnStrIdxLast atomic.Pointer[tnStrIdx]
-var tnStrIdxCache [8]atomic.Pointer[tnStrIdx]
-var tnStrIdxNext atomic.Uint32
+var tnStrIdxCache [1024][2]atomic.Pointer[tnStrIdx]
 
 // (long strings — a parser's whole input — have slots of their own, so the
 // many short slices taken from them don't evict their index)
 var tnStrIdxBig [4]atomic.Pointer[tnStrIdx]
 var tnStrIdxBigNext atomic.Uint32
 
-// Whether a short string is all ASCII is kept in the same lock-free index
-// cache as long strings (tnStrIdxLast / tnStrIdxCache): a lexer reads each
-// character of one line with charCodeAt(i) and tests i < line.length, which
-// would otherwise rescan the line on every call
+func tnStrSlot(p *byte, n int) uint32 {
+	h := (uint64(uintptr(unsafe.Pointer(p))) >> 4) ^ (uint64(n) * 0x9e3779b97f4a7c15)
+	return uint32((h ^ (h >> 16)) & 1023)
+}
+
+func tnStrCacheGet(slot uint32, p *byte, n int) *tnStrIdx {
+	if c := tnStrIdxCache[slot][0].Load(); c != nil && c.p == p && c.n == n {
+		return c
+	}
+	if c := tnStrIdxCache[slot][1].Load(); c != nil && c.p == p && c.n == n {
+		return c
+	}
+	return nil
+}
+
+func tnStrCachePut(slot uint32, c *tnStrIdx) {
+	if prev := tnStrIdxCache[slot][0].Load(); prev != nil {
+		tnStrIdxCache[slot][1].Store(prev)
+	}
+	tnStrIdxCache[slot][0].Store(c)
+}
 
 func tnStrIsASCII(s string) bool {
 	i := 0
@@ -33957,17 +35248,33 @@ func tnStrIndexOf(s string) *tnStrIdx {
 	if c := tnStrIdxLast.Load(); c != nil && c.p == p && c.n == len(s) {
 		return c
 	}
-	// (a short ASCII string needs no index at all: code points are bytes, and
-	// the scan is a few vectorized loads — cheaper than an entry per string)
-	if len(s) < 32 && tnStrIsASCII(s) {
-		return tnStrIdxASCII
+	if len(s) < 4096 {
+		slot := tnStrSlot(p, len(s))
+		if c := tnStrCacheGet(slot, p, len(s)); c != nil {
+			tnStrIdxLast.Store(c)
+			return c
+		}
+		// (a short ASCII string needs no index at all: code points are bytes, and
+		// the scan is a few vectorized loads — cheaper than an entry per string)
+		if len(s) < 32 && tnStrIsASCII(s) {
+			return tnStrIdxASCII
+		}
+		c := &tnStrIdx{p: p, n: len(s), ascii: tnStrIsASCII(s)}
+		if !c.ascii {
+			c.offs = make([]int, 0, len(s)+1)
+			for b := 0; b < len(s); {
+				c.offs = append(c.offs, b)
+				_, size := utf8.DecodeRuneInString(s[b:])
+				b += size
+			}
+			c.offs = append(c.offs, len(s))
+		}
+		tnStrIdxLast.Store(c)
+		tnStrCachePut(slot, c)
+		return c
 	}
-	cache := tnStrIdxCache[:]
-	if len(s) >= 4096 {
-		cache = tnStrIdxBig[:]
-	}
-	for i := range cache {
-		c := cache[i].Load()
+	for i := range tnStrIdxBig {
+		c := tnStrIdxBig[i].Load()
 		if c == nil {
 			continue
 		}
@@ -33977,7 +35284,7 @@ func tnStrIndexOf(s string) *tnStrIdx {
 		}
 		// (a slice of a cached long string — the rest of a parser's input —
 		// is indexed from it, without evicting it)
-		if len(s) >= 4096 && c.n > 0 && uintptr(unsafe.Pointer(p)) >= uintptr(unsafe.Pointer(c.p)) && uintptr(unsafe.Pointer(p))+uintptr(len(s)) <= uintptr(unsafe.Pointer(c.p))+uintptr(c.n) {
+		if c.n > 0 && uintptr(unsafe.Pointer(p)) >= uintptr(unsafe.Pointer(c.p)) && uintptr(unsafe.Pointer(p))+uintptr(len(s)) <= uintptr(unsafe.Pointer(c.p))+uintptr(c.n) {
 			if c.ascii {
 				return tnStrIdxASCII
 			}
@@ -33997,11 +35304,7 @@ func tnStrIndexOf(s string) *tnStrIdx {
 		c.offs = append(c.offs, len(s))
 	}
 	tnStrIdxLast.Store(c)
-	if len(s) >= 4096 {
-		tnStrIdxBig[tnStrIdxBigNext.Add(1)%uint32(len(tnStrIdxBig))].Store(c)
-	} else if len(s) >= 32 {
-		tnStrIdxCache[tnStrIdxNext.Add(1)%uint32(len(tnStrIdxCache))].Store(c)
-	}
+	tnStrIdxBig[tnStrIdxBigNext.Add(1)%uint32(len(tnStrIdxBig))].Store(c)
 	return c
 }
 
@@ -34019,6 +35322,30 @@ func (c *tnStrIdx) slice(p *byte, n int) *tnStrIdx {
 
 // The number of code points
 func tnStrCount(s string) int {
+	p := unsafe.StringData(s)
+	if c := tnStrIdxLast.Load(); c != nil && c.p == p && c.n == len(s) {
+		if c.ascii {
+			return len(s)
+		}
+		return len(c.offs) - 1
+	}
+	if len(s) < 4096 {
+		if c := tnStrCacheGet(tnStrSlot(p, len(s)), p, len(s)); c != nil {
+			tnStrIdxLast.Store(c)
+			if c.ascii {
+				return len(s)
+			}
+			return len(c.offs) - 1
+		}
+		// Short uncached string (e.g. one-off s.slice(2, 9).length): count
+		// directly without allocating a tnStrIdx or []int offsets slice
+		if len(s) < 64 {
+			if tnStrIsASCII(s) {
+				return len(s)
+			}
+			return utf8.RuneCountInString(s)
+		}
+	}
 	c := tnStrIndexOf(s)
 	if c.ascii {
 		return len(s)
@@ -34081,7 +35408,27 @@ func TnStrLength(s string) float64 { return float64(tnStrCount(s)) }
 
 // Whether code points are bytes in s (an operation asks once, not per offset)
 func tnStrASCII(s string) bool {
+	if len(s) < 32 {
+		return tnStrIsASCII(s)
+	}
 	return tnStrIndexOf(s).ascii
+}
+
+// Fast bounds-checked ASCII character access (when caller already proved tnStrASCII(s))
+func TnAsciiCharAt(s string, i float64) string {
+	n := tnStrPos(i)
+	if i >= 0 && n < len(s) {
+		return s[n : n+1]
+	}
+	return ""
+}
+
+func TnAsciiCharCodeAt(s string, i float64) float64 {
+	n := tnStrPos(i)
+	if i >= 0 && n < len(s) {
+		return float64(s[n])
+	}
+	return math.NaN()
 }
 
 // s[i] / s.charAt(i): "" out of range
@@ -34158,10 +35505,10 @@ func TnStrAt(s string, i float64) string {
 
 // s.slice(start, end?)
 func TnStrSlice(s string, start float64, end float64, hasEnd bool) string {
-	ascii := tnStrASCII(s)
+	c := tnStrIndexOf(s)
 	count := len(s)
-	if !ascii {
-		count = tnStrCount(s)
+	if !c.ascii {
+		count = len(c.offs) - 1
 	}
 	a, b := tnStrPos(start), count
 	if hasEnd {
@@ -34177,18 +35524,18 @@ func TnStrSlice(s string, start float64, end float64, hasEnd bool) string {
 	if a >= b {
 		return ""
 	}
-	if ascii {
+	if c.ascii {
 		return s[a:b]
 	}
-	return s[tnStrByte(s, a):tnStrByte(s, b)]
+	return s[c.offs[a]-c.base : c.offs[b]-c.base]
 }
 
 // s.substring(start, end?): clamped, swapped when reversed
 func TnSubstring(s string, start float64, end float64, hasEnd bool) string {
-	ascii := tnStrASCII(s)
+	c := tnStrIndexOf(s)
 	count := len(s)
-	if !ascii {
-		count = tnStrCount(s)
+	if !c.ascii {
+		count = len(c.offs) - 1
 	}
 	a, b := min(max(tnStrPos(start), 0), count), count
 	if hasEnd {
@@ -34197,10 +35544,10 @@ func TnSubstring(s string, start float64, end float64, hasEnd bool) string {
 	if a > b {
 		a, b = b, a
 	}
-	if ascii {
+	if c.ascii {
 		return s[a:b]
 	}
-	return s[tnStrByte(s, a):tnStrByte(s, b)]
+	return s[c.offs[a]-c.base : c.offs[b]-c.base]
 }
 
 // s.substr(start, length?)
@@ -35851,9 +37198,13 @@ func tnJSONMarshal(v interface{}) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\\n")), nil
 }`,
   orderedMap: `// TnMap: JS Map/Set/object semantics — keys iterate in insertion order
+// Small maps (<= 8 concrete keys, no accessors/views) stay in flat keys/vals
+// slices (values == nil) with zero Go map allocation or hashing, promoting to
+// values map[K]V on the 9th key or on features that need a hash map.
 type TnMap[K comparable, V any] struct {
 	keys      []K
 	values    map[K]V
+	vals      []V
 	jsKind    uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
 	indexKeys bool  // some key is an array index ("2"): see orderedKeys
 	// a plain object's accessor properties ({ get x() {} }, defineProperty
@@ -35870,6 +37221,21 @@ type TnMap[K comparable, V any] struct {
 	// keys not listed yet: values is an any object's map, viewed as a record
 	// (TnRecordOf), and listKeys lists them when something first needs keys
 	view bool
+}
+
+func (m *TnMap[K, V]) promote() {
+	if m.values != nil {
+		return
+	}
+	capHint := len(m.keys) * 2
+	if capHint < 16 {
+		capHint = 16
+	}
+	m.values = make(map[K]V, capHint)
+	for i, k := range m.keys {
+		m.values[m.hk(k)] = m.vals[i]
+	}
+	m.vals = nil
 }
 
 // A record view's keys, listed the first time they're needed: sorted (a Go
@@ -35904,6 +37270,19 @@ type TnAccessor struct {
 
 // k's value: an accessor's getter result, else the stored value
 func (m *TnMap[K, V]) read(k K) (V, bool) {
+	if m.values == nil {
+		if m.keyMode == 2 {
+			var zero V
+			return zero, false
+		}
+		for i := 0; i < len(m.keys); i++ {
+			if m.keys[i] == k {
+				return m.vals[i], true
+			}
+		}
+		var zero V
+		return zero, false
+	}
 	if m.accessors != nil {
 		if a, ok := m.accessors[m.hk(k)]; ok {
 			var zero V
@@ -35952,6 +37331,7 @@ func (m *TnMap[K, V]) liveKeys() []K {
 }
 
 func (m *TnMap[K, V]) addKey(k K) {
+	m.promote()
 	if _, ok := m.values[m.hk(k)]; !ok {
 		m.pushKey(k)
 		if _, isIndex := tnIndexKey(any(k)); isIndex {
@@ -35977,6 +37357,7 @@ func (m *TnMap[K, V]) setHidden(k K, hidden bool) {
 // accessor (enumerable, as a literal's are, or not: defineProperty's default
 // for a new key; an existing key keeps its enumerability)
 func (m *TnMap[K, V]) TnDefineAccessor(k K, get func() interface{}, set func(interface{}), enumerable bool) {
+	m.promote()
 	_, existed := m.values[m.hk(k)]
 	m.addKey(k)
 	if m.accessors == nil {
@@ -35991,6 +37372,7 @@ func (m *TnMap[K, V]) TnDefineAccessor(k K, get func() interface{}, set func(int
 // { get k() {}, set k(v) {} } of an object literal: an enumerable accessor,
 // each of its functions set as the literal defines it
 func (m *TnMap[K, V]) TnAddAccessor(k K, get func() interface{}, set func(interface{})) {
+	m.promote()
 	if m.accessors != nil {
 		if a, ok := m.accessors[m.hk(k)]; ok {
 			if get != nil {
@@ -36007,6 +37389,7 @@ func (m *TnMap[K, V]) TnAddAccessor(k K, get func() interface{}, set func(interf
 
 // Object.defineProperty(o, k, { value }): k becomes a data property
 func (m *TnMap[K, V]) TnDefineValue(k K, v V, enumerable bool, explicit bool) {
+	m.promote()
 	_, existed := m.values[m.hk(k)]
 	if m.accessors != nil {
 		delete(m.accessors, m.hk(k))
@@ -36072,7 +37455,7 @@ func TnMapFromGoMap(m map[string]interface{}) *TnMap[string, interface{}] {
 }
 
 func TnNewMap[K comparable, V any]() *TnMap[K, V] {
-	return &TnMap[K, V]{values: map[K]V{}}
+	return &TnMap[K, V]{}
 }
 
 // A key as the map stores it. JS Maps key objects by identity, and a dynamic
@@ -36118,9 +37501,7 @@ func (m *TnMap[K, V]) hkSlow(k K) K {
 // Fills a new map from dynamic entries (a decoded record held as any),
 // converting keys and values with convert
 func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, reflect.Type) (reflect.Value, bool)) bool {
-	if m.values == nil {
-		m.values = map[K]V{}
-	}
+	m.promote()
 	keyType := reflect.TypeOf((*K)(nil)).Elem()
 	valueType := reflect.TypeOf((*V)(nil)).Elem()
 	for _, e := range entries {
@@ -36135,6 +37516,28 @@ func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, 
 }
 
 func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
+	if m.values == nil {
+		if m.keyMode == 0 {
+			m.hkSlow(k)
+		}
+		if m.keyMode == 1 {
+			for i := 0; i < len(m.keys); i++ {
+				if m.keys[i] == k {
+					m.vals[i] = v
+					return m
+				}
+			}
+			if len(m.keys) < 8 {
+				m.keys = append(m.keys, k)
+				m.vals = append(m.vals, v)
+				if _, isIndex := tnIndexKey(any(k)); isIndex {
+					m.indexKeys = true
+				}
+				return m
+			}
+		}
+		m.promote()
+	}
 	if m.accessors != nil {
 		if a, ok := m.accessors[m.hk(k)]; ok {
 			if a.Set != nil {
@@ -36248,11 +37651,35 @@ func (m *TnMap[K, V]) Has(k K) bool {
 	if m == nil {
 		return false
 	}
+	if m.values == nil {
+		if m.keyMode == 2 {
+			return false
+		}
+		for i := 0; i < len(m.keys); i++ {
+			if m.keys[i] == k {
+				return true
+			}
+		}
+		return false
+	}
 	_, ok := m.values[m.hk(k)]
 	return ok
 }
 
 func (m *TnMap[K, V]) Delete(k K) bool {
+	if m.values == nil {
+		if m.keyMode == 2 {
+			return false
+		}
+		for i := 0; i < len(m.keys); i++ {
+			if m.keys[i] == k {
+				m.keys = append(m.keys[:i], m.keys[i+1:]...)
+				m.vals = append(m.vals[:i], m.vals[i+1:]...)
+				return true
+			}
+		}
+		return false
+	}
 	h := m.hk(k)
 	if _, ok := m.values[h]; !ok {
 		return false
@@ -36318,7 +37745,14 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 // A fresh result map for a set operation, with room for every key
 func tnSetResult[K comparable, V any](m, o *TnMap[K, V]) *TnMap[K, V] {
 	r := TnNewMap[K, V]()
-	if n := len(m.values) + len(o.values); n > 0 {
+	n := len(m.values) + len(o.values)
+	if m.values == nil {
+		n += len(m.keys)
+	}
+	if o.values == nil {
+		n += len(o.keys)
+	}
+	if n > 0 {
 		r.values = make(map[K]V, n)
 	}
 	return r
@@ -36327,6 +37761,9 @@ func tnSetResult[K comparable, V any](m, o *TnMap[K, V]) *TnMap[K, V] {
 // Set without the accessor check (a fresh result map has none): the hot path
 // of the set operations
 func (m *TnMap[K, V]) setFast(k K, v V) {
+	if m.values == nil {
+		m.promote()
+	}
 	h := m.hk(k)
 	if _, ok := m.values[h]; !ok {
 		m.pushKey(k)
@@ -36337,13 +37774,21 @@ func (m *TnMap[K, V]) setFast(k K, v V) {
 	m.values[h] = v
 }
 
+func (m *TnMap[K, V]) rawVal(k K) V {
+	if m.values == nil {
+		v, _ := m.read(k)
+		return v
+	}
+	return m.values[m.hk(k)]
+}
+
 func (m *TnMap[K, V]) Union(o *TnMap[K, V]) *TnMap[K, V] {
 	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
-		r.setFast(k, m.values[m.hk(k)])
+		r.setFast(k, m.rawVal(k))
 	}
 	for _, k := range o.liveKeys() {
-		r.setFast(k, o.values[o.hk(k)])
+		r.setFast(k, o.rawVal(k))
 	}
 	return r
 }
@@ -36352,7 +37797,7 @@ func (m *TnMap[K, V]) Intersection(o *TnMap[K, V]) *TnMap[K, V] {
 	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
 		if o.Has(k) {
-			r.setFast(k, m.values[m.hk(k)])
+			r.setFast(k, m.rawVal(k))
 		}
 	}
 	return r
@@ -36362,7 +37807,7 @@ func (m *TnMap[K, V]) Difference(o *TnMap[K, V]) *TnMap[K, V] {
 	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
 		if !o.Has(k) {
-			r.setFast(k, m.values[m.hk(k)])
+			r.setFast(k, m.rawVal(k))
 		}
 	}
 	return r
@@ -36372,12 +37817,12 @@ func (m *TnMap[K, V]) SymmetricDifference(o *TnMap[K, V]) *TnMap[K, V] {
 	r := tnSetResult(m, o)
 	for _, k := range m.liveKeys() {
 		if !o.Has(k) {
-			r.setFast(k, m.values[m.hk(k)])
+			r.setFast(k, m.rawVal(k))
 		}
 	}
 	for _, k := range o.liveKeys() {
 		if !m.Has(k) {
-			r.setFast(k, o.values[o.hk(k)])
+			r.setFast(k, o.rawVal(k))
 		}
 	}
 	return r
@@ -36393,8 +37838,8 @@ func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
 }
 
 func (m *TnMap[K, V]) Clear() {
-	m.keys, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, 0, false
-	m.values = map[K]V{}
+	m.keys, m.vals, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, false
+	m.values = nil
 	m.accessors = nil
 	m.hidden = nil
 }
@@ -36455,8 +37900,8 @@ func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return fmt.Errorf("json: cannot unmarshal %v into an object", tok)
 	}
-	m.keys, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, 0, false
-	m.values = map[K]V{}
+	m.keys, m.vals, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, false
+	m.values = nil
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
@@ -38176,6 +39621,12 @@ func TnBigInt(s string) *tnbig.Int {
 	return v
 }
 
+func tnBigAddIn(dst, b *tnbig.Int) *tnbig.Int { return dst.Add(dst, b) }
+func tnBigSubIn(dst, b *tnbig.Int) *tnbig.Int { return dst.Sub(dst, b) }
+func tnBigMulIn(dst, b *tnbig.Int) *tnbig.Int { return dst.Mul(dst, b) }
+func tnBigDivIn(dst, b *tnbig.Int) *tnbig.Int { return dst.Div(dst, b) }
+func tnBigRemIn(dst, b *tnbig.Int) *tnbig.Int { return dst.Rem(dst, b) }
+
 // x === 1n where x is a dynamic (number | bigint) value
 func TnBigSame(v interface{}, b *tnbig.Int) bool {
 	x, ok := v.(*tnbig.Int)
@@ -38247,6 +39698,13 @@ func tnGoFromNums[T tnGoNumber](s []T) []float64 {
 func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
 	if m == nil {
 		return nil
+	}
+	if m.values == nil {
+		out := make(map[K]V, len(m.keys))
+		for i, k := range m.keys {
+			out[k] = m.vals[i]
+		}
+		return out
 	}
 	out := make(map[K]V, len(m.values))
 	for _, k := range m.liveKeys() {
@@ -38658,8 +40116,15 @@ var tnLoopRefs int64
 
 // The baton: free when it sits in the channel (main holds it at start).
 // A call of an async function lends it to the body until its first await.
+type tnLend struct {
+	ch      chan struct{}
+	isStart bool
+}
+
 var tnBaton = make(chan struct{}, 1)
-var tnLendStack []chan struct{}
+var tnLendStack []tnLend
+var tnStartLends int
+var tnMicrotaskDepth int
 
 // Async context (AsyncLocalStorage): the baton holder's current stores. Callbacks
 // scheduled by JS code capture it (TnAsyncWrap) and run with it restored; an await
@@ -38742,7 +40207,10 @@ func tnRelease() {
 	if n := len(tnLendStack); n > 0 {
 		lender := tnLendStack[n-1]
 		tnLendStack = tnLendStack[:n-1]
-		close(lender)
+		if lender.isStart {
+			tnStartLends--
+		}
+		close(lender.ch)
 		return
 	}
 	tnBaton <- struct{}{}
@@ -38760,7 +40228,8 @@ func TnRunAsyncInline(body func()) {
 // end), then the caller continues while the body waits
 func TnStartAsync(body func()) {
 	yielded := make(chan struct{})
-	tnLendStack = append(tnLendStack, yielded)
+	tnStartLends++
+	tnLendStack = append(tnLendStack, tnLend{ch: yielded, isStart: true})
 	ctx := tnAsyncCtx
 	go func() {
 		defer tnRelease()
@@ -38994,7 +40463,7 @@ func tnCancelAwait(ch any, tok chan struct{}) bool {
 // again (or finish): JS keeps running one thing at a time
 func tnDeliver(tok chan struct{}) {
 	back := make(chan struct{})
-	tnLendStack = append(tnLendStack, back)
+	tnLendStack = append(tnLendStack, tnLend{ch: back, isStart: false})
 	close(tok)
 	<-back
 }
@@ -39020,6 +40489,71 @@ func tnYieldMicrotask() {
 	<-tok
 }
 
+func tnCanDirectAwait() bool {
+	return !tnAsyncHooksOn && tnStartLends == 0 && atomic.LoadInt32(&tnHasMicrotasks) == 0
+}
+
+// Fast microtask tick: when no TnStartAsync caller is waiting for the baton
+// and no microtasks are queued, resuming immediately is observationally
+// identical to queuing a continuation and immediately running it.
+func tnYieldMicrotaskFast() {
+	if tnStartLends == 0 && atomic.LoadInt32(&tnHasMicrotasks) == 0 {
+		return
+	}
+	if len(tnLendStack) > 0 {
+		tnYieldMicrotask()
+		return
+	}
+	tnRunMicrotasksBatch()
+}
+
+func tnRunMicrotasksBatch() {
+	tnMicrotasksMu.Lock()
+	n := len(tnMicrotasks)
+	tnMicrotasksMu.Unlock()
+	if n == 0 {
+		return
+	}
+	ctx := tnAsyncCtx
+	defer func() { tnAsyncCtx = ctx }()
+	for i := 0; i < n; i++ {
+		tnMicrotasksMu.Lock()
+		if len(tnMicrotasks) == 0 {
+			atomic.StoreInt32(&tnHasMicrotasks, 0)
+			tnMicrotasksMu.Unlock()
+			return
+		}
+		fn := tnMicrotasks[0]
+		tnMicrotasks[0] = nil
+		tnMicrotasks = tnMicrotasks[1:]
+		if len(tnMicrotasks) == 0 {
+			tnMicrotasks = tnMicrotasks[:0]
+			atomic.StoreInt32(&tnHasMicrotasks, 0)
+		}
+		tnMicrotasksMu.Unlock()
+		TnAsyncRun(nil, fn)
+	}
+}
+
+// Re-inserts a fulfilled value into a cap==1 promise channel so multiple
+// readers see it; safe even if a producer closed the channel after sending.
+func tnReputLocked[T any](ch chan T, v T) {
+	defer func() { recover() }()
+	select {
+	case ch <- v:
+	default:
+	}
+}
+
+func tnReput[T any](ch chan T, v T) {
+	if cap(ch) != 1 {
+		return
+	}
+	tnWakeMu.Lock()
+	tnReputLocked(ch, v)
+	tnWakeMu.Unlock()
+}
+
 // (baton holder) Receives from a channel, running loop tasks while waiting;
 // once nothing is left it parks. An already-settled promise still yields one
 // microtask tick so the async function never resumes synchronously. A promise
@@ -39030,33 +40564,43 @@ func TnLoopReceive[T any](ch chan T) (T, bool) {
 	defer func() { tnAsyncCtx = ctx }()
 	select {
 	case v, ok := <-ch:
-		tnYieldMicrotask()
+		if ok && cap(ch) == 1 {
+			tnReput(ch, v)
+		}
+		tnYieldMicrotaskFast()
 		return v, ok
 	default:
 	}
 	for {
-		if len(tnLendStack) == 0 {
+		if tnStartLends == 0 && tnMicrotaskDepth < 8 {
 			TnRunMicrotasks()
-			if TnLoopRunPending() {
+			if len(tnLendStack) == 0 && TnLoopRunPending() {
 				continue
 			}
 		}
-		tok := make(chan struct{})
+		var tok chan struct{}
 		tnWakeMu.Lock()
 		select {
 		case v, ok := <-ch:
+			if ok && cap(ch) == 1 {
+				tnReputLocked(ch, v)
+			}
 			tnWakeMu.Unlock()
-			if len(tnLendStack) > 0 {
+			if tnStartLends > 0 {
 				tnYieldMicrotask()
 			}
 			return v, ok
 		default:
+			tok = make(chan struct{})
 			tnAwaiting[any(ch)] = append(tnAwaiting[any(ch)], tok)
 		}
 		tnWakeMu.Unlock()
 		tnRelease()
 		select {
 		case v, ok := <-ch:
+			if ok && cap(ch) == 1 {
+				tnReput(ch, v)
+			}
 			// The value is taken; when a promise wake was queued (the token
 			// is gone) it hands the baton over, else take the baton ourselves
 			tnWakeMu.Lock()
@@ -39069,7 +40613,42 @@ func TnLoopReceive[T any](ch chan T) (T, bool) {
 			}
 			return v, ok
 		case <-tok:
+			v, ok := <-ch
+			if ok && cap(ch) == 1 {
+				tnReput(ch, v)
+			}
+			return v, ok
 		}
+	}
+}
+
+// (baton holder on a dedicated async goroutine: async function / async generator)
+// Receives from an async iterator / generator channel without spawning a
+// tnLoopStandIn goroutine or touching tnAwaiting.
+func tnRawReceiveAsync[T any](ch chan T) (T, bool) {
+	select {
+	case v, ok := <-ch:
+		return v, ok
+	default:
+	}
+	ctx := tnAsyncCtx
+	defer func() { tnAsyncCtx = ctx }()
+	for {
+		if len(tnLendStack) == 0 {
+			TnRunMicrotasks()
+			if TnLoopRunPending() {
+				select {
+				case v, ok := <-ch:
+					return v, ok
+				default:
+				}
+				continue
+			}
+		}
+		tnRelease()
+		v, ok := <-ch
+		tnAcquire()
+		return v, ok
 	}
 }
 
@@ -39091,13 +40670,14 @@ func tnRawReceive[T any](ch chan T) (T, bool) {
 		if TnLoopRunPending() {
 			continue
 		}
-		tok := make(chan struct{})
+		var tok chan struct{}
 		tnWakeMu.Lock()
 		select {
 		case v, ok := <-ch:
 			tnWakeMu.Unlock()
 			return v, ok
 		default:
+			tok = make(chan struct{})
 			tnAwaiting[any(ch)] = append(tnAwaiting[any(ch)], tok)
 		}
 		tnWakeMu.Unlock()
@@ -39122,6 +40702,8 @@ func tnRawReceive[T any](ch chan T) (T, bool) {
 			return v, ok
 		case <-tok:
 			close(stop)
+			v, ok := <-ch
+			return v, ok
 		}
 	}
 }
@@ -39172,6 +40754,8 @@ func TnRunMicrotasks() {
 	if atomic.LoadInt32(&tnHasMicrotasks) == 0 {
 		return
 	}
+	tnMicrotaskDepth++
+	defer func() { tnMicrotaskDepth-- }()
 	for {
 		tnMicrotasksMu.Lock()
 		if len(tnMicrotasks) == 0 {
@@ -39620,7 +41204,12 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 	__tnWaitGroup.Add(1)
 	TnStartAsync(func() {
 		defer __tnWaitGroup.Done()
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		var v, reason interface{}
 		rejected := false
@@ -39628,16 +41217,17 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 			received, ok := TnLoopReceive(ch)
 			v, reason, rejected = tnSettled(ch, received, ok)
 		} else if received, ok := p.TryRecv(); ok {
+			tnReputReflect(p, received)
 			if received.IsValid() {
 				v = received.Interface()
 			}
-			tnYieldMicrotask()
+			tnYieldMicrotaskFast()
 		} else if val, resolved := tnResolved.Load(p.Interface()); resolved {
 			v = val
-			tnYieldMicrotask()
+			tnYieldMicrotaskFast()
 		} else if r, rej := tnRejections.Load(p.Interface()); rej {
 			reason, rejected = r, true
-			tnYieldMicrotask()
+			tnYieldMicrotaskFast()
 		} else {
 			untyped := make(chan interface{}, 1)
 			go func() {
@@ -39645,7 +41235,6 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 				if !ok {
 					if val, resolved := tnResolved.Load(p.Interface()); resolved {
 						TnAsyncSend(untyped, val)
-						TnAsyncClose(untyped)
 						return
 					}
 					if r, rej := tnRejections.Load(p.Interface()); rej {
@@ -39655,12 +41244,12 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 					TnAsyncClose(untyped)
 					return
 				}
+				tnReputReflect(p, received)
 				var val interface{}
 				if received.IsValid() {
 					val = received.Interface()
 				}
 				TnAsyncSend(untyped, val)
-				TnAsyncClose(untyped)
 			}()
 			received, ok := TnLoopReceive(untyped)
 			v, reason, rejected = tnSettled(untyped, received, ok)
@@ -39685,10 +41274,11 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 			v, rejected = result, false
 		}
 		if rejected {
-			tnRejections.Store(out, reason)
+			tnStoreRejection(out, reason)
 			return
 		}
 		TnAsyncSend(out, v)
+		sent = true
 	})
 	return out, true
 }`,
@@ -39696,9 +41286,30 @@ func tnPromiseMethodDynamic(p reflect.Value, name string, args []interface{}) (i
 type tnFunctionConstructor struct{}
 
 var TnFunction interface{} = &tnFunctionConstructor{}`,
-  promise: `// Promises are channels; a settled promise is a closed channel with its value or reason
+  promise: `// Promises are channels: buffered (cap == 1) fulfilled promises retain their
+// value in the channel buffer (re-put by readers) without touching any global
+// map, so resolved promises are garbage-collected normally. Unbuffered channels
+// and rejections still use tnResolved / tnRejections with a closed channel.
 var tnResolved sync.Map
 var tnRejections sync.Map
+var tnHasRejections atomic.Bool
+
+func tnReputReflect(ch reflect.Value, v reflect.Value) {
+	if ch.Cap() != 1 {
+		return
+	}
+	tnWakeMu.Lock()
+	defer func() {
+		recover()
+		tnWakeMu.Unlock()
+	}()
+	ch.TrySend(v)
+}
+
+func tnStoreRejection(ch any, reason interface{}) {
+	tnHasRejections.Store(true)
+	tnRejections.Store(ch, reason)
+}
 
 // A throw inside a Promise executor rejects the promise
 func TnRejectExecutor[T any](ch chan T) {
@@ -39707,23 +41318,38 @@ func TnRejectExecutor[T any](ch chan T) {
 	}
 }
 
-// Promise resolution: the value (or rejection) is stored and the channel closed
-// so any number of consumers (.then / await) can read it; parked awaiters are
-// woken in settlement order — Node runs promise continuations as ordered
-// microtasks; a bare channel wake would race for the baton and resume out of
-// order on a starved machine
+// Promise resolution: buffered promises store their value directly in the
+// channel buffer (avoiding global sync.Map growth); parked awaiters are woken
+// in settlement order — Node runs promise continuations as ordered microtasks.
 func TnAsyncSend[T any](ch chan T, v T) {
 	tnWakeMu.Lock()
-	select {
-	case _, ok := <-ch:
-		if !ok {
+	if cap(ch) == 1 {
+		if len(ch) > 0 {
 			tnWakeMu.Unlock()
 			return
 		}
-	default:
+		select {
+		case prev, ok := <-ch:
+			if ok {
+				ch <- prev
+			}
+			tnWakeMu.Unlock()
+			return
+		default:
+		}
+		ch <- v
+	} else {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				tnWakeMu.Unlock()
+				return
+			}
+		default:
+		}
+		tnResolved.Store(any(ch), v)
+		close(ch)
 	}
-	tnResolved.Store(any(ch), v)
-	close(ch)
 	toks := tnAwaiting[any(ch)]
 	if len(toks) > 0 {
 		delete(tnAwaiting, any(ch))
@@ -39736,9 +41362,16 @@ func TnAsyncSend[T any](ch chan T, v T) {
 
 func TnAsyncClose[T any](ch chan T) {
 	tnWakeMu.Lock()
+	if cap(ch) == 1 && len(ch) > 0 {
+		tnWakeMu.Unlock()
+		return
+	}
 	select {
-	case _, ok := <-ch:
-		if !ok {
+	case prev, ok := <-ch:
+		if ok && cap(ch) == 1 {
+			ch <- prev
+		}
+		if !ok || cap(ch) == 1 {
 			tnWakeMu.Unlock()
 			return
 		}
@@ -39757,7 +41390,7 @@ func TnAsyncClose[T any](ch chan T) {
 
 func TnPromiseResolve[T any](v T) chan T {
 	ch := make(chan T, 1)
-	TnAsyncSend(ch, v)
+	ch <- v
 	return ch
 }
 
@@ -39791,6 +41424,10 @@ func TnRejecter[T any](ch chan T) func(...interface{}) {
 
 func TnReject[T any](ch chan T, reason interface{}) {
 	tnWakeMu.Lock()
+	if cap(ch) == 1 && len(ch) > 0 {
+		tnWakeMu.Unlock()
+		return
+	}
 	select {
 	case _, ok := <-ch:
 		if !ok {
@@ -39799,7 +41436,7 @@ func TnReject[T any](ch chan T, reason interface{}) {
 		}
 	default:
 	}
-	tnRejections.Store(ch, reason)
+	tnStoreRejection(ch, reason)
 	close(ch)
 	toks := tnAwaiting[any(ch)]
 	if len(toks) > 0 {
@@ -39839,7 +41476,7 @@ func TnDetach[T any](ch chan T) {
 // Deferred in async functions: a throw rejects the function's promise
 func TnRejectOnPanic[T any](ch chan T) {
 	if r := recover(); r != nil {
-		tnRejections.Store(ch, r)
+		tnStoreRejection(ch, r)
 	}
 }
 
@@ -39851,8 +41488,10 @@ func tnSettled[T any](ch chan T, v T, ok bool) (T, interface{}, bool) {
 			}
 			return v, nil, false
 		}
-		if reason, rejected := tnRejections.Load(ch); rejected {
-			return v, reason, true
+		if tnHasRejections.Load() {
+			if reason, rejected := tnRejections.Load(ch); rejected {
+				return v, reason, true
+			}
 		}
 	}
 	return v, nil, false
@@ -39860,7 +41499,21 @@ func tnSettled[T any](ch chan T, v T, ok bool) (T, interface{}, bool) {
 
 // Waits for a promise (helper goroutines, without the baton): its value, or its rejection reason
 func tnSettle[T any](ch chan T) (T, interface{}, bool) {
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-ch:
+		if ok && cap(ch) == 1 {
+			tnReputLocked(ch, v)
+		}
+		tnWakeMu.Unlock()
+		return tnSettled(ch, v, ok)
+	default:
+	}
+	tnWakeMu.Unlock()
 	v, ok := <-ch
+	if ok && cap(ch) == 1 {
+		tnReput(ch, v)
+	}
 	return tnSettled(ch, v, ok)
 }
 
@@ -39901,6 +41554,7 @@ func TnAwaitValue(v interface{}, inline bool) interface{} {
 				TnAsyncClose(untyped)
 				return
 			}
+			tnReputReflect(rv, received)
 			TnAsyncSend(untyped, received.Interface())
 		}()
 		if inline {
@@ -39909,7 +41563,7 @@ func TnAwaitValue(v interface{}, inline bool) interface{} {
 		return TnAwait(untyped)
 	}
 	if !inline {
-		tnYieldMicrotask()
+		tnYieldMicrotaskFast()
 	}
 	return v
 }
@@ -39919,11 +41573,138 @@ func TnAwaitValue(v interface{}, inline bool) interface{} {
 // loop, so it must keep running tasks while it waits
 func TnAwaitInline[T any](ch chan T) T {
 	received, ok := tnRawReceive(ch)
+	if ok && cap(ch) == 1 {
+		tnReput(ch, received)
+	}
 	v, reason, rejected := tnSettled(ch, received, ok)
 	if rejected {
 		panic(reason)
 	}
 	return v
+}
+
+// Statement-form p.then(fn): when p is already settled, queues fn directly as
+// a microtask with zero goroutines; otherwise falls back to TnStartAsync.
+func TnPromiseThenVoid[T any](p chan T, fn func(T)) {
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-p:
+		if ok && cap(p) == 1 {
+			tnReputLocked(p, v)
+		}
+		tnWakeMu.Unlock()
+		val, _, rejected := tnSettled(p, v, ok)
+		if rejected {
+			return
+		}
+		__tnWaitGroup.Add(1)
+		TnQueueMicrotask(func() {
+			defer __tnWaitGroup.Done()
+			fn(val)
+		})
+		return
+	default:
+		tnWakeMu.Unlock()
+	}
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		received, ok := TnLoopReceive(p)
+		val, _, rejected := tnSettled(p, received, ok)
+		if rejected {
+			return
+		}
+		fn(val)
+	})
+}
+
+func TnPromiseThenVoid0[T any](p chan T, fn func()) {
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-p:
+		if ok && cap(p) == 1 {
+			tnReputLocked(p, v)
+		}
+		tnWakeMu.Unlock()
+		_, _, rejected := tnSettled(p, v, ok)
+		if rejected {
+			return
+		}
+		__tnWaitGroup.Add(1)
+		TnQueueMicrotask(func() {
+			defer __tnWaitGroup.Done()
+			fn()
+		})
+		return
+	default:
+		tnWakeMu.Unlock()
+	}
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		received, ok := TnLoopReceive(p)
+		_, _, rejected := tnSettled(p, received, ok)
+		if rejected {
+			return
+		}
+		fn()
+	})
+}
+
+// Value-form p.then(fn): returns a promise of fn's result; zero goroutines when p is already settled.
+func TnPromiseThen[T, U any](p chan T, fn func(T) U) chan U {
+	out := make(chan U, 1)
+	tnWakeMu.Lock()
+	select {
+	case v, ok := <-p:
+		if ok && cap(p) == 1 {
+			tnReputLocked(p, v)
+		}
+		tnWakeMu.Unlock()
+		val, reason, rejected := tnSettled(p, v, ok)
+		if rejected {
+			TnReject(out, reason)
+			return out
+		}
+		__tnWaitGroup.Add(1)
+		TnQueueMicrotask(func() {
+			defer __tnWaitGroup.Done()
+			sent := false
+			defer func() {
+				if !sent {
+					TnAsyncClose(out)
+				}
+			}()
+			defer TnRejectOnPanic(out)
+			res := fn(val)
+			TnAsyncSend(out, res)
+			sent = true
+		})
+		return out
+	default:
+		tnWakeMu.Unlock()
+	}
+	__tnWaitGroup.Add(1)
+	TnStartAsync(func() {
+		defer __tnWaitGroup.Done()
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
+		defer TnRejectOnPanic(out)
+		received, ok := TnLoopReceive(p)
+		val, reason, rejected := tnSettled(p, received, ok)
+		if rejected {
+			tnStoreRejection(out, reason)
+			return
+		}
+		res := fn(val)
+		TnAsyncSend(out, res)
+		sent = true
+	})
+	return out
 }
 
 func TnPromiseReject[T any](reason interface{}) chan T {
@@ -39938,7 +41719,12 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 	__tnWaitGroup.Add(1)
 	TnStartAsync(func() {
 		defer __tnWaitGroup.Done()
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		received, ok := TnLoopReceive(p)
 		v, reason, rejected := tnSettled(p, received, ok)
@@ -39947,6 +41733,7 @@ func TnPromiseCatch[T any, E any](p chan T, onRejected func(E)) chan T {
 			TnAsyncRun(ctx, func() { onRejected(e) })
 		}
 		TnAsyncSend(out, v)
+		sent = true
 	})
 	return out
 }
@@ -39962,7 +41749,6 @@ func TnPromiseAs[T any](p chan interface{}, convert func(interface{}) T) chan T 
 			return
 		}
 		TnAsyncSend(out, convert(v))
-		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -39973,7 +41759,12 @@ func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 	__tnWaitGroup.Add(1)
 	TnStartAsync(func() {
 		defer __tnWaitGroup.Done()
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		received, ok := TnLoopReceive(p)
 		v, reason, rejected := tnSettled(p, received, ok)
@@ -39982,6 +41773,7 @@ func TnPromiseCatchValue[T any, E any](p chan T, onRejected func(E) T) chan T {
 			TnAsyncRun(ctx, func() { v = onRejected(e) })
 		}
 		TnAsyncSend(out, v)
+		sent = true
 	})
 	return out
 }
@@ -39992,16 +41784,22 @@ func TnPromiseFinally[T any](p chan T, onFinally func()) chan T {
 	__tnWaitGroup.Add(1)
 	TnStartAsync(func() {
 		defer __tnWaitGroup.Done()
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		received, ok := TnLoopReceive(p)
 		v, reason, rejected := tnSettled(p, received, ok)
 		onFinally()
 		if rejected {
-			tnRejections.Store(out, reason)
+			tnStoreRejection(out, reason)
 			return
 		}
 		TnAsyncSend(out, v)
+		sent = true
 	})
 	return out
 }
@@ -40019,7 +41817,6 @@ func TnPromiseRace[T any](chs []chan T) chan T {
 					return
 				}
 				TnAsyncSend(out, v)
-				TnAsyncClose(out)
 			})
 		}(ch)
 	}
@@ -40045,7 +41842,6 @@ func TnPromiseAllSettled[T any](chs []chan T) chan []*TnSettled[T] {
 			}
 		}
 		TnAsyncSend(out, results)
-		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -40070,7 +41866,6 @@ func TnPromiseAny[T any](chs []chan T) chan T {
 			select {
 			case v := <-values:
 				TnAsyncSend(out, v)
-				TnAsyncClose(out)
 				return
 			case <-failures:
 			}
@@ -40104,6 +41899,7 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 						results[i] = nil
 					}
 				} else {
+					tnReputReflect(rv, r)
 					results[i] = r.Interface()
 				}
 			} else {
@@ -40111,7 +41907,6 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 			}
 		}
 		TnAsyncSend(out, results)
-		TnAsyncClose(out)
 	}()
 	return out
 }
@@ -40122,20 +41917,28 @@ func TnPromiseAllValues(values []interface{}) chan []interface{} {
 func TnFromAsyncChan[T any](ch chan T) chan []T {
 	out := make(chan []T, 1)
 	TnStartAsync(func() {
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		results := []T{}
 		for {
-			v, ok := tnRawReceive(ch)
+			v, ok := tnRawReceiveAsync(ch)
 			if !ok {
-				if reason, rejected := tnRejections.Load(ch); rejected {
-					panic(reason)
+				if tnHasRejections.Load() {
+					if reason, rejected := tnRejections.Load(ch); rejected {
+						panic(reason)
+					}
 				}
 				break
 			}
 			results = append(results, v)
 		}
 		TnAsyncSend(out, results)
+		sent = true
 	})
 	return out
 }
@@ -40151,7 +41954,12 @@ func TnFromAsyncValues[T any](values []T) chan []T {
 func TnFromAsyncMap[T, U any](src chan []T, fn func(T, float64) U) chan []U {
 	out := make(chan []U, 1)
 	TnStartAsync(func() {
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		values := TnAwait(src)
 		results := make([]U, len(values))
@@ -40159,6 +41967,7 @@ func TnFromAsyncMap[T, U any](src chan []T, fn func(T, float64) U) chan []U {
 			results[i] = fn(v, float64(i))
 		}
 		TnAsyncSend(out, results)
+		sent = true
 	})
 	return out
 }
@@ -40167,7 +41976,12 @@ func TnFromAsyncMap[T, U any](src chan []T, fn func(T, float64) U) chan []U {
 func TnFromAsyncMapAwait[T, U any](src chan []T, fn func(T, float64) chan U) chan []U {
 	out := make(chan []U, 1)
 	TnStartAsync(func() {
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		values := TnAwait(src)
 		results := make([]U, len(values))
@@ -40175,6 +41989,7 @@ func TnFromAsyncMapAwait[T, U any](src chan []T, fn func(T, float64) chan U) cha
 			results[i] = TnAwait(fn(v, float64(i)))
 		}
 		TnAsyncSend(out, results)
+		sent = true
 	})
 	return out
 }
@@ -40193,9 +42008,54 @@ func TnPromiseAll[T any](chs []chan T) chan []T {
 			results[i] = v
 		}
 		TnAsyncSend(out, results)
-		TnAsyncClose(out)
 	}()
 	return out
+}
+
+// Fast path for \`await Promise.all(chs)\`: drains microtasks and collects
+// settled channels on the caller's goroutine without spawning a goroutine.
+// Falls back to TnAwait(TnPromiseAll(chs)) if any promise is still pending.
+func TnAwaitAll[T any](chs []chan T) []T {
+	if len(chs) == 0 {
+		tnYieldMicrotaskFast()
+		return []T{}
+	}
+	if tnStartLends == 0 && tnMicrotaskDepth < 8 {
+		TnRunMicrotasks()
+	}
+	results := make([]T, len(chs))
+	allReady := true
+	tnWakeMu.Lock()
+	for i, ch := range chs {
+		select {
+		case v, ok := <-ch:
+			if ok && cap(ch) == 1 {
+				tnReputLocked(ch, v)
+			}
+			val, reason, rejected := tnSettled(ch, v, ok)
+			if rejected {
+				tnWakeMu.Unlock()
+				if tnStartLends > 0 {
+					tnYieldMicrotask()
+				}
+				panic(reason)
+			}
+			results[i] = val
+		default:
+			allReady = false
+		}
+		if !allReady {
+			break
+		}
+	}
+	tnWakeMu.Unlock()
+	if allReady {
+		if tnStartLends > 0 {
+			tnYieldMicrotask()
+		}
+		return results
+	}
+	return TnAwait(TnPromiseAll(chs))
 }`,
   getenv: `func TnGetenv(name string) string {
 	return os.Getenv(name)
@@ -40291,9 +42151,9 @@ function emitTypedDynamicCalls(): string {
     const call = `f(${argExprs.join(', ')})`;
     const results = result ? splitGoParameters(result) : [];
     let body: string;
-    if (results.length === 0) body = `${call}; return nil, true`;
-    else if (results.length === 1) body = `return ${call}, true`;
-    else body = `${results.map((_, i) => (i === 0 ? '__r0' : '_')).join(', ')} := ${call}; return __r0, true`;
+    if (results.length === 0) body = `if f != nil { ${call} }; return nil, true`;
+    else if (results.length === 1) body = `if f == nil { return nil, true }; return ${call}, true`;
+    else body = `if f == nil { return nil, true }; ${results.map((_, i) => (i === 0 ? '__r0' : '_')).join(', ')} := ${call}; return __r0, true`;
     cases.push(`\tcase ${fnType}:\n\t\t${body}`);
   }
   if (cases.length === 0) return 'func tnCallValueTyped(fn interface{}, args []interface{}) (interface{}, bool) {\n\treturn nil, false\n}';
@@ -41127,12 +42987,14 @@ function goIterElems(goType: string): string[] {
 // for (const x of generator): each value received only after the loop body
 // ran for the previous one, and the generator resumed only then (as JS
 // resumes a generator on next()): TnGenLockstep / TnGenAck / TnGenStep
-function lockstepRange(name: string, chanExpr: string, body: AstNode): string {
+function lockstepRange(name: string, chanExpr: string, body: AstNode, extraPrefix = ''): string {
   useHelper('generatorStep');
   const g = getTempName('gen');
   const first = getTempName('first');
   const ok = getTempName('ok');
-  const prefix = `if !${first} { TnGenAck(${g}) }\n\t\t${first} = false\n\t\t${name}, ${ok} := <-${g}\n\t\tif !${ok} {\n\t\t\tTnGenDone(${g})\n\t\t\tbreak\n\t\t}\n\t\t_ = ${name}\n\t\t`;
+  const bind = name === '_' ? `_, ${ok} := <-${g}` : `${name}, ${ok} := <-${g}`;
+  const keep = name === '_' ? '' : `_ = ${name}\n\t\t`;
+  const prefix = `if !${first} { TnGenAck(${g}) }\n\t\t${first} = false\n\t\t${bind}\n\t\tif !${ok} {\n\t\t\tTnGenDone(${g})\n\t\t\tbreak\n\t\t}\n\t\t${keep}${extraPrefix}`;
   return `${g} := TnGenLockstep(${chanExpr})\n\t\t${first} := true\n\t\tfor ${visitLoopBody(body, prefix)}`;
 }
 
@@ -41213,8 +43075,11 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
       if (declaration && isIdentifier(declaration.name)) registerLocalVariable(declaration.name.text, elemType);
       // A rejected iterator (a stream error) throws out of the loop
       useHelper('promise');
-      // Raw receive: iterator channels are fed by raw sends (generator yields)
-      let awaitPrefix = `${valueVar}, __ok := tnRawReceive(${chanVar})\n\t\tif !__ok {\n\t\t\tif __reason, __rejected := tnRejections.Load(${chanVar}); __rejected {\n\t\t\t\tpanic(__reason)\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
+      // Raw receive: iterator channels are fed by raw sends (generator yields).
+      // Inside an async function or async generator we are already off the loop
+      // goroutine, so tnRawReceiveAsync avoids spawning a tnLoopStandIn per item.
+      const rawRecv = asyncChannelVar && getEnclosingFunction(node) === asyncFunctionNode ? 'tnRawReceiveAsync' : 'tnRawReceive';
+      let awaitPrefix = `${valueVar}, __ok := ${rawRecv}(${chanVar})\n\t\tif !__ok {\n\t\t\tif tnHasRejections.Load() {\n\t\t\t\tif __reason, __rejected := tnRejections.Load(${chanVar}); __rejected {\n\t\t\t\t\tpanic(__reason)\n\t\t\t\t}\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\t_ = ${valueVar}\n\t\t`;
       if (declaration && isArrayBindingPattern(declaration.name)) {
         const memberType = elemType.startsWith('[]') ? elemType.slice(2) : undefined;
         useHelper('dynamic');
@@ -41229,14 +43094,14 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
     }
     if (declaration && isIdentifier(declaration.name)) {
       registerLocalVariable(declaration.name.text, elemType);
-      const seq = generatorSeqCall(node.expression, iterExpr);
+      const seq = storedSeqVars.has(unwrapParentheses(node.expression)) ? iterExpr : (generatorSeqCall(node.expression, iterExpr) ?? emitIteratorSeqSource(node.expression)?.code);
       if (seq) {
         const loopVar = visit(declaration.name);
         return `for ${loopVar} := range ${seq}${visitLoopBody(node.statement, `_ = ${loopVar}\n\t\t`)}`;
       }
       return lockstepRange(visit(declaration.name), iterExpr, node.statement);
     }
-    // for await (const [a, b] of channel) → a := item[0]; b := item[1]
+    // for (const [a, b] of channel) → a := item[0]; b := item[1]
     if (declaration && isArrayBindingPattern(declaration.name)) {
       const chanItem = getTempName('item');
       const memberType = elemType.startsWith('[]') ? elemType.slice(2) : undefined;
@@ -41248,9 +43113,17 @@ function visitForOfSequence(node: AstNode, iterExpr: string, iterType: string | 
         chanPrefix += `${name} := TnAt(${chanItem}, ${index})\n\t\t_ = ${name}\n\t\t`;
       });
       useHelper('dynamic');
-      return `for ${chanItem} := range ${iterExpr}${visitLoopBody(node.statement, chanPrefix)}`;
+      const seq = storedSeqVars.has(unwrapParentheses(node.expression)) ? iterExpr : (generatorSeqCall(node.expression, iterExpr) ?? emitIteratorSeqSource(node.expression)?.code);
+      if (seq) {
+        return `for ${chanItem} := range ${seq}${visitLoopBody(node.statement, chanPrefix)}`;
+      }
+      return lockstepRange(chanItem, iterExpr, node.statement, chanPrefix);
     }
-    return `for _ = range ${iterExpr}${visitLoopBody(node.statement)}`;
+    const seq = storedSeqVars.has(unwrapParentheses(node.expression)) ? iterExpr : (generatorSeqCall(node.expression, iterExpr) ?? emitIteratorSeqSource(node.expression)?.code);
+    if (seq) {
+      return `for _ = range ${seq}${visitLoopBody(node.statement)}`;
+    }
+    return lockstepRange('_', iterExpr, node.statement);
   }
   const elementType =
     iterType === 'string' ? 'string' : iterType?.startsWith('[]') ? iterType.slice(2) : undefined;

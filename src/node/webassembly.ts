@@ -327,10 +327,7 @@ func tnWasmToJS(t wazeroapi.ValueType, v uint64) interface{} {
 
 // ToInt32: modulo 2^32 (NaN and the infinities are 0)
 func tnWasmToInt32(f float64) int32 {
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0
-	}
-	return int32(uint32(int64(math.Mod(math.Trunc(f), 4294967296))))
+	return TnInt32(f)
 }
 
 var tnWasmMask64 = new(tnbig.Int).SetUint64(math.MaxUint64)
@@ -437,10 +434,78 @@ func tnWasmFail(err error, name string) {
 }
 
 // An exported function as a JS function: numbers / BigInts in, a number /
-// BigInt (an array of them for several results, undefined for none) out
-func tnWasmExportFunc(fn wazeroapi.Function) func(args ...interface{}) interface{} {
+// BigInt (an array of them for several results, undefined for none) out.
+// Common small numeric signatures (0–2 i32/f64 params → i32/f64) return a
+// direct typed Go func so typed callers invoke it without interface{} boxing.
+func tnWasmExportFunc(fn wazeroapi.Function) interface{} {
 	def := fn.Definition()
 	params, results := def.ParamTypes(), def.ResultTypes()
+	if len(results) == 1 && (results[0] == wazeroapi.ValueTypeI32 || results[0] == wazeroapi.ValueTypeF64) {
+		rI32 := results[0] == wazeroapi.ValueTypeI32
+		switch len(params) {
+		case 0:
+			if rI32 {
+				return func() float64 {
+					var stack [1]uint64
+					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+						tnWasmFail(err, "RuntimeError")
+					}
+					return float64(int32(uint32(stack[0])))
+				}
+			}
+			return func() float64 {
+				var stack [1]uint64
+				if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+					tnWasmFail(err, "RuntimeError")
+				}
+				return math.Float64frombits(stack[0])
+			}
+		case 1:
+			if params[0] == wazeroapi.ValueTypeI32 && rI32 {
+				return func(a float64) float64 {
+					var stack [1]uint64
+					stack[0] = uint64(uint32(TnInt32(a)))
+					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+						tnWasmFail(err, "RuntimeError")
+					}
+					return float64(int32(uint32(stack[0])))
+				}
+			}
+			if params[0] == wazeroapi.ValueTypeF64 && !rI32 {
+				return func(a float64) float64 {
+					var stack [1]uint64
+					stack[0] = math.Float64bits(a)
+					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+						tnWasmFail(err, "RuntimeError")
+					}
+					return math.Float64frombits(stack[0])
+				}
+			}
+		case 2:
+			if params[0] == wazeroapi.ValueTypeI32 && params[1] == wazeroapi.ValueTypeI32 && rI32 {
+				return func(a, b float64) float64 {
+					var stack [2]uint64
+					stack[0] = uint64(uint32(TnInt32(a)))
+					stack[1] = uint64(uint32(TnInt32(b)))
+					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+						tnWasmFail(err, "RuntimeError")
+					}
+					return float64(int32(uint32(stack[0])))
+				}
+			}
+			if params[0] == wazeroapi.ValueTypeF64 && params[1] == wazeroapi.ValueTypeF64 && !rI32 {
+				return func(a, b float64) float64 {
+					var stack [2]uint64
+					stack[0] = math.Float64bits(a)
+					stack[1] = math.Float64bits(b)
+					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+						tnWasmFail(err, "RuntimeError")
+					}
+					return math.Float64frombits(stack[0])
+				}
+			}
+		}
+	}
 	size := len(params)
 	if len(results) > size {
 		size = len(results)

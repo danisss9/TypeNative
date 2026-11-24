@@ -59,7 +59,8 @@ type TnTypedArray[T tnTypedElem] struct {
 	kind    string
 	clamped bool
 	// Float16Array: the uint16 elements are binary16 bits
-	half bool
+	half    bool
+	isFloat bool
 	// A view on an ArrayBuffer: the buffer, the view's byte offset and byte
 	// length (-1: it tracks a resizable buffer's length). data is recomputed
 	// when a buffer was resized or detached since (gen); oob while the view is
@@ -122,15 +123,41 @@ func (a *TnTypedArray[T]) num(v T) float64 {
 }
 
 func (a *TnTypedArray[T]) conv(v float64) T {
+	if a.isFloat {
+		return T(v)
+	}
+	if !a.half && !a.clamped {
+		return T(tnTypedToUint32(v))
+	}
 	if a.half {
 		return T(TnF64ToF16(v))
 	}
 	return tnTypedConv[T](v, a.clamped)
 }
 
+func tnIsFloatKind(kind string) bool { return kind == "Float32Array" || kind == "Float64Array" }
+
 func tnTypedSize[T tnTypedElem]() int {
 	var zero T
 	return int(unsafe.Sizeof(zero))
+}
+
+func tnTypedToUint32(v float64) uint32 {
+	if v > -9.2e18 && v < 9.2e18 {
+		return uint32(int64(v))
+	}
+	return tnTypedToUint32Wide(v)
+}
+
+func tnTypedToUint32Wide(v float64) uint32 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	m := math.Mod(math.Trunc(v), 4294967296)
+	if m < 0 {
+		m += 4294967296
+	}
+	return uint32(m)
 }
 
 // A number converted to the element type the way JS stores it: floats round,
@@ -152,14 +179,7 @@ func tnTypedConv[T tnTypedElem](v float64, clamped bool) T {
 		}
 		return T(math.RoundToEven(v))
 	}
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0
-	}
-	m := math.Mod(math.Trunc(v), 4294967296)
-	if m < 0 {
-		m += 4294967296
-	}
-	return T(uint32(m))
+	return T(tnTypedToUint32(v))
 }
 
 func tnTypedRangeError(message string) *TnError {
@@ -200,19 +220,19 @@ func tnTypedOf[T tnTypedElem](kind string, clamped bool, values []float64) *TnTy
 			data[i] = tnTypedConv[T](v, clamped)
 		}
 	}
-	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped, half: kind == "Float16Array"}
+	return &TnTypedArray[T]{data: data, kind: kind, clamped: clamped, half: kind == "Float16Array", isFloat: tnIsFloatKind(kind)}
 }
 
 // new XArray(), new XArray(length), new XArray(array-like or typed array): a copy
 func TnNewTypedArray[T tnTypedElem](kind string, clamped bool, src ...interface{}) *TnTypedArray[T] {
 	if len(src) == 0 || src[0] == nil {
-		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped, half: kind == "Float16Array"}
+		return &TnTypedArray[T]{data: []T{}, kind: kind, clamped: clamped, half: kind == "Float16Array", isFloat: tnIsFloatKind(kind)}
 	}
 	if n, ok := src[0].(float64); ok {
 		if !(n >= 0) || n != math.Trunc(n) || n > 4294967295 {
 			panic(tnTypedRangeError("Invalid typed array length: " + TnNumStr(n)))
 		}
-		return &TnTypedArray[T]{data: make([]T, int(n)), kind: kind, clamped: clamped, half: kind == "Float16Array"}
+		return &TnTypedArray[T]{data: make([]T, int(n)), kind: kind, clamped: clamped, half: kind == "Float16Array", isFloat: tnIsFloatKind(kind)}
 	}
 	return tnTypedOf[T](kind, clamped, tnTypedFloats(src[0]))
 }
@@ -221,7 +241,7 @@ func TnNewTypedArray[T tnTypedElem](kind string, clamped bool, src ...interface{
 // memory (without a length, on a resizable buffer, it tracks its length)
 func TnTypedArrayView[T tnTypedElem](kind string, clamped bool, buf []byte, args ...float64) *TnTypedArray[T] {
 	offset, fixed := tnABViewBounds(kind, buf, tnTypedSize[T](), args)
-	a := &TnTypedArray[T]{kind: kind, clamped: clamped, half: kind == "Float16Array", src: buf, offset: offset, fixed: fixed}
+	a := &TnTypedArray[T]{kind: kind, clamped: clamped, half: kind == "Float16Array", isFloat: tnIsFloatKind(kind), src: buf, offset: offset, fixed: fixed}
 	a.resync()
 	return a
 }
@@ -243,18 +263,50 @@ func TnTypedArrayOf[T tnTypedElem](kind string, clamped bool, items ...float64) 
 
 // Element reads: out-of-range and non-integer indices read 0 (undefined in JS)
 func (a *TnTypedArray[T]) Get(i float64) float64 {
-	a.sync()
-	if !(i >= 0) || i >= float64(len(a.data)) || i != math.Trunc(i) {
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+	idx := int(i)
+	if uint(idx) >= uint(len(a.data)) || float64(idx) != i {
 		return 0
 	}
-	return a.num(a.data[int(i)])
+	if a.half {
+		return TnF16ToF64(uint16(a.data[idx]))
+	}
+	return float64(a.data[idx])
+}
+
+func (a *TnTypedArray[T]) GetInt(idx int) float64 {
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+	if uint(idx) >= uint(len(a.data)) {
+		return 0
+	}
+	if a.half {
+		return TnF16ToF64(uint16(a.data[idx]))
+	}
+	return float64(a.data[idx])
 }
 
 // Element writes: out-of-range indices are ignored, as in JS
 func (a *TnTypedArray[T]) Set(i float64, v float64) float64 {
-	a.sync()
-	if i >= 0 && i < float64(len(a.data)) && i == math.Trunc(i) {
-		a.data[int(i)] = a.conv(v)
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+	idx := int(i)
+	if uint(idx) < uint(len(a.data)) && float64(idx) == i {
+		a.data[idx] = a.conv(v)
+	}
+	return v
+}
+
+func (a *TnTypedArray[T]) SetInt(idx int, v float64) float64 {
+	if a.src != nil && a.gen != tnABGen.Load() {
+		a.resync()
+	}
+	if uint(idx) < uint(len(a.data)) {
+		a.data[idx] = a.conv(v)
 	}
 	return v
 }
@@ -346,6 +398,14 @@ func (a *TnTypedArray[T]) set(src interface{}, offset ...float64) {
 	if len(offset) > 0 {
 		at = int(offset[0])
 	}
+	if s, ok := src.(*TnTypedArray[T]); ok && !a.half && !s.half && !a.clamped {
+		s.check("set")
+		if at < 0 || at+len(s.data) > len(a.data) {
+			panic(tnTypedRangeError("offset is out of bounds"))
+		}
+		copy(a.data[at:], s.data)
+		return
+	}
 	values := tnTypedFloats(src)
 	if at < 0 || at+len(values) > len(a.data) {
 		panic(tnTypedRangeError("offset is out of bounds"))
@@ -368,17 +428,17 @@ func (a *TnTypedArray[T]) subarray(args ...float64) *TnTypedArray[T] {
 			fixed = -1
 		}
 		tnABConstructCheck(a.src)
-		out := &TnTypedArray[T]{kind: a.kind, clamped: a.clamped, half: a.half, src: a.src, offset: a.offset + start*size, fixed: fixed}
+		out := &TnTypedArray[T]{kind: a.kind, clamped: a.clamped, half: a.half, isFloat: a.isFloat, src: a.src, offset: a.offset + start*size, fixed: fixed}
 		out.resync()
 		return out
 	}
-	return &TnTypedArray[T]{data: a.data[start:end:end], kind: a.kind, clamped: a.clamped, half: a.half}
+	return &TnTypedArray[T]{data: a.data[start:end:end], kind: a.kind, clamped: a.clamped, half: a.half, isFloat: a.isFloat}
 }
 
 func (a *TnTypedArray[T]) slice(args ...float64) *TnTypedArray[T] {
 	a.check("slice")
 	start, end := tnTypedBounds(len(a.data), args)
-	return &TnTypedArray[T]{data: append([]T{}, a.data[start:end]...), kind: a.kind, clamped: a.clamped, half: a.half}
+	return &TnTypedArray[T]{data: append([]T{}, a.data[start:end]...), kind: a.kind, clamped: a.clamped, half: a.half, isFloat: a.isFloat}
 }
 
 func (a *TnTypedArray[T]) at(i float64) float64 {
@@ -621,80 +681,159 @@ func (d *TnDataView) Get_byteLength() float64 {
 }
 
 func (d *TnDataView) at(method string, offset float64, size int) []byte {
-	// (inlined check: the method name is only needed on the panic path, so
-	// the common case does not build the string)
+	if d.gen == tnABGen.Load() && !d.oob {
+		start := int(offset)
+		if start >= 0 && start+size <= len(d.view) && float64(start) == offset {
+			return d.view[start : start+size]
+		}
+	}
+	return d.atSlow(method, offset, size)
+}
+
+func (d *TnDataView) atSlow(method string, offset float64, size int) []byte {
 	if d.gen != tnABGen.Load() {
 		d.resync()
 	}
 	if d.oob {
 		panic(tnABOutOfBounds("DataView.prototype." + method))
 	}
-	if !(offset >= 0) || offset != math.Trunc(offset) || int(offset)+size > len(d.view) {
+	start := int(offset)
+	if start < 0 || start+size > len(d.view) || float64(start) != offset {
 		panic(tnTypedRangeError("Offset is outside the bounds of the DataView"))
 	}
-	start := int(offset)
 	return d.view[start : start+size]
-}
-
-func tnDataViewOrder(little []bool) binary.ByteOrder {
-	if len(little) > 0 && little[0] {
-		return binary.LittleEndian
-	}
-	return binary.BigEndian
 }
 
 func (d *TnDataView) getInt8(o float64) float64  { return float64(int8(d.at("getInt8", o, 1)[0])) }
 func (d *TnDataView) getUint8(o float64) float64 { return float64(d.at("getUint8", o, 1)[0]) }
 func (d *TnDataView) getInt16(o float64, little ...bool) float64 {
-	return float64(int16(tnDataViewOrder(little).Uint16(d.at("getInt16", o, 2))))
+	b := d.at("getInt16", o, 2)
+	if len(little) > 0 && little[0] {
+		return float64(int16(binary.LittleEndian.Uint16(b)))
+	}
+	return float64(int16(binary.BigEndian.Uint16(b)))
 }
 func (d *TnDataView) getUint16(o float64, little ...bool) float64 {
-	return float64(tnDataViewOrder(little).Uint16(d.at("getUint16", o, 2)))
+	b := d.at("getUint16", o, 2)
+	if len(little) > 0 && little[0] {
+		return float64(binary.LittleEndian.Uint16(b))
+	}
+	return float64(binary.BigEndian.Uint16(b))
 }
 func (d *TnDataView) getInt32(o float64, little ...bool) float64 {
-	return float64(int32(tnDataViewOrder(little).Uint32(d.at("getInt32", o, 4))))
+	b := d.at("getInt32", o, 4)
+	if len(little) > 0 && little[0] {
+		return float64(int32(binary.LittleEndian.Uint32(b)))
+	}
+	return float64(int32(binary.BigEndian.Uint32(b)))
 }
 func (d *TnDataView) getUint32(o float64, little ...bool) float64 {
-	return float64(tnDataViewOrder(little).Uint32(d.at("getUint32", o, 4)))
+	b := d.at("getUint32", o, 4)
+	if len(little) > 0 && little[0] {
+		return float64(binary.LittleEndian.Uint32(b))
+	}
+	return float64(binary.BigEndian.Uint32(b))
 }
 func (d *TnDataView) getFloat32(o float64, little ...bool) float64 {
-	return float64(math.Float32frombits(tnDataViewOrder(little).Uint32(d.at("getFloat32", o, 4))))
+	b := d.at("getFloat32", o, 4)
+	if len(little) > 0 && little[0] {
+		return float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))
+	}
+	return float64(math.Float32frombits(binary.BigEndian.Uint32(b)))
 }
 func (d *TnDataView) getFloat16(o float64, little ...bool) float64 {
-	return TnF16ToF64(tnDataViewOrder(little).Uint16(d.at("getFloat16", o, 2)))
+	b := d.at("getFloat16", o, 2)
+	if len(little) > 0 && little[0] {
+		return TnF16ToF64(binary.LittleEndian.Uint16(b))
+	}
+	return TnF16ToF64(binary.BigEndian.Uint16(b))
 }
 func (d *TnDataView) setFloat16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at("setFloat16", o, 2), TnF64ToF16(v))
+	b := d.at("setFloat16", o, 2)
+	u := TnF64ToF16(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint16(b, u)
+		return
+	}
+	binary.BigEndian.PutUint16(b, u)
 }
 func (d *TnDataView) getFloat64(o float64, little ...bool) float64 {
-	return math.Float64frombits(tnDataViewOrder(little).Uint64(d.at("getFloat64", o, 8)))
+	b := d.at("getFloat64", o, 8)
+	if len(little) > 0 && little[0] {
+		return math.Float64frombits(binary.LittleEndian.Uint64(b))
+	}
+	return math.Float64frombits(binary.BigEndian.Uint64(b))
 }
 func (d *TnDataView) getBigInt64(o float64, little ...bool) *tnbig.Int {
-	return tnbig.NewInt(int64(tnDataViewOrder(little).Uint64(d.at("getBigInt64", o, 8))))
+	b := d.at("getBigInt64", o, 8)
+	if len(little) > 0 && little[0] {
+		return tnbig.NewInt(int64(binary.LittleEndian.Uint64(b)))
+	}
+	return tnbig.NewInt(int64(binary.BigEndian.Uint64(b)))
 }
 func (d *TnDataView) getBigUint64(o float64, little ...bool) *tnbig.Int {
-	return new(tnbig.Int).SetUint64(tnDataViewOrder(little).Uint64(d.at("getBigUint64", o, 8)))
+	b := d.at("getBigUint64", o, 8)
+	if len(little) > 0 && little[0] {
+		return new(tnbig.Int).SetUint64(binary.LittleEndian.Uint64(b))
+	}
+	return new(tnbig.Int).SetUint64(binary.BigEndian.Uint64(b))
 }
 
-func (d *TnDataView) setInt8(o float64, v float64)  { d.at("setInt8", o, 1)[0] = byte(tnTypedConv[uint8](v, false)) }
-func (d *TnDataView) setUint8(o float64, v float64) { d.at("setUint8", o, 1)[0] = tnTypedConv[uint8](v, false) }
+func (d *TnDataView) setInt8(o float64, v float64)  { d.at("setInt8", o, 1)[0] = byte(tnTypedToUint32(v)) }
+func (d *TnDataView) setUint8(o float64, v float64) { d.at("setUint8", o, 1)[0] = byte(tnTypedToUint32(v)) }
 func (d *TnDataView) setInt16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at("setInt16", o, 2), tnTypedConv[uint16](v, false))
+	b := d.at("setInt16", o, 2)
+	u := uint16(tnTypedToUint32(v))
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint16(b, u)
+		return
+	}
+	binary.BigEndian.PutUint16(b, u)
 }
 func (d *TnDataView) setUint16(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint16(d.at("setUint16", o, 2), tnTypedConv[uint16](v, false))
+	b := d.at("setUint16", o, 2)
+	u := uint16(tnTypedToUint32(v))
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint16(b, u)
+		return
+	}
+	binary.BigEndian.PutUint16(b, u)
 }
 func (d *TnDataView) setInt32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at("setInt32", o, 4), tnTypedConv[uint32](v, false))
+	b := d.at("setInt32", o, 4)
+	u := tnTypedToUint32(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint32(b, u)
+		return
+	}
+	binary.BigEndian.PutUint32(b, u)
 }
 func (d *TnDataView) setUint32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at("setUint32", o, 4), tnTypedConv[uint32](v, false))
+	b := d.at("setUint32", o, 4)
+	u := tnTypedToUint32(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint32(b, u)
+		return
+	}
+	binary.BigEndian.PutUint32(b, u)
 }
 func (d *TnDataView) setFloat32(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint32(d.at("setFloat32", o, 4), math.Float32bits(float32(v)))
+	b := d.at("setFloat32", o, 4)
+	u := math.Float32bits(float32(v))
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint32(b, u)
+		return
+	}
+	binary.BigEndian.PutUint32(b, u)
 }
 func (d *TnDataView) setFloat64(o float64, v float64, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at("setFloat64", o, 8), math.Float64bits(v))
+	b := d.at("setFloat64", o, 8)
+	u := math.Float64bits(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint64(b, u)
+		return
+	}
+	binary.BigEndian.PutUint64(b, u)
 }
 
 // BigInt writes wrap modulo 2^64 (BigInt.asUintN(64, v))
@@ -703,10 +842,22 @@ func tnDataViewUint64(v *tnbig.Int) uint64 {
 	return m.Uint64()
 }
 func (d *TnDataView) setBigInt64(o float64, v *tnbig.Int, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at("setBigInt64", o, 8), tnDataViewUint64(v))
+	b := d.at("setBigInt64", o, 8)
+	u := tnDataViewUint64(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint64(b, u)
+		return
+	}
+	binary.BigEndian.PutUint64(b, u)
 }
 func (d *TnDataView) setBigUint64(o float64, v *tnbig.Int, little ...bool) {
-	tnDataViewOrder(little).PutUint64(d.at("setBigUint64", o, 8), tnDataViewUint64(v))
+	b := d.at("setBigUint64", o, 8)
+	u := tnDataViewUint64(v)
+	if len(little) > 0 && little[0] {
+		binary.LittleEndian.PutUint64(b, u)
+		return
+	}
+	binary.BigEndian.PutUint64(b, u)
 }
 
 // BigInt64Array / BigUint64Array: 64-bit integers, read and written as

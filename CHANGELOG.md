@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Symbol-keyed class members:** `get [sym]()`, `[sym]()`, `[sym] = …` and
+  `static [sym]`, including `Symbol.for(...)`, exported `unique symbol`
+  constants used across modules, and namespace-qualified keys
+  (`syntax-symbol-keyed-class-members.ts`). `o[sym]` reads, writes and
+  optional-chain calls rewrite to the plain member.
+- **Class shapes:** a class may extend a const alias of a class
+  (`const B = A as …; class C extends B`), local classes inside functions and
+  blocks are hoisted, and `super()` may follow validation inside an `else if`
+  chain (a throwing branch needs none)
+  (`syntax-class-alias-local-super.ts`).
+- **`declare` members:** ambient `declare const` globals and `declare` class
+  fields are erased instead of emitted as zero-valued Go declarations.
+
+### Changed
+
+- **Performance hot paths:**
+  - **Async/await, Promises & `for await…of`:** stored fulfilled values in
+    buffered (`cap == 1`) promise channels with panic-safe reader re-insertion
+    instead of the unbounded global `tnResolved` map; added direct-await sibling
+    functions (`name__await`) and `tnYieldMicrotaskFast` (distinguishing
+    `TnStartAsync` caller lends from `tnDeliver` resumptions); added
+    zero-goroutine settled fast paths in `.then()` and `TnAwaitAll` for
+    `await Promise.all(...)`; and avoided per-item `tnLoopStandIn` goroutine
+    spawns via `tnRawReceiveAsync` (`async-await` 52.7x slower → 14.9x faster,
+    `async-promise-all` 16.4x → 1.3x, `gen-async` 7.5x → 2.4x, `async-als`
+    2.7x → 1.1x).
+  - **Iterators & generators:** lowered `Iterator.from(...)` helper pipelines
+    and single-use stored generators onto synchronous `iter.Seq` helpers
+    (`TnSeq*`), and lowered manual `.next()` / `.return()` local generators onto
+    `iter.Pull` (`iter-helpers` 10.3x slower → 2.7x faster, `gen-next`
+    10.1x → 2.4x).
+  - **Dynamic `any` & small `TnMap` storage:** kept small maps (≤ 8 concrete
+    keys) in flat `keys` / `vals` slices before promoting to a Go map, added
+    concrete non-generic `tnMapGetStr` / `tnMapSetStr` helpers and fast paths in
+    `TnGetRef` / `TnGetPeek` / `TnSet` / `TnLength`, and specialized numeric
+    dynamic `+` via `TnDynamicAddFloat` (`any-dynamic` 80.8x → 31.3x,
+    `any-record-view` 8.4x → 5.7x, `json-any` 3.8x → 3.0x).
+  - **WebAssembly calls:** replaced `math.Mod` in `tnWasmToInt32` with
+    `TnInt32`, specialized `tnWasmExportFunc` to return concrete typed Go
+    functions for common 0/1/2-arg `i32` / `f64` exports, and added concrete
+    `*TnMap[string, interface{}]` fast dispatch in typed method dispatchers
+    (`wasm-call` 32.7x → 12.9x).
+  - **Strings & int32 bitwise loops:** upgraded `tnStrIdxCache` to a 2-way
+    set-associative `[1024][2]` cache, added short-string zero-alloc UTF-16
+    counting and ASCII loop specialization (`if tnStrASCII(s)`), widened
+    `TnInt32`, and unboxed bitwise-only mutable `int32` locals and `Math.imul`
+    (`num-hash-imul` 11.6x → 1.5x, `str-unicode` 13.6x → 5.4x, `str-short-scan`
+    3.8x → 1.1x, `str-char-scan` 3.5x → 1.3x).
+  - **BigInt, EventEmitter & TypedArrays:** hoisted BigInt literals and
+    constant shifts, specialized `0n` / LSB / shift / temporary-buffer
+    operations (`bigint-arith` 9.7x → 3.0x); widened `TnEventEmitter` inline
+    slots from 2 to 4 and routed `TnInvoke` through typed dispatch
+    (`events-emit` 8.9x → 3.0x); and replaced `math.Mod` / `math.Frexp` /
+    `math.Trunc` and `binary.ByteOrder` interface dispatch in `TypedArray` /
+    `DataView` with integer-index and same-type `copy()` fast paths
+    (`typed-array` 7.8x → 5.1x, `typed-dataview` 8.5x → 5.3x).
+
+### Fixed
+
+- **Generator `for…of` destructuring deadlock:** `for (const [a, b] of gen)`
+  and `for (const _ of gen)` now route through `generatorSeqCall` /
+  `lockstepRange` instead of raw channel receives, preventing a deadlock when
+  consuming lockstep generators.
+- **Generic `super` calls:** `super.map(…)` on a generic override is a parent
+  method call, not an `Array#map` call.
+- **Abstract classes:** concrete methods are emitted on the abstract class as
+  well as copied onto subclasses; abstract members get panic stubs so calls
+  through the base type compile.
+- **Variadic `super(...args)`** is forwarded to the parent constructor's
+  variadic parameters.
+
 ## [0.7.1] - 2026-11-19
 
 ### Added

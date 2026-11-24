@@ -799,7 +799,7 @@ func (res *TnServerResponse) end(args ...interface{}) *TnServerResponse {
 	// so the whole response can still be built on the connection goroutine.
 	if res.inSyncTurn && !res.headersSent && !res.wroteData && !res.writeEnded && !res.destroyed &&
 		len(res.ops) == 0 && len(res.writeQueue) == 0 && res.trailer == nil &&
-		res.state == nil && res.fn0 == nil && res.fn1 == nil && len(args) <= 1 {
+		res.state == nil && res.inlineN == 0 && len(args) <= 1 {
 		if len(args) == 0 || args[0] == nil {
 			res.fastEnd = true
 			res.wroteHead = true
@@ -1521,22 +1521,15 @@ func (hs *TnHttpServer) tryFastHTTP1(hc *tnHttpConn, br *bufio.Reader, local net
 			if len(body) > 0 {
 				req.bytesRead += float64(len(body))
 				if req.state == nil {
-					if req.fn0 != nil && req.ev0 == "data" {
-						if f, ok := req.fn0.(func([]byte)); ok {
-							f(body)
-						} else if f, ok := req.fn0.(func(interface{})); ok {
-							f(body)
-						} else {
-							TnInvoke(req.fn0, body)
-						}
-					}
-					if req.fn1 != nil && req.ev1 == "data" {
-						if f, ok := req.fn1.(func([]byte)); ok {
-							f(body)
-						} else if f, ok := req.fn1.(func(interface{})); ok {
-							f(body)
-						} else {
-							TnInvoke(req.fn1, body)
+					for i := 0; i < req.inlineN; i++ {
+						if req.inlineEv[i] == "data" {
+							if f, ok := req.inlineFn[i].(func([]byte)); ok {
+								f(body)
+							} else if f, ok := req.inlineFn[i].(func(interface{})); ok {
+								f(body)
+							} else {
+								TnInvoke(req.inlineFn[i], body)
+							}
 						}
 					}
 				} else {

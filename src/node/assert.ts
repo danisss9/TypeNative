@@ -224,7 +224,12 @@ func TnAssertDoesNotThrow(fn func(), msg ...interface{}) {
 func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...interface{}) chan struct{} {
 	out := make(chan struct{}, 1)
 	go func() {
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		_, reason, rejected := tnSettle(p)
 		if !rejected {
@@ -238,6 +243,7 @@ func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...inter
 			panic(reason)
 		}
 		TnAsyncSend(out, struct{}{})
+		sent = true
 	}()
 	return out
 }
@@ -245,13 +251,19 @@ func TnAssertRejects[T any](p chan T, check func(interface{}) bool, msg ...inter
 func TnAssertDoesNotReject[T any](p chan T, msg ...interface{}) chan struct{} {
 	out := make(chan struct{}, 1)
 	go func() {
-		defer TnAsyncClose(out)
+		sent := false
+		defer func() {
+			if !sent {
+				TnAsyncClose(out)
+			}
+		}()
 		defer TnRejectOnPanic(out)
 		_, reason, rejected := tnSettle(p)
 		if rejected {
 			panic(tnAssertionError(tnAssertFirst(msg), "Got unwanted rejection.\\nActual message: \\""+TnErrorText(reason)+"\\"", reason, nil, "doesNotReject"))
 		}
 		TnAsyncSend(out, struct{}{})
+		sent = true
 	}()
 	return out
 }

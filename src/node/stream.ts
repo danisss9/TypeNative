@@ -355,18 +355,13 @@ func (s *TnStream) flow() {
 	for s.flowing == 1 && len(s.queue) > 0 {
 		chunk := s.shiftChunk()
 		if s.state == nil {
-			if s.fn0 != nil && s.ev0 == "data" {
-				if f, ok := s.fn0.(func(interface{})); ok {
-					f(chunk)
-				} else {
-					TnInvoke(s.fn0, chunk)
-				}
-			}
-			if s.fn1 != nil && s.ev1 == "data" {
-				if f, ok := s.fn1.(func(interface{})); ok {
-					f(chunk)
-				} else {
-					TnInvoke(s.fn1, chunk)
+			for i := 0; i < s.inlineN; i++ {
+				if s.inlineEv[i] == "data" {
+					if f, ok := s.inlineFn[i].(func(interface{})); ok {
+						f(chunk)
+					} else {
+						TnInvoke(s.inlineFn[i], chunk)
+					}
 				}
 			}
 		} else {
@@ -438,18 +433,13 @@ func (s *TnStream) emitEnd() {
 	}
 	s.endEmitted = true
 	if s.state == nil {
-		if s.fn0 != nil && s.ev0 == "end" {
-			if f, ok := s.fn0.(func()); ok {
-				f()
-			} else {
-				TnInvoke(s.fn0)
-			}
-		}
-		if s.fn1 != nil && s.ev1 == "end" {
-			if f, ok := s.fn1.(func()); ok {
-				f()
-			} else {
-				TnInvoke(s.fn1)
+		for i := 0; i < s.inlineN; i++ {
+			if s.inlineEv[i] == "end" {
+				if f, ok := s.inlineFn[i].(func()); ok {
+					f()
+				} else {
+					TnInvoke(s.inlineFn[i])
+				}
 			}
 		}
 	} else {

@@ -47,6 +47,11 @@ func TnInvoke(fn interface{}, args ...interface{}) interface{} {
 			return nil
 		}
 	}
+	if !tnInvokeHasFuncArg(args) {
+		if v, ok := tnCallValueTyped(fn, args); ok {
+			return v
+		}
+	}
 	fv := reflect.ValueOf(fn)
 	if !fv.IsValid() || fv.Kind() != reflect.Func || fv.IsNil() {
 		return nil
@@ -81,6 +86,20 @@ func tnInvokeAt(args []interface{}, i int) interface{} {
 		return args[i]
 	}
 	return nil
+}
+
+// Whether any argument is a Go func (needs tnInvokeArg's reflect.MakeFunc adapter)
+func tnInvokeHasFuncArg(args []interface{}) bool {
+	for _, a := range args {
+		switch a.(type) {
+		case nil, float64, string, bool, []byte, int, int32, int64, *TnError:
+			continue
+		}
+		if reflect.ValueOf(a).Kind() == reflect.Func {
+			return true
+		}
+	}
+	return false
 }
 
 func tnInvokeArg(a interface{}, t reflect.Type) reflect.Value {
