@@ -5,10 +5,10 @@
   <div class="container">
     <header class="section-head">
       <p class="eyebrow">Showcase</p>
-      <h2 id="showcase-title">Real packages, unmodified source</h2>
+      <h2 id="showcase-title">Real packages, native binaries</h2>
       <p class="section-lede">
         TypeNative resolves npm packages from <code>node_modules</code> and compiles them into your program.
-        These four produce byte-for-byte the same output as Node on their own test suites.
+        These five produce byte-for-byte the same output as Node on their own test suites.
       </p>
     </header>
 

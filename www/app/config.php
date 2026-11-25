@@ -7,7 +7,7 @@ final class Site
 {
     public const string URL = 'https://typenative.dev';
     public const string NAME = 'TypeNative';
-    public const string VERSION = '0.7.1';
+    public const string VERSION = '0.7.2';
     public const string AUTHOR = 'Dani Santos';
     public const string EMAIL = 'info@typenative.dev';
 

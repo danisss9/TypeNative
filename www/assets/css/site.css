@@ -1321,11 +1321,26 @@ tbody tr:last-child > * {
 
 .showcase-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: 16px;
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+@media (min-width: 900px) {
+  .showcase-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .showcase-grid > li {
+    grid-column: span 2;
+  }
+
+  .showcase-grid > li:nth-child(4):nth-last-child(2),
+  .showcase-grid > li:nth-child(5):last-child {
+    grid-column: span 3;
+  }
 }
 
 .pkg {

@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 // Every piece of copy on the site. Numbers come from the repository:
-//   benchmarks  examples/README.md (Node v26.13.0, Go 1.27.4, TypeNative 0.7.0)
+//   benchmarks  examples/README.md (Node v26.13.0, Go 1.27.4, TypeNative 0.7.0; mongodb-driver: 0.7.1)
 //   probes      ls conformance/*.ts | wc -l
 //   code        the samples were compiled with TypeNative 0.7.1; outputs are real.
 // Update them together when a release changes the published results.
@@ -13,6 +13,7 @@ $benchmarks = [
     new Benchmark('todo-cli', 'per command', '54.8 ms', '5.4 ms', 10.2),
     new Benchmark('hello-world', 'startup', '45.2 ms', '4.9 ms', 9.2),
     new Benchmark('marked-cli', 'per call', '107 ms', '13 ms', 8.2),
+    new Benchmark('mongodb-driver', 'ping command', '175.7 ms', '33.8 ms', 5.2),
     new Benchmark('angular-templates', 'per template', '223 ms', '52 ms', 4.3),
     new Benchmark('desktop-notes', 'launch to first page', '97.5 ms', '24.8 ms', 3.9),
     new Benchmark('react-compiler', 'per file', '364 ms', '103 ms', 3.5),
@@ -134,7 +135,7 @@ return [
         ['9.2×', 'faster startup than Node.js', 'hello-world: 4.9 ms vs 45.2 ms'],
         ['6.7×', 'less memory for a desktop app', 'desktop-notes: 11 MiB vs 72 MiB'],
         ['1.6×', "Node's HTTP throughput", 'json-server: 94k vs 57k GET req/s'],
-        ['791', 'conformance probes', 'run in CI on Linux, macOS and Windows'],
+        ['793', 'conformance probes', 'run in CI on Linux, macOS and Windows'],
     ],
 
     'features' => [
@@ -157,7 +158,7 @@ return [
 
     'benchmarks' => $benchmarks,
     'benchmarkScaleMax' => 12.0,
-    'benchmarkEnv' => 'Medians on Windows 11 Pro, AMD Ryzen 5 7600, Node.js v26.13.0, Go 1.27.4, TypeNative 0.7.0.',
+    'benchmarkEnv' => 'Medians on Windows 11 Pro, AMD Ryzen 5 7600, Node.js v26.13.0, Go 1.27.4, TypeNative 0.7.0 (mongodb-driver: 0.7.1).',
 
     'showcase' => [
         [
@@ -173,6 +174,13 @@ return [
             'text' => 'The <code>marked</code> Markdown compiler and its CLI, compiled from unmodified source.',
             'parity' => ['2,859 / 2,859', 'spec cases identical to Node'],
             'speed' => ['8.2×', 'faster per call'],
+        ],
+        [
+            'name' => 'mongodb',
+            'example' => 'mongodb-driver',
+            'text' => 'The official <code>mongodb</code> 7.9 driver and <code>bson</code> (164 files), speaking live TCP OP_MSG and EJSON.',
+            'parity' => ['13 / 13', 'BSON, EJSON and wire-protocol cases identical'],
+            'speed' => ['5.2×', 'faster per ping'],
         ],
         [
             'name' => '@angular/compiler',
@@ -265,7 +273,7 @@ return [
         ],
         [
             'Can it compile any TypeScript or npm package?',
-            'It compiles a subset of TypeScript and resolves npm packages from <code>node_modules</code>. Large packages such as yaml, marked, @angular/compiler and the React Compiler build from unmodified source, but TypeNative fits best for CLIs, servers and tools where you control the code. The <a href="' . e(Site::repo('conformance.md')) . '">conformance matrix</a> lists exactly what works.',
+            'It compiles a subset of TypeScript and resolves npm packages from <code>node_modules</code>. Large packages such as yaml, marked, @angular/compiler, the React Compiler and the official MongoDB driver compile into standalone binaries, though TypeNative fits best for CLIs, servers and tools where you control the code. The <a href="' . e(Site::repo('conformance.md')) . '">conformance matrix</a> lists exactly what works.',
         ],
         [
             'Is it always faster than Node.js?',
