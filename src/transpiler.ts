@@ -7868,7 +7868,8 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
         } else {
           fieldType = getPropertyDeclarationType(member);
         }
-        fields.push(`\t${fieldName} ${fieldType}`);
+        const tag = hasModifier(member, 'DeclareKeyword') ? ' `tn:"declare"`' : '';
+        fields.push(`\t${fieldName} ${fieldType}${tag}`);
       }
     }
     for (const param of getParameterProperties(node)) {
@@ -30890,6 +30891,7 @@ type tnFieldPlan struct {
 	own     bool           // it answers property reads itself (see tnHasOwnGet)
 	setter  bool           // writes go through Set_key, or a Map's Set
 	missing bool           // no such field (a getter, or nothing)
+	declare bool           // a TypeScript declare field (unset while zero)
 	getter  int            // 1 + the index of its Get_key method (0: none)
 	offset  uintptr
 	field   unsafe.Pointer // the field's type
@@ -30961,6 +30963,9 @@ func tnMakeFieldPlan(obj interface{}, key string, t unsafe.Pointer) *tnFieldPlan
 	if !found {
 		p.missing = true
 		return p
+	}
+	if field.Tag.Get("tn") == "declare" {
+		p.declare = true
 	}
 	// (embedded parents are values; through a pointer, reflection follows it)
 	at := st
@@ -31247,8 +31252,12 @@ func (p *tnFieldPlan) set(base unsafe.Pointer) bool {
 	switch p.kind {
 	case tnFieldAny:
 		return *(*interface{})(f) != nil
-	case tnFieldString, tnFieldFloat, tnFieldBool:
-		return true
+	case tnFieldString:
+		return !p.declare || *(*string)(f) != ""
+	case tnFieldFloat:
+		return !p.declare || *(*float64)(f) != 0
+	case tnFieldBool:
+		return !p.declare || *(*bool)(f)
 	}
 	return *(*unsafe.Pointer)(f) != nil
 }
@@ -33582,6 +33591,14 @@ func TnHas(obj interface{}, key interface{}) bool {
 			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func:
 				return !f.IsNil()
 			}
+			for _, name := range []string{k, k + "_", strings.ReplaceAll(k, "$", "ǂ")} {
+				if sf, ok := rv.Type().FieldByName(name); ok {
+					if sf.Tag.Get("tn") == "declare" && f.IsZero() {
+						return false
+					}
+					break
+				}
+			}
 			return true
 		}
 	}
@@ -33656,7 +33673,7 @@ func tnCollectStructKeys(st reflect.Type, base uintptr, p *tnStructPlan) {
 				k.ref = true
 			}
 		}
-		if field.Tag.Get("tn") == "optional" && (ft.Kind() == reflect.Pointer || ft.Kind() == reflect.Interface) {
+		if (field.Tag.Get("tn") == "optional" || field.Tag.Get("tn") == "declare") && (ft.Kind() == reflect.Pointer || ft.Kind() == reflect.Interface) {
 			k.skipNil = true
 		}
 		// optional primitives (*string & co.): absent when unset, else their value

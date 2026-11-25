@@ -126,11 +126,39 @@ function tableRow({ name, description, node, native: nat }) {
   return `| [${name}](${name}.ts) | ${description} | ${n} | ${t} | ${ratio(median(node), median(nat))} |`;
 }
 
+// Sort key for a markdown table row: fastest (highest speedup) to slowest
+function rowSpeedScore(line) {
+  const cols = line.split('|').map((s) => s.trim());
+  const ratioCol = cols[5] ?? '';
+  const faster = /([\d.]+)x faster/.exec(ratioCol);
+  const slower = /([\d.]+)x slower/.exec(ratioCol);
+  const display = faster ? Number(faster[1]) : slower ? 1 / Number(slower[1]) : 0;
+  const parseMedian = (cell) => {
+    const m = /\/\s*([\d.]+)/.exec(cell ?? '');
+    return m ? Number(m[1]) : 0;
+  };
+  const nodeMed = parseMedian(cols[3]);
+  const natMed = parseMedian(cols[4]);
+  const exact = nodeMed > 0 && natMed > 0 ? nodeMed / natMed : display;
+  return { display, exact };
+}
+
+function compareRowsFastestFirst([nameA, lineA], [nameB, lineB]) {
+  const a = rowSpeedScore(lineA);
+  const b = rowSpeedScore(lineB);
+  if (b.display !== a.display) return b.display - a.display;
+  if (b.exact !== a.exact) return b.exact - a.exact;
+  return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
+}
+
 const header = [
   '| Probe | Measures | Node ms (min / median) | TypeNative ms (min / median) | TypeNative vs Node (median) |',
   '| ----- | -------- | ---------------------: | ---------------------------: | :-------------------------- |'
 ];
-const lines = [...rows.values()].map(tableRow);
+const lines = [...rows.values()]
+  .map((r) => [r.name, tableRow(r)])
+  .sort(compareRowsFastestFirst)
+  .map(([, line]) => line);
 console.log('');
 if (lines.length > 0) console.log([...header, ...lines].join('\n'));
 if (failures.length > 0) console.log(`\n${failures.join('\n')}`);
@@ -156,7 +184,7 @@ if (write && rows.size > 0) {
   const all = new Set(readdirSync(dir).filter((f) => f.endsWith('.ts')).map((f) => f.replace(/\.ts$/, '')));
   const body = [...kept.entries()]
     .filter(([name]) => all.has(name))
-    .sort(([x], [y]) => (x < y ? -1 : 1))
+    .sort(compareRowsFastestFirst)
     .map(([, line]) => line);
 
   const go = spawnSync('go', ['version'], { encoding: 'utf-8' }).stdout?.trim().replace(/^go version /, '') ?? 'go ?';

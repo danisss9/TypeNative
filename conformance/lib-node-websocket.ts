@@ -42,6 +42,7 @@ function parseFrame(buf: Buffer): { opcode: number; payload: Buffer; rest: Buffe
 
 let pongs = 0;
 let pinged = false;
+let onPong = () => {};
 const sockets: Record<string, Socket> = {};
 
 function acceptOf(req: http.IncomingMessage): string {
@@ -95,7 +96,10 @@ server.on('upgrade', (req: http.IncomingMessage, socket: Socket, _head: Buffer) 
       else if (frame.opcode === 8) {
         socket.write(serverFrame(8, frame.payload));
         socket.end();
-      } else if (frame.opcode === 10) pongs++;
+      } else if (frame.opcode === 10) {
+        pongs++;
+        onPong();
+      }
     }
   });
 });
@@ -133,16 +137,20 @@ server.listen(0, '127.0.0.1', () => {
   assert(ws.readyState === WebSocket.CONNECTING, 'still connecting after the throws');
 
   let messages = 0;
+  let closing = false;
+  const maybeClose = () => {
+    if (closing || messages < 3 || pongs < 1) return;
+    closing = true;
+    assert(ws.bufferedAmount === 0, 'writes drained');
+    ws.close(1000, 'bye');
+    assert(ws.readyState === WebSocket.CLOSING, 'closing after close()');
+    ws.close(1000, 'again');
+  };
+  onPong = maybeClose;
   ws.addEventListener('open', () => {
     assert(ws.readyState === WebSocket.OPEN && ws.protocol === 'chat', 'open: negotiated chat');
     ws.send('hello ws');
     ws.send(new Uint8Array([1, 2, 3]));
-    setTimeout(() => {
-      assert(ws.bufferedAmount === 0, 'writes drained');
-      ws.close(1000, 'bye');
-      assert(ws.readyState === WebSocket.CLOSING, 'closing after close()');
-      ws.close(1000, 'again');
-    }, 30);
   });
   ws.addEventListener('message', (ev: MessageEvent) => {
     messages++;
@@ -156,6 +164,7 @@ server.listen(0, '127.0.0.1', () => {
     } else if (messages === 3) {
       const ab = ev.data as ArrayBuffer;
       assert(!(ev.data instanceof Blob) && ab.byteLength === 3, 'binary arrives as ArrayBuffer');
+      maybeClose();
     }
   });
   ws.addEventListener('close', (ev: CloseEvent) => {
