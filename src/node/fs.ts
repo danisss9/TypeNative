@@ -1034,7 +1034,11 @@ export function registerFs(r: NodeRegistry): void {
   r.typers['fs.readdirSync'] = (c: NodeCall) => (optionIsTrue(c.nodes[1], 'withFileTypes') ? '[]*TnDirent' : '[]string');
   const stat = (lstat: boolean) => (c: NodeCall) => {
     const option = getOption(c.nodes[1], 'throwIfNoEntry');
-    const throwIfNoEntry = option && option.kind === 'FalseKeyword' ? 'false' : 'true';
+    const throwIfNoEntry = option
+      ? (option.kind === 'FalseKeyword' ? 'false' : 'true')
+      : c.nodes[1] && c.nodes[1].kind !== 'ObjectLiteralExpression'
+        ? (r.helper('dynamic'), `(TnGetPeek(${c.args[1]}, "throwIfNoEntry") != false)`)
+        : 'true';
     // (an aborted options.signal rejects the call)
     if (getOption(c.nodes[1], 'signal')) return `func() *TnStats { TnFsCheckSignal(${c.args[1]}); return TnStat(${c.args[0]}, ${lstat}, ${throwIfNoEntry}) }()`;
     return `TnStat(${c.args[0]}, ${lstat}, ${throwIfNoEntry})`;
@@ -1090,7 +1094,10 @@ export function registerFs(r: NodeRegistry): void {
   fn('openSync', 'float64', (c: NodeCall) => `TnOpen(${c.args[0]}, ${c.args[1] ?? '"r"'}${c.args[2] ? `, ${c.args[2]}` : ''})`);
   fn('closeSync', '', (c: NodeCall) => `TnClose(${c.args[0]})`);
   fn('readSync', 'float64', (c: NodeCall) => `TnReadSync(${c.args.join(', ')})`);
-  fn('writeSync', 'float64', (c: NodeCall) => `TnWriteSync(${c.args.join(', ')})`);
+  fn('writeSync', 'float64', (c: NodeCall) => {
+    const fd = c.types[0] === '*float64' ? `func() float64 { if __fd := ${c.args[0]}; __fd != nil { return *__fd }; return 0 }()` : c.args[0];
+    return `TnWriteSync(${[fd, ...c.args.slice(1)].join(', ')})`;
+  });
   fn('fsyncSync', '', (c: NodeCall) => `TnFsync(${c.args[0]})`);
   fn('ftruncateSync', '', (c: NodeCall) => `TnFtruncate(${c.args[0]}, ${c.args[1] ?? '0'})`);
   setResults(r, 'fs', '');

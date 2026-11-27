@@ -780,13 +780,21 @@ func tnWindowsCtrlBreak(pid int) bool {
     use();
     r.helper('osPlatform');
     r.helper('dynamic');
+    r.helper('timerWait');
     r.pkg('os');
     return 'func() *TnMap[string, interface{}] { __p := TnNewMap[string, interface{}](); __argv := []interface{}{}; for _, __a := range TnProcessArgv() { __argv = append(__argv, __a) }; __p.Set("argv", __argv); ' +
       '__env := TnNewMap[string, interface{}](); __src := TnEnvMap(); for _, __k := range __src.Keys() { __env.Set(__k, __src.Get(__k)) }; __p.Set("env", __env); __p.Set("platform", TnOsPlatform()); ' +
+      '__p.Set("version", "v26.0.0"); __p.Set("versions", TnProcessVersions()); __p.Set("execPath", TnProcessExecPath()); ' +
       '__out := TnNewMap[string, interface{}](); if TnIsTTY(os.Stdout) { __out.Set("isTTY", true) }; __p.Set("stdout", __out); ' +
+      '__p.Set("nextTick", func(__fn interface{}, __rest ...interface{}) { TnQueueMicrotask(func() { TnCallValue(__fn, __rest...) }) }); ' +
       '__p.Set("emitWarning", func(__w interface{}, __rest ...interface{}) { __t, _ := TnArg(__rest, 0).(string); TnProcessEmitWarning(__w, __t) }); return __p }()';
   };
   r.valueTypes['process'] = '*TnMap[string, interface{}]';
+  value('nextTick', 'func(interface{}, ...interface{})', () => {
+    r.helper('timerWait');
+    r.helper('dynamic');
+    return 'func(__fn interface{}, __rest ...interface{}) { TnQueueMicrotask(func() { TnCallValue(__fn, __rest...) }) }';
+  });
   value('argv0', 'string', () => {
     r.pkg('os');
     return 'os.Args[0]';
@@ -890,7 +898,15 @@ func tnWindowsCtrlBreak(pid int) bool {
   });
   fn('exit', '', (call: NodeCall) => {
     use();
-    return `TnProcessExitWith(${call.args.slice(0, 1).join(', ')})`;
+    if (call.args.length > 0) {
+      const arg0 = call.types[0] === '*float64'
+        ? `func() float64 { if __ec := ${call.args[0]}; __ec != nil { return *__ec }; return 0 }()`
+        : call.types[0] === 'interface{}'
+          ? (r.helper('dynamic'), `TnNumber(${call.args[0]})`)
+          : call.args[0];
+      return `TnProcessExitWith(${arg0})`;
+    }
+    return `TnProcessExitWith()`;
   });
   fn('cwd', 'string', (_c: NodeCall) => {
     r.pkg('os');

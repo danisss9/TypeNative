@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.json",
+  // Upstream TypeScript compiler sources are checked by their own tsconfig and lib
+  // definitions; noCheck keeps them out of TypeNative's strict lib:[] gate while
+  // still resolving imports for main.ts.
+  "compilerOptions": {
+    "types": ["../../types/typenative.d.ts", "../../types/typenative-go.d.ts", "../../types/typenative-npm.d.ts"],
+    "noCheck": true
+  },
+  "include": ["main.ts"]
+}

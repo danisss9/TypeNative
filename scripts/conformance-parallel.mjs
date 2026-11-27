@@ -236,10 +236,10 @@ async function worker() {
 // Build one sqlite probe and one intl probe alone first (both pull in large
 // vendored Go packages — sqlite and golang.org/x/text — that with a cold cache
 // would be compiled by many workers at once, timing out on small runners), and
-// run the largest example (React Compiler: ~450 transpiled modules) alone too so
-// its build gets full cores instead of contending with N-1 other jobs
+// run the largest examples (React Compiler, TypeScript tsc) alone too so their
+// builds get full cores instead of contending with N-1 other jobs
 const soloRan = new Set();
-for (const pattern of ['sqlite', 'intl', 'example-react-compiler']) {
+for (const pattern of ['sqlite', 'intl', 'example-react-compiler', 'example-tsc']) {
   const j = jobs.find((job) => (pattern.startsWith('example-') ? job.name === pattern : job.name.includes(pattern)));
   if (j) {
     jobs.splice(jobs.indexOf(j), 1);

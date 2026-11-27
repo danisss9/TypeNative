@@ -62,8 +62,12 @@ for (const job of jobs) {
   const [command, ...args] = compiler;
   const outDir = job.build ? mkdtempSync(path.join(os.tmpdir(), 'conf-')) : null;
   const jobArgs = outDir ? [...job.args, '--output', path.join(outDir, exe)] : job.args;
+  const env = job.build
+    ? { ...process.env, GOFLAGS: `${process.env.GOFLAGS ?? ''} -gcflags=-l`.trim() }
+    : process.env;
   const result = spawnSync(command, [...args, ...jobArgs], {
     cwd: root,
+    env,
     encoding: 'utf-8',
     // (an example's build is its own program's: the vendored-package ones
     // transpile tens of thousands of lines and go build the result)

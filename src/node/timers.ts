@@ -271,8 +271,16 @@ export function registerTimers(r: NodeRegistry): void {
   perf('getEntries', '[]*TnPerformanceEntry', (_c: NodeCall) => 'TnPerfEntries("", "")');
   perf('getEntriesByName', '[]*TnPerformanceEntry', (c: NodeCall) => `TnPerfEntries(${c.args[0]}, ${c.args[1] ?? '""'})`);
   perf('getEntriesByType', '[]*TnPerformanceEntry', (c: NodeCall) => `TnPerfEntries("", ${c.args[0]})`);
-  perf('clearMarks', '', (c: NodeCall) => `TnPerfClear("mark"${c.args[0] ? `, ${c.args[0]}` : ''})`);
-  perf('clearMeasures', '', (c: NodeCall) => `TnPerfClear("measure"${c.args[0] ? `, ${c.args[0]}` : ''})`);
+  perf('clearMarks', '', (c: NodeCall) => {
+    if (!c.args[0]) return `TnPerfClear("mark")`;
+    if (c.types[0] === '*string') return `func() { if __s := ${c.args[0]}; __s != nil { TnPerfClear("mark", *__s) } else { TnPerfClear("mark") } }()`;
+    return `TnPerfClear("mark", ${c.args[0]})`;
+  });
+  perf('clearMeasures', '', (c: NodeCall) => {
+    if (!c.args[0]) return `TnPerfClear("measure")`;
+    if (c.types[0] === '*string') return `func() { if __s := ${c.args[0]}; __s != nil { TnPerfClear("measure", *__s) } else { TnPerfClear("measure") } }()`;
+    return `TnPerfClear("measure", ${c.args[0]})`;
+  });
   r.values['perf_hooks.performance.timeOrigin'] = (_c: NodeCall) => {
     r.helper('nodePerf');
     return 'TnPerfTimeOrigin()';

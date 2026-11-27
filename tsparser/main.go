@@ -60,7 +60,6 @@ func main() {
 	parsedFile = sourceFile
 	out := serializeNode(sourceFile.AsNode())
 	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintln(os.Stderr, "encode:", err)
 		os.Exit(1)

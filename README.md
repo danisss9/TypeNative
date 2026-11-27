@@ -298,7 +298,11 @@ suites (CommonMark, GFM, its own tests and ReDoS inputs). The newest,
 [react-compiler](examples/react-compiler/), compiles the React Compiler
 itself (`babel-plugin-react-compiler` on Babel 7.29 and zod 4 — the largest
 codebase yet), matching Node on every parity fixture, 3.6x faster per file and
-1.7x faster on a 64 KB component file.
+1.7x faster on a 64 KB component file. [tsc](examples/tsc/) compiles the full
+upstream TypeScript compiler (`tsc` v6.0.3, 81 files, ~178K lines) to a single
+native binary with 100% byte-for-byte parity across all 23 workloads (including
+incremental `.tsbuildinfo`, `--build` project references, `--watch`, and
+type-checking TypeNative's own `src/`), starting 12.9x faster than Node.
 
 ## How it works
 
