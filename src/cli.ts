@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 module.enableCompileCache?.();
 
 (async function main() {
-  const { run, createProject, parseCliArgs, usage } = await import('./index.js');
+  const { run, createProject, parseCliArgs, usage, checkEnvironment } = await import('./index.js');
   const { VERSION } = await import('./version.js');
   const args = parseCliArgs(process.argv.slice(2));
   if (args.error) {
@@ -32,39 +32,70 @@ module.enableCompileCache?.();
   const source = args.source;
   const output = args.output;
 
+  if (newCommand) {
+    let inquirerModule: any = null;
+    const getInquirer = async () => {
+      if (!inquirerModule) inquirerModule = (await import('inquirer')).default;
+      return inquirerModule;
+    };
+    if (!args.skipChecks) {
+      const warnings = checkEnvironment();
+      if (warnings.length > 0) {
+        for (const warning of warnings) {
+          console.warn(`warning: ${warning}`);
+        }
+        const inquirer = await getInquirer();
+        const { continueAnyway } = await inquirer.prompt([
+          {
+            type: 'confirm',
+            name: 'continueAnyway',
+            message: 'Continue creating the project anyway?',
+            default: false
+          }
+        ]);
+        if (!continueAnyway) {
+          console.log('Project creation cancelled.');
+          return;
+        }
+      }
+    }
+    let projectName = source;
+    if (!projectName) {
+      const inquirer = await getInquirer();
+      const answer = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'projectName',
+          message: 'Enter Project Name:',
+          validate: (input: string) => input.trim() !== ''
+        }
+      ]);
+      projectName = answer.projectName;
+    }
+    createProject(projectName!.trim(), !args.skipInstall);
+    return;
+  }
+
   const questions = [
-    {
-      type: 'input',
-      name: 'projectName',
-      message: 'Enter Project Name:',
-      when: newCommand,
-      validate: (input) => input.trim() !== ''
-    },
-    {
-      type: 'confirm',
-      name: 'installDependencies',
-      message: 'Do you want to install dependencies?',
-      when: newCommand
-    },
     {
       type: 'input',
       name: 'path',
       message: 'Enter Path to typescript main file:',
-      when: !newCommand && !scriptMode && !source,
-      validate: (input) => input.trim() !== ''
+      when: !scriptMode && !source,
+      validate: (input: string) => input.trim() !== ''
     },
     {
       type: 'input',
       name: 'output',
       message: 'Enter Output Path:',
-      when: !newCommand && !scriptMode && !output && !args.emitGo,
-      validate: (input) => input.trim() !== ''
+      when: !scriptMode && !output && !args.emitGo,
+      validate: (input: string) => input.trim() !== ''
     },
     {
       type: 'editor',
       name: 'tsCode',
       message: 'Write your typescript code here:',
-      when: !newCommand && scriptMode && !source,
+      when: scriptMode && !source,
       default: `console.log('Hello, World!');`
     }
   ];
@@ -73,11 +104,6 @@ module.enableCompileCache?.();
   const answers: Record<string, any> = questions.some((q) => q.when)
     ? await (await import('inquirer')).default.prompt(questions as any)
     : {};
-
-  if (newCommand) {
-    createProject(answers.projectName.trim(), answers.installDependencies);
-    return;
-  }
 
   const sourcePath: string | null = answers.tsCode ? null : (source ?? answers.path ?? null);
 
@@ -98,6 +124,7 @@ module.enableCompileCache?.();
     cover: args.cover,
     profile: args.profile,
     emitGo: args.emitGo,
-    seaConfig: args.seaConfig
+    seaConfig: args.seaConfig,
+    skipChecks: args.skipChecks
   });
 })();

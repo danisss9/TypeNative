@@ -13,7 +13,9 @@ Every option accepts both `--flag value` and `--flag=value`. The entry file can 
 | `--source <file>` | build / script | TypeScript entry file (`.ts` or `.tsx`). Relative imports and npm packages are resolved from its directory. |
 | `--output <file>` | build | Destination path for the compiled executable. |
 | `--script` | run | Compile to `dist/native` (or `dist/native.exe`) and execute immediately with inherited stdio. Omit `--source` to open an editor prompt. |
-| `--new` | scaffold | Interactively create a new TypeNative project directory. |
+| `--new` | scaffold | Create a new TypeNative project directory, check Node.js and Go versions (warning and asking to continue if missing or outdated), and automatically run `npm install`. Pass a positional name or omit it to be prompted. |
+| `--skip-checks` | scaffold / build | Skip Node.js and Go version checks. |
+| `--skip-install` | scaffold | Skip running `npm install` after scaffolding a new project (`--new`). |
 | `--target <os/arch>` | build | Cross-compile for another OS and architecture (e.g., `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`). Run `go tool dist list` for all valid pairs. Not supported with `--script` unless matching the host. |
 | `--release` | build / script | Produce a smaller binary by stripping debug symbols and file paths (`-trimpath -ldflags="-s -w"`). |
 | `--gui` | build / script | Build as a windowed application on Windows with no console window (`-ldflags=-H=windowsgui`). Ignored on non-Windows targets. |

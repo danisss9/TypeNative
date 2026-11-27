@@ -96,7 +96,7 @@ npx typenative --script
 
 ```sh
 npx typenative --new
-# prompts for project name + whether to npm install
+# checks Node.js and Go versions, prompts for project name, creates files, and runs npm install
 # creates main.ts, package.json (with execute/build scripts), tsconfig.json, README.md, .gitignore
 ```
 
@@ -136,7 +136,9 @@ Scaffolded `tsconfig.json` targets the TypeNative type surface:
 | `--source <file>`    | build / script | TypeScript entry file. Relative imports (`./util`) and npm packages are resolved from its directory.                                                                          |
 | `--output <path>`    | build          | Where to copy the compiled binary. If omitted with `--script`, the temp binary in `dist/` is executed and kept there.                                                         |
 | `--script`           | run            | Build to `dist/native(.exe)` and execute immediately with inherited stdio. Combine with `--source`, or omit `--source` to type code into the prompt.                          |
-| `--new`              | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`).                                                                       |
+| `--new`              | scaffold       | Create a new project directory (`main.ts`, `package.json`, `tsconfig.json`, `README.md`, `.gitignore`), check Node.js and Go versions, and run `npm install`.                  |
+| `--skip-checks`      | scaffold/build | Skip the Node.js and Go version checks.                                                                                                                                       |
+| `--skip-install`     | scaffold       | Skip running `npm install` after creating a new project (`--new`).                                                                                                            |
 | `--no-typecheck`     | build / script | Skip the type-check that runs before transpiling.                                                                                                                             |
 | `--target <os/arch>` | build          | Cross-compile for another platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, … `go tool dist list` shows every pair). `--script` only runs host builds. |
 | `--release`          | build / script | Smaller binary: strips symbols and file paths (`-trimpath -ldflags="-s -w"`).                                                                                                 |

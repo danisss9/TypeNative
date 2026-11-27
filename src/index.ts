@@ -53,6 +53,8 @@ export interface RunOptions {
   // --sea-config <file>: node:sea's assets ({ assets: { key: path } }) to
   // embed in the binary (node:sea getAsset / getRawAsset / getAssetAsBlob)
   seaConfig: string | null;
+  // --skip-checks: skip Go and Node.js version checks
+  skipChecks?: boolean;
 }
 
 // --profile: starts a CPU profile before any module initializes and stops
@@ -98,9 +100,10 @@ func tnProfileExit(code int) {
 }
 `;
 
-// The minimum Go toolchain generated code needs
+// The minimum Go and Node.js toolchains TypeNative needs
 const MIN_GO_MAJOR = 1;
 const MIN_GO_MINOR = 26;
+const MIN_NODE_MAJOR = 26;
 
 // Parsed command line, shared by the Node CLI (src/cli.ts) and the
 // self-hosted one (src/main.ts)
@@ -108,6 +111,8 @@ export interface CliArgs {
   help: boolean;
   version: boolean;
   newProject: boolean;
+  skipChecks: boolean;
+  skipInstall: boolean;
   script: boolean;
   noTypeCheck: boolean;
   release: boolean;
@@ -133,7 +138,9 @@ Options:
   --source <file>      The program's entry file (or pass it as the last argument)
   --output <file>      Where to write the executable
   --script             Build and run the program (prompts for code without --source)
-  --new                Create a new TypeNative project
+  --new                Create a new TypeNative project (checks Node.js/Go, runs npm install)
+  --skip-checks        Skip Node.js and Go version checks
+  --skip-install       Skip running npm install (for --new)
   --target <os/arch>   Cross-compile, e.g. linux/amd64, linux/arm64, darwin/arm64,
                        windows/amd64 ('go tool dist list' shows every pair)
   --release            Smaller binary: drop symbols and file paths
@@ -161,6 +168,8 @@ export function parseCliArgs(argv: string[]): CliArgs {
     help: false,
     version: false,
     newProject: false,
+    skipChecks: false,
+    skipInstall: false,
     script: false,
     noTypeCheck: false,
     release: false,
@@ -185,6 +194,8 @@ export function parseCliArgs(argv: string[]): CliArgs {
     if (arg === '-h' || arg === '--help') args.help = true;
     else if (arg === '-v' || arg === '--version') args.version = true;
     else if (arg === '--new') args.newProject = true;
+    else if (arg === '--skip-checks') args.skipChecks = true;
+    else if (arg === '--skip-install') args.skipInstall = true;
     else if (arg === '--script') args.script = true;
     else if (arg === '--no-typecheck') args.noTypeCheck = true;
     else if (arg === '--release') args.release = true;
@@ -257,6 +268,32 @@ export function checkGo(target: string | null): string {
   }
   goCheckCache.set(cacheKey, '');
   return '';
+}
+
+// Checks Node.js on the PATH; returns an error message, '' when usable
+export function checkNode(): string {
+  const version = runCommand('node', ['--version']);
+  const found = (version.stdout ?? '').match(/v(\d+)\.(\d+)\.(\d+)/);
+  if (version.status !== 0 || !found) {
+    return `TypeNative needs Node.js ${MIN_NODE_MAJOR} or newer on the PATH (https://nodejs.org/)`;
+  }
+  const major = Number(found[1]);
+  const minor = Number(found[2]);
+  const patch = Number(found[3]);
+  if (major < MIN_NODE_MAJOR) {
+    return `TypeNative needs Node.js ${MIN_NODE_MAJOR} or newer; found v${major}.${minor}.${patch} (https://nodejs.org/)`;
+  }
+  return '';
+}
+
+// Checks both Node.js and Go toolchains; returns warning messages for any missing or outdated runtime
+export function checkEnvironment(): string[] {
+  const warnings: string[] = [];
+  const nodeError = checkNode();
+  if (nodeError) warnings.push(nodeError);
+  const goError = checkGo(null);
+  if (goError) warnings.push(goError);
+  return warnings;
 }
 
 // A source path as diagnostics and Go line directives show it: relative to
@@ -367,17 +404,21 @@ function writeGoMod(modules: GoModule[], goVersion: string, outDir: string): voi
 // Go helper (os/exec) once transpiled — both synchronous, same result shape.
 export function runCommand(name: string, args: string[]): CommandResult {
   const result = (childProcess as any).spawnSync(name, args, { encoding: 'utf-8' });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    status: result.status ?? 1
+  };
 }
 
 
 // Run a command with the parent's stdio, returns the exit code.
 export function runInherit(name: string, args: string[] = []): number {
   const result = (childProcess as any).spawnSync(name, args, { stdio: 'inherit' });
-  return result.status;
+  return result.status ?? 1;
 }
 
-export function createProject(projectName: string, installDependencies: boolean): void {
+export function createProject(projectName: string, installDependencies: boolean = true): void {
   fs.mkdirSync(projectName, { recursive: true });
 
   fs.writeFileSync(
@@ -393,11 +434,16 @@ export function createProject(projectName: string, installDependencies: boolean)
 
   if (installDependencies) {
     console.log('Installing dependencies...');
-    // npm --prefix avoids needing cwd support in the subprocess binding
-    const result = runCommand('npm', ['install', '--prefix', projectName]);
+    // npm --prefix avoids needing cwd support in the subprocess binding;
+    // on Windows npm is a .cmd shim, which Node >=20 refuses to spawn directly without cmd.exe
+    const result =
+      platform() === 'win32'
+        ? runCommand('cmd.exe', ['/c', 'npm', 'install', '--prefix', projectName])
+        : runCommand('npm', ['install', '--prefix', projectName]);
     if (result.stdout) console.log(result.stdout.trim());
     if (result.status !== 0) {
       if (result.stderr) console.error(result.stderr.trim());
+      console.error(`warning: npm install failed; run 'npm install' inside ${projectName} once Node.js is ready.`);
       process.exit(result.status);
     }
     console.log('Dependencies installed successfully!');
@@ -484,10 +530,12 @@ function copyEmbeds(rootDir: string, patterns: string[], outDir: string): void {
 }
 
 export function run(opts: RunOptions): void {
-  const goError = checkGo(opts.target);
-  if (goError) {
-    console.error(`error: ${goError}`);
-    process.exit(1);
+  if (!opts.skipChecks) {
+    const goError = checkGo(opts.target);
+    if (goError) {
+      console.error(`error: ${goError}`);
+      process.exit(1);
+    }
   }
   if (opts.target && opts.scriptMode && opts.target !== hostTarget()) {
     console.error(`error: --script can't run a program built for ${opts.target} on ${hostTarget()}; use --output`);

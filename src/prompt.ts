@@ -27,6 +27,6 @@ export function askMultiline(message: string): string {
 }
 
 export function confirm(message: string): boolean {
-  const answer: string = readlineSync.question(message + ' (y/n): ');
+  const answer: string = readlineSync.question(message + ' (y/N): ');
   return answer.trim().toLowerCase() === 'y';
 }

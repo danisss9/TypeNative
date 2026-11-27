@@ -43,7 +43,7 @@ return [
         'title' => ['Write TypeScript.', 'Ship native binaries.'],
         'lede' => 'TypeNative compiles your TypeScript to Go and builds a single self-contained executable. '
             . 'No Node.js runtime, no node_modules, no bundler: one file you can copy anywhere and run.',
-        'command' => 'npx typenative --new',
+        'command' => 'npx typenative@latest --new',
         'note' => 'Early development: TypeNative compiles a growing subset of TypeScript, and every supported feature is backed by a runnable probe.',
         'tabs' => [
             [
@@ -117,7 +117,7 @@ return [
                 'label' => 'terminal',
                 'lang' => 'sh',
                 'code' => <<<'SH'
-                    $ npx typenative --source todos.ts --output todos --target linux/amd64 --release
+                    $ npx typenative@latest --source todos.ts --output todos --target linux/amd64 --release
                     Created native executable at: todos
                     $ du -h todos
                     2.6M	todos
@@ -154,7 +154,7 @@ return [
         ['binary', 'Ship', 'One executable for Linux, macOS or Windows, on amd64 or arm64. Nothing else to install on the target machine.'],
     ],
     'targets' => ['linux/amd64', 'linux/arm64', 'darwin/amd64', 'darwin/arm64', 'windows/amd64', 'windows/arm64'],
-    'crossCompile' => '$ npx typenative --source main.ts --output bin/app --target linux/arm64 --release',
+    'crossCompile' => '$ npx typenative@latest --source main.ts --output bin/app --target linux/arm64 --release',
 
     'benchmarks' => $benchmarks,
     'benchmarkScaleMax' => 12.0,
@@ -246,12 +246,12 @@ return [
             win.createWebview({ html: '<h1>Hello from one binary</h1>' });
             app.run();
             TS,
-        'command' => '$ npx typenative --source main.ts --output notes --gui --release',
+        'command' => '$ npx typenative@latest --source main.ts --output notes --gui --release',
     ],
 
     'requirements' => 'You need Node.js 26+ and Go 1.26+ on the machine that builds. The binaries you ship need neither.',
     'startSteps' => [
-        ['Scaffold a project', 'Creates <code>main.ts</code>, <code>package.json</code>, <code>tsconfig.json</code> and a README.', 'npx typenative --new'],
+        ['Scaffold a project', 'Creates <code>main.ts</code>, <code>package.json</code>, <code>tsconfig.json</code> and a README.', 'npx typenative@latest --new'],
         ['Run it', 'Transpiles, builds and runs <code>main.ts</code> in one step.', 'npm run execute'],
         ['Ship a binary', 'Builds one executable into <code>bin/</code>. Add <code>--target</code> to cross-compile for another OS or CPU.', 'npm run build'],
     ],

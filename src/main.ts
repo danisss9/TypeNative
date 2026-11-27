@@ -3,7 +3,7 @@
 // prompt module (sync stdin) instead of inquirer.
 
 import path from 'node:path';
-import { run, createProject, parseCliArgs, usage } from './index.js';
+import { run, createProject, parseCliArgs, usage, checkEnvironment } from './index.js';
 import { ask, askMultiline, confirm } from './prompt.js';
 import { parseAstJsonNative, typeCheckNative } from './parse-native.js';
 import { VERSION } from './version.js';
@@ -27,9 +27,20 @@ import { VERSION } from './version.js';
   let output: string | null = args.output;
 
   if (args.newProject) {
-    const projectName = ask('Enter Project Name:');
-    const installDependencies = confirm('Do you want to install dependencies?');
-    createProject(projectName, installDependencies);
+    if (!args.skipChecks) {
+      const warnings = checkEnvironment();
+      if (warnings.length > 0) {
+        for (const warning of warnings) {
+          console.warn(`warning: ${warning}`);
+        }
+        if (!confirm('Continue creating the project anyway?')) {
+          console.log('Project creation cancelled.');
+          return;
+        }
+      }
+    }
+    const projectName = source ?? ask('Enter Project Name:');
+    createProject(projectName.trim(), !args.skipInstall);
     return;
   }
 
@@ -63,6 +74,7 @@ import { VERSION } from './version.js';
     cover: args.cover,
     profile: args.profile,
     emitGo: args.emitGo,
-    seaConfig: args.seaConfig
+    seaConfig: args.seaConfig,
+    skipChecks: args.skipChecks
   });
 })();

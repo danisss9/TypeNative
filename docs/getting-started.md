@@ -75,7 +75,7 @@ npx typenative --script
 npx typenative --new
 ```
 
-This prompts for a project name and whether to run `npm install`, then creates:
+This checks that Node.js v26+ and Go 1.26+ are on your `PATH` (warning you and asking whether to continue if either is missing or outdated; pass `--skip-checks` to bypass the checks), prompts for a project name (or takes one as an argument), creates the project files, and automatically runs `npm install` (pass `--skip-install` to skip installing dependencies):
 
 - `main.ts` — Starter entry point
 - `package.json` — Pinned `typenative` dev dependency with `execute` and `build` scripts
