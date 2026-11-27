@@ -67,10 +67,12 @@ type tnWasmCustom struct {
 }
 
 type tnWasmInfo struct {
-	imports []tnWasmImport
-	exports []tnWasmExport
-	custom  []tnWasmCustom
-	tables  []float64 // initial sizes: the imported tables, then the defined ones
+	imports         []tnWasmImport
+	exports         []tnWasmExport
+	custom          []tnWasmCustom
+	tables          []float64 // initial sizes: the imported tables, then the defined ones
+	importFuncCount int
+	codes           [][]byte // defined function bodies from the code section (id 10)
 }
 
 type tnWasmReader struct {
@@ -100,6 +102,26 @@ func (r *tnWasmReader) uleb() uint64 {
 		}
 		shift += 7
 	}
+}
+
+func (r *tnWasmReader) sleb() int64 {
+	var v int64
+	var shift uint
+	var c byte
+	for {
+		c = r.byte1()
+		if shift < 64 {
+			v |= int64(c&0x7f) << shift
+		}
+		shift += 7
+		if c&0x80 == 0 {
+			break
+		}
+	}
+	if shift < 64 && c&0x40 != 0 {
+		v |= ^int64(0) << shift
+	}
+	return v
 }
 
 func (r *tnWasmReader) bytes(n int) []byte {
@@ -156,6 +178,7 @@ func tnWasmParse(b []byte) *tnWasmInfo {
 				switch imp.kind {
 				case 0:
 					sec.uleb()
+					info.importFuncCount++
 				case 1:
 					imp.valType = sec.valType()
 					info.tables = append(info.tables, sec.limits())
@@ -187,6 +210,13 @@ func tnWasmParse(b []byte) *tnWasmInfo {
 				e := tnWasmExport{name: sec.name(), kind: sec.byte1()}
 				e.index = int(sec.uleb())
 				info.exports = append(info.exports, e)
+			}
+		case 10:
+			n := int(sec.uleb())
+			info.codes = make([][]byte, n)
+			for i := 0; i < n; i++ {
+				sz := int(sec.uleb())
+				info.codes[i] = sec.bytes(sz)
 			}
 		}
 	}
@@ -433,76 +463,482 @@ func tnWasmFail(err error, name string) {
 	panic(tnWasmError(name, msg))
 }
 
+type tnWasmFastOp struct {
+	op  byte
+	imm uint64
+	g   wazeroapi.Global
+	mg  wazeroapi.MutableGlobal
+}
+
+func tnWasmDecodeFastOps(body []byte, nParams int, mem0 wazeroapi.Memory, globals map[int]wazeroapi.Global) ([]tnWasmFastOp, bool) {
+	if len(body) < 2 || body[0] != 0 || body[len(body)-1] != 0x0b {
+		return nil, false
+	}
+	r := &tnWasmReader{b: body, pos: 1}
+	endPos := len(body) - 1
+	var ops []tnWasmFastOp
+	hasWrite := false
+	sp := 0
+	for r.pos < endPos {
+		if len(ops) >= 24 {
+			return nil, false
+		}
+		op := r.byte1()
+		switch op {
+		case 0x20: // local.get
+			idx := int(r.uleb())
+			if idx < 0 || idx >= nParams {
+				return nil, false
+			}
+			ops = append(ops, tnWasmFastOp{op: op, imm: uint64(idx)})
+			sp++
+		case 0x21, 0x22: // local.set, local.tee
+			idx := int(r.uleb())
+			if idx < 0 || idx >= nParams || sp < 1 {
+				return nil, false
+			}
+			ops = append(ops, tnWasmFastOp{op: op, imm: uint64(idx)})
+			if op == 0x21 {
+				sp--
+			}
+		case 0x23: // global.get
+			idx := int(r.uleb())
+			g := globals[idx]
+			if g == nil {
+				return nil, false
+			}
+			ops = append(ops, tnWasmFastOp{op: op, g: g})
+			sp++
+		case 0x24: // global.set
+			idx := int(r.uleb())
+			g := globals[idx]
+			mg, ok := g.(wazeroapi.MutableGlobal)
+			if !ok || sp < 1 {
+				return nil, false
+			}
+			ops = append(ops, tnWasmFastOp{op: op, mg: mg})
+			hasWrite = true
+			sp--
+		case 0x28, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f: // i32.load, f64.load, i32.load8_s/u, i32.load16_s/u
+			if mem0 == nil || hasWrite || sp < 1 {
+				return nil, false
+			}
+			r.uleb() // align
+			off := r.uleb()
+			ops = append(ops, tnWasmFastOp{op: op, imm: off})
+		case 0x41: // i32.const
+			v := uint64(uint32(int32(r.sleb())))
+			ops = append(ops, tnWasmFastOp{op: op, imm: v})
+			sp++
+		case 0x44: // f64.const
+			if r.pos+8 > endPos {
+				return nil, false
+			}
+			b := r.bytes(8)
+			bits := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+				uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+			ops = append(ops, tnWasmFastOp{op: op, imm: bits})
+			sp++
+		case 0x6a, 0x6b, 0x6c, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0xa0, 0xa1, 0xa2, 0xa3: // i32 / f64 binary ops
+			if sp < 2 {
+				return nil, false
+			}
+			ops = append(ops, tnWasmFastOp{op: op})
+			sp--
+		default:
+			return nil, false
+		}
+		if sp > 8 {
+			return nil, false
+		}
+	}
+	if r.pos != endPos || sp != 1 || len(ops) == 0 {
+		return nil, false
+	}
+	return ops, true
+}
+
+func tnWasmEvalFastOps(ops []tnWasmFastOp, locals *[2]uint64, mem0 wazeroapi.Memory) (uint64, bool) {
+	var st [8]uint64
+	sp := 0
+	for i := range ops {
+		o := &ops[i]
+		switch o.op {
+		case 0x20:
+			st[sp] = locals[o.imm]
+			sp++
+		case 0x21:
+			sp--
+			locals[o.imm] = st[sp]
+		case 0x22:
+			locals[o.imm] = st[sp-1]
+		case 0x23:
+			st[sp] = o.g.Get()
+			sp++
+		case 0x24:
+			sp--
+			o.mg.Set(st[sp])
+		case 0x41, 0x44:
+			st[sp] = o.imm
+			sp++
+		case 0x6a:
+			sp--
+			st[sp-1] = uint64(uint32(int32(st[sp-1]) + int32(st[sp])))
+		case 0x6b:
+			sp--
+			st[sp-1] = uint64(uint32(int32(st[sp-1]) - int32(st[sp])))
+		case 0x6c:
+			sp--
+			st[sp-1] = uint64(uint32(int32(st[sp-1]) * int32(st[sp])))
+		case 0x71:
+			sp--
+			st[sp-1] = uint64(uint32(st[sp-1]) & uint32(st[sp]))
+		case 0x72:
+			sp--
+			st[sp-1] = uint64(uint32(st[sp-1]) | uint32(st[sp]))
+		case 0x73:
+			sp--
+			st[sp-1] = uint64(uint32(st[sp-1]) ^ uint32(st[sp]))
+		case 0x74:
+			sp--
+			st[sp-1] = uint64(uint32(st[sp-1]) << (uint32(st[sp]) & 31))
+		case 0x75:
+			sp--
+			st[sp-1] = uint64(uint32(int32(st[sp-1]) >> (uint32(st[sp]) & 31)))
+		case 0x76:
+			sp--
+			st[sp-1] = uint64(uint32(st[sp-1]) >> (uint32(st[sp]) & 31))
+		case 0xa0:
+			sp--
+			st[sp-1] = math.Float64bits(math.Float64frombits(st[sp-1]) + math.Float64frombits(st[sp]))
+		case 0xa1:
+			sp--
+			st[sp-1] = math.Float64bits(math.Float64frombits(st[sp-1]) - math.Float64frombits(st[sp]))
+		case 0xa2:
+			sp--
+			st[sp-1] = math.Float64bits(math.Float64frombits(st[sp-1]) * math.Float64frombits(st[sp]))
+		case 0xa3:
+			sp--
+			st[sp-1] = math.Float64bits(math.Float64frombits(st[sp-1]) / math.Float64frombits(st[sp]))
+		case 0x2d: // i32.load8_u
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			b, ok := mem0.ReadByte(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = uint64(b)
+		case 0x2c: // i32.load8_s
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			b, ok := mem0.ReadByte(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = uint64(uint32(int32(int8(b))))
+		case 0x2f: // i32.load16_u
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			v, ok := mem0.ReadUint16Le(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = uint64(v)
+		case 0x2e: // i32.load16_s
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			v, ok := mem0.ReadUint16Le(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = uint64(uint32(int32(int16(v))))
+		case 0x28: // i32.load
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			v, ok := mem0.ReadUint32Le(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = uint64(v)
+		case 0x2b: // f64.load
+			addr := uint64(uint32(st[sp-1])) + o.imm
+			if addr > math.MaxUint32 {
+				return 0, false
+			}
+			v, ok := mem0.ReadUint64Le(uint32(addr))
+			if !ok {
+				return 0, false
+			}
+			st[sp-1] = v
+		}
+	}
+	return st[0], true
+}
+
 // An exported function as a JS function: numbers / BigInts in, a number /
 // BigInt (an array of them for several results, undefined for none) out.
 // Common small numeric signatures (0–2 i32/f64 params → i32/f64) return a
-// direct typed Go func so typed callers invoke it without interface{} boxing.
-func tnWasmExportFunc(fn wazeroapi.Function) interface{} {
+// direct typed Go func so typed callers invoke it without interface{} boxing,
+// and short straight-line leaf bodies run directly in Go without wazero's
+// per-call boundary/recover overhead (falling back to wazero on any trap).
+func tnWasmExportFunc(fn wazeroapi.Function, body []byte, mem0 wazeroapi.Memory, globals map[int]wazeroapi.Global) interface{} {
 	def := fn.Definition()
 	params, results := def.ParamTypes(), def.ResultTypes()
 	if len(results) == 1 && (results[0] == wazeroapi.ValueTypeI32 || results[0] == wazeroapi.ValueTypeF64) {
 		rI32 := results[0] == wazeroapi.ValueTypeI32
+		ops, fastOK := tnWasmDecodeFastOps(body, len(params), mem0, globals)
 		switch len(params) {
 		case 0:
-			if rI32 {
-				return func() float64 {
+			var buf [1]uint64
+			inUse := false
+			fallback := func() float64 {
+				var s []uint64
+				if !inUse {
+					inUse = true
+					s = buf[:]
+				} else {
 					var stack [1]uint64
-					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
-						tnWasmFail(err, "RuntimeError")
-					}
-					return float64(int32(uint32(stack[0])))
+					s = stack[:]
 				}
-			}
-			return func() float64 {
-				var stack [1]uint64
-				if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+				err := fn.CallWithStack(tnWasmCtx, s)
+				if &s[0] == &buf[0] {
+					inUse = false
+				}
+				if err != nil {
 					tnWasmFail(err, "RuntimeError")
 				}
-				return math.Float64frombits(stack[0])
+				if rI32 {
+					return float64(int32(uint32(s[0])))
+				}
+				return math.Float64frombits(s[0])
 			}
+			if fastOK {
+				return func() float64 {
+					var locals [2]uint64
+					if v, ok := tnWasmEvalFastOps(ops, &locals, mem0); ok {
+						if rI32 {
+							return float64(int32(uint32(v)))
+						}
+						return math.Float64frombits(v)
+					}
+					return fallback()
+				}
+			}
+			return fallback
 		case 1:
 			if params[0] == wazeroapi.ValueTypeI32 && rI32 {
-				return func(a float64) float64 {
-					var stack [1]uint64
-					stack[0] = uint64(uint32(TnInt32(a)))
-					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+				var buf [1]uint64
+				inUse := false
+				fallback := func(a float64) float64 {
+					var s []uint64
+					if !inUse {
+						inUse = true
+						s = buf[:]
+					} else {
+						var stack [1]uint64
+						s = stack[:]
+					}
+					s[0] = uint64(uint32(TnInt32(a)))
+					err := fn.CallWithStack(tnWasmCtx, s)
+					if &s[0] == &buf[0] {
+						inUse = false
+					}
+					if err != nil {
 						tnWasmFail(err, "RuntimeError")
 					}
-					return float64(int32(uint32(stack[0])))
+					return float64(int32(uint32(s[0])))
 				}
+				if fastOK {
+					if len(ops) == 2 && ops[0].op == 0x20 && ops[0].imm == 0 {
+						off := ops[1].imm
+						switch ops[1].op {
+						case 0x2d:
+							return func(a float64) float64 {
+								addr := uint64(uint32(TnInt32(a))) + off
+								if addr <= math.MaxUint32 {
+									if b, ok := mem0.ReadByte(uint32(addr)); ok {
+										return float64(b)
+									}
+								}
+								return fallback(a)
+							}
+						case 0x2c:
+							return func(a float64) float64 {
+								addr := uint64(uint32(TnInt32(a))) + off
+								if addr <= math.MaxUint32 {
+									if b, ok := mem0.ReadByte(uint32(addr)); ok {
+										return float64(int8(b))
+									}
+								}
+								return fallback(a)
+							}
+						case 0x28:
+							return func(a float64) float64 {
+								addr := uint64(uint32(TnInt32(a))) + off
+								if addr <= math.MaxUint32 {
+									if v, ok := mem0.ReadUint32Le(uint32(addr)); ok {
+										return float64(int32(v))
+									}
+								}
+								return fallback(a)
+							}
+						}
+					}
+					return func(a float64) float64 {
+						locals := [2]uint64{uint64(uint32(TnInt32(a))), 0}
+						if v, ok := tnWasmEvalFastOps(ops, &locals, mem0); ok {
+							return float64(int32(uint32(v)))
+						}
+						return fallback(a)
+					}
+				}
+				return fallback
 			}
 			if params[0] == wazeroapi.ValueTypeF64 && !rI32 {
-				return func(a float64) float64 {
-					var stack [1]uint64
-					stack[0] = math.Float64bits(a)
-					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+				var buf [1]uint64
+				inUse := false
+				fallback := func(a float64) float64 {
+					var s []uint64
+					if !inUse {
+						inUse = true
+						s = buf[:]
+					} else {
+						var stack [1]uint64
+						s = stack[:]
+					}
+					s[0] = math.Float64bits(a)
+					err := fn.CallWithStack(tnWasmCtx, s)
+					if &s[0] == &buf[0] {
+						inUse = false
+					}
+					if err != nil {
 						tnWasmFail(err, "RuntimeError")
 					}
-					return math.Float64frombits(stack[0])
+					return math.Float64frombits(s[0])
 				}
+				if fastOK {
+					return func(a float64) float64 {
+						locals := [2]uint64{math.Float64bits(a), 0}
+						if v, ok := tnWasmEvalFastOps(ops, &locals, mem0); ok {
+							return math.Float64frombits(v)
+						}
+						return fallback(a)
+					}
+				}
+				return fallback
 			}
 		case 2:
 			if params[0] == wazeroapi.ValueTypeI32 && params[1] == wazeroapi.ValueTypeI32 && rI32 {
-				return func(a, b float64) float64 {
-					var stack [2]uint64
-					stack[0] = uint64(uint32(TnInt32(a)))
-					stack[1] = uint64(uint32(TnInt32(b)))
-					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+				if fastOK && len(ops) == 3 && ops[0].op == 0x20 && ops[0].imm == 0 && ops[1].op == 0x20 && ops[1].imm == 1 {
+					switch ops[2].op {
+					case 0x6a:
+						return func(a, b float64) float64 { return float64(TnInt32(a) + TnInt32(b)) }
+					case 0x6b:
+						return func(a, b float64) float64 { return float64(TnInt32(a) - TnInt32(b)) }
+					case 0x6c:
+						return func(a, b float64) float64 { return float64(TnInt32(a) * TnInt32(b)) }
+					case 0x71:
+						return func(a, b float64) float64 { return float64(TnInt32(a) & TnInt32(b)) }
+					case 0x72:
+						return func(a, b float64) float64 { return float64(TnInt32(a) | TnInt32(b)) }
+					case 0x73:
+						return func(a, b float64) float64 { return float64(TnInt32(a) ^ TnInt32(b)) }
+					case 0x74:
+						return func(a, b float64) float64 { return float64(TnInt32(a) << (uint32(TnInt32(b)) & 31)) }
+					case 0x75:
+						return func(a, b float64) float64 { return float64(TnInt32(a) >> (uint32(TnInt32(b)) & 31)) }
+					case 0x76:
+						return func(a, b float64) float64 { return float64(int32(uint32(TnInt32(a)) >> (uint32(TnInt32(b)) & 31))) }
+					}
+				}
+				var buf [2]uint64
+				inUse := false
+				fallback := func(a, b float64) float64 {
+					var s []uint64
+					if !inUse {
+						inUse = true
+						s = buf[:]
+					} else {
+						var stack [2]uint64
+						s = stack[:]
+					}
+					s[0] = uint64(uint32(TnInt32(a)))
+					s[1] = uint64(uint32(TnInt32(b)))
+					err := fn.CallWithStack(tnWasmCtx, s)
+					if &s[0] == &buf[0] {
+						inUse = false
+					}
+					if err != nil {
 						tnWasmFail(err, "RuntimeError")
 					}
-					return float64(int32(uint32(stack[0])))
+					return float64(int32(uint32(s[0])))
 				}
+				if fastOK {
+					return func(a, b float64) float64 {
+						locals := [2]uint64{uint64(uint32(TnInt32(a))), uint64(uint32(TnInt32(b)))}
+						if v, ok := tnWasmEvalFastOps(ops, &locals, mem0); ok {
+							return float64(int32(uint32(v)))
+						}
+						return fallback(a, b)
+					}
+				}
+				return fallback
 			}
 			if params[0] == wazeroapi.ValueTypeF64 && params[1] == wazeroapi.ValueTypeF64 && !rI32 {
-				return func(a, b float64) float64 {
-					var stack [2]uint64
-					stack[0] = math.Float64bits(a)
-					stack[1] = math.Float64bits(b)
-					if err := fn.CallWithStack(tnWasmCtx, stack[:]); err != nil {
+				if fastOK && len(ops) == 3 && ops[0].op == 0x20 && ops[0].imm == 0 && ops[1].op == 0x20 && ops[1].imm == 1 {
+					switch ops[2].op {
+					case 0xa0:
+						return func(a, b float64) float64 { return a + b }
+					case 0xa1:
+						return func(a, b float64) float64 { return a - b }
+					case 0xa2:
+						return func(a, b float64) float64 { return a * b }
+					case 0xa3:
+						return func(a, b float64) float64 { return a / b }
+					}
+				}
+				var buf [2]uint64
+				inUse := false
+				fallback := func(a, b float64) float64 {
+					var s []uint64
+					if !inUse {
+						inUse = true
+						s = buf[:]
+					} else {
+						var stack [2]uint64
+						s = stack[:]
+					}
+					s[0] = math.Float64bits(a)
+					s[1] = math.Float64bits(b)
+					err := fn.CallWithStack(tnWasmCtx, s)
+					if &s[0] == &buf[0] {
+						inUse = false
+					}
+					if err != nil {
 						tnWasmFail(err, "RuntimeError")
 					}
-					return math.Float64frombits(stack[0])
+					return math.Float64frombits(s[0])
 				}
+				if fastOK {
+					return func(a, b float64) float64 {
+						locals := [2]uint64{math.Float64bits(a), math.Float64bits(b)}
+						if v, ok := tnWasmEvalFastOps(ops, &locals, mem0); ok {
+							return math.Float64frombits(v)
+						}
+						return fallback(a, b)
+					}
+				}
+				return fallback
 			}
 		}
 	}
@@ -510,12 +946,22 @@ func tnWasmExportFunc(fn wazeroapi.Function) interface{} {
 	if len(results) > size {
 		size = len(results)
 	}
+	var buf []uint64
+	if size > 0 {
+		buf = make([]uint64, size)
+	}
+	inUse := false
 	return func(args ...interface{}) interface{} {
-		// (a stack array for the common small arities: no allocation per call)
-		var stackArr [8]uint64
-		stack := stackArr[:size]
-		if size > len(stackArr) {
-			stack = make([]uint64, size)
+		var stack []uint64
+		usedBuf := false
+		if size > 0 {
+			if !inUse {
+				inUse = true
+				usedBuf = true
+				stack = buf
+			} else {
+				stack = make([]uint64, size)
+			}
 		}
 		for i, t := range params {
 			var a interface{}
@@ -524,7 +970,11 @@ func tnWasmExportFunc(fn wazeroapi.Function) interface{} {
 			}
 			stack[i] = tnWasmFromJS(t, a)
 		}
-		if err := fn.CallWithStack(tnWasmCtx, stack); err != nil {
+		err := fn.CallWithStack(tnWasmCtx, stack)
+		if usedBuf {
+			inUse = false
+		}
+		if err != nil {
 			tnWasmFail(err, "RuntimeError")
 		}
 		switch len(results) {
@@ -922,12 +1372,30 @@ func TnNewWasmInstance(m *TnWasmModule, importObject ...interface{}) *TnWasmInst
 		tnWasmFail(err, "LinkError")
 	}
 	inst := &TnWasmInstance{mod: mod, module: m, wasi: wasi}
+	var mem0 wazeroapi.Memory
+	var globals map[int]wazeroapi.Global
+	for _, e := range m.info.exports {
+		if e.kind == 2 && e.index == 0 {
+			mem0 = mod.ExportedMemory(e.name)
+		} else if e.kind == 3 {
+			if g := mod.ExportedGlobal(e.name); g != nil {
+				if globals == nil {
+					globals = map[int]wazeroapi.Global{}
+				}
+				globals[e.index] = g
+			}
+		}
+	}
 	exports := TnNewMap[string, interface{}]()
 	for _, e := range m.info.exports {
 		switch e.kind {
 		case 0:
 			if f := mod.ExportedFunction(e.name); f != nil {
-				exports.Set(e.name, tnWasmExportFunc(f))
+				var body []byte
+				if defIdx := e.index - m.info.importFuncCount; defIdx >= 0 && defIdx < len(m.info.codes) {
+					body = m.info.codes[defIdx]
+				}
+				exports.Set(e.name, tnWasmExportFunc(f, body, mem0, globals))
 			}
 		case 1:
 			length := 0.0

@@ -441,6 +441,13 @@ const declaredTypeAliases = new Map<string, AstNode>();
 // Package-level declarations of the main file's top-level variables
 const mainPackageVariables: string[] = [];
 const hoistedBigInts = new Map<string, string>();
+let propICCount = 0;
+function allocPropIC(): string {
+  const idx = propICCount++;
+  importedPackages.add('sync/atomic');
+  useHelper('orderedMap');
+  return `__tnICs[${idx}]`;
+}
 
 // String variables proven all-ASCII inside an active fast-path loop branch
 // (goName -> optional int loop counter proven 0 <= idx < len(goName))
@@ -3974,6 +3981,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   helperProvidedPackages.clear();
   mainPackageVariables.length = 0;
   hoistedBigInts.clear();
+  propICCount = 0;
   asciiStringGoVars.clear();
   keyOrderTables.clear();
   regexSites.clear();
@@ -4128,6 +4136,10 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   const ifaceAdapterInitCode = emitInterfaceAdapterInits();
   const classCode = (classValuesUsed ? `\n\n${emitClassDescriptors()}` : '') + `\n\n${emitToJSONWrappers()}` + emitMixinSupport() + nsHelpersCode + ifaceAdapterInitCode;
   let helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
+  if (propICCount > 0) {
+    importedPackages.add('sync/atomic');
+    helpersCode += `\n\nvar __tnICs [${propICCount}]atomic.Pointer[tnShapeSlot]`;
+  }
   // Object literal allocations: TnLit where the struct may be a strict prefix
   // of a merged union the program converts objects to, else plain
   const emittedCode = [mainCode, outsideCode, ...packageVariables, ...localImportFiles.values()];
@@ -4920,6 +4932,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     }
     if (targetType?.startsWith('*TnMap[')) {
       const mapKeyType = extractMapKeyType(targetType);
+      if (
+        targetType === '*TnMap[string, interface{}]' &&
+        isStringLiteral(node.argumentExpression) &&
+        !isAssignmentTarget(node) &&
+        node.argumentExpression.text !== 'length' &&
+        node.argumentExpression.text !== 'size'
+      ) {
+        useHelper('dynamic');
+        return `TnGetRefIC(${visit(node.expression)}, ${toGoStringLiteral(node.argumentExpression.text)}, &${allocPropIC()})`;
+      }
       const keyCode = mapKeyType === 'string'
         ? jsStringOfExpr(node.argumentExpression)
         : toGoValueOfType(node.argumentExpression, mapKeyType);
@@ -5050,7 +5072,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       if (hasQuestionDot(node)) {
         return `func() interface{} { __l := ${peekRead(visit(node.expression))}; if TnIsNil(__l) { return nil }; return TnGet(__l, "length") }()`;
       }
-      return `TnLength(${peekRead(visit(node.expression))})`;
+      return readLength(visit(node.expression));
     }
     // x.constructor of any value: its class (when it is a class instance)
     if (hasDynamicProperties(node.expression) && node.name.text === 'constructor' && !isCallee(node) && !isAssignmentTarget(node)) {
@@ -5094,7 +5116,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           return `TnAccGet_${acc.name}(${visit(node.expression)})`;
         }
       }
-      return `TnGetRef(${visit(node.expression)}, "${node.name.text}")`;
+      return `TnGetRefIC(${peekRead(visit(node.expression))}, "${node.name.text}", &${allocPropIC()})`;
     }
     // Error.stackTraceLimit / Error.prepareStackTrace (V8's): properties of
     // the Error class value, unset here (there are no V8 stack frames)
@@ -6899,7 +6921,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     ) {
       useHelper('numTruthy');
       const operand = (side: AstNode, goType: string | undefined): string =>
-        goType === '*float64' ? `TnNumPtr(${visit(side)})` : goType === 'interface{}' ? `TnNumber(${peekRead(visit(side))})` : visit(side);
+        goType === '*float64' ? `TnNumPtr(${visit(side)})` : goType === 'interface{}' ? readAsNumber(visit(side)) : visit(side);
       if (isDynamicGoType(bigLeft) || isDynamicGoType(bigRight)) useHelper('dynamic');
       const l = operand(node.left, bigLeft);
       const r = operand(node.right, bigRight);
@@ -6954,7 +6976,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     const asNumber = (side: AstNode): string => {
       const t = inferExpressionType(side);
       const code = asFloatOperand(side, visit(side));
-      return t === 'interface{}' || t === 'any' ? `TnNumber(${peekRead(code)})` : code;
+      return t === 'interface{}' || t === 'any' ? readAsNumber(code) : code;
     };
     if (op === '**') {
       importedPackages.add('math');
@@ -7182,7 +7204,11 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           return `TnAccSet_${acc.name}(${visit(node.left.expression)}, ${toGoValueOfType(node.right, acc.goType)})`;
         }
       }
-      return `TnSet(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'interface{}')})`;
+      const rhsType = inferExpressionType(node.right);
+      if (rhsType === 'float64') {
+        return `TnSetFloatIC(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'float64')}, &${allocPropIC()})`;
+      }
+      return `TnSetIC(${visit(node.left.expression)}, "${node.left.name.text}", ${toGoValueOfType(node.right, 'interface{}')}, &${allocPropIC()})`;
     }
     // record.key = v on a Record (an ordered map): a key write
     if (op === '=' && isPropertyAccessExpression(node.left) && !hasQuestionDot(node.left)) {
@@ -7302,7 +7328,7 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       const target = visit(node.left);
       // (a member the emitter reads dynamically is written dynamically)
-      if ((target.startsWith('TnGet(') || target.startsWith('TnGetRef('))) {
+      if (target.startsWith('TnGet(') || target.startsWith('TnGetRef(') || target.startsWith('TnGetRefIC(')) {
         useHelper('dynamic');
         const receiver = target.startsWith('TnGetRef(TnClass_Error, ') ? 'TnClass_Error' : visit(node.left.expression);
         return `TnSet(${receiver}, ${toGoStringLiteral(node.left.name.text)}, ${visit(node.right)})`;
@@ -7568,7 +7594,52 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       return code + ';\n\t';
     }
-    return visit(node.expression) + (options.inline ? '' : ';\n\t');
+    // Statement-level dynamic float property assignment: inline the monomorphic
+    // shape hit (and lower ternary RHS to a Go if/else with zero closure overhead)
+    if (
+      !options.inline &&
+      node.parent?.kind !== 'LabeledStatement' &&
+      isBinaryExpression(exprStmt) &&
+      exprStmt.operatorToken?.kind === 'EqualsToken' &&
+      isPropertyAccessExpression(exprStmt.left) &&
+      isIdentifier(exprStmt.left.name) &&
+      !hasQuestionDot(exprStmt.left) &&
+      isDynamicValue(exprStmt.left.expression) &&
+      !typedAccessorFor(exprStmt.left.expression, memberKey(exprStmt.left.name) ?? exprStmt.left.name.text, 'set') &&
+      inferExpressionType(exprStmt.right) === 'float64'
+    ) {
+      useHelper('dynamic');
+      const objRaw = visit(exprStmt.left.expression);
+      const objVar = getTempName('ico');
+      const keyLit = `"${exprStmt.left.name.text}"`;
+      const ic = allocPropIC();
+      const rhsU = unwrapParentheses(exprStmt.right);
+      const valVar = getTempName('icw');
+      if (isConditionalExpression(rhsU)) {
+        const condExp = expandTopLevelIC(toGoCondition(rhsU.condition));
+        const trueExp = expandTopLevelIC(withNarrowing(getNarrowedNames(rhsU.condition, true), () => toGoValueOfType(rhsU.whenTrue, 'float64')));
+        const falseExp = expandTopLevelIC(withNarrowing(getNarrowedNames(rhsU.condition, false), () => toGoValueOfType(rhsU.whenFalse, 'float64')));
+        const lines: string[] = [`${objVar} := ${objRaw}`, ...condExp.pre, `var ${valVar} float64`];
+        lines.push(`if ${condExp.expr} { ${[...trueExp.pre, `${valVar} = ${trueExp.expr}`].join('; ')} } else { ${[...falseExp.pre, `${valVar} = ${falseExp.expr}`].join('; ')} }`);
+        lines.push(`if !tnHitSetFloat(${objVar}, ${valVar}, &${ic}) { tnSetFloatICSlow(${objVar}, ${keyLit}, ${valVar}, &${ic}) }`);
+        return lines.join(';\n\t\t') + ';\n\t';
+      }
+      const rhsExp = expandTopLevelIC(toGoValueOfType(exprStmt.right, 'float64'));
+      const lines: string[] = [`${objVar} := ${objRaw}`, ...rhsExp.pre, `${valVar} := ${rhsExp.expr}`];
+      lines.push(`if !tnHitSetFloat(${objVar}, ${valVar}, &${ic}) { tnSetFloatICSlow(${objVar}, ${keyLit}, ${valVar}, &${ic}) }`);
+      return lines.join(';\n\t\t') + ';\n\t';
+    }
+    const stmtCode = visit(node.expression);
+    if (!options.inline && node.parent?.kind !== 'LabeledStatement' && stmtCode.includes('IC(')) {
+      const mAssign = /^([A-Za-z_][A-Za-z0-9_]*\s*(?:\+=|-=|\*=|\/=|=)\s*)([\s\S]+)$/.exec(stmtCode);
+      if (mAssign) {
+        const exp = expandTopLevelIC(mAssign[2]);
+        if (exp.pre.length > 0) {
+          return `${exp.pre.join(';\n\t\t')};\n\t\t${mAssign[1]}${exp.expr};\n\t`;
+        }
+      }
+    }
+    return stmtCode + (options.inline ? '' : ';\n\t');
   } else if (isForStatement(node)) {
     const multi = visitMultiForHeader(node);
     if (multi) return multi;
@@ -7759,13 +7830,16 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
     // terminating ';' is only added when no else branch follows
     const thenTerm = node.elseStatement ? '' : ';';
     // (the condition first: its names have their types before the branches run)
-    const conditionCode = toGoCondition(node.expression);
+    const rawCondCode = toGoCondition(node.expression);
+    const condExp = !options.inline && node.parent?.kind !== 'LabeledStatement' ? expandTopLevelIC(rawCondCode) : { pre: [], expr: rawCondCode };
+    const conditionCode = condExp.expr;
     const thenCode = withNarrowing(getNarrowedNames(node.expression, true), () =>
       isBlock(node.thenStatement)
         ? visit(node.thenStatement, { inline: !!node.elseStatement })
         : `{\n${withLineMarker(node.thenStatement, visit(node.thenStatement))}\n}${thenTerm}`
     );
     const condition = `if ${conditionCode} ${thenCode}`;
+    let fullIf = condition;
     if (node.elseStatement) {
       // else-if chains stay chained; other single statements get a block
       const elseCode = withNarrowing(getNarrowedNames(node.expression, false), () =>
@@ -7773,9 +7847,14 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
           ? visit(node.elseStatement)
           : `{\n${withLineMarker(node.elseStatement, visit(node.elseStatement))}\n};\n\t`
       );
-      return `${condition} else ${elseCode}`;
+      fullIf = `${condition} else ${elseCode}`;
     }
-    return condition;
+    if (condExp.pre.length > 0) {
+      const isElseIf = node.parent && isIfStatement(node.parent) && node.parent.elseStatement === node;
+      const prefix = condExp.pre.join(';\n\t\t') + ';\n\t\t';
+      return isElseIf ? `{\n\t\t${prefix}${fullIf}\n\t};\n\t` : `${prefix}${fullIf}`;
+    }
+    return fullIf;
   } else if (isSwitchStatement(node)) {
     // A nullable primitive (*T) switches on its value or nil; a value type
     // with a `case undefined:` switches as any
@@ -9210,8 +9289,24 @@ function visitNode(node: AstNode, options: VisitNodeOptions = {}): string {
       }
       const entries = (node.properties ?? [])
         .map((p) => {
-          if (isPropertyAssignment(p)) return `__obj.Set(${propertyKeyString(p.name)}, ${visit(p.initializer)})`;
-          if (isShorthandPropertyAssignment(p)) return `__obj.Set(${mapKeyText(p.name)}, ${visit(p.name)})`;
+          if (isPropertyAssignment(p)) {
+            if (unwrapParentheses(p.initializer).kind === 'NullKeyword') {
+              useHelper('dynamic');
+              return `__obj.Set(${propertyKeyString(p.name)}, TnNull)`;
+            }
+            if (inferExpressionType(p.initializer) === 'float64') {
+              useHelper('dynamic');
+              return `tnMapSetFloat(__obj, ${propertyKeyString(p.name)}, ${toGoValueOfType(p.initializer, 'float64')})`;
+            }
+            return `__obj.Set(${propertyKeyString(p.name)}, ${visit(p.initializer)})`;
+          }
+          if (isShorthandPropertyAssignment(p)) {
+            if (inferExpressionType(p.name) === 'float64') {
+              useHelper('dynamic');
+              return `tnMapSetFloat(__obj, ${mapKeyText(p.name)}, ${toGoValueOfType(p.name, 'float64')})`;
+            }
+            return `__obj.Set(${mapKeyText(p.name)}, ${visit(p.name)})`;
+          }
           return '';
         })
         .filter((e) => e);
@@ -10407,7 +10502,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
         return `TnSlicePtr(${boxedRead()})`;
       }
       const fallbackInner = boxedRead();
-      if (fallbackInner.startsWith('TnGetRef(') || fallbackInner.startsWith('TnGet(') || fallbackInner.startsWith('TnIndex(') || ownSlice === 'interface{}' || ownSlice === '') {
+      if (fallbackInner.startsWith('TnGetRef(') || fallbackInner.startsWith('TnGetRefIC(') || fallbackInner.startsWith('TnGet(') || fallbackInner.startsWith('TnIndex(') || ownSlice === 'interface{}' || ownSlice === '') {
         useHelper('dynamic');
         return `TnArrayRef[${elem}](${fallbackInner})`;
       }
@@ -10416,7 +10511,7 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
   const code = visit(expr);
   // (also a method call on an any value: o?.m.get(k) is any value too)
   const unwrapped = unwrapParentheses(expr);
-  const dynamicCode = code.startsWith('TnSlice(') || code.startsWith('TnIndex(') || code.startsWith('TnPtrValue(') || code.startsWith('TnGet(') || code.startsWith('TnGetRef(') || code.startsWith('TnCallValue(');
+  const dynamicCode = code.startsWith('TnSlice(') || code.startsWith('TnIndex(') || code.startsWith('TnPtrValue(') || code.startsWith('TnGet(') || code.startsWith('TnGetRef(') || code.startsWith('TnGetRefIC(') || code.startsWith('TnCallValue(');
   const calleeSigRet = isCallExpression(unwrapped)
     ? (isIdentifier(unwrapped.expression) && emittedFunctionReturnTypes.has(unwrapped.expression.text)
         ? emittedFunctionReturnTypes.get(unwrapped.expression.text)
@@ -10432,7 +10527,8 @@ function toGoValueOfType(expr: AstNode, goType: string | undefined): string {
       return `TnRecordOf(${code})`;
     }
     if (goType.startsWith('*')) return `TnAsPtr[${goType.slice(1)}](${code})`;
-    return `TnAs[${goType}](${goType === 'string' || goType === 'float64' ? peekRead(code) : code})`;
+    if (goType === 'float64') return readAsFloat(code);
+    return `TnAs[${goType}](${goType === 'string' ? peekRead(code) : code})`;
   }
   // Non-map value (array, function, struct) passed into MapLike<any> (*TnMap[string, interface{}])
   if (goType === '*TnMap[string, interface{}]' && !isNilLiteral(unwrapParentheses(expr))) {
@@ -11555,9 +11651,18 @@ function visitDynamicArithmetic(node: AstNode, op: string): string | undefined {
     const raw = peekRead(visit(side));
     // - * / % convert with ToNumber ('6' - 1, date - date); + keeps the number cast
     if ((op === '+' || op === '+=') && raw.startsWith('TnDynamicAdd(') && goParenEnd(raw, 'TnDynamicAdd'.length) === raw.length - 1) {
-      return `TnDynamicAddFloat(${raw.slice('TnDynamicAdd('.length, -1)})`;
+      const inner = raw.slice('TnDynamicAdd('.length, -1);
+      const parts = splitTopLevelTwoArgs(inner);
+      if (parts) {
+        const aVal = toDynValExpr(parts[0]);
+        const bVal = toDynValExpr(parts[1]);
+        if (aVal || bVal) {
+          return `TnDynamicAddFloatV(${aVal ?? `tnDynValOf(${peekRead(parts[0])})`}, ${bVal ?? `tnDynValOf(${peekRead(parts[1])})`})`;
+        }
+      }
+      return `TnDynamicAddFloat(${inner})`;
     }
-    return op === '+' || op === '+=' ? `TnAs[float64](${raw})` : `TnNumber(${raw})`;
+    return op === '+' || op === '+=' ? readAsFloat(raw) : readAsNumber(raw);
   };
   // Relational comparisons (<, <=, >, >=) when both sides are dynamic or either side may be a string:
   // JS compares strings lexicographically and everything else numerically
@@ -13673,6 +13778,10 @@ function visitTypedDispatch(node: AstNode, receiver: AstNode, method: string): s
 // The TnCall_C_m dispatchers (see visitTypedDispatch)
 function emitTypedDispatchers(): string {
   const out: string[] = [];
+  if (typedDispatchers.size > 0) {
+    importedPackages.add('sync/atomic');
+    useHelper('orderedMap');
+  }
   for (const [name, d] of [...typedDispatchers].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
     const params = d.params.map((t, i) => `__a${i} ${t}`);
     const argNames = d.params.map((_, i) => `__a${i}`);
@@ -13687,10 +13796,11 @@ function emitTypedDispatchers(): string {
     }
     const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
     const fnType = `func(${d.params.join(', ')})${d.result ? ` ${d.result}` : ''}`;
-    const mapFast = `\tif __m, __ok := __recv.(*TnMap[string, interface{}]); __ok && __m != nil {\n\t\tif __fn, __has := tnMapGetStr(__m, ${toGoStringLiteral(d.method)}); __has {\n\t\t\tif __f, __ok := __fn.(${fnType}); __ok && __f != nil {\n\t\t\t\t${d.result ? `return __f(${argNames.join(', ')})` : `__f(${argNames.join(', ')})\n\t\t\t\treturn`}\n\t\t\t}\n\t\t}\n\t}\n`;
+    const icName = `__tnCallIC_${name}`;
+    const mapFast = `\tif __m, __ok := __recv.(*TnMap[string, interface{}]); __ok && __m != nil {\n\t\tvar __fn interface{}\n\t\tvar __has bool\n\t\tif __s := ${icName}.Load(); __s != nil && __m.shape == __s.shape {\n\t\t\t__fn, __has = __m.vals[__s.idx], true\n\t\t} else {\n\t\t\t__fn, __has = tnMapGetStrIC(__m, ${toGoStringLiteral(d.method)}, &${icName})\n\t\t}\n\t\tif __has {\n\t\t\tif __f, __ok := __fn.(${fnType}); __ok && __f != nil {\n\t\t\t\t${d.result ? `return __f(${argNames.join(', ')})` : `__f(${argNames.join(', ')})\n\t\t\t\treturn`}\n\t\t\t}\n\t\t}\n\t}\n`;
     const boxed = `TnCall_${dispatcherSuffix(d.method)}(${['__recv', ...argNames].join(', ')})`;
     const fallback = d.result === '' ? `\t${boxed}\n` : d.result === 'interface{}' ? `\treturn ${boxed}\n` : `\treturn TnAs[${d.result}](${boxed})\n`;
-    out.push(`func TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${mapFast}${fallback}}`);
+    out.push(`var ${icName} atomic.Pointer[tnShapeSlot]\nfunc TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${mapFast}${fallback}}`);
   }
   return out.join('\n\n');
 }
@@ -19674,11 +19784,10 @@ function switchHasOnlyStringCases(node: AstNode): boolean {
   return seen.size > 0;
 }
 
-// A property read whose value is consumed on the spot (see TnGetPeek): code
-// when it is anything but one whole TnGetRef call
-function peekRead(code: string): string {
-  const head = 'TnGetRef(';
-  if (!code.startsWith(head)) return code;
+// Match a single whole call to `fnName(...)` and return its inner argument list
+function unwrapWholeCall(code: string, fnName: string): string | undefined {
+  const head = `${fnName}(`;
+  if (!code.startsWith(head)) return undefined;
   let depth = 0;
   let quote = '';
   for (let i = head.length - 1; i < code.length; i++) {
@@ -19692,10 +19801,192 @@ function peekRead(code: string): string {
       depth++;
     } else if (c === ')') {
       depth--;
-      if (depth === 0) return i === code.length - 1 ? 'TnGetPeek(' + code.substring(head.length) : code;
+      if (depth === 0) return i === code.length - 1 ? code.substring(head.length, i) : undefined;
     }
   }
+  return undefined;
+}
+
+function splitTopLevelTwoArgs(args: string): [string, string] | undefined {
+  let depth = 0;
+  let quote = '';
+  for (let i = 0; i < args.length; i++) {
+    const c = args.charAt(i);
+    if (quote !== '') {
+      if (c === '\\') i++;
+      else if (c === quote) quote = '';
+    } else if (c === '"' || c === '`') {
+      quote = c;
+    } else if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+    } else if (c === ',' && depth === 0) {
+      return [args.substring(0, i).trim(), args.substring(i + 1).trim()];
+    }
+  }
+  return undefined;
+}
+
+// A property read whose value is consumed on the spot (see TnGetPeek): code
+// when it is anything but one whole TnGetRef / TnGetRefIC call
+function peekRead(code: string): string {
+  const ic = unwrapWholeCall(code, 'TnGetRefIC');
+  if (ic !== undefined) return `TnGetPeekIC(${ic})`;
+  const plain = unwrapWholeCall(code, 'TnGetRef');
+  if (plain !== undefined) return `TnGetPeek(${plain})`;
   return code;
+}
+
+function readAsNumber(code: string): string {
+  const ic = unwrapWholeCall(code, 'TnGetRefIC') ?? unwrapWholeCall(code, 'TnGetPeekIC');
+  if (ic !== undefined) return `TnGetNumberIC(${ic})`;
+  return `TnNumber(${peekRead(code)})`;
+}
+
+function readAsFloat(code: string): string {
+  const ic = unwrapWholeCall(code, 'TnGetRefIC') ?? unwrapWholeCall(code, 'TnGetPeekIC');
+  if (ic !== undefined) return `TnGetFloatIC(${ic})`;
+  return `TnAs[float64](${peekRead(code)})`;
+}
+
+function readLength(code: string): string {
+  const ic = unwrapWholeCall(code, 'TnGetRefIC') ?? unwrapWholeCall(code, 'TnGetPeekIC');
+  if (ic !== undefined) return `TnGetLengthIC(${ic})`;
+  return `TnLength(${peekRead(code)})`;
+}
+
+function toDynValExpr(code: string): string | undefined {
+  const ic = unwrapWholeCall(code, 'TnGetRefIC') ?? unwrapWholeCall(code, 'TnGetPeekIC');
+  if (ic !== undefined) return `TnGetValIC(${ic})`;
+  return undefined;
+}
+
+// Split a top-level comma-separated Go argument list into its arguments
+function splitTopLevelArgs(args: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let quote = '';
+  let start = 0;
+  for (let i = 0; i < args.length; i++) {
+    const c = args.charAt(i);
+    if (quote !== '') {
+      if (c === '\\') i++;
+      else if (c === quote) quote = '';
+    } else if (c === '"' || c === '`') {
+      quote = c;
+    } else if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+    } else if (c === ',' && depth === 0) {
+      out.push(args.substring(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const tail = args.substring(start).trim();
+  if (tail !== '') out.push(tail);
+  return out;
+}
+
+// Whether a Go expression contains short-circuiting or nested closures outside strings
+function hasShortCircuitOrClosure(code: string): boolean {
+  let quote = '';
+  for (let i = 0; i < code.length; i++) {
+    const c = code.charAt(i);
+    if (quote !== '') {
+      if (c === '\\') i++;
+      else if (c === quote) quote = '';
+      continue;
+    }
+    if (c === '"' || c === '`') {
+      quote = c;
+      continue;
+    }
+    if ((c === '&' && code.charAt(i + 1) === '&') || (c === '|' && code.charAt(i + 1) === '|')) return true;
+    if (c === 'f' && code.startsWith('func(', i) && (i === 0 || !/[A-Za-z0-9_]/.test(code.charAt(i - 1)))) return true;
+  }
+  return false;
+}
+
+const EXPANDABLE_IC_FUNCS = new Set(['TnGetValIC', 'TnGetPeekIC', 'TnGetNumberIC', 'TnGetFloatIC', 'TnGetLengthIC']);
+
+// Expand unconditionally-evaluated IC property calls into statement-level
+// inlineable tnHit* checks + cold slow-path fallback, preserving exact
+// left-to-right JS evaluation order.
+function expandTopLevelIC(code: string): { pre: string[]; expr: string } {
+  if (!code.includes('IC(') || hasShortCircuitOrClosure(code)) return { pre: [], expr: code };
+  const pre: string[] = [];
+  const rewrite = (s: string): string => {
+    let out = '';
+    let i = 0;
+    let quote = '';
+    while (i < s.length) {
+      const c = s.charAt(i);
+      if (quote !== '') {
+        out += c;
+        if (c === '\\' && i + 1 < s.length) {
+          i++;
+          out += s.charAt(i);
+        } else if (c === quote) {
+          quote = '';
+        }
+        i++;
+        continue;
+      }
+      if (c === '"' || c === '`') {
+        quote = c;
+        out += c;
+        i++;
+        continue;
+      }
+      if (c === 'T' && (i === 0 || !/[A-Za-z0-9_]/.test(s.charAt(i - 1)))) {
+        let j = i;
+        while (j < s.length && /[A-Za-z0-9_]/.test(s.charAt(j))) j++;
+        const fn = s.substring(i, j);
+        if (EXPANDABLE_IC_FUNCS.has(fn) && s.charAt(j) === '(') {
+          const end = goParenEnd(s, j);
+          if (end > j) {
+            const rawArgs = splitTopLevelArgs(s.substring(j + 1, end));
+            if (rawArgs.length === 3) {
+              const objExpr = rewrite(rawArgs[0]);
+              const keyExpr = rawArgs[1];
+              const icExpr = rawArgs[2];
+              const objVar = /^[A-Za-z_][A-Za-z0-9_]*$/.test(objExpr) ? objExpr : getTempName('ico');
+              if (objVar !== objExpr) pre.push(`${objVar} := ${objExpr}`);
+              const vName = getTempName('icv');
+              const okName = getTempName('icok');
+              if (fn === 'TnGetValIC') {
+                const dvName = getTempName('icdv');
+                pre.push(`var ${dvName} tnDynVal`);
+                pre.push(`if ${vName}, ${okName} := tnHitFloat(${objVar}, ${icExpr}); ${okName} { ${dvName} = tnDynVal{num: ${vName}, isNum: true} } else { ${dvName} = tnGetValICSlow(${objVar}, ${keyExpr}, ${icExpr}) }`);
+                out += dvName;
+              } else if (fn === 'TnGetPeekIC') {
+                pre.push(`${vName}, ${okName} := tnHitAny(${objVar}, ${icExpr}); if !${okName} { ${vName} = tnGetPeekICSlow(${objVar}, ${keyExpr}, ${icExpr}) }`);
+                out += vName;
+              } else if (fn === 'TnGetNumberIC') {
+                pre.push(`${vName}, ${okName} := tnHitFloat(${objVar}, ${icExpr}); if !${okName} { ${vName} = tnGetNumberICSlow(${objVar}, ${keyExpr}, ${icExpr}) }`);
+                out += vName;
+              } else if (fn === 'TnGetFloatIC') {
+                pre.push(`${vName}, ${okName} := tnHitFloat(${objVar}, ${icExpr}); if !${okName} { ${vName} = tnGetFloatICSlow(${objVar}, ${keyExpr}, ${icExpr}) }`);
+                out += vName;
+              } else if (fn === 'TnGetLengthIC') {
+                pre.push(`${vName}, ${okName} := tnHitLen(${objVar}, ${icExpr}); if !${okName} { ${vName} = tnGetLengthICSlow(${objVar}, ${keyExpr}, ${icExpr}) }`);
+                out += vName;
+              }
+              i = end + 1;
+              continue;
+            }
+          }
+        }
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  };
+  const expr = rewrite(code);
+  return { pre, expr };
 }
 
 function truthinessCheck(code: string, goType: string | undefined): string {
@@ -19818,7 +20109,7 @@ function visitLogicalExpression(expr: AstNode): string | undefined {
   const resultType = getLogicalValueType(expr);
   const tmp = getTempName('or');
   const leftCode = visit(expr.left);
-  const effectiveLeftType = (leftCode.startsWith('TnIndex(') || leftCode.startsWith('TnGet(') || leftCode.startsWith('TnGetRef(')) ? 'interface{}' : leftType;
+  const effectiveLeftType = (leftCode.startsWith('TnIndex(') || leftCode.startsWith('TnGet(') || leftCode.startsWith('TnGetRef(') || leftCode.startsWith('TnGetRefIC(')) ? 'interface{}' : leftType;
   if (isAnd) {
     const isNilableLeft = !!effectiveLeftType && (effectiveLeftType.startsWith('*') || effectiveLeftType.startsWith('[]') || effectiveLeftType.startsWith('map[') || effectiveLeftType.startsWith('func('));
     const leftValue = resultType === 'interface{}' && NULLABLE_PRIMITIVE_TYPES.includes(effectiveLeftType ?? '') ? `TnPtrValue(${tmp})`
@@ -31674,7 +31965,7 @@ const helperPackages: Record<string, string[]> = {
   toFixed: ['math', 'math/bits', 'strconv', 'strings'],
   dynamicSpread: ['sort'],
   entryPoints: ['os'],
-  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort', 'unsafe'],
+  orderedMap: ['iter', 'encoding/json', 'bytes', 'fmt', 'reflect', 'sort', 'sync', 'sync/atomic', 'unsafe'],
   jsonStringify: ['encoding/json', 'bytes', 'io', 'strings', 'unsafe', 'reflect', 'math', 'fmt', 'sort', 'strconv', 'time', 'sync', 'unicode/utf8'],
   jsonTyped: ['reflect', 'strings', 'strconv', 'sync', 'unsafe', 'unicode/utf8'],
   objectAssign: ['reflect', 'unsafe'],
@@ -33324,6 +33615,9 @@ func tnMapGetStr(m *TnMap[string, interface{}], key string) (interface{}, bool) 
 		keys := m.keys
 		for i := 0; i < len(keys); i++ {
 			if keys[i] == key {
+				if m.isNum&(uint16(1)<<uint(i)) != 0 {
+					return m.nums[i], true
+				}
 				return m.vals[i], true
 			}
 		}
@@ -33341,6 +33635,20 @@ func tnMapGetStr(m *TnMap[string, interface{}], key string) (interface{}, bool) 
 	return v, ok
 }
 
+func tnMapGetStrIC(m *TnMap[string, interface{}], key string, ic *atomic.Pointer[tnShapeSlot]) (interface{}, bool) {
+	if m.shape != nil {
+		if idx := m.shape.find(key); idx >= 0 {
+			ic.Store(&m.shape.slots[idx])
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return m.nums[idx], true
+			}
+			return m.vals[idx], true
+		}
+		return nil, false
+	}
+	return tnMapGetStr(m, key)
+}
+
 func tnIndexKeyStr(s string) bool {
 	if s == "" || s[0] < '0' || s[0] > '9' || len(s) > 10 || (len(s) > 1 && s[0] == '0') {
 		return false
@@ -33355,28 +33663,148 @@ func tnIndexKeyStr(s string) bool {
 	return n < 4294967295
 }
 
-func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
+func tnMapEnsureNums(m *TnMap[string, interface{}], n int) {
+	if len(m.nums) >= n {
+		return
+	}
+	if cap(m.nums) >= n {
+		m.nums = m.nums[:n]
+		return
+	}
+	c := n
+	if c < 4 {
+		c = 4
+	}
+	ns := make([]float64, n, c)
+	copy(ns, m.nums)
+	m.nums = ns
+}
+
+func tnMapSetFloat(m *TnMap[string, interface{}], key string, val float64) {
 	if m.values == nil {
 		keys := m.keys
 		for i, k := range keys {
 			if k == key {
-				m.vals[i] = val
+				tnMapEnsureNums(m, len(keys))
+				mask := uint16(1) << uint(i)
+				if m.isNum&mask == 0 {
+					m.vals[i] = nil
+					m.isNum |= mask
+					m.isASCII &^= mask
+				}
+				m.nums[i] = val
 				return
 			}
 		}
 		if len(keys) < 16 {
+			idx := len(keys)
 			m.keyMode = 1
-			if len(keys) == 0 && cap(keys) == 0 {
-				m.keys = make([]string, 1, 4)
+			if m.jsKind == 0 && (idx == 0 || m.shape != nil) {
+				if idx == 0 {
+					m.shape = tnRootShape.transition(key)
+				} else {
+					m.shape = m.shape.transition(key)
+				}
+				m.keys = m.shape.keys
+				m.indexKeys = m.shape.hasIdx
+			} else {
+				if idx == 0 && cap(keys) == 0 {
+					m.keys = make([]string, 1, 4)
+					m.keys[0] = key
+				} else {
+					m.keys = append(keys, key)
+				}
+				if !m.indexKeys && tnIndexKeyStr(key) {
+					m.indexKeys = true
+				}
+			}
+			if idx == 0 && cap(m.vals) == 0 {
 				m.vals = make([]interface{}, 1, 4)
-				m.keys[0] = key
+			} else {
+				m.vals = append(m.vals, nil)
+			}
+			tnMapEnsureNums(m, idx+1)
+			m.nums[idx] = val
+			m.isNum |= uint16(1) << uint(idx)
+			return
+		}
+		m.keyMode = 1
+		m.promote()
+	}
+	if m.accessors != nil {
+		if a, ok := m.accessors[key]; ok {
+			if a.Set != nil {
+				a.Set(val)
+			}
+			return
+		}
+	}
+	if _, ok := m.values[key]; !ok {
+		m.pushKey(key)
+		if !m.indexKeys && tnIndexKeyStr(key) {
+			m.indexKeys = true
+		}
+	}
+	m.values[key] = val
+}
+
+func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
+	if m.values == nil {
+		if f, ok := val.(float64); ok {
+			tnMapSetFloat(m, key, f)
+			return
+		}
+		isASCII := false
+		if s, ok := val.(string); ok && len(s) < 64 && tnStrIsASCII(s) {
+			isASCII = true
+		}
+		keys := m.keys
+		for i, k := range keys {
+			if k == key {
+				m.vals[i] = val
+				mask := uint16(1) << uint(i)
+				m.isNum &^= mask
+				if isASCII {
+					m.isASCII |= mask
+				} else {
+					m.isASCII &^= mask
+				}
+				return
+			}
+		}
+		if len(keys) < 16 {
+			idx := len(keys)
+			m.keyMode = 1
+			if m.jsKind == 0 && (idx == 0 || m.shape != nil) {
+				if idx == 0 {
+					m.shape = tnRootShape.transition(key)
+				} else {
+					m.shape = m.shape.transition(key)
+				}
+				m.keys = m.shape.keys
+				m.indexKeys = m.shape.hasIdx
+			} else {
+				if idx == 0 && cap(keys) == 0 {
+					m.keys = make([]string, 1, 4)
+					m.keys[0] = key
+				} else {
+					m.keys = append(keys, key)
+				}
+				if !m.indexKeys && tnIndexKeyStr(key) {
+					m.indexKeys = true
+				}
+			}
+			if idx == 0 && cap(m.vals) == 0 {
+				m.vals = make([]interface{}, 1, 4)
 				m.vals[0] = val
 			} else {
-				m.keys = append(keys, key)
 				m.vals = append(m.vals, val)
 			}
-			if !m.indexKeys && tnIndexKeyStr(key) {
-				m.indexKeys = true
+			if isASCII {
+				m.isASCII |= uint16(1) << uint(idx)
+			}
+			if m.nums != nil {
+				tnMapEnsureNums(m, idx+1)
 			}
 			return
 		}
@@ -33398,6 +33826,376 @@ func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
 		}
 	}
 	m.values[key] = val
+}
+
+// Inlineable fast-hit helpers (each under Go's inline budget of 80 so callers
+// inline the monomorphic shape check directly into hot loops).
+func tnHitFloat(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (float64, bool) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			return m.nums[s.idx], true
+		}
+	}
+	return 0, false
+}
+
+func tnHitAny(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (interface{}, bool) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+			return m.vals[s.idx], true
+		}
+	}
+	return nil, false
+}
+
+func tnHitSetFloat(obj interface{}, val float64, ic *atomic.Pointer[tnShapeSlot]) bool {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			m.nums[s.idx] = val
+			return true
+		}
+	}
+	return false
+}
+
+func tnHitLen(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (float64, bool) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			switch t := m.vals[s.idx].(type) {
+			case string:
+				if m.isASCII&s.mask != 0 {
+					return float64(len(t)), true
+				}
+			case []string:
+				return float64(len(t)), true
+			case []interface{}:
+				return float64(len(t)), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// Inline-cached dynamic property reads/writes on shaped *TnMap[string, interface{}] objects
+type tnDynVal struct {
+	num   float64
+	val   interface{}
+	isNum bool
+}
+
+func tnDynValOf(v interface{}) tnDynVal {
+	if f, ok := v.(float64); ok {
+		return tnDynVal{num: f, isNum: true}
+	}
+	return tnDynVal{val: v}
+}
+
+func TnDynamicAddFloatV(a tnDynVal, b tnDynVal) float64 {
+	if a.isNum && b.isNum {
+		return a.num + b.num
+	}
+	return tnDynamicAddFloatVSlow(a, b)
+}
+
+func tnDynamicAddFloatVSlow(a tnDynVal, b tnDynVal) float64 {
+	av, bv := a.val, b.val
+	if a.isNum {
+		av = a.num
+	}
+	if b.isNum {
+		bv = b.num
+	}
+	return TnAs[float64](TnDynamicAdd(av, bv))
+}
+
+func TnGetRefIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+			v := m.vals[s.idx]
+			if _, ok := v.(*TnMap[string, interface{}]); ok {
+				return v
+			}
+		}
+	}
+	return tnGetRefICSlow(obj, key, ic)
+}
+
+func tnGetRefICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		idx := -1
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			idx = int(s.idx)
+		} else if i := m.shape.find(key); i >= 0 {
+			ic.Store(&m.shape.slots[i])
+			idx = i
+		}
+		if idx >= 0 {
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return m.nums[idx]
+			}
+			v := m.vals[idx]
+			switch v.(type) {
+			case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+				return v
+			}
+			if box, boxed := tnBoxSliceRef(v); boxed {
+				m.vals[idx] = box
+				return box
+			}
+			return v
+		}
+	}
+	return TnGetRef(obj, key)
+}
+
+func TnGetPeekIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+			return m.vals[s.idx]
+		}
+	}
+	return tnGetPeekICSlow(obj, key, ic)
+}
+
+func tnGetPeekICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		idx := -1
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			idx = int(s.idx)
+		} else if i := m.shape.find(key); i >= 0 {
+			ic.Store(&m.shape.slots[i])
+			idx = i
+		}
+		if idx >= 0 {
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return m.nums[idx]
+			}
+			return m.vals[idx]
+		}
+	}
+	return TnGetPeek(obj, key)
+}
+
+func TnGetValIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) tnDynVal {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			return tnDynVal{num: m.nums[s.idx], isNum: true}
+		}
+	}
+	return tnGetValICSlow(obj, key, ic)
+}
+
+func tnGetValICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) tnDynVal {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		idx := -1
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			idx = int(s.idx)
+		} else if i := m.shape.find(key); i >= 0 {
+			ic.Store(&m.shape.slots[i])
+			idx = i
+		}
+		if idx >= 0 {
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return tnDynVal{num: m.nums[idx], isNum: true}
+			}
+			return tnDynValOf(m.vals[idx])
+		}
+	}
+	return tnDynValOf(TnGetPeek(obj, key))
+}
+
+func TnGetNumberIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			return m.nums[s.idx]
+		}
+	}
+	return tnGetNumberICSlow(obj, key, ic)
+}
+
+func tnGetNumberICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		idx := -1
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			idx = int(s.idx)
+		} else if i := m.shape.find(key); i >= 0 {
+			ic.Store(&m.shape.slots[i])
+			idx = i
+		}
+		if idx >= 0 {
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return m.nums[idx]
+			}
+			return TnNumber(m.vals[idx])
+		}
+	}
+	return TnNumber(TnGetPeek(obj, key))
+}
+
+func TnGetFloatIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			return m.nums[s.idx]
+		}
+	}
+	return tnGetFloatICSlow(obj, key, ic)
+}
+
+func tnGetFloatICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		idx := -1
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			idx = int(s.idx)
+		} else if i := m.shape.find(key); i >= 0 {
+			ic.Store(&m.shape.slots[i])
+			idx = i
+		}
+		if idx >= 0 {
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return m.nums[idx]
+			}
+			return TnAs[float64](m.vals[idx])
+		}
+	}
+	return TnAs[float64](TnGetPeek(obj, key))
+}
+
+func TnGetLengthIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+			switch t := m.vals[s.idx].(type) {
+			case string:
+				n := len(t)
+				if n == 0 {
+					return 0
+				}
+				if n < 16 {
+					p := unsafe.Pointer(unsafe.StringData(t))
+					if n >= 8 {
+						if (*(*uint64)(p)|*(*uint64)(unsafe.Add(p, n-8)))&0x8080808080808080 == 0 {
+							return float64(n)
+						}
+					} else if n >= 4 {
+						if (*(*uint32)(p)|*(*uint32)(unsafe.Add(p, n-4)))&0x80808080 == 0 {
+							return float64(n)
+						}
+					} else if (t[0]|t[n>>1]|t[n-1]) < 0x80 {
+						return float64(n)
+					}
+				}
+				return float64(tnStrCount(t))
+			case []string:
+				return float64(len(t))
+			case *[]interface{}:
+				if t != nil {
+					return float64(len(*t))
+				}
+				return 0
+			case []interface{}:
+				return float64(len(t))
+			case []float64:
+				return float64(len(t))
+			}
+		}
+	}
+	return tnGetLengthICSlow(obj, key, ic)
+}
+
+func tnGetLengthICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if idx := m.shape.find(key); idx >= 0 {
+			ic.Store(&m.shape.slots[idx])
+			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+				return 0
+			}
+			return TnLength(m.vals[idx])
+		}
+	}
+	return TnLength(TnGetPeek(obj, key))
+}
+
+func TnSetFloatIC(obj interface{}, key string, val float64, ic *atomic.Pointer[tnShapeSlot]) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+			m.nums[s.idx] = val
+			return
+		}
+	}
+	tnSetFloatICSlow(obj, key, val, ic)
+}
+
+func tnSetFloatICSlow(obj interface{}, key string, val float64, ic *atomic.Pointer[tnShapeSlot]) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.jsKind == 0 && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+		if m.shape != nil {
+			if idx := m.shape.find(key); idx >= 0 {
+				tnMapEnsureNums(m, len(m.shape.keys))
+				mask := uint16(1) << uint(idx)
+				if m.isNum&mask == 0 {
+					m.vals[idx] = nil
+					m.isNum |= mask
+					m.isASCII &^= mask
+				}
+				m.nums[idx] = val
+				ic.Store(&m.shape.slots[idx])
+				return
+			}
+		}
+		tnMapSetFloat(m, key, val)
+		if m.shape != nil {
+			if idx := m.shape.find(key); idx >= 0 {
+				ic.Store(&m.shape.slots[idx])
+			}
+		}
+		return
+	}
+	TnSet(obj, key, val)
+}
+
+func TnSetIC(obj interface{}, key string, val interface{}, ic *atomic.Pointer[tnShapeSlot]) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if s := ic.Load(); s != nil && m.shape == s.shape {
+			switch v := val.(type) {
+			case float64:
+				if len(m.nums) > int(s.idx) {
+					if m.isNum&s.mask == 0 {
+						m.vals[s.idx] = nil
+						m.isNum |= s.mask
+						m.isASCII &^= s.mask
+					}
+					m.nums[s.idx] = v
+					return
+				}
+			case nil, bool, *TnMap[string, interface{}], *[]interface{}:
+				m.isNum &^= s.mask
+				m.isASCII &^= s.mask
+				m.vals[s.idx] = val
+				return
+			}
+		}
+	}
+	tnSetICSlow(obj, key, val, ic)
+}
+
+func tnSetICSlow(obj interface{}, key string, val interface{}, ic *atomic.Pointer[tnShapeSlot]) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.jsKind == 0 && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+		switch val.(type) {
+		case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+			tnMapSetStr(m, key, val)
+		default:
+			if box, boxed := tnBoxSliceRef(val); boxed {
+				tnMapSetStr(m, key, box)
+			} else {
+				tnMapSetStr(m, key, val)
+			}
+		}
+		if m.shape != nil {
+			if idx := m.shape.find(key); idx >= 0 {
+				ic.Store(&m.shape.slots[idx])
+			}
+		}
+		return
+	}
+	TnSet(obj, key, val)
 }
 
 func TnGetRef(obj interface{}, key string) interface{} {
@@ -34466,6 +35264,9 @@ var tnAccessorTypes tnTypeSet
 func TnRegisterAccessor(obj interface{}, key string, get func() interface{}, set func(interface{})) {
 	if obj == nil {
 		return
+	}
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		m.promote()
 	}
 	tnAnyAccessors.Store(true)
 	tnAccessorTypes.add(obj)
@@ -38950,6 +39751,9 @@ func TnDefineProperty(obj interface{}, key string, descriptor interface{}) {
 			// (functions and other unhashable keys: only the value case works)
 			return
 		}
+		if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+			m.promote()
+		}
 		tnAccessorTypes.add(obj)
 		props, _ := tnAccessors.LoadOrStore(obj, &sync.Map{})
 		acc := &tnAccessor{}
@@ -41269,10 +42073,73 @@ func tnJSONMarshal(v interface{}) ([]byte, error) {
 // Small maps (<= 8 concrete keys, no accessors/views) stay in flat keys/vals
 // slices (values == nil) with zero Go map allocation or hashing, promoting to
 // values map[K]V on the 9th key or on features that need a hash map.
+// Hidden class (shape) for flat *TnMap[string, interface{}] objects: objects
+// built with the same key insertion order share one immutable key list and
+// support O(1) inline-cached property lookups by slot index.
+type tnShapeSlot struct {
+	shape *tnShape
+	idx   uint16
+	mask  uint16
+}
+
+type tnShape struct {
+	mu     sync.RWMutex
+	keys   []string
+	slots  []tnShapeSlot
+	next   map[string]*tnShape
+	hasIdx bool
+}
+
+var tnRootShape = &tnShape{}
+
+func (sh *tnShape) find(key string) int {
+	for i, k := range sh.keys {
+		if k == key {
+			return i
+		}
+	}
+	return -1
+}
+
+func (sh *tnShape) transition(key string) *tnShape {
+	sh.mu.RLock()
+	child := sh.next[key]
+	sh.mu.RUnlock()
+	if child != nil {
+		return child
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if child = sh.next[key]; child != nil {
+		return child
+	}
+	n := len(sh.keys)
+	keys := make([]string, n+1)
+	copy(keys, sh.keys)
+	keys[n] = key
+	child = &tnShape{
+		keys:   keys,
+		slots:  make([]tnShapeSlot, n+1),
+		hasIdx: sh.hasIdx || tnIndexKeyStr(key),
+	}
+	for i := 0; i <= n; i++ {
+		child.slots[i] = tnShapeSlot{shape: child, idx: uint16(i), mask: uint16(1) << uint(i)}
+	}
+	if sh.next == nil {
+		sh.next = map[string]*tnShape{}
+	}
+	sh.next[key] = child
+	return child
+}
+
 type TnMap[K comparable, V any] struct {
 	keys      []K
 	values    map[K]V
 	vals      []V
+	nums      []float64
+	shape     *tnShape
+	isNum     uint16
+	isASCII   uint16
 	jsKind    uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
 	indexKeys bool  // some key is an array index ("2"): see orderedKeys
 	// a plain object's accessor properties ({ get x() {} }, defineProperty
@@ -41295,15 +42162,28 @@ func (m *TnMap[K, V]) promote() {
 	if m.values != nil {
 		return
 	}
+	if m.shape != nil {
+		ks := make([]K, len(m.keys))
+		copy(ks, m.keys)
+		m.keys = ks
+		m.shape = nil
+	}
 	capHint := len(m.keys) + 4
 	if capHint < 16 {
 		capHint = 16
 	}
 	m.values = make(map[K]V, capHint)
 	for i, k := range m.keys {
-		m.values[m.hk(k)] = m.vals[i]
+		if m.isNum&(uint16(1)<<uint(i)) != 0 {
+			m.values[m.hk(k)] = any(m.nums[i]).(V)
+		} else {
+			m.values[m.hk(k)] = m.vals[i]
+		}
 	}
 	m.vals = nil
+	m.nums = nil
+	m.isNum = 0
+	m.isASCII = 0
 }
 
 // A record view's keys, listed the first time they're needed: sorted (a Go
@@ -41345,6 +42225,9 @@ func (m *TnMap[K, V]) read(k K) (V, bool) {
 		}
 		for i := 0; i < len(m.keys); i++ {
 			if m.keys[i] == k {
+				if m.isNum&(uint16(1)<<uint(i)) != 0 {
+					return any(m.nums[i]).(V), true
+				}
 				return m.vals[i], true
 			}
 		}
@@ -41503,6 +42386,7 @@ func (m *TnMap[K, V]) orderedKeys() []K {
 
 func TnJSCollection[K comparable, V any](m *TnMap[K, V], kind uint8) *TnMap[K, V] {
 	m.jsKind = kind
+	m.shape = nil
 	return m
 }
 
@@ -41585,6 +42469,10 @@ func (m *TnMap[K, V]) TnFill(entries [][]interface{}, convert func(interface{}, 
 
 func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
 	if m.values == nil {
+		if mm, ok := any(m).(*TnMap[string, interface{}]); ok && m.jsKind == 0 {
+			tnMapSetStr(mm, any(k).(string), any(v))
+			return m
+		}
 		if m.keyMode == 0 {
 			m.hkSlow(k)
 		}
@@ -41592,6 +42480,8 @@ func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
 			for i := 0; i < len(m.keys); i++ {
 				if m.keys[i] == k {
 					m.vals[i] = v
+					m.isNum &^= uint16(1) << uint(i)
+					m.isASCII &^= uint16(1) << uint(i)
 					return m
 				}
 			}
@@ -41743,8 +42633,27 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 		}
 		for i := 0; i < len(m.keys); i++ {
 			if m.keys[i] == k {
+				if m.shape != nil {
+					ks := make([]K, len(m.keys))
+					copy(ks, m.keys)
+					m.keys = ks
+					m.shape = nil
+				}
 				m.keys = append(m.keys[:i], m.keys[i+1:]...)
 				m.vals = append(m.vals[:i], m.vals[i+1:]...)
+				if m.nums != nil {
+					m.nums = append(m.nums[:i], m.nums[i+1:]...)
+				}
+				if m.isNum != 0 {
+					lo := m.isNum & ((uint16(1) << uint(i)) - 1)
+					hi := (m.isNum >> uint(i+1)) << uint(i)
+					m.isNum = lo | hi
+				}
+				if m.isASCII != 0 {
+					lo := m.isASCII & ((uint16(1) << uint(i)) - 1)
+					hi := (m.isASCII >> uint(i+1)) << uint(i)
+					m.isASCII = lo | hi
+				}
 				return true
 			}
 		}
@@ -41908,7 +42817,7 @@ func (m *TnMap[K, V]) IsSubsetOf(o *TnMap[K, V]) bool {
 }
 
 func (m *TnMap[K, V]) Clear() {
-	m.keys, m.vals, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, false
+	m.keys, m.vals, m.nums, m.shape, m.isNum, m.isASCII, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, 0, nil, nil, 0, false
 	m.values = nil
 	m.accessors = nil
 	m.hidden = nil
@@ -41970,7 +42879,7 @@ func (m *TnMap[K, V]) UnmarshalJSON(data []byte) error {
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return fmt.Errorf("json: cannot unmarshal %v into an object", tok)
 	}
-	m.keys, m.vals, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, false
+	m.keys, m.vals, m.nums, m.shape, m.isNum, m.isASCII, m.pos, m.dead, m.deadN, m.view = nil, nil, nil, nil, 0, 0, nil, nil, 0, false
 	m.values = nil
 	for dec.More() {
 		tok, err := dec.Token()
@@ -43779,7 +44688,11 @@ func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
 	if m.values == nil {
 		out := make(map[K]V, len(m.keys))
 		for i, k := range m.keys {
-			out[k] = m.vals[i]
+			if m.isNum&(uint16(1)<<uint(i)) != 0 {
+				out[k] = any(m.nums[i]).(V)
+			} else {
+				out[k] = m.vals[i]
+			}
 		}
 		return out
 	}
