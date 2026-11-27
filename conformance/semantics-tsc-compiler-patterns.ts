@@ -299,4 +299,25 @@ const l1 = getFakeLinePos(dynFile, 1).line;
 const l2 = getFakeLinePos(dynFile, 2).line;
 assert(l1 === 3 && l2 === 3 && lineMapComputeCount === 1, 'chained expression call persists struct field write-back on dynamic object');
 
+// 24. Erased generic function returning an array reference with array write-back (moduleNameResolver.ts updateResolutionField)
+interface FakeResolvedCache {
+  failedLookupLocations?: string[];
+}
+function applyResolutionLocations(r: FakeResolvedCache, fl: string[]): FakeResolvedCache {
+  r.failedLookupLocations = updateResolutionFieldLike(r.failedLookupLocations, fl);
+  return r;
+}
+function updateResolutionFieldLike<T>(to: T[] | undefined, value: T[] | undefined): T[] | undefined {
+  if (!value?.length) return to;
+  if (!to?.length) return value;
+  to.push(...value);
+  return to;
+}
+const resCache: FakeResolvedCache = { failedLookupLocations: ['a'] };
+applyResolutionLocations(resCache, ['b', 'c']);
+assert(
+  resCache.failedLookupLocations?.length === 3 && resCache.failedLookupLocations.join(',') === 'a,b,c',
+  'erased generic array-reference return with write-back compiles and preserves elements'
+);
+
 console.log('semantics-tsc-compiler-patterns ok');

@@ -28216,6 +28216,9 @@ function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: stri
           if (rawRet && rawRet !== 'undefined' && rawRet !== 'void' && rawRet !== ':') resultType = rawRet;
         }
       }
+      if (resultType.startsWith('[]') && returnsArrayReference(calledDeclaration(node))) {
+        resultType = `*${resultType}`;
+      }
     }
   }
   if (!resultType) return `func() {\n\t${decls};\n\t${call};\n\t${writes}\n}()`;
