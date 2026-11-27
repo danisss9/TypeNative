@@ -173,3 +173,29 @@ Last run 2026-11-24: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor, N
 | [any-dynamic](any-dynamic.ts) | property reads and writes on `any` objects (nested objects, arrays) | 50.3 / 51.1 | 1598 / 1602 | 31.3x slower |
 
 <!-- perf-results:end -->
+
+## Whole-program case study: `tsc` in Node.js vs TypeNative `tsc` vs TypeScript 7 (`tsgo`)
+
+Micro-benchmarks above isolate single hot paths. For an apples-to-apples whole-program comparison at scale, [examples/tsc/](../examples/tsc/) compiles the full unmodified upstream TypeScript 6.0.3 compiler (81 files, ~178K lines) into a single native Go binary with 23/23 byte-for-byte parity against Node.js. Below is how the same 6 workloads from [examples/tsc/bench.mjs](../examples/tsc/bench.mjs) compare across three runtimes on the same machine:
+
+- **`tsc` in Node.js:** upstream TypeScript `6.0.3` pre-compiled ESM bundle running on Node.js v26.13.0.
+- **TypeNative `tsc`:** the exact same TypeScript `6.0.3` source transpiled automatically to Go by TypeNative 0.7.2 (`45.3 MB` default build, zero compiler logic rewritten).
+- **TypeScript 7 in Go (`tsgo`):** `@typescript/native-preview` `7.0.0-dev.20260707.2` (`tsgo.exe`, `23.4 MB`), Microsoft's hand-written, multi-threaded Go port of TypeScript, invoked directly (without Node's CLI wrapper).
+
+Last run 2026-11-27: Windows_NT 10.0.26300, AMD Ryzen 5 7600 6-Core Processor (12 threads), Node v26.13.0, go1.27.4 windows/amd64, TypeNative 0.7.2. All timings are complete spawn-to-exit process wall times (min / median), interleaved across all three runtimes; every run exited `0`.
+
+| Workload | Node.js `tsc` 6.0.3 (min / median) | TypeNative `tsc` 6.0.3 (min / median) | Go `tsgo` 7.0 (min / median) | TypeNative vs Node | TypeNative vs `tsgo` | `tsgo` vs Node |
+| --- | ---: | ---: | ---: | :--- | :--- | :--- |
+| Cold CLI startup (`tsc --version`, 15 runs) | 179.4 / 183.1 ms | 13.5 / 14.2 ms | 10.3 / 10.5 ms | **12.9x faster** | 1.35x slower | **17.5x faster** |
+| Single-file strict compile (`.js` + `.d.ts` + `.js.map`, 5 runs) | 779.4 / 799.4 ms | 2,672.9 / 2,740.1 ms | 199.6 / 203.7 ms | 3.43x slower | 13.4x slower | **3.92x faster** |
+| Medium project cold build (22 files, 5 runs) | 929.7 / 1,055.8 ms | 3,104.2 / 3,488.4 ms | 224.6 / 250.4 ms | 3.30x slower | 13.9x slower | **4.22x faster** |
+| Medium project incremental warm no-op (5 runs) | 424.4 / 538.9 ms | 741.3 / 795.3 ms | 52.6 / 54.2 ms | 1.48x slower | 14.7x slower | **9.95x faster** |
+| Medium project incremental 1-file edit rebuild (5 runs) | 467.9 / 513.0 ms | 805.3 / 834.0 ms | 52.4 / 52.8 ms | 1.63x slower | 15.8x slower | **9.72x faster** |
+| Large project (`tsc --noEmit` on TypeNative `src/`, ~47K LOC, 3 runs) | 3,439.9 / 3,829.5 ms | 65,988.4 / 66,056.9 ms | 505.3 / 529.1 ms | 17.2x slower | 125x slower | **7.24x faster** |
+
+### Why the gap looks like this
+
+- **Startup:** Both Go binaries avoid V8 initialization and parsing ~10 MB of compiler JS, so TypeNative `tsc` starts **12.9x faster** than Node.js and within **3.7 ms** of `tsgo` (`14.2 ms` vs `10.5 ms`).
+- **Dynamic ASTs and structural types:** Upstream `tsc` 6.0.3 relies heavily on JS's dynamic object model — open AST `Node` shapes with 300+ discriminated-union variants, expando properties (`pos`, `end`, `parent`, `flowNode`), and ad-hoc object literals. V8 optimizes those reads with hidden classes and inline caches; automatic transpilation to Go must preserve full JS semantics via dynamic lookups (`TnGetRef` / `TnGetPeek`), structural conversions (`TnConvertDynamic`), and `interface{}` boxing (see [any-dynamic](any-dynamic.ts) and [union-switch](union-switch.ts) above). That overhead dominates on the ~47K-line `src/transpiler.ts` type-checking graph (`66.1 s` vs `3.83 s`).
+- **Single-threaded JS vs hand-written parallel Go:** `tsc` 6.0.3 (under both Node.js and TypeNative) is strictly single-threaded, whereas `tsgo` was rewritten from scratch in idiomatic Go with compact typed structs, arena-friendly allocations, and multi-core goroutine parallelism across parsing, binding, and checking — achieving **3.9x–10x** over Node.js on project builds and **7.2x** on TypeNative's own `src/`.
+- **Takeaway:** TypeNative delivers a zero-dependency native binary with 100% byte-for-byte `tsc` 6.0.3 compatibility and native CLI startup directly from unmodified TypeScript source, while `tsgo` shows the performance ceiling of a dedicated, multi-threaded Go rewrite that leaves JS's dynamic runtime semantics behind.
