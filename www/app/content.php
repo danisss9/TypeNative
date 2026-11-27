@@ -3,12 +3,13 @@
 declare(strict_types=1);
 
 // Every piece of copy on the site. Numbers come from the repository:
-//   benchmarks  examples/README.md (Node v26.13.0, Go 1.27.4, TypeNative 0.7.0; mongodb-driver: 0.7.1)
+//   benchmarks  examples/README.md (Node v26.13.0, Go 1.27.4, TypeNative 0.7.0; mongodb-driver: 0.7.1; tsc: 0.7.2)
 //   probes      ls conformance/*.ts | wc -l
 //   code        the samples were compiled with TypeNative 0.7.1; outputs are real.
 // Update them together when a release changes the published results.
 
 $benchmarks = [
+    new Benchmark('tsc', 'startup (--version)', '169.3 ms', '13.1 ms', 12.9),
     new Benchmark('yaml-cli', 'per call', '107 ms', '9 ms', 11.3),
     new Benchmark('todo-cli', 'per command', '54.8 ms', '5.4 ms', 10.2),
     new Benchmark('hello-world', 'startup', '45.2 ms', '4.9 ms', 9.2),
@@ -135,7 +136,7 @@ return [
         ['9.2×', 'faster startup than Node.js', 'hello-world: 4.9 ms vs 45.2 ms'],
         ['6.7×', 'less memory for a desktop app', 'desktop-notes: 11 MiB vs 72 MiB'],
         ['1.6×', "Node's HTTP throughput", 'json-server: 94k vs 57k GET req/s'],
-        ['793', 'conformance probes', 'run in CI on Linux, macOS and Windows'],
+        ['794', 'conformance probes', 'run in CI on Linux, macOS and Windows'],
     ],
 
     'features' => [
@@ -157,10 +158,17 @@ return [
     'crossCompile' => '$ npx typenative@latest --source main.ts --output bin/app --target linux/arm64 --release',
 
     'benchmarks' => $benchmarks,
-    'benchmarkScaleMax' => 12.0,
-    'benchmarkEnv' => 'Medians on Windows 11 Pro, AMD Ryzen 5 7600, Node.js v26.13.0, Go 1.27.4, TypeNative 0.7.0 (mongodb-driver: 0.7.1).',
+    'benchmarkScaleMax' => 14.0,
+    'benchmarkEnv' => 'Medians on Windows 11 Pro, AMD Ryzen 5 7600, Node.js v26.13.0, Go 1.27.4, TypeNative 0.7.0 (mongodb-driver: 0.7.1; tsc: 0.7.2).',
 
     'showcase' => [
+        [
+            'name' => 'TypeScript (tsc)',
+            'example' => 'tsc',
+            'text' => 'The full upstream TypeScript 6.0.3 compiler (~178K lines, 81 files): type-checking, emit, <code>.d.ts</code>, incremental, <code>--build</code> and <code>--watch</code>.',
+            'parity' => ['23 / 23', 'end-to-end workloads identical to Node'],
+            'speed' => ['12.9×', 'faster cold CLI startup'],
+        ],
         [
             'name' => 'yaml',
             'example' => 'yaml-cli',
@@ -192,7 +200,7 @@ return [
         [
             'name' => 'React Compiler',
             'example' => 'react-compiler',
-            'text' => '<code>babel-plugin-react-compiler</code> with Babel and zod, about 470 files: the largest codebase TypeNative compiles.',
+            'text' => '<code>babel-plugin-react-compiler</code> with Babel and zod, about 470 files, compiling components to auto-memoized output.',
             'parity' => ['15 / 15', 'parity fixtures identical, errors included'],
             'speed' => ['3.5×', 'faster per file'],
         ],
@@ -273,7 +281,7 @@ return [
         ],
         [
             'Can it compile any TypeScript or npm package?',
-            'It compiles a subset of TypeScript and resolves npm packages from <code>node_modules</code>. Large packages such as yaml, marked, @angular/compiler, the React Compiler and the official MongoDB driver compile into standalone binaries, though TypeNative fits best for CLIs, servers and tools where you control the code. The <a href="' . e(Site::repo('conformance.md')) . '">conformance matrix</a> lists exactly what works.',
+            'It compiles a subset of TypeScript and resolves npm packages from <code>node_modules</code>. Large codebases such as the TypeScript compiler (<code>tsc</code>), yaml, marked, @angular/compiler, the React Compiler and the official MongoDB driver compile into standalone binaries, though TypeNative fits best for CLIs, servers and tools where you control the code. The <a href="' . e(Site::repo('conformance.md')) . '">conformance matrix</a> lists exactly what works.',
         ],
         [
             'Is it always faster than Node.js?',

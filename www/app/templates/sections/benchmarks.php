@@ -94,7 +94,8 @@ $x = static fn (float $ratio): string => number_format(100 * $ratio / $max, 2, '
     <p class="footnote">
       <?= e($c['benchmarkEnv']) ?>
       json-server compares requests per second, so higher is better there too.
-      Float-heavy (mandelbrot-png) and network-bound (openai-chat) work runs close to Node’s speed.
+      Float-heavy (mandelbrot-png) and network-bound (openai-chat) work runs close to Node’s speed;
+      in tsc, cold startup is 12.9× faster while full type-checking is slower than V8 (warm incremental rebuilds are within 1.6×–1.8×).
       <a href="<?= e(Site::repo('examples/')) ?>">Methodology and harnesses</a>.
     </p>
   </div>
