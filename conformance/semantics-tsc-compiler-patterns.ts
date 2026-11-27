@@ -251,4 +251,52 @@ const setC: any = new Set<string>(['x', 'z']);
 assert(sameKeys<string>(setA as MyReadonlyCollection<string>, setB as MyReadonlyCollection<string>), 'ReadonlyCollection sameKeys true');
 assert(!sameKeys<string>(setA as MyReadonlyCollection<string>, setC as MyReadonlyCollection<string>), 'ReadonlyCollection sameKeys false');
 
+// 21. Number() / unary + on hex, binary, and octal strings (scanner.ts numeric literal normalization)
+const hexStr: any = '0x7fffffff';
+const binStr: any = '0b1010';
+const octStr: any = '0o77';
+const badHexStr: any = '0x1p2';
+assert(Number(hexStr) === 2147483647, 'Number("0x7fffffff") === 2147483647');
+assert(+hexStr === 2147483647, '+"0x7fffffff" === 2147483647');
+assert(Number(binStr) === 10, 'Number("0b1010") === 10');
+assert(Number(octStr) === 63, 'Number("0o77") === 63');
+assert(Number.isNaN(Number(badHexStr)), 'Number("0x1p2") is NaN');
+
+// 22. Numeric enum object map entries have typeof === "number" (Object.keys(SyntaxKind) reverse map)
+enum SampleSyntaxKind {
+  Unknown = 0,
+  Identifier = 80,
+  SourceFile = 308,
+}
+const kindReverse: Record<number, string> = {};
+for (const k of Object.keys(SampleSyntaxKind)) {
+  const v = (SampleSyntaxKind as any)[k];
+  if (typeof v === 'number' && kindReverse[v] === undefined) {
+    kindReverse[v] = k;
+  }
+}
+assert(kindReverse[0] === 'Unknown' && kindReverse[80] === 'Identifier' && kindReverse[308] === 'SourceFile', 'enum object map entries are float64 numbers');
+
+// 23. Expression-level struct field write-back persists lazily populated cache fields (getLineAndCharacterOfPosition(file, pos).line)
+interface FakeSourceFileLike {
+  readonly text: string;
+  lineMap?: number[];
+}
+let lineMapComputeCount = 0;
+function getFakeLineStarts(sf: FakeSourceFileLike): number[] {
+  if (!sf.lineMap) {
+    lineMapComputeCount++;
+    sf.lineMap = [0, 5, 10];
+  }
+  return sf.lineMap;
+}
+function getFakeLinePos(sf: FakeSourceFileLike, pos: number): { line: number; col: number } {
+  const starts = getFakeLineStarts(sf);
+  return { line: starts.length, col: pos };
+}
+const dynFile: any = { text: 'hello\nworld\n!', kind: 308 };
+const l1 = getFakeLinePos(dynFile, 1).line;
+const l2 = getFakeLinePos(dynFile, 2).line;
+assert(l1 === 3 && l2 === 3 && lineMapComputeCount === 1, 'chained expression call persists struct field write-back on dynamic object');
+
 console.log('semantics-tsc-compiler-patterns ok');

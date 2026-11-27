@@ -3744,10 +3744,15 @@ function typeNodeToText(node) {
 }
 
 // Iterates the child nodes of a normalized JSON AST node (own enumerable
+const AST_PRIMITIVE_KEYS = new Set([
+    'kind', 'text', 'parent', 'line', 'column', 'endLine', 'endColumn',
+    'operator', 'token', 'declarationKind', 'rawText', 'hasTrailingComma', 'isTypeOnly'
+]);
+
 function childNodes(node) {
     const out: any[] = [];
     for (const key of Object.keys(node ?? {})) {
-        if (key === 'kind' || key === 'text' || key === 'parent')
+        if (AST_PRIMITIVE_KEYS.has(key))
             continue;
         const v = node[key];
         if (v && typeof v === 'object' && typeof v.kind === 'string') {
@@ -3858,6 +3863,10 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   nullableArrayCache.clear();
   declaredVariables.clear();
   arrayReferenceCache.clear();
+  mutatedCallResultsCache.clear();
+  usesArgumentsCache.clear();
+  mutatesArrayParamCache.clear();
+  mutatesParamFieldsCache.clear();
   declaredInterfaces.clear();
   interfacesByOriginalName.clear();
   declaredTypeAliases.clear();
@@ -4138,7 +4147,7 @@ export function transpileToNative(code: string, options?: TranspileOptions): Tra
   let helpersCode = emitGoHelpers() + coverageCode + dispatchCode + classCode;
   if (propICCount > 0) {
     importedPackages.add('sync/atomic');
-    helpersCode += `\n\nvar __tnICs [${propICCount}]atomic.Pointer[tnShapeSlot]`;
+    helpersCode += `\n\nvar __tnICs [${propICCount}]tnPIC`;
   }
   // Object literal allocations: TnLit where the struct may be a strict prefix
   // of a merged union the program converts objects to, else plain
@@ -13797,10 +13806,10 @@ function emitTypedDispatchers(): string {
     const body = cases.length > 0 ? `\tswitch o := __recv.(type) {\n${cases.join('\n')}\n\t}\n` : '';
     const fnType = `func(${d.params.join(', ')})${d.result ? ` ${d.result}` : ''}`;
     const icName = `__tnCallIC_${name}`;
-    const mapFast = `\tif __m, __ok := __recv.(*TnMap[string, interface{}]); __ok && __m != nil {\n\t\tvar __fn interface{}\n\t\tvar __has bool\n\t\tif __s := ${icName}.Load(); __s != nil && __m.shape == __s.shape {\n\t\t\t__fn, __has = __m.vals[__s.idx], true\n\t\t} else {\n\t\t\t__fn, __has = tnMapGetStrIC(__m, ${toGoStringLiteral(d.method)}, &${icName})\n\t\t}\n\t\tif __has {\n\t\t\tif __f, __ok := __fn.(${fnType}); __ok && __f != nil {\n\t\t\t\t${d.result ? `return __f(${argNames.join(', ')})` : `__f(${argNames.join(', ')})\n\t\t\t\treturn`}\n\t\t\t}\n\t\t}\n\t}\n`;
+    const mapFast = `\tif __m, __ok := __recv.(*TnMap[string, interface{}]); __ok && __m != nil {\n\t\tvar __fn interface{}\n\t\tvar __has bool\n\t\tif __s := ${icName}.find(__m.shape); __s != nil {\n\t\t\t__fn, __has = __m.vals[__s.idx], true\n\t\t} else {\n\t\t\t__fn, __has = tnMapGetStrIC(__m, ${toGoStringLiteral(d.method)}, &${icName})\n\t\t}\n\t\tif __has {\n\t\t\tif __f, __ok := __fn.(${fnType}); __ok && __f != nil {\n\t\t\t\t${d.result ? `return __f(${argNames.join(', ')})` : `__f(${argNames.join(', ')})\n\t\t\t\treturn`}\n\t\t\t}\n\t\t}\n\t}\n`;
     const boxed = `TnCall_${dispatcherSuffix(d.method)}(${['__recv', ...argNames].join(', ')})`;
     const fallback = d.result === '' ? `\t${boxed}\n` : d.result === 'interface{}' ? `\treturn ${boxed}\n` : `\treturn TnAs[${d.result}](${boxed})\n`;
-    out.push(`var ${icName} atomic.Pointer[tnShapeSlot]\nfunc TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${mapFast}${fallback}}`);
+    out.push(`var ${icName} tnPIC\nfunc TnCall_${name}(${['__recv interface{}', ...params].join(', ')})${d.result ? ` ${d.result}` : ''} {\n${body}${mapFast}${fallback}}`);
   }
   return out.join('\n\n');
 }
@@ -15390,8 +15399,22 @@ function hasNonIdentifierKeys(node: AstNode): boolean {
 }
 
 function containsNode(root: AstNode, predicate: (n: AstNode) => boolean): boolean {
-  for (const child of childNodes(root)) {
-    if (predicate(child) || containsNode(child, predicate)) return true;
+  if (!root || typeof root !== 'object') return false;
+  for (const key of Object.keys(root)) {
+    if (AST_PRIMITIVE_KEYS.has(key)) continue;
+    const v = root[key];
+    if (v && typeof v === 'object') {
+      if (typeof v.kind === 'string') {
+        if (predicate(v) || containsNode(v, predicate)) return true;
+      } else if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) {
+          const el = v[i];
+          if (el && typeof el === 'object' && typeof el.kind === 'string') {
+            if (predicate(el) || containsNode(el, predicate)) return true;
+          }
+        }
+      }
+    }
   }
   return false;
 }
@@ -17303,6 +17326,25 @@ function sanitizeInferredTypeForScope(goType: string | undefined, scopeNode: Ast
   return goType;
 }
 
+const mutatedCallResultsCache = new Map<AstNode, Set<string>>();
+
+function getMutatedCallResults(parent: AstNode): Set<string> {
+  let set = mutatedCallResultsCache.get(parent);
+  if (set) return set;
+  set = new Set<string>();
+  containsNode(parent, (n) => {
+    if (isPropertyAccessExpression(n) && MUTATING_ARRAY_METHODS.has(n.name.text)) {
+      const target = unwrapParentheses(n.expression);
+      if (isCallExpression(target) && isIdentifier(target.expression)) {
+        set!.add(target.expression.text);
+      }
+    }
+    return false;
+  });
+  mutatedCallResultsCache.set(parent, set);
+  return set;
+}
+
 function inferFunctionBodyReturnType(
   node: AstNode | AstNode | AstNode
 ): string | undefined {
@@ -17349,22 +17391,7 @@ function inferFunctionBodyReturnType(
           isReferenceArrayTarget(s.expression) || !!extractLazyInitArrayTarget(s.expression)
         );
         if (allRefArrays) {
-          const fnName = node.name.text;
-          let resultMutated = false;
-          containsNode(node.parent, (n) => {
-            if (
-              isPropertyAccessExpression(n) &&
-              MUTATING_ARRAY_METHODS.has(n.name.text) &&
-              isCallExpression(unwrapParentheses(n.expression)) &&
-              isIdentifier(unwrapParentheses(n.expression).expression) &&
-              unwrapParentheses(n.expression).expression.text === fnName
-            ) {
-              resultMutated = true;
-              return true;
-            }
-            return false;
-          });
-          if (resultMutated) return `*${distinct[0]}`;
+          if (getMutatedCallResults(node.parent).has(node.name.text)) return `*${distinct[0]}`;
         }
       }
       return returnsNil ? makeNullableType(types[0]) : types[0];
@@ -22338,14 +22365,11 @@ function enumObjectDecl(node: AstNode, enumName: string, members: string[]): str
   if (inPlaceEnum) return '';
   const entries = members
     .map((m) => {
-      const name = m.slice(m.indexOf('	') + 1, m.indexOf(' '));
-      const value = m.slice(m.indexOf('=') + 1).trim();
-      // strip the enum conversion wrapper: Dir(0) → 0 (numeric enums are
-      // plain float64 constants with no named Go type)
-      const plain = value.startsWith(`${enumName}(`) && value.endsWith(')')
-        ? value.slice(enumName.length + 1, -1)
-        : value;
-      return `.Set(${toGoStringLiteral(name.slice(enumName.length + 1))}, ${plain})`;
+      const name = m.slice(m.indexOf('\t') + 1, m.indexOf(' '));
+      // Use the declared typed member constant/variable (float64 for numeric
+      // enums, string for string enums) so untyped integer literals aren't
+      // boxed as Go int inside the interface{} map.
+      return `.Set(${toGoStringLiteral(name.slice(enumName.length + 1))}, ${name})`;
     })
     .join('');
   // (in declaration order, as Object.keys(Enum) lists them)
@@ -28039,12 +28063,32 @@ let callWriteBacks: { call: AstNode; items: { tmp: string; converted: string; ta
 // callee changes in place: after the call their elements are copied back into
 // the caller's array (JS arrays are shared: retainWhere(array, â€¦) truncates
 // the caller's array too)
-let arrayCallWriteBacks: { tmp: string; converted: string; reference: string; elementType: string }[] | undefined;
+let arrayCallWriteBacks: { tmp: string; converted: string; reference: string; elementType: string; origTmp?: string; origExpr?: string }[] | undefined;
+
+const mutatesArrayParamCache = new Map<AstNode, Map<string, boolean>>();
+const mutatesParamFieldsCache = new Map<AstNode, Map<string, boolean>>();
 
 // Whether a function changes the array its parameter `name` names in place
-// (push and the other mutators, a length assignment, an element write) â€” or
+// (push and the other mutators, a length assignment, an element write) — or
 // passes the array on to another function that does
-function mutatesArrayParameter(fn: AstNode, name: string, passedOn = new WeakSet<AstNode>()): boolean {
+function mutatesArrayParameter(fn: AstNode, name: string, followCallees = false, passedOn = new Set<AstNode>()): boolean {
+  const topLevel = passedOn.size === 0;
+  const cacheKey = followCallees ? `${name}\0f` : name;
+  if (topLevel) {
+    const cached = mutatesArrayParamCache.get(fn)?.get(cacheKey);
+    if (cached !== undefined) return cached;
+  }
+  const cacheAndReturn = (res: boolean): boolean => {
+    if (topLevel) {
+      let m = mutatesArrayParamCache.get(fn);
+      if (!m) {
+        m = new Map<string, boolean>();
+        mutatesArrayParamCache.set(fn, m);
+      }
+      m.set(cacheKey, res);
+    }
+    return res;
+  };
   const rootIsParam = (n: AstNode): boolean => {
     let u = unwrapParentheses(n);
     while (isPropertyAccessExpression(u) || isElementAccessExpression(u) || u.kind === 'NonNullExpression') u = unwrapParentheses(u.expression);
@@ -28070,16 +28114,28 @@ function mutatesArrayParameter(fn: AstNode, name: string, passedOn = new WeakSet
     if (isCallExpression(n) && !isPropertyAccessExpression(n.expression) && !isCallExpression(n.expression)) calls.push(n);
     return false;
   });
-  if (local) return true;
+  if (local) return cacheAndReturn(true);
   if (passedOn.has(fn)) return false;
   passedOn.add(fn);
-  // (the array handed to another call: that function may change it)
+  // (the array handed to another call: follow known callees so readonly helpers
+  // like binarySearch → binarySearchKeyWith don't trigger slice write-backs)
   for (const call of calls) {
-    for (const arg of call.arguments ?? []) {
-      if (isIdentifier(unwrapParentheses(arg)) && unwrapParentheses(arg).text === name) return true;
+    const callArgs: AstNode[] = call.arguments ?? [];
+    for (let i = 0; i < callArgs.length; i++) {
+      const u = unwrapParentheses(callArgs[i]);
+      if (!isIdentifier(u) || u.text !== name) continue;
+      if (followCallees && isIdentifier(call.expression)) {
+        const callee = declaredFunctions.get(call.expression.text);
+        const calleeParam = callee?.parameters?.[i];
+        if (callee?.body && calleeParam && isIdentifier(calleeParam.name)) {
+          if (mutatesArrayParameter(callee, calleeParam.name.text, true, passedOn)) return cacheAndReturn(true);
+          continue;
+        }
+      }
+      return cacheAndReturn(true);
     }
   }
-  return false;
+  return cacheAndReturn(false);
 }
 
 // Whether a function changes the Map / Set its parameter `name` names (set,
@@ -28125,17 +28181,43 @@ function arrayWriteBackOf(node: AstNode, paramType: string): { reference: string
   return undefined;
 }
 
-// A call whose array arguments were converted copies: the callee's changes to
-// them are copied back into the caller's arrays after it returns
-function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: string; converted: string; reference: string; elementType: string }[]): string {
+// A call whose array/map/struct arguments were converted copies: the callee's
+// changes to them are copied back into the caller's values after it returns
+function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: string; converted: string; reference: string; elementType: string; origTmp?: string; origExpr?: string }[]): string {
   useHelper('dynamic');
-  useHelper('arraySubclass');
-  const decls = backs.map((b) => `${b.tmp} := ${b.converted}`).join(';\n\t');
+  if (backs.some((b) => b.elementType !== '__fields__')) useHelper('arraySubclass');
+  const decls = backs
+    .map((b) => (b.origTmp ? `${b.origTmp} := ${b.origExpr};\n\t${b.tmp} := ${b.converted}` : `${b.tmp} := ${b.converted}`))
+    .join(';\n\t');
   // (a map's entry — no element type —: its contents copied back)
   if (backs.some((b) => b.elementType === '')) useHelper('mapAssign');
-  const writes = backs.map((b) => b.elementType === '' ? `TnMapAssign(${b.reference}, ${b.tmp})` : `if ${b.reference} != nil && ${b.tmp} != nil { (*${b.reference}) = TnSliceAs[${b.elementType}](*${b.tmp}) }`).join(';\n\t');
-  const type = inferExpressionType(node) ?? '';
-  const resultType = type && type !== 'undefined' && type !== 'void' && type !== ':' ? type : '';
+  const writes = backs
+    .map((b) =>
+      b.elementType === '__fields__'
+        ? `TnCopyFieldsBack(${b.reference}, ${b.tmp})`
+        : b.elementType === ''
+          ? `TnMapAssign(${b.reference}, ${b.tmp})`
+          : `if ${b.reference} != nil && ${b.tmp} != nil { (*${b.reference}) = TnSliceAs[${b.elementType}](*${b.tmp}) }`
+    )
+    .join(';\n\t');
+  let resultType = '';
+  if (!isVoidCall(node)) {
+    const type = inferExpressionType(node) ?? '';
+    resultType = type && type !== 'undefined' && type !== 'void' && type !== ':' ? type : '';
+    // (a generic callee whose return type was erased to interface{} returns
+    // interface{} in Go even when inferExpressionType instantiates T at the call site)
+    if (resultType && resultType !== 'interface{}' && !call.startsWith('TnAs[')) {
+      const callee = getCalleeSignature(node);
+      if (callee && callee.type && (callee.typeParameters ?? []).length > 0) {
+        const erased = erasedFunctionTypeParameters(callee);
+        const hasErased = (n: AstNode) => isTypeReferenceNode(n) && isIdentifier(n.typeName) && erased.has(n.typeName.text);
+        if (erased.size > 0 && (hasErased(callee.type) || containsNode(callee.type, hasErased))) {
+          const rawRet = getType(callee.type);
+          if (rawRet && rawRet !== 'undefined' && rawRet !== 'void' && rawRet !== ':') resultType = rawRet;
+        }
+      }
+    }
+  }
   if (!resultType) return `func() {\n\t${decls};\n\t${call};\n\t${writes}\n}()`;
   return `func() ${resultType} {\n\t${decls};\n\t__wbResult := ${call};\n\t${writes};\n\treturn __wbResult\n}()`;
 }
@@ -28145,6 +28227,17 @@ function wrapArrayCallWriteBacks(node: AstNode, call: string, backs: { tmp: stri
 // passes the object on to another function that does (a parser handing its
 // state object down: parseSubscript(…, state) → parseCoverCallAndAsyncArrowHead(…, state))
 function mutatesParameterFields(fn: AstNode, name: string, passedOn = new WeakSet<AstNode>()): boolean {
+  const cached = mutatesParamFieldsCache.get(fn)?.get(name);
+  if (cached !== undefined) return cached;
+  const cacheAndReturn = (res: boolean): boolean => {
+    let m = mutatesParamFieldsCache.get(fn);
+    if (!m) {
+      m = new Map<string, boolean>();
+      mutatesParamFieldsCache.set(fn, m);
+    }
+    m.set(name, res);
+    return res;
+  };
   const rootIsParam = (n: AstNode): boolean => {
     let u = unwrapParentheses(n);
     while (isPropertyAccessExpression(u) || isElementAccessExpression(u) || u.kind === 'NonNullExpression') u = unwrapParentheses(u.expression);
@@ -28166,7 +28259,7 @@ function mutatesParameterFields(fn: AstNode, name: string, passedOn = new WeakSe
     if (isCallExpression(n) && !isCallExpression(n.expression)) calls.push(n);
     return false;
   });
-  if (local) return true;
+  if (local) return cacheAndReturn(true);
   if (passedOn.has(fn)) return false;
   passedOn.add(fn);
   // (a parameter handed to another call — a method especially, whose body is
@@ -28177,10 +28270,10 @@ function mutatesParameterFields(fn: AstNode, name: string, passedOn = new WeakSe
   for (const call of calls) {
     const args: AstNode[] = call.arguments ?? [];
     for (const arg of args) {
-      if (isIdentifier(arg) && arg.text === name) return true;
+      if (isIdentifier(arg) && arg.text === name) return cacheAndReturn(true);
     }
   }
-  return false;
+  return cacheAndReturn(false);
 }
 
 function visitCallArguments(node: AstNode): string[] {
@@ -28360,7 +28453,7 @@ function visitCallArguments(node: AstNode): string[] {
     // (an array converted to the parameter's elements: the callee changes it
     // in place — the copy's elements are copied back after the call, as a JS
     // array handed to retainWhere(array, â€¦) is truncated for the caller too)
-    if (arrayCallWriteBacks && !isSpreadElement(arg) && paramType.startsWith('*[]') && isIdentifier(param.name) && fn.body && mutatesArrayParameter(fn, param.name.text)) {
+    if (arrayCallWriteBacks && !isSpreadElement(arg) && paramType.startsWith('*[]') && isIdentifier(param.name) && fn.body && mutatesArrayParameter(fn, param.name.text, true)) {
       const back = arrayWriteBackOf(arg, paramType);
       if (back) {
         const tmp = getTempName('wb');
@@ -28378,23 +28471,32 @@ function visitCallArguments(node: AstNode): string[] {
         return tmp;
       }
     }
-    // (a converted copy the function changes: written back after the call)
-    if (callWriteBacks && callWriteBacks.call === node && (converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && !isSpreadElement(arg) && paramType.startsWith('*') && (isObjectTypeName(paramType.slice(1)) || paramType.slice(1).startsWith('struct{')) && isIdentifier(param.name) && fn.body && mutatesParameterFields(fn, param.name.text)) {
-      const tmp = getTempName('wb');
-      if (identifierOfCastArgument(arg)) {
-        callWriteBacks.items.push({ tmp, converted, target: visit(arg) });
-        return tmp;
-      }
-      const argU = unwrapParentheses(arg);
-      if (!isNilLiteral(argU) && !isObjectLiteralExpression(argU)) {
-        const origExpr = visit(arg);
-        if (origExpr !== 'nil') {
-          const origTmp = getTempName('wbo');
-          const convertedFromOrig = converted.startsWith('TnAsPtr[')
-            ? `TnAsPtr[${paramType.slice(1)}](${origTmp})`
-            : `TnAs[${paramType}](${origTmp})`;
-          callWriteBacks.items.push({ tmp, converted: convertedFromOrig, target: origTmp, origTmp, origExpr });
+    // (a converted copy the function changes: written back after the call —
+    // statement-level calls use callWriteBacks; nested expression calls like
+    // getLineAndCharacterOfPosition(file, pos).line use arrayCallWriteBacks so
+    // lazily populated cache fields such as file.lineMap persist on the caller)
+    if ((converted.startsWith('TnAs[') || converted.startsWith('TnAsPtr[')) && !isSpreadElement(arg) && paramType.startsWith('*') && (isObjectTypeName(paramType.slice(1)) || paramType.slice(1).startsWith('struct{')) && isIdentifier(param.name) && fn.body && mutatesParameterFields(fn, param.name.text)) {
+      const useStmt = !!(callWriteBacks && callWriteBacks.call === node);
+      if (useStmt || arrayCallWriteBacks) {
+        const tmp = getTempName('wb');
+        if (identifierOfCastArgument(arg)) {
+          const target = visit(arg);
+          if (useStmt) callWriteBacks!.items.push({ tmp, converted, target });
+          else arrayCallWriteBacks!.push({ tmp, converted, reference: target, elementType: '__fields__' });
           return tmp;
+        }
+        const argU = unwrapParentheses(arg);
+        if (!isNilLiteral(argU) && !isObjectLiteralExpression(argU)) {
+          const origExpr = visit(arg);
+          if (origExpr !== 'nil') {
+            const origTmp = getTempName('wbo');
+            const convertedFromOrig = converted.startsWith('TnAsPtr[')
+              ? `TnAsPtr[${paramType.slice(1)}](${origTmp})`
+              : `TnAs[${paramType}](${origTmp})`;
+            if (useStmt) callWriteBacks!.items.push({ tmp, converted: convertedFromOrig, target: origTmp, origTmp, origExpr });
+            else arrayCallWriteBacks!.push({ tmp, converted: convertedFromOrig, reference: origTmp, elementType: '__fields__', origTmp, origExpr });
+            return tmp;
+          }
         }
       }
     }
@@ -28601,17 +28703,26 @@ function withArgumentsObject(fn: AstNode, info: FunctionParametersInfo, allowExt
 }
 
 // A non-arrow function whose own body reads `arguments` (arrows see their parent's)
+const usesArgumentsCache = new Map<AstNode, boolean>();
+
 function usesArgumentsObject(fn: AstNode): boolean {
   if (isArrowFunction(fn) || !fn.body) return false;
+  const cached = usesArgumentsCache.get(fn);
+  if (cached !== undefined) return cached;
   // (a parameter's default may read it too)
   // ({ noNewArrows = !arguments[0]?.specCompliant } = {}: a destructured element's too)
   const inDefaults = (fn.parameters ?? []).some((p: AstNode) =>
     containsNode(p, (n: AstNode) => isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n)));
-  if (inDefaults) return true;
-  return containsNode(fn.body, (n) => {
+  if (inDefaults) {
+    usesArgumentsCache.set(fn, true);
+    return true;
+  }
+  const result = containsNode(fn.body, (n) => {
     if (n !== fn.body && (isFunctionDeclaration(n) || isFunctionExpression(n) || isMethodDeclaration(n))) return false;
     return isIdentifier(n) && n.text === 'arguments' && !isFieldNameIdentifier(n);
   });
+  usesArgumentsCache.set(fn, result);
+  return result;
 }
 
 // Destructured parameters ({ a, b }: T / [x, y]: T[]) get a temporary name
@@ -33610,13 +33721,47 @@ func tnPlainValue(v interface{}) interface{} {
 // Concrete non-generic lookup/store on *TnMap[string, interface{}]: Go compiles
 // m.keys[i] == key to direct inline length+pointer compares instead of an
 // indirect dictionary equal call on generic K comparable.
+var tnSmallFloats = func() [512]interface{} {
+	var a [512]interface{}
+	for i := range a {
+		a[i] = float64(i)
+	}
+	return a
+}()
+
+var tnZeroFloat64Val interface{} = float64(0)
+var tnFloat64TypePtr = (*[2]unsafe.Pointer)(unsafe.Pointer(&tnZeroFloat64Val))[0]
+
+func tnBoxFloat(f float64) interface{} {
+	if i := int(f); i >= 0 && i < len(tnSmallFloats) && float64(i) == f && (i != 0 || 1/f > 0) {
+		return tnSmallFloats[i]
+	}
+	return f
+}
+
+func tnPeekFloat(p *float64) interface{} {
+	var v interface{}
+	e := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+	e[0], e[1] = tnFloat64TypePtr, unsafe.Pointer(p)
+	return v
+}
+
 func tnMapGetStr(m *TnMap[string, interface{}], key string) (interface{}, bool) {
 	if m.values == nil {
+		if m.shape != nil && m.shape.idxMap != nil {
+			if idx, ok := m.shape.idxMap[key]; ok {
+				if m.isNum&(uint32(1)<<uint(idx)) != 0 {
+					return tnBoxFloat(m.nums[idx]), true
+				}
+				return m.vals[idx], true
+			}
+			return nil, false
+		}
 		keys := m.keys
 		for i := 0; i < len(keys); i++ {
 			if keys[i] == key {
-				if m.isNum&(uint16(1)<<uint(i)) != 0 {
-					return m.nums[i], true
+				if m.isNum&(uint32(1)<<uint(i)) != 0 {
+					return tnBoxFloat(m.nums[i]), true
 				}
 				return m.vals[i], true
 			}
@@ -33635,12 +33780,12 @@ func tnMapGetStr(m *TnMap[string, interface{}], key string) (interface{}, bool) 
 	return v, ok
 }
 
-func tnMapGetStrIC(m *TnMap[string, interface{}], key string, ic *atomic.Pointer[tnShapeSlot]) (interface{}, bool) {
+func tnMapGetStrIC(m *TnMap[string, interface{}], key string, ic *tnPIC) (interface{}, bool) {
 	if m.shape != nil {
 		if idx := m.shape.find(key); idx >= 0 {
-			ic.Store(&m.shape.slots[idx])
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
-				return m.nums[idx], true
+			ic.store(&m.shape.slots[idx])
+			if m.isNum&(uint32(1)<<uint(idx)) != 0 {
+				return tnBoxFloat(m.nums[idx]), true
 			}
 			return m.vals[idx], true
 		}
@@ -33683,10 +33828,10 @@ func tnMapEnsureNums(m *TnMap[string, interface{}], n int) {
 func tnMapSetFloat(m *TnMap[string, interface{}], key string, val float64) {
 	if m.values == nil {
 		keys := m.keys
-		for i, k := range keys {
-			if k == key {
+		if m.shape != nil && m.shape.idxMap != nil {
+			if i, ok := m.shape.idxMap[key]; ok {
 				tnMapEnsureNums(m, len(keys))
-				mask := uint16(1) << uint(i)
+				mask := uint32(1) << uint(i)
 				if m.isNum&mask == 0 {
 					m.vals[i] = nil
 					m.isNum |= mask
@@ -33695,8 +33840,22 @@ func tnMapSetFloat(m *TnMap[string, interface{}], key string, val float64) {
 				m.nums[i] = val
 				return
 			}
+		} else {
+			for i, k := range keys {
+				if k == key {
+					tnMapEnsureNums(m, len(keys))
+					mask := uint32(1) << uint(i)
+					if m.isNum&mask == 0 {
+						m.vals[i] = nil
+						m.isNum |= mask
+						m.isASCII &^= mask
+					}
+					m.nums[i] = val
+					return
+				}
+			}
 		}
-		if len(keys) < 16 {
+		if len(keys) < 32 {
 			idx := len(keys)
 			m.keyMode = 1
 			if m.jsKind == 0 && (idx == 0 || m.shape != nil) {
@@ -33725,7 +33884,7 @@ func tnMapSetFloat(m *TnMap[string, interface{}], key string, val float64) {
 			}
 			tnMapEnsureNums(m, idx+1)
 			m.nums[idx] = val
-			m.isNum |= uint16(1) << uint(idx)
+			m.isNum |= uint32(1) << uint(idx)
 			return
 		}
 		m.keyMode = 1
@@ -33759,10 +33918,10 @@ func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
 			isASCII = true
 		}
 		keys := m.keys
-		for i, k := range keys {
-			if k == key {
+		if m.shape != nil && m.shape.idxMap != nil {
+			if i, ok := m.shape.idxMap[key]; ok {
 				m.vals[i] = val
-				mask := uint16(1) << uint(i)
+				mask := uint32(1) << uint(i)
 				m.isNum &^= mask
 				if isASCII {
 					m.isASCII |= mask
@@ -33771,8 +33930,22 @@ func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
 				}
 				return
 			}
+		} else {
+			for i, k := range keys {
+				if k == key {
+					m.vals[i] = val
+					mask := uint32(1) << uint(i)
+					m.isNum &^= mask
+					if isASCII {
+						m.isASCII |= mask
+					} else {
+						m.isASCII &^= mask
+					}
+					return
+				}
+			}
 		}
-		if len(keys) < 16 {
+		if len(keys) < 32 {
 			idx := len(keys)
 			m.keyMode = 1
 			if m.jsKind == 0 && (idx == 0 || m.shape != nil) {
@@ -33801,7 +33974,7 @@ func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
 				m.vals = append(m.vals, val)
 			}
 			if isASCII {
-				m.isASCII |= uint16(1) << uint(idx)
+				m.isASCII |= uint32(1) << uint(idx)
 			}
 			if m.nums != nil {
 				tnMapEnsureNums(m, idx+1)
@@ -33828,29 +34001,42 @@ func tnMapSetStr(m *TnMap[string, interface{}], key string, val interface{}) {
 	m.values[key] = val
 }
 
-// Inlineable fast-hit helpers (each under Go's inline budget of 80 so callers
-// inline the monomorphic shape check directly into hot loops).
-func tnHitFloat(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (float64, bool) {
+// Inlineable fast-hit helpers (each under Go's inline budget so callers
+// inline the 1-2 shape check directly into hot loops).
+func tnHitFloat(obj interface{}, ic *tnPIC) (float64, bool) {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+		sh := m.shape
+		if s := ic.s0.Load(); s != nil && sh == s.shape && m.isNum&s.mask != 0 {
+			return m.nums[s.idx], true
+		}
+		if s := ic.s1.Load(); s != nil && sh == s.shape && m.isNum&s.mask != 0 {
 			return m.nums[s.idx], true
 		}
 	}
 	return 0, false
 }
 
-func tnHitAny(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (interface{}, bool) {
+func tnHitAny(obj interface{}, ic *tnPIC) (interface{}, bool) {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+		sh := m.shape
+		if s := ic.s0.Load(); s != nil && sh == s.shape && m.isNum&s.mask == 0 {
+			return m.vals[s.idx], true
+		}
+		if s := ic.s1.Load(); s != nil && sh == s.shape && m.isNum&s.mask == 0 {
 			return m.vals[s.idx], true
 		}
 	}
 	return nil, false
 }
 
-func tnHitSetFloat(obj interface{}, val float64, ic *atomic.Pointer[tnShapeSlot]) bool {
+func tnHitSetFloat(obj interface{}, val float64, ic *tnPIC) bool {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+		sh := m.shape
+		if s := ic.s0.Load(); s != nil && sh == s.shape && m.isNum&s.mask != 0 {
+			m.nums[s.idx] = val
+			return true
+		}
+		if s := ic.s1.Load(); s != nil && sh == s.shape && m.isNum&s.mask != 0 {
 			m.nums[s.idx] = val
 			return true
 		}
@@ -33858,9 +34044,9 @@ func tnHitSetFloat(obj interface{}, val float64, ic *atomic.Pointer[tnShapeSlot]
 	return false
 }
 
-func tnHitLen(obj interface{}, ic *atomic.Pointer[tnShapeSlot]) (float64, bool) {
+func tnHitLen(obj interface{}, ic *tnPIC) (float64, bool) {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape {
+		if s := ic.s0.Load(); s != nil && m.shape == s.shape {
 			switch t := m.vals[s.idx].(type) {
 			case string:
 				if m.isASCII&s.mask != 0 {
@@ -33908,11 +34094,15 @@ func tnDynamicAddFloatVSlow(a tnDynVal, b tnDynVal) float64 {
 	return TnAs[float64](TnDynamicAdd(av, bv))
 }
 
-func TnGetRefIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+func TnGetRefIC(obj interface{}, key string, ic *tnPIC) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil {
+			if m.isNum&s.mask != 0 {
+				return tnBoxFloat(m.nums[s.idx])
+			}
 			v := m.vals[s.idx]
-			if _, ok := v.(*TnMap[string, interface{}]); ok {
+			switch v.(type) {
+			case nil, string, bool, float64, *TnMap[string, interface{}], *[]interface{}:
 				return v
 			}
 		}
@@ -33920,82 +34110,117 @@ func TnGetRefIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) in
 	return tnGetRefICSlow(obj, key, ic)
 }
 
-func tnGetRefICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
-		idx := -1
-		if s := ic.Load(); s != nil && m.shape == s.shape {
-			idx = int(s.idx)
-		} else if i := m.shape.find(key); i >= 0 {
-			ic.Store(&m.shape.slots[i])
-			idx = i
-		}
-		if idx >= 0 {
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
-				return m.nums[idx]
+func tnGetRefICSlow(obj interface{}, key string, ic *tnPIC) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if m.shape != nil {
+			idx := -1
+			if s := ic.find(m.shape); s != nil {
+				idx = int(s.idx)
+			} else if i := m.shape.find(key); i >= 0 {
+				ic.store(&m.shape.slots[i])
+				idx = i
 			}
-			v := m.vals[idx]
-			switch v.(type) {
-			case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+			if idx >= 0 {
+				if m.isNum&(uint32(1)<<uint(idx)) != 0 {
+					return tnBoxFloat(m.nums[idx])
+				}
+				v := m.vals[idx]
+				switch v.(type) {
+				case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+					return v
+				}
+				if box, boxed := tnBoxSliceRef(v); boxed {
+					m.vals[idx] = box
+					return box
+				}
 				return v
 			}
-			if box, boxed := tnBoxSliceRef(v); boxed {
-				m.vals[idx] = box
-				return box
+			if m.accessors == nil && key != "length" && key != "size" && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+				return nil
 			}
-			return v
+		} else if m.values != nil && m.accessors == nil && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+			if v, present := m.values[key]; present {
+				switch v.(type) {
+				case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
+					return v
+				}
+				if box, boxed := tnBoxSliceRef(v); boxed {
+					m.values[key] = box
+					return box
+				}
+				return v
+			}
+			if key != "length" && key != "size" {
+				return nil
+			}
 		}
 	}
 	return TnGetRef(obj, key)
 }
 
-func TnGetPeekIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+func TnGetPeekIC(obj interface{}, key string, ic *tnPIC) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil {
+			if m.isNum&s.mask != 0 {
+				return tnPeekFloat(&m.nums[s.idx])
+			}
 			return m.vals[s.idx]
 		}
 	}
 	return tnGetPeekICSlow(obj, key, ic)
 }
 
-func tnGetPeekICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) interface{} {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
-		idx := -1
-		if s := ic.Load(); s != nil && m.shape == s.shape {
-			idx = int(s.idx)
-		} else if i := m.shape.find(key); i >= 0 {
-			ic.Store(&m.shape.slots[i])
-			idx = i
-		}
-		if idx >= 0 {
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
-				return m.nums[idx]
+func tnGetPeekICSlow(obj interface{}, key string, ic *tnPIC) interface{} {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
+		if m.shape != nil {
+			idx := -1
+			if s := ic.find(m.shape); s != nil {
+				idx = int(s.idx)
+			} else if i := m.shape.find(key); i >= 0 {
+				ic.store(&m.shape.slots[i])
+				idx = i
 			}
-			return m.vals[idx]
+			if idx >= 0 {
+				if m.isNum&(uint32(1)<<uint(idx)) != 0 {
+					return tnPeekFloat(&m.nums[idx])
+				}
+				return m.vals[idx]
+			}
+			if m.accessors == nil && key != "length" && key != "size" && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+				return nil
+			}
+		} else if m.values != nil && m.accessors == nil && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
+			if v, present := m.values[key]; present {
+				return v
+			}
+			if key != "length" && key != "size" {
+				return nil
+			}
 		}
 	}
 	return TnGetPeek(obj, key)
 }
 
-func TnGetValIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) tnDynVal {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+func TnGetValIC(obj interface{}, key string, ic *tnPIC) tnDynVal {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil && m.isNum&s.mask != 0 {
 			return tnDynVal{num: m.nums[s.idx], isNum: true}
 		}
 	}
 	return tnGetValICSlow(obj, key, ic)
 }
 
-func tnGetValICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) tnDynVal {
+func tnGetValICSlow(obj interface{}, key string, ic *tnPIC) tnDynVal {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
 		idx := -1
-		if s := ic.Load(); s != nil && m.shape == s.shape {
+		if s := ic.find(m.shape); s != nil {
 			idx = int(s.idx)
 		} else if i := m.shape.find(key); i >= 0 {
-			ic.Store(&m.shape.slots[i])
+			ic.store(&m.shape.slots[i])
 			idx = i
 		}
 		if idx >= 0 {
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+			if m.isNum&(uint32(1)<<uint(idx)) != 0 {
 				return tnDynVal{num: m.nums[idx], isNum: true}
 			}
 			return tnDynValOf(m.vals[idx])
@@ -34004,26 +34229,26 @@ func tnGetValICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]
 	return tnDynValOf(TnGetPeek(obj, key))
 }
 
-func TnGetNumberIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+func TnGetNumberIC(obj interface{}, key string, ic *tnPIC) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil && m.isNum&s.mask != 0 {
 			return m.nums[s.idx]
 		}
 	}
 	return tnGetNumberICSlow(obj, key, ic)
 }
 
-func tnGetNumberICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+func tnGetNumberICSlow(obj interface{}, key string, ic *tnPIC) float64 {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
 		idx := -1
-		if s := ic.Load(); s != nil && m.shape == s.shape {
+		if s := ic.find(m.shape); s != nil {
 			idx = int(s.idx)
 		} else if i := m.shape.find(key); i >= 0 {
-			ic.Store(&m.shape.slots[i])
+			ic.store(&m.shape.slots[i])
 			idx = i
 		}
 		if idx >= 0 {
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+			if m.isNum&(uint32(1)<<uint(idx)) != 0 {
 				return m.nums[idx]
 			}
 			return TnNumber(m.vals[idx])
@@ -34032,26 +34257,26 @@ func tnGetNumberICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSl
 	return TnNumber(TnGetPeek(obj, key))
 }
 
-func TnGetFloatIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+func TnGetFloatIC(obj interface{}, key string, ic *tnPIC) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil && m.isNum&s.mask != 0 {
 			return m.nums[s.idx]
 		}
 	}
 	return tnGetFloatICSlow(obj, key, ic)
 }
 
-func tnGetFloatICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+func tnGetFloatICSlow(obj interface{}, key string, ic *tnPIC) float64 {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
 		idx := -1
-		if s := ic.Load(); s != nil && m.shape == s.shape {
+		if s := ic.find(m.shape); s != nil {
 			idx = int(s.idx)
 		} else if i := m.shape.find(key); i >= 0 {
-			ic.Store(&m.shape.slots[i])
+			ic.store(&m.shape.slots[i])
 			idx = i
 		}
 		if idx >= 0 {
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+			if m.isNum&(uint32(1)<<uint(idx)) != 0 {
 				return m.nums[idx]
 			}
 			return TnAs[float64](m.vals[idx])
@@ -34060,9 +34285,9 @@ func tnGetFloatICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlo
 	return TnAs[float64](TnGetPeek(obj, key))
 }
 
-func TnGetLengthIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask == 0 {
+func TnGetLengthIC(obj interface{}, key string, ic *tnPIC) float64 {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil && m.isNum&s.mask == 0 {
 			switch t := m.vals[s.idx].(type) {
 			case string:
 				n := len(t)
@@ -34101,11 +34326,11 @@ func TnGetLengthIC(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot])
 	return tnGetLengthICSlow(obj, key, ic)
 }
 
-func tnGetLengthICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSlot]) float64 {
+func tnGetLengthICSlow(obj interface{}, key string, ic *tnPIC) float64 {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
 		if idx := m.shape.find(key); idx >= 0 {
-			ic.Store(&m.shape.slots[idx])
-			if m.isNum&(uint16(1)<<uint(idx)) != 0 {
+			ic.store(&m.shape.slots[idx])
+			if m.isNum&(uint32(1)<<uint(idx)) != 0 {
 				return 0
 			}
 			return TnLength(m.vals[idx])
@@ -34114,9 +34339,9 @@ func tnGetLengthICSlow(obj interface{}, key string, ic *atomic.Pointer[tnShapeSl
 	return TnLength(TnGetPeek(obj, key))
 }
 
-func TnSetFloatIC(obj interface{}, key string, val float64, ic *atomic.Pointer[tnShapeSlot]) {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape && m.isNum&s.mask != 0 {
+func TnSetFloatIC(obj interface{}, key string, val float64, ic *tnPIC) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil && m.isNum&s.mask != 0 {
 			m.nums[s.idx] = val
 			return
 		}
@@ -34124,26 +34349,26 @@ func TnSetFloatIC(obj interface{}, key string, val float64, ic *atomic.Pointer[t
 	tnSetFloatICSlow(obj, key, val, ic)
 }
 
-func tnSetFloatICSlow(obj interface{}, key string, val float64, ic *atomic.Pointer[tnShapeSlot]) {
+func tnSetFloatICSlow(obj interface{}, key string, val float64, ic *tnPIC) {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.jsKind == 0 && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
 		if m.shape != nil {
 			if idx := m.shape.find(key); idx >= 0 {
 				tnMapEnsureNums(m, len(m.shape.keys))
-				mask := uint16(1) << uint(idx)
+				mask := uint32(1) << uint(idx)
 				if m.isNum&mask == 0 {
 					m.vals[idx] = nil
 					m.isNum |= mask
 					m.isASCII &^= mask
 				}
 				m.nums[idx] = val
-				ic.Store(&m.shape.slots[idx])
+				ic.store(&m.shape.slots[idx])
 				return
 			}
 		}
 		tnMapSetFloat(m, key, val)
 		if m.shape != nil {
 			if idx := m.shape.find(key); idx >= 0 {
-				ic.Store(&m.shape.slots[idx])
+				ic.store(&m.shape.slots[idx])
 			}
 		}
 		return
@@ -34151,9 +34376,9 @@ func tnSetFloatICSlow(obj interface{}, key string, val float64, ic *atomic.Point
 	TnSet(obj, key, val)
 }
 
-func TnSetIC(obj interface{}, key string, val interface{}, ic *atomic.Pointer[tnShapeSlot]) {
-	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil {
-		if s := ic.Load(); s != nil && m.shape == s.shape {
+func TnSetIC(obj interface{}, key string, val interface{}, ic *tnPIC) {
+	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.shape != nil {
+		if s := ic.find(m.shape); s != nil {
 			switch v := val.(type) {
 			case float64:
 				if len(m.nums) > int(s.idx) {
@@ -34176,7 +34401,7 @@ func TnSetIC(obj interface{}, key string, val interface{}, ic *atomic.Pointer[tn
 	tnSetICSlow(obj, key, val, ic)
 }
 
-func tnSetICSlow(obj interface{}, key string, val interface{}, ic *atomic.Pointer[tnShapeSlot]) {
+func tnSetICSlow(obj interface{}, key string, val interface{}, ic *tnPIC) {
 	if m, ok := obj.(*TnMap[string, interface{}]); ok && m != nil && m.jsKind == 0 && (!tnAnyAccessors.Load() || !tnAccessorTypes.has(obj)) {
 		switch val.(type) {
 		case nil, float64, string, bool, *TnMap[string, interface{}], *[]interface{}:
@@ -34190,7 +34415,7 @@ func tnSetICSlow(obj interface{}, key string, val interface{}, ic *atomic.Pointe
 		}
 		if m.shape != nil {
 			if idx := m.shape.find(key); idx >= 0 {
-				ic.Store(&m.shape.slots[idx])
+				ic.store(&m.shape.slots[idx])
 			}
 		}
 		return
@@ -37130,6 +37355,30 @@ func TnNumber(v interface{}) float64 {
 		if s == "" {
 			return 0
 		}
+		if len(s) > 2 && s[0] == '0' {
+			var base int
+			switch s[1] {
+			case 'x', 'X':
+				base = 16
+			case 'b', 'B':
+				base = 2
+			case 'o', 'O':
+				base = 8
+			}
+			if base != 0 {
+				digits := s[2:]
+				if u, err := strconv.ParseUint(digits, base, 64); err == nil {
+					return float64(u)
+				}
+				if digits[0] != '+' && digits[0] != '-' {
+					if bi, ok := new(tnbig.Int).SetString(digits, base); ok {
+						f, _ := new(tnbig.Float).SetInt(bi).Float64()
+						return f
+					}
+				}
+				return math.NaN()
+			}
+		}
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
 			return f
 		}
@@ -39875,6 +40124,54 @@ func TnToArray(v interface{}) []interface{} {
 		return []interface{}{}
 	case []interface{}:
 		return append([]interface{}{}, t...)
+	case []float64:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out
+	case *[]float64:
+		if t == nil {
+			return []interface{}{}
+		}
+		s := *t
+		out := make([]interface{}, len(s))
+		for i, x := range s {
+			out[i] = x
+		}
+		return out
+	case []string:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out
+	case *[]string:
+		if t == nil {
+			return []interface{}{}
+		}
+		s := *t
+		out := make([]interface{}, len(s))
+		for i, x := range s {
+			out[i] = x
+		}
+		return out
+	case []bool:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out
+	case *[]bool:
+		if t == nil {
+			return []interface{}{}
+		}
+		s := *t
+		out := make([]interface{}, len(s))
+		for i, x := range s {
+			out[i] = x
+		}
+		return out
 	case tnArrayLike:
 		return append([]interface{}{}, (*t.TnItems())...)
 	case tnSeqIter:
@@ -39991,6 +40288,9 @@ func tnDerefValue(rv reflect.Value) reflect.Value {
 }
 
 func TnSliceAs[T any](v interface{}) []T {
+	if same, ok := v.([]T); ok {
+		return same
+	}
 	var items []interface{}
 	if list, ok := v.([]interface{}); ok {
 		items = list
@@ -42079,13 +42379,77 @@ func tnJSONMarshal(v interface{}) ([]byte, error) {
 type tnShapeSlot struct {
 	shape *tnShape
 	idx   uint16
-	mask  uint16
+	mask  uint32
+}
+
+type tnPIC struct {
+	s0 atomic.Pointer[tnShapeSlot]
+	s1 atomic.Pointer[tnShapeSlot]
+	s2 atomic.Pointer[tnShapeSlot]
+	s3 atomic.Pointer[tnShapeSlot]
+}
+
+func (ic *tnPIC) find(sh *tnShape) *tnShapeSlot {
+	if s := ic.s0.Load(); s != nil {
+		if s.shape == sh {
+			return s
+		}
+		if s = ic.s1.Load(); s != nil {
+			if s.shape == sh {
+				return s
+			}
+			if s = ic.s2.Load(); s != nil {
+				if s.shape == sh {
+					return s
+				}
+				if s = ic.s3.Load(); s != nil && s.shape == sh {
+					return s
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (ic *tnPIC) store(slot *tnShapeSlot) {
+	s0 := ic.s0.Load()
+	if s0 == nil {
+		ic.s0.Store(slot)
+		return
+	}
+	if s0 == slot {
+		return
+	}
+	s1 := ic.s1.Load()
+	if s1 == nil {
+		ic.s1.Store(slot)
+		return
+	}
+	if s1 == slot {
+		return
+	}
+	s2 := ic.s2.Load()
+	if s2 == nil {
+		ic.s2.Store(slot)
+		return
+	}
+	if s2 == slot {
+		return
+	}
+	if ic.s3.Load() == slot {
+		return
+	}
+	ic.s3.Store(s2)
+	ic.s2.Store(s1)
+	ic.s1.Store(s0)
+	ic.s0.Store(slot)
 }
 
 type tnShape struct {
 	mu     sync.RWMutex
 	keys   []string
 	slots  []tnShapeSlot
+	idxMap map[string]int
 	next   map[string]*tnShape
 	hasIdx bool
 }
@@ -42093,6 +42457,12 @@ type tnShape struct {
 var tnRootShape = &tnShape{}
 
 func (sh *tnShape) find(key string) int {
+	if sh.idxMap != nil {
+		if i, ok := sh.idxMap[key]; ok {
+			return i
+		}
+		return -1
+	}
 	for i, k := range sh.keys {
 		if k == key {
 			return i
@@ -42117,13 +42487,21 @@ func (sh *tnShape) transition(key string) *tnShape {
 	keys := make([]string, n+1)
 	copy(keys, sh.keys)
 	keys[n] = key
+	var idxMap map[string]int
+	if n+1 > 8 {
+		idxMap = make(map[string]int, n+1)
+		for i, k := range keys {
+			idxMap[k] = i
+		}
+	}
 	child = &tnShape{
 		keys:   keys,
 		slots:  make([]tnShapeSlot, n+1),
+		idxMap: idxMap,
 		hasIdx: sh.hasIdx || tnIndexKeyStr(key),
 	}
 	for i := 0; i <= n; i++ {
-		child.slots[i] = tnShapeSlot{shape: child, idx: uint16(i), mask: uint16(1) << uint(i)}
+		child.slots[i] = tnShapeSlot{shape: child, idx: uint16(i), mask: uint32(1) << uint(i)}
 	}
 	if sh.next == nil {
 		sh.next = map[string]*tnShape{}
@@ -42138,8 +42516,8 @@ type TnMap[K comparable, V any] struct {
 	vals      []V
 	nums      []float64
 	shape     *tnShape
-	isNum     uint16
-	isASCII   uint16
+	isNum     uint32
+	isASCII   uint32
 	jsKind    uint8 // 1: made by new Map(), 2: by new Set() (instanceof)
 	indexKeys bool  // some key is an array index ("2"): see orderedKeys
 	// a plain object's accessor properties ({ get x() {} }, defineProperty
@@ -42174,7 +42552,7 @@ func (m *TnMap[K, V]) promote() {
 	}
 	m.values = make(map[K]V, capHint)
 	for i, k := range m.keys {
-		if m.isNum&(uint16(1)<<uint(i)) != 0 {
+		if m.isNum&(uint32(1)<<uint(i)) != 0 {
 			m.values[m.hk(k)] = any(m.nums[i]).(V)
 		} else {
 			m.values[m.hk(k)] = m.vals[i]
@@ -42225,7 +42603,7 @@ func (m *TnMap[K, V]) read(k K) (V, bool) {
 		}
 		for i := 0; i < len(m.keys); i++ {
 			if m.keys[i] == k {
-				if m.isNum&(uint16(1)<<uint(i)) != 0 {
+				if m.isNum&(uint32(1)<<uint(i)) != 0 {
 					return any(m.nums[i]).(V), true
 				}
 				return m.vals[i], true
@@ -42480,12 +42858,12 @@ func (m *TnMap[K, V]) Set(k K, v V) *TnMap[K, V] {
 			for i := 0; i < len(m.keys); i++ {
 				if m.keys[i] == k {
 					m.vals[i] = v
-					m.isNum &^= uint16(1) << uint(i)
-					m.isASCII &^= uint16(1) << uint(i)
+					m.isNum &^= uint32(1) << uint(i)
+					m.isASCII &^= uint32(1) << uint(i)
 					return m
 				}
 			}
-			if len(m.keys) < 16 {
+			if len(m.keys) < 8 {
 				m.keys = append(m.keys, k)
 				m.vals = append(m.vals, v)
 				if !m.indexKeys {
@@ -42645,12 +43023,12 @@ func (m *TnMap[K, V]) Delete(k K) bool {
 					m.nums = append(m.nums[:i], m.nums[i+1:]...)
 				}
 				if m.isNum != 0 {
-					lo := m.isNum & ((uint16(1) << uint(i)) - 1)
+					lo := m.isNum & ((uint32(1) << uint(i)) - 1)
 					hi := (m.isNum >> uint(i+1)) << uint(i)
 					m.isNum = lo | hi
 				}
 				if m.isASCII != 0 {
-					lo := m.isASCII & ((uint16(1) << uint(i)) - 1)
+					lo := m.isASCII & ((uint32(1) << uint(i)) - 1)
 					hi := (m.isASCII >> uint(i+1)) << uint(i)
 					m.isASCII = lo | hi
 				}
@@ -44688,7 +45066,7 @@ func tnGoMap[K comparable, V any](m *TnMap[K, V]) map[K]V {
 	if m.values == nil {
 		out := make(map[K]V, len(m.keys))
 		for i, k := range m.keys {
-			if m.isNum&(uint16(1)<<uint(i)) != 0 {
+			if m.isNum&(uint32(1)<<uint(i)) != 0 {
 				out[k] = any(m.nums[i]).(V)
 			} else {
 				out[k] = m.vals[i]
